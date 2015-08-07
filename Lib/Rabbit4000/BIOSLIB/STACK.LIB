@@ -370,10 +370,10 @@ _stack_debug
 void _Init_Stacks(void)
 {
 	auto long allocatedForStacks;
-	auto long spaceLeft;
+	auto long stacksTop;
 	auto int i;
 	auto unsigned locCounts[STACKPOOLCOUNT];
-	auto unsigned int allocIndex;
+	auto unsigned allocIndex;
 	auto unsigned totalStackCounts;
 
 	locCounts[0] = STACK_CNT_256;
@@ -383,42 +383,45 @@ void _Init_Stacks(void)
 	locCounts[4] = STACK_CNT_4K;
 	totalStackCounts = TOTAL_STACK_CNT;
 	SizeOfStacks1 = 0;
-	allocIndex    = 0;
+	allocIndex    = TOTAL_STACK_CNT - 1u;
 
-	for(i = 0; i< STACKPOOLCOUNT; i++) {
+	for (i = 0; i < STACKPOOLCOUNT; ++i)
+	{
 		SizeOfStacks1 += locCounts[i]*(unsigned long)stackSizes[i];
 	}
 
 	// Use allocatedForStacks as the total size of stack(s) to be allocated, to
-	//  prevent _xalloc() from altering the value in SizeOfStacks1 and because
-	//  we'll need the (possibly) updated value later.
+	//  prevent _xalloc() from altering the value in SizeOfStacks1.
 	allocatedForStacks = SizeOfStacks1;
 	// Allocate required stack size plus possible additional size due to the
 	//  4 KByte (i.e 2^^12 byte) boundary alignment requirement for STACKSEG.
 	BaseOfStacks1 = _xalloc(&allocatedForStacks, 12, XALLOC_MAYBBB);
-	// Calculate the uppermost allocated 4 KByte boundary address, which is the
-	//  starting point for later fitting of individual stack(s) into the total
-	//  stack(s) allocation.
-	spaceLeft = BaseOfStacks1 + allocatedForStacks & 0xFFF000L;
+	// Calculate the uppermost allocated stack address (which is one less than
+	//  the sum of BaseOfStacks1 plus SizeOfStacks1).
+	stacksTop = BaseOfStacks1 + SizeOfStacks1 - 1L;
 
-	while(totalStackCounts) {
-		for(i = STACKPOOLCOUNT-1; i>=0; i--) {
-			// ensure that stack can fit before the next 4k (0x1000) boundary
-			while(locCounts[i] && (spaceLeft & 0xfffL) >= stackSizes[i]-1) {
-				// if we are about to overrun our current allocation
-				// allocate more space
-				locCounts[i]--;
-				totalStackCounts--;
-				freeStacks[allocIndex] = ((long)i<<24)+spaceLeft;
-				allocIndex++;
-				spaceLeft -= stackSizes[i];
+	while (totalStackCounts)
+	{
+		for (i = 0; i < STACKPOOLCOUNT; ++i)
+		{
+			/*
+				Stack sizes are powers of two ranging from 256 bytes to 4096 bytes.
+				Because _xalloc() has allocated the total stack(s) storage memory
+				starting on a 4K (0x1000) address boundary, allocating the smallest
+				stack(s) first from the top down to the base guarantees that each
+				stack fits completely within its 4KB (0x1000 byte) memory block. The
+				freeStacks[] array is filled in reverse index order to maintain the
+				requirements of sorting stacks of decreasing size by ascending
+				physical address.
+			*/
+			while (locCounts[i])
+			{
+				--locCounts[i];
+				--totalStackCounts;
+				freeStacks[allocIndex] = ((long) i << 24) + stacksTop;
+				--allocIndex;
+				stacksTop -= stackSizes[i];
 			}
-		}
-		// if i< 0 then count not fit any more stacks in remaining space
-		// move down to next 4k boundary
-		if (i < 0 ) {
-			spaceLeft -= 0x1000;
-			spaceLeft |= 0xfff;
 		}
 	}
 }
@@ -523,49 +526,67 @@ long _Alloc_Stack(unsigned int sz)
 	auto long retval;
 	auto int i, i2;
 	auto char *fsPtr;
+
 #if (DK_ENABLE_STACK_TRACING == 1)
 	#ifdef MCOS
-   sz -= 3;
-   #endif
+	sz -= 3;
+	#endif
 #endif
 
-	for(i = 0;i < STACKPOOLCOUNT;i++) {
-		if(sz <= stackSizes[i]) {
+	for (i = 0; i < STACKPOOLCOUNT; ++i)
+	{
+		if (sz <= stackSizes[i])
+		{
 			sz = i;
 			break;
 		}
 	}
 
-	if (i == STACKPOOLCOUNT) {
+	if (i == STACKPOOLCOUNT)
+	{
 		return 0;
 	}
 	fsPtr = (char *) freeStacks;
-	for(i = TOTAL_STACK_CNT-1; i >= 0;i--) {
-		// test for allocation (high bit)
-		i2 = i*sizeof(long)+sizeof(long)-1;
-		if(!(fsPtr[i2] & 0x80)) {
-			if(fsPtr[i2]>=sz) {
+	/*
+		Step through freeStacks[] in reverse index order to find an available
+		stack of the smallest suitable size. Note that the _Init_Stacks() function
+		populates the freeStacks[] array with allocated stacks sorted in
+		descending size order.
+	*/
+	for (i = TOTAL_STACK_CNT - 1; i >= 0; --i)
+	{
+		// calculate offset to (long) freeStacks[i] entry's MSB
+		i2 = i * sizeof (long) + sizeof (long) - 1;
+		// test for available (high bit reset) stack entry
+		if (!(fsPtr[i2] & 0x80))
+		{
+			// test for suitable (same or larger) stack size
+			if (fsPtr[i2] >= sz)
+			{
+				// allocate the available, suitable stack entry
 				fsPtr[i2] |= 0x80;
 				break;
 			}
 		}
 	}
 
-	if (i < 0) {
+	if (i < 0)
+	{
+		// no suitable stack is available
 		return 0;
 	}
 	retval = freeStacks[i] & 0xffffff; // get the physical address
 #if (DK_ENABLE_STACK_TRACING == 1)
 	#ifdef MCOS
 	dkUCos = 1;
-   retval -= 3;
-   *(int __far *)(retval + 2) = 0xdbbd;	// v = 0xdbbd; root2xmem(retval + 2, &v, 2);
-   #endif
+	retval -= 3;
+	*(int __far *) (retval + 2) = 0xdbbd;	// v = 0xdbbd; root2xmem(retval + 2, &v, 2);
+	#endif
 #endif
 
 	// convert return value into form bc:de
 	// where bc is STACKSEGH:STACKSEGL and de is 0xDyyy logical address
-   _gen_lin2seg(&retval, 0xd);
+	_gen_lin2seg(&retval, 0xd);
 	return retval;
 }
 
