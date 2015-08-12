@@ -1,0 +1,595 @@
+/*
+	Embedded 802.11 wireless network interface
+	MAC layer hardware interface
+
+	Copyright (c) 2007-2008 Digi International Inc., All Rights Reserved
+
+	This software contains proprietary and confidential information of Digi
+	International Inc.  By accepting transfer of this copy, Recipient agrees
+	to retain this software in confidence, to prevent disclosure to others,
+	and to make no use of this software other than that for which it was
+	delivered.  This is an unpublished copyrighted work of Digi International
+	Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+	prohibited.
+
+	Restricted Rights Legend
+
+	Use, duplication, or disclosure by the Government is subject to
+	restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+	Technical Data and Computer Software clause at DFARS 252.227-7031 or
+	subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+	Restricted Rights at 48 CFR 52.227-19, as applicable.
+
+	Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+
+	This library includes hardware-specific initialization routines and
+	other hardware-specific routines used by the rest of the WiFi driver.
+	This also includes the entry point to the ISR.
+*/
+
+/*** BeginHeader */
+#ifndef __WIFI_RABBITEARS_HW_LIB
+#define __WIFI_RABBITEARS_HW_LIB
+
+/*** EndHeader */
+
+/*** BeginHeader _wifi_auto_calibration, freqTable, ubec_pwr */
+
+#ifndef WIFI_AUTO_CAL_ONLY
+#use "wifi_ubec_mcal.lib"
+#endif
+
+// Link LED bit (NCRSSI1R)
+#define	_WIFI_LED_LINK			0x01		// Link LED
+
+#define WIFI_FPGA_TIMEOUT 2	// Number of seconds to wait for FPGA
+										// initialization
+#define UBEC_PWR_SETTING 0x39ee0
+
+// Delay (in us) after changing the VCO value
+#define 	_WIFI_VCO_INITIAL_DELAY		50
+// Number of milliseconds to wait for a solid LOCK signal
+#define 	_WIFI_VCO_WAIT					10
+
+struct _wifi_freq_divider{
+    unsigned int integer;
+    unsigned int fraction;
+};
+
+
+struct wifi_rf_power {
+	uint8 			index;
+	unsigned long   reg;
+};
+
+extern int _wifi_auto_calibration;
+extern struct _wifi_freq_divider const freqTable[];
+extern struct wifi_rf_power const ubec_pwr[];
+extern int pwrMacDown;
+
+/*** EndHeader */
+
+// Flag used for selecting channel calibration method
+int _wifi_auto_calibration;
+int pwrMacDown;
+
+// RF transceiver frequency divider for each channel
+struct _wifi_freq_divider const freqTable[] = {
+    { 0, 0 },
+    { 0x6847, 0x0999 }, // 1 (2412 MHz)
+    { 0x6847, 0x099b }, // 2 (2417 MHz)
+    { 0x6867, 0x0998 }, // 3
+    { 0x6867, 0x099a }, // 4
+    { 0x6867, 0x0999 }, // 5
+    { 0x6867, 0x099b }, // 6
+    { 0x6857, 0x0998 }, // 7
+    { 0x6857, 0x099a }, // 8
+    { 0x6857, 0x0999 }, // 9
+    { 0x6857, 0x099b }, // 10
+    { 0x6877, 0x0998 }, // 11
+    { 0x6877, 0x099a }, // 12
+    { 0x6877, 0x0999 }, // 13 (2472 MHz)
+    { 0x684f, 0x0ccc }, // 14 (2484 MHz)
+};
+
+struct wifi_rf_power const ubec_pwr[] = {
+	{ 0 , 0x0fffe},   // 0
+   { 1 , 0x0fffe },  // 1
+	{ 3 , 0x0fffe },  // 2
+	{ 5 , 0x0fffe },  // 3
+	{ 7 , 0x0fffe },  // 4
+	{ 4 , 0x1fffe },  // 5
+	{ 5 , 0x1fffe },  // 6
+	{ 7 , 0x1fffe },  // 7
+	{ 8 , 0x17ffe },  // 8
+	{ 9 , 0x17ffe },  // 9
+	{ 11 , 0x17ffe },  // 10
+	{ 13 , 0x17ffe },  // 11
+	{ 15 , 0x17ffe },  // 12
+	{ 13 , 0x1fffe },  // 13
+	{ 14 , 0x1fffe },  // 14
+   { 15 , 0x1fffe },  // 15
+};
+
+/*** BeginHeader _wc_SetTxPower, _wifi_hwAES */
+void _wc_SetTxPower(word value);
+
+extern const uint32 _wifi_powerTable[];
+extern int _wifi_hwAES;
+
+/*** EndHeader */
+
+int _wifi_hwAES;
+
+// RF transceiver transmitter gain for each power level.
+// This is the 0-15 power level, bit reversed.
+const uint32 _wifi_powerTable[] = {
+	0x0, 0x8, 0x4, 0xc, 0x2, 0xa, 0x6, 0xe,
+	0x1, 0x9, 0x5, 0xd, 0x3, 0xb, 0x7, 0xf
+};
+
+//
+// This is used to set the transmit power.  Values can range
+// from 0-15, where 8 is the default and I am told provides about
+// 12dBm (16mW) output power.
+_wifig_nodebug
+void _wc_SetTxPower(word value)
+{
+	auto int index;
+
+   if (value >= 0 && value < 16) {
+#ifndef WIFI_AUTO_CAL_ONLY
+      if(_wifi_auto_calibration)
+   	{
+#endif
+   		_wifi_WriteRF (7, ubec_pwr[value].reg);
+    		index  = ubec_pwr[value].index;
+    		_wifi_WriteRF (5, UBEC_PWR_SETTING |
+      						_wifi_powerTable[index]); // transmitter gain
+         #ifdef WIFI_REGION_VERBOSE
+      	printf("Set TxPower using auto calibration, Index=%d\n",value);
+      	#endif
+#ifndef WIFI_AUTO_CAL_ONLY
+      }
+      else
+      {
+      	if(value < 8)
+         	value = 8;
+      	_wifi_WriteRF (5, 0x19e40 | _wifi_powerTable[value]);
+         #ifdef WIFI_REGION_VERBOSE
+      	printf("Set TxPower using manual calibration, Index=%d\n",value);
+      	#endif
+      }
+#endif
+
+	}
+}
+
+
+/*** BeginHeader _wc_IsRFPowered */
+int _wc_IsRFPowered (void);
+/*** EndHeader */
+_wifig_nodebug
+int _wc_IsRFPowered (void)
+{
+	return BitRdPortI(NAPCR, 4);
+}
+
+/*** BeginHeader _wc_IsLogicPowered */
+int _wc_IsLogicPowered (void);
+/*** EndHeader */
+_wifig_nodebug
+int _wc_IsLogicPowered (void)
+{
+	return (RdPortI(NAPCR) & 0x0C) == 0x0C;
+}
+
+
+
+/*** BeginHeader _wc_RampPower */
+// Used by RCM4400W only
+void _wc_RampPower (void);
+/*** EndHeader */
+#ifndef RABBIT_EARS
+	#fatal "_wc_RampPower function only for RCM4400W"
+#endif
+
+_wifig_nodebug
+void _wc_RampPower (void)
+{
+   auto int rf_regulator_on;
+   auto int rf_regulator_off;
+	auto int reg_ramp;
+   auto int i;
+
+   // Enable the RF regulator, ramp up slowly to limit current overshoot.
+   rf_regulator_on   =  (RdPortI(NAPCR) | 0x10);
+   rf_regulator_off  =  (RdPortI(NAPCR) & ~0x10);
+
+   // Charge 100ufd cap
+   for(i=0, reg_ramp = 1; i <200; i++, reg_ramp+=2)
+   {
+   	#asm
+      ld	de,NAPCR
+      ld	hl,(sp+@sp+reg_ramp)
+      ld	bc,hl
+      ld	hl,(sp+@sp+rf_regulator_on)
+      ld	a,l
+		ioi	ld	(de),a
+      .reg_loop1:
+		dwjnz	.reg_loop1
+      ld	hl,(sp+@sp+rf_regulator_off)
+      ld	a,l
+      ioi   ld	(de),a
+   	#endasm
+   }
+
+   // Ramp-up current
+   for(i=0; i <200; i++, reg_ramp--)
+   {
+   	if(reg_ramp < 1)
+      	reg_ramp = 1;
+   	#asm
+      ld	de,NAPCR
+      ld	hl,(sp+@sp+reg_ramp)
+      ld	bc,hl
+      ld	hl,(sp+@sp+rf_regulator_off)
+      ld	a,l
+		ioi	ld	(de),a
+      .reg_loop2:
+		dwjnz	.reg_loop2
+      ld	hl,(sp+@sp+rf_regulator_on)
+      ld	a,l
+      ioi   ld	(de),a
+   	#endasm
+   }
+}
+
+
+
+/*** BeginHeader _wc_InitHW */
+WiFiMacReturn _wc_InitHW (void);
+/*** EndHeader */
+
+// Initialize the 802.11 MAC hardware
+_wifig_nodebug
+WiFiMacReturn _wc_InitHW (void)
+{
+	auto unsigned long macro;
+	auto unsigned long timeout;
+	auto int done;
+	auto int retval;
+
+	#GLOBAL_INIT { \
+		_wc_locklevel = 0; \
+		_wifi_auto_calibration = 0; \
+	}
+
+#ifndef WIFI_AUTO_CAL_ONLY
+	_GetSysMacroValue("_DC_ETH0_", &macro);
+   if(macro == 0x38001000)
+   	_wifi_auto_calibration = TRUE;
+#endif
+
+	_wc_locklevel = 0;
+	// Disable Network Port A
+	WrPortI(NACR, NULL, 0x00);
+
+	// Make sure serial flash lines are not driven
+	WrPortI(SBCR, NULL, 0x00);
+   WrPortI(PBDDR, NULL, PBDDRShadow & ~0x01);
+   WrPortI(PCDDR, NULL, PCDDRShadow & ~0x30);
+
+	_wc_RampPower();
+
+	// Set up FPGA strobe line
+	BitWrPortI(PEDDR, &PEDDRShadow, 1, 6);
+   BitWrPortI(PEFR, &PEFRShadow, 1, 6);
+   WrPortI(IB6CR, &IB6CRShadow, 0x4B);
+
+   // Raise the INIT_BR line
+	WrPortI(NAPCR, &NAPCRShadow, RdPortI(NAPCR) | 0x04);
+	_wifi_waitUS(10);
+   // Raise the RE_INIT line (starts FPGA self-boot sequence)
+	WrPortI(NAPCR, &NAPCRShadow, RdPortI(NAPCR) | 0x08);
+
+	// Wait for the FPGA to start
+   timeout = set_timeout(WIFI_FPGA_TIMEOUT);
+   done = 0;
+   while ((!done) && (!chk_timeout(timeout))) {
+   	// Check if the FPGA has started
+   	done = RdPortI(NAPCR) & 0x02;
+   }
+
+	// restore registers used by serial flash
+   WrPortI(PBDDR, NULL, PBDDRShadow);
+   WrPortI(PCDDR, NULL, PCDDRShadow);
+
+	// If SBCR was previously set up for SPI, toggle chip select to serial flash
+	// and read status byte to get it back to a known state for sflash.lib.
+	#asm
+				ld		a, (SBCRShadow)
+		ioi	ld		(SBCR), a				; restore SBCR from shadow
+				cp		0x0C
+				jr		nz, .skip_spistatus	; port was not set up serial flash
+
+				ld		hl, NAPCR
+		ioi	set	5, (hl)					; enable chip select
+
+				ld		a, 0xD7
+		ioi	ld		(SBDR), a		; send 0xD7 (Status Register Read command)
+
+				ld		a, (SBCRShadow)
+				set	7, a
+		ioi	ld		(SBCR), a				; start SPI transmit
+
+				ld		hl, SBSR
+		.waitwrite:
+		ioi	ld		a, (hl)
+				and	0x0C
+				jr		nz, .waitwrite			; wait for the byte to go out
+
+				ld		a, (SBCRShadow)
+				set	6, a
+		ioi	ld		(SBCR), a				; start SPI receive
+
+				align	2							; even-align the following ioi bit X,(hl)
+		.waitread:
+		ioi	bit	7, (hl)
+				jr		z, .waitread			; wait for the byte to come in
+
+		ioi	ld		a, (SBDR)				; read the status byte to clear register
+
+				ld		hl, NAPCR
+		ioi	res	5, (hl)					; disable chip select
+		.skip_spistatus:
+	#endasm
+
+   if (!done) {
+   	// The FPGA did not initialize
+		#if WIFIG_VERBOSE
+		printf("ERROR!!!  Wireless interface did not initialize!  FPGA image corrupted?\n");
+		#endif
+   	return _WIFI_ERR_LOAD;
+	}
+
+	// Initialize RF tranceiver
+   // Write out the SPI Control Register
+   _wc_write8(NCSPICR, _WIFI_SPI_CTRL_LEN);
+
+#ifndef WIFI_AUTO_CAL_ONLY
+   if(!_wifi_auto_calibration)
+   {
+   	_wifi_init_manual_cal();
+      #ifdef WIFI_REGION_VERBOSE
+      printf("Init HW using manual calibration\n");
+      #endif
+	}
+   else
+   {
+#endif
+    	_wifi_WriteRF (7, 0x1fffe); // test
+    	_wifi_WriteRF (6, 0xf81ac); // filter register
+    	_wifi_WriteRF (5, UBEC_PWR_SETTING); // transmitter gain
+    	_wifi_WriteRF (4, 0x0002b); // receiver gain
+    	_wifi_WriteRF (3, 0x46622); // vco control
+    	_wifi_WriteRF (0, 0x25f9c); // mode control
+    	_wifi_waitUS (10);
+
+      #ifdef WIFI_REGION_VERBOSE
+      printf("Init HW using auto calibration\n");
+      #endif
+#ifndef WIFI_AUTO_CAL_ONLY
+  	}
+#endif
+
+   // Set pointer to current region info
+   _wifi_region_current = &_wifi_country_info[IFC_WIFI_REGION];
+
+	// Set Max allowable power level limit for selectable compile time region
+   _wifi_macParams.tx_power_max = _wifi_region_current->max_pwr_index;
+
+   // Initially set RF to approx half the allowable power range
+   _wifi_macStatus.tx_power = (_wifi_macParams.tx_power_max/2) + 1;
+   _wc_SetTxPower(_wifi_macStatus.tx_power);
+   _wifi_waitUS (10);
+
+   // Set allowable channel range for selectable compile time region
+   _wifi_setchannelmask(_wifi_region_current->channel_mask);
+
+	// Set the General Control register to a known good value
+	_wc_write32(NCGC0R, 0x37780001);
+
+	// Enable DCMs
+	_wc_or32(NCGC0R, 0x02000000);
+
+   // Reset RX and TX FIFOs
+   _wc_or32(NCGC0R, _WIFI_GEN_RXFIFORST | _WIFI_GEN_TXFIFORST);
+   _wc_and32(NCGC0R, ~(_WIFI_GEN_RXFIFORST | _WIFI_GEN_TXFIFORST));
+
+	return _WIFI_ERR_OK;
+}
+
+
+/*** BeginHeader _wifi_InitHW */
+WiFiMacReturn _wifi_InitHW (void);
+/*** EndHeader */
+
+// Initialize 802.11 MAC subsystem
+_wifig_nodebug
+WiFiMacReturn _wifi_InitHW (void)
+{
+	auto WiFiMacReturn retval;
+
+	#GLOBAL_INIT { \
+		_wifi_isr_initialized = 0; \
+		_wifi_isr_enabled = 0; \
+	}
+
+	DPRINTF ("HW init\n");
+
+	// Calibrate delay loop
+	_wifi_InitTimer();
+
+	// RabbitEars FPGA doesn't support 802.11 AES acceleration
+	_wifi_hwAES = FALSE;
+	_wifi_macParams.chan_mask &= 0x3fff;
+
+	if (_wifi_macParams.frag_thresh < _WIFI_MIN_FRAG_SIZE)
+		_wifi_macParams.frag_thresh = _WIFI_MIN_FRAG_SIZE;
+	if (_wifi_maxFragSize > _WIFI_MAX_FRAG_SIZE)
+		_wifi_maxFragSize = _WIFI_MAX_FRAG_SIZE;
+
+
+	// Call Board specfic initialization
+	retval =  _wc_InitHW();
+	if (retval != _WIFI_ERR_OK)
+		return retval;
+
+	// Init baseband processor and MAC assist
+	_wc_HWMemcpy(NCSTAID0R, _wifi_macParams.sta_addr, WLN_ADDR_SIZE);
+
+	// Set antenna diversity if enabled
+	if (_wifi_macParams.options & WLN_OPT_ANTDIV)
+		_wc_or32(NCGC0R, _WIFI_GEN_ANTDIV);
+
+	_wc_write32(0x28, 0x8043202C); // enable binary data on DAC
+
+	_wc_write8(NCPSKBRSR, NCPSKBRSR_SET);
+											// Enable all 802.11b data rates (used by MAC
+											// assist for transmitting ACKs)
+
+	_wc_write8(NCBFR, 0xfc);    // set beacon interval  0xFC = 262ms,
+										 // 0x80 = 8.39 sec
+
+	// Clear the Interrupt Mask Register before enabling external interrupts.
+	// Also clear out any status bits in the Interrupt Status Register.
+	_wc_write8(NCIMR, 0x00);
+	_wc_write8(NCISR, 0xff);
+
+	// Install interrupt handler
+	SetVectExtern3000(1, _wifi_HandleIR);
+	if (!_wifi_isr_initialized)
+	{
+		BitWrPortI(PEDDR, &PEDDRShadow, 0, 5);
+		BitWrPortI(PEFR, &PEFRShadow, 0, 5);
+		_wifi_isr_enabled = 1;
+		_WIFI_ENABLE (1);
+		// enable WiFi (PE5, rising edge) external interrupt
+		WrPortI(I1CR, &I1CRShadow, I1CRShadow & 0xCC | 0x20 | WIFIG_NET_IP);
+	}
+
+	// Clear any status bits, then enable the appropriate bits in the
+	// Interrupt Mask Register.
+	_wc_write8(NCISR, 0xff);
+	_wc_write8(NCIMR, _WIFI_INTR_RX|_WIFI_INTR_TXEND|
+	                  _WIFI_INTR_TIMEOUT|_WIFI_INTR_RXOVERRUN);
+
+	_wifi_isr_initialized = 1;
+	pwrMacDown = FALSE;
+	return _WIFI_ERR_OK;
+}
+
+/*** BeginHeader _wifi_ShutdownHW */
+void _wifi_ShutdownHW (void);
+/*** EndHeader */
+
+//
+// Shutdown the wireless hardware
+//
+_wifig_nodebug
+void _wifi_ShutdownHW (void)
+{
+	DPRINTF ("HW shutdown\n");
+
+	_wc_write32(NCGC0R, _WIFI_GEN_RESET);
+	_wc_write8(NCMACCR, 0);
+	_wc_write8(NCIMR, 0);
+}
+
+/*** BeginHeader _wifi_SetChannel */
+void _wifi_SetChannel (int channel);
+/*** EndHeader */
+
+//
+// Select a channel
+// @param channel Channel number: 1-14
+//
+
+_wifig_nodebug
+void _wifi_SetChannel (int channel)
+{
+   _wc_and32(NCGC0R, ~_WIFI_GEN_RXEN);
+
+#ifndef WIFI_AUTO_CAL_ONLY
+   if(!_wifi_auto_calibration)
+   {
+   	_wifi_manual_cal_channel(channel);
+      #ifdef WIFI_REGION_VERBOSE
+      printf("Set Channel using manual calibration, ch=%d\n", channel);
+      #endif
+	}
+   else
+   {
+#endif
+ 		// Set frequency divider for channel
+    	_wifi_WriteRF (1, freqTable[channel].integer);
+    	_wifi_WriteRF (2, freqTable[channel].fraction);
+
+    	_wifi_WriteRF (0, 0x25f9c);
+    	_wifi_waitUS (12);
+    	_wifi_WriteRF (0, 0x25f9a);
+    	_wifi_waitUS (84);
+    	_wifi_WriteRF (0, 0x25f94);
+    	_wifi_waitUS (12);
+      #ifdef WIFI_REGION_VERBOSE
+      printf("Set Channel using auto calibration, ch=%d\n", channel );
+      #endif
+#ifndef WIFI_AUTO_CAL_ONLY
+   }
+#endif
+
+   _wc_or32(NCGC0R, _WIFI_GEN_RXEN);
+}
+
+
+
+/*** BeginHeader _wifi_CheckLock */
+int _wifi_CheckLock(void);
+/*** EndHeader */
+
+_wifig_nodebug
+int _wifi_CheckLock(void)
+{
+	auto unsigned long timeout;
+
+	timeout = MS_TIMER + _WIFI_VCO_WAIT;
+	while (((long)(MS_TIMER-timeout)) < 0) {
+      if (!(_wc_read32(NCGS0R) & _WIFI_STAT_LOCK)) {
+      	return 0;
+      }
+	}
+	return 1;
+}
+
+
+/*** BeginHeader _wifi_link_led */
+int _wifi_link_led(int led_cntrl);
+/*** EndHeader */
+
+_wifig_nodebug
+_wifi_link_led(int led_cntrl)
+{
+	if(led_cntrl)
+    	_wc_or8(NCRSSI1R, _WIFI_LED_LINK);		// turn on link LED
+   else
+	   _wc_and8(NCRSSI1R, ~_WIFI_LED_LINK);	// turn off link LED
+
+}
+
+
+
+/*** BeginHeader */
+#endif /* __WIFI_MAC_HW_LIB */
+/*** EndHeader */
+

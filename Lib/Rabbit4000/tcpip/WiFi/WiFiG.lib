@@ -1,0 +1,1311 @@
+/*
+ *    WiFiG.lib
+ *    Copyright (C) 2006 Rabbit Semiconductor. All rights reserved.
+ *
+ *    Packet driver functions for the Rabbit 5000 on-chip 802.11g WiFi.
+ *
+ *
+ */
+
+/*** BeginHeader _WiFiGController */
+#ifndef __WIFIG_LIB
+#define __WIFIG_LIB
+
+#define ETH_ALEN	6
+
+
+// global defines
+#ifdef WIFIG_DEBUG
+   #define _wifig_nodebug __debug
+#else
+   #define _wifig_nodebug __nodebug
+#endif
+
+// Using a WiFi packet driver.  Define to number of NICs.  Leave this at '1' for now.
+#ifdef USING_WIFIG
+	#undef USING_WIFIG
+#endif
+#define USING_WIFIG 1
+
+#if CPU_ID_MASK(_CPU_ID_) == R5000
+	// Rabbit 5000 requires silky smooth wifi DAC
+	#define _WIFI_SILKEN_DAC 1
+#else
+	#define _WIFI_SILKEN_DAC 0
+#endif
+
+#ifdef WIFIG_DEBUG_SILKEN_DAC
+	#define _WIFI_SILKEN_DAC_DEBUG
+#endif
+
+#ifndef WIFIG_NET_IP
+   // Interrupt priority for network port C.  This is also used for the DMA transfer priority.
+   #define WIFIG_NET_IP   1
+#endif
+
+#ifndef PKT_POOL_IPSET
+   #define PKT_POOL_IPSET WIFIG_NET_IP
+#endif
+
+#if PKT_POOL_IPSET < WIFIG_NET_IP
+   #error "PKT_POOL_IPSET must be >= WIFIG_NET_IP"
+#endif
+
+#ifndef WIFIG_RXCHAN
+   #define WIFIG_RXCHAN   6
+#endif
+#ifndef WIFIG_TXCHAN
+   #define WIFIG_TXCHAN   7
+#endif
+
+/* ***************************************************************************/
+// a struct describing the current WiFiG configuration
+typedef struct {
+   const NetControllerDevice * ncd;
+   word  iface;         // Interface number
+   char  txchannel;     // Transmit DMA channel number (0-7), not equal to
+   							// receive DMA
+   char  rxchannel;     // Receive DMA channel number (0-7)
+   char  hwa[6];        // Shadow copy of current MAC address
+} _WiFiGConfig;
+
+extern _WiFiGConfig  _wifig_conf[USING_WIFIG];  // Instance of _WiFiGConfig in
+																// use by the driver
+
+extern const NetControllerDevice _WiFiGController;
+
+// These macros are used by net.lib to properly initialize all instances.  Each
+// macro is a C initializer (with trailing comma if not null).  First element
+// points to NetControllerDevice, second is a void pointer which points to the
+// specific state structure for the instance, third field is instance number.
+#define WIFIG_TABLE1  { &_WiFiGController, (void *)_wifig_conf, 0 },
+#define WIFIG_TABLE2
+
+#use "wifi_mac.lib"
+
+extern word _wifi_macms;
+// This is set to IF_COMING_DOWN to request power-down,
+// IF_COMING_UP to request power-up,
+// IF_UP or IF_DOWN for no change (and indicate current stable state).
+extern word _wifi_powerstate_req;
+
+// _WIFI_DUTYCYCLE should be defined to the maximum number of milliseconds
+// (out of each time bin of _WIFI_BINSIZE ms) that PSK/CCK packets may be
+// transmitted at within 3dB of the max tx power.
+// Normally, _WIFI_DUTYCYCLE should be set to 50, and then _WIFI_BINSIZE
+// will default to 100.  This is the standard condition for FCC testing.
+#ifdef _WIFI_DUTYCYCLE
+	#ifndef _WIFI_BINSIZE
+		// Duty cycle is a fraction _WIFI_DUTYCYCLE/_WIFI_BINSIZE
+		#define _WIFI_BINSIZE (_WIFI_DUTYCYCLE * 2)	// Default to 50% duty
+	#endif
+extern unsigned long _wifi_pskcck_us;
+extern unsigned long _wifi_last_timebin;
+extern __far WiFiMacQueue _wifi_suspended;
+
+#endif
+
+
+/*** EndHeader */
+
+_WiFiGConfig  _wifig_conf[USING_WIFIG]; // Instance of _WiFiGConfig in use by
+													 // the driver
+
+word _wifi_macms;
+word _wifi_powerstate_req;
+#ifdef _WIFI_DUTYCYCLE
+unsigned long _wifi_pskcck_us;
+unsigned long _wifi_last_timebin;
+__far WiFiMacQueue _wifi_suspended;
+#endif
+
+
+// Pointer to this is stored in IFTEntry.ncd field - basically, pointers to
+// specific driver functions.
+const NetControllerDevice _WiFiGController =
+{
+   sizeof(_WiFiGConfig)		// sizeof_state
+  ,NCD_POLL                // flags (needs polling to drive wifi mac)
+  ,6                       // sizeof_hwa
+  ,USING_WIFIG					// instances
+  ,wifig_receive				// receive()
+	#pragma nowarn warns
+  ,wifig_sendpacket			// sendpacket()
+	#pragma nowarn warns
+  ,wifig_ioctl					// ioctl()
+#ifdef PKTDRV_VERBOSE
+	#pragma nowarn warns
+  ,wifig_prt_nicreg			// prtregs()
+#else
+	#pragma nowarn warns
+  ,NULL
+#endif
+	#pragma nowarn warns
+  ,wifig_ifctl					// ifctl()
+	#pragma nowarn warns
+};
+
+/*** BeginHeader wifig_resetinterface */
+int wifig_resetinterface(_WiFiGConfig * nic, word instance, int iface);
+/*** EndHeader */
+
+static const _WiFiGConfig _wifig_config[USING_WIFIG] =
+{
+   {
+   	&_WiFiGController      		// ncd
+     ,0                          // iface
+     ,WIFIG_TXCHAN           		// txchannel
+     ,WIFIG_RXCHAN           		// rxchannel
+   }
+};
+
+_wifig_nodebug
+int wln_set_params (void)
+{
+	auto wln_params *p;
+
+	p = &_wifi_macParams;
+
+	// Set default values
+	if (p->authen == 0)
+		p->authen = WLN_AUTH_OPEN;
+	if (p->encrypt == 0)
+		p->encrypt = WLN_ENCR_ANY;
+#ifdef WPA_USE_EAP
+	if (p->eap_methods == 0)
+		p->eap_methods = WLN_EAP_ANY;
+#endif
+	if (p->chan_mask == 0)
+		p->chan_mask = WLN_CHANMASK_ALL;
+	if (p->tx_rate <= 0)
+		p->tx_rate = 540;
+	if (p->rts_thresh <= 0)
+		p->rts_thresh = 2347;
+
+	if (p->frag_thresh <= 0 || p->frag_thresh > _WIFI_DATA_SIZE+_WIFI_BUF_SIZE)
+		p->frag_thresh = _WIFI_DATA_SIZE+_WIFI_BUF_SIZE;
+	else if (p->frag_thresh < 256)
+		p->frag_thresh = 256;
+	p->frag_thresh &= ~1; // make even
+
+#ifndef WIFI_USE_WPA
+	p->encrypt &= ~WLN_ENCR_TKIP;
+#endif
+#ifndef WIFI_AES_ENABLED
+	p->encrypt &= ~WLN_ENCR_CCMP;
+#endif
+
+	return WLN_SUCCESS;
+
+}
+
+__nodebug
+void _wifi_disable_exit(void)
+{
+	// This is an atexit() function to make sure wifi interrupts
+	// don't do any damage after exit().
+	_WIFI_DISABLE();
+}
+
+_wifig_nodebug __nouseix
+int wifig_resetinterface(_WiFiGConfig * nic, word instance, int iface)
+{
+	static int first_time = 1;
+	auto int i, j;
+#ifdef _WIFI_DUTYCYCLE
+	auto unsigned long t;
+#endif
+
+   if (instance >= USING_WIFIG)
+      return -6;  // No such instance
+
+   memcpy(nic, _wifig_config + instance, sizeof(*nic));
+   nic->iface = iface;
+
+
+   // Clear the _wifi_macParams structure
+   memset(&_wifi_macParams, 0, sizeof(_wifi_macParams));
+	wln_set_params ();
+
+#ifdef _WIFI_DUTYCYCLE
+	_wifi_pskcck_us = 0;
+	t = MS_TIMER;
+	_wifi_last_timebin = t - t % _WIFI_BINSIZE;
+	_f_memset(&_wifi_suspended, 0, sizeof(_wifi_suspended));
+#endif
+
+   /*
+    * Setup the NIC address
+    */
+   j = 0;
+   for (i=0; i<6; i++) {
+      nic->hwa[i] = SysIDBlock.macAddr[i];
+      _wifi_macParams.sta_addr[i] = SysIDBlock.macAddr[i];
+      j |= nic->hwa[i];
+   }
+
+   // is ID block's MAC address zero?
+   if (!j) {
+      exception(-ERR_INVALIDMACADDR);
+      return -5;
+   }
+
+	if (first_time) {
+   	atexit(_wifi_disable_exit);
+   	first_time = 0;
+   }
+
+	// Initialize the hardware
+   if (_wifi_MacInit() != _WIFI_ERR_OK) {
+   	return 1;
+   }
+
+#ifdef WIFI_USE_WPA
+	wpa_supplicant_init(nic, &_wifi_macParams);
+#endif
+
+	_wifi_macms = _SET_SHORT_TIMEOUT(10);
+	_wifi_powerstate_req = IF_UP;	// Assume no power state change, and power ON
+	_wifi_isr_enabled = 1;
+	_WIFI_ENABLE (1);
+
+   // return success!
+   return 0;
+}
+
+/*** BeginHeader wifig_receive */
+int wifig_receive(_WiFiGConfig * nic);
+/*** EndHeader */
+
+_wifig_nodebug
+int wifig_receive(_WiFiGConfig * nic)
+{
+	auto int level;
+	auto __far WiFiMacBuffer *buf;
+
+#ifdef _WIFI_DUTYCYCLE
+	auto unsigned long t;
+#endif
+
+	// Return immediately if the WiFi ISR is not initialized,
+	//  or is disabled and no power state change is requested.
+	if (!_wifi_isr_initialized ||
+	    (!_wifi_isr_enabled &&
+	     (IF_DOWN == _wifi_powerstate_req || IF_UP == _wifi_powerstate_req)))
+	{
+		return 1;
+	}
+
+#ifdef _WIFI_DUTYCYCLE
+	// Reset transmit time counter at start of each time bin
+	t = MS_TIMER;
+	t = t - t % _WIFI_BINSIZE;
+	if (t != _wifi_last_timebin) {
+		_wifi_last_timebin = t;
+		if (_wifi_pskcck_us > _WIFI_BINSIZE*1000uL)
+			_wifi_pskcck_us -= _WIFI_BINSIZE*1000uL;
+		else
+			_wifi_pskcck_us = 0;
+	}
+	level = _WIFI_DISABLE();
+	// Start sending any suspended tx data
+	if (_wifi_txState == _WIFI_ST_IDLE)
+		_wifi_SendQueue();
+	_WIFI_ENABLE (level);
+#endif
+
+	// Process the receive queue only when the WiFi ISR is enabled.
+	while (_wifi_isr_enabled)
+	{
+		level = _WIFI_DISABLE();
+		_WIFI_RXQ_GET (buf);
+		if (!buf)
+		{
+			break;
+		}
+		_wifi_RecvFrame(buf);
+		_WIFI_ENABLE (level);
+	}
+
+	// If the current power state does not match the requested state,
+	//  attempt to complete the change of power state when safe to do so.
+	switch (_wifi_powerstate_req)
+	{
+	case IF_COMING_DOWN:									// want power down
+		if (IF_DOWN == ifpending(nic->iface) &&	// interface is down (to app)
+		    _wc_IsLogicPowered())						// but hardware is powered up
+		{
+#ifdef WIFIG_VERBOSE_POWERSTATE
+			printf("wifig: bringing power down now\n");
+#endif
+			_wifig_powerdown(nic);						// does _WIFI_DISABLE() for us
+			level = 0;										// . . . so we don't re-enable
+			// NOTE: We deliberately do not re-enable the WiFi ISR here,
+			//       since powering down causes random interrupts.
+		}
+#ifdef WIFIG_VERBOSE_POWERSTATE
+		else
+		{
+			// Logic is already powered down, this shouldn't happen!
+			printf("wifig: was already powered down?\n");
+		}
+#endif
+		_wifi_powerstate_req = IF_DOWN;
+		break;
+	case IF_COMING_UP:									// want power up
+		if (!_wc_IsLogicPowered())						// but hardware is powered down
+		{
+#ifdef WIFIG_VERBOSE_POWERSTATE
+			printf("wifig: bringing power up now\n");
+#endif
+			_wifig_powerup(nic);							// does _WIFI_ENABLE(1) for us
+			level = 0;										// . . . so we don't do it again
+			// a slight delay after power-up before driving the MAC state machine
+			_wifi_macms = _SET_SHORT_TIMEOUT(20);
+		}
+#ifdef WIFIG_VERBOSE_POWERSTATE
+		else
+		{
+			// Logic is already powered up, this shouldn't happen!
+			printf("wifig: was already powered up?\n");
+		}
+#endif
+		_wifi_powerstate_req = IF_UP;
+	default:
+		break;
+	}
+
+	if (level)
+	{
+		_WIFI_ENABLE (level);
+	}
+
+	// skip MAC, WPA processing if WiFi interface is down or its ISR is disabled
+	if (/*IF_DOWN != ifpending(nic->iface) && */_wifi_isr_enabled)
+	{
+		// drive the MAC state machine according to its schedule
+		if (_CHK_SHORT_TIMEOUT(_wifi_macms))
+		{
+			_wifi_macms = (word) _wifi_MacTimer();
+			_wifi_macms = _SET_SHORT_TIMEOUT(_wifi_macms);
+		}
+
+#ifdef WIFI_USE_WPA
+ #ifdef WPA_USE_EAP
+  #ifndef WPA_EAP_BLOCKING
+		if (!_eapol_cop_busy) {
+			_eapol_cop_busy = 1;
+  #endif
+ #endif
+		eloop_run();
+ #ifdef WPA_USE_EAP
+  #ifndef WPA_EAP_BLOCKING
+			_eapol_cop_busy = 0;
+		}
+		else
+			_eapol_proc_cop(NULL);
+  #endif
+ #endif
+#endif
+
+	}
+
+	return 1;
+}
+
+/*** BeginHeader wifig_sendpacket */
+int wifig_sendpacket(_WiFiGConfig * nic, ll_Gather * g);
+/*** EndHeader */
+
+_wifig_nodebug
+int __wifig_sendpacket(_WiFiGConfig * nic, ll_Gather * g)
+{
+	// g->data1 points to "Ethernet" (14 byte) header possibly followed by more
+	// root data.
+	// g->data2/3 are far pointers to possible extra data.
+	// DEVIDEA: currently, we copy the data to make it contiguous.  This is
+	// inefficient, so it should be fixed (but this will be complex because of
+	// the requirements for encryption etc.)
+#ifdef _WIFI_USING_TKIP
+	auto MichaelState s;
+	auto TkipKey __far *key;
+#endif
+	auto char coda[10+8];	// Space for max padding (10) plus Michael MIC (8)
+	auto word coda_len;		// Actual length of coda
+	auto __far WiFiMacBuffer *sbuf;
+	auto __far WiFiMacBuffer *buf;
+	auto const WiFiMacCipher *cipher;
+	auto MacAddr dsti;
+	auto int fragSize;
+	auto int frag;
+	auto int i;
+   auto uint8 __far *body;
+   auto int length;
+	auto WiFiSeqControlU squ;
+   auto WiFiLLC_SNAP __far *ls;
+   auto MacAddr * dst;
+   auto int epType;
+   auto uint8 __far *data;
+   auto int datasize;
+   auto int sect;
+   auto int direct_group;
+   auto word sectlen, togo, frag_thresh;
+   auto word N_frags;	// Number of non-final fragments
+#if _WIFI_SILKEN_DAC
+	auto int smooth;
+	auto word silk_T, silk_L;
+	auto int rate;
+#endif
+
+	// Drop data frame if not associated
+	if (_wifi_staState != _WIFI_SS_ASSOC)
+	{
+		_wifi_macStats.txDropAssoc++;
+		return _WIFI_ERR_ASSOC;
+	}
+
+	// Owing to the magic of SNAP, we can replace the source address field of the
+	// Ethernet header in-place, with the (constant) 1st 6 bytes of the SNAP header.
+	// The dest address and type field remain untouched.
+	_f_memcpy(g->data1 + 6, &_wifi_llc_snap, 6);
+
+	// Development note: this copy required until vantive 25911 fixed.
+	_f_memcpy(&dsti, g->data1, sizeof(dsti));
+	//dst = (far MacAddr *)g->data1;		<-- this is what we really want, and lose dsti!
+	dst = &dsti;
+
+	epType = *(int __far *)(g->data1 + 12);
+	data = (uint8 __far *)(g->data1 + 6);
+	sectlen = g->len1 - 6;	// Don't count the dest addr ethernet field, but include the
+									// SNAP header which we just set.
+	datasize = sectlen + g->len2 + g->len3;
+	coda_len = 0;
+
+	// Determine if group address in addr1 MAC header field.
+	direct_group = _WIFI_IS_GROUP_ADDR (*dst) && (_wifi_macStatus.bss_caps & _WIFI_CAP_IBSS);
+
+#if _WIFI_SILKEN_DAC
+	_wifi_GetTxRates(0, direct_group, &rate);
+	// Set smoothing if rate will be 5.5 or 11Mbit.
+	smooth = _wifi_rateInfo[rate].bps == 11 || _wifi_rateInfo[rate].bps == 22;
+#endif
+
+	// Decide which encryption cipher to use
+	// Don't encrypt 802.1x (EAPOL) frames if no pairwise key
+	if (epType == _WIFI_EP_8021X && _wifi_pairCipher == NULL)
+		cipher = &_wifi_openCipher;
+	// No pair key, or ad-hoc broadcast
+	else if (_wifi_pairCipher == NULL || direct_group)
+		cipher = _wifi_groupCipher;
+	else
+		cipher = _wifi_pairCipher;
+
+	if (cipher == NULL)
+		return _WIFI_ERR_ENCRYPT;
+
+	fragSize = frag_thresh = _wifi_macParams.frag_thresh;
+
+	// Adjust MSDU payload length for Michael MIC if using TKIP.
+	datasize += cipher->perMSDU_add;
+
+	// Assume 0 non-final fragments
+	N_frags = 0;
+
+#if _WIFI_SILKEN_DAC
+	// Determine frame size adjustment factors, and work out a suitable
+	// fragmentation size, and pad packet appropriately.
+	if (smooth) {
+		silk_T = cipher->perMPDU_add;
+		silk_L = datasize;
+		if (silk_L + silk_T > frag_thresh) {
+			// Data payload length of non-final fragments
+			fragSize = (_wifi_maxFragSize / 11) * 11 - silk_T;
+			N_frags = silk_L / fragSize;
+			// length of final fragment
+			silk_L -= N_frags * fragSize;
+			if (!silk_L) {
+				// Divides exactly, so bump it
+				--N_frags;
+				silk_L = fragSize;
+			}
+			if (N_frags >= _WIFI_MAX_FRAGS)
+				return _WIFI_ERR_SIZE;
+		}
+		// Now silk_L is length of last (or only) fragment, which we need to pad.
+		// Pad bytes = (11 - (L + T) mod 11) mod 11
+		coda_len = 11 - (silk_L + silk_T) % 11;
+		if (coda_len == 11)
+			coda_len = 0;
+		// Add padding to 4th section (coda).  Pad with zeros (hopefully least
+		// likely to cause problems with bad implementations).
+		memset(coda, 0, coda_len);
+		datasize += coda_len;
+	}
+	else {
+#endif
+
+	   // Fragment directed frames, all frames sent to AP
+	   if ((datasize + cipher->perMPDU_add) > frag_thresh &&
+	      !direct_group)
+	   {
+	      fragSize = _wifi_maxFragSize - cipher->perMPDU_add;
+	      N_frags = datasize / fragSize;
+	      if (N_frags * fragSize == datasize)
+	      	--N_frags;
+	      if (N_frags >= _WIFI_MAX_FRAGS)
+	         return _WIFI_ERR_SIZE;
+	   }
+	   else
+	   {
+	      fragSize = _WIFI_BUF_SIZE;
+	      if (datasize > fragSize)
+	         return _WIFI_ERR_SIZE;
+	   }
+
+#if _WIFI_SILKEN_DAC
+	}
+#endif
+
+#ifdef _WIFI_USING_TKIP
+	// Add message integrity check.  Since TKIP is a hack anyway, we in-line
+	// the algorithm here.  More efficient than doing it after fragmentation,
+	// and simplifies the fragment length and padding calculations.
+	if (cipher->is_TKIP) {
+
+	   key = &tkip_keys[tkip_txKeyID];
+
+	   // Drop non-802.1x data frames if tkip_blocking mode
+	   if (!key->valid ||
+	       tkip_blocking && epType != _WIFI_EP_8021X)
+         return _WIFI_ERR_ENCRYPT;
+
+	   // Initialize MIC from header fields
+	   MichaelInit (&s, &key->key[16], (__far uint8 *)dst, _wifi_macParams.sta_addr);
+	   // Note the inclusion of the SNAP header which preceeds the payload
+   	MichaelUpdate (&s, data, sectlen);
+   	if (g->len2)
+   		MichaelUpdate (&s, (char __far *)g->data2, g->len2);
+   	if (g->len3)
+   		MichaelUpdate (&s, (char __far *)g->data3, g->len3);
+   	if (coda_len)
+   		MichaelUpdate (&s, coda, coda_len);
+
+	   // Add MIC to coda
+	   MichaelFinal  (&s, coda + coda_len);
+	   coda_len += _WIFI_MIC_SIZE;
+
+	   // Make sure all frames in MSDU use the same upper TSC, by seeing if there
+	   // will be an overflow and, if so, setting txTSCO so it will start at
+	   // zero for the 1st fragment.
+	   if ((longword)key->txTSC0 + (N_frags+1) >= 0xffffuL)
+	      key->txTSC0 = 0xffff;
+
+	}
+#endif
+
+	// Allocate a buffer for each fragment
+	sbuf = NULL;
+	for (i = 0; i <= N_frags; ++i)
+	{
+		buf = _wifi_GetBuffer();
+		if (buf == NULL)
+		{
+      #if WIFIG_VERBOSE
+			printf("__wifig_sendpacket: Could not allocate buffer for frag %u of %u\n",
+						i+1, N_frags+1);
+		#endif
+			_wifi_FreeBuffers (sbuf);
+			return _WIFI_ERR_MEMORY;
+		}
+
+		// Add to buffer list
+		buf->next = sbuf;
+		sbuf = buf;
+	}
+
+	// Set MAC header fields on first fragment
+	sbuf->macHdr.fc.type = _WIFI_TYPE_DATA;
+	_WIFI_SET_ADDR (sbuf->macHdr.addr2, _wifi_macParams.sta_addr);
+	if (_wifi_macStatus.bss_caps & _WIFI_CAP_ESS)
+	{
+		sbuf->macHdr.fc.flags |= _WIFI_FCNTRL_TODS;
+		_WIFI_SET_ADDR (sbuf->macHdr.addr1, _wifi_macStatus.bss_addr);
+		_WIFI_SET_ADDR (sbuf->macHdr.addr3, *dst);
+	}
+	else
+	{
+		_WIFI_SET_ADDR (sbuf->macHdr.addr1, *dst);
+		_WIFI_SET_ADDR (sbuf->macHdr.addr3, _wifi_macStatus.bss_addr);
+	}
+
+	// Prepare each fragment
+	frag = 0;
+	sect = 0;
+	for (buf = sbuf; buf; buf = buf->next)
+	{
+		body = buf->body + cipher->ivSize;
+		length = datasize;
+
+		// Limit length to fragment size
+		if (length > fragSize)
+			length = fragSize;
+		buf->length = length + _WIFI_DATA_SIZE;
+
+		// Copy MAC header from first fragment
+		if (frag > 0)
+			buf->macHdr = sbuf->macHdr;
+
+		// Set fragment fields
+		buf->macHdr.squ.sq.info = frag;
+      if (buf->next)
+			buf->macHdr.fc.flags |= _WIFI_FCNTRL_MOREFRAG;
+      else
+			buf->macHdr.fc.flags &= ~_WIFI_FCNTRL_MOREFRAG;
+
+		// Copy data to fragment
+		//  body -> where to copy to
+		//  length = length of this fragment
+		//  sect = 0,1,2,3 (source section)
+		//  sectlen = remaining data in this section
+		//  data -> source data
+		//  togo = remaining length in this fragment
+		togo = length;
+		while (sectlen < togo) {
+			_f_memcpy (body + (length-togo), data, sectlen);
+			togo -= sectlen;
+
+			switch (sect) {
+			case 0:
+				sect = 1;
+				sectlen = g->len2;
+				data = (uint8 __far *)g->data2;
+				if (sectlen)
+					break;
+			case 1:
+				sect = 2;
+				sectlen = g->len3;
+				data = (uint8 __far *)g->data3;
+				if (sectlen)
+					break;
+			case 2:
+				sect = 3;
+				sectlen = coda_len;
+				data = coda;
+				break;
+			}
+		}
+		// Now sectlen >= togo
+
+      _f_memcpy (body + (length-togo), data, togo);
+      data += togo;
+      datasize -= length;
+      sectlen -= togo;
+      frag++;
+	}
+
+	// Encrypt each fragment after headers and MIC are set
+	for (buf = sbuf; buf; buf = buf->next) {
+		if (!cipher->Encrypt (buf))
+		{
+			_wifi_FreeBuffers (sbuf);
+			return _WIFI_ERR_ENCRYPT;
+		}
+	}
+
+	// Done with frame, set new pair cipher
+	_wifi_pairCipher = _wifi_newPairCipher;
+
+	// Note that the dst parameter is only used for management frames, which
+	// is not the case here, but we need to pass something.
+	_wifi_SendFrames (sbuf, *dst);
+	return _WIFI_ERR_OK;
+}
+
+_wifig_nodebug
+int wifig_sendpacket(_WiFiGConfig * nic, ll_Gather * g)
+{
+	auto int level, rc;
+
+	level = _WIFI_DISABLE();
+	rc = __wifig_sendpacket(nic, g);
+	_WIFI_ENABLE(level);
+	return rc;
+}
+
+/*** BeginHeader wifig_ioctl */
+int wifig_ioctl(_WiFiGConfig * nic, int cmd, ...);
+/*** EndHeader */
+
+_wifig_nodebug
+int wifig_ioctl(_WiFiGConfig * nic, int cmd, ...)
+{
+   auto char * stack;
+
+   stack = (char *)(&cmd + 1);
+   switch (cmd) {
+   case PD_HASFEATURE:
+      cmd = *(int *)stack;
+      return cmd >= PD_HASFEATURE && cmd <=
+        #ifdef USE_MULTICAST
+            PD_REMOVEMULTICAST
+        #else
+            PD_GETHWA
+        #endif
+        ;
+   case PD_INITIALIZE:
+      return wifig_resetinterface(nic, *(word *)stack,
+                                  *(int *)(stack+sizeof(word)));
+   case PD_HAVELINK:
+      return wifig_havelink(nic);
+   case PD_POWER:
+      if (*(int *)stack)
+         return wifig_powerup(nic);
+      else
+         return wifig_powerdown(nic);
+   case PD_POWERSTATUS:
+   	return _wifi_powerstate_req;
+   case PD_SETHWA:
+      wifig_sethwaddr(nic, *(char **)stack);
+      break;
+   case PD_GETHWA:
+      **(char ***)stack = nic->hwa;
+      return sizeof(nic->hwa);
+#ifdef USE_MULTICAST
+   case PD_ADDMULTICAST:
+      return wifig_addmulticast(nic, *(char **)stack,
+                                *(int **)(stack + sizeof(char *)));
+   case PD_REMOVEMULTICAST:
+      return wifig_removemulticast(nic, *(char **)stack);
+#endif
+	}
+   return 0;
+}
+
+/*** BeginHeader wifig_powerdown, _wifig_powerdown */
+int wifig_powerdown(_WiFiGConfig * nic);
+int _wifig_powerdown(_WiFiGConfig * nic);
+
+// General control register bits
+#define	GEN_TXFIFOEMPTY	0x00004000		// Transmit FIFO empty
+#define	GEN_RXEN		0x00000001				// Receive enable
+
+// Baseband control registers
+#define	HW_VERSION		0x0000		// Version
+#define	HW_GEN_CONTROL	0x0004		// General control
+#define	HW_GEN_STATUS	0x0008		// General status
+#define	HW_RSSI_AES		0x000c		// RSSI and AES status
+#define	HW_INTR_MASK	0x0010		// Interrupt mask
+#define  HW_SPI_CTRL    0x001C		// RF SPI control
+#define  HW_OUT_CTRL    0x003C   	// Output control
+#define	HW_AES_MODE		0x0038		// AES mode
+#define  HW_CONF1       0x0028		// Configuration 1
+#define  HW_CONF2       0x002C		// Configuration 2
+#define	HW_INTR_STATUS	0x0014		// Interrupt status
+
+// MAC control registers
+#define	HW_MAC_CONTROL	0x0064		// MAC control (8 bits)
+
+#ifndef WIFI_TX_TIMEOUT
+#define WIFI_TX_TIMEOUT 50
+#endif
+
+/*** EndHeader */
+
+_wifig_nodebug
+int wifig_powerdown(_WiFiGConfig * nic)
+{
+	// The normal API just sets a flag.  We need to defer actual
+	// powerdown until it is safe to do so, and the network layer
+	// has been shut down cleanly (ifdown()).
+#ifdef WIFIG_VERBOSE_POWERSTATE
+   printf("wifig: requesting power down\n");
+#endif
+	if (_wifi_powerstate_req == IF_UP)
+		_wifi_powerstate_req = IF_COMING_DOWN;
+	else if (_wifi_powerstate_req != IF_COMING_DOWN) {
+#ifdef WIFIG_VERBOSE_POWERSTATE
+   	printf("... was down or pending up\n");
+#endif
+		_wifi_powerstate_req = IF_DOWN;
+	}
+	return 0;
+}
+
+_wifig_nodebug
+int _wifig_powerdown(_WiFiGConfig * nic)
+{
+	unsigned long timeout;
+
+   // Disable RX
+	_wc_write32(HW_GEN_CONTROL,  (_wc_read32(HW_GEN_CONTROL) & ~GEN_RXEN));
+
+
+   // Clear TX hold bit if it set
+   if(_wc_read32(HW_GEN_CONTROL) & 0x00000008)
+   	_wc_write32(HW_GEN_CONTROL,  (_wc_read32(HW_GEN_CONTROL) & ~0x00000008));
+
+   timeout=MS_TIMER+WIFI_TX_TIMEOUT;
+   	//wait for AES not busy status
+   while (_wc_read32(HW_RSSI_AES) & _WIFI_AES_BUSY)
+   {
+   	if((long) (MS_TIMER-timeout) >= 0)
+      {
+      	#ifdef TX_TIMEOUT_VERBOSE
+         printf(" !!! TX Timeout occurred !!!\n");
+         #endif
+         break;
+
+      }
+   }
+   timeout=MS_TIMER+WIFI_TX_TIMEOUT;
+   //wait for tx fifo empty
+   while ((_wc_read32(HW_GEN_CONTROL) & _WIFI_GEN_TXFIFOEMPTY) == 0)
+   {
+   	if((long) (MS_TIMER-timeout) >= 0)
+      {
+      	#ifdef TX_TIMEOUT_VERBOSE
+         printf(" !!! TX Timeout occurred !!!\n");
+            #endif
+         	break;
+      }
+   }
+	// This MUST be called with interrupts disabled, and all states idle.
+	// NOT a user API!
+	_WIFI_DISABLE();
+	_wifi_isr_enabled = 0;
+#ifdef RABBIT_EARS
+	WrPortI(NAPCR, &NAPCRShadow, RdPortI(NAPCR) & ~0x10);
+	_wifi_MacShutdown();
+	// Pull down PROGB and INITB on FPGA - should draw minimum current
+	WrPortI(NAPCR, &NAPCRShadow, RdPortI(NAPCR) & ~0x0C);
+#else
+	_wifi_MacShutdown();
+	_wifi_link_led(0);
+	// clear port enable bit and interrupt bits
+	WrPortI(ENPR, NULL, RdPortI(ENPR) & ~0x83);
+#endif
+
+   return 0;   // return success
+}
+
+/*** BeginHeader wifig_powerup, _wifig_powerup */
+int wifig_powerup(_WiFiGConfig * nic);
+int _wifig_powerup(_WiFiGConfig * nic);
+/*** EndHeader */
+
+_wifig_nodebug
+int wifig_powerup(_WiFiGConfig * nic)
+{
+#ifdef WIFIG_VERBOSE_POWERSTATE
+   printf("wifig: requesting power up\n");
+#endif
+	if (_wifi_powerstate_req == IF_DOWN)
+		_wifi_powerstate_req = IF_COMING_UP;
+	else if (_wifi_powerstate_req != IF_COMING_UP) {
+#ifdef WIFIG_VERBOSE_POWERSTATE
+   	printf("... was up or pending down\n");
+#endif
+		_wifi_powerstate_req = IF_UP;
+	}
+	return 0;
+}
+
+_wifig_nodebug
+int _wifig_powerup(_WiFiGConfig * nic)
+{
+	wifig_resetinterface(nic, 0, nic->iface);
+	return 0; // success!
+}
+
+/*** BeginHeader wifig_addmulticast */
+int wifig_addmulticast(_WiFiGConfig * nic, char* EthAddress, int* slot);
+/*** EndHeader */
+
+_wifig_nodebug
+int wifig_addmulticast(_WiFiGConfig * nic, char* EthAddress, int* slot)
+{
+	// The WiFi device does not have any special features for filtering
+	// multicast frames.
+	return 0;
+}
+
+/*** BeginHeader wifig_removemulticast */
+int wifig_removemulticast(_WiFiGConfig * nic, char* EthAddress);
+/*** EndHeader */
+
+_wifig_nodebug
+int wifig_removemulticast(_WiFiGConfig * nic, char* EthAddress)
+{
+	// The WiFi device does not have any special features for filtering
+	// multicast frames.
+	return 0;
+}
+
+/*** BeginHeader wifig_havelink */
+int wifig_havelink(_WiFiGConfig * nic);
+/*** EndHeader */
+
+_wifig_nodebug
+int wifig_havelink(_WiFiGConfig * nic)
+{
+	return _wifi_macStatus.link;
+}
+
+/*** BeginHeader wifig_sethwaddr */
+void wifig_sethwaddr(_WiFiGConfig * nic, char* hwa);
+/*** EndHeader */
+
+_wifig_nodebug
+void wifig_sethwaddr(_WiFiGConfig *  nic, char* hwa)
+{
+   memcpy(nic->hwa, hwa, sizeof(nic->hwa));  // Keep shadow copy
+   memcpy(_wifi_macParams.sta_addr, hwa, sizeof(nic->hwa));  // Keep shadow copy
+	_wc_HWMemcpy(NCSTAID0R, _wifi_macParams.sta_addr, WLN_ADDR_SIZE);
+}
+
+/*** BeginHeader wifig_ifctl */
+int wifig_ifctl(_WiFiGConfig * nic, int up, int change);
+/*** EndHeader */
+
+int _wifi_pend_change;
+
+_wifig_nodebug
+int wifig_ifctl(_WiFiGConfig * nic, int up, int change)
+{
+	static int _wifi_txState_old;
+	#GLOBAL_INIT { _wifi_pend_change = 0; }
+
+#ifdef _COPROCESS_H
+  #ifdef WPA_USE_EAP
+	#ifndef WPA_EAP_BLOCKING
+		if ((change || _wifi_pend_change) && _eapol_cop_busy) {
+			// If currently performing non-blocking RSA (or other processing where
+			// the library has temporarily yielded back to the application), it
+			// would severely break things if we called the termination
+			// routines.  Thus, wait for these to complete.
+			_wifi_pend_change = 1;
+			return IFCTL_PEND;
+		}
+		if (_wifi_pend_change) {
+			change = 1;
+			_wifi_pend_change = 0;
+		}
+	#endif
+  #endif
+#endif
+
+   if (!up && change)
+   {
+#ifdef WIFI_USE_WPA
+		wpa_supplicant_terminate();
+#endif
+   	_wifi_wln_disassociate(_wifi_macStatus.bss_addr,
+		                       _WIFI_REAS_DEAUTH_LEAVING);
+      _wifi_txState_old = -1;
+      return IFCTL_PEND;
+   }
+   else if (up && change) {
+		_wifi_macParams.bss_type &= ~WLN_BSS_NONE;
+#ifdef WIFI_USE_WPA
+		wpa_supplicant_init(nic, &_wifi_macParams);
+#endif
+	}
+   else if(!up && !change && (_wifi_txState != _wifi_txState_old))
+   {
+      if(_wifi_txState == _WIFI_ST_IDLE) {
+      	_wifi_txState_old = _wifi_txState;
+			_wifi_macStatus.state = WLN_ST_STOPPED;
+			_wifi_macParams.bss_type |= WLN_BSS_NONE;
+		}
+      else
+      	return IFCTL_PEND;
+   }
+   return ifctl_ethernet(nic->iface, up, change);
+
+}
+
+/*** BeginHeader wifig_prt_nicreg */
+void wifig_prt_nicreg(_WiFiGConfig * nic);
+/*** EndHeader */
+
+void wifig_prt_nicreg(_WiFiGConfig * nic)
+{
+	auto int level;
+
+   auto word    ncIMR     // Interrupt Mask (reduced from 4 to 1 register)
+         , ncISR;     // Interrupt Status (reduced from 4 to 1 register)
+	auto uint32 ncGC0R    // General Control
+         , ncGS0R    // General Status
+         , ncRSSI0R  // RSSI
+         , ncSPID0R  // SPI Control Register
+         , ncC1R0    // Configuration 1 register
+         , ncC2R0    // Configuration 2 register
+         , ncAMR     // AES Mode (reduced from 4 to 1 register)
+         , ncOCR0    // Output Control Register
+         , ncSTAID0R // Station (STA) Identification
+         , ncSTAID4R
+         , ncBSSID0R  // BSS Identification
+         , ncBSSID4R;
+
+   auto uint16  ncV0R // Version
+          ,ncBO0R     //Backoff
+          ,ncLI0R    // Listen Interval
+          ,ncBI0R    // Beacon Interval
+          ,ncCFPMD0R // CFP MaxDuration / ATIM Period
+          ,ncRBO0R   // Remaining Backoff
+          ,ncBBO0R;   // Beacon Backoff
+
+   //8-bit registers
+   auto uint16 ncSSIDLR,    //SSID Length
+          ncDTIMPR,  //DTIM Period
+          ncCFPPR,   //CFP Period
+          ncMACSR,   // MAC Status
+          ncMACCR,   // MAC Control
+          ncBFR;     // Beacon Filter
+
+
+   level = _WIFI_DISABLE();
+
+      ncV0R = _wc_read16(NCV0R); //Version
+
+      ncGC0R = _wc_read32(NCGC0R);  // General Control
+
+      ncGS0R = _wc_read32(NCGS0R);  //General Status
+
+      ncRSSI0R = _wc_read32(NCRSSI0R);  //RSSI
+
+      ncIMR = _wc_read8(NCIMR);    // Interrupt Mask (reduced from 4 to 1 register)
+      ncISR = _wc_read8(NCISR);    // Interrupt Status (reduced from 4 to 1 register)
+
+      ncSPID0R = _wc_read32(NCSPID0R);    // SPI control register
+
+   	ncC1R0 = _wc_read32(NCC1R0);    // Configuration 1 register
+   	ncC2R0 = _wc_read32(NCC2R0);    // Configuration 2 register
+
+      ncAMR = _wc_read8(NCAMR);     // AES Mode (reduced from 4 to 1 register)
+
+      ncOCR0 = _wc_read32(NCOCR0);   // Output Control Register
+
+      ncSTAID0R = _wc_read32(NCSTAID0R);   // Station (STA) Identification
+      ncSTAID4R = _wc_read32(NCSTAID4R);
+
+
+      ncBSSID0R = _wc_read32(NCBSSID0R);   // BSS Identification
+      ncBSSID4R = _wc_read32(NCBSSID4R);
+
+      ncSSIDLR = _wc_read8(NCSSIDLR);   // SSID Length
+
+      ncBO0R = intel16(_wc_read16(NCBO0R));  // Backoff
+
+      ncDTIMPR = _wc_read8(NCDTIMPR);  // DTIM Period
+      ncCFPPR = _wc_read8(NCCFPPR);    // CFP Period
+
+      ncLI0R = _wc_read16(NCLI0R); // Listen Interval
+
+      ncBI0R = intel16(_wc_read16(NCBI0R)); // Beacon Interval
+
+      ncCFPMD0R = intel16(_wc_read16(NCCFPMD0R));   // CFP MaxDuration / ATIM Period
+
+      ncMACSR = _wc_read8(NCMACSR);   // MAC Status
+      ncMACCR = _wc_read8(NCMACCR);   // MAC Control
+
+      ncRBO0R = intel16(_wc_read16(NCRBO0R));  // Remaining Backoff
+
+      ncBFR = _wc_read8(NCBFR);       // Beacon Filter
+      ncBBO0R = intel16(_wc_read16(NCBBO0R));   // Beacon Backoff
+
+	_WIFI_ENABLE(level);
+
+   printf("\n\n");
+   printf("===================================\n");
+   printf("|        WIFIg Registers           |\n");
+   printf("===================================\n");
+
+   printf("\nVersion reg: %x\n", ncV0R);
+
+   printf("NCGC 0x%08lx  RXEN=%d ANTDIV=%d ANTSEL=%d 5GEN=%d\n",
+   	ncGC0R,
+        ncGC0R&0x01?1:0,   //RX EN
+        ncGC0R&0x02?1:0,   //ANT DIV
+        ncGC0R&0x04?1:0,   //ANT SEL
+        ncGC0R&0x08?1:0);   //5G EN
+   printf("  SH PRE=%d RXFIFORST=%d TXFIFORST=%d TXHOLD=%d\n",
+        ncGC0R&0x10?1:0,   //SH PRE
+        ncGC0R&0x20?1:0,   //RX FIFO RST
+        ncGC0R&0x40?1:0,   //TX FIFO RST
+        ncGC0R&0x80?1:0);   //TX HOLD
+   printf("  BEACEN=%d MACEN=%d DSPEN=%d TXFIFOEMPTY=%d TXFIFOFULL=%d\n",
+        ncGC0R&0x0100?1:0, //BEAC EN
+        ncGC0R&0x0200?1:0, //MAC EN
+        ncGC0R&0x0400?1:0, //DSP EN
+        ncGC0R&0x4000?1:0, //TX FIFO EMPTY
+        ncGC0R&0x8000?1:0); //TX FIFO FULL
+   printf("  MAXGAIN=%u AGCDIS=%d SPIRST=%d\n",
+        (word)((ncGC0R&0x007F0000)>>16), //MAX GAIN
+        ncGC0R&0x00800000?1:0, //AGC DIS
+        ncGC0R&0x40000000?1:0 //SPI RST
+      );
+
+   printf("NCGS  0x%08lx  CS=%d RXANT=%d CRC32=%d LOCK=%d RXFE=%d SHDET=%d\n",
+   	  ncGS0R,
+        ncGS0R&0x01?1:0,   //CS
+        ncGS0R&0x02?1:0,   //RX ANT
+        ncGS0R&0x04?1:0,   //CRC32
+        ncGS0R&0x08?1:0,   //LOCK
+        ncGS0R&0x10?1:0,   //RX FE
+        ncGS0R&0x40?1:0);   //SH DET
+   printf("  BBPWR=%u SCRDIS=%d SPRDDIS=%d DLLDIS=%d CONTTX=%d DATATYPE=%d\n",
+        (word)(ncGS0R)>>8, //BB PWR
+        ncGS0R&0x00010000?1:0, //SCR DIS
+        ncGS0R&0x00020000?1:0, //SPRD DIS
+        ncGS0R&0x00040000?1:0, //DLL DIS
+        ncGS0R&0x00100000?1:0, //CONT TX
+        (word)((ncGS0R&0x00600000)>>21));   //DATA TYPE
+   printf("  DCDIS=%d RXHPSET=%d RXHPRST=%d BEN=%d AEN=%d\n",
+        ncGS0R&0x01000000?1:0, //DC DIS
+        ncGS0R&0x02000000?1:0, //RXHP SET
+        ncGS0R&0x04000000?1:0, //RXHP RST
+        ncGS0R&0x01000000?1:0, //B EN
+        ncGS0R&0x02000000?1:0 //A EN
+      );
+
+   printf("NCRSSI  0x%08lx   RSSI=%u AES EMPTY=%d AES FULL=%d AES BUSY=%d AES MIC=%d\n",
+   	  ncRSSI0R,
+        (word)(ncRSSI0R&0x7F),   //RSSI
+        ncRSSI0R&0x0100?1:0,   //AES EMPTY
+        ncRSSI0R&0x0200?1:0,   //AES FULL
+        ncRSSI0R&0x0400?1:0,   //AES BUSY
+        ncRSSI0R&0x0800?1:0   //AES MIC
+      );
+
+   printf("NCIMR  0x%02x  RXFIFO=%d TXFIFO=%d TO=%d ABORT=%d TBTT=%d ATIM=%d RX OVER=%d PKTARR=%d\n",
+   	  ncIMR,
+        ncIMR&0x01?1:0,   //RX FIFO
+        ncIMR&0x02?1:0,   //TX FIFO
+        ncIMR&0x04?1:0,   //TO
+        ncIMR&0x08?1:0,   //ABORT
+        ncIMR&0x10?1:0,   //TBTT
+        ncIMR&0x20?1:0,   //ATIM
+        ncIMR&0x40?1:0,   //RX OVER
+        ncIMR&0x80?1:0   //PKT ARRIVED
+      );
+
+   printf("NCISR  0x%02x  RXFIFO=%d TXFIFO=%d TO=%d ABORT=%d TBTT=%d ATIM=%d RX OVER=%d PKTARR=%d\n",
+   	  ncISR,
+        ncISR&0x01?1:0,   //RX FIFO
+        ncISR&0x02?1:0,   //TX FIFO
+        ncISR&0x04?1:0,   //TO
+        ncISR&0x08?1:0,   //ABORT
+        ncISR&0x10?1:0,   //TBTT
+        ncISR&0x20?1:0,   //ATIM
+        ncISR&0x40?1:0,   //RX OVER
+        ncISR&0x80?1:0   //PKT ARRIVED
+      );
+
+   printf("NCSPID  0x%08lx  SPILength=%ld CLKINV=%d ENINV=%d\n",
+   	  ncSPID0R,
+        ncSPID0R&0x1F,   //SPI Length
+        ncSPID0R&0x20?1:0,   //CLK INV
+        ncSPID0R&0x40?1:0   //EN INV
+      );
+
+   printf("NCC1  0x%08lx  DACVCM=%d DACsleep=%d DACEnQ=%d DACEnI=%d\n",
+   	  ncC1R0,
+        ncC1R0&0x01?1:0,   //DAC VCM
+        ncC1R0&0x02?1:0,   //DAC sleep
+        ncC1R0&0x04?1:0,   //DAC EnQ
+        ncC1R0&0x08?1:0);   //DAC EnI
+   printf("  ADC10Ctl=%u TXCtl=%u TConst=%u\n",
+        (word)((ncC1R0&0x1FF0)>>4), //ADC10 Ctl
+        (word)((ncC1R0&0x6000)>>13), //TX Ctl
+        (word)((ncC1R0&0x00FF0000)>>16) //Tracking Const
+      );
+
+   printf("NCC2  0x%08lx  NonlinAGC=%d Settle=%u LNADelta=%u AGCScale=%u ADCScale=%u\n",
+   	  ncC2R0,
+        ncC2R0&0x3F?1:0,       //Nonlinear AGC
+        (word)((ncC2R0&0x0003FFC0)>>6), //Settle
+        (word)((ncC2R0&0x00FC0000)>>18), //LNA Delta
+        (word)((ncC2R0&0x03000000)>>24), //AGC Scale
+        (word)((ncC2R0&0x0C000000)>>26)  //ADC Scale
+      );
+
+   printf("NCOC  0x%08lx   Bootmux=%u ACT LED=%u RXHP=%u TXOn=%u PA5G=%u PA2G=%u \n",
+   	  ncOCR0,
+        (word)(ncOCR0&0x00000003), //Bootmux
+        (word)((ncOCR0&0x0000000C)>>2), //ACT LED
+        (word)((ncOCR0&0x00000030)>>4), //RXHP
+        (word)((ncOCR0&0x000000C0)>>6), //TX On
+        (word)((ncOCR0&0x00000300)>>8), //PA 5G
+        (word)((ncOCR0&0x00000C00)>>10)); //PA 2G
+   printf("  LNA[1:0]=%u %u VGA[4:0]=%u %u %u %u %u HostInt=%u RXOn=%u\n",
+        (word)((ncOCR0&0x0000C000)>>14), //LNA[1]
+        (word)((ncOCR0&0x00003000)>>12), //LNA[0]
+        (word)((ncOCR0&0x03000000)>>24), //VGA[4]
+        (word)((ncOCR0&0x00C00000)>>22), //VGA[3]
+        (word)((ncOCR0&0x00300000)>>20), //VGA[2]
+        (word)((ncOCR0&0x000C0000)>>18), //VGA[1]
+        (word)((ncOCR0&0x00030000)>>16), //VGA[0]
+        (word)((ncOCR0&0x0C000000)>>26), //Host Int
+        (word)((ncOCR0&0x30000000)>>28)  //RX On
+      );
+
+   printf("\n=====MAC Control Registers=====\n");
+
+   printf("NCSTAID  0x%04X%08LX\n",
+			(word)ncSTAID4R,
+   	   ncSTAID0R
+        );
+
+   printf("BSSID  0x%04X%08lX\n",
+   		(word)ncBSSID4R,
+   	    ncBSSID0R
+        );
+
+   printf("SSID Length = %d\n",ncSSIDLR);
+
+   printf("Backoff = %d\n",ncBO0R);
+
+   printf("DTIM Period = %d\n",ncDTIMPR);
+
+   printf("CFP Period = %d\n",ncCFPPR);
+
+   printf("Listen Interval = %d\n",ncLI0R);
+
+   printf("Beacon Interval = %d\n",ncBI0R);
+
+   printf("CFP MaxDuration/ATIM Period = %d\n",ncCFPMD0R);
+
+
+   printf("NCMACSR  %X  DIR MSG=%d BC MSG=%d FCS=%d MAC ERR=%d\n",
+   	  ncMACSR,
+        ncMACSR&0x01?1:0, //DIR MSG
+        ncMACSR&0x02?1:0, //BC MSG
+        ncMACSR&0x04?1:0, //FCS
+        ncMACSR&0x08?1:0  //MAC ERR
+      );
+
+   printf("NCMACCR  %X  TX REQ=%d AUTO TX DISABLE=%d BEACON TX=%d PROMISC=%d IBSS=%d AES DISABLE=%d\n",
+   	  ncMACCR,
+        ncMACCR&0x01?1:0,  //TX REQ
+        ncMACCR&0x02?1:0,  //AUTO TX DISABLE
+        ncMACCR&0x04?1:0,  //BEACON TX
+        ncMACCR&0x08?1:0,  //PROMISC
+        ncMACCR&0x10?1:0,  //IBSS
+        ncMACCR&0x20?1:0   //AES DISABLE
+      );
+
+   printf("Remaining Backoff =  %d\n",ncRBO0R);
+
+   printf("Beacon Filter =  %d\n",ncBFR);
+
+   printf("Beacon Backoff =  %d\n",ncBBO0R);
+
+
+   printf("==================\n");
+}
+
+/*** BeginHeader */
+#endif /* __WIFIG_LIB */
+/*** EndHeader */
+

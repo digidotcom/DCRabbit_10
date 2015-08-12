@@ -1,0 +1,1019 @@
+//
+// Embedded 802.11 wireless network interface
+// MAC layer hardware interface
+// Copyright 2007 Rabbit Semiconductor.  All rights reserved.
+//
+// This library includes hardware-specific initialization routines and
+// other hardware-specific routines used by the rest of the WiFi driver.
+//	This also includes the entry point to the ISR.
+
+/*** BeginHeader */
+#ifndef __WIFI_MAC_HW_LIB
+#define __WIFI_MAC_HW_LIB
+
+#ifdef WIFI_USE_WPA
+	#ifndef NET_ADD_ENTROPY
+		#define NET_ADD_ENTROPY
+	#endif
+#endif
+
+/*** EndHeader */
+
+/*** BeginHeader _wifi_rxFrame, _wifi_isr_initialized, _wifi_isr_enabled */
+
+
+// Bring in the DSP and MAC assist code that must be loaded to the Rabbit 5000
+#use "wifi_common.lib"
+
+// FIFO sizes in bytes
+#define	_WIFI_HW_TX_FIFO_SIZE	(2048-256)	// 1st 256 used for fixed beacon,
+															// RTS, CTS packets
+#define	_WIFI_HW_RX_FIFO_SIZE	2048
+
+#if (_WIFI_MAX_FRAME_SIZE > _WIFI_HW_TX_FIFO_SIZE)
+#error	_WIFI_MAX_FRAME_SIZE too big
+#endif
+
+// Min fragment size to allow interrupt latency between frames
+#define	_WIFI_MIN_FRAG_SIZE	400
+
+// Size of CTS frame in FIFO
+#define	_WIFI_CTS_OVERHEAD	20
+// Max overhead per fragment (CCMP is worst case)
+#define	_WIFI_FRAG_OVERHEAD	(8+_WIFI_DATA_SIZE+_WIFI_CCMP_SIZE-_WIFI_FCS_SIZE)
+// Max fragment size to fit CTS and 2 fragments in transmit FIFO
+#define	_WIFI_MAX_FRAG_SIZE	(_WIFI_DATA_SIZE + \
+				(_WIFI_HW_TX_FIFO_SIZE-_WIFI_CTS_OVERHEAD-2*_WIFI_FRAG_OVERHEAD)/2)
+
+extern WiFiMacBuffer _wifi_rxFrame;	// Frame being received
+extern int _wifi_isr_initialized;
+
+extern int _wifi_isr_enabled;
+/*** EndHeader */
+
+
+WiFiMacBuffer _wifi_rxFrame;	// Frame being received
+
+// Keep track of whether or not the WiFi ISR has been initialized
+int _wifi_isr_initialized;
+// Keep track of the WiFi ISR's current disabled (0) vs. enabled (nonzero) state
+int _wifi_isr_enabled;
+
+
+/*** BeginHeader _wifi_SetBSS */
+void _wifi_SetBSS (int bssCaps, const MacAddr bssid, const uint8 *ssid,
+                   int ssid_len, uint16 basic, int atim);
+/*** EndHeader */
+
+//
+// Set BSS mode and IDs
+// @param bssCaps BSS capabilities, OR of CAP_xxx
+// @param bssid ID of BSS to join or start
+// @param ssid Service set ID
+// @param ssid_len Service set ID length
+// @param atim IBSS ATIM window size in TU
+//
+_wifig_nodebug
+void _wifi_SetBSS (int bssCaps, const MacAddr bssid, const uint8 *ssid,
+                   int ssid_len, uint16 basic, int atim)
+{
+	// Set BSSID in hardware
+#if WIFIG_VERBOSE
+	if (debug_on > 1)
+	DPRINTF("_wifi_SetBSS: caps=0x%04X ssid=%.*s, basic=0x%04X\n", bssCaps,
+	        ssid_len, ssid_len ? ssid : "", basic);
+#endif
+	_wc_HWMemcpy (NCBSSID0R, bssid, WLN_ADDR_SIZE);
+
+	// Set SSID and basic rates in hardware
+   _wc_write8(NCSSIDLR, ssid_len);
+	_wc_HWMemcpy (NCSSIDR, ssid, ssid_len);
+
+	// IBSS mode
+	if (bssCaps & _WIFI_CAP_IBSS)
+	{
+		// If starting IBSS, set beacon and ATIM intervals
+      _wc_write16(NCCFPMD0R, intel16(atim));
+      _wc_write16(NCBI0R, intel16(_WIFI_BEACON_INT));
+
+		// Write beacon frame to beacon buffer
+		if (_wifi_bcnFrame)
+		{
+			_wc_or32(NCGC0R, _WIFI_GEN_BEACEN);
+			_wc_HWWriteFifo (&_wifi_bcnFrame->frameHdr,
+				sizeof(WiFiFrameHeader) + sizeof(WiFiPlcpHeader) +
+				_wifi_bcnFrame->length - _WIFI_FCS_SIZE);
+			_wc_and32(NCGC0R, ~_WIFI_GEN_BEACEN);
+		}
+
+		// Set interrupt mask to enable TBTT and ATIM interrupts
+		_wc_or8(NCISR, _WIFI_INTR_TBTT|_WIFI_INTR_ATIM); // clear
+
+		_wc_or8(NCIMR, _WIFI_INTR_TBTT|_WIFI_INTR_ATIM); // enable
+
+		// Enable IBSS mode
+		_wc_or8(NCMACCR,_WIFI_CTRL_IBSS|_WIFI_CTRL_BEACONTX);
+	}
+
+	// ESS mode
+	else
+	{
+		// Set interrupt mask to disable TBTT and ATIM interrupts
+
+		_wc_and8(NCIMR, ~(_WIFI_INTR_TBTT|_WIFI_INTR_ATIM));
+
+		// Disable IBSS mode
+		_wc_and8(NCMACCR, ~(_WIFI_CTRL_IBSS|_WIFI_CTRL_BEACONTX));
+	}
+}
+
+
+/*** BeginHeader _wifi_SendFrame */
+void _wifi_SendFrame (__far WiFiMacBuffer *buf, int cw, int next);
+
+
+#ifdef _ALOG
+#use "malloc.lib"
+struct Alog {
+	struct Alog __far * next;
+	char		fh[40];
+	char		ncamr;
+	char		init[48];
+	word		len_plain;
+	char		plain[1];	// extends...
+};
+
+struct Alog __far * first_al;
+struct Alog __far * prev_al;
+#endif
+
+int _wifi_SendFrame_CTSRTS_Hold;
+
+/*** EndHeader */
+
+//
+// Transmit a frame
+// @param buf Frame to transmit
+// @param cw Contention window size, 0 if no backoff
+// @param next Next expected event, one of SF_xxx
+//
+_wifig_nodebug
+void _wifi_SendFrame (__far WiFiMacBuffer *buf, int cw, int next)
+{
+	auto long b;
+	auto char * addr;
+	auto word xpc_seg;
+#ifdef WIFI_WRITE_TX
+	auto int i;
+	auto unsigned long __far * fulp;
+#endif
+#ifdef WIFI_AES_ENABLED
+	auto _wifi_WiFiCcmpData data;
+	auto unsigned long timeout;
+#endif
+#ifdef _ALOG
+	auto word len_p;
+	struct Alog __far * al;
+	#GLOBAL_INIT { first_al = NULL; prev_al = NULL; }
+#endif
+
+   #GLOBAL_INIT{ _wifi_SendFrame_CTSRTS_Hold = 0; }
+
+#if defined AIROHA_PWR_CONTROL || defined R6_AIROHA_PWR_CONTROL
+	// Provides automatic power control for the Airoha RF chip
+	_wifi_pwrCntrl();
+#endif
+
+#ifdef WIFI_MANUFACTURING_TEST
+	// Don't allow packets to be sent during the Rx sensitivity test
+	if(_wifi_macStats.rxTestCntrl)
+   	return;
+#endif
+
+#ifdef _WIFI_DUTYCYCLE
+	// _wifi_pskcck_us incremented with microseconds spent transmitting, if
+	// a PSK/CCK packet being transmitted within 3dB of max power.  CustIndex
+	// ranges up to 15 (max power) and the conversion factor to dBm is
+	// _WIFI_PWR_GAIN.  Note: power test disabled, since apparently it is the
+	// harmonic ratio which is tested, and this is (surprisingly) unaffected
+	// by transmitter output power.
+	if (buf->frameHdr.tx.modType == _WIFI_MOD_PSKCCK
+	#if 0
+	      && _wapc.CustIndex >= (int)((15*_WIFI_PWR_GAIN - 3.0)/_WIFI_PWR_GAIN)
+	#endif
+	      ) {
+		_wifi_pskcck_us += _WIFI_NTOH16(buf->plcpHdr.pskcck.length);
+	}
+#endif
+
+	// Set backoff timer
+	if (cw)
+	{
+		// Pick a random time up to cw, convert to usecs
+		cw = 10*(rand16() & cw);
+		if (buf->macHdr.fc.type == _WIFI_TYPE_BEACON)
+		{
+			// Beacon frame is already in beacon buffer.
+			// Only set backoff timer here.
+			_wc_write16(NCBBO0R, intel16(cw));
+
+			// Simulate TxEnd
+			_wifi_HandleTxEnd();
+			return;
+		}
+		else
+			_wc_write16(NCBO0R, intel16(cw));
+	}
+
+	// Use short preamble?
+	if (_WIFI_USE_SHORTPRE (buf->tx_rate))
+		_wc_or32(NCGC0R, _WIFI_GEN_SHPRE);
+	else
+		_wc_and32(NCGC0R, ~_WIFI_GEN_SHPRE);
+
+	// If expecting TxEnd, enable interrupt
+	if (next == _WIFI_SF_TXEND)
+      _wc_or8(NCIMR, _WIFI_INTR_TXEND); // enable
+	else
+      _wc_and8(NCIMR, ~_WIFI_INTR_TXEND); // disable
+
+#ifdef WIFI_AES_ENABLED
+	// Use hardware AES if encrypted with AES
+	if (_wifi_hwAES && (buf->macHdr.fc.flags & _WIFI_FCNTRL_PROTECT) &&
+         _wifi_cipherIsCcmp(buf) &&
+         _wifi_CcmpGetData (buf, &data))
+	{
+
+   	timeout = MS_TIMER + _WIFI_AES_TIMEOUT;
+		while (((long)(MS_TIMER-timeout)) < 0) {
+      	if (!(_wc_read32(NCRSSI0R) & _WIFI_AES_BUSY))
+         {
+           	break;
+         }
+      }
+
+      #ifdef _ALOG
+      len_p = buf->length-_WIFI_DATA_SIZE-_WIFI_CCMP_SIZE;
+      al = (struct Alog __far *)_sys_malloc(sizeof(struct Alog)-1 + len_p);
+		if (prev_al)
+      	prev_al->next = al;
+      if (al) {
+      	al->next = NULL;
+      	if (!first_al)
+      		first_al = al;
+      	prev_al = al;
+      }
+      #endif
+
+		// Prevent transmit until encrypted data is ready
+		_wc_or32(NCGC0R, _WIFI_GEN_TXHOLD);
+
+      #ifdef _ALOG
+      _f_memcpy(al->fh, &buf->frameHdr, 4*10);
+      #endif
+		// Write frame headers to transmit FIFO
+		_wc_HWWriteFifo (&buf->frameHdr, 4*10);
+
+#ifdef _WIFI_OLD_AES
+		// Set transmit mode
+		_wc_write8(NCAMR, 0);
+
+		// Write key, init block, headers to AES FIFO
+		_wc_HWWriteAES (data.key->rd_key, 4*44);
+#else
+		// Set transmit mode, select key
+      #ifdef _ALOG
+      al->ncamr = _WIFI_AES_MODE_BIT | (buf->body[3] >> 6);
+      #endif
+      _wc_write8(NCAMR, _WIFI_AES_MODE_BIT | (buf->body[3] >> 6));
+#endif
+      #ifdef _ALOG
+      _f_memcpy(al->init, data.init, 4*12);
+      #endif
+		_wc_HWWriteAES (data.init, 4*12);
+
+      #ifdef _ALOG
+      al->len_plain = len_p;
+      _f_memcpy(al->plain, buf->body+_WIFI_EXT_IV_SIZE, len_p);
+      #endif
+
+		// Write plaintext data to AES FIFO
+      #if RCM4400W_SERIES
+		_wc_HWWriteAES (buf->body+_WIFI_EXT_IV_SIZE,
+		                buf->length-_WIFI_DATA_SIZE-_WIFI_CCMP_SIZE);
+      #elif RCM5400W_SERIES || RCM5600W_SERIES || _RAB6K
+      b = (long)(buf->body + _WIFI_EXT_IV_SIZE);
+      if ((b & 0xFFFF0000) == 0xFFFF0000) {
+      	addr = (char *)(word)(b & 0xFFFF);
+      	xpc_seg = 0;
+      }
+      else {
+	      addr = (char *)(word)(b & 0xFFF | 0xE000);
+	      xpc_seg = (word)((b >> 12) - 0xE);
+	   }
+	   //printf("b=%08lX addr=%04X xpc=%04X\n", b, addr, xpc_seg);
+		_wc_HWWriteAES_R (addr, xpc_seg,
+			buf->length-_WIFI_DATA_SIZE-_WIFI_CCMP_SIZE);
+      #else
+         #warnt "Using _wc_HWWriteAES.  _wc_HWWriteAES_R may write the AES" \
+            "FIFO too fast, and we're not checking AES FIFO FULL."
+		_wc_HWWriteAES (buf->body+_WIFI_EXT_IV_SIZE,
+		                buf->length-_WIFI_DATA_SIZE-_WIFI_CCMP_SIZE);
+      #endif
+
+
+		// Start transmit
+      _wc_and32(NCGC0R, ~_WIFI_GEN_TXHOLD);
+	}
+
+	else
+#endif
+	{
+      #if RCM5400W_SERIES || RCM5600W_SERIES || _RAB6K
+      b = (long)&buf->frameHdr;
+      if ((b & 0xFFFF0000) == 0xFFFF0000) {
+      	addr = (char *)(word)(b & 0xFFFF);
+      	xpc_seg = 0;
+      }
+      else {
+	      addr = (char *)(word)(b & 0xFFF | 0xE000);
+	      xpc_seg = (word)((b >> 12) - 0xE);
+	   }
+	   //printf("b=%08lX addr=%04X xpc=%04X\n", b, addr, xpc_seg);
+		_wc_or32(NCGC0R, _WIFI_GEN_TXHOLD);
+      // Write frame to transmit FIFO, excluding FCS
+		_wc_HWWriteFifoR (addr, xpc_seg,
+			(sizeof(WiFiFrameHeader) + sizeof(WiFiPlcpHeader) - _WIFI_FCS_SIZE) +
+			buf->length);
+
+      #elif RCM4400W_SERIES
+		_wc_HWWriteFifo (&buf->frameHdr,
+			(sizeof(WiFiFrameHeader) + sizeof(WiFiPlcpHeader) - _WIFI_FCS_SIZE) +
+			buf->length);
+      #else
+         #warnt "If this is a Rabbit 6000, try using _wc_HWWriteFifoR." \
+            "  Either variant should work :)"
+		_wc_HWWriteFifo (&buf->frameHdr,
+			(sizeof(WiFiFrameHeader) + sizeof(WiFiPlcpHeader) - _WIFI_FCS_SIZE) +
+			buf->length);
+		#endif
+		// Start transmit
+      if (! _wifi_SendFrame_CTSRTS_Hold) {
+         _wc_and32(NCGC0R, ~_WIFI_GEN_TXHOLD);
+      }
+		#ifdef WIFI_WRITE_TX
+		i = (sizeof(WiFiFrameHeader) + sizeof(WiFiPlcpHeader) - _WIFI_FCS_SIZE) +
+		    buf->length;
+		printf("static const unsigned long txpacket[%u+3>>2] = {\n", i);
+		fulp = (unsigned long __far *)&buf->frameHdr;
+		while (i > 0) {
+			i -= 4;
+			printf("0x%08lX%s\n", *fulp, i > 0 ? "," : "");
+			++fulp;
+		}
+		printf("};\n");
+		#endif
+	}
+}
+
+/*** BeginHeader _wifi_do_OSLockNesting */
+extern char _wifi_do_OSLockNesting;
+/*** EndHeader */
+
+char _wifi_do_OSLockNesting;
+
+/*** BeginHeader _wifi_HandleIR */
+__root void _wifi_HandleIR (void);		// Assembler stub, prevents re-entry from
+												// wifi interrupts
+__xmem void _wifi_isr (void);			// Actual handler, runs at CPU priority of
+												// interruptee
+/*** EndHeader */
+
+//
+// Handle an interrupt request
+//
+
+#define  MAXLEN   512
+__nodebug void dumpPacket()
+{
+   auto long  data[MAXLEN];
+   auto int   i, len;
+
+   i = 0;
+   while ((_wc_read8(0xA14) & 0x01) && (i < MAXLEN)) {
+      data[i] = _wc_read32(0xA20);
+      i++;
+   }
+
+   len = i;
+   printf("LENGTH = %d\n", len);
+   for (i=0; i<len; i++)
+      printf("%08lx",data[i]);
+}
+
+
+#asm __root __nodebug
+
+_wifi_HandleIR::
+	push	ix
+	push	iy
+	push	af
+	push	jkhl
+	push	bcde
+	push	pw
+	push	px
+	push	py
+	push	pz
+	exp
+	exx
+	ex		af,af'
+	push	af
+	push	jkhl
+	push	bcde
+	push	pw
+	push	px
+	push	py
+	push	pz
+	ld		hl,lxpc
+	push	hl
+
+  #ifdef AIROHA_PWR_CONTROL
+	lcall _wifi_airohaISR
+	#endif
+
+.loop:
+	; wow, that's a lot of context to save
+	; Anyway, let's no do something in C after disabling wifi interrupts but
+	; lowering the CPU priority level.
+#ifdef RABBIT_EARS
+	; disable WiFi (PE5, rising edge) external interrupt
+	ld		a, (I1CRShadow)
+	and	~0x03
+	ld		(I1CRShadow), a
+	ioi	ld (I1CR), a
+#else
+	; disable WiFi interrupt
+	ioi	ld a, (ENPR)
+	and	~0x03
+	ioi	ld	(ENPR), a
+#endif
+
+#ifdef MCOS
+	#if OS_SCHED_LOCK_EN < 1
+		#fatal "Wi-Fi must be able to lock the uC/OS II task scheduler, but " \
+		       "OS_SCHED_LOCK_EN < 1"
+	#endif
+	// Don't let uC/OS II switch away from the ISR
+	// -- lcall OSSchedLock
+	// Increment OSLockNesting unless it would overflow
+	ld		a, (OSLockNesting)
+	inc	a						; if overflow then value in A wraps back to zero
+	ld		(_wifi_do_OSLockNesting), a	; save OSLockNesting status flag
+	jr		z, .mcos_lock_ovfl	; don't save overflowed OSLockNesting value
+
+	ld		(OSLockNesting), a
+.mcos_lock_ovfl:
+#endif
+
+	push	ip
+	ipres
+	lcall	_wifi_isr
+	; Disable interrupts, reenable the hardware request line
+	pop	ip
+
+#ifdef MCOS
+	// -- lcall OSSchedUnlock
+	// Decrement OSLockNesting if it was not overflowed and is not zero
+	ld		a, (_wifi_do_OSLockNesting)
+	or		a
+	jr		z, .mcos_no_decr	; don't decrement if OSLockNesting status flag clear
+
+	ld		a, (OSLockNesting)
+	or		a
+	jr		z, .mcos_no_decr	; don't decrement if OSLockNesting is zero
+
+	dec	a
+	ld		(OSLockNesting), a
+.mcos_no_decr:
+#endif
+
+	;; if WiFi uninitialized / disabled, don't enable WiFi hardware interrupts
+	ld		hl, (_wifi_isr_initialized)
+	test	hl
+	jr		z, .noenable
+
+	ld		hl, (_wifi_isr_enabled)
+	test	hl
+	jr		z, .noenable
+
+#ifdef RABBIT_EARS
+	; enable WiFi (PE5, rising edge) external interrupt
+	ld		a, (I1CRShadow)
+	and	~0x03
+	or		_cexpr(WIFIG_NET_IP)
+	ld		(I1CRShadow), a
+	ioi	ld (I1CR), a
+#else
+	; enable WiFi interrupt
+	ioi	ld a, (ENPR)
+	and	~0x03
+	or		_cexpr(WIFIG_NET_IP)
+	ioi	ld (ENPR), a
+#endif
+
+.noenable:
+	; Check for any further outstanding interrupts
+	ld		L,NCISR
+   call	_wc_read8
+   ld		b,L
+   ld		L,NCIMR
+	call	_wc_read8
+	ld		a,L
+   and	b
+	; Process interrupt if found
+	jr		nz, .loop
+
+	; restore all that context and re-enable interrupts
+	pop	hl
+	ld		lxpc,hl
+	pop	pz
+	pop	py
+	pop	px
+	pop	pw
+	pop	bcde
+	pop	jkhl
+	pop	af
+	exp
+	exx
+	ex		af,af'
+	pop	pz
+	pop	py
+	pop	px
+	pop	pw
+	pop	bcde
+	pop	jkhl
+	pop	af
+	pop	iy
+	pop	ix
+	ipres
+	ret
+
+#endasm
+
+// Main 802.11 interrupt service routine (called from _wifi_HandleIR)
+_wifig_nodebug
+__xmem void _wifi_isr (void)
+{
+	auto uint8 intrStatus;
+	auto word xtra_count;
+	static int rx_signal_fixedpoint; // Fixed-point value to track average
+
+	#GLOBAL_INIT { \
+		rx_signal_fixedpoint = -1; /* Flag as not initialized */ \
+	}
+
+	// This indicates that we are already locked (interrupts disabled) so that
+	// subsequent nesting works.
+	++_wc_locklevel;
+
+	while (_wifi_isr_enabled)
+	{
+	   // Get interrupt status
+	   intrStatus = _wc_read8(NCISR) & _wc_read8(NCIMR);
+	   if (!intrStatus)
+	      break;
+
+	   // Handle errors
+	   if (intrStatus & (_WIFI_INTR_TIMEOUT|_WIFI_INTR_ABORT))
+	   {
+	      DPRINTF("_wifi_isr: timeout or abort\n");
+	      _wifi_HandleMacError (intrStatus);
+
+	      // Clear txEnd after timeout
+	      _wc_write8(NCISR, _WIFI_INTR_TXEND);
+	      intrStatus &= ~_WIFI_INTR_TXEND;
+	   }
+
+	   // Handle beacon/ATIM timer
+	   if (intrStatus & (_WIFI_INTR_TBTT|_WIFI_INTR_ATIM)) {
+	      _wifi_HandleBeacon ((BOOL)(intrStatus & _WIFI_INTR_TBTT));
+	   }
+
+	   // Transmit complete
+	   if (intrStatus & _WIFI_INTR_TXEND) {
+	      _wifi_HandleTxEnd();
+	   }
+
+	   // Received a frame
+	   if (intrStatus & _WIFI_INTR_RX)
+	   {
+         // Get only the headers (up to MAC addr2 field).
+         // This is enough to hold the smallest frame (ACK).
+         // The rest is gotten by _wifi_GetFrame() if needed.
+         _wc_HWReadFifo_f (&_wifi_rxFrame.frameHdr, 24);
+
+         // Get received signal strength
+         // Max RSSI is 107-15-0 = 92 when LNA=1 and VGA=0
+         // (LNA is always 1,2 or 3)
+         _wifi_rxFrame.rx_signal = _WIFI_MAC_RSSI_MAX
+            - 15*_WIFI_GET_FIELD(_wifi_rxFrame.frameHdr.rx.rssiInfo, _WIFI_RX_RSSI_LNA)
+            - 2*_WIFI_GET_FIELD(_wifi_rxFrame.frameHdr.rx.rssiInfo, _WIFI_RX_RSSI_VGA);
+
+         #ifdef WIFIG_LOG
+         __wlog(_WIFI_LOG_RSSI, 1, &_wifi_rxFrame.rx_signal);
+         __wlog(_WIFI_LOG_HEADER, 24, &_wifi_rxFrame.frameHdr);
+         #endif
+
+         // Add into average RSSI
+         if (rx_signal_fixedpoint >= 0) {
+            // Subtract off the average, and add in the new
+            rx_signal_fixedpoint = rx_signal_fixedpoint
+                  - (rx_signal_fixedpoint / _WIFI_RSSI_SCALE)
+                  + _wifi_rxFrame.rx_signal;
+         } else {
+            // Fixed-point not initialized, use first value, scaled
+            rx_signal_fixedpoint =
+                  _wifi_rxFrame.rx_signal * _WIFI_RSSI_SCALE;
+         }
+         // Store a rounded value in _wifi_macStatus
+         _wifi_macStatus.rx_signal =
+               (rx_signal_fixedpoint+_WIFI_RSSI_SCALE/2) /
+               _WIFI_RSSI_SCALE;
+
+         // Process the frame
+         _wifi_HandleRxEnd (&_wifi_rxFrame);
+
+         #ifdef WIFI_USE_WPA
+         // If using WPA (or any strong crypto) add entropy to the random number stream
+      	seed_clock(0);
+         #endif
+	   }
+      if (intrStatus & _WIFI_INTR_RXOVERRUN) {
+      	//DPRINTF("_wifi_isr: rx overrun\n");
+      	//_wifi_DropFrame(_WIFI_HW_RX_FIFO_SIZE + 1);	// discard entire Rx FIFO
+	      _wifi_macStats.rxDropOverrun++;
+	   }
+
+	   // Clear interrupts
+	   _wc_write8(NCISR, intrStatus);
+
+   }
+	// Reset the lock level to zero, since we know we are returning to interrupt
+	// enabled status.
+	--_wc_locklevel;
+}
+
+
+
+/*** BeginHeader _wifi_GetFrame */
+BOOL _wifi_GetFrame (__far WiFiMacBuffer *buf);
+/*** EndHeader */
+
+//
+// Get the complete frame that is being received
+// @param buf Buffer to copy frame into, length field contains frame size
+//
+_wifig_nodebug
+BOOL _wifi_GetFrame (__far WiFiMacBuffer *buf)
+{
+#ifdef WIFI_AES_ENABLED
+	auto _wifi_WiFiCcmpData data;
+   auto unsigned long timeout;
+#endif
+	auto uint32 tmp;
+
+	// Copy data already read from _wifi_rxFrame
+	buf->rx_signal = _wifi_rxFrame.rx_signal;
+   _f_memcpy(&buf->frameHdr,&_wifi_rxFrame.frameHdr,24);
+
+#ifdef WIFI_AES_ENABLED
+	// Use hardware AES if encrypted with AES
+	if (_wifi_hwAES && (buf->macHdr.fc.flags & _WIFI_FCNTRL_PROTECT) &&
+         _wifi_cipherIsCcmp(buf) &&
+	    buf->length >= _WIFI_DATA_SIZE+_WIFI_CCMP_SIZE)
+	{
+		// Get frame headers and init vector from receive FIFO
+#ifdef WIFIG_DEBUG
+		if (!isValidWiFiMacBuffer(buf)) {
+      	DPRINTF2("Bad buf addr=%08lX\n", buf);
+			_WIFI_ASSERT(0);
+			return FALSE;
+		}
+		if (buf->length >= sizeof (WiFiBuffer)) {
+			DPRINTF2("############# 1 Unreasonable length %u\n", buf->length);
+			return FALSE;
+		}
+#endif
+		_wc_HWReadFifo_f (buf->macHdr.addr3, 16);
+
+		// Get AES key, init block, headers
+		if (_wifi_CcmpGetData (buf, &data))
+		{
+      	timeout = MS_TIMER + _WIFI_AES_TIMEOUT;
+			while (((long)(MS_TIMER-timeout)) < 0) {
+      		if (!(_wc_read32(NCRSSI0R) & _WIFI_AES_BUSY))
+           		break;
+      	}
+
+#ifndef _WIFI_OLD_AES
+			// Select key
+      	_wc_write8(NCAMR, _WIFI_AES_MODE_BIT | (buf->body[3] >> 6));
+#endif
+			// Set receive mode
+			tmp = _wc_read8(NCAMR);
+
+#ifdef _WIFI_OLD_AES
+			// Write key, init vector, headers to AES FIFO
+			_wc_HWWriteAES (data.key->rd_key, 4*44);
+#endif
+			_wc_HWWriteAES (data.init, 4*12);
+
+			// Get plaintext data from AES FIFO
+			_wc_HWReadAES (buf->body+_WIFI_EXT_IV_SIZE,
+			               buf->length-_WIFI_DATA_SIZE-_WIFI_CCMP_SIZE);
+
+      	timeout = MS_TIMER + _WIFI_AES_TIMEOUT;
+			while (((long)(MS_TIMER-timeout)) < 0) {
+      		if (!(_wc_read32(NCRSSI0R) & _WIFI_AES_BUSY))
+           		break;
+      	}
+
+			// Check if MIC is correct
+			if (!(_wc_read32(NCRSSI0R) & _WIFI_AES_MIC))
+			{
+				_wifi_macStats.rxDropDecrypt++;
+				return FALSE;
+			}
+		}
+
+		// Not AES, get remaining data from receive FIFO
+		else {
+#ifdef WIFIG_DEBUG
+	      if (!isValidWiFiMacBuffer(buf)) {
+	      	DPRINTF2("Bad buf addr=%08lX\n", buf);
+	         _WIFI_ASSERT(0);
+	         return FALSE;
+	      }
+		if (buf->length >= sizeof (WiFiBuffer) || buf->length < 32) {
+			DPRINTF2("############# 2 Unreasonable length %u\n", buf->length);
+			return FALSE;
+		}
+#endif
+			_wc_HWReadFifo_f (buf->body+_WIFI_EXT_IV_SIZE, buf->length-32);
+		}
+	}
+
+	// Get remaining data from receive FIFO
+	else
+#endif
+	{
+#ifdef WIFIG_DEBUG
+		if (!isValidWiFiMacBuffer(buf)) {
+      	DPRINTF2("Bad buf addr=%08lX\n", buf);
+			_WIFI_ASSERT(0);
+			return FALSE;
+		}
+		if (buf->length >= sizeof (WiFiBuffer) || buf->length < 16) {
+			DPRINTF2("############# 3 Unreasonable length %u\n", buf->length);
+			return FALSE;
+		}
+#endif
+		_wc_HWReadFifo_f (buf->macHdr.addr3, buf->length-16);
+      #ifdef WIFIG_LOG
+      __wlog(_WIFI_LOG_DATA, buf->length-16, buf->macHdr.addr3);
+      #endif
+	}
+
+	return TRUE;
+}
+
+/*** BeginHeader _wifi_DropFrame */
+void _wifi_DropFrame (int length);
+/*** EndHeader */
+
+//
+// Received frame is not needed, remove from FIFO
+// @param length MAC frame size
+//
+_wifig_nodebug
+void _wifi_DropFrame (int length)
+{
+	auto uint32 tmp;
+
+	if (length >= 14 && length <= _WIFI_HW_RX_FIFO_SIZE)
+	{
+		// First 16 bytes already read.  ACK frames are only length 14, but this
+		// is OK since _wc_HWDiscardFifo() ignores negative quantities.
+		_wc_HWDiscardFifo(length - 16);
+	}
+	else
+	{
+		// Length is unreasonable.
+		// We might not be looking at the start of a frame.
+		// Reset the receive FIFO.
+#if WIFIG_VERBOSE
+		if (debug_on > 2)
+			DPRINTF("Dropping frame length %d, reset fifo\n", length);
+#endif
+      _wc_or32(NCGC0R, _WIFI_GEN_RXFIFORST);
+      _wc_and32(NCGC0R, ~_WIFI_GEN_RXFIFORST);
+	}
+}
+
+
+#ifdef _WIFI_FCC_ENABLED // TODO
+
+
+//
+// This function is used to put the mac driver in a quiet mode where
+// no transmitting is done, but the FPGA is still running.  It is my
+// hope that by disabling interrupts the FPGA will not do any automatic
+// acking of received data.
+//
+_wifig_nodebug
+void MacSetQuiet(int enable_quiet)
+{
+    auto int level;
+    /* disable interrupts */
+    level = _WIFI_DISABLE();
+
+    if (enable_quiet)
+    {
+        /* disable the mac driver */
+        _wifi_macStatus.state = WLN_ST_STOPPED;
+
+        //fcc_transmit_disabled = 1;
+
+        /* disable mac interrupts */
+		  _wc_write8(NCIMR, 0);
+    }
+    else
+    {
+        //fcc_transmit_disabled = 0;
+
+        /* enable common mac interrupts */
+		  _wc_or8(NCIMR, INTR_RXEND|_WIFI_INTR_TXEND|_WIFI_INTR_TIMEOUT|
+		                 _WIFI_INTR_ABORT);
+
+        /* enable the mac driver */
+        _wifi_macStatus.state = WLN_ST_SCANNING;
+        setWifiStaState(_WIFI_SS_WAIT);
+    }
+
+    /* enable interrupts */
+    _WIFI_ENABLE(level);
+}
+
+// This buffer is used as the transmit buffer for testing the
+// continuous transmit FCC test.
+unsigned char fcc_txbuffer[64];
+
+//
+// This function is used to fill the fcc_txbuffer with random data
+// for the transmit test.
+//
+_wifig_nodebug
+void MacUpdateFccBuffer(unsigned int transmit_mode, unsigned int transmit_rate)
+{
+    auto int i;
+
+    switch (transmit_rate)
+    {
+    case 0:
+        /* 1mpbs */
+        fcc_txbuffer[0] = 0x0a;
+        break;
+
+    case 1:
+        /* 2mpbs */
+        fcc_txbuffer[0] = 0x14;
+        break;
+
+    case 2:
+        /* 5.5mpbs */
+        fcc_txbuffer[0] = 0x37;
+        break;
+
+    case 3:
+        /* 11mpbs */
+        fcc_txbuffer[0] = 0x6e;
+        break;
+
+    default:
+        fcc_txbuffer[0] = 0x0a;
+        break;
+    }
+
+    if (transmit_mode == 4)
+    {
+        /* for fcc transmit 01 pattern */
+        for (i=1; i < 64; i++)
+        {
+            fcc_txbuffer[i] = 0xaa;
+        }
+    }
+    else
+    {
+        for (i=1; i < 64; i++)
+        {
+            fcc_txbuffer[i] = (unsigned char )rand();
+        }
+    }
+
+    /* copy to transmit buffer */
+    _wc_HWMemcpy (HW_TX_BUFFER, fcc_txbuffer, 64);
+}
+
+//
+// This function puts the driver into continuous transfer mode.  When doing
+// so it attempts to shutdown normal driver functionality so the driver
+// will not interfere with the continuous transfer.  However I do not think
+// the process of shutting down the driver while enabling continous transfer
+// mode is completely void of interference, but I think it will work well
+// enough for FCC testing.
+//
+_wifig_nodebug
+void MacContinuousTransmit(int enable, unsigned int transmit_mode,
+                           unsigned int transmit_rate)
+{
+    auto int level;
+    auto uint8 data;
+
+    switch (transmit_mode)
+    {
+    case 0:
+        /* random */
+        data = 0x4;
+        break;
+
+    case 1:
+        /* zeros */
+        data = 0x14;
+        break;
+
+    case 2:
+        /* ones */
+        data = 0x24;
+        break;
+
+    case 3:
+        /* Unmodulated signal, carrier only, continuous
+           transmit.  Used for Japan emmissions testing. */
+        data = 0x17;
+        break;
+
+    case 4:
+        /* FCC - continuous transmit, scramble disable, 010101...*/
+        data = 0x06;
+        break;
+
+    default:
+        data = 0x4;
+        break;
+    }
+
+
+    /* disable interrupts */
+    level = _WIFI_DISABLE();
+
+    if (enable)
+    {
+        /* disable the mac driver */
+        _wifi_macStatus.state = WLN_ST_STOPPED;
+
+        MacUpdateFccBuffer(transmit_mode, transmit_rate);
+
+        /* disable mac interrupts */
+        _wc_write8(NCIMR, 0);
+
+        /* set to continuous transmit */
+        HW_TEST_MODE = data;
+
+        /* start transmiting */
+		  _wc_write8(NCMACCR, _WIFI_CTRL_TXREQ);
+    }
+    else
+    {
+        /* clear test mode */
+        HW_TEST_MODE = 0x0;
+
+        /* enable common mac interrupts */
+		  _wc_or8(NCIMR, INTR_RXEND|_WIFI_INTR_TXEND|_WIFI_INTR_TIMEOUT|
+		                 _WIFI_INTR_ABORT);
+
+        _wifi_macStatus.state = WLN_ST_SCANNING;
+        setWifiStaState(_WIFI_SS_WAIT);
+    }
+
+    /* enable interrupts */
+    _WIFI_ENABLE (level);
+}
+
+
+
+#endif
+
+/*** BeginHeader */
+#endif /* __WIFI_MAC_HW_LIB */
+/*** EndHeader */
+

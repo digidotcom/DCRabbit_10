@@ -1,0 +1,1771 @@
+/*
+	Embedded 802.11 wireless network interface
+	MAC layer management functions
+
+	Copyright (c) 2007-2008 Digi International Inc., All Rights Reserved
+
+	This software contains proprietary and confidential information of Digi
+	International Inc.  By accepting transfer of this copy, Recipient agrees
+	to retain this software in confidence, to prevent disclosure to others,
+	and to make no use of this software other than that for which it was
+	delivered.  This is an unpublished copyrighted work of Digi International
+	Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+	prohibited.
+
+	Restricted Rights Legend
+
+	Use, duplication, or disclosure by the Government is subject to
+	restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+	Technical Data and Computer Software clause at DFARS 252.227-7031 or
+	subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+	Restricted Rights at 48 CFR 52.227-19, as applicable.
+
+	Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+*/
+
+/*** BeginHeader _wifi_macParams, _wifi_macStatus */
+#use "rand.lib"
+
+#ifndef WIFI_MAC_MGMT_VERBOSE
+	#define WIFI_MAC_MGMT_VERBOSE 0
+#endif
+
+extern wln_params _wifi_macParams;			// Operating parameters
+extern wln_status _wifi_macStatus;			// Operating status
+extern __far WiFiMacBuffer *_wifi_bcnFrame;	// Beacon frame if IBSS
+extern __far WiFiMacBuffer *_wifi_respFrame;// Probe response frame if IBSS
+extern WiFiStaState _wifi_staState;			// Station state: one of SS_xxx
+extern uint16 _wifi_bcnInt;					// Beacon interval (in TU)
+extern uint16 _wifi_atimWindow;				// ATIM window size, 0 if none
+extern uint16 _wifi_basicRates;
+extern uint8 _wifi_erpInfo;					// Extended rate PHY info
+extern uint32 _wifi_macRandom;				// Random value generated from network
+
+// Scan parameters
+
+typedef struct
+{
+	uint8 ssid[WLN_SSID_SIZE];	// Service set ID
+	int ssid_len;					// SSID length, 0 for any
+	uint32 chan_mask;				// Channels to scan
+	BOOL requested;				// TRUE if requested by _wifi_wln_scan()
+	int count;						// Number of networks found
+	int max;							// Number of networks allocated
+	int channel;					// Channel being scanned
+	int index;						// Next network to try
+	WiFiStaState state;			// Station state before scan
+	uint32 time;					// Time of last scan
+	void (*callback)();			// Callback function for
+	int roam_enabled;				// is roaming enabled?
+	int roam_beacon_loss;		// number of lost beacons to trigger roam event
+} WiFiScan;
+
+extern _wifi_wln_scan_data __far _wifi_scan_data;	// Networks found by scan
+
+extern WiFiScan _wifi_scan;
+
+extern WiFiAuthState _wifi_authState;				// Authentication state
+extern uint8 _wifi_challenge[_WIFI_CHAL_SIZE];	// Authentication challenge
+
+extern uint32 _wifi_mgmtTime;				// Last time management timer ran
+extern int _wifi_retry;						// Management retry counter
+
+// Broadcast MAC address
+extern const MacAddr _wifi_bc_addr;
+
+// WPA information element
+extern const uint8 _wifi_wpaOUI[];
+
+
+/*** EndHeader */
+
+wln_params _wifi_macParams;			// Operating parameters
+wln_status _wifi_macStatus;			// Operating status
+__far WiFiMacBuffer *_wifi_bcnFrame;	// Beacon frame if IBSS
+__far WiFiMacBuffer *_wifi_respFrame;	// Probe response frame if IBSS
+WiFiStaState _wifi_staState;			// Station state: one of SS_xxx
+uint16 _wifi_bcnInt;						// Beacon interval (in TU)
+uint16 _wifi_atimWindow;				// ATIM window size, 0 if none
+uint16 _wifi_basicRates;
+uint8 _wifi_erpInfo;						// Extended rate PHY info
+uint32 _wifi_macRandom;					// Random value generated from network
+
+// Scan parameters
+WiFiScan _wifi_scan;
+_wifi_wln_scan_data __far _wifi_scan_data;	// Networks found by scan
+
+WiFiAuthState _wifi_authState;		// Authentication state
+uint8 _wifi_challenge[_WIFI_CHAL_SIZE];	// Authentication challenge
+
+uint32 _wifi_mgmtTime;					// Last time management timer ran
+int _wifi_retry;							// Management retry counter
+
+// Broadcast MAC address
+const MacAddr _wifi_bc_addr = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+
+// WPA information element
+const uint8 _wifi_wpaOUI[] = { 0x00, 0x50, 0xf2, 0x01 };
+
+
+/*** BeginHeader _wifi_MacInit */
+WiFiMacReturn _wifi_MacInit (void);
+/*** EndHeader */
+
+//
+// Initialize the MAC layer and enable the network interface
+// Parameters must be set by wln_set_params() before calling
+//
+_wifig_nodebug
+WiFiMacReturn _wifi_MacInit (void)
+{
+	auto WiFiMacReturn retval;
+	auto int i;
+
+	// Miscellaneous initialization
+	_wifi_initRatesGlobals();
+
+   // Initialize the _wifi_macparams structure appropriately
+   _wifi_macParams.bss_type = WLN_BSS_ESS;
+   _wifi_macParams.authen = WLN_AUTH_OPEN;
+   _wifi_macParams.encrypt = WLN_ENCR_OPEN;
+#ifdef WPA_USE_EAP
+   _wifi_macParams.eap_methods = WLN_EAP_ANY;
+#endif
+   _wifi_macParams.chan_mask = WLN_CHANMASK_ALL;
+   _wifi_macParams.power_mode = WLN_PWR_MAX;
+   _wifi_macParams.band = WLN_BAND_DEFAULT;
+   _wifi_macParams.tx_power = WLN_TXPOWER_DEFAULT;
+
+#ifdef _WIFI_BONLY
+	_wifi_macParams.options |= WLN_OPT_BONLY;
+#endif
+
+	// The link is down initially
+   _wifi_macStatus.link = 0;
+
+	// Apply initialization from TCP_CONFIG.LIB
+#ifdef WIFI_INIT
+   WIFI_INIT;
+#endif
+
+   memset (&_wifi_macStatus, 0, sizeof(_wifi_macStatus));
+   _wifi_bcnFrame = NULL;
+   _wifi_respFrame = NULL;
+   _wifi_scan.max = _WIFI_SCAN_NUM;
+   _wifi_setStaState(_WIFI_SS_WAIT);
+   _wifi_mgmtTime = _WIFI_GET_TIME();
+
+	// Seed the PRNG with the time and station MAC address
+	// so that identical devices use a different sequence
+	srand ((uint16) _wifi_mgmtTime ^ _wifi_macParams.sta_addr[3] ^
+	                _wifi_macParams.sta_addr[4] ^ _wifi_macParams.sta_addr[5]);
+	memcpy (&_wifi_macRandom, _wifi_macParams.sta_addr+2,
+	        sizeof(_wifi_macRandom));
+
+	retval = _wifi_InitBuffers();
+	if (retval != _WIFI_ERR_OK)
+		return retval;
+
+	_wifi_InitData();
+	_wifi_InitIR();
+
+
+   if (_wifi_macParams.options & WLN_OPT_MULTI_DOMAIN)
+   {
+   	_wifi_macStatus.tx_power = -1;
+      _wifi_macParams.tx_power = WLN_TXPOWER_MIN;
+   }
+
+	retval = _wifi_InitHW();
+	if (retval != _WIFI_ERR_OK)
+		return retval;
+
+	if (_wifi_macParams.bss_type < WLN_BSS_NONE)
+   {
+		_wifi_StartScan (_wifi_macParams.ssid, _wifi_macParams.ssid_len,
+		                 _wifi_macParams.channel, FALSE);
+   }
+   else
+   {
+      _wifi_SetChannel (_wifi_macParams.channel);
+      // Set BSSID and SSID to receive all frames
+      _wifi_SetBSS (0, _wifi_bc_addr, NULL, 0, 0, 0);
+   }
+
+	return _WIFI_ERR_OK;
+}
+
+/*** BeginHeader _wifi_MacShutdown */
+void _wifi_MacShutdown (void);
+/*** EndHeader */
+
+//
+// Shutdown the MAC layer and disable the network interface
+//
+_wifig_nodebug
+void _wifi_MacShutdown (void)
+{
+	_wifi_macStatus.state = WLN_ST_STOPPED;
+	_wifi_ShutdownHW();
+}
+
+/*** BeginHeader _wifi_MacTimer */
+uint32 _wifi_MacTimer (void);
+/*** EndHeader */
+
+//
+// Process received frames and periodic tasks.
+// Called from the network task.
+// @return time interval in msecs to call again
+//
+_wifig_nodebug
+uint32 _wifi_MacTimer (void)
+{
+	auto __far WiFiMacBuffer *buf;
+	auto uint32 now;
+	auto int level;
+
+	level = _WIFI_DISABLE();
+
+	_wifi_IRTimer();
+
+#ifdef RABBIT_EARS
+	// Check that we still have a LOCK
+	if (!(_wc_read32(NCGS0R) & _WIFI_STAT_LOCK) &&
+	    (_wifi_macStatus.channel != 0)) {
+		// LOCK has failed!--Recalibrate this channel
+		DPRINTF2("Recalibrating channel %d\n", _wifi_macStatus.channel);
+		_wifi_CalibrateChannel(_wifi_macStatus.channel);
+		_wifi_SetVCO(_wifi_radio_calibration[_wifi_macStatus.channel-1]);
+	}
+#endif
+
+	// Process channel scanning
+	if (_wifi_staState == _WIFI_SS_SCAN)
+	{
+		now = _WIFI_GET_TIME();
+		if (now-_wifi_scan.time >= _WIFI_SCAN_PERIOD)
+		{
+			_wifi_scan.time = now;
+			_wifi_ScanChannel();
+		}
+	}
+	_WIFI_ENABLE(level);
+
+   if (_wifi_macParams.bss_type < WLN_BSS_NONE)
+   {
+	   level = _WIFI_DISABLE();
+	   // Process management tasks
+	   now = _WIFI_GET_TIME();
+	   if (now-_wifi_mgmtTime >= _WIFI_MGMT_PERIOD)
+	   {
+	      _wifi_mgmtTime = now;
+	      _wifi_AgeRecvCache();
+	      _wifi_SendMgmtFrame();
+	      _wifi_UpdateRate();
+	   }
+
+	   _WIFI_ENABLE(level);
+	}
+
+	if (_wifi_staState == _WIFI_SS_SCAN)
+		return _WIFI_SCAN_PERIOD;
+	else
+		return _WIFI_TIMER_PERIOD;
+}
+
+/*** BeginHeader _wifi_wln_scan */
+int _wifi_wln_scan (uint8 *ssid, int ssid_len, int channel);
+/*** EndHeader */
+
+//
+// Scan for wireless networks.
+// Results are returned with a WLN_EVT_SCAN event.
+// @param ssid		Service set ID
+// @param ssid_len	SSID length in bytes, 0 to scan all
+// @param channel	Channel: 1-WLN_CHAN_NUM, 0 to scan all
+//
+_wifig_nodebug
+int _wifi_wln_scan (uint8 *ssid, int ssid_len, int channel)
+{
+	auto int level;
+
+	level = _WIFI_DISABLE();
+	_wifi_StartScan (ssid, ssid_len, channel, TRUE);
+	_WIFI_ENABLE(level);
+
+	return 0;
+}
+
+/*** BeginHeader _wifi_wln_associate */
+int _wifi_wln_associate (uint8 *ssid, int ssid_len, int channel,
+                         mac_addr bss_addr, uint8 *wpa_ie);
+/*** EndHeader */
+
+//
+// Associate with a BSS
+// @param ssid		Service set ID
+// @param ssid_len	SSID length in bytes, 0 to scan all
+// @param channel	Channel: 1-WLN_CHAN_NUM, 0 to scan all
+// @param bss_addr 	BSS to associate with
+// @param wpa_ie WPA info element to send, NULL if none
+//
+_wifig_nodebug
+int _wifi_wln_associate (uint8 *ssid, int ssid_len, int channel,
+                         mac_addr bss_addr, uint8 *wpa_ie)
+{
+	auto int level;
+
+	if (wpa_ie && wpa_ie[1] + 2 > WLN_WPAIE_SIZE)
+		return -1;
+
+	level = _WIFI_DISABLE();
+
+   if (_wifi_macStatus.state >= WLN_ST_ASSOC_ESS) {
+   	DPRINTF("_wifi_wln_associate: DISASSOC because already assoc\n");
+      wln_send_event (WLN_EVT_DISASSOC, _wifi_macStatus.bss_addr);
+   }
+
+#if WIFI_MAC_MGMT_VERBOSE
+	DPRINTF ("Join bssid=%02x:%02x:%02x:%02x:%02x:%02x ssid=%.*s chan=%d\n",
+		bss_addr[0], bss_addr[1], bss_addr[2],
+		bss_addr[3], bss_addr[4], bss_addr[5],
+		ssid_len, ssid_len ? ssid : "", channel);
+#endif
+	// Set BSS info
+	memcpy (_wifi_macStatus.ssid, ssid, ssid_len);
+   if (ssid_len < WLN_SSID_SIZE) {
+      // Null-terminate ssid if there is space to do so.
+      _wifi_macStatus.ssid[ssid_len] = '\0';
+   }
+	_wifi_macStatus.ssid_len = ssid_len;
+	_wifi_macStatus.channel = channel;
+	_wifi_macStatus.bss_caps = _WIFI_CAP_ESS;
+	_WIFI_SET_ADDR (_wifi_macStatus.bss_addr, bss_addr);
+	if (wpa_ie)
+		memcpy (_wifi_macStatus.wpa_info, wpa_ie, wpa_ie[1] + 2);
+	else
+		_wifi_macStatus.wpa_info_len = 0;
+
+	// Set BSS info in hardware
+	_wifi_SetChannel (channel);
+	_wifi_SetBSS (_wifi_macStatus.bss_caps, _wifi_macStatus.bss_addr,
+			        _wifi_macStatus.ssid, _wifi_macStatus.ssid_len, 0, 0);
+
+	// Wait to receive a beacon
+	_wifi_setStaState(_WIFI_SS_BEACON);
+	_wifi_scan.state = _WIFI_SS_WAIT;
+	_wifi_mgmtTime = _WIFI_GET_TIME();
+
+	DPRINTF3("Trying to associate with SSID '%.*s'\n", ssid_len, ssid_len ? ssid : "");
+	_WIFI_ENABLE(level);
+	return 0;
+}
+
+/*** BeginHeader _wifi_wln_disassociate */
+int _wifi_wln_disassociate (mac_addr bss_addr, int reason);
+/*** EndHeader */
+
+//
+// Disassociate from a BSS
+// @param bss_addr BSS to disassociate from
+// @param reason reason code to send
+//
+_wifig_nodebug
+int _wifi_wln_disassociate (mac_addr bss_addr, int reason)
+{
+	auto int level;
+	auto __far WiFiMacBuffer *buf;
+
+#if WIFIG_VERBOSE > 1
+  	DPRINTF("_wifi_wln_disassociate: reason: %s\n",
+  		reason==_WIFI_REAS_NOLONGERVALID?"no longer valid":
+  		reason==_WIFI_REAS_DEAUTH_LEAVING?"leaving":
+  		reason==_WIFI_REAS_INACTIVITY?"inactivity":
+  		"unknown"
+  		);
+#endif
+
+	level = _WIFI_DISABLE();
+
+	// Not associated with the BSS
+	if (_wifi_macStatus.state < WLN_ST_ASSOC_ESS ||
+		 !_WIFI_EQUAL_ADDR (bss_addr, _wifi_macStatus.bss_addr))
+	{
+      // Set state machine to disassociate status
+      wln_send_event (WLN_EVT_DISASSOC, _wifi_macStatus.bss_addr);
+
+		// Clear BSSID so no more frames are received
+		memset (_wifi_macStatus.bss_addr, 0, WLN_ADDR_SIZE);
+   	_wifi_macStatus.bss_caps = _WIFI_CAP_ESS;
+		_WIFI_ENABLE (level);
+		return -1;
+	}
+
+	if (_wifi_macStatus.bss_caps & _WIFI_CAP_ESS)
+	{
+	   // Send disassociation
+	   if (_wifi_staState == _WIFI_SS_ASSOC)
+	   {
+	      buf = _wifi_GetBuffer();
+	      if (buf)
+	      {
+	         buf->macHdr.fc.type = _WIFI_TYPE_DISASSOC;
+	         buf->length = _WIFI_DATA_SIZE + 2;
+	         _WIFI_SET16_FAR(buf->body, reason);
+	         _wifi_SendFrames (buf, _wifi_macStatus.bss_addr);
+	      }
+	   }
+
+	   // Send deauthentication
+	   if (_wifi_staState == _WIFI_SS_AUTH || _wifi_staState == _WIFI_SS_ASSOC)
+	   {
+	      buf = _wifi_GetBuffer();
+	      if (buf)
+	      {
+	         buf->macHdr.fc.type = _WIFI_TYPE_DEAUTH;
+	         buf->length = _WIFI_DATA_SIZE + 2;
+	         _WIFI_SET16_FAR(buf->body, reason);
+	         _wifi_SendFrames (buf, _wifi_macStatus.bss_addr);
+	      }
+	   }
+	}
+
+	if (_wifi_macStatus.state >= WLN_ST_ASSOC_ESS) {
+   	DPRINTF("_wifi_wln_disassociate: DISASSOC because already assoc\n");
+		wln_send_event (WLN_EVT_DISASSOC, _wifi_macStatus.bss_addr);
+   }
+
+	// Clear BSSID so no more frames are received
+	memset (_wifi_macStatus.bss_addr, 0, WLN_ADDR_SIZE);
+   _wifi_macStatus.bss_caps = _WIFI_CAP_ESS;
+
+	// Continue scanning. Timer will call _wifi_NextBSS().
+	_wifi_setStaState(_WIFI_SS_BEACON);
+	_wifi_scan.state = _WIFI_SS_WAIT;
+	_wifi_mgmtTime = _WIFI_GET_TIME();
+
+	_WIFI_ENABLE (level);
+	return 0;
+}
+
+/*** BeginHeader _wifi_RecvMgmtFrame */
+void _wifi_RecvMgmtFrame (__far WiFiMacBuffer *buf);
+/*** EndHeader */
+
+//
+// Process a received management frame
+// @param buf Received frame
+//
+_wifig_nodebug
+void _wifi_RecvMgmtFrame (__far WiFiMacBuffer *buf)
+{
+	auto int level;
+
+	// Ignore frame if not:
+	//   Beacon or probe response, or
+	//   Joined ESS and from this BSS
+	if (!(buf->macHdr.fc.type == _WIFI_TYPE_BEACON ||
+		  buf->macHdr.fc.type == _WIFI_TYPE_PROBE_RESP ||
+		  ((_wifi_macStatus.bss_caps & _WIFI_CAP_ESS) && _WIFI_EQUAL_ADDR (buf->macHdr.addr2, _wifi_macStatus.bss_addr))))
+	{
+		_wifi_FreeBuffers (buf);
+		return;
+	}
+
+	level = _WIFI_DISABLE();
+
+	switch (buf->macHdr.fc.type)
+	{
+		case _WIFI_TYPE_BEACON:
+		case _WIFI_TYPE_PROBE_RESP:
+			// Accumulate timestamp and RSSI into random value
+			_wifi_macRandom ^= _WIFI_GET32_FAR(buf->body) ^ buf->rx_signal;
+
+			if (_wifi_staState == _WIFI_SS_SCAN)
+				_wifi_RecvScan (buf);
+			else if (_wifi_staState >= _WIFI_SS_BEACON)
+				_wifi_RecvBeacon (buf);
+			break;
+
+		case _WIFI_TYPE_DEAUTH:
+			DPRINTF2("Got mgmt: Deauthentication %d\n", _WIFI_GET16_FAR(&buf->body[0]));
+			if (_wifi_staState == _WIFI_SS_ASSOC) {
+
+				wln_send_event (WLN_EVT_DISASSOC, _wifi_macStatus.bss_addr);
+         }
+
+			if (_wifi_staState == _WIFI_SS_AUTH ||
+			    _wifi_staState == _WIFI_SS_ASSOC)
+			{
+				if (_WIFI_GET16_FAR(buf->body) == _WIFI_REAS_NOLONGERVALID ||
+					_WIFI_GET16_FAR(buf->body) == _WIFI_REAS_INACTIVITY)
+				{
+					// Send authentication request
+					_wifi_setStaState(_WIFI_SS_JOIN);
+					_wifi_authState = _WIFI_SA_INIT;
+					_wifi_SendNextMgmtFrame();
+				}
+				else
+					_wifi_NextBSS();
+			}
+			break;
+
+		case _WIFI_TYPE_AUTH:
+			DPRINTF2("Got mgmt: Authentication %d\n", _WIFI_GET16_FAR(&buf->body[4]));
+			if (_wifi_staState == _WIFI_SS_JOIN)
+				_wifi_RecvAuthentication (buf);
+			break;
+
+		case _WIFI_TYPE_DISASSOC:
+			DPRINTF2("Got mgmt: Disassociation %d\n", _WIFI_GET16_FAR(&buf->body[0]));
+			if (_wifi_staState == _WIFI_SS_ASSOC)
+			{
+				wln_send_event (WLN_EVT_DISASSOC, _wifi_macStatus.bss_addr);
+
+				if (_WIFI_GET16_FAR(buf->body) == _WIFI_REAS_INACTIVITY)
+				{
+					// Send authentication request
+					_wifi_setStaState(_WIFI_SS_JOIN);
+					_wifi_authState = _WIFI_SA_INIT;
+					_wifi_SendNextMgmtFrame();
+				}
+				else
+					_wifi_NextBSS();
+			}
+			break;
+
+		case _WIFI_TYPE_ASSOC_RESP:
+			DPRINTF2("Got mgmt: Association response %d\n", _WIFI_GET16_FAR(&buf->body[2]));
+			if (_wifi_staState == _WIFI_SS_AUTH)
+			{
+				// Check association response
+				if (((_WIFI_GET16_FAR(buf->body) & (_WIFI_CAP_ESS|_WIFI_CAP_IBSS)) == _WIFI_CAP_ESS) &&
+					(_WIFI_GET16_FAR(&buf->body[2]) == _WIFI_STAT_SUCCESS))
+				{
+					_wifi_setStaState(_WIFI_SS_ASSOC);
+					_wifi_macStatus.state = WLN_ST_ASSOC_ESS;
+					DPRINTF3("%lu: -> association to %s complete\n", MS_TIMER, _wifi_macStatus.ssid);
+					wln_send_event (WLN_EVT_ASSOC, _wifi_macStatus.bss_addr);
+					// If we are not doing TKIP/CCMP, then indicate that the link is
+					// up
+					if (_wifi_macStatus.wpa_info_len == 0) {
+						wln_send_event (WLN_EVT_LINKUP, _wifi_macStatus.bss_addr);
+					}
+				}
+				else
+					_wifi_NextBSS();
+			}
+			break;
+	}
+
+	_wifi_FreeBuffers (buf);
+	_WIFI_ENABLE(level);
+}
+
+/*** BeginHeader _wifi_ParseMultiDomainInfo */
+void _wifi_ParseMultiDomainInfo(__far uint8 *bp, int channel);
+/*** EndHeader */
+// parse country information elelment
+// @param bp       country information data
+// @param channel  current channel number
+
+_wifig_nodebug
+void _wifi_ParseMultiDomainInfo(__far uint8 *bp, int channel)
+{
+    auto int idx;
+    auto int len;
+    int data1, data2, data3;
+
+    len = (int)bp[1];
+    if (len >= _WIFI_COUNTRY_INFO_MIN_LEN)
+    {
+        // save the country string
+        _f_memcpy(&_wifi_macStatus.country_info, &bp[2],
+                  sizeof(_wifi_macStatus.country_info));
+
+        idx = 5; /* first channel info */
+        len -= 3;
+
+        while ((len-3) >= 0)
+        {
+            // check the channel
+            if ((channel >= bp[idx]) && (channel < (bp[idx]+bp[idx+1])))
+            {
+            	// save the maximum tx power
+               if (bp[idx+2] > WLN_TXPOWER_MAX)
+                 	_wifi_macStatus.tx_power = WLN_TXPOWER_MAX;
+               else
+                 	_wifi_macStatus.tx_power = (int)bp[idx+2];
+
+               if(_wifi_macParams.tx_power_max != _wifi_macStatus.tx_power)
+               {
+               	#ifdef WIFI_REGION_VERBOSE
+      				printf("Parse Beacon 802.11d info: \nChannel Range is %d - %d, Pwr < %d dBm\n",
+                       bp[idx], (bp[idx]+bp[idx+1])-1, (int)bp[idx+2]);
+      				#endif
+                  _wc_SetTxPower((unsigned char)_wifi_macStatus.tx_power);
+                  _wifi_macParams.tx_power_max = _wifi_macStatus.tx_power;
+               }
+               break;
+            }
+            else
+            {
+               	_wifi_macStatus.tx_power = -1;
+      				_wifi_macParams.tx_power = WLN_TXPOWER_MIN;
+                  _wifi_macParams.tx_power_max = WLN_TXPOWER_MIN;
+            }
+
+            len -= 3;
+            idx += 3;
+        }
+    }
+}
+
+
+
+/*** BeginHeader _wifi_ParseBeacon */
+BOOL _wifi_ParseBeacon (__far WiFiMacBuffer *buf, int channel,
+                        _wifi_wln_scan_bss __far*sp);
+/*** EndHeader */
+
+//
+// Parse a received beacon or probe response frame
+// @param buf Received frame
+// @param channel Expected channel
+// @param sp BSS scan information returned
+// @return TRUE if valid frame
+//
+_wifig_nodebug
+BOOL _wifi_ParseBeacon (__far WiFiMacBuffer *buf, int channel,
+                        _wifi_wln_scan_bss __far*sp)
+{
+	auto uint16 bssCaps;
+	auto __far uint8 *bp;
+   auto __far uint8 *multidominfo;
+
+   bssCaps = _WIFI_GET16_FAR(buf->body+10);
+
+	_f_memset (sp, 0, sizeof(_wifi_wln_scan_bss));
+	multidominfo = NULL;
+
+	// Save fixed fields
+	_WIFI_SET_ADDR (sp->bss_addr, buf->macHdr.addr3);
+	sp->channel = channel;
+	sp->rx_signal = buf->rx_signal;
+	sp->bss_caps = bssCaps;
+
+	// Set default ERP info
+	if (!(bssCaps & _WIFI_CAP_SHORTPRE))
+		sp->erp_info |= _WIFI_ERP_BARKER;
+
+	// Process each info element
+	for (bp = &buf->body[12]; bp+bp[1]+2 <= buf->body+buf->length; bp += bp[1]+2)
+		switch (bp[0])
+		{
+			case _WIFI_ELEM_SSID:
+				// Check for valid SSID
+				if (bp[1] > WLN_SSID_SIZE) {
+					DPRINTF(" - SSID length bad\n");
+					return FALSE;
+				}
+
+            // Save SSID
+				_f_memcpy (sp->ssid, bp+2, bp[1]);
+				sp->ssid_len = bp[1];
+
+				break;
+
+			case _WIFI_ELEM_SUPRATES:
+			case _WIFI_ELEM_EXTSUPRATES:
+				// Check supported rates
+				if (!_wifi_CheckRates (bp+2, bp[1], sp)) {
+					DPRINTF(" - unsuitable rates\n");
+					return FALSE;
+				}
+				break;
+
+			case _WIFI_ELEM_DSPARAM:
+				// Check channel number
+				if (!_WIFI_CHAN_5G (channel) &&
+					(bp[1] != 1 || bp[2] != channel)) {
+						//DPRINTF(" - wrong channel\n");	-- this one's a bit too
+						//                                  frequent
+						return FALSE;
+					}
+				break;
+
+			case _WIFI_ELEM_IBSSPARAM:
+				// Save ATIM window if IBSS
+				if (bssCaps & _WIFI_CAP_IBSS)
+					sp->atim = _WIFI_GET16_FAR(bp+2);
+				break;
+
+			case _WIFI_ELEM_ERPINFO:
+				// Save extended rate PHY info
+				sp->erp_info = bp[2];
+				break;
+
+         case _WIFI_ELEM_COUNTRY:
+				multidominfo = bp;
+            break;
+
+			case _WIFI_ELEM_VENDOR:
+				// Check for WPA info.  Don't overwrite RSN info.
+				if (!(sp->wpa_info_len == 0 && memcmp (bp+2, _wifi_wpaOUI, sizeof _wifi_wpaOUI) == 0))
+					break;
+
+				// Fall thruough
+
+			case _WIFI_ELEM_RSN:
+				// Save WPA/RSN info
+				if ((bssCaps & (_WIFI_CAP_ESS|_WIFI_CAP_PRIVACY)) == (_WIFI_CAP_ESS|_WIFI_CAP_PRIVACY) &&
+					bp[1]+2 <= WLN_WPAIE_SIZE)
+						_f_memcpy (sp->wpa_info, bp, bp[1]+2);
+				break;
+		}
+
+   if (_wifi_macParams.options & WLN_OPT_MULTI_DOMAIN)
+   {
+   	// if there was a country element, and this AP matches our SSID (or if we
+      // were scanning and haven't set an ssid) parse the multi domain info
+   	if (multidominfo)
+      {
+      	if (_wifi_macParams.ssid_len)
+         {		// make sure ssid matches
+         	if ( (_wifi_macParams.ssid_len == sp->ssid_len) &&
+            	(memcmp (sp->ssid, _wifi_macParams.ssid, sp->ssid_len) == 0) )
+            {
+					_wifi_ParseMultiDomainInfo(multidominfo, channel);
+            }
+         }
+      }
+    	if (_wifi_macStatus.tx_power < 0)
+      {
+			DPRINTF(" - undetermined tx power\n");
+			return FALSE;
+      }
+   }
+
+	return TRUE;
+}
+
+/*** BeginHeader _wifi_CheckBSS */
+BOOL _wifi_CheckBSS (_wifi_wln_scan_bss __far *sp);
+/*** EndHeader */
+
+//
+// Check if BSS info matches current parameters
+// @param sp BSS scan information to check
+// @return TRUE if match, FALSE if not
+//
+_wifig_nodebug
+BOOL _wifi_CheckBSS (_wifi_wln_scan_bss __far *sp)
+{
+	auto uint16 bssCaps;
+	auto int rsn;
+
+	// Check capabilities
+#if WIFI_MAC_MGMT_VERBOSE
+	if (debug_on)
+	DPRINTF4("CheckBSS %.*ls: signal strength %d\n", sp->ssid_len, sp->ssid, sp->rx_signal);
+#endif
+	bssCaps = sp->bss_caps;
+	rsn = 0;
+	// want ESS, but not an ESS
+	if ((_wifi_macParams.bss_type == WLN_BSS_ESS && !(bssCaps & _WIFI_CAP_ESS)) && (rsn=1) ||
+		// want IBSS, but not an IBSS
+		((_wifi_macParams.bss_type == WLN_BSS_IBSS || _wifi_macParams.bss_type == WLN_BSS_IB_WIFI_SS_JOIN)
+			&& !(bssCaps & _WIFI_CAP_IBSS)) && (rsn=2) ||
+		// unsecured BSS not allowed
+		(!(_wifi_macParams.encrypt & WLN_ENCR_OPEN) && !(bssCaps & _WIFI_CAP_PRIVACY)) && (rsn=3) ||
+		// secured BSS not allowed
+		(!(_wifi_macParams.encrypt & ~WLN_ENCR_OPEN) && (bssCaps & _WIFI_CAP_PRIVACY)))
+	{
+		if (debug_on)
+		DPRINTF4("CheckBSS %.*ls: not %s\n", sp->ssid_len, sp->ssid,
+			rsn==1?"ESS":rsn==2?"IBSS":rsn==3?"secure":"open");
+		return FALSE;
+	}
+
+	// Check SSID if looking for a specific one
+	if (_wifi_macParams.ssid_len > 0 &&
+		!(sp->ssid_len == _wifi_macParams.ssid_len &&
+		  memcmp (sp->ssid, _wifi_macParams.ssid, _wifi_macParams.ssid_len) == 0))
+	{
+		if (debug_on)
+		DPRINTF3("CheckBSS %.*ls: SSID mismatch\n", sp->ssid_len, sp->ssid);
+		return FALSE;
+	}
+
+	// No rates supported
+	if (sp->rates == 0)
+	{
+		if (debug_on)
+		DPRINTF3("CheckBSS %.*ls: no rates supported\n", sp->ssid_len, sp->ssid);
+		return FALSE;
+	}
+
+	// If not WPA, check if WEP allowed
+	if (sp->wpa_info_len == 0 &&
+		!(_wifi_macParams.encrypt & WLN_ENCR_WEP) &&
+		(bssCaps & _WIFI_CAP_PRIVACY))
+	{
+		if (debug_on)
+		DPRINTF3("CheckBSS %.*ls: not WEP\n", sp->ssid_len, sp->ssid);
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+/*** BeginHeader _wifi_RecvScan */
+void _wifi_RecvScan (__far WiFiMacBuffer *buf);
+/*** EndHeader */
+
+//
+// Process a received beacon or probe response frame while scanning
+// @param buf Received frame
+//
+_wifig_nodebug
+void _wifi_RecvScan (__far WiFiMacBuffer *buf)
+{
+	auto _wifi_wln_scan_bss __far *sp;
+	auto int i;
+   auto _wifi_wln_scan_data __far *sd;
+
+	// Check if already full table
+	if (_wifi_scan.count == _wifi_scan.max)
+		return;
+
+	// Check if already have this BSS
+	for (i = _wifi_scan.count-1; i >= 0; i--)
+			if (_wifi_scan.channel == _wifi_scan_data.bss[i].channel &&
+				_WIFI_EQUAL_ADDR (buf->macHdr.addr3, _wifi_scan_data.bss[i].bss_addr))
+				return;
+
+	// Add new BSS to end of list
+	sp = _wifi_scan_data.bss + _wifi_scan.count;
+	if (!_wifi_ParseBeacon (buf, _wifi_scan.channel, sp))
+		return;
+
+#if WIFI_MAC_MGMT_VERBOSE
+	if (debug_on)
+	DPRINTF ("New bssid[%d]=%02x:%02x:%02x:%02x:%02x:%02x " \
+		"ssid=%.*ls chan=%d rssi=%d caps=0x%04x rates=0x%04x\n",
+		_wifi_scan.count,
+		sp->bss_addr[0], sp->bss_addr[1], sp->bss_addr[2],
+		sp->bss_addr[3], sp->bss_addr[4], sp->bss_addr[5],
+		sp->ssid_len, sp->ssid, sp->channel,
+		sp->rx_signal, sp->bss_caps, sp->rates);
+#endif
+	++_wifi_scan.count;
+}
+
+/*** BeginHeader _wifi_RecvBeacon */
+void _wifi_RecvBeacon (__far WiFiMacBuffer *buf);
+/*** EndHeader */
+
+//
+// Process a received beacon or probe response frame
+// while joined or trying to join a BSS
+// @param buf Received frame
+//
+_wifig_nodebug
+void _wifi_RecvBeacon (__far WiFiMacBuffer *buf)
+{
+	auto _wifi_wln_scan_bss info;
+
+	// Beacon is from another BSS
+	if (!_WIFI_EQUAL_ADDR (_wifi_macStatus.bss_addr, buf->macHdr.addr3))
+	{
+	#if WIFI_MAC_MGMT_VERBOSE
+		if (_wifi_staState == _WIFI_SS_BEACON)
+			DPRINTF("Ignoring beacon from another BSS\n");
+	#endif
+		// Found another IBSS that matches our SSID, join it
+		if (_wifi_staState == _WIFI_SS_ASSOC &&
+			(_wifi_macStatus.bss_caps & _WIFI_CAP_IBSS) &&
+			_wifi_ParseBeacon (buf, _wifi_macStatus.channel, &info) &&
+			(info.bss_caps & _WIFI_CAP_IBSS) &&
+			info.ssid_len == _wifi_macStatus.ssid_len &&
+			!memcmp (info.ssid, _wifi_macStatus.ssid, info.ssid_len))
+		{
+			DPRINTF("_wifi_RecvBeacon: joining IBSS\n");
+
+			wln_send_event (WLN_EVT_DISASSOC, _wifi_macStatus.bss_addr);
+
+			_wifi_setStaState(_WIFI_SS_BEACON);
+			_WIFI_SET_ADDR (_wifi_macStatus.bss_addr, info.bss_addr);
+		}
+		else
+			return;
+	}
+
+	// Parse beacon from current BSS
+	else if (!_wifi_ParseBeacon (buf, _wifi_macStatus.channel, &info)) {
+		DPRINTF(" - unsuitable access point\n");
+		return;
+	}
+
+	// Restore state after a scan
+	if (_wifi_scan.state >= _WIFI_SS_JOIN)
+	{
+		_wifi_setStaState(_wifi_scan.state);
+		_wifi_scan.state = _WIFI_SS_WAIT;
+      _wifi_bcnTime = 0;
+	}
+
+	// Waiting for first beacon from BSS
+	if (_wifi_staState == _WIFI_SS_BEACON)
+	{
+#if WIFI_MAC_MGMT_VERBOSE
+		DPRINTF("Got first beacon\n");
+#endif
+		// Set BSS info
+		_wifi_macStatus.bss_caps = info.bss_caps;
+		_wifi_macStatus.authen = 0;
+		_wifi_macStatus.encrypt = 0;
+		_wifi_atimWindow = info.atim;
+		_wifi_basicRates = info.rates_basic;
+
+		// Initialize rate info
+		if (!_wifi_InitRates (&info, TRUE)) {
+			DPRINTF(" - unsuitable rates\n");
+			return;
+		}
+
+		// Initialize non-WPA encryption
+		_wifi_SetDefaultKeys();
+
+		// Initialize beacon timer
+		_wifi_bcnInt = _WIFI_GET16_FAR(buf->body+8);
+		_wifi_bcnTime = 0;
+
+		if (_wifi_macStatus.bss_caps & _WIFI_CAP_ESS)
+		{
+			// Free any beacon or probe response frames
+			_wifi_FreeBuffers (_wifi_bcnFrame);
+			_wifi_FreeBuffers (_wifi_respFrame);
+			_wifi_bcnFrame = _wifi_respFrame = NULL;
+		}
+		else
+			// Make IBSS beacon using current beacon interval
+			if (!_wifi_MakeBeacon (_wifi_bcnInt))
+				return;
+
+      // Update BSS info in hardware
+      _wifi_SetBSS (_wifi_macStatus.bss_caps, _wifi_macStatus.bss_addr,
+            _wifi_macStatus.ssid, _wifi_macStatus.ssid_len, info.rates_basic, _wifi_atimWindow);
+
+     if (_wifi_macStatus.bss_caps & _WIFI_CAP_ESS) {
+			// Send authentication frame if ESS
+			_wifi_setStaState(_WIFI_SS_JOIN);
+			_wifi_authState = _WIFI_SA_INIT;
+			_wifi_SendNextMgmtFrame();
+		}
+		else {
+			_wifi_setStaState(_WIFI_SS_ASSOC);
+			_wifi_macStatus.state = WLN_ST_JOIN_IBSS;
+			wln_send_event (WLN_EVT_ASSOC, _wifi_macStatus.bss_addr);
+			wln_send_event (WLN_EVT_LINKUP, _wifi_macStatus.bss_addr);
+		}
+	}
+	else if (_wifi_erpInfo != info.erp_info) {
+	// Update rate info if protection state changes
+		if (!_wifi_InitRates (&info, FALSE))
+			_wifi_wln_disassociate (_wifi_macStatus.bss_addr, _WIFI_REAS_DEAUTH_LEAVING);
+	}
+
+	// Update ERP info which can change every beacon
+	_wifi_erpInfo = info.erp_info;
+}
+
+/*** BeginHeader _wifi_RecvAuthentication */
+void _wifi_RecvAuthentication (__far WiFiMacBuffer *buf);
+/*** EndHeader */
+
+//
+// Process a received authentication frame
+// @param buf Received frame
+//
+_wifig_nodebug
+void _wifi_RecvAuthentication (__far WiFiMacBuffer *buf)
+{
+	// Check authentication response
+	if (_WIFI_GET16_FAR(&buf->body[4]) != _WIFI_STAT_SUCCESS)
+	{
+		// Try next method
+		_wifi_authState++;
+		_wifi_SendNextMgmtFrame();
+		return;
+	}
+
+	switch (_wifi_authState)
+	{
+		case _WIFI_SA_OPEN:
+			if (_WIFI_GET16_FAR(buf->body) == _WIFI_AUTH_OPEN &&
+				_WIFI_GET16_FAR(&buf->body[2]) == 2)
+			{
+				_wifi_setStaState(_WIFI_SS_AUTH);
+				_wifi_macStatus.authen = WLN_AUTH_OPEN;
+				_wifi_SendNextMgmtFrame();
+			}
+			break;
+
+		case _WIFI_SA_LEAP:
+			if (_WIFI_GET16_FAR(buf->body) == _WIFI_AUTH_LEAP &&
+				_WIFI_GET16_FAR(&buf->body[2]) == 2)
+			{
+				_wifi_setStaState(_WIFI_SS_AUTH);
+				_wifi_macStatus.authen = WLN_AUTH_LEAP;
+				_wifi_SendNextMgmtFrame();
+			}
+			break;
+
+		case _WIFI_SA_SHARED:
+			// Shared key challenge (2nd frame)
+			if (!(buf->macHdr.fc.flags & _WIFI_FCNTRL_PROTECT) &&
+				_WIFI_GET16_FAR(buf->body) == _WIFI_AUTH_SHAREDKEY &&
+				_WIFI_GET16_FAR(&buf->body[2]) == 2 &&
+				buf->body[6] == _WIFI_ELEM_CHALLENGE &&
+				buf->body[7] == _WIFI_CHAL_SIZE)
+			{
+				_f_memcpy (_wifi_challenge, &buf->body[8], _WIFI_CHAL_SIZE);
+				_wifi_authState = _WIFI_SA_SHARED2;
+				_wifi_SendNextMgmtFrame();
+			}
+			break;
+
+		case _WIFI_SA_SHARED2:
+			// Shared key response (4th frame)
+			if (_WIFI_GET16_FAR(buf->body) == _WIFI_AUTH_SHAREDKEY &&
+				_WIFI_GET16_FAR(&buf->body[2]) == 4)
+			{
+				_wifi_setStaState(_WIFI_SS_AUTH);
+				_wifi_macStatus.authen = WLN_AUTH_SHAREDKEY;
+				_wifi_SendNextMgmtFrame();
+			}
+			break;
+
+		default:
+			break;
+	}
+
+	// Ignore other received authentication frames
+}
+
+/*** BeginHeader _wifi_CompareBSS */
+int _wifi_CompareBSS (__far _wifi_wln_scan_bss *a, __far _wifi_wln_scan_bss *b);
+/*** EndHeader */
+
+//
+// Compare BSS information
+// Return > 0 if b is better than a
+//
+_wifig_nodebug
+int _wifi_CompareBSS (__far _wifi_wln_scan_bss *a, __far _wifi_wln_scan_bss *b)
+{
+	auto BOOL pref_a;
+   auto BOOL pref_b;
+
+	// Use strongest signal
+	return b->rx_signal - a->rx_signal;
+}
+
+/*** BeginHeader _wifi_StartScan */
+void _wifi_StartScan (uint8 *ssid, int ssid_len, int channel, BOOL requested);
+/*** EndHeader */
+
+//
+// Start scanning for BSS info
+//
+_wifig_nodebug
+void _wifi_StartScan (uint8 *ssid, int ssid_len, int channel, BOOL requested)
+{
+	// Save parameters
+	memcpy (_wifi_scan.ssid, ssid, ssid_len);
+	_wifi_scan.ssid_len = ssid_len;
+	if (channel == WLN_CHAN_SCAN)
+		_wifi_scan.chan_mask = _wifi_macParams.chan_mask;
+	else
+		_wifi_scan.chan_mask = 1 << (channel-1);
+	_wifi_scan.requested = requested;
+
+   // If not already scanning, save current state to restore after scan complete
+   if (_wifi_scan.state == _WIFI_SS_WAIT)
+		_wifi_scan.state = _wifi_staState;
+
+   // Switch to scan state
+	_wifi_setStaState(_WIFI_SS_SCAN);
+	_wifi_scan.channel = 0;
+	_wifi_scan.count = 0;
+	_wifi_scan.time = _WIFI_GET_TIME();
+	_wifi_retry = _WIFI_SCAN_LIMIT;
+
+	if (!requested)
+   {
+		_wifi_macStatus.state = WLN_ST_SCANNING;
+   }
+   if (requested)
+		_wifi_ScanChannel();
+}
+
+/*** BeginHeader _wifi_ScanChannel */
+void _wifi_ScanChannel (void);
+/*** EndHeader */
+
+//
+// Scan a channel for BSS info
+//
+_wifig_nodebug
+void _wifi_ScanChannel (void)
+{
+	auto __far uint8 *bp;
+	auto __far WiFiMacBuffer *buf;
+#if WIFIG_VERBOSE
+	auto int i;
+#endif
+
+	_wifi_retry++;
+
+	// After _WIFI_SCAN_LIMIT (or first time), switch to next channel.
+	// Receive frames on this channel until next timer tick.
+	if (_wifi_retry >= _WIFI_SCAN_LIMIT)
+	{
+		// Wait for transmit queue to empty
+		if (_wifi_txQueue.head != NULL || _wifi_txState != _WIFI_ST_IDLE)
+			return;
+
+		// Find next active channel
+		while (_wifi_scan.channel <= WLN_CHAN_NUM)
+		{
+			_wifi_scan.channel++;
+			if (_wifi_scan.chan_mask & (1 << (_wifi_scan.channel-1)))
+				break;
+		}
+
+		// Switch to next channel
+		if (_wifi_scan.channel <= WLN_CHAN_NUM)
+		{
+			_wifi_retry = 0;
+			_wifi_SetChannel (_wifi_scan.channel);
+
+			// Set BSSID and SSID to receive all frames
+			_wifi_SetBSS (0, _wifi_bc_addr, NULL, 0, 0, 0);
+		}
+
+		// Finished with application requested scan
+		else if (_wifi_scan.requested)
+		{
+
+			// Restore state before scan
+			if (_wifi_scan.state >= _WIFI_SS_JOIN) {
+				// Set BSS info in hardware
+				_wifi_SetChannel (_wifi_macStatus.channel);
+				_wifi_SetBSS (_wifi_macStatus.bss_caps, _wifi_macStatus.bss_addr,
+						        _wifi_macStatus.ssid, _wifi_macStatus.ssid_len,
+						        _wifi_basicRates, _wifi_atimWindow);
+
+				// Wait to receive a beacon
+				_wifi_setStaState(_WIFI_SS_BEACON);
+				_wifi_mgmtTime = _WIFI_GET_TIME();
+			}
+         else {
+				_wifi_setStaState(_WIFI_SS_WAIT);
+           _wifi_scan.state = _WIFI_SS_WAIT;
+         }
+
+			// Send scan event with results to application
+			_wifi_scan_data.count = _wifi_scan.count;
+			wln_send_event (WLN_EVT_SCAN_RESULTS, &_wifi_scan_data);
+         // Force new auto scan
+			_wifi_scan_data.count = 0;
+         _wifi_scan.time = 0;
+		}
+
+		// Finished with auto scan
+		else
+		{
+#if WIFI_MAC_MGMT_VERBOSE
+			DPRINTF("WIFI Auto Scan\n");
+#endif
+			// Sort the found BSS's by rx_signal strength
+			if (_wifi_scan.count > 1) {
+				_f_qsort(_wifi_scan_data.bss, _wifi_scan.count,
+						sizeof(_wifi_wln_scan_bss), _wifi_CompareBSS);
+            #if WIFIG_VERBOSE
+				for(i = 0; i < _wifi_scan.count; ++i) {
+	            printf("%X: %16ls ; ch %2d ; rss %d\n", i,
+	            		 _wifi_scan_data.bss[i].ssid,
+	                   _wifi_scan_data.bss[i].channel,
+	                   _wifi_scan_data.bss[i].rx_signal);
+	         }
+            #endif
+			}
+
+			// Try to join BSS's, starting with the first one.
+			_wifi_scan.index = 0;
+		   _wifi_scan.state = _WIFI_SS_WAIT;
+			_wifi_scan.index = 0;
+#if WIFI_MAC_MGMT_VERBOSE
+			DPRINTF("Finished preference sorting, next BSS...\n");
+#endif
+			_wifi_NextBSS();
+		}
+	}
+
+	// On other timer ticks, send probe request
+	else
+	{
+      /* wait for power level from AP if 802.11d is enabled */
+      if (_wifi_macParams.options & WLN_OPT_MULTI_DOMAIN)
+         if (_wifi_macStatus.tx_power < 0)
+             return;
+
+		buf = _wifi_GetBuffer();
+		if (buf == NULL)
+			return;
+		bp = buf->body;
+
+		// Set SSID
+		bp[0] = _WIFI_ELEM_SSID;
+		bp[1] = _wifi_scan.ssid_len;
+		_f_memcpy (&buf->body[2], _wifi_scan.ssid, _wifi_scan.ssid_len);
+		bp += bp[1] + 2;
+
+		// Set supported rates
+		bp = _wifi_SetRates (bp, 0, _wifi_scan.channel);
+
+		buf->macHdr.fc.type = _WIFI_TYPE_PROBE_REQ;
+		//_WIFI_SET_ADDR (buf->macHdr.addr3, _wifi_bc_addr);
+      _f_memcpy(buf->macHdr.addr3, _wifi_bc_addr, WLN_ADDR_SIZE);
+
+		buf->length = (word)(_WIFI_DATA_SIZE + (bp - buf->body));
+
+		if (_WIFI_CHAN_5G (_wifi_scan.channel))
+			_wifi_rateMin = _WIFI_RATE_MIN_A;
+		else
+			_wifi_rateMin = _WIFI_RATE_MIN_B;
+
+		_wifi_SendFrames (buf, _wifi_bc_addr);
+	}
+}
+
+/*** BeginHeader _wifi_NextBSS */
+void _wifi_NextBSS (void);
+/*** EndHeader */
+
+//
+// Try to associate with next BSS
+//
+_wifig_nodebug
+void _wifi_NextBSS (void)
+{
+	auto _wifi_wln_scan_bss __far *sp;
+
+#if WIFI_MAC_MGMT_VERBOSE
+	DPRINTF3("Try BSS %d of %d...\n", _wifi_scan.index,
+	         _wifi_scan.count);
+#endif
+	// Exit if not joining a BSS
+	if (_wifi_macParams.bss_type >= WLN_BSS_NONE)
+	{
+#if WIFI_MAC_MGMT_VERBOSE
+		DPRINTF("Not joining BSS\n");
+#endif
+		// Clear BSSID so no more frames are received
+		memset (_wifi_macStatus.bss_addr, 0, WLN_ADDR_SIZE);
+		_wifi_SetBSS (0, _wifi_macStatus.bss_addr, NULL, 0, 0, 0);
+
+		_wifi_setStaState(_WIFI_SS_WAIT);
+		_wifi_macStatus.state = WLN_ST_STOPPED;
+		return;
+	}
+
+	_wifi_setStaState(_WIFI_SS_BEACON);
+	_wifi_macStatus.state = WLN_ST_SCANNING;
+
+	// Scan data has expired, start a new scan
+	if (!_wifi_scan.time ||
+	    _WIFI_GET_TIME()-_wifi_scan.time >= _WIFI_SCAN_MAX_TIME)
+	{
+		DPRINTF("Scan data expired\n");
+		_wifi_StartScan (_wifi_macParams.ssid, _wifi_macParams.ssid_len,
+		                 _wifi_macParams.channel, FALSE);
+		return;
+	}
+
+	// Try next BSS in scan info
+	while (_wifi_scan.index < _wifi_scan.count)
+	{
+		sp = _wifi_scan_data.bss + _wifi_scan.index;
+		_wifi_scan.index++;
+
+		// Check if BSS info matches current parameters
+		if (!_wifi_CheckBSS (sp))
+			continue;
+
+		// Set BSS info so event handler can call wln_get_status()
+		_f_memcpy (_wifi_macStatus.ssid, sp->ssid, sp->ssid_len);
+		_wifi_macStatus.ssid_len = sp->ssid_len;
+		_wifi_macStatus.channel = sp->channel;
+		_wifi_macStatus.bss_caps = sp->bss_caps;
+		_WIFI_SET_ADDR (_wifi_macStatus.bss_addr, sp->bss_addr);
+		_f_memcpy (_wifi_macStatus.wpa_info, sp->wpa_info, sp->wpa_info_len + 2);
+		_wifi_macStatus.authen = 0;
+		_wifi_macStatus.encrypt = 0;
+		_wifi_macStatus.tx_rate = sp->tx_rate;
+		_wifi_macStatus.rx_signal = sp->rx_signal;
+
+		// If have event callback function, notify application.
+		// Application will call _wifi_wln_associate() to associate with this BSS.
+		if (!wln_send_event (WLN_EVT_JOIN, _wifi_macStatus.bss_addr))
+		{
+			DPRINTF3("OK to join '%.*s'\n", _wifi_macStatus.ssid_len,
+			         _wifi_macStatus.ssid_len ? _wifi_macStatus.ssid : "");
+			// Try to associate with BSS.
+			_wifi_wln_associate (_wifi_macStatus.ssid, _wifi_macStatus.ssid_len,
+				                  _wifi_macStatus.channel, _wifi_macStatus.bss_addr,
+				                  _wifi_macStatus.wpa_info);
+		}
+		return;
+	}
+
+	// No more scan info, try to start an IBSS
+	if (_wifi_StartIBSS())
+		return;
+
+#if WIFI_MAC_MGMT_VERBOSE
+	DPRINTF("Restarting scan.\n");
+#endif
+	// Restart scan after a delay
+	_wifi_setStaState(_WIFI_SS_WAIT);
+	_wifi_SendMgmtFrame();
+}
+
+/*** BeginHeader _wifi_SendAuthentication */
+void _wifi_SendAuthentication (void);
+/*** EndHeader */
+
+//
+// Send authentication request
+//
+_wifig_nodebug
+void _wifi_SendAuthentication (void)
+{
+	auto __far WiFiMacBuffer *buf;
+
+   buf = _wifi_GetBuffer();
+
+	if (buf == NULL)
+		return;
+
+	// Set common frame contents
+	buf->macHdr.fc.type = _WIFI_TYPE_AUTH;
+	_WIFI_SET16_FAR(&buf->body[2], 1);
+	_WIFI_SET16_FAR(&buf->body[4], 0);
+	buf->length = _WIFI_DATA_SIZE + 6;
+
+#if WIFI_MAC_MGMT_VERBOSE
+	DPRINTF3("_wifi_SendAuthentication: retry=%d, authState=%d\n", _wifi_retry,
+	         _wifi_authState);
+#endif
+
+	_wifi_retry++;
+	if (_wifi_retry >= _WIFI_MGMT_RETRY_LIMIT)
+	{
+		// Try next method
+		_wifi_authState++;
+		_wifi_retry = 0;
+	}
+
+	switch (_wifi_authState)
+	{
+		case _WIFI_SA_LEAP:			// note _WIFI_SA_LEAP == _WIFI_SA_INIT
+			// LEAP allowed and not a WPA BSS
+			if ((_wifi_macParams.authen & WLN_AUTH_LEAP) && _wifi_macStatus.wpa_info_len == 0)
+			{
+				_WIFI_SET16_FAR(&buf->body[0], _WIFI_AUTH_LEAP);
+				_wifi_authState = _WIFI_SA_LEAP;
+				break;
+			}
+			// Fall through to next method
+
+		case _WIFI_SA_SHARED:
+			// Shared key allowed and not a WPA BSS
+			if ((_wifi_macParams.authen & WLN_AUTH_SHAREDKEY) && _wifi_macStatus.wpa_info_len == 0)
+			{
+				_WIFI_SET16_FAR(&buf->body[0], _WIFI_AUTH_SHAREDKEY);
+				_wifi_authState = _WIFI_SA_SHARED;
+				break;
+			}
+			// Fall through to next method
+
+		case _WIFI_SA_OPEN:
+		case _WIFI_SA_FAIL2:
+			// Open system or WEP with 802.1X allowed, or a WPA BSS
+			if ((_wifi_macParams.authen & (WLN_AUTH_OPEN|WLN_AUTH_WEP_8021X)) ||
+				_wifi_macStatus.wpa_info_len > 0)
+			{
+				_WIFI_SET16_FAR(&buf->body[0], _WIFI_AUTH_OPEN);
+				_wifi_authState = _WIFI_SA_OPEN;
+				break;
+			}
+			// Fall through to next method
+
+		case _WIFI_SA_FAIL:
+			// All methods have failed
+			_wifi_FreeBuffers (buf);
+			DPRINTF(" - all auth methods failed, next BSS...\n");
+			_wifi_NextBSS();
+			return;
+
+		case _WIFI_SA_SHARED2:
+			// Shared key response (3rd frame)
+			_WIFI_SET16_FAR(&buf->body[_WIFI_IV_SIZE], _WIFI_AUTH_SHAREDKEY);
+			_WIFI_SET16_FAR(&buf->body[_WIFI_IV_SIZE+2], 3);
+			_WIFI_SET16_FAR(&buf->body[_WIFI_IV_SIZE+4], 0);
+			buf->body[_WIFI_IV_SIZE+6] = _WIFI_ELEM_CHALLENGE;
+			buf->body[_WIFI_IV_SIZE+7] = _WIFI_CHAL_SIZE;
+			_f_memcpy (&buf->body[_WIFI_IV_SIZE+8], _wifi_challenge, _WIFI_CHAL_SIZE);
+			buf->length = _WIFI_DATA_SIZE + _WIFI_CHAL_SIZE + 8;
+
+			// Encrypt challenge with WEP
+			if (!_wifi_wepCipher.Encrypt (buf))
+			{
+				// No WEP keys available
+				_wifi_FreeBuffers (buf);
+				_wifi_authState = _WIFI_SA_FAIL2;
+				return;
+			}
+
+			_wifi_authState = _WIFI_SA_SHARED2;
+			break;
+
+		default:
+			// invalid state, possibly caused by changing Wi-Fi settings (V29126)
+	      DPRINTF2("_wifi_SendAuthentication: reset invalid authState (%d)\n",
+	               _wifi_authState);
+			_wifi_authState = _WIFI_SA_INIT;
+			_wifi_retry = 0;
+			return;
+	}
+
+	_wifi_SendFrames (buf, _wifi_macStatus.bss_addr);
+}
+
+/*** BeginHeader _wifi_SendAssociation */
+void _wifi_SendAssociation (void);
+/*** EndHeader */
+
+//
+// Send association request
+//
+_wifig_nodebug
+void _wifi_SendAssociation (void)
+{
+	auto __far uint8 *bp;
+	auto uint16 caps;
+   auto __far WiFiMacBuffer *buf;
+
+	buf = _wifi_GetBuffer();
+	if (buf == NULL)
+		return;
+	bp = buf->body;
+
+   // Set capabilities
+   caps = _WIFI_CAP_ESS;
+   if (_wifi_macParams.options & WLN_OPT_SHORTPRE)
+       caps |= _WIFI_CAP_SHORTPRE;
+   // Always support short preamble and short slot time for 802.11g
+   if (!(_wifi_macParams.options & WLN_OPT_BONLY))
+       caps |= _WIFI_CAP_SHORTPRE|_WIFI_CAP_SHORTSLOT;
+
+	_WIFI_SET16_FAR(bp, caps);
+	_WIFI_SET16_FAR(bp+2, 0);
+	bp += 4;
+
+	// Set SSID
+	bp[0] = _WIFI_ELEM_SSID;
+	bp[1] = _wifi_macStatus.ssid_len;
+	_f_memcpy (bp+2, _wifi_macStatus.ssid, _wifi_macStatus.ssid_len);
+	bp += bp[1] + 2;
+
+	// Set supported rates
+	bp = _wifi_SetRates (bp, 0, _wifi_macStatus.channel);
+
+	// Set WPA info
+	if (_wifi_macStatus.wpa_info_len > 0)
+	{
+		_f_memcpy (bp, _wifi_macStatus.wpa_info,
+		           _wifi_macStatus.wpa_info_len + 2);
+		bp += bp[1] + 2;
+	}
+
+	buf->macHdr.fc.type = _WIFI_TYPE_ASSOC_REQ;
+	buf->length = _WIFI_DATA_SIZE + (word)(bp - buf->body);
+	_wifi_SendFrames (buf, _wifi_macStatus.bss_addr);
+}
+
+/*** BeginHeader _wifi_SendNextMgmtFrame */
+void _wifi_SendNextMgmtFrame (void);
+/*** EndHeader */
+
+//
+// Clear retry count and send the next management frame
+//
+_wifig_nodebug
+void _wifi_SendNextMgmtFrame (void)
+{
+	_wifi_retry = 0;
+	_wifi_mgmtTime = _WIFI_GET_TIME();
+	_wifi_SendMgmtFrame();
+}
+
+/*** BeginHeader _wifi_SendMgmtFrame */
+void _wifi_SendMgmtFrame (void);
+/*** EndHeader */
+
+//
+// Check retry count and send the next management frame
+//
+_wifig_nodebug
+void _wifi_SendMgmtFrame (void)
+{
+	switch (_wifi_staState)
+	{
+   	case _WIFI_SS_WAIT:
+         // If joining a BSS, restart scan after SCAN_MIN_TIME
+         if (_wifi_macParams.bss_type < WLN_BSS_NONE &&
+            (_wifi_scan.time == 0 || _WIFI_GET_TIME()-_wifi_scan.time >= _WIFI_SCAN_MIN_TIME))
+             _wifi_StartScan (_wifi_macParams.ssid, _wifi_macParams.ssid_len,
+                              _wifi_macParams.channel, FALSE);
+         break;
+
+   	case _WIFI_SS_BEACON:
+        	// No beacon received
+			if (_wifi_macStatus.bss_caps & _WIFI_CAP_ESS) {
+            // Can't restore connection prior to a scan, notify application
+            if (_wifi_scan.state == _WIFI_SS_ASSOC) {
+   				DPRINTF("_wifi_SendMgmtFrame: DISASSOC because scan\n");
+               wln_send_event (WLN_EVT_DISASSOC, _wifi_macStatus.bss_addr);
+            }
+            _wifi_scan.state = _WIFI_SS_WAIT;
+
+				// Continue scanning
+#if WIFI_MAC_MGMT_VERBOSE
+				DPRINTF("No beacon rx'd, next BSS...\n");
+#endif
+            _wifi_NextBSS();
+			}
+			// If IBSS, there may not be another station sending beacons.
+			// Just assume we are connected after a timeout.
+			else {
+				_wifi_setStaState(_WIFI_SS_ASSOC);
+				_wifi_scan.state = _WIFI_SS_WAIT;
+            }
+         break;
+
+		case _WIFI_SS_JOIN:
+			_wifi_SendAuthentication();
+			break;
+
+		case _WIFI_SS_AUTH:
+			_wifi_retry++;
+			if (_wifi_retry >= _WIFI_MGMT_RETRY_LIMIT) {
+				DPRINTF("Too many assoc requests, next BSS...\n");
+				_wifi_NextBSS();
+			}
+			else
+				_wifi_SendAssociation();
+			break;
+
+		default:
+			break;
+	}
+}
+
+/*** BeginHeader _wifi_StartIBSS */
+BOOL _wifi_StartIBSS (void);
+/*** EndHeader */
+
+//
+// Start a new IBSS
+//
+_wifig_nodebug
+BOOL _wifi_StartIBSS (void)
+{
+	auto _wifi_wln_scan_bss info;
+	auto int i;
+
+	// Must have specific type, channel, and SSID
+	if (!(_wifi_macParams.bss_type == WLN_BSS_IBSS &&
+		  _wifi_macParams.channel != WLN_CHAN_SCAN &&
+		  _wifi_macParams.ssid_len != 0))
+		return FALSE;
+
+	// Init BSS info
+	memcpy (_wifi_macStatus.ssid, _wifi_macParams.ssid,
+	        _wifi_macParams.ssid_len);
+	_wifi_macStatus.ssid_len = _wifi_macParams.ssid_len;
+	_wifi_macStatus.channel = _wifi_macParams.channel;
+	_wifi_macStatus.wpa_info_len = 0;
+	_wifi_macStatus.authen = 0;
+	_wifi_macStatus.encrypt = 0;
+	_wifi_atimWindow = 0;
+	_wifi_erpInfo = 0;
+
+	// Set capabilities
+	_wifi_macStatus.bss_caps = _WIFI_CAP_IBSS;
+	if (!(_wifi_macParams.encrypt & WLN_ENCR_OPEN))
+		_wifi_macStatus.bss_caps |= _WIFI_CAP_PRIVACY;
+	if (_wifi_macParams.options & WLN_OPT_SHORTPRE)
+		_wifi_macStatus.bss_caps |= _WIFI_CAP_SHORTPRE;
+
+	// Init rate info
+	if (_WIFI_CHAN_5G (_wifi_macStatus.channel))
+		info.rates = _WIFI_RATE_MASK_A;
+	else if (_wifi_macParams.options & WLN_OPT_BONLY)
+		info.rates = _WIFI_RATE_MASK_B;
+	else
+		info.rates = _WIFI_RATE_MASK_G;
+
+   info.rates_basic = info.rates & _WIFI_RATE_MASK_BASIC;
+	_wifi_basicRates = info.rates_basic;
+	info.erp_info = 0;
+	_wifi_InitRates (&info, TRUE);
+
+	// Select a random BSSID
+	for (i = 0; i < WLN_ADDR_SIZE; i++)
+		_wifi_macStatus.bss_addr[i] = rand16();
+	_wifi_macStatus.bss_addr[0] &= ~_WIFI_MAC_GROUP;  // clear group bit
+	_wifi_macStatus.bss_addr[0] |=  _WIFI_MAC_LOCAL;  // set local bit
+
+	if (!_wifi_MakeBeacon (_WIFI_BEACON_INT))
+		return FALSE;
+
+	// Initialize non-WPA encryption
+	_wifi_SetDefaultKeys();
+
+	// Set BSS info in hardware
+	_wifi_SetChannel (_wifi_macStatus.channel);
+	_wifi_SetBSS (_wifi_macStatus.bss_caps, _wifi_macStatus.bss_addr,
+		           _wifi_macStatus.ssid, _wifi_macStatus.ssid_len,
+		           info.rates_basic, _wifi_atimWindow);
+#if WIFIG_VERBOSE
+	DPRINTF ("Start bssid=%02x:%02x:%02x:%02x:%02x:%02x " \
+		"ssid=%.*s chan=%d caps=0x%04x\n",
+		_wifi_macStatus.bss_addr[0], _wifi_macStatus.bss_addr[1],
+		_wifi_macStatus.bss_addr[2],
+		_wifi_macStatus.bss_addr[3], _wifi_macStatus.bss_addr[4],
+		_wifi_macStatus.bss_addr[5],
+		_wifi_macStatus.ssid_len, _wifi_macStatus.ssid_len ? _wifi_macStatus.ssid : "",
+		_wifi_macStatus.channel, _wifi_macStatus.bss_caps);
+#endif
+	_wifi_setStaState(_WIFI_SS_ASSOC);
+	_wifi_macStatus.state = WLN_ST_START_IBSS;
+	wln_send_event (WLN_EVT_ASSOC, _wifi_macStatus.bss_addr);
+	wln_send_event (WLN_EVT_LINKUP, _wifi_macStatus.bss_addr);
+
+	return TRUE;
+}
+
+/*** BeginHeader _wifi_MakeBeacon */
+BOOL _wifi_MakeBeacon (int interval);
+/*** EndHeader */
+
+//
+// Create beacon and probe response frames to send in an IBSS
+// @param interval Beacon interval in TU
+// @return TRUE if success, FALSE if error
+//
+_wifig_nodebug
+BOOL _wifi_MakeBeacon (int interval)
+{
+	auto __far uint8 *bp;
+	auto uint16 caps;
+	auto int dur;
+
+	// Allocate or reuse current frames
+	if (_wifi_bcnFrame == NULL)
+		_wifi_bcnFrame = _wifi_GetBuffer();
+	if (_wifi_respFrame == NULL)
+		_wifi_respFrame = _wifi_GetBuffer();
+	if (_wifi_respFrame == NULL || _wifi_bcnFrame == NULL)
+		return FALSE;
+
+	// Init beacon MAC header
+	_f_memset (&_wifi_bcnFrame->macHdr, 0, sizeof (WiFiMacHeader));
+	_wifi_bcnFrame->macHdr.fc.type = _WIFI_TYPE_BEACON;
+	_f_memset (_wifi_bcnFrame->macHdr.addr1, 0xff, WLN_ADDR_SIZE);
+	_f_memcpy (_wifi_bcnFrame->macHdr.addr2, _wifi_macParams.sta_addr,
+	           WLN_ADDR_SIZE);
+	_f_memcpy (_wifi_bcnFrame->macHdr.addr3, _wifi_macStatus.bss_addr,
+	           WLN_ADDR_SIZE);
+
+	// Set fixed params
+	// Timestamp is set by hardware
+	bp = _wifi_bcnFrame->body;
+	_WIFI_SET16_FAR(&bp[8], interval);
+
+	// Set capabilities
+	caps = _wifi_macStatus.bss_caps &
+	       (_WIFI_CAP_ESS|_WIFI_CAP_IBSS|_WIFI_CAP_PRIVACY);
+	if (_wifi_macParams.options & WLN_OPT_SHORTPRE)
+		caps |= _WIFI_CAP_SHORTPRE;
+	_WIFI_SET16_FAR(&bp[10], caps);
+	bp += 12;
+
+	// Set SSID
+	bp[0] = _WIFI_ELEM_SSID;
+	bp[1] = _wifi_macStatus.ssid_len;
+	_f_memcpy (&bp[2], _wifi_macStatus.ssid, _wifi_macStatus.ssid_len);
+	bp += bp[1] + 2;
+
+	// Set supported rates
+	bp = _wifi_SetRates (bp, _WIFI_ELEM_SUPRATES, _wifi_macStatus.channel);
+
+	// Set channel number
+	if (!_WIFI_CHAN_5G (_wifi_macStatus.channel))
+	{
+		bp[0] = _WIFI_ELEM_DSPARAM;
+		bp[1] = 1;
+		bp[2] = _wifi_macStatus.channel;
+		bp += bp[1] + 2;
+	}
+
+	// Set IBSS ATIM window
+	bp[0] = _WIFI_ELEM_IBSSPARAM;
+	bp[1] = 2;
+	_WIFI_SET16_FAR(&bp[2], _wifi_atimWindow);
+	bp += bp[1] + 2;
+
+	// Set ERP info.
+	if (!_WIFI_CHAN_5G (_wifi_macStatus.channel) &&
+	    !(_wifi_macParams.options & WLN_OPT_BONLY))
+	{
+		bp[0] = _WIFI_ELEM_ERPINFO;
+		bp[1] = 1;
+		bp[2] = 0;
+		bp += bp[1] + 2;
+	}
+
+	// Set extended supported rates
+	bp = _wifi_SetRates (bp, _WIFI_ELEM_EXTSUPRATES, _wifi_macStatus.channel);
+
+	_wifi_bcnFrame->length = (word)(_WIFI_DATA_SIZE + (bp - _wifi_bcnFrame->body));
+	_wifi_SetPLCP (_wifi_bcnFrame, _wifi_rateMin);
+
+   // Copy probe response from beacon
+   _wifi_CopyBuffer(_wifi_respFrame, _wifi_bcnFrame);
+
+	// Set probe response type and duration
+	_wifi_respFrame->macHdr.fc.type = _WIFI_TYPE_PROBE_RESP;
+	dur = _wifi_GetAckDuration (_wifi_respFrame->tx_rate);
+	_wifi_respFrame->macHdr.duration = _WIFI_HTON16(dur);
+
+	return TRUE;
+}
+
+

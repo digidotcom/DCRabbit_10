@@ -1,0 +1,611 @@
+//
+// Embedded 802.11 wireless network interface
+// MAC layer rate control functions
+// Copyright 2007 Rabbit Semiconductor
+//
+
+/*** BeginHeader _wifi_rateInfo, _wifi_ratesA, _wifi_ratesB, _wifi_ratesG,
+                 _wifi_ratesGx, _wifi_initRatesGlobals */
+
+// Length (in usecs) of a MAC frame of bytes at rate (in 500kbps units)
+// not including SIFS and PLCP preamble/header
+#define	_WIFI_LENGTH_USECS(bytes, rate)		((16*(bytes)+(rate)-1)/(rate))
+
+// Length (in usecs) of SIFS and PLCP preamble/header.
+#define	_WIFI_PRE_LEN(rate)			(_WIFI_USE_SHORTPRE(rate) ? 106 : 202)
+
+// Duration (in usecs) of an OFDM frame at rate (in 500kbps units)
+// including SIFS and PLCP preamble/header
+#define	_WIFI_OFDM_DUR(bytes, rate)	(36 + 4*((4*(bytes)+(rate)+10)/(rate)))
+
+// Information on each supported rate
+typedef struct {
+	uint8	bps;			// Bit rate in 500kbps units
+	uint8	ofdmCode;	// OFDM rate code, 0 if not OFDM
+	uint16	ackLen;	// Duration of ACK or CTS in usecs
+} WiFiRateInfo;
+
+// Must be ordered by modulation type, then by increasing bit rate
+#define	_WIFI_RATE_NUM	12
+extern const WiFiRateInfo _wifi_rateInfo[_WIFI_RATE_NUM];
+
+
+// Supported rates info elements
+extern const uint8 _wifi_ratesA[10];
+extern const uint8 _wifi_ratesB[6];
+extern const uint8 _wifi_ratesG[10];
+extern const uint8 _wifi_ratesGx[6];
+
+// Following rate values are indices into _wifi_rateInfo table
+extern int _wifi_rateTx;	// Directed frame rate
+extern int _wifi_rateBC;	// Broadcast or protection frame rate
+extern int _wifi_rateMin;	// Minimum rate
+
+// Rates allowed in BSS
+extern int _wifi_rateCount;
+extern uint8 _wifi_rates[_WIFI_RATE_NUM];
+
+// Map each rate to lower or equal BSS basic rate
+extern uint8 _wifi_ratesBasic[_WIFI_RATE_NUM];
+
+// Adaptive rate control info
+extern int _wifi_rateTxCount;			// Transmitted frames
+extern int _wifi_rateErrorCount;		// Transmitted frames with errors
+
+extern int _wifi_rateIdx;				// Current rate, index into _wifi_rates[]
+extern int _wifi_success;				// Successful intervals
+extern int _wifi_successThreshold;	// Successful intervals needed to increase rate
+extern BOOL _wifi_recovery;			// TRUE if interval follows rate increase
+
+// Min/max successful intervals to increase rate
+#define	_WIFI_THRESH_MIN		1
+#define	_WIFI_THRESH_MAX		10
+
+void _wifi_initRatesGlobals(void);
+
+/*** EndHeader */
+
+const WiFiRateInfo _wifi_rateInfo[_WIFI_RATE_NUM] = {
+	{ 2,   0,   _WIFI_LENGTH_USECS   (_WIFI_ACK_SIZE, 2)   },
+	{ 4,   0,   _WIFI_LENGTH_USECS   (_WIFI_ACK_SIZE, 4)   },
+	{ 11,  0,   _WIFI_LENGTH_USECS   (_WIFI_ACK_SIZE, 11)  },
+	{ 22,  0,   _WIFI_LENGTH_USECS   (_WIFI_ACK_SIZE, 22)  },
+	{ 12,  0xb, _WIFI_OFDM_DUR (_WIFI_ACK_SIZE, 12)  },
+	{ 18,  0xf, _WIFI_OFDM_DUR (_WIFI_ACK_SIZE, 18)  },
+	{ 24,  0xa, _WIFI_OFDM_DUR (_WIFI_ACK_SIZE, 24)  },
+	{ 36,  0xe, _WIFI_OFDM_DUR (_WIFI_ACK_SIZE, 36)  },
+	{ 48,  0x9, _WIFI_OFDM_DUR (_WIFI_ACK_SIZE, 48)  },
+	{ 72,  0xd, _WIFI_OFDM_DUR (_WIFI_ACK_SIZE, 72)  },
+	{ 96,  0x8, _WIFI_OFDM_DUR (_WIFI_ACK_SIZE, 96)  },
+	{ 108, 0xc, _WIFI_OFDM_DUR (_WIFI_ACK_SIZE, 108) },
+};
+
+const uint8 _wifi_ratesA[]  = { _WIFI_ELEM_SUPRATES, 8, _WIFI_RATE_BASIC+12,
+                                18, _WIFI_RATE_BASIC+24, 36,
+                                _WIFI_RATE_BASIC+48, 72, 96, 108 };
+const uint8 _wifi_ratesB[]  = { _WIFI_ELEM_SUPRATES, 4, _WIFI_RATE_BASIC+2,
+                                _WIFI_RATE_BASIC+4, 11, 22 };
+const uint8 _wifi_ratesG[]  = { _WIFI_ELEM_SUPRATES, 8, _WIFI_RATE_BASIC+2,
+                                _WIFI_RATE_BASIC+4, 11, 22, 12, 18, 24, 36 };
+const uint8 _wifi_ratesGx[] = { _WIFI_ELEM_EXTSUPRATES, 4, 48, 72, 96, 108 };
+
+
+// Following rate values are indices into _wifi_rateInfo table
+int _wifi_rateTx;		// Directed frame rate
+int _wifi_rateBC;		// Broadcast or protection frame rate
+int _wifi_rateMin;	// Minimum rate
+
+// Rates allowed in BSS
+int _wifi_rateCount;
+uint8 _wifi_rates[_WIFI_RATE_NUM];
+
+// Map each rate to lower or equal BSS basic rate
+uint8 _wifi_ratesBasic[_WIFI_RATE_NUM];
+
+// Adaptive rate control info
+int _wifi_rateTxCount;			// Transmitted frames
+int _wifi_rateErrorCount;		// Transmitted frames with errors
+
+int _wifi_rateIdx;				// Current rate, index into _wifi_rates[]
+int _wifi_success;				// Successful intervals
+int _wifi_successThreshold;	// Successful intervals needed to increase rate
+BOOL _wifi_recovery;				// TRUE if interval follows rate increase
+
+_wifig_nodebug
+void _wifi_initRatesGlobals(void)
+{
+	_wifi_rateTx = 0;
+	_wifi_rateBC = 0;
+	_wifi_rateMin = 0;
+	_wifi_rateCount = 0;
+	memset(_wifi_rates, 0, sizeof(_wifi_rates));
+	memset(_wifi_ratesBasic, 0, sizeof(_wifi_ratesBasic));
+	_wifi_rateTxCount = 0;
+	_wifi_rateErrorCount = 0;
+	_wifi_rateIdx = 0;
+	_wifi_success = 0;
+	_wifi_successThreshold = 0;
+	_wifi_recovery = 0;
+}
+
+/*** BeginHeader _wifi_GetAckDuration */
+int _wifi_GetAckDuration (int rate);
+/*** EndHeader */
+
+//
+// Get the duration (in usecs) of an ACK or CTS frame at rate
+//
+_wifig_nodebug
+int _wifi_GetAckDuration (int rate)
+{
+	auto int dur;
+
+	// ACK/CTS is sent at equal or lower basic rate
+	rate = _wifi_ratesBasic[rate];
+	dur = _wifi_rateInfo[rate].ackLen;
+
+	// Add PSK/CCK preamble time
+	if (_wifi_rateInfo[rate].ofdmCode == 0)
+		dur += _WIFI_PRE_LEN(rate);
+
+	return dur;
+}
+
+/*** BeginHeader _wifi_GetDuration */
+int _wifi_GetDuration ( WiFiMacBuffer __far *buf);
+/*** EndHeader */
+
+//
+// Get the duration (in usecs) of a frame.
+// _wifi_SetPLCP() must have previously been called on the frame.
+//
+_wifig_nodebug
+int _wifi_GetDuration (WiFiMacBuffer __far *buf)
+{
+	auto int rate;
+	auto int dur;
+
+   rate = buf->tx_rate;
+
+	// Frame duration
+	if (_wifi_rateInfo[rate].ofdmCode)
+		dur = _WIFI_OFDM_DUR(buf->length, _wifi_rateInfo[rate].bps);
+	else
+		// PLCP length field previously set
+		dur = _WIFI_PRE_LEN(rate) + _WIFI_NTOH16(buf->plcpHdr.pskcck.length);
+
+	// Add ACK duration
+	return dur + _wifi_GetAckDuration (rate);
+}
+
+/*** BeginHeader _wifi_SetPLCP */
+void _wifi_SetPLCP (__far WiFiMacBuffer *buf, int rate);
+/*** EndHeader */
+
+//
+// Set the frame and PLCP headers in a frame.
+// Buffer has its length field set.
+// @param buf Frame to modify
+// @param rate Transmit rate index
+//
+_wifig_nodebug
+void _wifi_SetPLCP (__far WiFiMacBuffer *buf, int rate)
+{
+	auto int length, align_usec;
+
+
+	length = buf->length;
+	buf->tx_rate = rate;
+	buf->frameHdr.hdr32 = 0;
+
+	// Length in words, excluding FCS, rounded up
+	buf->frameHdr.tx.length =
+		(length + (sizeof(WiFiFrameHeader) + sizeof(WiFiPlcpHeader) + 3 - _WIFI_FCS_SIZE)) >> 2;
+
+	// OFDM rates
+	if (_wifi_rateInfo[rate].ofdmCode)
+	{
+		buf->frameHdr.tx.modType = _WIFI_MOD_OFDM;
+		// Mask in the OFDM code and length into the correct bit positions
+		buf->plcpHdr.plcp32 = _wifi_rateInfo[rate].ofdmCode & 0x0F |
+			                   (uint32)length << 5 & 0x1FFE0uL;
+	}
+
+	// PSK/CCK rates.
+	else
+	{
+
+		buf->frameHdr.tx.modType = _WIFI_MOD_PSKCCK;
+		buf->plcpHdr.pskcck.signal = 5*_wifi_rateInfo[rate].bps;
+		buf->plcpHdr.pskcck.service = _WIFI_SERVICE_LOCKED;
+
+		// Convert length from bytes to microseconds.
+		// Use a switch to avoid a long divide operation.
+		switch (_wifi_rateInfo[rate].bps)
+		{
+			case 2:
+				length *= 8;
+				break;
+			case 4:
+				length *= 4;
+				break;
+			case 11:
+				length = (16*length+10)/11;
+
+#if _WIFI_SILKEN_DAC
+	#ifdef _WIFI_SILKEN_DAC_DEBUG
+            if(buf->length % 11) {
+            	printf("Silken DAC: not multiple of 11 at 5.5Mbit!\n");
+            	//exit(999);
+            }
+	#endif
+#endif
+				break;
+			case 22:
+         	// Calculate packet length in usec's
+            length = (8*length+10)/11;
+
+#if _WIFI_SILKEN_DAC
+	#ifdef _WIFI_SILKEN_DAC_DEBUG
+            if(buf->length % 11) {
+            	printf("Silken DAC: not multiple of 11 at 11Mbit!\n");
+            	//exit(999);
+            }
+	#endif
+#endif
+
+				// Set length extension bit if needed
+				if ((11*length)/8 > buf->length)
+            {
+					buf->plcpHdr.pskcck.service |= _WIFI_SERVICE_LENEXT;
+            }
+				break;
+			default:
+				DPRINTF("ERROR:  Invalid bit rate!\n");
+				break;
+		}
+
+		buf->plcpHdr.pskcck.length = _WIFI_HTON16 (length);
+	}
+}
+
+/*** BeginHeader _wifi_CheckRates */
+BOOL _wifi_CheckRates (__far uint8 *bssRates, int len,
+                       _wifi_wln_scan_bss __far *info);
+/*** EndHeader */
+
+//
+// Check if we can handle the supported rates of a BSS.
+// @param bssRates Rates supported by the BSS
+// @param len Number of rates
+// @param info Scan info to update with rates
+// @return TRUE if supported, FALSE if a basic rate not supported
+//
+_wifig_nodebug
+BOOL _wifi_CheckRates (__far uint8 *bssRates, int len,
+                       _wifi_wln_scan_bss __far*info)
+{
+	auto int i, j;
+
+	// For each rate in BSS
+	for (i = 0; i < len; i++)
+	{
+		// Check if we support the rate
+		for (j = 0; j < _WIFI_RATE_NUM; j++)
+			if ((bssRates[i] & ~_WIFI_RATE_BASIC) == _wifi_rateInfo[j].bps)
+				break;
+
+		if (j < _WIFI_RATE_NUM)
+		{
+			// Rate is supported
+			info->rates |= 1 << j;
+			if (bssRates[i] & _WIFI_RATE_BASIC)
+				info->rates_basic |= 1 << j;
+
+			// Find max rate
+			if (info->tx_rate < 5*_wifi_rateInfo[j].bps)
+				info->tx_rate = 5*_wifi_rateInfo[j].bps;
+		}
+
+		// Basic rate not supported, return failure
+		else if (bssRates[i] & _WIFI_RATE_BASIC)
+			return FALSE;
+	}
+
+	return TRUE;
+}
+
+/*** BeginHeader _wifi_SetRates */
+__far uint8 *_wifi_SetRates (__far uint8 *bp, int elem, int channel);
+/*** EndHeader */
+
+//
+// Store supported rates elements into a buffer
+// @param bp Pointer into buffer
+// @param elem Element to store: _WIFI_ELEM_SUPRATES, _WIFI_ELEM_EXTSUPRATES, or 0 for both
+// @param channel Channel number
+// @return Updated buffer pointer
+//
+_wifig_nodebug
+__far uint8 *_wifi_SetRates (__far uint8 *bp, int elem, int channel)
+{
+	auto const uint8 *sr;
+
+	// Select rate set
+	if (_WIFI_CHAN_5G (channel))
+		sr = _wifi_ratesA;
+	else if (_wifi_macParams.options & WLN_OPT_BONLY)
+		sr = _wifi_ratesB;
+	else
+		sr = _wifi_ratesG;
+
+	// Store up to 8 supported rates
+	if (elem != _WIFI_ELEM_EXTSUPRATES)
+	{
+		root2xmem ((long)bp,
+						sr,
+						sr[1]+2);
+		bp += bp[1] + 2;
+	}
+
+	// Store remaining extended supported rates
+	if (elem != _WIFI_ELEM_SUPRATES && sr == _wifi_ratesG)
+	{
+		root2xmem ((long)bp, _wifi_ratesGx, _wifi_ratesGx[1]+2);
+		bp += bp[1] + 2;
+	}
+
+	return bp;
+}
+
+/*** BeginHeader _wifi_InitRates */
+BOOL _wifi_InitRates (_wifi_wln_scan_bss *sp, BOOL init);
+/*** EndHeader */
+
+//
+// Initialize rate tables
+// @param sp BSS scan information
+// @param init TRUE to init adaptive rate control
+// @return TRUE if supported, FALSE if error
+//
+_wifig_nodebug
+BOOL _wifi_InitRates (_wifi_wln_scan_bss *sp, BOOL init)
+{
+	auto uint16 oper;			// Operation rate mask
+	auto uint16 basic;		// Basic rate mask
+	auto uint16 bc;			// Broadcast rate mask
+	auto int i, rateBasic;
+   auto uint16 mask;
+
+   oper  = sp->rates;
+   basic = sp->rates_basic;
+   DPRINTF3("_wifi_InitRates: initial oper=0x%04X  basic=0x%04X\n", oper, basic);
+	// Limit rate set to 802.11a or b rates
+	if (_WIFI_CHAN_5G (_wifi_macStatus.channel))
+		oper &= _WIFI_RATE_MASK_A;
+	else if (_wifi_macParams.options & WLN_OPT_BONLY)
+		oper &= _WIFI_RATE_MASK_B;
+
+	// Special case for channel 14:
+	// hardware is only certified for 1 and 2 mbps
+	if (_wifi_macStatus.channel == 14)
+		oper &= _WIFI_RATE_MASK_PSK;
+
+	basic &= oper;
+
+#if _WIFI_SILKEN_DAC
+	// No CCK rates
+	basic &= ~_WIFI_RATE_MASK_CCK;
+#endif
+
+	// Ensure minimum rates for each modulation are included in basic rate set.
+	//
+	// DEVIDEA:  This line was originally the following.  This is so that for
+	// 802.11a devices it includes the minimum a rate, and for 802.11b devices,
+	// it includes the minimum b rate.  Unfortunately, this causes rate 4 to
+	// be included for b devices as a basic rate, which is an OFDM rate.  Since
+	// the broadcast rate selected will be the maximum, that causes the OFDM
+	// rate to be selected for 802.11b devices.  Note that for G devices, the
+	// B rate is really the minimum.
+	//
+	// This logic will probably need to be revisited if/when we have an 802.11a
+	// device.
+	//
+	// basic |= (1 << _WIFI_RATE_MIN_A) | (1 << _WIFI_RATE_MIN_B);
+	basic |= (1 << _WIFI_RATE_MIN_B);
+
+	// Use basic rates for broadcast and protection frames.
+	// Limit to 802.11b rates if protection enabled.
+	bc = basic;
+	if (sp->erp_info & _WIFI_ERP_USEPROTECT)
+		bc &= _WIFI_RATE_MASK_B;
+
+	// If OFDM rates in use, don't use CCK rates (5.5 and 11 mbps)
+	// for directed frames because these overlap and have longer preambles
+	if (oper & _WIFI_RATE_MASK_OFDM)
+		oper &= ~_WIFI_RATE_MASK_CCK;
+
+   DPRINTF3("  ...updated to oper=0x%04X  basic=0x%04X\n", oper, basic);
+
+	// Build rate tables
+	_wifi_rateCount = 0;
+	_wifi_rateBC = rateBasic = 0;
+	for (i = 0; i < _WIFI_RATE_NUM; i++)
+	{
+		mask = 1 << i;
+
+		// Rate allowed by parameters, if tx_rate == 0, all rates are allowed
+		if (!_wifi_macParams.tx_rate
+			|| (5*_wifi_rateInfo[i].bps <= _wifi_macParams.tx_rate))
+		{
+			// Rate allowed by BSS
+			if (oper & mask)
+				_wifi_rates[_wifi_rateCount++] = i;
+
+			// Find max broadcast rate
+			if (bc & mask)
+				_wifi_rateBC = i;
+		}
+
+		// Find lower or equal basic rate
+		if (basic & mask)
+			rateBasic = i;
+		_wifi_ratesBasic[i] = rateBasic;
+	}
+
+	if (_wifi_rateCount == 0)
+		return FALSE;
+
+	// Set directed transmit rate
+	if (_wifi_macParams.options & WLN_OPT_FIXEDRATE)
+		_wifi_rateIdx = _wifi_rateCount - 1;
+
+	else if (init || _wifi_rateIdx >= _wifi_rateCount)
+	{
+		_wifi_rateIdx = _wifi_rateCount/2;
+
+		// Init adaptive rate info
+		_wifi_success = 0;
+		_wifi_successThreshold = _WIFI_THRESH_MIN;
+		_wifi_recovery = FALSE;
+		_wifi_rateTxCount = _wifi_rateErrorCount = 0;
+	}
+
+	_wifi_rateMin = _wifi_rates[0];
+	_wifi_rateTx = _wifi_rates[_wifi_rateIdx];
+	_wifi_macStatus.tx_rate = 5*_wifi_rateInfo[_wifi_rateTx].bps;
+
+	// Init CTS-to-self frame if protection enabled
+	if (sp->erp_info & _WIFI_ERP_USEPROTECT)
+		_wifi_SetPLCP (&_wifi_ctsFrame, _wifi_rateBC);
+
+	return TRUE;
+}
+
+/*** BeginHeader _wifi_ReduceRate */
+void _wifi_ReduceRate (__far WiFiMacBuffer *buf, int steps);
+/*** EndHeader */
+
+//
+// Reduce the transmit rate of a frame by steps
+//
+_wifig_nodebug void _wifi_ReduceRate (__far WiFiMacBuffer *buf, int steps)
+{
+	auto int i, dur;
+
+	// No change if using fixed rate
+	if (_wifi_macParams.options & WLN_OPT_FIXEDRATE)
+		return;
+
+	// Limit rate index to valid range.
+	// Use minimum for last retry.
+	i = _wifi_rateIdx - steps;
+	if (i >= _wifi_rateCount)
+		i = _wifi_rateCount - 1;
+	if (i < 0 || steps >= _WIFI_SHORT_RETRY_LIMIT-1)
+		i = 0;
+
+	// No change needed
+	if (_wifi_rates[i] >= buf->tx_rate)
+		return;
+
+	// Subtract ACK at old rate from duration
+	dur = _WIFI_NTOH16 (buf->macHdr.duration) - _wifi_GetAckDuration (buf->tx_rate);
+
+	// Set new rate
+	_wifi_SetPLCP (buf, _wifi_rates[i]);
+
+	// Add ACK at new rate to duration
+	dur += _wifi_GetAckDuration (buf->tx_rate);
+	buf->macHdr.duration = _WIFI_HTON16 (dur);
+}
+
+/*** BeginHeader _wifi_UpdateRate */
+void _wifi_UpdateRate (void);
+/*** EndHeader */
+
+//
+// This is an implementation of the Adaptive Multi Rate Retry (AMRR)
+// algorithm described at http://www.inria.fr/rrrt/rr-5208.html
+//
+
+// Have enough frames to adjust rate
+#define _wifi_is_enough()		(_wifi_rateTxCount >= 10)
+
+// Error rate is low enough to increase rate
+#define _wifi_is_success()		(8*_wifi_rateErrorCount < _wifi_rateTxCount)
+
+// Error rate is high enough to decrease rate
+#define _wifi_is_failure()		(4*_wifi_rateErrorCount > _wifi_rateTxCount)
+//#define _wifi_is_failure()	(_wifi_rateErrorCount > _wifi_rateTxCount)
+
+//
+// Update the current transmit rate.
+// Called periodically from _wifi_MacTimer().
+//
+_wifig_nodebug
+void _wifi_UpdateRate (void)
+{
+	// If using fixed rate, or not enough frames elapsed, return, unless current
+	// rate is larger than that allowed by _wifi_macParams
+	if (((_wifi_macParams.options & WLN_OPT_FIXEDRATE) || !_wifi_is_enough()) &&
+			! (_wifi_macParams.tx_rate &&
+         5*_wifi_rateInfo[_wifi_rates[_wifi_rateIdx]].bps > _wifi_macParams.tx_rate
+         ) ) {
+		return;
+	}
+
+	// Try to increase rate
+	if (_wifi_is_success())
+	{
+		_wifi_success++;
+		if (_wifi_success >= _wifi_successThreshold && _wifi_rateIdx < _wifi_rateCount-1)
+		{
+			_wifi_recovery = TRUE;
+			_wifi_success = 0;
+			_wifi_rateIdx++;
+		}
+		else
+			_wifi_recovery = FALSE;
+	}
+
+	// Decrease rate
+	else if (_wifi_is_failure())
+	{
+		if (_wifi_rateIdx > 0)
+		{
+			if (_wifi_recovery)
+			{
+				// Errors resulted from a rate increase.
+				// Double successful intervals needed to increase next time.
+				_wifi_successThreshold *= 2;
+				if (_wifi_successThreshold > _WIFI_THRESH_MAX)
+					_wifi_successThreshold = _WIFI_THRESH_MAX;
+			}
+			else
+				_wifi_successThreshold = _WIFI_THRESH_MIN;
+
+			_wifi_rateIdx--;
+		}
+
+		_wifi_success = 0;
+		_wifi_recovery = FALSE;
+	}
+   //SJH - check that actual rate will not exceed the value set in
+   // macParams.tx_rate, since that value may be altered dynamically from
+   // the value used at association time.
+   //DEC - check that _wifi_macParams.tx_rate != IFPARAM_WIFI_TX_RATE_ANY
+   // (0) before using it as a maximum rate.
+	while (_wifi_rateIdx > 0 && _wifi_macParams.tx_rate &&
+	       5*_wifi_rateInfo[_wifi_rates[_wifi_rateIdx]].bps > _wifi_macParams.tx_rate)
+		--_wifi_rateIdx;
+
+	// Set new transmit rate
+	_wifi_rateTx = _wifi_rates[_wifi_rateIdx];
+	_wifi_macStatus.tx_rate = 5*_wifi_rateInfo[_wifi_rateTx].bps;
+	DPRINTF4("rate=%d tx=%d err=%d\n", _wifi_macStatus.tx_rate, _wifi_rateTxCount, _wifi_rateErrorCount);
+
+	// Reset counters
+	_wifi_rateTxCount = _wifi_rateErrorCount = 0;
+}
+

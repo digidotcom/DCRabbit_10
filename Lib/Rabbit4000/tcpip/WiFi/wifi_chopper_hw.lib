@@ -1,0 +1,386 @@
+/*
+   Embedded 802.11 wireless network interface
+   MAC layer hardware interface
+
+   Copyright (c) 2007-2008 Digi International Inc., All Rights Reserved
+
+   This software contains proprietary and confidential information of Digi
+   International Inc.  By accepting transfer of this copy, Recipient agrees
+   to retain this software in confidence, to prevent disclosure to others,
+   and to make no use of this software other than that for which it was
+   delivered.  This is an unpublished copyrighted work of Digi International
+   Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+   prohibited.
+
+   Restricted Rights Legend
+
+   Use, duplication, or disclosure by the Government is subject to
+   restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+   Technical Data and Computer Software clause at DFARS 252.227-7031 or
+   subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+   Restricted Rights at 48 CFR 52.227-19, as applicable.
+
+   Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+
+   This library includes hardware-specific initialization routines and
+   other hardware-specific routines used by the rest of the WiFi driver.
+   This also includes the entry point to the ISR.
+*/
+
+/*** BeginHeader */
+#ifndef __WIFI_PIPER_HW_LIB
+#define __WIFI_PIPER_HW_LIB
+
+/*** EndHeader */
+
+/*** BeginHeader _wifi_hwAES */
+
+#use "wifig_dsp_ucode_r6.lib"
+#use "wifig_macassist_ucode_r6.lib"
+
+#use "wifi_airoha_chopper.lib"
+
+#define _WIFI_ANTENNA_SETTING 0x5A
+
+#ifndef _WIFI_RX_MAX_GAIN
+	#if RCM6600W_SERIES
+		#define _WIFI_RX_MAX_GAIN 0x37780001
+	#else
+		#define _WIFI_RX_MAX_GAIN 0x37740001
+	#endif
+#endif
+
+extern int _wifi_hwAES;
+
+/*** EndHeader */
+
+int _wifi_hwAES;   // Control flag used to enable HW AES acceleration
+
+
+/*** BeginHeader _wc_SetTxPower */
+void _wc_SetTxPower(word value);
+/*** EndHeader */
+
+
+//
+// This is used to set the transmit power.  Values can range
+// from 0-15, where 12 is the default, provides about
+// 14dBm of output power.
+_wifig_nodebug
+void _wc_SetTxPower(word value)
+{
+   __wifi_SetPower (value);
+}
+
+
+
+/*** BeginHeader _wc_IsRFPowered */
+int _wc_IsRFPowered (void);
+/*** EndHeader */
+_wifig_nodebug
+int _wc_IsRFPowered (void)
+{
+   return 1;   // For future use
+}
+
+/*** BeginHeader _wc_IsLogicPowered */
+int _wc_IsLogicPowered (void);
+/*** EndHeader */
+_wifig_nodebug
+int _wc_IsLogicPowered (void)
+{
+	//FIXME: for r6k
+   if (RdPortI(ENPR) & 0x80) {
+      return 1;   // For future use
+   }
+   else  {
+      return 0;
+   }
+}
+
+/*** BeginHeader _wc_InitHW */
+WiFiMacReturn _wc_InitHW (void);
+
+
+/*** EndHeader */
+
+// Initialize the 802.11 MAC hardware
+_wifig_nodebug
+WiFiMacReturn _wc_InitHW (void)
+{
+   auto unsigned long timeout;
+   auto uint16 addr;
+   auto uint16 i;
+
+   #GLOBAL_INIT { _wc_locklevel = 0; }
+
+
+   // EK FIXME
+   //setPLL_MULT();
+
+   _wc_locklevel = 0;
+   // Set 1's complement of #wait states
+   //
+   //    Worst-case calculation for Chopper:  200MHz => 5ns period
+   //    WiFi has min access time of 75ns, so 75/5 = 15ws
+	//
+   //		Calculation:  freq(MHz) = (freq_divider+1)*0.6144
+	//                  period(ns) = 1000/freq
+	//                  wait states = 1 + 75ns/period
+	//                              = 1 + 75*0.6144*(freq_divider+1)/1000
+   //
+   i = 1 + 46*(freq_divider+1)/1000;
+   WrPortI(NCCWR, NULL, 0x1F - i);
+
+   // Enable the wireless subsystem on the processor
+   WrPortI(ENPR, NULL, RdPortI(ENPR) | 0x80); // enable network port C
+
+   _wifi_AirohaCalEERd();
+
+   PDDDRShadow = RdPortI( PDDDR);
+   PDDRShadow = RdPortI( PDDR);
+
+   BitWrPortI(PDDR, &PDDRShadow, 0, 7);  	//AD_CS starts high (wifi ADC disabled)
+   BitWrPortI(PDDDR, &PDDDRShadow, 1, 7); //make sure the pin is output also
+
+   // give the 80MHz PLL time to lock
+   _wifi_waitUS (1000);
+
+   // Set Reg control to logic 1
+    _wc_or32(0x0A3C, 0x300L);
+   _wc_and32(NCGC0R, ~(_WIFI_GEN_RXFIFORST | _WIFI_GEN_TXFIFORST));
+
+
+   // Zero out MAC assist SRAM (put into known state before enabling MAC assist)
+   for (addr=0xA40; addr<0xAC0; addr += 4)
+      _wc_write32(addr, 0x00000000ul);
+
+   // Load the DSP code
+   _wc_InitHW_DSP();
+   // Load the MAC assist code
+   _wc_InitHW_MACassist();
+
+   // Enable execution of the DSP and MAC assist code
+   _wc_or32(NCGC0R, _WIFI_GEN_LOADEN);
+
+
+   _wc_write8(0xA3C, ((_wc_read8(0xA3C) & ~0xC0) | 0x80)); // Set TX_ON Low
+   _wc_write8(0xA3D, ((_wc_read8(0xA3D) & ~0x0C) | 0x08)); // Set PA_2G Low
+   _wc_write8(0xA3F, ((_wc_read8(0xA3F) & ~0x30) | 0x20)); // Set RX_ON low
+
+
+   // Initialize RF chip being used
+   __wifi_RFChipInit();
+
+   // Set TX_ON/RXHP_ON to normal wifi
+   // Set PA_2G to normal wifi
+   // Set RX_ON to normal wifi
+   _wc_write8(0xA3C, (_wc_read8(0xA3C) & ~0xF0));
+   _wc_write8(0xA3D, (_wc_read8(0xA3D) & ~0x0C));
+   _wc_write8(0xA3F, (_wc_read8(0xA3F) & ~0x30));
+
+   // if enforced, get locked region ID
+   _wifi_macParams.regionLock = _wifi_AirohaRegionLock();
+
+   // Set either the compile-time default region or a permitted region
+   _wifi_setregion(IFC_WIFI_REGION);
+
+   _wifi_Airoha(AIROHA_PWR_SETTING | ((long)58 << 4));
+
+   // Set the General Control register to a known good value
+   _wc_write32(NCGC0R, _WIFI_RX_MAX_GAIN);
+
+   _wc_write32(NCGS0R, 0x34000000);
+
+   _wc_write32(NCC2R0, 0x08729ad4);
+
+
+   // enable antenna map
+   _wc_write8(NCRSSI3R, _WIFI_ANTENNA_SETTING);
+
+#if RCM6600W_SERIES
+   // enable the clock gating for reduced current draw
+   _wc_write32(NCCC0R, 0x00000300);
+#endif
+
+   // Reset RX and TX FIFOs
+   _wc_or32(NCGC0R, _WIFI_GEN_RXFIFORST | _WIFI_GEN_TXFIFORST);
+
+   _wc_and32(NCGC0R, ~(_WIFI_GEN_RXFIFORST | _WIFI_GEN_TXFIFORST));
+
+
+   return _WIFI_ERR_OK;
+}
+
+
+/*** BeginHeader _wifi_InitHW */
+WiFiMacReturn _wifi_InitHW (void);
+/*** EndHeader */
+
+// Initialize 802.11 MAC subsystem
+_wifig_nodebug
+WiFiMacReturn _wifi_InitHW (void)
+{
+   auto WiFiMacReturn retval;
+
+	#GLOBAL_INIT { \
+		_wifi_isr_initialized = 0; \
+		_wifi_isr_enabled = 0; \
+	}
+
+   DPRINTF ("HW init\n");
+
+   // Calibrate delay loop
+   _wifi_InitTimer();
+
+   if (!_wifi_isr_initialized) {
+      // Calibrate delay loop
+      _wifi_InitTimer();
+      _wifi_macParams.chan_mask &= 0x3fff;
+
+      if (_wifi_macParams.frag_thresh < _WIFI_MIN_FRAG_SIZE) {
+         _wifi_macParams.frag_thresh = _WIFI_MIN_FRAG_SIZE;
+      }
+      if (_wifi_maxFragSize > _WIFI_MAX_FRAG_SIZE) {
+         _wifi_maxFragSize = _WIFI_MAX_FRAG_SIZE;
+      }
+   }
+
+   // Call Board specfic initialization
+   retval =  _wc_InitHW();
+   if (retval != _WIFI_ERR_OK) {
+      return retval;
+   }
+
+   // Hardware supports 802.11, channels 1-14, AES acceleration
+#ifdef WIFI_AES_ENABLED
+      _wifi_hwAES = TRUE;
+   #ifndef _WIFI_OLD_AES
+      _wc_write8(NCAMR, 0);
+      _wc_write8(NCAMR, _WIFI_AES_MODE_BIT);
+   #endif
+#else
+      _wifi_hwAES = FALSE;
+#endif
+
+   // Init baseband processor and MAC assist
+   _wc_HWMemcpy(NCSTAID0R, _wifi_macParams.sta_addr, WLN_ADDR_SIZE);
+
+   // Set antenna diversity if enabled
+   if (_wifi_macParams.options & WLN_OPT_ANTDIV) {
+      _wc_or32(NCGC0R, _WIFI_GEN_ANTDIV);
+   }
+
+	_wc_write32(NCC1R0, 0xC0430088);
+
+
+   _wc_write8(NCPSKBRSR, NCPSKBRSR_SET);
+
+                                 // Enable all 802.11b data rates (used by MAC
+                                 // assist for transmitting ACKs)
+   _wc_write8(NCOFDMBRSR, 0xff); // Enable all 802.11g data rates (used by MAC
+
+                                 // assist for transmitting ACKs)
+
+   _wc_write8(NCBFR, 0xfc);    // set beacon interval  0xFC = 262ms,
+
+                               // 0x80 = 8.39 sec
+
+   // Clear the Interrupt Mask Register before enabling external interrupts.
+   // Also clear out any status bits in the Interrupt Status Register.
+   _wc_write8(NCIMR, 0x00);
+   _wc_write8(NCISR, 0xff);
+
+   // Install interrupt handler
+   SetVectIntern(0x10, _wifi_HandleIR);  // this is for the 6000
+   if (!_wifi_isr_initialized)
+   {
+      _wifi_isr_enabled = 1;
+      _WIFI_ENABLE (1);
+      // enable WiFi hardware (network port C), interrupt
+      WrPortI(ENPR, NULL, RdPortI(ENPR) & 0x7C | _WIFI_ENPR_ENAB);
+   }
+   // Clear any status bits, then enable the appropriate bits in the
+   // Interrupt Mask Register.
+   _wc_write8(NCISR, 0xff);
+
+   _wc_write8(NCIMR, _WIFI_INTR_RX|_WIFI_INTR_TXEND| _WIFI_INTR_TBTT |
+                     _WIFI_INTR_TIMEOUT|_WIFI_INTR_RXOVERRUN);
+
+   _wifi_isr_initialized = 1;
+
+   return _WIFI_ERR_OK;
+}
+
+/*** BeginHeader _wifi_ShutdownHW */
+void _wifi_ShutdownHW (void);
+/*** EndHeader */
+
+//
+// Shutdown the wireless hardware
+//
+_wifig_nodebug
+void _wifi_ShutdownHW (void)
+{
+   DPRINTF ("HW shutdown\n");
+
+   // Shut down RF chip
+   _wifi_Airoha(0x0416c7);
+
+   _wc_write32(NCGC0R, _WIFI_GEN_RESET);
+   _wc_write8(NCMACCR, 0);
+   _wc_write8(NCIMR, 0);
+}
+
+/*** BeginHeader _wifi_SetChannel */
+void _wifi_SetChannel (int channel);
+/*** EndHeader */
+
+//
+// Select a channel
+// @param channel Channel number: 1-14
+//
+
+_wifig_nodebug
+void _wifi_SetChannel (int channel)
+{
+   _wc_and32(NCGC0R, ~_WIFI_GEN_RXEN);
+
+   __wifi_SetChannel (channel);
+
+   _wc_or32(NCGC0R, _WIFI_GEN_RXEN);
+}
+
+/*** BeginHeader _wifi_link_led */
+int _wifi_link_led(int led_cntrl);
+#define _WIFI_LED_LINK 0
+/*** EndHeader */
+
+_wifig_nodebug
+_wifi_link_led(int led_cntrl)
+{
+   //the RCM6600 uses BUFEN (aka IOBEN) as its link LED control
+   #if RCM6600W_SERIES
+   if(led_cntrl) {
+      BitWrPortI(GOCR, &GOCRShadow, 0, 0);       // turn on link LED (set low)
+      BitWrPortI(GOCR, &GOCRShadow, 1, 1);       //
+   }
+   else {
+      BitWrPortI(GOCR, &GOCRShadow, 1, 0);       // turn off link LED (set high)
+      BitWrPortI(GOCR, &GOCRShadow, 1, 1);       //
+   }
+   //other boards use PH7
+   #else
+   if(led_cntrl) {
+      BitWrPortI(PHDR, &PHDRShadow, 0, 7);       // turn on link LED
+   }
+   else {
+      BitWrPortI(PHDR, &PHDRShadow, 1, 7);       // turn off link LED
+   }
+   #endif
+}
+
+/*** BeginHeader */
+#endif /* __WIFI_MAC_HW_LIB */
+/*** EndHeader */
+

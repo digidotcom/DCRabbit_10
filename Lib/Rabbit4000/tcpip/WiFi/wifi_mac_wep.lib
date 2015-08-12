@@ -1,0 +1,179 @@
+//
+// Embedded 802.11 wireless network interface
+// MAC layer WEP encryption functions
+// Copyright 2007 Rabbit Semiconductor
+//
+
+/*** BeginHeader */
+#ifndef __WIFI_MAC_WEP_LIB
+#define __WIFI_MAC_WEP_LIB
+
+
+/*** EndHeader */
+
+
+/*** BeginHeader */
+
+#use "rand.lib"
+#use	"RC4.lib"
+
+// WEP key data
+typedef struct {
+	int	length;						// Length: 0, 5, or 13
+	uint8	key[WLN_WEP104_SIZE];	// Key bytes
+} WepKey;
+
+WepKey _wifi_wep_keys[WLN_KEY_NUM];
+int _wifi_wep_txKeyID;				// Key index used to transmit
+
+
+/*** EndHeader */
+
+
+
+/*** BeginHeader WepSetKey */
+BOOL WepSetKey (int id, BOOL tx, uint8 *key, int len, uint8 *seq);
+/*** EndHeader */
+
+//
+// Set or delete a TKIP key
+//
+_wifig_nodebug
+BOOL WepSetKey (int id, BOOL tx, uint8 *key, int len, uint8 *seq)
+{
+	// Initialize _wifi_wep_txKeyID and _wifi_wep_keys
+	#GLOBAL_INIT {
+		memset(_wifi_wep_keys, 0, sizeof(_wifi_wep_keys));
+		_wifi_wep_txKeyID = 0;
+	}
+
+	if (id < 0 || id >= WLN_KEY_NUM)
+		return FALSE;
+
+	if (len == 0 || len == WLN_WEP40_SIZE || len == WLN_WEP104_SIZE)
+	{
+		memcpy (&_wifi_wep_keys[id].key, key, len);
+		_wifi_wep_keys[id].length = len;
+		if (tx)
+			_wifi_wep_txKeyID = id;
+
+		return TRUE;
+	}
+	else
+		return FALSE;
+}
+
+/*** BeginHeader WepEncrypt */
+BOOL WepEncrypt (__far WiFiMacBuffer *buf);
+/*** EndHeader */
+
+//
+// Encrypt a frame to be transmitted.
+// Buffer includes room for WEP IV and ICV.
+// Buffer length does not include these, but will be updated.
+// @param buf Frame to encrypt
+// @return TRUE if success, FALSE if error
+//
+_wifig_nodebug
+BOOL WepEncrypt (__far WiFiMacBuffer *buf)
+{
+	auto int length;
+	auto WepKey *wepKey;
+	auto uint8 rc4Key[WLN_WEP104_SIZE+3];
+	auto uint16 iv;
+	auto uint32 crc;
+
+   length = buf->length - _WIFI_DATA_SIZE;
+   wepKey = &_wifi_wep_keys[_wifi_wep_txKeyID];
+
+	// No key available
+	if (wepKey->length == 0)
+		return FALSE;
+
+	// Pick a random 16-bit IV.
+	// Store into 24-bit IV field, avoiding weak keys used by key crackers.
+	iv = rand16();
+	buf->body[0] = rc4Key[0] = iv & 0xff;
+	buf->body[1] = rc4Key[1] = (iv | 0x20) & 0x7f;
+	buf->body[2] = rc4Key[2] = iv >> 8;
+	buf->body[3] = _wifi_wep_txKeyID << 6;
+
+	// Calculate ICV
+	crc = crc32_calc (buf->body+_WIFI_IV_SIZE, length, 0);
+	_WIFI_SET32_FAR(buf->body+_WIFI_IV_SIZE+length, crc);
+
+	// Append WEP key
+	memcpy (&rc4Key[3], wepKey->key, wepKey->length);
+
+	// Encrypt data and ICV
+	RC4Process (rc4Key, wepKey->length+3, &buf->body[_WIFI_IV_SIZE], length+_WIFI_ICV_SIZE);
+
+	// Adjust MAC header and length
+	buf->macHdr.fc.flags |= _WIFI_FCNTRL_PROTECT;
+	buf->length += _WIFI_WEP_SIZE;
+
+	return TRUE;
+}
+
+/*** BeginHeader WepDecrypt */
+BOOL WepDecrypt (__far WiFiMacBuffer *buf);
+/*** EndHeader */
+
+//
+// Decrypt a received frame
+// WEP IV and ICV are not removed from buffer.
+// Buffer length will be updated with length of decrypted data.
+// @param buf Frame to decrypt
+// @return TRUE if success, FALSE if ICV error
+//
+_wifig_nodebug
+BOOL WepDecrypt (__far WiFiMacBuffer *buf)
+{
+	auto int length;
+	auto int id;
+	auto WepKey *wepKey;
+	auto uint8 rc4Key[WLN_WEP104_SIZE+3];
+
+	length = buf->length - _WIFI_DATA_SIZE - _WIFI_WEP_SIZE;
+   id = buf->body[3] >> 6;
+   wepKey = &_wifi_wep_keys[id];
+
+	// Not encrypted
+	if (!(buf->macHdr.fc.flags & _WIFI_FCNTRL_PROTECT))
+		return FALSE;
+
+	// No key available
+	if (wepKey->length == 0)
+		return FALSE;
+
+	// Append IV and WEP key
+	_f_memcpy (&rc4Key[0], buf->body, 3);
+	memcpy (&rc4Key[3], wepKey->key, wepKey->length);
+
+	// Decrypt data and ICV
+	RC4Process (rc4Key, wepKey->length+3, &buf->body[_WIFI_IV_SIZE], length+_WIFI_ICV_SIZE);
+	buf->length -= _WIFI_WEP_SIZE;
+
+	// Check for correct ICV
+	return crc32_calc (&buf->body[_WIFI_IV_SIZE], length+_WIFI_ICV_SIZE, 0) == _WIFI_GOOD_CRC32;
+}
+
+/*** BeginHeader _wifi_wepCipher */
+extern const WiFiMacCipher _wifi_wepCipher;
+/*** EndHeader */
+
+// WEP cipher operations table
+const WiFiMacCipher _wifi_wepCipher = {
+	_WIFI_IV_SIZE,
+	0,
+	_WIFI_DATA_SIZE + 8,
+	0,
+	WepSetKey,
+	WepEncrypt,
+	WepDecrypt
+};
+
+/*** BeginHeader */
+#endif /* __WIFI_MAC_WEP_LIB */
+/*** EndHeader */
+

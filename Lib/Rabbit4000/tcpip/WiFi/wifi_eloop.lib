@@ -1,0 +1,237 @@
+//
+// Embedded 802.11b/g wireless network interface
+//
+
+/*** BeginHeader eloop */
+
+// SJH - changed from using thread timers to using tick loop a-la Rabbit
+
+/* Magic number for eloop_cancel_timeout() */
+#define ELOOP_ALL_CTX (void __far *) -1
+
+
+
+
+
+/*
+ * Event loop
+ * Copyright (c) 2002-2004, Jouni Malinen <jkmaline@cc.hut.fi>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ *
+ * Alternatively, this software may be distributed under the terms of BSD
+ * license.
+ *
+ * See README and COPYING for more details.
+ */
+
+/* TRUE if a < b modulo 2^32 */
+#define	timercmp(a, b) 		((long)((uint32)(a)-(uint32)(b)) < 0)
+
+struct eloop_timeout {
+	uint32 time;	// time in ticks
+	void __far *eloop_data;
+	void __far *user_data;
+	void (*handler)( /*void far *eloop_ctx, void far *sock_ctx */ );
+	struct eloop_timeout __far *next;
+};
+
+struct eloop_data {
+	struct eloop_timeout __far *timeout;
+	int terminate;
+#define ELOOP_MAXEVENTS 10
+	Pool_t * pool;
+	struct eloop_timeout base[ELOOP_MAXEVENTS];
+};
+
+extern Pool_t eloop_pool;
+extern struct eloop_data __far eloop;
+
+typedef void (*eloop_timeout_handler)(/*void far *eloop_data, void far *user_ctx*/);
+/*** EndHeader */
+
+Pool_t eloop_pool;
+struct eloop_data __far eloop;
+
+
+/*** BeginHeader eloop_init */
+/* Initialize global event loop data - must be called before any other eloop_*
+ * function. user_data is a pointer to global data structure and will be passed
+ * as eloop_ctx to signal handlers. */
+void eloop_init(void *user_data);
+/*** EndHeader */
+
+_wifig_nodebug
+void eloop_init(void *user_data)
+{
+	_f_memset(&eloop, 0, sizeof(eloop));
+	eloop.pool = &eloop_pool;
+	pool_xinit(eloop.pool, (long)eloop.base, ELOOP_MAXEVENTS, sizeof(eloop.base[0]));
+}
+
+
+/*** BeginHeader eloop_register_timeout */
+/* Register timeout */
+int eloop_register_timeout(uint32 msec,
+			   void (*handler)( /*void far *eloop_ctx, void far *timeout_ctx */ ),
+			   void __far *eloop_data, void __far *user_data);
+/*** EndHeader */
+
+_wifig_nodebug
+int eloop_register_timeout(uint32 msec,
+			   void (* handler)( /*void far *eloop_ctx, void far *timeout_ctx */ ),
+			   void __far *eloop_data, void __far *user_data)
+{
+	struct eloop_timeout __far *timeout;
+	struct eloop_timeout __far *tmp;
+	struct eloop_timeout __far *prev;
+
+	timeout = (struct eloop_timeout __far *) pxalloc(eloop.pool);
+	if (timeout == NULL)
+		return -1;
+#ifdef WPA_VERBOSE
+	msec *= 10;	// Allow more liberal timeout when verbose
+#endif
+
+	timeout->time = _SET_TIMEOUT(msec);
+	timeout->eloop_data = eloop_data;
+	timeout->user_data = user_data;
+	timeout->handler = handler;
+	timeout->next = NULL;
+
+	if (eloop.timeout == NULL) {
+		eloop.timeout = timeout;
+		return 0;
+	}
+
+	prev = NULL;
+	tmp = eloop.timeout;
+	while (tmp != NULL) {
+		if (timercmp(timeout->time, tmp->time))
+			break;
+		prev = tmp;
+		tmp = tmp->next;
+	}
+
+	if (prev == NULL) {
+		timeout->next = eloop.timeout;
+		eloop.timeout = timeout;
+		/* signal timer task */
+		//tx_event_flags_set(&eloop.event_flags, 1, TX_OR);
+	} else {
+		timeout->next = prev->next;
+		prev->next = timeout;
+	}
+
+	return 0;
+}
+
+
+/*** BeginHeader eloop_cancel_timeout */
+/* Cancel timeouts matching <handler,eloop_data,user_data>.
+ * ELOOP_ALL_CTX can be used as a wildcard for cancelling all timeouts
+ * regardless of eloop_data/user_data. */
+int eloop_cancel_timeout(void (*handler)( /*void far *eloop_ctx, void far *sock_ctx */ ),
+			 void __far *eloop_data, void __far *user_data);
+/*** EndHeader */
+
+_wifig_nodebug
+int eloop_cancel_timeout(void (*handler)( /*void far *eloop_ctx, void far *sock_ctx */ ),
+			 void __far *eloop_data, void __far *user_data)
+{
+	struct eloop_timeout __far *timeout;
+	struct eloop_timeout __far *next;
+	struct eloop_timeout __far *prev;
+	int removed;
+
+	removed = 0;
+	prev = NULL;
+	timeout = eloop.timeout;
+
+	while (timeout != NULL) {
+		// timeout = NULL
+		next = timeout->next;
+
+		if (timeout->handler == handler &&
+		    (timeout->eloop_data == eloop_data ||
+		     eloop_data == ELOOP_ALL_CTX) &&
+		    (timeout->user_data == user_data ||
+		     user_data == ELOOP_ALL_CTX)) {
+			if (prev == NULL)
+				eloop.timeout = next;
+			else
+				prev->next = next;
+			pxfree(eloop.pool, (long)timeout);
+			removed++;
+		} else
+			prev = timeout;
+
+		timeout = next;
+	}
+
+	return removed;
+}
+
+
+/*** BeginHeader eloop_run */
+/* Start event loop and continue running as long as there are any registered
+ * event handlers.
+ *
+ * This is called regularly by a "tick" function in order to poll for timeouts.
+ */
+void eloop_run(void);
+/*** EndHeader */
+
+_wifig_nodebug
+void eloop_run(void)
+{
+	auto struct eloop_timeout __far *tmp;
+
+	while (!eloop.terminate && eloop.timeout && _CHK_TIMEOUT(eloop.timeout->time)) {
+      tmp = eloop.timeout;
+      eloop.timeout = eloop.timeout->next;
+      tmp->handler((void __far *)tmp->eloop_data,
+             (void __far *)tmp->user_data);
+      pxfree(eloop.pool, (long)tmp);
+   }
+}
+
+
+
+/*** BeginHeader eloop_terminate */
+/* Terminate event loop even if there are registered events. */
+void eloop_terminate(void);
+/*** EndHeader */
+
+_wifig_nodebug
+void eloop_terminate(void)
+{
+	eloop.terminate = 1;
+}
+
+
+
+/*** BeginHeader eloop_destroy */
+/* Free any reserved resources. After calling eloop_destoy(), other eloop_*
+ * functions must not be called before re-running eloop_init(). */
+void eloop_destroy(void);
+/*** EndHeader */
+
+_wifig_nodebug
+void eloop_destroy(void)
+{
+	// Nothing to do here.  Pool will be re-init next time.
+}
+
+
+/*** BeginHeader eloop_terminated */
+/* Check whether event loop has been terminated. */
+int eloop_terminated(void);
+/*** EndHeader */
+_wifig_nodebug
+int eloop_terminated(void)
+{
+	return eloop.terminate;
+}

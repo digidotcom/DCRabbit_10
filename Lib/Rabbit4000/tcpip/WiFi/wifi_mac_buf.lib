@@ -1,0 +1,287 @@
+//
+// Embedded 802.11 wireless network interface
+// MAC layer buffer management
+// Copyright 2007 Rabbit Semiconductor
+//
+// Now uses DCRTCP network buffer management.
+
+/*** BeginHeader */
+#ifndef __WIFI_MAC_BUF_LIB
+#define __WIFI_MAC_BUF_LIB
+/*** EndHeader */
+
+/*** BeginHeader _wifi_txQueue, _wifi_rxQueue */
+
+extern WiFiMacQueue _wifi_txQueue;	// Transmit queue
+extern WiFiMacQueue _wifi_rxQueue;	// Receive queue
+
+// Buffer including headers and data
+typedef struct {
+	WiFiMacBuffer buf;
+	uint8 data[_WIFI_BUF_SIZE];
+} WiFiBuffer;
+
+/*** EndHeader */
+
+WiFiMacQueue _wifi_txQueue;	// Transmit queue
+WiFiMacQueue _wifi_rxQueue;	// Receive queue
+
+/*** BeginHeader _wifi_InitBuffers */
+WiFiMacReturn _wifi_InitBuffers();
+/*** EndHeader */
+
+//
+// Initialize buffer module
+//
+// We use the normal network buffer pool, shared with all other network interfaces.
+//
+_wifig_nodebug WiFiMacReturn _wifi_InitBuffers()
+{
+	auto int i;
+
+	_wifi_txQueue.head = NULL;
+	_wifi_txQueue.count = 0;
+
+	_wifi_rxQueue.head = NULL;
+	_wifi_rxQueue.count = 0;
+
+
+	return _WIFI_ERR_OK;
+}
+
+
+/*** BeginHeader _wifi_GetBuffer */
+__far WiFiMacBuffer *_wifi_GetBuffer();
+/*** EndHeader */
+
+#if ETH_MAXBUFS < 12
+	#warns "Probably insufficient network buffers for WIFI operation"
+#endif
+
+//
+// Allocate a transmit buffer.
+// Called from base level.
+// @return Allocated buffer, NULL if none available
+//
+_wifig_nodebug __far WiFiMacBuffer *_wifi_GetBuffer()
+{
+	auto __far WiFiMacBuffer *buf;
+	auto int level;
+	auto ll_prefix __far * LL;
+
+	if (_wifi_txQueue.count >= ETH_MAXBUFS * 3 / 4)
+		return NULL;
+
+   buf = NULL;
+   LL = NULL;
+
+	// No need for _WIFI_DISABLE, since pb_reserve does ipset.
+	#asm
+	push	ix
+	lcall	_pb_reserve
+	pop	ix
+;   PY points to allocated ll_prefix.
+;   Cy flag set if no buffer available (in which case PY is undefined).
+	jr		c,.nobuf
+	ld		(sp+@sp+LL),py
+.nobuf:
+	#endasm
+
+	// Zero MAC header
+	if (LL) {
+		//DPRINTF2("Got LL %04X\n", LL);
+
+		buf = (__far WiFiMacBuffer *)LL->data1;
+		_f_memset (&buf->macHdr, 0, sizeof (WiFiMacHeader));
+		buf->LL = LL;
+		buf->next = NULL;
+	}
+
+	return buf;
+}
+
+/*** BeginHeader _wifi_GetBufferIR */
+__far WiFiMacBuffer *_wifi_GetBufferIR();
+/*** EndHeader */
+
+//
+// Allocate a receive buffer.
+// Called from WIFI_MAC_IR (currently).
+// @return Allocated buffer, NULL if none available
+//
+_wifig_nodebug __far WiFiMacBuffer *_wifi_GetBufferIR()
+{
+	auto __far WiFiMacBuffer *buf;
+	auto int level;
+	auto ll_prefix __far * LL;
+
+	if (_wifi_rxQueue.count >= ETH_MAXBUFS * 3 / 4)
+		return NULL;
+
+   buf = NULL;
+   LL = NULL;
+
+	// No need for _WIFI_DISABLE, since pb_reserve does ipset.
+	#asm
+	push	ix
+	lcall	_pb_reserve
+	pop	ix
+;   PY points to allocated ll_prefix.
+;   Cy flag set if no buffer available (in which case PY is undefined).
+	jr		c,.nobuf
+	ld		(sp+@sp+LL),py
+.nobuf:
+	#endasm
+
+	//DPRINTF2("Got LL %06lX\n", LL);
+
+	if (LL) {
+		buf = (__far WiFiMacBuffer *)LL->data1;
+		buf->LL = LL;
+		buf->next = NULL;
+	}
+
+	return buf;
+}
+
+
+// Do not use _f_memcpy directly on buffers: they contain pool info.
+/*** BeginHeader _wifi_CopyBuffer */
+_wifig_nodebug __far WiFiMacBuffer *_wifi_CopyBuffer(__far WiFiMacBuffer *to,
+		__far WiFiMacBuffer *from);
+/*** EndHeader */
+_wifig_nodebug __far WiFiMacBuffer *_wifi_CopyBuffer(__far WiFiMacBuffer *to,
+		__far WiFiMacBuffer *from)
+{
+   // Copy, skipping the first two elements (LL & next), since these refer
+   // to buffer pool structures, not the buffer's contents.  The first
+   // "buffer" field is length.
+	_f_memcpy (
+      (char __far *)&to->length,	// Skip the buffer pool elements
+      (char __far *)&from->length,
+      (sizeof (WiFiMacBuffer)
+      		- ( sizeof(to->LL) + sizeof(to->next) )
+      		+ from->length - _WIFI_DATA_SIZE)
+   );
+}
+
+/*** BeginHeader isValidWiFiMacBuffer */
+int isValidWiFiMacBuffer (WiFiMacBuffer __far *buf);
+/*** EndHeader */
+
+// This code is only used for debugging purposes
+
+_wifig_nodebug int isValidWiFiMacBuffer (WiFiMacBuffer __far *buf)
+{
+	// Simple check is to see if pointers refer consistently
+	return buf == (WiFiMacBuffer __far *)buf->LL->data1;
+}
+
+/*** BeginHeader _wifi_FreeBuffers */
+void _wifi_FreeBuffers (WiFiMacBuffer __far *buf);
+/*** EndHeader */
+
+//
+// Free a list of buffers.
+// All buffers chained via the next field are freed, until next is NULL.
+// Called from base level.
+// @param buf First buffer in list
+//
+_wifig_nodebug void _wifi_FreeBuffers (__far WiFiMacBuffer *buf)
+{
+	auto int level;
+   auto __far WiFiMacBuffer *buf2;
+
+   level = _WIFI_DISABLE();
+	while (buf)
+	{
+	#ifdef WIFIG_DEBUG
+		if (!isValidWiFiMacBuffer(buf)) {
+			_WIFI_ASSERT(0);
+  			_WIFI_ENABLE (level);
+  			return;	// to see caller
+		}
+	#endif
+		buf2 = buf->next;
+		_wifi_FreeBufferIR(buf);
+		buf = buf2;
+	}
+
+	_WIFI_ENABLE (level);
+}
+
+/*** BeginHeader _wifi_FreeBufferIR */
+void _wifi_FreeBufferIR (__far WiFiMacBuffer *buf);
+/*** EndHeader */
+
+//
+// Free a single buffer.
+// Called from interrupt level.
+// @param buf Buffer to free
+//
+_wifig_nodebug void _wifi_FreeBufferIR (__far WiFiMacBuffer *buf)
+{
+	_WIFI_ASSERT(isValidWiFiMacBuffer(buf));
+   #asm
+   ld    px,(sp+@sp+buf)
+   ld    jkhl,(px+[WiFiMacBuffer]+LL)
+   ld    py,jkhl
+   push ix
+   lcall _pb_free
+   pop ix
+   #endasm
+	buf->LL = NULL;	// Trash linkage to ferret out errors
+}
+
+/*** BeginHeader _wifi_GetQueue */
+__far WiFiMacBuffer *_wifi_GetQueue (__far WiFiMacQueue *q);
+/*** EndHeader */
+
+//
+// Remove a buffer from the head of a queue.
+// @param q Buffer queue
+// @return Buffer from queue, NULL if queue was empty.
+//
+_wifig_nodebug __far WiFiMacBuffer *_wifi_GetQueue (__far WiFiMacQueue *q)
+{
+	auto __far WiFiMacBuffer *buf;
+   buf = q->head;
+	if (buf)
+	{
+		_WIFI_ASSERT(isValidWiFiMacBuffer(buf));
+		if (buf->next) _WIFI_ASSERT(isValidWiFiMacBuffer(buf->next));
+		q->head = buf->next;
+		q->count--;
+		buf->next = NULL;
+	}
+
+	return buf;
+}
+
+/*** BeginHeader _wifi_PutQueue */
+void _wifi_PutQueue (__far WiFiMacQueue *q, __far WiFiMacBuffer *buf);
+/*** EndHeader */
+
+//
+// Add a buffer to the tail of a queue.
+// @param q Buffer queue
+// @param buf Buffer to put on queue
+//
+_wifig_nodebug void _wifi_PutQueue (__far WiFiMacQueue *q, __far WiFiMacBuffer *buf)
+{
+   _WIFI_ASSERT (buf);
+
+	if (q->head)
+		q->tail->next = buf;
+	else
+		q->head = buf;
+
+	q->tail = buf;
+	q->count++;
+	buf->next = NULL;
+}
+
+/*** BeginHeader */
+#endif /* __WIFI_MAC_BUF_LIB */
+/*** EndHeader */
+

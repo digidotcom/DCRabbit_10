@@ -1,0 +1,910 @@
+//
+// Embedded 802.11 wireless network interface
+// MAC layer data processing functions
+// Copyright 2007 Rabbit Semiconductor
+//
+
+/*** BeginHeader _wifi_recvCache, _wifi_pairCipher, _wifi_newPairCipher,
+                 _wifi_groupCipher, _wifi_macStats,
+			        _wifi_maxFragSize, _wifi_llc_snap, _wifi_ciphers */
+
+#ifndef WIFI_MAC_DATA_VERBOSE
+	#define WIFI_MAC_DATA_VERBOSE 0
+#endif
+
+// LLC/SNAP (802.2) header on data frames
+extern const WiFiLLC_SNAP _wifi_llc_snap;
+
+// Receive cache entry
+typedef struct {
+	MacAddr	addr;			// Transmitter address
+	uint16	seq;			// Frame sequence number
+	uint16	frags;		// Number of fragments received
+	uint32	time;			// Time first fragment received
+	WiFiMacQueue  bufs;	// List of fragments
+} WiFiRecvCacheEntry;
+
+// Receive cache.
+// This collects fragments of MSDUs until all have been received.
+// It also stores the most recent MSDUs received so that duplicate
+// frames can be detected.
+WiFiRecvCacheEntry  __far _wifi_recvCache[_WIFI_RXCACHE_NUM] ;
+
+extern const WiFiMacCipher _wifi_openCipher;
+extern const WiFiMacCipher _wifi_wepCipher;
+#ifdef WIFI_USE_WPA
+extern const WiFiMacCipher _wifi_tkipCipher;
+#endif
+#ifdef WIFI_AES_ENABLED
+extern const WiFiMacCipher _wifi_ccmpCipher;
+#endif
+
+extern const WiFiMacCipher * const _wifi_ciphers[];
+
+extern const WiFiMacCipher *_wifi_pairCipher;		// Pairwise (station to station) cipher
+extern const WiFiMacCipher *_wifi_newPairCipher;	// Pairsize cipher after next frame
+extern const WiFiMacCipher *_wifi_groupCipher;		// Group (broadcast) cipher
+
+extern WiFiMacStats _wifi_macStats;		// Statistics counters
+extern int _wifi_maxFragSize;				// Max data fragment size
+
+/*** EndHeader */
+
+const WiFiLLC_SNAP _wifi_llc_snap = { _WIFI_SAP_SNAP, _WIFI_SAP_SNAP,
+                                      _WIFI_XDLC_U, {0, 0, 0}, 0 };
+
+const WiFiMacCipher *_wifi_pairCipher;		// Pairwise (station to station) cipher
+const WiFiMacCipher *_wifi_newPairCipher;	// Pairsize cipher after next frame
+const WiFiMacCipher *_wifi_groupCipher;	// Group (broadcast) cipher
+
+WiFiMacStats _wifi_macStats;		// Statistics counters
+int _wifi_maxFragSize;				// Max data fragment size
+
+// Supported encryption ciphers
+const WiFiMacCipher * const _wifi_ciphers[] = {
+	&_wifi_openCipher,
+	&_wifi_wepCipher,
+#ifdef WIFI_USE_WPA
+	&_wifi_tkipCipher,
+#else
+   NULL,
+#endif
+#ifdef WIFI_AES_ENABLED
+	&_wifi_ccmpCipher,
+#else
+	NULL,
+#endif
+};
+
+/*** BeginHeader _wifi_InitData */
+void _wifi_InitData();
+/*** EndHeader */
+
+//
+// Initialize the MAC data module
+//
+_wifig_nodebug
+void _wifi_InitData()
+{
+	_f_memset (_wifi_recvCache, 0, sizeof _wifi_recvCache);
+	_f_memset (&_wifi_macStats, 0, sizeof _wifi_macStats);
+
+	_wifi_pairCipher = NULL;
+	_wifi_newPairCipher = NULL;
+	_wifi_groupCipher = NULL;
+
+	_wifi_maxFragSize = _wifi_macParams.frag_thresh;
+}
+
+/*** BeginHeader _wifi_wln_set_key */
+int _wifi_wln_set_key (wln_key_type type, mac_addr addr, int id, BOOL tx,
+				 uint8 *key, int key_len, uint8 *seq);
+/*** EndHeader */
+
+//
+// Set an encryption key
+// @param type key type, one of WLN_KEY_xxx
+// @param addr peer station if pairwise key, broadcast address if group key
+// @param id key index (0-3)
+// @param tx TRUE if key is used to transmit
+// @param key key data
+// @param key_len key length in bytes
+// @param seq packet sequence number, NULL if none
+//
+_wifig_nodebug
+int _wifi_wln_set_key (wln_key_type type, mac_addr addr, int id,
+                       BOOL tx, uint8 *key, int key_len, uint8 *seq)
+{
+	//printf("XXX dc: _wifi_wln_set_key: type %d\n", type);
+	// Delete previous key
+	if (_WIFI_IS_GROUP_ADDR (addr))
+	{
+		if (_wifi_groupCipher)
+			_wifi_groupCipher->SetKey (id, FALSE, NULL, 0, NULL);
+	}
+	else
+	{
+		if (_wifi_pairCipher)
+			_wifi_pairCipher->SetKey (id, FALSE, NULL, 0, NULL);
+		_wifi_pairCipher = _wifi_newPairCipher = NULL;
+	}
+
+	if (type == WLN_KEY_NONE)
+	{
+		_wifi_macStatus.encrypt = 0;
+		return 0;
+	}
+
+	// Set new key
+	else if (type <= WLN_KEY_CCMP)
+	{
+		if (_wifi_ciphers[type] == NULL)
+			return -1;
+
+		if (!_wifi_ciphers[type]->SetKey (id, tx, key, key_len, seq))
+			return -1;
+
+		// Setting a key to non-default value indicates sucessful authentication
+		if (_wifi_macStatus.state == WLN_ST_ASSOC_ESS &&
+			(key_len != _wifi_macParams.wep_key_len[id] ||
+			 memcmp (key, _wifi_macParams.wep_key[id], key_len) != 0))
+		{
+			_wifi_macStatus.state = WLN_ST_AUTH_ESS;
+
+ 			// Completed TKIP/CCMP; indicate that the link is up
+			wln_send_event (WLN_EVT_LINKUP, _wifi_macStatus.bss_addr);
+
+			// Guess at authentication type from WPA info
+			if (_wifi_macStatus.authen == WLN_AUTH_LEAP)
+				;
+			else if (_wifi_macStatus.wpa_info_len == 0)
+				_wifi_macStatus.authen = WLN_AUTH_WEP_8021X;
+			else if ((_wifi_macStatus.wpa_info[0] == _WIFI_ELEM_RSN && _wifi_macStatus.wpa_info[19] == 2) ||
+					 (_wifi_macStatus.wpa_info[0] == _WIFI_ELEM_VENDOR && _wifi_macStatus.wpa_info[23] == 2))
+				_wifi_macStatus.authen = WLN_AUTH_WPA_PSK;
+			else
+				_wifi_macStatus.authen = WLN_AUTH_WPA_8021X;
+		}
+
+		if (_WIFI_IS_GROUP_ADDR (addr) || type == WLN_KEY_WEP)
+			_wifi_groupCipher = _wifi_ciphers[type];
+		else
+      {
+			// WPA app queues an 802.1X frame, then sets the pairwise key.
+			// Delay setting _wifi_pairCipher until after sending the frame,
+			// or before receiving a new frame.
+			_wifi_newPairCipher = _wifi_ciphers[type];
+			// XXX dc: Hack - assume group cipher should be the same as pairwise cipher
+			_wifi_groupCipher = _wifi_ciphers[type];
+		}
+
+		_wifi_macStatus.encrypt |= 1 << type;
+		return 0;
+	}
+
+	return -1;
+}
+
+/*** BeginHeader _wifi_SetDefaultKeys */
+void _wifi_SetDefaultKeys (void);
+/*** EndHeader */
+
+//
+// Initialize non-WPA encryption
+//
+_wifig_nodebug
+void _wifi_SetDefaultKeys (void)
+{
+	auto int i;
+
+	_wifi_pairCipher = _wifi_newPairCipher = NULL;
+
+	// Initialize WEP using default keys.
+	// These may be used by shared key authentication or WEP encryption.
+	for (i = 0; i < WLN_KEY_NUM; i++)
+		if (_wifi_macParams.wep_key_len[i] > 0)
+			_wifi_wepCipher.SetKey (i, i == _wifi_macParams.wep_key_id,
+				_wifi_macParams.wep_key[i], _wifi_macParams.wep_key_len[i], NULL);
+
+	// Select encryption method
+	if (_wifi_macStatus.bss_caps & _WIFI_CAP_PRIVACY)
+	{
+		_wifi_groupCipher = &_wifi_wepCipher;
+		_wifi_macStatus.encrypt = WLN_ENCR_WEP;
+	}
+	else
+	{
+		_wifi_groupCipher = &_wifi_openCipher;
+		_wifi_macStatus.encrypt = WLN_ENCR_OPEN;
+	}
+}
+
+/*** BeginHeader _wifi_cipherIsCcmp */
+int _wifi_cipherIsCcmp (__far WiFiMacBuffer *buf);
+/*** EndHeader */
+
+/*
+ * Test whether or not the frame is to be sent / received to/from the AES
+ * FIFO.
+ */
+
+_wifig_nodebug
+int _wifi_cipherIsCcmp (__far WiFiMacBuffer *buf)
+{
+   if (_WIFI_IS_GROUP_ADDR(buf->macHdr.addr1))
+   {
+      return _wifi_groupCipher == &_wifi_ccmpCipher;
+   }
+   else
+   {
+      return _wifi_pairCipher == &_wifi_ccmpCipher;
+   }
+}
+
+/*** BeginHeader _wifi_SendFrames, _wifi_GetTxRates */
+void _wifi_SendFrames (__far WiFiMacBuffer *sbuf, const MacAddr dst);
+#if _WIFI_SILKEN_DAC
+int _wifi_GetTxRates(int mgmt, int group, int * rate2p);
+#endif
+/*** EndHeader */
+
+#if _WIFI_SILKEN_DAC
+_wifig_nodebug
+int _wifi_GetTxRates(int mgmt, int group, int * rate2p)
+{
+	// Replicate the rate determination procedure of _wifi_SendFrames() below,
+	// without changing any state.
+	// 'rate2' is rate for LAST frame,
+	// 'rate' (return value) is used for all others (if any).
+	auto WiFiMacBuffer __far  *buf;
+	auto int rate, rate2;
+
+	rate = rate2 = _wifi_rateTx;
+
+	if (mgmt)
+		rate2 = _wifi_rateMin;
+	else if (group)
+		rate2 = _wifi_rateBC;
+	else if (_wifi_erpInfo & _WIFI_ERP_USEPROTECT)
+		rate = _wifi_rateBC;
+	*rate2p = rate2;
+	return rate;
+}
+#endif
+
+//
+// Send a list of data MPDUs or a management MPDU
+// @param sbuf Start of buffer list.
+// @param dst Destination MAC address
+//
+_wifig_nodebug
+void _wifi_SendFrames ( WiFiMacBuffer __far  *sbuf, const MacAddr dst)
+{
+	auto WiFiMacBuffer __far  *buf;
+	auto int rate, rate2, dur, level;
+
+	rate = rate2 = _wifi_rateTx;
+
+	// Set MAC address fields for management frames.
+	// Send at lowest rate.
+	if (_WIFI_IS_MGMT (sbuf))
+	{
+   	_f_memcpy(sbuf->macHdr.addr1, dst,WLN_ADDR_SIZE);
+      _f_memcpy(sbuf->macHdr.addr2, _wifi_macParams.sta_addr,WLN_ADDR_SIZE);
+
+		if (_wifi_staState >= _WIFI_SS_JOIN)
+			_f_memcpy(sbuf->macHdr.addr3, _wifi_macStatus.bss_addr,WLN_ADDR_SIZE);
+
+#if _WIFI_SILKEN_DAC
+      // Don't allow 5.5/11Mbps management frames
+      if(_wifi_rateMin == 2 || _wifi_rateMin == 3)
+			rate2 = 1;
+      else
+#endif
+			rate2 = _wifi_rateMin;
+
+	}
+
+	// If broadcast, send at broadcast rate
+	else if (_WIFI_IS_GROUP_ADDR (sbuf->macHdr.addr1))
+		rate2 = _wifi_rateBC;
+
+	// If protection enabled and multiple fragments,
+	// send all but last fragment at broadcast rate
+	else if (_wifi_erpInfo & _WIFI_ERP_USEPROTECT)
+		rate = _wifi_rateBC;
+
+	// Set PLCP header for each fragment
+	for (buf = sbuf; buf->next; buf = buf->next)
+		_wifi_SetPLCP (buf, rate);
+	_wifi_SetPLCP (buf, rate2);
+
+	// Set duration for initial fragments
+	for (buf = sbuf; buf->next; buf = buf->next)
+	{
+		// Set this fragment's duration to its ACK plus
+		// next fragment's data and ACK
+		dur = _wifi_GetAckDuration (rate) + _wifi_GetDuration (buf->next);
+		buf->macHdr.duration = _WIFI_HTON16(dur);
+	}
+
+	// Set duration for final (or only) fragment
+	if (_WIFI_IS_GROUP_ADDR (buf->macHdr.addr1))
+		buf->macHdr.duration = 0;
+	else
+	{
+		dur = _wifi_GetAckDuration (rate2);
+		buf->macHdr.duration = _WIFI_HTON16(dur);
+	}
+
+	// Add each fragment to transmit queue
+	level = _WIFI_DISABLE();
+	while (sbuf)
+	{
+		buf = sbuf->next;
+		_WIFI_TXQ_PUT (sbuf);
+		sbuf = buf;
+	}
+
+	// Start sending first fragment
+	if (_wifi_txState == _WIFI_ST_IDLE)
+		_wifi_SendQueue();
+
+	_WIFI_ENABLE (level);
+}
+
+/*** BeginHeader _wifi_MacGetData */
+int _wifi_MacGetData (__far WiFiMacBuffer *buf, uint8 __far *data, int datasize);
+/*** EndHeader */
+
+//
+// Copy data from a list of MPDUs, defragmenting as needed.
+// @param buf Start of buffer list
+// @param data Destination to copy data from buffers
+// @param datasize Size of data in bytes
+// @return Number of bytes copied, may be less than size
+// if end of buffer list is reached
+//
+_wifig_nodebug
+int _wifi_MacGetData (__far WiFiMacBuffer *buf, uint8 __far *data, int datasize)
+{
+	auto int total;
+   auto uint8 __far * body;
+   auto int length;
+
+	total = 0;
+
+	// Copy buffers until datasize is reached
+	while (buf && datasize > 0)
+	{
+		body = buf->body;
+		length = buf->length-_WIFI_DATA_SIZE;
+
+		// Skip over IV
+		if (buf->macHdr.fc.flags & _WIFI_FCNTRL_PROTECT)
+		{
+			if (body[3] & _WIFI_EXT_IV)
+				body += _WIFI_EXT_IV_SIZE;		// 8
+			else
+				body += _WIFI_IV_SIZE;			// 4
+		}
+
+		// Skip over LLC/SNAP header if first fragment
+		if (total == 0)
+		{
+			body   += _WIFI_SNAP_SIZE;
+			length -= _WIFI_SNAP_SIZE;
+		}
+
+		if (length > datasize)
+			length = datasize;
+		memcpy (data, body, length);
+
+		buf = buf->next;
+		data += length;
+		datasize -= length;
+		total += length;
+	}
+
+	return total;
+}
+
+
+/*** BeginHeader _wifi_MacRecvData */
+void _wifi_MacRecvData (__far WiFiMacBuffer *buf, __far char * src, int epType,
+                        int length);
+/*** EndHeader */
+//
+// Receive a data MSDU.
+// Called my MAC layer to provide data to an upper layer.
+// This function must copy data by calling MacGetData() before returning.
+// @param buf Start of buffer list
+// @param dst Destination MAC address
+// @param src Source MAC address
+// @param epType Ethernet protocol type
+// @param length Length of data in bytes
+//
+_wifig_nodebug
+void _wifi_MacRecvData (__far WiFiMacBuffer *buf, __far char * src, int epType,
+                        int length)
+{
+	/*
+	Rabbit implementation note:
+
+	One or more network buffers are used to contain the packet (possibly
+	fragmented).  The stack	requires a single buffer, so we need to coalesce all
+	fragments into one buffer, and free the rest.
+
+	If the total length exceeds the MTU, then we must currently drop this packet.
+	Otherwise, all	fragments other than the first are concatenated to the first,
+	freeing those buffers for re-use	by other interfaces etc.  The first buffer
+	is retained, complete with its 66-byte MAC header.  We retain this header for
+	the most part, however pkt_received() prefers to see an ethernet header.
+	Thus, we replace the last part of the wifi MAC header, which is normally
+	{addr1, addr2, addr3}, with {dst, src, epType}.  This is harmless, since by
+	the time the packet is seen by the stack, those original wifi MAC fields are
+	not meaningful.  Also, since dst is	always addr1, no copy is necessary for
+	this field.
+
+	pkt_received() only needs to recognize the packet as having come from WiFi
+	interface in order to obtain the correct offset to the "Ethernet" header,
+	which starts at the macHdr.addr1 field.  The offset to the actual data is
+	further than 14 bytes past addr1, since the LLC/SNAP header	is still there.
+
+	*/
+	auto ll_prefix __far * LL;
+	auto __far char * body;
+	auto uint8 __far *data;
+	auto word ilen, netoffs, datasize, trunc, pktlen;
+	auto __far WiFiMacBuffer *sbuf;  // second buffer (if any)
+
+#if WIFI_MAC_DATA_VERBOSE
+	DPRINTF3("MacRecvData eptype=%04X length=%u\n", epType, length);
+#endif
+	// Process first buffer, which will be retained
+	body = buf->body;
+	ilen = buf->length-_WIFI_DATA_SIZE;
+
+   // Skip over IV
+   if (buf->macHdr.fc.flags & _WIFI_FCNTRL_PROTECT)
+   {
+      if (body[3] & _WIFI_EXT_IV)
+         body += _WIFI_EXT_IV_SIZE;    // 8
+      else
+         body += _WIFI_IV_SIZE;        // 4
+   }
+
+   body   += _WIFI_SNAP_SIZE;
+   ilen -= _WIFI_SNAP_SIZE;
+
+	netoffs = (word)(body - (__far char *)buf);	// Offset to IP header
+	datasize = NET_BUFSIZE - netoffs - ilen;	// Available space
+	data = body + ilen;		// Point to where next fragment data goes
+	pktlen = (word)(data - (__far char *)buf);	// Track reassembled packet length
+
+	LL = buf->LL;
+
+	// Construct "Ethernet" header
+	if (src != (char __far *)&buf->macHdr.addr2)
+		_f_memcpy(&buf->macHdr.addr2, src, sizeof(buf->macHdr.addr2));
+	*(__far int *)(&buf->macHdr.addr3) = epType;
+
+
+	// Copy fragments other than the 1st
+	trunc = 0;
+	for (sbuf = buf->next; sbuf; sbuf = sbuf->next) {
+		body = sbuf->body;
+		length = sbuf->length-_WIFI_DATA_SIZE;
+
+		// Skip over IV
+		if (sbuf->macHdr.fc.flags & _WIFI_FCNTRL_PROTECT)
+		{
+			if (body[3] & _WIFI_EXT_IV)
+				body += _WIFI_EXT_IV_SIZE;		// 8
+			else
+				body += _WIFI_IV_SIZE;			// 4
+		}
+
+		if (length > datasize) {
+			trunc = 1;
+			break;
+		}
+		_f_memcpy (data, body, length);
+
+		data += length;
+		pktlen += length;
+		datasize -= length;
+	}
+
+	if (trunc) {
+		// Too much reassembled data.  We have to drop this frame.
+		_wifi_FreeBuffers (buf);
+		return;
+	}
+
+	// Free all but the first buffer
+	if (buf->next) {
+		_wifi_FreeBuffers (buf->next);
+		buf->next = NULL;
+	}
+
+	// Mark the buffer ready
+	#asm
+	ld		hl,(sp+@sp+pktlen)
+	ld		bc,hl
+	ld		hl,(sp+@sp+netoffs)
+	ld		de,hl
+	ld		py,(sp+@sp+LL)
+	ld		hl,LL_READY+(IF_WIFI0<<8)
+	push	ix
+	lcall	_pb_finish
+	pop	ix
+	#endasm
+
+}
+
+
+/*** BeginHeader _wifi_RecvFrame */
+void _wifi_RecvFrame (__far WiFiMacBuffer *buf);
+/*** EndHeader */
+
+//
+// Process a frame from receive queue
+// @param buf Received frame
+//
+_wifig_nodebug
+void _wifi_RecvFrame (__far WiFiMacBuffer *buf)
+{
+	// Disabled debugging code
+#if 0
+	// Check for correct FCS
+	if (!(buf->macHdr.fc.flags & _WIFI_FCNTRL_PROTECT) &&
+#ifdef WIFI_AES_ENABLED
+	    _wifi_hwAES &&
+#endif
+		crc32_calc (&buf->macHdr, buf->length, 0) != _WIFI_GOOD_CRC32)
+	{
+		_wifi_FreeBuffers (buf);
+		_wifi_macStats.rxDropInvalid++;
+	#if WIFI_MAC_DATA_VERBOSE
+		DPRINTF2("Bad CRC %d\n", _wifi_macStats.rxDropInvalid);
+	#endif
+		return;
+	}
+#endif
+
+	// Discard received frame if:
+	//   To DS
+	//   Broadcast originally from this station
+	//   Data and not associated or from another BSS
+	if ((buf->macHdr.fc.flags & _WIFI_FCNTRL_TODS) ||
+		(_WIFI_IS_GROUP_ADDR (buf->macHdr.addr1) && !memcmp (buf->macHdr.addr3, _wifi_macParams.sta_addr,WLN_ADDR_SIZE)) ||
+		(_WIFI_IS_DATA (buf) &&
+		 (_wifi_staState != _WIFI_SS_ASSOC ||
+		  ((buf->macHdr.fc.flags & _WIFI_FCNTRL_FROMDS)  && memcmp (buf->macHdr.addr2, _wifi_macStatus.bss_addr,WLN_ADDR_SIZE)) ||
+		  (!(buf->macHdr.fc.flags & _WIFI_FCNTRL_FROMDS) && memcmp (buf->macHdr.addr3, _wifi_macStatus.bss_addr,WLN_ADDR_SIZE)))))
+	{
+		_wifi_FreeBuffers (buf);
+		_wifi_macStats.rxDropInvalid++;
+		return;
+	}
+
+	// Cache directed frames until all fragments received
+	if (!_WIFI_IS_GROUP_ADDR (buf->macHdr.addr1))
+	{
+		buf = _wifi_RecvCache (buf);
+		if (buf == NULL)
+			return;
+	}
+
+	// Have complete list of fragments
+	if (_WIFI_IS_DATA (buf))
+		_wifi_RecvData (buf);
+	else
+		_wifi_RecvMgmtFrame (buf);
+}
+
+/*** BeginHeader _wifi_RecvData */
+void _wifi_RecvData (__far WiFiMacBuffer *sbuf);
+/*** EndHeader */
+
+//
+// Process a data MSDU
+// @param sbuf List of buffers
+//
+_wifig_nodebug
+void _wifi_RecvData (__far WiFiMacBuffer *sbuf)
+{
+	auto __far WiFiMacBuffer *buf;
+	auto const WiFiMacCipher *cipher;
+	auto WiFiLLC_SNAP __far * ls;
+	auto int length;
+
+#if WIFI_MAC_DATA_VERBOSE
+	DPRINTF2("RecvData: fc 0x%x\n", sbuf->macHdr.fc.flags);
+#endif
+	// Update pair cipher before trying to decrypt
+	if (!_WIFI_IS_GROUP_ADDR (sbuf->macHdr.addr1))
+		_wifi_pairCipher = _wifi_newPairCipher;
+
+	// Decide which decryption cipher to use
+	if (!(sbuf->macHdr.fc.flags & _WIFI_FCNTRL_PROTECT))
+		cipher = &_wifi_openCipher;
+	else if (_WIFI_IS_GROUP_ADDR (sbuf->macHdr.addr1) || _wifi_pairCipher == NULL)
+		cipher = _wifi_groupCipher;
+	else
+		cipher = _wifi_pairCipher;
+
+	if (!cipher)
+	{
+		_wifi_FreeBuffers (sbuf);
+		_wifi_macStats.rxDropDecrypt++;
+		return;
+	}
+
+	// Decrypt each fragment
+	for (buf = sbuf; buf; buf = buf->next) {
+		//if (_WIFI_IS_GROUP_ADDR (sbuf->macHdr.addr1)) {
+		//	printf("Let's break here...\n");
+		//}
+		if (!cipher->Decrypt (buf))
+		{
+#if WIFI_MAC_DATA_VERBOSE
+			DPRINTF2("RecvData decrypt failed for %s\n",
+				_WIFI_IS_GROUP_ADDR (sbuf->macHdr.addr1) ? "group" : "unicast");
+#endif
+			_wifi_FreeBuffers (sbuf);
+			_wifi_macStats.rxDropDecrypt++;
+			return;
+		}
+	}
+
+#ifdef _WIFI_USING_TKIP
+	// Verify message integrity check
+	if (cipher->is_TKIP && !MichaelVerifyMIC(sbuf))
+	{
+	#if WIFI_MAC_DATA_VERBOSE
+		DPRINTF("RecvData MIC failed\n");
+	#endif
+		_wifi_FreeBuffers (sbuf);
+		_wifi_macStats.rxDropDecrypt++;
+		return;
+	}
+#endif
+
+	// Calculate total length
+	length = 0;
+	for (buf = sbuf; buf; buf = buf->next)
+    	length += buf->length - _WIFI_DATA_SIZE;
+
+	// Verify LLC/SNAP header
+	ls = (WiFiLLC_SNAP __far *) (sbuf->body + cipher->ivSize);
+	if (length < _WIFI_SNAP_SIZE || memcmp (ls, &_wifi_llc_snap, _WIFI_SNAP_SIZE-2) != 0)
+	{
+	#if WIFI_MAC_DATA_VERBOSE
+		DPRINTF("RecvData bad SNAP header\n");
+	#endif
+		_wifi_FreeBuffers (sbuf);
+		_wifi_macStats.rxDropInvalid++;
+		return;
+	}
+
+   // Drop if not encrypted when required.
+   // Always allow 802.1x (EAPOL) frames.
+	if (!(sbuf->macHdr.fc.flags & _WIFI_FCNTRL_PROTECT) &&
+	    (_wifi_macStatus.bss_caps & _WIFI_CAP_PRIVACY) &&
+	    ls->eptype != _WIFI_EP_8021X)
+	{
+	#if WIFI_MAC_DATA_VERBOSE
+		DPRINTF("RecvData required encryption missing\n");
+	#endif
+		_wifi_FreeBuffers (sbuf);
+		_wifi_macStats.rxDropDecrypt++;
+		return;
+	}
+
+   // Send data frame to upper layer
+	_wifi_MacRecvData (sbuf,
+		(sbuf->macHdr.fc.flags & _WIFI_FCNTRL_FROMDS) ?
+			(char __far *)&sbuf->macHdr.addr3 :
+			(char __far *)&sbuf->macHdr.addr2,
+		ls->eptype, length-_WIFI_SNAP_SIZE);
+}
+
+/*** BeginHeader _wifi_RecvCache */
+__far WiFiMacBuffer *_wifi_RecvCache (__far WiFiMacBuffer *buf);
+/*** EndHeader */
+
+//
+// Add a frame to the receive cache.
+// Discards duplicate frames and out of order fragments.
+// @param Received frame
+// @return List of fragments in MSDU if all fragments received, else NULL.
+//
+_wifig_nodebug
+__far WiFiMacBuffer *_wifi_RecvCache (__far WiFiMacBuffer *buf)
+{
+	auto __far WiFiRecvCacheEntry *rce;
+	auto BOOL found;
+	auto WiFiSeqControlU squ;
+
+	// Find <addr2,seq> in receive cache, or an entry to replace
+	squ.sq16 = _WIFI_NTOH16 (buf->macHdr.squ.sq16);
+	found = _wifi_SearchRecvCache (buf->macHdr.addr2,
+                                  _WIFI_GET_FIELD(squ.sq.info, _WIFI_SEQCNTRL_SEQ),
+                                  &rce);
+
+	// First or only fragment
+	if (_WIFI_GET_FIELD(squ.sq.info, _WIFI_SEQCNTRL_FRAG) == 0)
+	{
+		// Discard if duplicate and retry bit set
+		if (found && (buf->macHdr.fc.flags & _WIFI_FCNTRL_RETRY) &&
+          rce->frags == 0)
+		{
+			_wifi_FreeBuffers (buf);
+			_wifi_macStats.rxDropDup++;
+			return NULL;
+		}
+
+		// Free any previous buffers
+		if (rce->bufs.head)
+		{
+			_wifi_FreeBuffers (rce->bufs.head);
+			rce->bufs.head = NULL;
+			_wifi_macStats.rxDropAge++;
+		}
+
+		// Set new cache entry
+		_WIFI_SET_ADDR (rce->addr, buf->macHdr.addr2);
+		rce->seq = _WIFI_GET_FIELD(squ.sq.info, _WIFI_SEQCNTRL_SEQ);
+		rce->frags = 1;
+		rce->time = _WIFI_GET_TIME();
+		_WIFI_ASSERT(isValidWiFiMacBuffer(buf));
+		_wifi_PutQueue (&rce->bufs, buf);
+	}
+
+	// Other fragments:
+	// Add to cache entry if next expected fragment
+	else if (found &&
+            _WIFI_GET_FIELD(squ.sq.info, _WIFI_SEQCNTRL_FRAG) == rce->frags)
+	{
+		rce->frags++;
+		_WIFI_ASSERT(isValidWiFiMacBuffer(buf));
+		_wifi_PutQueue (&rce->bufs, buf);
+	}
+	else
+	{
+		_wifi_FreeBuffers (buf);
+		_wifi_macStats.rxDropDup++;
+		return NULL;
+	}
+
+	// Return list of buffers if all fragments received
+	if (!(buf->macHdr.fc.flags & _WIFI_FCNTRL_MOREFRAG))
+	{
+		// Remove buffers from cache, but leave entry for duplicate detection
+		buf = rce->bufs.head;
+		rce->bufs.head = NULL;
+		rce->frags = 0;
+		return buf;
+	}
+	else
+		return NULL;
+}
+
+/*** BeginHeader _wifi_SearchRecvCache */
+BOOL _wifi_SearchRecvCache ( __far char * addr, uint16 seq, WiFiRecvCacheEntry __far*__far*rce);
+/*** EndHeader */
+
+//
+// Find the entry with <addr,seq> in receive cache.
+// If not found, select an entry to replace.
+// @param addr Transmitter address
+// @param seq Frame sequence number
+// @param rce Returned pointer to cache entry
+// @return TRUE if entry found, FALSE to replace the entry at rce.
+//
+_wifig_nodebug
+BOOL _wifi_SearchRecvCache ( __far char * addr, uint16 seq, WiFiRecvCacheEntry __far*__far*rce)
+{
+	auto int i;
+	auto uint32 oldest;
+   oldest = _wifi_recvCache[0].time;  // Oldest entry to replace
+	*rce = &_wifi_recvCache[0];
+
+	for (i = 0; i < _WIFI_RXCACHE_NUM; i++)
+	{
+		// Found a match
+		if (_wifi_recvCache[i].seq == seq && _WIFI_EQUAL_ADDR (_wifi_recvCache[i].addr, addr))
+		{
+			*rce = &_wifi_recvCache[i];
+			return TRUE;
+		}
+		// Found an older entry
+		else if (_wifi_recvCache[i].time < oldest)
+		{
+			*rce = &_wifi_recvCache[i];
+			oldest = _wifi_recvCache[i].time;
+		}
+	}
+
+	return FALSE;
+}
+
+/*** BeginHeader _wifi_AgeRecvCache */
+void _wifi_AgeRecvCache();
+/*** EndHeader */
+
+//
+// Free buffers associated with old receive cache entries
+//
+_wifig_nodebug
+void _wifi_AgeRecvCache()
+{
+	auto int i;
+	auto uint32 now;
+   now = _WIFI_GET_TIME();
+
+	for (i = 0; i < _WIFI_RXCACHE_NUM; i++)
+		// Has buffers and time is old
+		if (_wifi_recvCache[i].bufs.head &&
+		    now-_wifi_recvCache[i].time >= _WIFI_MAX_RX_LIFETIME)
+		{
+			// Free buffers, but leave entry for duplicate detection
+			_wifi_FreeBuffers (_wifi_recvCache[i].bufs.head);
+			_wifi_recvCache[i].bufs.head = NULL;
+			_wifi_recvCache[i].frags = 0;
+			_wifi_macStats.rxDropAge++;
+		}
+}
+
+
+/*** BeginHeader _wifi_OpenSetKey */
+BOOL _wifi_OpenSetKey (int id, BOOL tx, uint8 *key, int len, uint8 *seq);
+/*** EndHeader */
+
+//
+// Open cipher (no encryption) implementation
+//
+_wifig_nodebug
+BOOL _wifi_OpenSetKey (int id, BOOL tx, uint8 *key, int len, uint8 *seq)
+{
+	// No encryption so simply return FALSE
+	return FALSE;
+}
+
+/*** BeginHeader _wifi_OpenEncrypt */
+BOOL _wifi_OpenEncrypt (__far WiFiMacBuffer *buf);
+/*** EndHeader */
+
+_wifig_nodebug
+BOOL _wifi_OpenEncrypt (__far WiFiMacBuffer *buf)
+{
+	// No encryption so simply return FALSE
+	return TRUE;
+}
+
+/*** BeginHeader _wifi_OpenDecrypt */
+BOOL _wifi_OpenDecrypt (__far WiFiMacBuffer *buf);
+/*** EndHeader */
+
+_wifig_nodebug
+BOOL _wifi_OpenDecrypt (__far WiFiMacBuffer *buf)
+{
+	return !(buf->macHdr.fc.flags & _WIFI_FCNTRL_PROTECT);
+}
+
+
+/*** BeginHeader _wifi_openCipher */
+extern const WiFiMacCipher _wifi_openCipher;
+/*** EndHeader */
+const WiFiMacCipher _wifi_openCipher = {
+	0,
+	0,
+	_WIFI_DATA_SIZE,
+	0,
+	_wifi_OpenSetKey,
+	_wifi_OpenEncrypt,
+	_wifi_OpenDecrypt
+};
+

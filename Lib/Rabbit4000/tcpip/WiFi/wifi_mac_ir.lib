@@ -1,0 +1,867 @@
+//
+// Embedded 802.11 wireless network interface
+// MAC layer interrupt handler
+// Copyright 2007 Rabbit Semiconductor
+//
+
+/*** BeginHeader _wifi_txState, _wifi_bcnState */
+
+extern WiFiTxState _wifi_txState;			// Transmitter state
+extern uint32 _wifi_idleTime;					// Time last in idle state
+extern __far WiFiMacBuffer *_wifi_txFrame;	// Frame being tranmitted
+extern WiFiMacBuffer _wifi_rtsFrame;		// Pre-initialized RTS frame
+extern WiFiMacBuffer _wifi_ctsFrame;		// Pre-initialized CTS-to-self frame
+extern int _wifi_cw;								// Contention window size
+extern int _wifi_src;							// Short retry counter
+extern int _wifi_lrc;							// Long retry counter
+extern int _wifi_seq;							// Current sequence number
+extern int _wifi_next_seq;						// Next sequence number
+
+extern WiFiBcnState _wifi_bcnState;			// Beacon/ATIM state
+extern uint32 _wifi_bcnTime;					// Time last beacon received
+extern BOOL _wifi_sentBcn;						// TRUE if sent last beacon
+extern BOOL _wifi_sendResp;					// TRUE to send probe response
+
+// Map OFDM rate code to rate in 100kbps
+extern const int _wifi_ofdmRate[];
+
+/*** EndHeader */
+
+WiFiTxState _wifi_txState;				// Transmitter state
+uint32 _wifi_idleTime;					// Time last in idle state
+__far WiFiMacBuffer *_wifi_txFrame;	// Frame being tranmitted
+WiFiMacBuffer _wifi_rtsFrame;			// Pre-initialized RTS frame
+WiFiMacBuffer _wifi_ctsFrame;			// Pre-initialized CTS-to-self frame
+int _wifi_cw;								// Contention window size
+int _wifi_src;								// Short retry counter
+int _wifi_lrc;								// Long retry counter
+int _wifi_seq;								// Current sequence number
+int _wifi_next_seq;						// Next sequence number
+
+WiFiBcnState _wifi_bcnState;			// Beacon/ATIM state
+uint32 _wifi_bcnTime;					// Time last beacon received
+BOOL _wifi_sentBcn;						// TRUE if sent last beacon
+BOOL _wifi_sendResp;						// TRUE to send probe response
+
+// Map OFDM rate code to rate in 100kbps
+const int _wifi_ofdmRate[] = { 480, 240, 120, 60, 540, 360, 180, 90 };
+
+/*** BeginHeader _wifi_MacEvent */
+void _wifi_MacEvent(int, __far WiFiMacBuffer *);
+/*** EndHeader */
+
+_wifig_nodebug
+void _wifi_MacEvent(int evt, __far WiFiMacBuffer * buf)
+{
+#if 0
+#if WIFIG_VERBOSE > 4
+	// For the Rabbit, just print what happens
+	DPRINTF2("_wifi_MacEvent %s: ",
+		evt == _WIFI_MAC_EVT_TX_INTR ? "TxIntr"  :
+		evt == _WIFI_MAC_EVT_RX_INTR ? "RxIntr"  :
+		                               "OtherEvt");
+
+	if (buf) {
+		DPRINTF4("len=%u rx_signal=%u tx_rate=%u\n",
+			buf->length, buf->rx_signal, buf->tx_rate);
+	}
+	else {
+		DPRINTF("Null buffer!\n");
+	}
+#endif
+#endif
+}
+
+
+
+/*** BeginHeader _wifi_InitIR */
+void _wifi_InitIR (void);
+/*** EndHeader */
+
+//
+// Initialize interrupt handler module
+//
+_wifig_nodebug
+void _wifi_InitIR (void)
+{
+	_wifi_txFrame = NULL;
+	_wifi_txState = _WIFI_ST_IDLE;
+	_wifi_bcnState = _WIFI_SB_DATA;
+	_wifi_sentBcn = FALSE;
+	_wifi_sendResp = FALSE;
+	_wifi_bcnTime = 0;
+	_wifi_idleTime = 0;
+	_wifi_seq = 0;
+	_wifi_next_seq = 0;
+
+	// Init fixed values in control frames
+	memset (&_wifi_rtsFrame, 0, sizeof _wifi_rtsFrame);
+	_wifi_rtsFrame.length = _WIFI_RTS_SIZE;
+	_wifi_rtsFrame.macHdr.fc.type = _WIFI_TYPE_RTS;
+	_WIFI_SET_ADDR (_wifi_rtsFrame.macHdr.addr2, _wifi_macParams.sta_addr);
+
+	memset (&_wifi_ctsFrame, 0, sizeof _wifi_ctsFrame);
+	_wifi_ctsFrame.length = _WIFI_CTS_SIZE;
+	_wifi_ctsFrame.macHdr.fc.type = _WIFI_TYPE_CTS;
+	_WIFI_SET_ADDR (_wifi_ctsFrame.macHdr.addr1, _wifi_macParams.sta_addr);
+}
+
+/*** BeginHeader _wifi_IRTimer */
+void _wifi_IRTimer (void);
+/*** EndHeader */
+
+//
+// Interrupt module timer
+// Called periodically from _wifi_MacTimer()
+//
+_wifig_nodebug
+void _wifi_IRTimer (void)
+{
+	auto uint32 now;
+	auto uint32 then;
+	auto int level;
+
+   now = _WIFI_GET_TIME();
+
+#ifdef _WIFI_IR_TIMEOUT
+	// Interrupt handler sets _wifi_idleTime to 0 when idle.
+	// Read time only once in case changed by interrupt.
+	// Save actual time here instead of in interrupt handler.
+	then = _wifi_idleTime;
+	if (then == 0)
+		_wifi_idleTime = now;
+
+	// Check for transmit idle timeout
+	else if (_wifi_txState != _WIFI_ST_IDLE && now-then >= _WIFI_IR_TIMEOUT)
+	{
+//		DPRINTF2("Idle timeout state=%d\n", _wifi_txState);
+		level = _WIFI_DISABLE();
+      DPRINTF3("*** MAC TIMER TIMEOUT *** Timeout on TX from MacTimer IMR=%02x ISR=%02x\n",
+               _wc_read8(NCIMR), _wc_read8(NCISR));
+		_wifi_HandleMacError (0);
+		_WIFI_ENABLE (level);
+	}
+#endif
+
+	if (_wifi_scan.roam_enabled)
+	{
+	// Check for missed beacons
+	if (_wifi_staState >= _WIFI_SS_JOIN &&
+	    (_wifi_macStatus.bss_caps & _WIFI_CAP_ESS))
+	{
+		// Interrupt handler sets _wifi_bcnTime to 0 when beacon received.
+		// Read time only once in case changed by interrupt.
+		// Save actual time here instead of in interrupt handler.
+		then = _wifi_bcnTime;
+		if (then == 0)
+			{
+			_wifi_bcnTime = now;
+			}
+		// More than _WIFI_BEACON_MISS intervals since we last
+		// received a beacon, resume search for BSS.
+		// Note: times are in msecs, beacon intervals are in TU (1024 usecs).
+			else if (1000L*(now-then) >= 1024UL* _wifi_scan.roam_beacon_loss * _wifi_bcnInt)
+		{
+			DPRINTF ("Beacon timeout, next BSS...\n");
+				if (_wifi_staState == _WIFI_SS_ASSOC)
+				{
+				wln_send_event (WLN_EVT_DISASSOC, _wifi_macStatus.bss_addr);
+         }
+			_wifi_NextBSS();
+		}
+	}
+	}
+}
+
+/*** BeginHeader _wifi_setTxState */
+#if WIFIG_VERBOSE > 5
+void _wifi_setTxState (WiFiTxState new_state);
+#else
+	#define _wifi_setTxState(x) (_wifi_txState = (x))
+#endif
+/*** EndHeader */
+#if WIFIG_VERBOSE > 5
+char * swtx_xlate(WiFiTxState s)
+{
+	switch (s) {
+	case _WIFI_ST_IDLE: return("IDLE");
+	case _WIFI_ST_CTS: return("waitCTS");
+	case _WIFI_ST_ACK: return("waitACK");
+	case _WIFI_ST_BC: return("sentBC");
+	case _WIFI_ST_BUSY: return("BUSY");
+	}
+	return "unknown";
+}
+__nodebug void _wifi_setTxState (WiFiTxState new_state)
+{
+	if (_wifi_txState == new_state)
+		return;
+	DPRINTF3("Set Tx state %s -> %s\n", swtx_xlate(_wifi_txState), swtx_xlate(new_state));
+	_wifi_txState = new_state;
+}
+#endif
+
+/*** BeginHeader _wifi_setStaState */
+#if WIFIG_VERBOSE > 1
+void _wifi_setStaState (WiFiStaState new_state);
+#else
+	#define _wifi_setStaState(x) (_wifi_staState = (x))
+#endif
+/*** EndHeader */
+#if WIFIG_VERBOSE > 1
+char * swsta_xlate(WiFiStaState s)
+{
+	switch (s) {
+	case _WIFI_SS_WAIT: return("WAITrestart");
+	case _WIFI_SS_SCAN: return("SCANNING");
+	case _WIFI_SS_BEACON: return("waitBCN");
+	case _WIFI_SS_JOIN: return("JOINED");
+	case _WIFI_SS_AUTH: return("AUTHD");
+	case _WIFI_SS_ASSOC: return("ASSOCD");
+	}
+	return "unknown";
+}
+_wifig_nodebug void _wifi_setStaState (WiFiStaState new_state)
+{
+	if (_wifi_staState == new_state)
+		return;
+	DPRINTF3("Set STA state %s -> %s\n", swsta_xlate(_wifi_staState), swsta_xlate(new_state));
+	_wifi_staState = new_state;
+}
+#endif
+
+/*** BeginHeader _wifi_HandleRxEnd */
+void _wifi_HandleRxEnd (__far WiFiMacBuffer *rxBuf);
+/*** EndHeader */
+
+//
+// Handle a receive interrupt
+// @param rxBuf Frame being received, only header is valid
+//
+_wifig_nodebug
+void _wifi_HandleRxEnd (__far WiFiMacBuffer *rxBuf)
+{
+	auto BOOL txNext;  // TRUE to transmit next frame
+	auto uint16 length;
+	auto WiFiPlcpHeader plcp;
+
+   txNext = FALSE;
+
+	//
+	// Process transmit state transition
+	//
+	switch (_wifi_txState)
+	{
+		case _WIFI_ST_CTS:
+			// CTS received
+			if (rxBuf->macHdr.fc.type == _WIFI_TYPE_CTS)
+			{
+				_wifi_macStats.txRTS++;
+				_wifi_src = 0;
+				txNext = TRUE;
+			}
+			break;
+
+		case _WIFI_ST_ACK:
+			// ACK received
+			if (rxBuf->macHdr.fc.type == _WIFI_TYPE_ACK)
+			{
+#if WIFIG_VERBOSE > 5
+         	DPRINTF("*** ACK *** Received ACK\n");
+#endif
+         	if (!(_wc_read32(NCGC0R) & _WIFI_GEN_TXFIFOEMPTY)) {
+            	DPRINTF("*!*!*!*! Received ACK; TX FIFO not empty !*!*!*!*\n");
+            }
+				_WIFI_ASSERT (_wifi_txFrame);
+				_wifi_macStats.txBytes += _wifi_txFrame->length-_WIFI_DATA_SIZE;
+				_wifi_macStats.txFrames++;
+				_wifi_rateTxCount++;
+
+				// No more fragments to send
+				if (!(_wifi_txFrame->macHdr.fc.flags & _WIFI_FCNTRL_MOREFRAG))
+				{
+					_wifi_MacEvent (_WIFI_MAC_EVT_TX_INTR, _wifi_txFrame);
+					_wifi_setTxState(_WIFI_ST_IDLE);
+				}
+
+				// Free data frame
+				_wifi_FreeBufferIR (_wifi_txFrame);
+				_wifi_txFrame = NULL;
+				txNext = TRUE;
+			}
+			break;
+
+		case _WIFI_ST_BC:
+		case _WIFI_ST_BUSY:
+		case _WIFI_ST_IDLE:
+			break;
+	}
+
+	//
+	// Process received frame
+	//
+
+	// Calculate length in bytes.
+	if (rxBuf->frameHdr.rx.modType == _WIFI_MOD_OFDM)
+	{
+		// Swap bytes of OFDM PLCP headers
+		plcp.plcp32 = _WIFI_SWAP32 (rxBuf->plcpHdr.plcp32);
+
+		length = (uint16)_WIFI_GET_FIELD(plcp.ofdm.info, _WIFI_OFDM_LENGTH);
+		_wifi_macStatus.rx_rate =
+         _wifi_ofdmRate[(uint16)(_WIFI_GET_FIELD(plcp.ofdm.info, _WIFI_OFDM_RATE) & 0x7)];
+	}
+	else
+	{
+		// Use a switch to avoid doing a divide operation.
+		length = _WIFI_NTOH16 (rxBuf->plcpHdr.pskcck.length);
+		switch (rxBuf->plcpHdr.pskcck.signal)
+		{
+			case 10:
+				length >>= 3;
+				break;
+			case 20:
+				length >>= 2;
+				break;
+			case 55:
+				length = (11*length) >> 4;
+				break;
+			case 110:
+				length = (11*length) >> 3;
+				if (rxBuf->plcpHdr.pskcck.service & _WIFI_SERVICE_LENEXT)
+					length--;
+				break;
+		}
+		_wifi_macStatus.rx_rate = rxBuf->plcpHdr.pskcck.signal;
+	}
+
+	// Received RTS
+	if (rxBuf->macHdr.fc.type == _WIFI_TYPE_RTS) {
+		_wifi_macStats.rxRTS++;
+	}
+
+	// Received data or management frame
+	else if ((rxBuf->macHdr.fc.type & 0x7) == 0)
+	{
+		// Received beacon and already joined a BSS
+		if (_wifi_staState >= _WIFI_SS_BEACON && rxBuf->macHdr.fc.type == _WIFI_TYPE_BEACON)
+		{
+			// Receiving a beacon cancels beacon transmission
+			if (_wifi_bcnState == _WIFI_SB_BEACON)
+				_wifi_setTxState(_WIFI_ST_IDLE);
+
+			// Update beacon state
+			if (_wifi_bcnState != _WIFI_SB_DATA)
+			{
+				if (_wifi_atimWindow > 0)
+					_wifi_bcnState = _WIFI_SB_ATIM;
+				else
+					_wifi_bcnState = _WIFI_SB_DATA;
+			}
+		}
+
+		// Get a buffer for frame
+		if (length <= _WIFI_MAX_FRAME_SIZE)
+		{
+			rxBuf = _wifi_GetBufferIR();
+			if (rxBuf)
+			{
+				// Get complete frame
+				rxBuf->length = length;
+				if (_wifi_GetFrame (rxBuf))
+				{
+					// Received probe request.
+					// Process in interrupt handler for fast response time.
+					if (rxBuf->macHdr.fc.type == _WIFI_TYPE_PROBE_REQ)
+					{
+						_wifi_SendProbeResponse (rxBuf);
+						_wifi_FreeBufferIR (rxBuf);
+					}
+					else
+					{
+						// Add to receive queue
+						_WIFI_RXQ_PUT (rxBuf);
+						_wifi_MacEvent (_WIFI_MAC_EVT_RX_INTR, rxBuf);
+					}
+
+					if (_WIFI_IS_GROUP_ADDR (rxBuf->macHdr.addr1))
+						_wifi_macStats.rxBCFrames++;
+					else
+						_wifi_macStats.rxFrames++;
+
+					if (rxBuf->macHdr.fc.flags & _WIFI_FCNTRL_RETRY)
+						_wifi_macStats.rxRetries++;
+
+					_wifi_macStats.rxBytes += length-_WIFI_DATA_SIZE;
+					length = 0;
+				}
+				else
+					_wifi_FreeBufferIR (rxBuf);
+			}
+			else
+			{
+				// no available Rx buffer, mark the dropped frame
+				_wifi_macStats.rxDropBuffer++;
+#if 0
+/*
+   Maintenance Note:
+      Originally introduced as part of Vantive 34696 fix, this action is too
+      drastic to incorporate into the general Dynamic C release. More
+      investigation is needed.
+*/
+				// now drop all queued Rx buffers to prevent fragmentation deadlock
+				while (_WIFI_RXQ_GET (rxBuf))
+				{
+					_wifi_FreeBuffers(rxBuf);
+					_wifi_macStats.rxDropBuffer++;
+				}
+#endif
+			}
+		}
+		else
+			_wifi_macStats.rxDropSize++;
+	}
+
+#ifdef WIFI_MANUFACTURING_TEST
+  	if(length == _WIFI_RX_TEST_PACKET_SIZE)
+      	_wifi_macStats.rxPktCounter++;
+#endif
+
+	// Drop frame if not copied to buffer
+	if (length > 0)
+		_wifi_DropFrame (length);
+
+	// Reset beacon timer
+	_wifi_bcnTime = 0;
+
+	//
+	// Transmit next data frame
+	//
+	if (txNext || _wifi_txState == _WIFI_ST_IDLE)
+		_wifi_SendQueue();
+}
+
+/*** BeginHeader _wifi_HandleTxEnd */
+void _wifi_HandleTxEnd (void);
+/*** EndHeader */
+
+//
+// Handle a transmit complete interrupt.
+//
+_wifig_nodebug
+void _wifi_HandleTxEnd (void)
+{
+	// Broadcast frame transmitted
+	if (_wifi_txState == _WIFI_ST_BC)
+	{
+		_WIFI_ASSERT (_wifi_txFrame);
+		_wifi_macStats.txBytes += _wifi_txFrame->length-_WIFI_DATA_SIZE;
+		_wifi_macStats.txBCFrames++;
+		_wifi_MacEvent (_WIFI_MAC_EVT_TX_INTR, _wifi_txFrame);
+
+		// Free data frame
+		_wifi_FreeBufferIR (_wifi_txFrame);
+		_wifi_txFrame = NULL;
+		_wifi_setTxState(_WIFI_ST_IDLE);
+	}
+
+	// Other frame transmitted
+	else if (_wifi_txState == _WIFI_ST_BUSY)
+	{
+		// Beacon transmitted
+		if (_wifi_bcnState == _WIFI_SB_BEACON)
+		{
+			_wifi_sentBcn = TRUE;
+			if (_wifi_atimWindow > 0)
+				_wifi_bcnState = _WIFI_SB_ATIM;
+			else
+				_wifi_bcnState = _WIFI_SB_DATA;
+		}
+		_wifi_setTxState(_WIFI_ST_IDLE);
+	}
+
+	// Transmit next data frame
+	if (_wifi_txState == _WIFI_ST_IDLE)
+		_wifi_SendQueue();
+}
+
+/*** BeginHeader _wifi_HandleMacError */
+void _wifi_HandleMacError (uint32 error);
+/*** EndHeader */
+
+//
+// Handle an error interrupt
+// @param error Error type (not used)
+//
+_wifig_nodebug
+void _wifi_HandleMacError (uint32 error)
+{
+	DPRINTF("*** MAC ERROR *** Handling MAC error\n");
+	// Retry data frame
+	if (_wifi_txState == _WIFI_ST_CTS || _wifi_txState == _WIFI_ST_ACK) {
+   	DPRINTF("*** RETRY *** Retrying sending of frame\n");
+		_wifi_Retry();
+   }
+
+	// Discard broadcast frame
+	else if (_wifi_txState == _WIFI_ST_BC)
+	{
+		_WIFI_ASSERT (_wifi_txFrame);
+		_wifi_macStats.txDropBC++;
+		_wifi_MacEvent (_WIFI_MAC_EVT_TX_INTR, _wifi_txFrame);
+		_wifi_FreeBufferIR (_wifi_txFrame);
+		_wifi_txFrame = NULL;
+	}
+
+	_wifi_setTxState(_WIFI_ST_IDLE);
+	_wifi_bcnState = _WIFI_SB_DATA;
+
+	// Transmit next data frame
+	_wifi_SendQueue();
+}
+
+/*** BeginHeader _wifi_HandleBeacon */
+void _wifi_HandleBeacon (BOOL tbtt);
+/*** EndHeader */
+
+//
+// Handle a beacon or ATIM interrupt
+// @param tbtt TRUE if target beacon transmission time, FALSE if end of ATIM window
+//
+_wifig_nodebug
+void _wifi_HandleBeacon (BOOL tbtt)
+{
+	// Handle only if joined or started an IBSS
+	if ((_wifi_macStatus.bss_caps & _WIFI_CAP_IBSS) && _wifi_staState == _WIFI_SS_ASSOC)
+	{
+		// Time to trasmit a beacon
+		if (tbtt && _wifi_bcnState != _WIFI_SB_BEACON)
+		{
+			_wifi_sentBcn = FALSE;
+			_wifi_bcnState = _WIFI_SB_TBTT;
+		}
+
+		// End of ATIM interval
+		else if (!tbtt)
+		{
+			// In case a received beacon cancels beacon transmission
+			if (_wifi_bcnState == _WIFI_SB_BEACON)
+				_wifi_setTxState(_WIFI_ST_IDLE);
+			_wifi_bcnState = _WIFI_SB_DATA;
+		}
+
+		// Transmit next frame
+		if (_wifi_txState == _WIFI_ST_IDLE)
+			_wifi_SendQueue();
+	}
+}
+
+/*** BeginHeader _wifi_SendQueue */
+void _wifi_SendQueue (void);
+/*** EndHeader */
+
+//
+// Send the next frame in the transmit queue
+//
+// This function is called once per data fragment.
+// It tries to keep at least 2 frames in the hardware transmit FIFO.
+//
+// When called for the first frame of a sequence, send one of:
+//   Only data fragment
+//   First 2 data fragments
+//   RTS and first data fragment
+//   CTS and only data fragment
+//   CTS and first 2 data fragment
+//
+// When called after RTS or data fragment is complete, send only the
+// next data fragment if any.  Previous fragment is already queued.
+//
+// This function is not called when CTS completes, so always send it
+// with the first 2 data fragments.
+//
+_wifig_nodebug
+void _wifi_SendQueue (void)
+{
+	auto WiFiFrameHeader hdr;
+	auto WiFiSeqControlU squ;
+	auto BOOL firstFrame; // TRUE if first frame in sequence
+	auto int next;
+
+	_WIFI_ASSERT (_wifi_txState == _WIFI_ST_IDLE || _wifi_txState == _WIFI_ST_CTS
+	              || _wifi_txState == _WIFI_ST_ACK);
+	firstFrame = (_wifi_txState == _WIFI_ST_IDLE);
+
+	// Transmit a beacon.  This may interrupt the
+	// current frame sequence after the CTS or ACK.
+	if (_wifi_bcnState == _WIFI_SB_TBTT)
+	{
+		if (_wifi_bcnFrame)
+		{
+			_wifi_bcnState = _WIFI_SB_BEACON;
+			_wifi_setTxState(_WIFI_ST_BUSY);
+			_wifi_bcnFrame->macHdr.squ.sq.info = _wifi_next_seq << 4;
+			++_wifi_next_seq;
+			_wifi_SendFrame (_wifi_bcnFrame, 2*_WIFI_CW_MIN+1, _WIFI_SF_TXEND);
+			return;
+		}
+		else
+			_wifi_bcnState = _WIFI_SB_DATA;
+	}
+
+	// Don't send other frames during ATIM window
+	if (_wifi_bcnState != _WIFI_SB_DATA)
+		return;
+
+#ifdef _WIFI_DUTYCYCLE
+	// If there were suspended packets, transmit the next one if allowable
+	if (_wifi_pskcck_us >= _WIFI_DUTYCYCLE*1000uL)
+		return;
+#endif
+
+	// Clear idle timer
+	if (_wifi_txState == _WIFI_ST_IDLE)
+		_wifi_idleTime = 0;
+
+	// Transmit a probe response
+	if (_wifi_sendResp && _wifi_respFrame)
+	{
+		_wifi_sendResp = FALSE;
+		_wifi_setTxState(_WIFI_ST_BUSY);  // don't wait for ACK
+		_wifi_respFrame->macHdr.squ.sq.info = _wifi_next_seq<<4;
+		++_wifi_next_seq;
+
+		_wifi_SendFrame (_wifi_respFrame, _WIFI_CW_MIN, _WIFI_SF_RX);
+		return;
+	}
+
+	// First time a data frame has been transmitted
+	if (_wifi_txFrame == NULL)
+	{
+		// Get next frame to send
+		_WIFI_TXQ_GET (_wifi_txFrame);
+		if (_wifi_txFrame == NULL)
+		{
+			_WIFI_ASSERT (_wifi_txState == _WIFI_ST_IDLE);
+			_wifi_setTxState(_WIFI_ST_IDLE);
+			return;
+		}
+
+		// Init counters
+		_wifi_cw = _WIFI_CW_MIN;
+		_wifi_src = _wifi_lrc = 0;
+
+		// Get new sequence number for first fragment, use it for all fragments
+		squ.sq16 = _WIFI_NTOH16(_wifi_txFrame->macHdr.squ.sq16);
+		if (_WIFI_GET_FIELD(squ.sq.info, _WIFI_SEQCNTRL_FRAG) == 0)
+			_wifi_seq = _wifi_next_seq++;
+		squ.sq.info &= 0x000F;
+		squ.sq.info |= _wifi_seq<<4;
+
+		_wifi_txFrame->macHdr.squ.sq.info = squ.sq.info;
+	}
+
+	// Swap bytes of frame header
+	hdr.hdr32 = _WIFI_SWAP32 (_wifi_txFrame->frameHdr.hdr32);
+
+	// Frame length exceeds RTS threashold
+	if (firstFrame &&
+		_wifi_txFrame->length > _wifi_macParams.rts_thresh &&
+		!_WIFI_IS_GROUP_ADDR (_wifi_txFrame->macHdr.addr1))
+	{
+		_wifi_SendRTS (_wifi_txFrame);
+	}
+
+	// OFDM protection mechanism enabled
+	else if (firstFrame &&
+		(_wifi_erpInfo & _WIFI_ERP_USEPROTECT) &&
+		hdr.tx.modType == _WIFI_MOD_OFDM)
+	{
+		if (_wifi_macParams.options & WLN_OPT_RTSPROT)
+			_wifi_SendRTS (_wifi_txFrame);
+		else
+			_wifi_SendCTS (_wifi_txFrame);
+	}
+
+	// Set next transmit action and state
+	if (_WIFI_IS_GROUP_ADDR (_wifi_txFrame->macHdr.addr1))
+	{
+		// Wait for txEnd
+		_wifi_setTxState(_WIFI_ST_BC);
+		next = _WIFI_SF_TXEND;
+	}
+	else
+	{
+		// Wait for ACK, unless first frame is RTS
+		if (!(firstFrame && _wifi_txState == _WIFI_ST_CTS))
+			_wifi_setTxState(_WIFI_ST_ACK);
+
+		if (_wifi_txFrame->macHdr.fc.flags & _WIFI_FCNTRL_MOREFRAG)
+			next = _WIFI_SF_RX_TX;
+		else
+			next = _WIFI_SF_RX;
+	}
+
+	// If starting a new frame sequence, send first data fragment
+	if (firstFrame)
+		_wifi_SendFrame (_wifi_txFrame, _wifi_cw, next);
+
+	// Send next data fragment, if any.
+	// If sent RTS above, only send RTS and first data fragment.
+	if (_wifi_txState != _WIFI_ST_CTS &&
+                        (_wifi_txFrame->macHdr.fc.flags & _WIFI_FCNTRL_MOREFRAG) &&
+                        _wifi_txQueue.head)
+	{
+		squ.sq16 = _WIFI_NTOH16(_wifi_txQueue.head->macHdr.squ.sq16);
+		squ.sq.info &= 0x000F;
+		squ.sq.info |= _wifi_seq << 4;
+		_wifi_txQueue.head->macHdr.squ.sq16 = squ.sq16;
+
+		_wifi_SendFrame (_wifi_txQueue.head, _wifi_cw, next);
+	}
+
+	// _wifi_txFrame may need to be retransmitted, so don't free
+	// until successfully ACKed (or completed or dropped)
+}
+
+/*** BeginHeader _wifi_Retry */
+void _wifi_Retry(void);
+/*** EndHeader */
+
+//
+// Prepare to retransmit the current frame, _wifi_txFrame.
+// Actual trasmission occurs next time _wifi_SendFrame() is called.
+//
+_wifig_nodebug
+void _wifi_Retry(void)
+{
+	_WIFI_ASSERT (_wifi_txFrame);
+	_wifi_macStats.txRetries++;
+	if (_wifi_src+_wifi_lrc == 0)
+		_wifi_rateErrorCount++;
+
+	// Increase contention window
+	if (_wifi_cw < _WIFI_CW_MAX)
+		_wifi_cw = 2*_wifi_cw + 1;
+
+	// Increment short or long retry counter
+	if (_wifi_txState == _WIFI_ST_CTS || _wifi_txFrame->length < _wifi_macParams.rts_thresh)
+		_wifi_src++;
+	else
+		_wifi_lrc++;
+
+	// Check if exceeded retry limit
+	if (_wifi_src >= _WIFI_SHORT_RETRY_LIMIT || _wifi_lrc >= _WIFI_LONG_RETRY_LIMIT)
+	{
+		_wifi_macStats.txDropRetry++;
+		_wifi_MacEvent (_WIFI_MAC_EVT_TX_INTR, _wifi_txFrame);
+
+		// Discard remaining fragments
+ 		while (_wifi_txFrame &&
+             (_wifi_txFrame->macHdr.fc.flags & _WIFI_FCNTRL_MOREFRAG))
+ 		{
+			_wifi_FreeBufferIR (_wifi_txFrame);
+			_WIFI_TXQ_GET (_wifi_txFrame);
+		}
+
+		// Discard last fragment
+		if (_wifi_txFrame)
+			_wifi_FreeBufferIR (_wifi_txFrame);
+		_wifi_txFrame = NULL;
+		return;
+	}
+
+	// If not a CTS frame, set retry bit
+	if (_wifi_txState != _WIFI_ST_CTS)
+		_wifi_txFrame->macHdr.fc.flags |= _WIFI_FCNTRL_RETRY;
+
+	// Reduce transmit rate
+	if (_WIFI_IS_DATA (_wifi_txFrame))
+		_wifi_ReduceRate (_wifi_txFrame, 2*_wifi_lrc+_wifi_src);
+}
+
+/*** BeginHeader _wifi_SendProbeResponse */
+void _wifi_SendProbeResponse (__far WiFiMacBuffer *rxBuf);
+/*** EndHeader */
+
+//
+// Send a probe response frame
+// @param rxBuf Probe request frame
+//
+_wifig_nodebug
+void _wifi_SendProbeResponse (__far WiFiMacBuffer *rxBuf)
+{
+	// Respond only if we sent the last beacon
+	if (_wifi_sentBcn && _wifi_respFrame)
+	{
+		// Check SSID
+		if (rxBuf->body[0] == _WIFI_ELEM_SSID &&
+			(rxBuf->body[1] == 0 ||
+		 	 (rxBuf->body[1] == _wifi_macStatus.ssid_len &&
+		  	  memcmp (&rxBuf->body[2], _wifi_macStatus.ssid, _wifi_macStatus.ssid_len) == 0)))
+		{
+			// Send response to requester
+			_WIFI_SET_ADDR (_wifi_respFrame->macHdr.addr1, rxBuf->macHdr.addr2);
+
+			// Set flag to send response when transmitter is idle.
+			// Only one probe response can be pending.
+			_wifi_sendResp = TRUE;
+		}
+	}
+}
+
+/*** BeginHeader _wifi_SendRTS */
+void _wifi_SendRTS (__far WiFiMacBuffer *txBuf);
+/*** EndHeader */
+
+//
+// Send a request-to-send frame
+// @param txBuf Data frame to transmit after RTS
+//
+_wifig_nodebug
+void _wifi_SendRTS (__far WiFiMacBuffer *txBuf)
+{
+	auto WiFiFrameHeader hdr;
+	auto int rate, dur;
+
+	// Swap bytes of frame header
+	hdr.hdr32 = _WIFI_SWAP32 (txBuf->frameHdr.hdr32);
+
+	// Send RTS at broadcast rate if protection enabled, else at basic rate
+	if ((_wifi_erpInfo & _WIFI_ERP_USEPROTECT) && hdr.tx.modType == _WIFI_MOD_OFDM)
+		rate = _wifi_rateBC;
+	else
+		rate = _wifi_ratesBasic[txBuf->tx_rate];
+	_wifi_SetPLCP (&_wifi_rtsFrame, rate);
+
+	// Duration of CTS-data-ACK
+	dur = _wifi_GetAckDuration (txBuf->tx_rate) + _wifi_GetDuration (txBuf);
+	_wifi_rtsFrame.macHdr.duration = _WIFI_HTON16 (dur);
+
+	_wifi_setTxState(_WIFI_ST_CTS);
+	_f_memcpy (_wifi_rtsFrame.macHdr.addr1, txBuf->macHdr.addr1,WLN_ADDR_SIZE);
+   _wifi_SendFrame_CTSRTS_Hold = 1;
+	_wifi_SendFrame (&_wifi_rtsFrame, _wifi_cw, _WIFI_SF_RX_TX);
+   _wifi_SendFrame_CTSRTS_Hold = 0;
+}
+
+/*** BeginHeader _wifi_SendCTS */
+void _wifi_SendCTS (__far WiFiMacBuffer *txBuf);
+/*** EndHeader */
+
+//
+// Send a CTS-to-self protection frame
+// @param txBuf Data frame to transmit after CTS
+//
+_wifig_nodebug
+void _wifi_SendCTS (__far WiFiMacBuffer *txBuf)
+{
+	auto int dur;
+
+   dur = _wifi_GetDuration (txBuf);
+	_wifi_ctsFrame.macHdr.duration = _WIFI_HTON16 (dur);
+
+   _wifi_SendFrame_CTSRTS_Hold = 1;
+	_wifi_SendFrame (&_wifi_ctsFrame, _wifi_cw, _WIFI_SF_RX);
+   _wifi_SendFrame_CTSRTS_Hold = 0;
+}
+

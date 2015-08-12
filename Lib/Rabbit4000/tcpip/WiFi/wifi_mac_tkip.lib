@@ -1,0 +1,635 @@
+//
+// Embedded 802.11b/g wireless network interface
+// MAC layer TKIP encryption functions
+// Copyright 2004-2007 Digi International
+//
+
+/*** BeginHeader tkip_keys, tkip_txKeyID, tkip_micFailureTime, tkip_blocking */
+
+#define _WIFI_USING_TKIP
+
+//#use "wifi_mac.lib"		// assume already included
+
+// TKIP key data
+typedef struct {
+	BOOL valid;					// TRUE if key is valid
+	uint8  key[_WIFI_TKIP_KEY_SIZE];	// Key data
+	uint16 txTTAK[5];			// Transmit phase 1 key mixing output
+	uint16 rxTTAK[5];			// Receive phase 1 key mixing output
+
+	uint16 txTSC0;				// Transmit sequence counter (low 16 bits)
+	uint32 txTSC1;				// Transmit sequence counter (high 32 bits)
+
+	uint16 rxTSC0;				// Receive sequence counter
+	uint32 rxTSC1;
+	uint16 micTSC0;				// Next receive sequence counter after MIC verified
+	uint32 micTSC1;
+} TkipKey;
+
+extern TkipKey __far tkip_keys[WLN_KEY_NUM];
+extern int tkip_txKeyID;				// Key index used to transmit
+
+extern uint32 tkip_micFailureTime;	// Time MIC failure occurred
+extern BOOL tkip_blocking;			// TRUE if tkip_blocking due to MIC failure
+
+/*** EndHeader */
+
+TkipKey __far tkip_keys[WLN_KEY_NUM];
+int tkip_txKeyID;				// Key index used to transmit
+
+uint32 tkip_micFailureTime;	// Time MIC failure occurred
+BOOL tkip_blocking;			// TRUE if tkip_blocking due to MIC failure
+
+
+
+/*** BeginHeader tkip_sbox, rotr1, MixKeyPhase1, MixKeyPhase2 */
+uint16 tkip_sbox (uint16 i);
+uint16 rotr1 (uint16 val);
+void MixKeyPhase1 (uint8 __far *key, uint8 __far *ta, uint32 pnh, uint16 __far *p1k);
+void MixKeyPhase2 (uint8 __far *key, uint16 __far *p1k, uint16 pnl, uint8 __far *rc4key);
+/*** EndHeader */
+
+//
+// TKIP encryption implementation
+//
+
+static const __far uint16 Tkip_Sbox[256] =
+{
+	0xC6A5, 0xF884, 0xEE99, 0xF68D, 0xFF0D, 0xD6BD, 0xDEB1, 0x9154,
+	0x6050, 0x0203, 0xCEA9, 0x567D, 0xE719, 0xB562, 0x4DE6, 0xEC9A,
+	0x8F45, 0x1F9D, 0x8940, 0xFA87, 0xEF15, 0xB2EB, 0x8EC9, 0xFB0B,
+	0x41EC, 0xB367, 0x5FFD, 0x45EA, 0x23BF, 0x53F7, 0xE496, 0x9B5B,
+	0x75C2, 0xE11C, 0x3DAE, 0x4C6A, 0x6C5A, 0x7E41, 0xF502, 0x834F,
+	0x685C, 0x51F4, 0xD134, 0xF908, 0xE293, 0xAB73, 0x6253, 0x2A3F,
+	0x080C, 0x9552, 0x4665, 0x9D5E, 0x3028, 0x37A1, 0x0A0F, 0x2FB5,
+	0x0E09, 0x2436, 0x1B9B, 0xDF3D, 0xCD26, 0x4E69, 0x7FCD, 0xEA9F,
+	0x121B, 0x1D9E, 0x5874, 0x342E, 0x362D, 0xDCB2, 0xB4EE, 0x5BFB,
+	0xA4F6, 0x764D, 0xB761, 0x7DCE, 0x527B, 0xDD3E, 0x5E71, 0x1397,
+	0xA6F5, 0xB968, 0x0000, 0xC12C, 0x4060, 0xE31F, 0x79C8, 0xB6ED,
+	0xD4BE, 0x8D46, 0x67D9, 0x724B, 0x94DE, 0x98D4, 0xB0E8, 0x854A,
+	0xBB6B, 0xC52A, 0x4FE5, 0xED16, 0x86C5, 0x9AD7, 0x6655, 0x1194,
+	0x8ACF, 0xE910, 0x0406, 0xFE81, 0xA0F0, 0x7844, 0x25BA, 0x4BE3,
+	0xA2F3, 0x5DFE, 0x80C0, 0x058A, 0x3FAD, 0x21BC, 0x7048, 0xF104,
+	0x63DF, 0x77C1, 0xAF75, 0x4263, 0x2030, 0xE51A, 0xFD0E, 0xBF6D,
+	0x814C, 0x1814, 0x2635, 0xC32F, 0xBEE1, 0x35A2, 0x88CC, 0x2E39,
+	0x9357, 0x55F2, 0xFC82, 0x7A47, 0xC8AC, 0xBAE7, 0x322B, 0xE695,
+	0xC0A0, 0x1998, 0x9ED1, 0xA37F, 0x4466, 0x547E, 0x3BAB, 0x0B83,
+	0x8CCA, 0xC729, 0x6BD3, 0x283C, 0xA779, 0xBCE2, 0x161D, 0xAD76,
+	0xDB3B, 0x6456, 0x744E, 0x141E, 0x92DB, 0x0C0A, 0x486C, 0xB8E4,
+	0x9F5D, 0xBD6E, 0x43EF, 0xC4A6, 0x39A8, 0x31A4, 0xD337, 0xF28B,
+	0xD532, 0x8B43, 0x6E59, 0xDAB7, 0x018C, 0xB164, 0x9CD2, 0x49E0,
+	0xD8B4, 0xACFA, 0xF307, 0xCF25, 0xCAAF, 0xF48E, 0x47E9, 0x1018,
+	0x6FD5, 0xF088, 0x4A6F, 0x5C72, 0x3824, 0x57F1, 0x73C7, 0x9751,
+	0xCB23, 0xA17C, 0xE89C, 0x3E21, 0x96DD, 0x61DC, 0x0D86, 0x0F85,
+	0xE090, 0x7C42, 0x71C4, 0xCCAA, 0x90D8, 0x0605, 0xF701, 0x1C12,
+	0xC2A3, 0x6A5F, 0xAEF9, 0x69D0, 0x1791, 0x9958, 0x3A27, 0x27B9,
+	0xD938, 0xEB13, 0x2BB3, 0x2233, 0xD2BB, 0xA970, 0x0789, 0x33A7,
+	0x2DB6, 0x3C22, 0x1592, 0xC920, 0x8749, 0xAAFF, 0x5078, 0xA57A,
+	0x038F, 0x59F8, 0x0980, 0x1A17, 0x65DA, 0xD731, 0x84C6, 0xD0B8,
+	0x82C3, 0x29B0, 0x5A77, 0x1E11, 0x7BCB, 0xA8FC, 0x6DD6, 0x2C3A,
+};
+
+_wifig_nodebug
+uint16 tkip_sbox (uint16 i)
+{
+	auto unsigned l;
+	auto unsigned r;
+	l = Tkip_Sbox[i & 0xff];
+	r = Tkip_Sbox[i >> 8];
+	return l ^ ((r << 8) | (r >> 8));
+}
+
+_wifig_nodebug
+uint16 rotr1 (uint16 val)
+{
+	return (val >> 1) | (val << 15);
+}
+
+//
+// Phase 1 TKIP key mixing
+//
+_wifig_nodebug
+void MixKeyPhase1 (uint8 __far *key, uint8 __far *ta, uint32 pnh, uint16 __far *p1k)
+{
+	auto uint16 i, j;
+
+	/* Phase 1, step 1 */
+	p1k[0] = (uint16)pnh;
+	p1k[1] = (uint16)(pnh >> 16);
+	p1k[2] = _WIFI_GET16_FAR (ta);
+	p1k[3] = _WIFI_GET16_FAR (ta+2);
+	p1k[4] = _WIFI_GET16_FAR (ta+4);
+
+	/* Phase 1, step 2 */
+	for (i=0, j = 0; i<8; i++, j ^= 2)
+	{
+		p1k[0] += tkip_sbox (p1k[4] ^ _WIFI_GET16_FAR (key+j));
+		p1k[1] += tkip_sbox (p1k[0] ^ _WIFI_GET16_FAR (key+j+4));
+		p1k[2] += tkip_sbox (p1k[1] ^ _WIFI_GET16_FAR (key+j+8));
+		p1k[3] += tkip_sbox (p1k[2] ^ _WIFI_GET16_FAR (key+j+12));
+		p1k[4] += tkip_sbox (p1k[3] ^ _WIFI_GET16_FAR (key+j)) + i;
+	}
+}
+
+//
+// Phase 2 TKIP key mixing
+//
+_wifig_nodebug
+void MixKeyPhase2 (uint8 __far *key, uint16 __far *p1k, uint16 pnl, uint8 __far *rc4key)
+{
+	auto uint16 ppk0, ppk1, ppk2, ppk3, ppk4, ppk5;
+	/* Phase 2, Step 1 */
+	ppk0 = p1k[0];
+	ppk1 = p1k[1];
+	ppk2 = p1k[2];
+	ppk3 = p1k[3];
+	ppk4 = p1k[4];
+	ppk5 = ppk4 + pnl;
+
+	/* Phase2, Step 2 */
+	ppk0 += tkip_sbox (ppk5 ^ _WIFI_GET16_FAR (key));
+	ppk1 += tkip_sbox (ppk0 ^ _WIFI_GET16_FAR (key+2));
+	ppk2 += tkip_sbox (ppk1 ^ _WIFI_GET16_FAR (key+4));
+	ppk3 += tkip_sbox (ppk2 ^ _WIFI_GET16_FAR (key+6));
+	ppk4 += tkip_sbox (ppk3 ^ _WIFI_GET16_FAR (key+8));
+	ppk5 += tkip_sbox (ppk4 ^ _WIFI_GET16_FAR (key+10));
+
+	ppk0 += rotr1 (ppk5 ^ _WIFI_GET16_FAR (key+12));
+	ppk1 += rotr1 (ppk0 ^ _WIFI_GET16_FAR (key+14));
+	ppk2 += rotr1 (ppk1);
+	ppk3 += rotr1 (ppk2);
+	ppk4 += rotr1 (ppk3);
+	ppk5 += rotr1 (ppk4);
+
+	/* Phase 2, Step 3 */
+	rc4key[0] = pnl >> 8;
+	rc4key[1] = ((pnl >> 8) | 0x20) & 0x7f;
+	rc4key[2] = pnl;
+	rc4key[3] = (ppk5 ^ _WIFI_GET16_FAR (key)) >> 1;
+
+	_WIFI_SET16_FAR (rc4key+4,  ppk0);
+	_WIFI_SET16_FAR (rc4key+6,  ppk1);
+	_WIFI_SET16_FAR (rc4key+8,  ppk2);
+	_WIFI_SET16_FAR (rc4key+10, ppk3);
+	_WIFI_SET16_FAR (rc4key+12, ppk4);
+	_WIFI_SET16_FAR (rc4key+14, ppk5);
+}
+
+/*** BeginHeader TkipSetKey */
+BOOL TkipSetKey (int id, BOOL tx, uint8 *data, int len, uint8 *seq);
+/*** EndHeader */
+//
+// Set or delete a TKIP key
+//
+_wifig_nodebug
+BOOL TkipSetKey (int id, BOOL tx, uint8 *data, int len, uint8 *seq)
+{
+	auto TkipKey __far *key;
+	#GLOBAL_INIT {_f_memset(tkip_keys,0,sizeof(tkip_keys));tkip_txKeyID=0;tkip_micFailureTime=0;tkip_blocking=0;}
+
+	if (id < 0 || id >= WLN_KEY_NUM)
+		return FALSE;
+
+	key = &tkip_keys[id];
+
+	if (len == _WIFI_TKIP_KEY_SIZE)
+	{
+		_f_memset (key, 0, sizeof (TkipKey));
+		_f_memcpy (key->key, data, _WIFI_TKIP_KEY_SIZE);
+		key->valid = TRUE;
+		if (tx)
+			tkip_txKeyID = id;
+
+		// Set sequence counter if given
+		if (seq)
+		{
+			key->rxTSC0 = key->micTSC0 = _WIFI_GET16 (seq);
+			key->rxTSC1 = key->micTSC1 = _WIFI_GET32 (seq+2);
+		}
+
+		// Set initial phase 1 key mix
+		MixKeyPhase1 (data, _wifi_macParams.sta_addr, 0, key->txTTAK);
+		MixKeyPhase1 (data, _wifi_macStatus.bss_addr, key->rxTSC1, key->rxTTAK);
+	}
+	else if (len == 0)
+		key->valid = FALSE;
+	else
+		return FALSE;
+
+	// Clear MIC failure tkip_blocking
+	tkip_micFailureTime = 0;
+	tkip_blocking = FALSE;
+
+	return TRUE;
+}
+
+/*** BeginHeader TkipEncrypt */
+BOOL TkipEncrypt (__far WiFiMacBuffer *buf);
+/*** EndHeader */
+//
+// Encrypt a frame with TKIP
+//
+_wifig_nodebug
+BOOL TkipEncrypt (__far WiFiMacBuffer *buf)
+{
+	auto uint8 rc4key[16];
+	auto uint32 crc;
+	auto int length;
+	auto TkipKey __far * key;
+
+	length = buf->length - _WIFI_DATA_SIZE;
+	key = &tkip_keys[tkip_txKeyID];
+
+	if (!key->valid)
+		return FALSE;
+
+	// Increment transmit sequence counter
+	key->txTSC0++;
+	if (key->txTSC0 == 0)
+	{
+		// Lower counter rolled over, get new phase 1 key mix
+		key->txTSC1++;
+		MixKeyPhase1 (key->key, _wifi_macParams.sta_addr, key->txTSC1, key->txTTAK);
+	}
+
+	// Get phase 2 key mix
+	MixKeyPhase2 (key->key, key->txTTAK, key->txTSC0, rc4key);
+
+	// Set initialization vector in frame
+	buf->body[0] = rc4key[0];
+	buf->body[1] = rc4key[1];
+	buf->body[2] = rc4key[2];
+	buf->body[3] = (tkip_txKeyID << 6) | _WIFI_EXT_IV;
+	_WIFI_SET32_FAR (buf->body+4, key->txTSC1);
+
+	// Calculate ICV
+	crc = crc32_calc (buf->body+_WIFI_EXT_IV_SIZE, length, 0);
+	_WIFI_SET32_FAR (buf->body+_WIFI_EXT_IV_SIZE+length, crc);
+
+	// Encrypt data and ICV (This is in WEP library)
+	RC4Process (rc4key, 16, buf->body+_WIFI_EXT_IV_SIZE, length+_WIFI_ICV_SIZE);
+
+	// Adjust MAC header and length
+	buf->macHdr.fc.flags |= _WIFI_FCNTRL_PROTECT;
+	buf->length += _WIFI_TKIP_SIZE;
+
+	return TRUE;
+}
+
+/*** BeginHeader TkipDecrypt */
+BOOL TkipDecrypt (__far WiFiMacBuffer *buf);
+/*** EndHeader */
+//
+// Decrypt a frame with TKIP
+//
+_wifig_nodebug
+BOOL TkipDecrypt (__far WiFiMacBuffer *buf)
+{
+	auto int length;
+	auto uint8 rc4key[16];
+	auto uint16 tsc0;
+	auto uint32 tsc1;
+	auto TkipKey __far *key;
+
+	length = buf->length - _WIFI_DATA_SIZE - _WIFI_TKIP_SIZE;
+
+	if (length < 0)
+		return FALSE;
+
+	// Not encrypted
+	if (!(buf->macHdr.fc.flags & _WIFI_FCNTRL_PROTECT) || !(buf->body[3] & _WIFI_EXT_IV))
+		return FALSE;
+
+	key = &tkip_keys[buf->body[3] >> 6];
+	if (!key->valid)
+		return FALSE;
+
+	// Get sequence counter from frame and check for replay.
+	// Counters are 48 bits: 16 LSB in TSC0, 32 LSB in TSC1.
+	tsc0 = (buf->body[0] << 8) | buf->body[2];
+	tsc1 = _WIFI_GET32_FAR (buf->body+4);
+
+	// Received TSC must be greater than or equal to next expected TSC
+	if (tsc1 < key->micTSC1 || (tsc1 == key->micTSC1 && tsc0 < key->micTSC0))
+	{
+		DPRINTF ("TKIP replay detected\n");
+		_wifi_macStats.rxDropReplay++;
+		return FALSE;
+	}
+
+	// Get key mix for this sequence counter
+	if (tsc1 != key->rxTSC1)
+		MixKeyPhase1 (key->key, _wifi_macStatus.bss_addr, tsc1, key->rxTTAK);
+	MixKeyPhase2 (key->key, key->rxTTAK, tsc0, rc4key);
+	key->rxTSC0 = tsc0;
+	key->rxTSC1 = tsc1;
+
+	// Decrypt data and ICV
+	RC4Process (rc4key, 16, buf->body+_WIFI_EXT_IV_SIZE, length+_WIFI_ICV_SIZE);
+
+	// Check for correct ICV
+	if (crc32_calc (buf->body+_WIFI_EXT_IV_SIZE, length+_WIFI_ICV_SIZE, 0) != _WIFI_GOOD_CRC32)
+		return FALSE;
+
+	// Adjust buffer length
+	buf->length -= _WIFI_TKIP_SIZE;
+
+	return TRUE;
+}
+
+
+/*** BeginHeader MichaelUpdate, MichaelInit, MichaelFinal, MichaelAddMIC, MICFailure, MichaelVerifyMIC */
+typedef struct {
+	uint32 l, r;
+	int n;
+} MichaelState;
+void MichaelUpdate (MichaelState *s, __far /*const*/ uint8 *data, int Size);
+void MichaelInit (MichaelState *s, uint8 __far *key, __far uint8 * dst, __far uint8 * src);
+void MichaelFinal (MichaelState *s, __far uint8 *mic);
+BOOL MichaelAddMIC (__far WiFiMacBuffer *buf, MacAddr dst);
+void MICFailure (int id);
+BOOL MichaelVerifyMIC (__far WiFiMacBuffer *buf);
+/*** EndHeader */
+//
+// Michael MIC implementation
+//
+
+
+_wifig_nodebug
+uint32 rotl (uint32 val, int bits)
+{
+	return (val << bits) | (val >> (32 - bits));
+}
+
+_wifig_nodebug
+uint32 _twiddle_swap (uint32 val)
+{
+	return ((val & 0x00ff00ff) << 8) | ((val >> 8) & 0x00ff00ff);
+}
+
+#define _TWIDDLE_BLOCK(l, r)	{ \
+	r ^= rotl (l, 17); l += r; \
+	r ^= _twiddle_swap (l);     l += r; \
+	r ^= rotl (l, 3);  l += r; \
+	r ^= rotl (l, 30); l += r; }
+
+//
+// Update Michael state with a buffer of data
+//
+_wifig_nodebug
+void MichaelUpdate (MichaelState *s, __far /*const*/ uint8 *data, int Size)
+{
+	auto uint32 l;
+	auto uint32 r;
+	auto int n;
+
+	l = s->l;
+	r = s->r;
+	n = s->n;
+
+	if (n > 0)
+	{
+		// Complete previous 4 byte block
+		while (Size > 0 && n < 32)
+		{
+			l ^= (uint32)*data++ << n;
+			n += 8;
+			Size--;
+		}
+
+		if (n == 32)
+		{
+			_TWIDDLE_BLOCK (l, r);
+			n = 0;
+		}
+	}
+
+	// Process 4 bytes at a time
+	while (Size >= 4)
+	{
+		l ^= _WIFI_GET32_FAR (data);
+		_TWIDDLE_BLOCK (l, r);
+		data += 4;
+		Size -= 4;
+	}
+
+	// Fill partial block
+	while (Size > 0)
+	{
+		l ^= (uint32)*data++ << n;
+		n += 8;
+		Size--;
+	}
+
+	s->l = l;
+	s->r = r;
+	s->n = n;
+}
+
+//
+// Initialize Michael state
+//
+_wifig_nodebug
+void MichaelInit (MichaelState *s, uint8 __far *key, __far uint8 * dst, __far uint8 * src)
+{
+	// Initialize state
+	s->l = _WIFI_GET32_FAR (key);
+	s->r = _WIFI_GET32_FAR (key+4);
+	s->n = 0;
+
+	// Process header
+	MichaelUpdate (s, dst, WLN_ADDR_SIZE);
+	MichaelUpdate (s, src, WLN_ADDR_SIZE);
+	MichaelUpdate (s, (__far uint8 *)"\0\0\0", 4);
+}
+
+//
+// Finish Michael calculation and return result
+//
+_wifig_nodebug
+void MichaelFinal (MichaelState *s, __far uint8 *mic)
+{
+	MichaelUpdate (s, "\x5A\0\0\0\0\0\0", 5);
+	while (s->n)
+		MichaelUpdate (s, "", 1);
+
+
+	_WIFI_SET32_FAR (mic,   s->l);
+	_WIFI_SET32_FAR (mic+4, s->r);
+}
+
+//
+// Add Michael MIC to a list of frames
+//
+_wifig_nodebug
+BOOL MichaelAddMIC (__far WiFiMacBuffer *buf, MacAddr dst)
+{
+	auto int len;
+	auto MichaelState s;
+	auto WiFiSeqControlU squ;
+	auto TkipKey __far *key;
+   auto WiFiLLC_SNAP __far *ls;
+
+	key = &tkip_keys[tkip_txKeyID];
+
+	// Drop non-802.1x data frames if tkip_blocking mode
+	if (tkip_blocking && _WIFI_IS_DATA (buf))
+	{
+		ls = (WiFiLLC_SNAP __far *) (buf->body+_WIFI_EXT_IV_SIZE);
+		if (ls->eptype != _WIFI_EP_8021X)
+			return FALSE;
+	}
+
+	if (!key->valid)
+		return FALSE;
+
+	// Initialize MIC from buffer header
+	MichaelInit (&s, &key->key[16], (__far uint8 *)dst, (__far uint8 *)_wifi_macParams.sta_addr);
+
+	// Update all but last frame
+	while (buf->next)
+	{
+		MichaelUpdate (&s, buf->body+_WIFI_EXT_IV_SIZE, buf->length-_WIFI_DATA_SIZE);
+		buf = buf->next;
+	}
+
+	// Update last frame
+	len = buf->length-_WIFI_DATA_SIZE;
+	MichaelUpdate (&s, buf->body+_WIFI_EXT_IV_SIZE, len);
+
+	// Add MIC to last frame
+	MichaelFinal  (&s, buf->body+_WIFI_EXT_IV_SIZE+len);
+	buf->length += _WIFI_MIC_SIZE;
+
+	// Make sure all frames in MSDU use the same upper TSC
+	squ.sq16 = intel16(buf->macHdr.squ.sq16);
+	if ((longword)key->txTSC0 + (squ.sq.info & _WIFI_SEQCNTRL_FRAG) >= 0xffffuL)
+		key->txTSC0 = 0xffff;
+
+	return TRUE;
+}
+
+//
+// Handle a MIC failure
+//
+_wifig_nodebug
+void MICFailure (int id)
+{
+	auto __far WiFiMacBuffer *buf;
+	auto int level;
+	auto BOOL pairwise;
+
+	DPRINTF ("Michael MIC verification failed\n");
+	_wifi_macStats.rxDropMICFail++;
+
+	// Previous failure occurred within timeout period
+	if (tkip_micFailureTime > 0 && _WIFI_GET_TIME()-tkip_micFailureTime < _WIFI_MICFAIL_TIMEOUT)
+	{
+		// Set tkip_blocking mode
+		tkip_blocking = TRUE;
+
+		// Flush transmit queue
+		level = _WIFI_DISABLE();
+		while (_WIFI_TXQ_GET (buf))
+			_wifi_FreeBufferIR (buf);
+		_WIFI_ENABLE (level);
+	}
+
+	// Save time of failure
+	tkip_micFailureTime = _WIFI_GET_TIME();
+
+	// Notify upper layer of failure
+	pairwise = (id == 0);
+	wln_send_event (WLN_EVT_MIC_FAIL, &pairwise);
+}
+
+//
+// Verify the Michael MIC on a list of frames
+//
+_wifig_nodebug
+BOOL MichaelVerifyMIC (__far WiFiMacBuffer *buf)
+{
+	auto int len, mlen;
+	auto int id;
+	auto TkipKey __far *key;
+	auto MichaelState s;
+	auto uint8 mic[_WIFI_MIC_SIZE], mic2[_WIFI_MIC_SIZE];
+
+	id = buf->body[3] >> 6;
+	key = &tkip_keys[id];
+
+	// Drop data frames if tkip_blocking mode
+	if (tkip_blocking && _WIFI_IS_DATA (buf))
+		return FALSE;
+
+	if (!key->valid)
+		return FALSE;
+
+	// Initialize MIC from buffer header
+	MichaelInit (&s, &key->key[24], (__far uint8 *)buf->macHdr.addr1,
+		(buf->macHdr.fc.flags & _WIFI_FCNTRL_FROMDS) ?
+				(__far uint8 *)buf->macHdr.addr3 :
+				(__far uint8 *)buf->macHdr.addr2);
+
+	// While next fragment not last or has space for complete MIC
+	while (buf->next &&
+		   (buf->next->next || buf->next->length >= _WIFI_DATA_SIZE+_WIFI_MIC_SIZE))
+	{
+		// Calculate MIC from this fragment
+		MichaelUpdate (&s, buf->body+_WIFI_EXT_IV_SIZE, buf->length-_WIFI_DATA_SIZE);
+		buf = buf->next;
+	}
+
+	if (buf->next)
+	{
+		// Get MIC that spans last 2 fragments
+		len = buf->length + buf->next->length - 2*_WIFI_DATA_SIZE - _WIFI_MIC_SIZE;
+		mlen = buf->length - _WIFI_DATA_SIZE - len;
+		_f_memcpy (mic2, buf->body+_WIFI_EXT_IV_SIZE+len, mlen);
+		_f_memcpy (mic2+mlen, buf->next->body+_WIFI_EXT_IV_SIZE, _WIFI_MIC_SIZE-mlen);
+
+		// Set last fragment to zero length
+		buf->next->length = _WIFI_DATA_SIZE;
+	}
+	else
+	{
+		// Get complete MIC from last fragment
+		len = buf->length-_WIFI_DATA_SIZE-_WIFI_MIC_SIZE;
+		_f_memcpy (mic2, buf->body+_WIFI_EXT_IV_SIZE+len, _WIFI_MIC_SIZE);
+	}
+
+	// Calculate MIC and remove from last fragment
+	MichaelUpdate (&s, buf->body+_WIFI_EXT_IV_SIZE, len);
+	buf->length = _WIFI_DATA_SIZE+len;
+
+	// Compare calculated and actual MICs
+	MichaelFinal (&s, mic);
+	if (memcmp (mic, mic2, _WIFI_MIC_SIZE) != 0)
+	{
+		MICFailure (id);
+		return FALSE;
+	}
+
+	// Save next expected TSC value after successful MIC verification
+	key->micTSC0 = key->rxTSC0+1;
+	key->micTSC1 = key->rxTSC1;
+	if (key->micTSC0 == 0)
+		key->micTSC1++;
+
+	return TRUE;
+}
+
+/*** BeginHeader _wifi_tkipCipher */
+extern const WiFiMacCipher _wifi_tkipCipher;
+/*** EndHeader */
+
+// TKIP cipher operations table
+const WiFiMacCipher _wifi_tkipCipher = {
+	_WIFI_EXT_IV_SIZE,
+	_WIFI_MIC_SIZE,
+	_WIFI_DATA_SIZE + 12,
+	1,
+	TkipSetKey,
+	TkipEncrypt,
+	TkipDecrypt
+};

@@ -1,0 +1,438 @@
+//
+// Embedded 802.11b wireless network interface
+// MAC layer CCMP (AES) encryption functions
+// Copyright 2004 Digi International
+//
+
+/*** BeginHeader */
+
+
+#ifdef WIFI_AES_DEBUG
+	#define _wifi_ccmp_debug __debug
+#else
+	#define _wifi_ccmp_debug __nodebug
+#endif
+
+
+#define _WIFI_AES_ENCRYPT	1
+#define _WIFI_AES_DECRYPT	0
+
+// AES_CONTROL_REGISTER
+#define _WIFI_AES_MODE_BIT         0x10
+#define _WIFI_AES_KEY_LOAD_BIT     0x04
+
+/* Because array size can't be a const in C, the following two are macros.
+   Both sizes are in bytes. */
+#define 	_WIFI_AES_MAXNR 10
+#define 	_WIFI_AES_BLOCK_SIZE 16
+#define	_WIFI_AES_BITS	128			// 128 bit keys, 10 rounds
+
+#ifndef  _WIFI_AES_TIMEOUT
+#define 	_WIFI_AES_TIMEOUT 50
+#endif
+
+// AES block
+typedef uint8 _wifi_AES_Block[_WIFI_AES_BLOCK_SIZE];
+
+/* This should be a hidden type, but EVP requires that the size be known */
+typedef struct {
+    unsigned long rd_key[4 *(_WIFI_AES_MAXNR + 1)];
+}_WIFI_AES_KEY;
+
+
+// CCMP key data
+typedef struct {
+	BOOL valid;				// TRUE if key is valid
+	uint16 	txPN0;		// Transmit packet number (low 16 bits)
+	uint32 	txPN1;		// Transmit packet number (high 32 bits)
+	uint16 	rxPN0;		// Next receive packet number
+	uint32 	rxPN1;
+	_WIFI_AES_KEY	rk;			// AES key schedule
+} _wifi_CcmpKey;
+
+__far _wifi_CcmpKey aes_keys[WLN_KEY_NUM];
+
+int aes_txKeyID;			// Key index used to transmit
+
+
+
+// CCMP encryption data
+typedef struct {
+	_WIFI_AES_KEY __far *key;
+	uint8		init[_WIFI_AES_BLOCK_SIZE];
+	uint8		header[2*_WIFI_AES_BLOCK_SIZE];
+} _wifi_WiFiCcmpData;
+
+#ifndef __AES_CORE_LIB
+	#use "aes_core.lib"
+#endif
+
+
+/*** EndHeader */
+
+
+/*** BeginHeader  _wifi_SetAESKey */
+void _wifi_SetAESKey(int id, _WIFI_AES_KEY __far *key);
+/*** EndHeader */
+
+// Load a key to the WiWave
+_wifi_ccmp_debug
+void _wifi_SetAESKey(int id, _WIFI_AES_KEY __far *key)
+{
+    // Set AES register for loading key
+    _wc_write8(NCAMR, _WIFI_AES_MODE_BIT | _WIFI_AES_KEY_LOAD_BIT | id);
+    _wc_HWWriteAES(key, sizeof(_WIFI_AES_KEY));
+}
+
+
+/*** BeginHeader _wifi_CcmpSetKey */
+BOOL _wifi_CcmpSetKey (int id, BOOL tx, uint8 *data, int len, uint8 *seq);
+/*** EndHeader */
+
+//
+// Set or delete a CCMP key
+//
+_wifi_ccmp_debug
+BOOL _wifi_CcmpSetKey (int id, BOOL tx, uint8 *data, int len, uint8 *seq)
+{
+	_wifi_CcmpKey __far *key;
+
+	if (id < 0 || id >= WLN_KEY_NUM)
+		return FALSE;
+
+	key = aes_keys + id;
+
+	if (len == _WIFI_CCMP_KEY_SIZE)
+	{
+		_f_memset (key, 0, sizeof (_wifi_CcmpKey));
+		key->valid = TRUE;
+		if (tx)
+			aes_txKeyID = id;
+
+		// Set sequence counter if given
+		if (seq)
+		{
+         key->rxPN0 = _WIFI_GET16 (seq);
+			key->rxPN1 = _WIFI_GET32 (seq+2);
+		}
+
+		// Store only AES key schedule for this key
+      AESexpandKey4((unsigned char __far *)&key->rk, data);
+
+#ifndef _WIFI_OLD_AES
+		// Encrypt if not using hardware AES
+		if (_wifi_hwAES)
+		{
+			// Set key in hardware, AES mode 1
+      	_wifi_SetAESKey(id, &key->rk);
+		}
+#endif
+	}
+	else if (len == 0)
+		key->valid = FALSE;
+	else
+		return FALSE;
+
+	return TRUE;
+}
+
+/*** BeginHeader _wifi_CcmpGetData */
+BOOL _wifi_CcmpGetData (__far WiFiMacBuffer *buf, _wifi_WiFiCcmpData *data);
+/*** EndHeader */
+
+//
+// Get AES encryption data for a frame.
+// Called from hardware interrupt handler if using AES acceleration.
+//
+_wifi_ccmp_debug
+BOOL _wifi_CcmpGetData (__far WiFiMacBuffer *buf, _wifi_WiFiCcmpData *data)
+{
+	int dlen;
+	_wifi_CcmpKey __far *key;
+	__far uint8 *bp;
+	WiFiSeqControlU squ;
+
+   dlen = buf->length - _WIFI_DATA_SIZE - _WIFI_CCMP_SIZE;
+	// Not encrypted
+	if (dlen < 0 ||
+       !buf->macHdr.fc.flags 	||
+       !(buf->body[3] & _WIFI_EXT_IV) ||
+       !(_wifi_macParams.encrypt & WLN_ENCR_CCMP))
+		return FALSE;
+
+	// Key not set
+	key = &aes_keys[buf->body[3] >> 6];
+	if (!key->valid)
+		return FALSE;
+
+	// Get key schedule
+	data->key = &key->rk;
+
+	// Set up CCM initial block for MIC IV
+	data->init[0] = 0x59;
+	data->init[1] = 0;
+	_f_memcpy (data->init+2, buf->macHdr.addr2, WLN_ADDR_SIZE);
+
+	data->init[8]  = buf->body[7];
+	data->init[9]  = buf->body[6];
+	data->init[10] = buf->body[5];
+	data->init[11] = buf->body[4];
+	data->init[12] = buf->body[1];
+	data->init[13] = buf->body[0];
+	data->init[14] = dlen >> 8;
+	data->init[15] = dlen;
+
+
+	// Set up MIC header blocks
+	bp = (__far uint8 *) &buf->macHdr;
+
+	squ.sq16 = _WIFI_NTOH16 (buf->macHdr.squ.sq16);
+
+	data->header[0] = 0;
+	data->header[1] = 22;
+
+
+	data->header[2] = bp[0] & 0xcf;
+	data->header[3] = bp[1] & 0xd7;
+
+
+	_f_memcpy (data->header+4, buf->macHdr.addr1, 3*WLN_ADDR_SIZE);
+	data->header[22] = squ.sq.info & 0x0f;
+	data->header[23] = 0;
+	memset (data->header+24, 0, 8);
+
+	return TRUE;
+}
+
+/*** BeginHeader _wifi_xor_block */
+void _wifi_xor_block (__far uint8 *dst, __far uint8 *src, int len);
+/*** EndHeader */
+
+// XOR src into dst for length len
+_wifi_ccmp_debug
+void _wifi_xor_block (__far uint8 *dst, __far uint8 *src, int len)
+{
+	while (--len >= 0)
+		*dst++ ^= *src++;
+}
+
+/*** BeginHeader _wifi_InitBlocks */
+BOOL _wifi_InitBlocks (__far WiFiMacBuffer *buf, _wifi_AES_Block init, _wifi_AES_Block mic);
+/*** EndHeader */
+//
+// Initialize MIC and counter blocks for a frame
+//
+_wifi_ccmp_debug
+BOOL _wifi_InitBlocks (__far WiFiMacBuffer *buf, _wifi_AES_Block init, _wifi_AES_Block mic)
+{
+	_wifi_WiFiCcmpData data;
+
+	if (!_wifi_CcmpGetData (buf, &data))
+		return FALSE;
+
+	// Calculate MIC over initial and header blocks
+   AESencrypt4x4((char __far *)data.key, data.init, mic);
+	xor16(mic, data.header);
+   AESencrypt4x4((char __far *)data.key, mic, mic);
+	xor16 (mic, data.header+_WIFI_AES_BLOCK_SIZE);
+   AESencrypt4x4((char __far *)data.key, mic, mic);
+
+	// Set up CCM CTR-mode counter
+	memcpy (init, data.init, _WIFI_AES_BLOCK_SIZE);
+	init[0]  = 0x01;
+	init[14] = 0;
+	init[15] = 0;
+
+	return TRUE;
+}
+
+/*** BeginHeader _wifi_CcmpEncrypt */
+BOOL _wifi_CcmpEncrypt (__far WiFiMacBuffer *buf);
+/*** EndHeader */
+//
+// Encrypt a frame with CCMP
+//
+_wifi_ccmp_debug
+BOOL _wifi_CcmpEncrypt (__far WiFiMacBuffer *buf)
+{
+	_wifi_CcmpKey __far *key;
+	_wifi_AES_Block blk, ctr, mic, pkt;
+	__far uint8 *dp;
+	int dlen;
+	int blen;
+
+
+   dp = buf->body + _WIFI_EXT_IV_SIZE;
+   dlen = buf->length - _WIFI_DATA_SIZE;
+
+	// Use transmit key
+	key = &aes_keys[aes_txKeyID];
+	if (!key->valid)
+		return FALSE;
+
+	// Increment packet number
+	key->txPN0++;
+	if (key->txPN0 == 0)
+		key->txPN1++;
+
+	// Store in IV .....
+   buf->macHdr.fc.flags |= _WIFI_FCNTRL_PROTECT;
+
+	_WIFI_SET16_FAR (buf->body, key->txPN0);
+	buf->body[2] = 0;
+	buf->body[3] = (aes_txKeyID << 6) | _WIFI_EXT_IV;
+	_WIFI_SET32_FAR (buf->body+4, key->txPN1);
+
+	// Adjust buffer length
+	buf->length += _WIFI_CCMP_SIZE;
+
+	// Encrypt if not using hardware AES
+	if (!_wifi_hwAES)
+	{
+		if (!_wifi_InitBlocks (buf, ctr, mic))
+			return FALSE;
+
+		blen = _WIFI_AES_BLOCK_SIZE;
+		while (dlen > 0)
+		{
+			if (dlen < _WIFI_AES_BLOCK_SIZE)
+				blen = dlen;
+
+			// Update MIC
+			xor_n(mic, dp, blen);
+         AESencrypt4x4((char __far *)&key->rk, mic, mic);
+
+			// Encrypt with counter
+			ctr[15]++;
+         AESencrypt4x4((char __far *)&key->rk, ctr, blk);
+			xor_n(dp, blk, blen);
+
+			dp += blen;
+			dlen -= blen;
+		}
+
+		// Encrypt MIC with counter = 0
+		ctr[15] = 0;
+      AESencrypt4x4((char __far *)&key->rk, ctr, blk);
+		xor8(mic, blk /*, _WIFI_MIC_SIZE*/);
+		_f_memcpy (dp, mic, _WIFI_MIC_SIZE);
+	}
+
+	return TRUE;
+}
+
+/*** BeginHeader _wifi_CcmpDecrypt */
+BOOL _wifi_CcmpDecrypt (__far WiFiMacBuffer *buf);
+/*** EndHeader */
+//
+// Decrypt a frame with CCMP
+//
+_wifi_ccmp_debug
+BOOL _wifi_CcmpDecrypt (__far WiFiMacBuffer *buf)
+{
+	_wifi_CcmpKey __far *key;
+	_wifi_AES_Block blk, ctr, mic, pkt;
+	__far uint8 *dp;
+	int dlen;
+	uint16 pn0;
+	uint32 pn1;
+	int blen;
+
+   dp = buf->body + _WIFI_EXT_IV_SIZE;
+   dlen = buf->length - _WIFI_DATA_SIZE - _WIFI_CCMP_SIZE;
+
+	// Not encrypted
+	if (dlen < 0 || !buf->macHdr.fc.flags || !(buf->body[3] & _WIFI_EXT_IV))
+		return FALSE;
+
+	// Key not set
+	key = &aes_keys[buf->body[3] >> 6];
+	if (!key->valid)
+		return FALSE;
+
+	// Get packet number from IV and check for replay.
+	// Counters are 48 bits: 16 LSB in pn0, 32 LSB in pn1.
+	// Allow frame counter (pn) to be REPLAY_WINDOW-1 less than previous value (rxPN).
+	pn0 = _WIFI_GET16_FAR (buf->body);
+	pn1 = _WIFI_GET32_FAR (buf->body+4);
+
+	// Received PN must be greater than or equal to next expected PN
+	if ((pn1   == key->rxPN1 && pn0+_WIFI_REPLAY_WINDOW <= key->rxPN0) ||
+		// micTSC0 has wrapped, tsc0 has not
+		(pn1+1 == key->rxPN1 && pn0+_WIFI_REPLAY_WINDOW <= key->rxPN0+0x10000UL) ||
+		(pn1+2 <= key->rxPN1))
+	{
+		DPRINTF ("CCMP replay detected\n");
+		return FALSE;
+	}
+
+	// Decrypt if not using hardware AES
+	if (!_wifi_hwAES)
+	{
+		if (!_wifi_InitBlocks (buf, ctr, mic))
+			return FALSE;
+
+      memset(pkt, 0, 16);
+      _f_memcpy (pkt, dp, 8);
+		blen = _WIFI_AES_BLOCK_SIZE;
+		while (dlen > 0)
+		{
+			if (dlen < _WIFI_AES_BLOCK_SIZE)
+				blen = dlen;
+
+			// Decrypt with counter
+			ctr[15]++;
+         AESencrypt4x4((char __far *) &key->rk, ctr, blk);
+			xor_n(dp, blk, blen);
+
+			// Update MIC
+			xor_n(mic, dp, blen);
+         AESencrypt4x4((char __far *) &key->rk, mic, mic);
+			dp += blen;
+			dlen -= blen;
+		}
+
+		// Decrypt MIC with counter = 0
+		ctr[15] = 0;
+      AESencrypt4x4((char __far *) &key->rk, ctr, blk);
+		xor8(dp, blk /*, _WIFI_MIC_SIZE*/);
+
+		// Compare calculated MIC with actual MIC
+		if (memcmp (mic, dp, _WIFI_MIC_SIZE) != 0)
+		{
+			_wifi_macStats.rxDropMICFail++;
+			return FALSE;
+		}
+	}
+
+	// Save next expected packet number if successful
+	key->rxPN0 = pn0+1;
+	key->rxPN1 = pn1;
+	if (key->rxPN0 == 0)
+		key->rxPN1++;
+
+	// Adjust buffer length
+	buf->length -= _WIFI_CCMP_SIZE;
+
+	return TRUE;
+}
+
+/*** BeginHeader  _wifi_ccmpCipher */
+extern const WiFiMacCipher _wifi_ccmpCipher;
+/*** EndHeader */
+
+
+// CCMP cipher operations table
+const WiFiMacCipher _wifi_ccmpCipher = {
+	_WIFI_EXT_IV_SIZE,
+	0,
+	_WIFI_DATA_SIZE + 16,
+	0,
+	_wifi_CcmpSetKey,
+	_wifi_CcmpEncrypt,
+	_wifi_CcmpDecrypt
+};
+
+
+
+
