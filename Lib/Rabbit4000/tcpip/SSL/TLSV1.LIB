@@ -1,0 +1,341 @@
+/* START LIBRARY DESCRIPTION *********************************************
+TLSV1.LIB
+	SSL Module, v. 1.06
+ *-----------------------------------------------------------------------------
+ * Copyright (c) 2008 Digi International Inc., All Rights Reserved
+ *
+ * This software contains proprietary and confidential information of Digi
+ * International Inc.  By accepting transfer of this copy, Recipient agrees
+ * to retain this software in confidence, to prevent disclosure to others,
+ * and to make no use of this software other than that for which it was
+ * delivered.  This is an published copyrighted work of Digi International
+ * Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+ * prohibited.
+ *
+ * Restricted Rights Legend
+ *
+ * Use, duplication, or disclosure by the Government is subject to
+ * restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+ * Technical Data and Computer Software clause at DFARS 252.227-7031 or
+ * subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+ * Restricted Rights at 48 CFR 52.227-19, as applicable.
+ *
+ * Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+ *-----------------------------------------------------------------------------
+
+DESCRIPTION: This library provides TLS version 1 functionality
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader */
+
+#ifndef __TLSV1_LIB__
+#define __TLSV1_LIB__
+
+#ifdef TLS_V1_DEBUG
+#define __TLS_V1_DEBUG__ __debug
+#else
+#define __TLS_V1_DEBUG__ __nodebug
+#endif
+
+// PRF profiling macro (uses printf)
+#ifndef TLS_PRF_PROFILE
+#define TLS_PRF_PROFILE 0
+#endif
+
+
+// ********************************************************
+// *****               TLSv1 Defaults                 *****
+// ********************************************************
+
+#define TLS1_VER_MAJ 3 // TLSv1 version number is 3.1
+#define TLS1_VER_MIN 1
+
+// Key derivation labels
+#define TLS_MASTER_SEC_LABEL "master secret"
+#define TLS_KEY_EXPAND_LABEL "key expansion"
+
+// Finish message verification labels
+#define TLS_FINISHED_LAB_SER "server finished"
+#define TLS_FINISHED_LAB_CLI "client finished"
+
+#define TLS_VERIFY_DATA_SIZE	12 // Size of verify data for finish messages
+
+// TLS warning level
+enum {
+	TLS_auto_level = 0,	// This is not sent in message; it indicates to automatically
+								// select the alert level based on the message
+	TLS_warning = 1,
+   TLS_fatal = 2
+};
+typedef char TLS_AlertLevel_t;
+
+// TLS alerts
+enum {
+	TLS_ALRT_close_notify = 0,
+   TLS_ALRT_unexpected_message = 10,
+   TLS_ALRT_bad_record_mac = 20,
+   TLS_ALRT_decryption_failed = 21,
+   TLS_ALRT_record_overflow = 22,
+   TLS_ALRT_decompression_failure = 30,
+   TLS_ALRT_handshake_failure = 40,
+   TLS_ALRT_no_certificate = 41, // Only for SSLv3
+   TLS_ALRT_bad_certificate = 42,
+   TLS_ALRT_unsupported_certificate = 43,
+   TLS_ALRT_certificate_revoked = 44,
+   TLS_ALRT_certificate_expired = 45,
+   TLS_ALRT_certificate_unknown = 46,
+   TLS_ALRT_illegal_parameter = 47,
+   TLS_ALRT_unknown_ca = 48,
+   TLS_ALRT_access_denied = 49,
+   TLS_ALRT_decode_error = 50,
+   TLS_ALRT_decrypt_error = 51,
+   TLS_ALRT_export_restriction = 60,
+   TLS_ALRT_protocol_version = 70,
+   TLS_ALRT_insufficient_security = 71,
+   TLS_ALRT_internal_error = 80,
+   TLS_ALRT_user_cancelled = 90,
+   TLS_ALRT_no_renegotiation = 100,
+   TLS_ALRT_unknown_psk_identity = 115,
+};
+typedef char TLS_AlertDescription_t;
+
+// TLS Alert structure
+typedef struct {
+	TLS_AlertLevel_t level;
+   TLS_AlertDescription_t description;
+} TLS_Alert;
+
+/*** EndHeader */
+
+
+////////////////////////////////////////////////////////////////////////////////
+
+/*** BeginHeader _tls_1_derive_keys */
+int _tls_1_derive_keys(ssl_Socket __far*);
+/*** EndHeader */
+
+// Derive symmetric keys from the state's master secret
+__TLS_V1_DEBUG__
+int _tls_1_derive_keys(ssl_Socket __far* state) {
+	auto SSL_CipherState __far* cipher;			// Pointers to state internals
+   auto SSL_BulkCipherConfig __far* bulk_cipher;
+	auto SSL_Secret __far* master_secret;
+   auto SSL_byte_t output[SSL_KEY_BLOCK_SIZE], out_temp[SSL_KEY_BLOCK_SIZE];
+   auto SSL_byte_t seeded_label[SSL_SEEDED_LABEL_MAX];
+   auto SSL_byte_t __far*keys;
+   auto unsigned int label_len;
+   auto int i;
+
+   // Access to state internals
+   cipher = state->cipher_state;
+   bulk_cipher = cipher->bulk_cipher;
+   master_secret = state->master_secret;
+
+   // Set up the seeded label for the key derivation
+   // Seeded label = KEY_EXPAND_LABEL + server random + client random
+   label_len = sizeof(TLS_KEY_EXPAND_LABEL) - 1;
+   memcpy(seeded_label, TLS_KEY_EXPAND_LABEL, label_len);
+
+   // Check size of buffer against what we are putting into it
+   _ssl_assert((label_len + (sizeof(SSL_Random) * 2)) < sizeof(seeded_label));
+
+	_f_memcpy(seeded_label + label_len, &cipher->server_random,
+	       sizeof(SSL_Random));
+   label_len += sizeof(SSL_Random);
+	_f_memcpy(seeded_label + label_len, &cipher->client_random,
+          sizeof(SSL_Random));
+   label_len += sizeof(SSL_Random);
+   memset(seeded_label + label_len, 0, SSL_SEEDED_LABEL_MAX - label_len);
+
+   // ***Derive the Key Block***
+   // Note that we get a static SSL_KEY_BLOCK_SIZE number of bytes,
+   // which is most likely too many. However, we just ignore any
+   // bytes past the number we actually need
+   // Possible optimization is to calculate the actual
+   // number of bytes needed. This won't buy much, since we will
+   // at most avoid an iteration or two in the PRF. Also, this only
+   // happens once in the handshake.
+   memset(out_temp, 0, SSL_KEY_BLOCK_SIZE);
+   memset(output, 0, SSL_KEY_BLOCK_SIZE);
+	_tls_1_PRF(master_secret, seeded_label, label_len, output,
+            out_temp, SSL_KEY_BLOCK_SIZE);
+
+#if _SSL_PRINTF_DEBUG > 2
+   printf("\nKey material block:\n");
+   mem_dump(output, SSL_KEY_BLOCK_SIZE);
+#endif
+
+	// Temporary pointer for accessing key material output
+  	keys = output;
+
+   // Now we can set up our keys. The sizes for all these values are
+   // determined in SSL_cipher_init (Watch pointer arithmetic with assertions)
+   // 1) client_write_MAC_secret
+   _f_memcpy(cipher->client_mac_sec, keys, cipher->client_mac_sec_size);
+   keys += cipher->client_mac_sec_size;
+   _ssl_assert(keys < (SSL_byte_t __far*)(output + SSL_KEY_BLOCK_SIZE));
+
+   // 2) server_write_MAC_secret
+   _f_memcpy(cipher->server_mac_sec, keys, cipher->server_mac_sec_size);
+   keys += cipher->server_mac_sec_size;
+   _ssl_assert(keys < (SSL_byte_t __far*)(output + SSL_KEY_BLOCK_SIZE));
+
+   // 3) client_write_key
+   _f_memcpy(bulk_cipher->client_key, keys, bulk_cipher->key_size);
+   keys += bulk_cipher->key_size;
+   _ssl_assert(keys < (SSL_byte_t __far*)(output + SSL_KEY_BLOCK_SIZE));
+
+   // 4) server_write_key
+   _f_memcpy(bulk_cipher->server_key, keys, bulk_cipher->key_size);
+   keys += bulk_cipher->key_size;
+   _ssl_assert(keys < (SSL_byte_t __far*)(output + SSL_KEY_BLOCK_SIZE));
+
+   // Only set up initialization vectors if we have a block cipher
+   // (bulk_cipher->block_size = 0 for stream ciphers)
+   if(bulk_cipher->block_size > 0) {
+	   // 5) client_write_IV
+   	_f_memcpy(bulk_cipher->client_iv, keys, bulk_cipher->block_size);
+   	keys += bulk_cipher->block_size;
+	   _ssl_assert(keys < (SSL_byte_t __far*)(output + SSL_KEY_BLOCK_SIZE));
+
+   	// 6) server_write_IV
+   	_f_memcpy(bulk_cipher->server_iv, keys, bulk_cipher->block_size);
+   	keys += bulk_cipher->block_size;
+	   _ssl_assert(keys < (SSL_byte_t __far*)(output + SSL_KEY_BLOCK_SIZE));
+   }
+
+   // Clear the key material (for security)
+   memset(output, 0, SSL_KEY_BLOCK_SIZE);
+
+   return 0;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+/*** BeginHeader _tls_1_generate_finish_mac */
+int _tls_1_generate_finish_mac(ssl_Socket __far*, SSL_Finish_Hash_t __far*,
+										 _ssl_MAC_sender_t, SSL_byte_t __far*);
+/*** EndHeader */
+
+__TLS_V1_DEBUG__
+int _tls_1_generate_finish_mac(ssl_Socket __far* state, SSL_Finish_Hash_t __far* hash,
+										 _ssl_MAC_sender_t sender, SSL_byte_t __far* mac)
+{
+
+	// This buffer needs to be big enough to hold the MD5 and SHA-1
+   // handshake hashes plus TLS_FINISHED_LAB_XXX concatenated
+	auto SSL_byte_t seeded_label[HMAC_MD5_HASH_SIZE + HMAC_SHA_HASH_SIZE + 16];
+   auto SSL_byte_t out_temp[TLS_VERIFY_DATA_SIZE];
+   auto unsigned int seeded_label_len;
+
+	// Complete the hash, generate seeded label
+   if(SSL_FMAC_CLIENT == sender) {
+	   seeded_label_len = sizeof(TLS_FINISHED_LAB_CLI) - 1;
+	   memset(seeded_label, 0,  seeded_label_len);
+	   memcpy(seeded_label, TLS_FINISHED_LAB_CLI, seeded_label_len);
+	}
+   else if(SSL_FMAC_SERVER == sender) {
+	   seeded_label_len = sizeof(TLS_FINISHED_LAB_SER) - 1;
+	   memset(seeded_label, 0,  seeded_label_len);
+	   memcpy(seeded_label, TLS_FINISHED_LAB_SER, seeded_label_len);
+   }
+
+   md5_finish(&hash->md5_hash, &seeded_label[seeded_label_len]);
+   seeded_label_len += HMAC_MD5_HASH_SIZE;
+	sha_finish(&hash->sha_hash, &seeded_label[seeded_label_len]);
+   seeded_label_len += HMAC_SHA_HASH_SIZE;
+
+   // Do the final finished calculation
+	_tls_1_PRF(state->master_secret, seeded_label, seeded_label_len, mac,
+                     out_temp, TLS_VERIFY_DATA_SIZE);
+
+#if _SSL_PRINTF_DEBUG > 2
+	printf("Generated verify data:\n");
+   mem_dump(mac, TLS_VERIFY_DATA_SIZE);
+   printf("\n");
+#endif
+
+   return 0;
+}
+////////////////////////////////////////////////////////////////////////////////
+
+/*** BeginHeader _tls_1_PRF */
+void _tls_1_PRF(SSL_Secret __far*, SSL_byte_t __far*, int, SSL_byte_t __far*, SSL_byte_t __far*, int);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_tls_1_PRF                               <SSL.LIB>
+
+SYNTAX: void _tls_1_PRF(SSL_Secret far* secret, SSL_byte_t far* label,
+                      int label_len, SSL_byte_t far* output1,
+                      SSL_byte_t far* output2, int length);
+
+DESCRIPTION: TLS Pseudo-Random Function. Using a master secret,
+             and an ASCII label, produce a pseudo-random number
+             for key generation, etc...
+
+PARAMETER 1: The secret
+PARAMETER 2: An ASCII label
+PARAMETER 3: Length of the label (NOT including NULL terminator)
+PARAMETER 4: Primary output, of size length
+PARAMETER 5: Temporary buffer, also of size length
+PARAMETER 6: The length of the desired output
+
+RETURN VALUE: None
+
+END DESCRIPTION **********************************************************/
+
+__TLS_V1_DEBUG__
+void _tls_1_PRF(SSL_Secret __far* secret, // The hash secret
+   SSL_byte_t __far* label,   // label (used in hash)
+   int label_len,       // Seed value for random number
+   SSL_byte_t __far* output1, // Output data 1 (of size length)
+	SSL_byte_t __far* output2, // Output data 2 (of size length, used as temporoary)
+   int length )         // length of output data
+{
+   auto SSL_uint16_t LS;		// Length of the split secret
+   auto SSL_byte_t __far *S1, *S2;	// Pointers to the split secret
+   auto HMAC_ctx_t md5;      // HMAC states for MD5 and SHA
+   auto HMAC_ctx_t sha;
+   auto int i;
+#if TLS_PRF_PROFILE
+	auto unsigned long t0, t1;
+   t0 = MS_TIMER;
+#endif
+
+   // Split the secret
+   LS = secret->length / 2;
+   S1 = &secret->data[0];
+
+	// This is always at length/2 , even if length is odd (rounded down)
+   S2 = &secret->data[LS];
+
+   if(secret->length & 0x01 != 0) {
+    	// Length is odd, round up
+      LS += 1;
+   }
+
+   // Initialize HMAC hashes
+   HMAC_init(&md5, HMAC_USE_MD5);
+   HMAC_init(&sha, HMAC_USE_SHA);
+
+   // Do the hashing
+   P_HASH(&md5, S1, LS, label, label_len, output1, length);
+   P_HASH(&sha, S2, LS, label, label_len, output2, length);
+
+   // XOR the results
+	for(i = 0; i < length; i++) {
+		output1[i] ^= output2[i];
+   }
+#if TLS_PRF_PROFILE
+   t1 = MS_TIMER;
+   printf("TLS_PRF time: %dms\n", t1-t0);
+#endif
+
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/*** BeginHeader */
+#endif // __TLSV1_LIB__
+/*** EndHeader */

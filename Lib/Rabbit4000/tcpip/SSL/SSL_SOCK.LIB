@@ -1,0 +1,652 @@
+/* START LIBRARY DESCRIPTION *********************************************
+SSL_SOCK.LIB
+	SSL Module, v. 2.0
+ *-----------------------------------------------------------------------------
+ * Copyright (c) 2008 Digi International Inc., All Rights Reserved
+ *
+ * This software contains proprietary and confidential information of Digi
+ * International Inc.  By accepting transfer of this copy, Recipient agrees
+ * to retain this software in confidence, to prevent disclosure to others,
+ * and to make no use of this software other than that for which it was
+ * delivered.  This is an published copyrighted work of Digi International
+ * Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+ * prohibited.
+ *
+ * Restricted Rights Legend
+ *
+ * Use, duplication, or disclosure by the Government is subject to
+ * restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+ * Technical Data and Computer Software clause at DFARS 252.227-7031 or
+ * subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+ * Restricted Rights at 48 CFR 52.227-19, as applicable.
+ *
+ * Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+ *-----------------------------------------------------------------------------
+
+DESCRIPTION:
+
+  This library implements TLS/SSL over TCP sockets, as client or server.
+
+  In order for TLS/SSL to work correctly with TCP sockets, the application
+  must #use this library, not SSL_TPORT.LIB.  The latter only includes
+  transport-agnostic code if #used first.
+
+  NOTE: if using this library, ZSERVER.LIB and SSL_TPORT.LIB will be used
+  automatically.
+
+  This library adds two API functions to the core TCP socket API:
+
+  sock_secure()
+  sock_unsecure()
+
+  		sock_secure() turns an ordinary TCP socket into an SSL/TLS socket, and
+  		sock_unsecure() releases any resources (such as dynamically allocated
+  		buffers) back to the system.
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader */
+
+#ifndef _SSL_SOCK_H
+#define _SSL_SOCK_H
+
+#ifdef SSL_SOCK_DEBUG
+	#define _ssl_sock_debug __debug
+#else
+	#define _ssl_sock_debug __nodebug
+#endif
+
+//#define SSL_SOCK_VERBOSE
+
+#define USING_SSL		// This is defined so DCRTCP libraries can conditionally include SSL
+							// TCP socket-specific support.
+
+
+
+#ifndef _SSL_TPORT_H
+	// Need to use Zserver as a certificate store.  Currently, cannot use SSL over TCP
+	// sockets without using Zserver.
+	#ifndef __ZSERVER_LIB
+		#use "zserver.lib"
+	#endif
+	#use "ssl_tport.lib"
+#endif
+
+// Internal transport-layer flags
+#define SSL_SOCK_RDBUF_ALLOCD 0x0001	// Socket read/handshake buffer dynamically allocated
+#define SSL_SOCK_WRBUF_ALLOCD 0x0002	// Socket write buffer dynamically allocated
+
+// To avoid compilation problems, define function parameter types according
+// to whether RSA used or not.
+#if _SSL_USE_RSA_
+typedef SSL_Cert_Import_t _SSL_Cert_Import_t;
+typedef SSL_Cert_t __far * _SSL_Cert_fp_t;
+#else
+typedef int _SSL_Cert_Import_t;
+typedef void __far * _SSL_Cert_fp_t;
+#endif
+
+/*** EndHeader */
+
+
+/*** BeginHeader _sock_tls_handler */
+// This is an internal function which implements a way for the TLS layer to
+// communicate back to the transport layer e.g. to request it to close the
+// underlying socket.  See the event descriptions in SSL_DEFS.LIB (TPORT_EVENT_*).
+int _sock_tls_handler(ssl_Socket __far * ssl, SSL_event_t event, int event_data);
+/*** EndHeader */
+_ssl_sock_debug
+int _sock_tls_handler(ssl_Socket __far * ssl, SSL_event_t event, int event_data)
+{
+	// Default TLS event handler for TCP sockets.  Basically, we close the tport
+	// when TLS session ends, and abort when TLS session gets error or is aborted.
+	// This default is fine for HTTPS, but applications may wish to implement a
+	// different behavior.  For example, it is possible to have several TLS
+	// sessions conducted over the same TCP socket, without having to close/
+	// re-open the socket each time.
+	auto tcp_Socket * tcp;
+
+	tcp = _TCP_SOCK_OF_SSL(_ssl_downcast(ssl));
+	if (!_IS_TCP_SOCK(tcp) || !sock_alive(tcp))
+		// Ignore all if transport already closed or invalid
+		return 0;
+
+	switch (event) {
+	case TPORT_QUERY_UNSENT:
+		return tcp->wr.len;
+	case TPORT_EVENT_SENT_CLOSE_NOTIFY:
+		// No action necessary.  Normal course of events is for app
+		// to read remaining data from ssl socket, then call
+		// sock_unsecure(), then either close the socket or continue using
+		// it in unsecured mode.
+#ifdef SSL_SOCK_VERBOSE
+		printf("_sock_tls_handler: got 'sent close notify'\n");
+#endif
+		return 0;
+	case TPORT_EVENT_ERROR:
+		// If socket already closing, return, else fall thru
+#ifdef SSL_SOCK_VERBOSE
+		printf("_sock_tls_handler: got 'error'\n");
+#endif
+		if (!sock_writable(tcp))
+			return 0;
+	case TPORT_EVENT_SENT_FATAL_ALERT:
+#ifdef SSL_SOCK_VERBOSE
+	printf("_sock_tls_handler: calling sock_close()\n");
+#endif
+		sock_close(tcp);
+		break;
+	case TPORT_EVENT_CLOSE_NOTIFY_TIMEOUT:
+	case TPORT_EVENT_FATAL_ALERT:
+	case TPORT_EVENT_APP_ABORT:
+#ifdef SSL_SOCK_VERBOSE
+		printf("_sock_tls_handler: calling sock_abort()\n");
+#endif
+		sock_abort(tcp);
+		break;
+	case TPORT_EVENT_HS_COMPLETE:
+      // At this point, re-balance the handshake and app_rd buffers.
+      // There should be no remaining HS data at this point.
+      // HS buffer will be set to 'always full', so other code will
+      // need to reallocate for HS if necessary.
+      ssl->rd.maxlen = ssl->hs.maxlen;
+      ssl->hs.maxlen = ssl->hs.len = 0;
+      break;
+	default:
+		// Safe to ignore all others
+		break;
+	}
+	return 0;
+}
+
+
+/*** BeginHeader sock_secure */
+/* START FUNCTION DESCRIPTION ********************************************
+sock_secure                  			<SSL_SOCK.LIB>
+
+SYNTAX: int sock_secure(tcp_Socket *s, ssl_Socket ** secure,
+					 size_t rdbuf_size, char far * rdbuf,
+					 size_t wrbuf_size, char far * wrbuf,
+					 int be_client,
+					 word flags,
+					 long my_cert_addr,			// 0 if no cert
+					 SSL_Cert_Import_t my_cert_import_type,
+                long my_priv_addr,	// 0 if no private key
+					 SSL_Cert_Import_t my_priv_import_type,
+					 SSL_Cert_t far * my_cert,
+					 SSL_Cert_t far * trusted,
+					 SSL_Session_Resume_t far * sess
+                );
+
+DESCRIPTION: Turn a TCP socket into a secure (TLS or SSLv3) socket.  The
+             original TCP socket (s) is still usable as an ordinary
+             un-encrypted socket, however this must not be done until the
+             secure connection is shut down using sock_unsecure().
+
+             When secured, the application can pass the secure socket
+             (at *secure) to all core TCP API functions, such as
+             sock_established(), sock_fastread(), sock_awrite() etc., and
+             will behave in the expected manner.
+
+             **NOTE** Each call to sock_secure() must be matched with a call
+             to sock_unsecure() after the secure session is terminated.  If
+             this is not done, there will be a resource leak which will result
+             in the next call to sock_secure() failing.
+
+				 **NOTE** Sizing the underlying TCP socket receive buffer:
+				 Where possible, this should be at least
+				 16420 bytes, which guarantees that the largest possible TLS record
+				 may be buffered before decryption.  If the read buffer is smaller
+				 than this size, then it is possible for a client to send an
+				 encrypted record which is too big for the buffer, in which case
+				 the library has no choice but to discard the record, which will
+				 cause the session to terminate with an error.  Many clients will
+				 not send such large records (for example, a Rabbit peer would not
+				 send records larger than the transmit buffer size), however each
+				 peer in a TLS session has no control over the other peer's
+				 record sizes.
+
+				 When initially opening the TCP socket, which is to be passed to
+				 this function, use NULL and -16420 for the last two parameters
+				 of sock_extopen() or sock_extlisten().  These values will
+				 cause a dynamically allocated buffer of the correct size to be
+				 used and managed by the library.  Don't use the default values,
+				 since this will make the buffer unusably small for TLS.
+
+PARAMETER 1: s:
+				 Transport layer (i.e. TCP) socket which is to be secured.  This
+				 socket may be in any state provided sock_alive() returns true
+				 for it.  Usually, sock_secure() is called immediately after
+				 sock_extlisten() or sock_extopen().  See note above about
+				 initially sizing the socket receive buffer.
+PARAMETER 2: secure:
+				 A pointer to the location at which to place a pointer to
+				 the newly created secure socket object.  If this function returns
+				 zero, this will be a non-NULL value which may then be used with
+				 any of the core TCP API functions in order to use the socket in
+				 its secure capacity.  Do *NOT* use 's' (i.e. the raw TCP socket)
+				 since this will break the secure protocol and cause disconnection.
+PARAMETER 3: rdbuf_size:
+				 Size of read buffer.  This buffer only has to be as big as the
+				 application would normally desire if the (plaintext) TCP socket
+				 was to be used.  See the note in the description section about
+				 sizing the underlying TCP socket receive buffer.
+PARAMETER 4: rdbuf:
+				 Read buffer base address.  If this is NULL, then a buffer will be
+				 allocated and managed by the library.  Otherwise, the buffer is
+				 assumed to be available at this location.  In both cases, the
+				 size of the buffer is specified by rdbuf_size.
+PARAMETER 5: wrbuf_size:
+				 Size of write buffer.  This should normally be approximately the
+				 same size as the network interface MTU (1500 in most cases),
+				 although a larger buffer can improve transmit efficiency slightly.
+PARAMETER 6: wrbuf:
+				 Write buffer base address.  Works like rdbuf.  The read and write
+				 buffers may be different sizes if desired.
+PARAMETER 7: be_client:
+				 If zero, set up a server TLS/SSL session; otherwise set up a
+				 client session.
+PARAMETER 8: flags:
+				 A bitwise combination of the following flags:
+               SSL_F_REQUIRE_CERT  Require certificate from peer.
+               SSL_F_PEER_CERT_OK  Pretend all certs are valid.  This is mainly
+                         for debugging.
+               SSL_F_DISABLE_SSLV3 Set to not accept SSLv3.0, only accept TLS
+                         a.k.a. SSL V3.1 (always implied for clients).
+               SSL_F_NO_RESUME     Set to not accept or attempt session
+                         resumption.
+               SSL_F_COP_YIELD	  Set to call cop_yield() during long-running
+                                   calculations.
+               SSL_S_ALLOW_NULL    Permit NULL bulk encryption suites.  This
+											  allows eavesdropping, but still requires
+											  strong authentication and message integrity.
+					SSL_S_FORBID_RC4    Do not permit RC4 stream cipher (force AES)
+					SSL_S_FORBID_MD5    Do not permit MD5-based hash (force SHA-1)
+PARAMETER 9: my_cert_addr:
+				 Address of "our" certificate, as would be provided to
+				 SSL_new_cert().  Pass as zero if my_cert (below) is not NULL.
+PARAMETER 10:my_cert_import_type:
+				 Import type of "our" certificate, as would be provided to
+				 SSL_new_cert().
+PARAMETER 11:my_priv_addr:
+				 Address of "our" private key information, as would be provided to
+				 SSL_set_private_key().  Pass as zero if my_cert (below) is not
+				 NULL.
+PARAMETER 12:my_priv_import_type:
+				 Import type of "our" private key information, as would be provided
+				 to SSL_set_private_key().
+PARAMETER 13:my_cert:
+				 If not NULL, is a parsed certificate including private key
+				 information.  If given, then the above 4 parameters are not
+				 used.  This is convenient if the certificate is already avaiable
+				 as a parsed structure.  The following code shows the gist of it:
+               SSL_Cert_t my_cert;
+               SSL_new_cert(&my_cert, my_cert_addr, SSL_DCERT_XIM, 0);
+               SSL_set_private_key(&my_cert, my_priv_addr, SSL_DCERT_XIM);
+               sock_secure(...0,0,0,0,&my_cert,...);
+PARAMETER 14:trusted:
+				 Pre-parsed certificate chain representing the list of trusted
+				 authorities.  This parameter is usually NULL for a server which
+				 accepts anonymous clients only and does not validate any
+				 client certificates.  Otherwise, if the server needs to validate
+				 certificates, this parameter must contain at least one CA
+				 certificate.
+PARAMETER 15:sess:
+				 If not NULL, use this information to attempt session resumption.
+				 This is only relevant for clients (since servers automatically
+				 cache session resumption details).  Session resumption makes
+				 re-connection to a server much faster, since it bypasses the
+				 expensive public key shared secret generation step.  To obtain
+				 session information, call sock_get_session() immediately before
+				 closing an existing session.  This information can then be used
+				 when reconnecting, although it will only be successful when
+				 reconnecting to the same server as before.
+
+RETURN VALUE: 0 if OK, otherwise a negative error code such as -ENOMEM
+				  if memory could not be allocated.  In the case of error,
+				  *secure will be NULL.
+
+END DESCRIPTION **********************************************************/
+int sock_secure(tcp_Socket *s, ssl_Socket ** secure,
+					 size_t rdbuf_size, char __far * rdbuf,
+					 size_t wrbuf_size, char __far * wrbuf,
+					 int be_client,
+					 word flags,
+					 long my_cert_addr,			// 0 if no cert
+					 _SSL_Cert_Import_t my_cert_import_type,
+                long my_priv_addr,	// 0 if no private key
+					 _SSL_Cert_Import_t my_priv_import_type,
+					 _SSL_Cert_fp_t my_cert,
+					 _SSL_Cert_fp_t trusted,
+					 SSL_Session_Resume_t __far * sess
+                );
+/*** EndHeader */
+_ssl_sock_debug
+int sock_secure(tcp_Socket *s, ssl_Socket ** secure,
+					 size_t rdbuf_size, char __far * rdbuf,
+					 size_t wrbuf_size, char __far * wrbuf,
+					 int be_client,
+					 word flags,
+					 long my_cert_addr,			// non-zero if unparsed cert/key following...
+					 _SSL_Cert_Import_t my_cert_import_type,
+                long my_priv_addr,	// 0 if no private key
+					 _SSL_Cert_Import_t my_priv_import_type,
+					 // If not null, this is used instead of the above.  Useful when
+					 // one local cert used for multiple servers or clients.  Must
+					 // include private key info.
+					 _SSL_Cert_fp_t my_cert,
+					 // Trusted cert (chain) if require client certs
+					 _SSL_Cert_fp_t trusted,
+					 SSL_Session_Resume_t __far * sess
+                )
+{
+	auto ssl_Socket * ssl;
+	auto ssl_Socket __far * _f_ssl;
+	auto int rdbuf_allocd;
+	auto int wrbuf_allocd;
+	auto int rc;
+
+#ifdef SSL_SOCK_VERBOSE
+	printf("sock_secure: as %s\n",
+	   be_client ? "client" : "server"
+	   );
+#endif
+	rdbuf_allocd = 0;
+	wrbuf_allocd = 0;
+	*secure = NULL;
+	if (!rdbuf)
+		rdbuf = _sys_malloc(rdbuf_size), rdbuf_allocd = 1;
+	if (!rdbuf) {
+		rc = -ENOMEM;
+		goto _cleanup;
+	}
+	if (!wrbuf)
+		wrbuf = _sys_malloc(wrbuf_size), wrbuf_allocd = 1;
+	if (!wrbuf) {
+		rc = -ENOMEM;
+		goto _cleanup;
+	}
+
+	_f_ssl = tls_connection_init(&_ssl_globals);
+	if (!_f_ssl) {
+		rc = -_ssl_globals.last_error;
+		goto _cleanup;
+	}
+	// Downcast should work since in fact the ssl sockets are always in root.
+	// Pointer is in "far logical" form (0xFFFFnnnn).
+	*secure = ssl = _ssl_downcast(_f_ssl);
+
+	// Important: signifies this TLS state uses TCP socket transport...
+  	ssl->ip_type = SSL_PROTO;
+  	// ...and point to the underlying transport state (TCP socket)
+	ssl->sock = s;
+	s->app_rd = &ssl->rd;
+	s->app_wr = &ssl->wr;
+	// Initially, app read buffer and HS buffer are "shared", with app_rd getting
+	// no space, and HS all space.  After state is advanced to the point where app
+	// data is possible, then the buffer is shifted to all app_rd, and no
+	// HS.  HS may still need some space, since HS messages can be sometimes received,
+	// however we assume there will be no more HS messages.  (Alerts are OK since they
+	// do not use the HS buffer).
+	ssl->rd.buf = rdbuf;
+	ssl->hs.buf = rdbuf;
+	ssl->hs.maxlen = rdbuf_size;
+	ssl->wr.buf = wrbuf;
+	ssl->wr.maxlen = wrbuf_size;
+
+	tls_set_flags(ssl, flags, -1);
+	tls_set_tport_flags(ssl,
+		(rdbuf_allocd ? SSL_SOCK_RDBUF_ALLOCD : 0) |
+		(wrbuf_allocd ? SSL_SOCK_WRBUF_ALLOCD : 0),
+		-1
+		);
+#if _SSL_USE_RSA_
+	if (my_cert) {
+#ifdef SSL_SOCK_VERBOSE
+		printf("sock_secure:  setting parsed cert %08lX\n", my_cert);
+#endif
+		rc = tls_set_cert(ssl, 0, 0,
+		                    0, 0, 0, my_cert);
+		if (rc < 0)
+			goto _cleanup;
+	}
+	else if (my_cert_addr) {
+#ifdef SSL_SOCK_VERBOSE
+		printf("sock_secure:  setting unparsed cert %08lX\n", my_cert_addr);
+#endif
+		rc = tls_set_cert(ssl, my_cert_addr, my_cert_import_type,
+		                    0, my_priv_addr, my_priv_import_type, NULL);
+		if (rc < 0)
+			goto _cleanup;
+	}
+	if (trusted) {
+#ifdef SSL_SOCK_VERBOSE
+		printf("sock_secure:  setting trusted %08lX\n", trusted);
+#endif
+		tls_set_trusted(ssl, trusted);
+	}
+#endif
+	// Set our transport/TLS callback
+	ssl->tport = _sock_tls_handler;
+
+	if (be_client) {
+		if (sess)
+			tls_set_session(ssl, sess);
+		rc = tls_sm(ssl, NULL, &s->wr, &ssl->hs, s->app_rd, s->app_wr);
+		if (rc < 0)
+			goto _cleanup;
+		// Need to call tcp_send here, otherwise there is nothing to trigger off
+		// the initial send from tcp_tick().
+      tcp_send((tcp_Socket *)s, 401 );
+
+	}
+#ifdef SSL_SOCK_VERBOSE
+	printf("sock_secure: OK, returning secure=%04X\n", ssl);
+#endif
+	return 0;
+
+_cleanup:
+   if (*secure) {
+   	tls_connection_deinit(&_ssl_globals, *secure);
+   	*secure = NULL;
+   }
+   if (wrbuf_allocd)
+      _sys_free(wrbuf);
+   if (rdbuf_allocd)
+      _sys_free(rdbuf);
+#ifdef SSL_SOCK_VERBOSE
+	printf("sock_secure: ERROR, rc=%d\n", rc);
+#endif
+	return rc;
+}
+
+
+/*** BeginHeader sock_unsecure */
+/* START FUNCTION DESCRIPTION ********************************************
+sock_unsecure						<SSL_SOCK.LIB>
+
+SYNTAX: int sock_unsecure(ssl_Socket * secure);
+
+DESCRIPTION: Release resources allocated by sock_secure().  This must be
+             called after termination of each TLS/SSL session, otherwise
+             there will be a resource leakage and sock_secure() will fail.
+
+PARAMETER 1: TLS/SSL socket
+
+RETURN VALUE: 0.
+
+END DESCRIPTION **********************************************************/
+int sock_unsecure(ssl_Socket * secure);
+/*** EndHeader */
+// Note that we use the verb 'unsecure' rather than the adjective 'insecure'.
+// This frees up any resources allocated by sock_secure().
+_ssl_sock_debug
+int sock_unsecure(ssl_Socket * secure)
+{
+	auto word flags;
+
+#ifdef SSL_SOCK_VERBOSE
+	printf("sock_unsecure: unsecuring=%04X\n", secure);
+#endif
+	flags = tls_get_tport_flags(secure);
+	if (flags & SSL_SOCK_RDBUF_ALLOCD) {
+		_sys_free(secure->rd.buf);
+		secure->rd.buf = NULL;
+	}
+	if (flags & SSL_SOCK_WRBUF_ALLOCD) {
+		_sys_free(secure->wr.buf);
+		secure->wr.buf = NULL;
+	}
+   if (secure->resource_index)
+      tls_connection_deinit(&_ssl_globals, secure);
+	return 0;
+}
+
+
+
+/*** BeginHeader sock_get_session */
+/* START FUNCTION DESCRIPTION ********************************************
+sock_get_session						<SSL_SOCK.LIB>
+
+SYNTAX: int sock_get_session(ssl_Socket far * s,
+                             SSL_Session_Resume_t far * sess);
+
+DESCRIPTION: Obtain session resumption information from an open secure
+				 socket.  This is an optimization which can dramatically speed
+				 up session negotiation time if connecting to the same server
+				 as a previous session.
+
+PARAMETER 1: TLS/SSL socket as obtained by sock_secure().  This socket
+				 should be open and active.  Normally, this routine is
+				 called immediately prior to unsecuring the socket.
+PARAMETER 2: Pointer to uninitialized storage which will be filled with
+             the session resumption information.  This may be passed on
+             a subsequent call to sock_secure() (as the 'sess' parameter)
+             in order to speed up session negotiation.
+
+RETURN VALUE: 0.
+
+END DESCRIPTION **********************************************************/
+int sock_get_session(ssl_Socket __far * s, SSL_Session_Resume_t __far * sess);
+/*** EndHeader */
+
+
+_ssl_sock_debug
+int sock_get_session(ssl_Socket __far * s, SSL_Session_Resume_t __far * sess)
+{
+	return tls_get_session(s, sess);
+}
+
+
+/*** BeginHeader sock_set_policy */
+/* START FUNCTION DESCRIPTION ********************************************
+sock_set_policy						<SSL_SOCK.LIB>
+
+SYNTAX: int sock_set_policy(ssl_Socket far * s,
+            	int (*policy)(ssl_Socket far * state,
+                             int trusted,
+	                          struct x509_certificate far * cert,
+	                          void far * data)
+	                			)
+
+DESCRIPTION: Install a certificate acceptance policy callback for the
+             specified SSL socket.
+
+             The policy callback can examine the fields of an X509
+             certificate (provided by the connection peer) and return an
+             indication to the library whether or not to accept the certificate.
+
+             The certificate is available in the 3rd parameter to the
+             callback.  Relevant fields are:
+               cert->issuer
+               	Sub-structure identifying the issuer of the certificate.
+               cert->subject
+               	Sub-structure identifying the subject i.e. the peer itself.
+
+             The above sub-strutures contain the following fields.  Any of
+             these fields may be NULL, in which case there is no information.
+             Otherwise, the fields point to a null-terminated string.
+
+             	c
+             		Country code (e.g. ZA, AU, US, UK etc.)
+             	l (lowercase el)
+             		Location (e.g. Davis)
+             	st
+             		State or province
+             	o
+             		Organization (e.g. company name)
+             	ou
+             		Organizational unit
+             	email
+             		Email address
+             	cn
+             		Common name.  This is usually set to the DNS domain name
+             		of the subject, so that a client can check that the server
+             		is indeed the expected server and not an impostor.  (An
+             		impostor, lacking the private key of the real certificate
+             		subject, cannot fake a CN field).
+
+             For example,
+             	cert->issuer.o
+             is the organization name of the certificate issuer, and
+               cert->subject.cn
+             is the domain name of the peer.
+
+             The 'trusted' parameter to the callback is a simple boolean
+             which indicates whether there was a trusted CA list available.
+             If no such list is available, then 'trusted' is set false.  In
+             this case, the callback should not assume the veracity of the
+             certificate, since it could not be checked.
+
+             If there is a trusted CA list, then either
+             1. the presented certificate was verified against the trusted CA
+                list, or
+             2. the certificate (or its issuer) could not be located in the
+                CA list, or
+             3. A trusted CA was located, but the presented certificate failed
+                verification for some reason (e.g. being used beyond its
+                expiry date).
+
+             In the first case, the policy callback is then invoked with
+             'trusted' set TRUE.  In any other case, the policy callback is
+             *not* invoked.
+
+             After examining the fields of the certificate, the policy callback
+             then returns '1' to reject the session, or '0' to allow it to
+             proceed.  In the case that the policy callback rejects the
+             certificate, the library will shut down the TLS/SSL socket with
+             an appropriate alert message to the peer.
+
+             Note that the most common task of the policy callback is to
+             match the subject Common Name with the expected domain name of
+             the peer.  The application needs to provide the necessary
+             information (i.e. the domain name) by some other means.  See the
+             sample code in samples\tcpip\smtp\smtp_tls.c.
+
+PARAMETER 1: TLS/SSL socket as obtained by sock_secure().  Normally, this
+				 routine is called as soon as possible after sock_secure().
+PARAMETER 2: Pointer to callback function.  May be NULL to remove the
+             callback.
+PARAMETER 3: Data for callback function.
+
+
+RETURN VALUE: 0.
+
+END DESCRIPTION **********************************************************/
+int sock_set_policy(ssl_Socket __far * s, int (*policy)(), void __far * data);
+/*** EndHeader */
+
+
+_ssl_sock_debug
+int sock_set_policy(ssl_Socket __far * s, int (*policy)(), void __far * data)
+{
+	s->policy = policy;
+	s->policy_data = data;
+	return 0;
+}
+
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+

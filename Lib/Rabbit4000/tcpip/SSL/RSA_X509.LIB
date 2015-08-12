@@ -1,0 +1,353 @@
+/* START LIBRARY DESCRIPTION *********************************************
+RSA_X509.LIB
+ *-----------------------------------------------------------------------------
+ * Copyright (c) 2008 Digi International Inc., All Rights Reserved
+ *
+ * This software contains proprietary and confidential information of Digi
+ * International Inc.  By accepting transfer of this copy, Recipient agrees
+ * to retain this software in confidence, to prevent disclosure to others,
+ * and to make no use of this software other than that for which it was
+ * delivered.  This is an published copyrighted work of Digi International
+ * Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+ * prohibited.
+ *
+ * Restricted Rights Legend
+ *
+ * Use, duplication, or disclosure by the Government is subject to
+ * restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+ * Technical Data and Computer Software clause at DFARS 252.227-7031 or
+ * subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+ * Restricted Rights at 48 CFR 52.227-19, as applicable.
+ *
+ * Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+ *-----------------------------------------------------------------------------
+
+DESCRIPTION: RSA support routines related to X.509 certificates
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader */
+#ifndef _RSA_X509_H
+#define _RSA_X509_H
+
+#ifndef _TBUF_H
+	#use "tbuf.lib"
+#endif
+
+#ifndef _X509_H
+	#use "x509.lib"
+#endif
+
+#ifndef _RSA_H
+	#use "rsa.lib"
+#endif
+/*** EndHeader */
+
+/*****************************************************************************
+  Note: following functions assume X509.LIB and TBUF.LIB have been included
+******************************************************************************/
+
+/*** BeginHeader crypto_rsa_parse_integer */
+char __far * crypto_rsa_parse_integer(char __far * pos, char __far * end,
+							MP_Mod __far * num, int __far * actual_len);
+/*** EndHeader */
+_rsa_debug
+char __far * crypto_rsa_parse_integer(char __far * pos, char __far * end,
+							MP_Mod __far * num, int __far * actual_len) {
+    auto struct asn1_hdr hdr;
+    int temp;
+
+
+    if (!pos)
+    	return NULL;
+    temp = asn1_get_next(pos, (_x509_ptrdiff_t)(end-pos), &hdr);
+    if (temp<0 || hdr.class!=0 || hdr.tag!=0x02) {
+        _X509_PRINTF(((int  )(MSG_DEBUG),
+        		(char  __far * )("RSA: Expected INTEGER - found class %d " \
+         "tag 0x%x" ), hdr.class, hdr.tag));
+        return ((void  __far * )0);
+
+    }
+
+	// note that there can be a leading '00' which may make the length 65
+	// (for a 512-bit number),
+	// hence we allow extra leading zeros.
+    if (hdr.length>num->length || hdr.length<1) {
+        _X509_PRINTF(((int  )(MSG_DEBUG),
+        	(char  __far * )("RSA: Number field too long/short at %d bytes (of %d)" ),
+        	hdr.length, num->length));
+        return ((void  __far * )0);
+
+    }
+
+    bin2mp((char  __far * )(hdr.payload), (MP_Mod  __far * )(num),
+    			(unsigned int  )(hdr.length));
+    *actual_len = hdr.length;
+    return hdr.payload+hdr.length;
+
+}
+
+/*** BeginHeader _PEM_decode */
+char __far * _PEM_decode(char __far * * _in, size_t * lenp, char __far * tag);
+/*** EndHeader */
+_rsa_debug
+char __far * _PEM_decode(char __far * * _in, size_t * lenp, char __far * tag)
+{
+	// if 'in' starts with "-----BEGIN "+tag+"-----" then allocate and
+	// decode the base64 contents into a returned buffer (which caller must
+	// free).  Otherwise, return NULL.  A non-null return will also update
+	// *lenp to the decoded length.
+	// Note: PEM files can contain other stuff, so we search for 'BEGIN'
+	// strings.
+	//v30722: changed 1st param to also return pointer to 1st byte after the
+	// certificate which was found (if any). *_in is not touched if decode
+	// was not successful in any way.
+	auto char btag[100];
+	auto char etag[100];
+	auto size_t b64len, taglen, begin, matchlen, btaglen, etaglen;
+	auto char __far * end, * out;
+	auto _tbuf t;	// Used for search facility
+	auto char __far * in;
+
+	in = *_in;
+
+	taglen = _f_strlen(tag);
+	memcpy(btag,"-----BEGIN ",11);
+	_f_memcpy(btag+11, tag, taglen);
+	memcpy(btag+11+taglen,"-----",5);
+	btaglen = 16+taglen;
+	memcpy(etag,"-----END ",9);
+	_f_memcpy(etag+9, tag, taglen);
+	memcpy(etag+9+taglen,"-----",5);
+	etaglen = 14+taglen;
+
+	t.buf = in;
+	t.len = t.maxlen = *lenp;
+	t.begin = 0;
+
+   matchlen = btaglen;
+   begin = _tbuf_findmem(&t, btag, &matchlen, t.len, 0);
+   if ((int)begin < 0 || matchlen < btaglen)
+      return (void __far *)0;	// no complete begin tag
+   begin += btaglen;
+   _tbuf_delete(&t, begin);
+   in = t.buf + t.begin;
+   *lenp -= begin;
+
+   matchlen = etaglen;
+   begin = _tbuf_findmem(&t, etag, &matchlen, t.len, 0);
+   if ((int)begin < 0 || matchlen < etaglen)
+      return (void __far *)0;	// no end tag
+   b64len = begin;		// the data length between tags
+
+   // Resulting length <= ceil(b64len * 3/4), so allocate that amount.
+   // May be a bit too much, since there will be CRLFs in the b64 which
+   // don't add anything, but this is simpler.
+   out = (char __far *)_sys_malloc((b64len+3) * 3 >> 2);
+   if (out) {
+      *lenp = base64_ndecode(out, in, b64len);
+	   *_in = in + (b64len + etaglen);
+	}
+   return out;
+}
+
+
+/*** BeginHeader crypto_public_key_import */
+struct RSA_key_t __far * crypto_public_key_import(char __far * bufi, size_t len);
+/*** EndHeader */
+_rsa_debug
+struct RSA_key_t __far * crypto_public_key_import(char __far * bufi, size_t len) {
+    struct RSA_key_t __far * key; 	// From "x509_all.c":299
+    struct asn1_hdr hdr; 	// From "x509_all.c":300
+    char __far * pos; 	// From "x509_all.c":301
+    char __far * end; 	// From "x509_all.c":301
+    int actual_len; 	// From "x509_all.c":302
+    char __far * buf;
+
+
+    key = _sys_calloc((size_t  )(sizeof(struct RSA_key_t  )));
+    if (!key) return ((void  __far * )0);
+
+	// Note that the public key is usually part of a certificate, which will have
+	// already been converted to DER format by the caller, hence this PEM decode
+	// will never actually do anything.
+    buf = _PEM_decode(&bufi, &len, "RSA PUBLIC KEY");
+    if (!buf)
+    	buf = bufi;
+
+    if (asn1_get_next(buf, len, &hdr)<0 || hdr.class!=0 || hdr.tag!=0x10) {
+        _X509_PRINTF(((int  )(MSG_DEBUG),
+        	(char  __far * )("RSA: Expected SEQUENCE " \
+         "(public key) - found class %d tag 0x%x" ), hdr.class, hdr.tag));
+        goto error;
+
+    }
+
+    pos = hdr.payload;
+    end = pos+hdr.length;
+    key->public.n.length = MP_SIZE;
+    pos = crypto_rsa_parse_integer(pos, end, &key->public.n, &actual_len);
+    // Add 1 since there is already an extra zero byte at the end of the number,
+    // but our library needs two extra padding zeros at the end.
+    key->public.n.length = actual_len+1;
+    key->public.e.length = key->public.n.length;
+    pos = crypto_rsa_parse_integer(pos, end, &key->public.e, &actual_len);
+    if (!pos) goto error;
+
+    if (pos!=end) {
+        _X509_HEXDUMP(((int  )(MSG_DEBUG),
+        	(char  __far * )("RSA: Extra data in public key SEQUENCE" ),
+        	(char  __far * )(pos), (size_t  )((_x509_ptrdiff_t)(end-pos))));
+        goto error;
+
+    }
+
+    if (buf != bufi)
+    	_sys_free(buf);
+
+    return key;
+
+error:
+    _sys_free(key);
+    if (buf != bufi)
+    	_sys_free(buf);
+    return ((void  __far * )0);
+
+}
+
+
+/*** BeginHeader crypto_public_key_free */
+// From "x509_all.c":353
+void crypto_public_key_free(struct RSA_key_t __far * key);
+/*** EndHeader */
+_rsa_debug
+void crypto_public_key_free(struct RSA_key_t __far * key) {
+    _sys_free((void  __far * )(key));
+
+}
+
+
+/*** BeginHeader crypto_private_key_free */
+// From "x509_all.c":358
+void crypto_private_key_free(struct RSA_key_t __far * key);
+/*** EndHeader */
+_rsa_debug
+void crypto_private_key_free(struct RSA_key_t __far * key) {
+    _sys_free((void  __far * )(key));
+
+}
+
+
+/*** BeginHeader crypto_private_key_import */
+// From "x509_all.c":379, but modified to return better diagnostics
+struct RSA_key_t __far * crypto_private_key_import(char __far * bufi,
+												size_t len, int * err_code);
+/*** EndHeader */
+_rsa_debug
+struct RSA_key_t __far * crypto_private_key_import(char __far * bufi,
+												size_t len, int * err_code) {
+    MP_Mod zero; 	// From "x509_all.c":381
+    struct RSA_key_t __far * key; 	// From "x509_all.c":382
+    struct asn1_hdr hdr; 	// From "x509_all.c":383
+    char __far * pos; 	// From "x509_all.c":384
+    char __far * end; 	// From "x509_all.c":384
+    int actual_len; 	// From "x509_all.c":385
+    int i; 	// From "x509_all.c":385
+    int nz; 	// From "x509_all.c":385
+    char __far * buf;
+
+    *err_code = 0;
+    key = _sys_calloc((size_t  )(sizeof(struct RSA_key_t  )));
+    if (!key) { *err_code = -ENOMEM; return ((void  __far * )0); }
+
+    buf = _PEM_decode(&bufi, &len, "RSA PRIVATE KEY");
+    if (!buf)
+    	buf = bufi;
+
+    key->public.private_key = 1;
+    if (asn1_get_next(buf, len, &hdr)<0 || hdr.class!=0 || hdr.tag!=0x10) {
+        _X509_PRINTF(((int  )(MSG_DEBUG),
+         (char  __far * )("RSA: Expected SEQUENCE " \
+         "(public key) - found class %d tag 0x%x" ), hdr.class, hdr.tag));
+        goto error;
+
+    }
+
+    pos = hdr.payload;
+    end = pos+hdr.length;
+    zero.length = MP_SIZE;
+    pos = crypto_rsa_parse_integer(pos, end, &zero, &actual_len);
+    for (i = nz = 0;
+     i<actual_len;
+      ++i) nz |= zero.mod[i];
+
+    if (pos==((void  __far * )0) || nz) {
+        _X509_PRINTF(((int  )(MSG_DEBUG),
+         (char  __far * )("RSA: Expected zero INTEGER in the " \
+         "beginning of private key; not found" )));
+        *err_code = -EINVAL;
+        goto error;
+
+    }
+
+    key->public.n.length = MP_SIZE;
+    pos = crypto_rsa_parse_integer(pos, end, &key->public.n, &actual_len);
+    key->public.n.length = actual_len+1;
+    key->public.e.length = key->public.n.length;
+    pos = crypto_rsa_parse_integer(pos, end, &key->public.e, &actual_len);
+    key->d.length = key->public.n.length;
+    pos = crypto_rsa_parse_integer(pos, end, &key->d, &actual_len);
+#ifndef RSA_DISABLE_CRT
+	 key->p.length = (key->d.length-2>>1)+2;
+	 key->q.length = key->p.length;
+	 // These may be shorter, so pad...
+	 _f_memset(key->dmp1.mod, 0, sizeof(key->dmp1.mod));
+	 _f_memset(key->dmq1.mod, 0, sizeof(key->dmq1.mod));
+	 _f_memset(key->iqmp.mod, 0, sizeof(key->iqmp.mod));
+	 key->dmp1.length = key->p.length;
+	 key->dmq1.length = key->p.length;
+	 key->iqmp.length = key->p.length;
+	 pos = crypto_rsa_parse_integer(pos, end, &key->p, &actual_len);
+	 pos = crypto_rsa_parse_integer(pos, end, &key->q, &actual_len);
+	 pos = crypto_rsa_parse_integer(pos, end, &key->dmp1, &actual_len);
+	 pos = crypto_rsa_parse_integer(pos, end, &key->dmq1, &actual_len);
+	 pos = crypto_rsa_parse_integer(pos, end, &key->iqmp, &actual_len);
+#else
+    for (i = 0;
+     i<5;
+      ++i) pos = crypto_rsa_parse_integer(pos, end, &zero, &actual_len);
+#endif
+
+    if (!pos) {
+        *err_code = -EINVAL;
+        goto error;
+    }
+
+    if (pos!=end) {
+        _X509_HEXDUMP(((int  )(MSG_DEBUG),
+         (char  __far * )("RSA: Extra data in public key SEQUENCE" ),
+         (char  __far * )(pos), (size_t  )((_x509_ptrdiff_t)(end-pos))));
+        *err_code = -EINVAL;
+        goto error;
+
+    }
+
+    if (buf != bufi)
+    	_sys_free(buf);
+    return key;
+
+error:
+    _sys_free(key);
+    if (buf != bufi)
+    	_sys_free(buf);
+    return ((void  __far * )0);
+
+}
+
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+
+
+

@@ -1,0 +1,1154 @@
+/* START LIBRARY DESCRIPTION *********************************************
+SSL_CERT.LIB
+	TLS/SSL Module, v. 2.0
+ *-----------------------------------------------------------------------------
+ * Copyright (c) 2008 Digi International Inc., All Rights Reserved
+ *
+ * This software contains proprietary and confidential information of Digi
+ * International Inc.  By accepting transfer of this copy, Recipient agrees
+ * to retain this software in confidence, to prevent disclosure to others,
+ * and to make no use of this software other than that for which it was
+ * delivered.  This is an published copyrighted work of Digi International
+ * Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+ * prohibited.
+ *
+ * Restricted Rights Legend
+ *
+ * Use, duplication, or disclosure by the Government is subject to
+ * restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+ * Technical Data and Computer Software clause at DFARS 252.227-7031 or
+ * subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+ * Restricted Rights at 48 CFR 52.227-19, as applicable.
+ *
+ * Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+ *-----------------------------------------------------------------------------
+
+DESCRIPTION:
+ TLS Certificate management library. Provides utilities for extracting
+ keys and data from certificate import files.
+
+ May 2003 - Initial Revision - TJS
+ 	- Proprietary format, may change to standard (ASN.1) format later
+ Aug 2007 - SJH
+   - Added support for ASN.1/X509 certificates, for SSL client implementation.
+     Application can #define SSL_DISABLE_LEGACY_DCC to do away with the legacy
+     DCC format certificate handling code.  There's only a small saving
+     doing this, since X509 is relatively huge.
+
+     You can also #define SSL_DISABLE_USERBLOCK to delete code relating
+     to certificates stored in the user ID block.
+
+     DER/PEM format certificates and RSA private key files are supported.
+     The certificate contains the server or client identity, along with
+     an RSA public key (comprising a public modulus and exponent).
+     The certificate is also self-signed or signed by a Certificate
+     Authority (CA).  An RSA private key file contains a repeat of the
+     public key information, plus the private exponent plus other numbers
+     which are useful for optimizing RSA operations which use the private
+     key.  The public key information in the certificate and the public
+     key information in the private key must obviously match.
+
+     Several certificates may be specified:
+
+       .  A server certificate, which is used for TLS sockets which are
+          opened in passive (listen) mode such as the HTTPS server socket.
+
+       .  A client certificate, optionally used for TLS sockets which are
+          actively opened.  A different client certificate may be supplied
+          for each actively opened socket, since the certificate resource
+          name is specified as a parameter to the TLS active open function.
+
+       .  One or more trusted CA certificates.  These are used to verify
+          certificates presented by a TLS socket peer during handshake
+          phase.
+
+     The certificate object, from the application point-of-view, is the
+     SSL_Cert_t typedef.  This should be considered opaque to the
+     application.
+
+     These objects may contain one or more certificates, forming a
+     chain.  Certificates are numbered 0 (the first) thru N-1.
+     Certificate M is expected to verify certificate M-1 in the chain.
+     The first certificate may also have private key data attached, which
+     is necessary if this is "our" certificate.
+ Dec 2009 - SJH
+ 	  v30722: changed SSL_new_cert() so that a PEM file with multiple
+ 	  certificates will all be parsed and added to a certificate chain.
+ 	  This is useful for when the client needs to send intermediate
+ 	  CAs, and also the acceptable trusted CA list can be in a single
+ 	  PEM file.
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader */
+
+#ifndef __SSL_CERT_LIB__
+#define __SSL_CERT_LIB__
+
+// Debugging for TLS certificate functions
+#ifndef SSL_CERT_DEBUG
+#define __SSL_CERT_DEBUG__ __nodebug
+#else
+#define __SSL_CERT_DEBUG__ __debug
+#endif
+
+// Bring in certificate parsing lib.
+#ifndef _X509_H
+	#use "x509.lib"
+#endif
+
+#use "idblock_api.lib"
+
+// The size of the temporary buffer used in certificate extraction
+#define SSL_CERT_BUF_SIZE 256
+
+
+// Certificate import types
+typedef enum {
+	// Legacy certificate types (prior to TLS client support).  These
+	// indicate the certificate is stored in "DCC" format, which is a semi-digested
+	// form of the original DER format certificate.
+	SSL_CERT_XIM,	// Certificate is #ximported
+   SSL_CERT_XMEM, // Certificate is in an XMEM buffer
+   // Following macros indicate the new format for storing certificates, which
+   // requires the X509 and ASN.1 support provided by X509.LIB.  In this case,
+   // the certificate is stored in "native" DER format.  To make the distinction
+   // clear, the enums start with SSL_DCERT.
+   // Note that PEM format is automatically detected, and converted to DER format
+   // via base64 decoding.
+	SSL_DCERT_XIM,	// DER or PEM format certificate is #ximported
+   SSL_DCERT_UID,	// DER or PEM format in the User ID block
+   SSL_DCERT_Z,	// DER or PEM format zserver resource
+   SSL_DCERT_TBUF,// Internal circular buffer (used for certs received from the wire) - DER binary
+   SSL_DCERT_X509 // Internal format (already parsed into a struct x509_certificate object).  Note
+   					// that this object must be allocated via x509_certificate_parse(), and it will
+   					// be freed if SSL_free_cert() is called!
+} SSL_Cert_Import_t;
+
+typedef enum {
+	SSL_CERT_FORMAT_DCC,		// Legacy DCC format
+	SSL_CERT_FORMAT_DER		// Distinguished Encoding Rules format, X509 cert.
+	                  		// Privacy Enhanced Mail (PEM) format also
+									// accepted, since this is simple to convert.
+} SSL_Cert_Format_t;
+
+#ifndef SSL_DISABLE_LEGACY_DCC
+// This info only used for DCC certificates (which were restricted to 512-bit
+// RSA keys).
+typedef struct {
+   long mod_offs;		// Offset into file of modulus
+   long pkey_offs;   // Offset of private exponent
+   long exp_offs;    // Offset of public exponent
+   long cert_offs;   // Offset of certificate
+   int key_size;     // Size of modulus/private key
+   int exp_size;     // Public exponent size
+   int cert_size;    // Certificate size
+} SSL_DCC_Cert_t;
+#endif
+
+
+	// Keys are split into public and private parts.  Obviously, the public
+	// certificate is transferred over the wire, whereas the private cert
+	// is used internally for verification and decyption.
+	// The legacy DCC format includes both public and private information
+	// so the same certificate structure may be used for both purposes.
+
+// Certificate structure
+typedef struct SSL_Cert_t_t {
+   SSL_Cert_Import_t  cert_type; // The type of import
+   SSL_Cert_Format_t  format;    // Encoding rules
+
+   union {
+   	// These will be NULL for SSL_DCERT_TBUF, or SSL_DCERT_X509
+      char __far                    * farptr;   // RAM address
+      long  								ximport_addr; // Address for ximport
+      char __far                    * name;    // Zserver resource name
+   } addr;
+
+   union {
+      // One for each supported format.
+      char __far                    * generic;
+#ifndef SSL_DISABLE_LEGACY_DCC
+      SSL_DCC_Cert_t __far          * dcc_cert;
+#endif
+      struct x509_certificate __far * x509_cert;
+   } u;
+
+	// Public and maybe private key information extracted from
+	// certificate and/or private key resource.  May be null if this
+	// is a trusted cert list.
+   struct RSA_key_t __far           * rsa_key;
+} SSL_Cert_t;
+
+
+/*** EndHeader */
+
+/*** BeginHeader SSL_new_cert */
+int SSL_new_cert(SSL_Cert_t __far* cert, long addr,
+						SSL_Cert_Import_t import_type,
+						int append);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+SSL_new_cert                           <SSL_CERT.LIB>
+
+SYNTAX: int SSL_new_cert(SSL_Cert_t* cert, long addr,
+                         SSL_Cert_Import_t import_type,
+                         int append);
+
+DESCRIPTION: Create a new certificate or certificate chain for use with
+TLS/SSL. This function populates the certificate
+structure (PARAMETER 1) with information used by the extract functions
+(also in SSL_CERT.LIB). The import file may be any of the following
+import types:
+
+	SSL_CERT_XIM       Legacy (.dcc) certificate is #ximported
+   SSL_CERT_XMEM      Legacy (.dcc) certificate is in an XMEM buffer
+	SSL_DCERT_XIM      DER or PEM format certificate is #ximported
+   SSL_DCERT_UID      DER or PEM format certificate is in the User ID block
+   SSL_DCERT_Z        DER or PEM format zserver resource
+   SSL_DCERT_TBUF     Internal circular buffer (used for certs received
+                      from the wire) - only supports DER binary
+   SSL_DCERT_X509     Internal binary format (already parsed into a struct
+                      x509_certificate object).  Note that this object
+                      must be allocated via x509_certificate_parse(), and
+                      it will be freed if SSL_free_cert() is called!
+
+NOTE: some parts of the cert struct will be dynamically allocated, thus
+SSL_free_cert() should be called to release memory when the certificate
+chain is no longer required.
+
+For DER or PEM format certificates, since the private key info is not
+necessarily stored in the certificate then, if required, it must be provided by
+a subsequent call to SSL_set_private_key(cert,...).  Note that PEM format
+files may contain both the certificate and the private key.  In such cases,
+the same file may be passed to both SSL_new_cert() and SSL_set_private_key().
+
+See SSL_store_cert() for a convenient way of storing certificates in the
+userID block (non-volatile storage available on all Rabbit core modules).
+If that function is used, the certificate may be read from the userID block
+by using the import type SSL_DCERT_UID.  In this case, any private key
+data that was associated with the certificate at time of storage will be
+extracted automatically, hence there would be no need to subsequently call
+SSL_set_private_key().
+
+If you #define SSL_DISABLE_LEGACY_DCC, then the SSL_CERT_XIM and SSL_CERT_XMEM
+import types will not be available.  Similarly, #define SSL_DISABLE_USERBLOCK
+to remove code which supports storing DER/PEM certificates in the user ID block
+(SSL_DCERT_UID).  SSL_DCERT_Z is only available if ZSERVER.LIB is included.
+
+PARAMETER 1: Certificate data structure to be populated.  Initially, should
+				 be memset to zero.  Subsequently, call this routine with
+				 the 'append' flag, or call SSL_free_cert() to recycle.
+PARAMETER 2: The address or name of the certificate input file.  The
+             interpretation of this field depends on the import type:
+	SSL_CERT_XIM or
+	SSL_DCERT_XIM      symbol defined on the #ximport directive
+   SSL_CERT_XMEM      address of first byte of .dcc certificate.  Note that
+                      this format defines its own length, hence a length
+                      field is unnecessary.
+   SSL_DCERT_UID      offset from beginning of User ID block.  This is the
+                      same value as originally specified to SSL_store_cert().
+   SSL_DCERT_Z        char far *, pointer to null-term string name of Zserver
+                      resource containing the DER or PEM certificate.
+   SSL_DCERT_TBUF     _tbuf far *.  This is used internally by the library.
+   SSL_DCERT_X509     struct x509_certificate far *.  Used internally
+
+PARAMETER 3: The import type of public input file (SSL_CERT_XIM etc. as
+             documented for parameter 2 above)
+PARAMETER 4: If true, then new cert is added to the end of the existing
+             chain in "cert".  This is used to construct a chain of
+             trusted certs.  Can also be used to create a verification
+             chain when sending or receiving cert lists.  Note that all
+             certs in a chain will be freed when SSL_free_cert() is
+             called.  If private key data is available for the specified
+             certificate import, then it will only be loaded if this
+             parameter is zero.
+
+RETURN VALUE: 0 on success, non-zero on failure.
+              Return code may be -EBUSY, which indicates that the user
+              block device is busy.  Try again later in this case.
+              -EINVAL: not a supported import type.
+
+SEE ALSO: SSL_extract_cert, SSL_get_chain_size, SSL_get_cert_len,
+          SSL_free_cert, SSL_set_private_key, SSL_store_cert
+
+END DESCRIPTION **********************************************************/
+
+#define _SNC_RET(x) { rc = -(x); goto _ret; }
+__SSL_CERT_DEBUG__
+int SSL_new_cert(SSL_Cert_t __far* cert, long addr,
+                 SSL_Cert_Import_t import_type,
+                 int append) {
+   auto char temp_buf[SSL_CERT_BUF_SIZE]; // Temporary root buffer
+	auto size_t key_len, exp_len, cert_len, uoffs, rdoffs;
+	auto int rc;
+   auto long offset, lcertlen, cert_addr;
+   auto void __far * buf, * cert_buf, * der_buf, * next_buf, * end_buf;
+   auto _tbuf __far * tbuf;
+   struct x509_certificate __far * __far * cpp;
+
+#ifdef SSL_CERT_VERBOSE
+	printf("SSL_new_cert: cert=%08lX addr=%08lX type=%d append=%d\n",
+		cert, addr, (int)import_type, append);
+#endif
+
+	// Check for NULL
+	if (!cert)
+    	_SNC_RET(ERR_BADPOINTER)
+
+	cpp = &cert->u.x509_cert;
+
+	// Splat any key here.
+	// Caller should free any old key first, by calling SSL_free_cert
+	if (!append) {
+#ifdef SSL_CERT_VERBOSE
+		if (cert->rsa_key)
+			printf("  Warning: rsa_key was not NULL (%08lX)\n", cert->rsa_key);
+#endif
+   	cert->rsa_key = NULL;
+ 		cert->cert_type = import_type;
+ 	}
+ 	else {
+ 		// Appending to end of current chain
+		while (*cpp)
+			cpp = &((*cpp)->next);
+ 	}
+
+	switch (import_type) {
+	case SSL_DCERT_X509:
+  		if (!addr)
+    		_SNC_RET(ERR_BADPOINTER)
+		*cpp = (struct x509_certificate __far *)addr;
+ 		cert->format = SSL_CERT_FORMAT_DER;
+		cert->addr.ximport_addr = 0;
+		break;
+#ifndef SSL_DISABLE_USERBLOCK
+	case SSL_DCERT_UID:
+		uoffs = (size_t)addr;
+		rc = readUserBlock(&lcertlen, uoffs, sizeof(lcertlen));
+		if (rc > 0)
+			_SNC_RET(EBUSY)
+		else if (rc < 0)
+			_SNC_RET(ENODEV)
+		// Assume can read successfully now...
+		uoffs += sizeof(lcertlen);	// skip length field
+		cert_len = (size_t)(lcertlen>>16);
+		if (!cert_len)
+			// No private key info
+			cert_len = (size_t)lcertlen;
+		buf = _sys_malloc(cert_len);
+      if (!buf)
+         _SNC_RET(ENOMEM)
+      // Read cert by bouncing through root buffer
+      for (rdoffs = 0;
+           rdoffs + sizeof(temp_buf) < cert_len;
+           rdoffs += sizeof(temp_buf)) {
+			readUserBlock(temp_buf, uoffs + rdoffs, sizeof(temp_buf));
+			_f_memcpy((char __far *)buf + rdoffs, temp_buf, sizeof(temp_buf));
+		}
+		readUserBlock(temp_buf, uoffs + rdoffs, cert_len - rdoffs);
+		_f_memcpy((char __far *)buf + rdoffs, temp_buf, cert_len - rdoffs);
+		goto _common_der;
+#endif
+	case SSL_DCERT_TBUF:
+  		if (!addr)
+    		_SNC_RET(ERR_BADPOINTER)
+		tbuf = (_tbuf __far *)addr;
+		cert_len = tbuf->len;
+		// Only make contiguous copy if wraps in buffer
+		if (tbuf->begin + cert_len > tbuf->maxlen) {
+			buf = _sys_malloc(cert_len);
+			if (!buf)
+				_SNC_RET(ENOMEM)
+			_tbuf_xread(buf, tbuf, 0, cert_len);
+	_common_buf:
+	      *cpp = x509_certificate_parse(buf, cert_len);
+	      _sys_free(buf);
+		}
+		else
+	      *cpp = x509_certificate_parse(tbuf->buf + tbuf->begin, cert_len);
+
+		if (!*cpp) {
+			// This is a limitation of X509 lib: null can be returned because the
+			// cert is invalid too.
+			_SNC_RET(ENOMEM)
+		}
+ 		cert->format = SSL_CERT_FORMAT_DER;
+		cert->addr.ximport_addr = 0;
+		break;
+	case SSL_DCERT_XIM:
+  		if (!addr)
+    		_SNC_RET(ERR_BADPOINTER)
+      cert->addr.ximport_addr = addr;
+      cert_len = (size_t)*(long __far *)cert->addr.farptr;
+      buf = cert->addr.farptr + sizeof(long);   // start after length word
+ 		goto _common_der;
+#ifdef __ZSERVER_LIB
+	case SSL_DCERT_Z:
+  		if (!addr)
+    		_SNC_RET(ERR_BADPOINTER)
+		cert->addr.name = (char __far *)addr;
+      // Certificate in DER format, as a Zserver resource
+      _f_strcpy(temp_buf, cert->addr.name);
+      rc = _sspec_dup(-1, &buf, &lcertlen, temp_buf, _ssl_globals.context, _sys_malloc_stub, _sys_free_stub);
+      if (rc < 0)
+         goto _ret;
+      cert_len = (size_t)lcertlen;
+		// Unfortunately, x509.lib likes to tack the cert on to the end of
+		// the struct.  This means we temporarily have two copies of the cert in memory
+		// (three if you count the zserver storage used, and 4 if we need to base64 decode).
+#endif
+	_common_der:
+
+ 		cert->format = SSL_CERT_FORMAT_DER;
+ 		end_buf = (char __far *)buf + cert_len;
+		// If certificate is in PEM format, this call will convert it to DER and
+		// return an allocated (temp) area which is freed below.
+		next_buf = buf;
+    	der_buf = _PEM_decode(&next_buf, &cert_len, "CERTIFICATE");
+    	if (!der_buf) {
+    		der_buf = buf;		// was already in DER format
+    		next_buf = NULL;	// cannot be another PEM cert following
+    	}
+
+		*cpp = x509_certificate_parse(der_buf, cert_len);
+		if (der_buf != buf) {
+			_sys_free(der_buf);
+			// While there is a 'next_buf', this must be a PEM file, so parse
+			// and append any following certificates.
+			while (*cpp && next_buf) {
+				cert_len = (size_t)((char __far *)end_buf - (char __far *)next_buf);
+    			der_buf = _PEM_decode(&next_buf, &cert_len, "CERTIFICATE");
+				if (!der_buf)
+					break;
+				cpp = &((*cpp)->next);
+				*cpp = x509_certificate_parse(der_buf, cert_len);
+				_sys_free(der_buf);
+			}
+		}
+		if (import_type == SSL_DCERT_Z || import_type == SSL_DCERT_UID)
+			_sys_free(buf);
+		if (!*cpp) {
+			// This is a limitation of X509 lib: null can be returned because the
+			// cert is invalid too.
+			_SNC_RET(ENOMEM)
+		}
+		break;
+#ifndef SSL_DISABLE_LEGACY_DCC
+   // Load certificate from an xmem location
+   case SSL_CERT_XIM:
+   case SSL_CERT_XMEM:
+  		if (!addr)
+    		_SNC_RET(ERR_BADPOINTER)
+    	// Certificate is ximported
+   	offset = 0; // Start with 0
+      cert->addr.ximport_addr = addr;
+ 		cert->format = SSL_CERT_FORMAT_DCC;
+ 		cert->u.dcc_cert = (SSL_DCC_Cert_t __far *)_sys_malloc(sizeof(SSL_DCC_Cert_t));
+ 		if (!cert->u.dcc_cert)
+ 			_SNC_RET(ENOMEM)
+
+	   // Load key length
+      if(SSL_CERT_XIM == import_type) {
+	      offset = sizeof(long); // Skip ximport length field
+      }
+		key_len = xgetint(addr + offset);
+      cert->u.dcc_cert->key_size = key_len;
+      offset += sizeof(int);
+
+      // Modulus offset
+   	cert->u.dcc_cert->mod_offs = offset;
+
+      // Private key offset
+      offset += key_len;
+      cert->u.dcc_cert->pkey_offs = offset;
+
+	   // Load exponent length
+      offset += key_len;
+		exp_len = xgetint(addr+offset);
+      cert->u.dcc_cert->exp_size = exp_len;
+		offset += sizeof(int);
+
+      // Exponent offset
+      cert->u.dcc_cert->exp_offs = offset;
+
+      // Load certificate length
+      offset += exp_len;
+		cert_len = xgetint(addr + offset);
+      cert->u.dcc_cert->cert_size = cert_len;
+		offset += sizeof(int);
+
+      // Certificate offset
+      cert->u.dcc_cert->cert_offs = offset;
+   	break;
+#endif
+   default:
+   	// Currently unsupported or unknown import type
+      _SNC_RET(EINVAL)
+   }
+
+   if (!append) switch (cert->format) {
+   case SSL_CERT_FORMAT_DER:
+#ifndef SSL_DISABLE_USERBLOCK
+   	if (cert->cert_type == SSL_DCERT_UID && (size_t)(lcertlen>>16)) {
+         key_len = (size_t)lcertlen - cert_len;
+         #ifdef SSL_CERT_VERBOSE
+            printf("SSL_new_cert: UID format has key, len %u\n", key_len);
+         #endif
+         if (key_len <= sizeof(*cert->rsa_key)) {
+	         cert->rsa_key = _sys_calloc(sizeof(struct RSA_key_t));
+	         if (!cert->rsa_key) {
+	            SSL_free_cert(cert);
+	            _SNC_RET(ENOMEM)
+	         }
+	         uoffs += cert_len;
+	         for (rdoffs = 0;
+	              rdoffs + sizeof(temp_buf) < key_len;
+	              rdoffs += sizeof(temp_buf)) {
+	            readUserBlock(temp_buf, uoffs + rdoffs, sizeof(temp_buf));
+	            _f_memcpy((char __far *)cert->rsa_key + rdoffs, temp_buf, sizeof(temp_buf));
+	         }
+	         readUserBlock(temp_buf, uoffs + rdoffs, key_len - rdoffs);
+	         _f_memcpy((char __far *)cert->rsa_key + rdoffs, temp_buf, key_len - rdoffs);
+	         // Done, got private key info
+	         break;
+         }
+      }
+#endif
+		// Got cert, extract public key info
+		cert->rsa_key = crypto_public_key_import(cert->u.x509_cert->public_key, cert->u.x509_cert->public_key_len);
+		if (!cert->rsa_key) {
+			SSL_free_cert(cert);
+			_SNC_RET(ENOMEM)
+		}
+#ifdef SSL_CERT_VERBOSE
+		printf("  crypto_public_key_import() returns %08lX\n", cert->rsa_key);
+#endif
+		break;
+	default:
+#ifndef SSL_DISABLE_LEGACY_DCC
+		// Create an RSA key struct, so that access routines can use same code
+		// for all formats.
+		cert->rsa_key = _sys_calloc(sizeof(struct RSA_key_t));
+		if (!cert->rsa_key) {
+			SSL_free_cert(cert);
+			_SNC_RET(ENOMEM)
+		}
+	   switch (cert->cert_type) {
+	   // The certificate is #ximported
+	   case SSL_CERT_XIM:
+	      cert_addr = cert->addr.ximport_addr;
+	      cert->rsa_key->public.private_key = 1;	// Have private key info
+			cert->rsa_key->public.n.length = cert->u.dcc_cert->key_size + 2;
+			cert->rsa_key->public.e.length = cert->u.dcc_cert->key_size + 2;
+			cert->rsa_key->d.length = cert->u.dcc_cert->key_size + 2;
+	      // Load modulus, private key and public exponent
+			bin2mp((char __far *)(cert_addr + cert->u.dcc_cert->mod_offs),
+										&cert->rsa_key->public.n,
+										cert->u.dcc_cert->key_size);
+			bin2mp((char __far *)(cert_addr + cert->u.dcc_cert->exp_offs),
+										&cert->rsa_key->public.e,
+										cert->u.dcc_cert->exp_size);
+			bin2mp((char __far *)(cert_addr + cert->u.dcc_cert->pkey_offs),
+								  		&cert->rsa_key->d,
+								  		cert->u.dcc_cert->key_size);
+
+	      break;
+	   default:
+	   	break;
+	   }
+
+#endif
+		break;
+   }
+
+#ifdef SSL_CERT_VERBOSE
+	printf("SSL_new_cert: OK\n");
+#endif
+   // Success!
+   return 0;
+
+_ret:
+#ifdef SSL_CERT_VERBOSE
+	printf("SSL_new_cert: ERROR: return code=%d\n", rc);
+#endif
+	return rc;
+
+}
+#undef _SNC_RET
+
+/*** BeginHeader SSL_set_private_key */
+/* START FUNCTION DESCRIPTION ********************************************
+SSL_set_private_key                           <SSL_CERT.LIB>
+
+SYNTAX: int SSL_set_private_key(SSL_Cert_t far* cert, long addr,
+						SSL_Cert_Import_t import_type);
+
+DESCRIPTION: Set private key information in a certificate object.  The
+             first certificate in a chain may have private key information
+             associated with it.  This allows the TLS library to use the
+             certificate as "our" cert.
+
+             Legacy certificates (i.e. ".dcc" format) include
+             private key information, thus it is not necessary to call
+             this function.  The new DER or PEM format is split into
+             two parts: the certificate proper, and the private key
+             information.  In this case, it is necessary to call this
+             function in order to associate the correct private key
+             information with the certificate.
+
+PARAMETER 1: Certificate data structure to be augmented.  This should have
+             been initialized using SSL_new_cert() with the DER or PEM
+             certificate itself, as the first or only member of the chain.
+             This parameter can also be NULL, in which case the private
+             key is only checked for basic validity.
+PARAMETER 2: The address or name of the private key input file.  See
+             SSL_new_cert() for details.
+PARAMETER 3: The import type of private key input file.  One of the
+             following is allowed (this is a subset of the allowable formats
+             for SSL_new_cert()):
+   import_type        Interpretation of addr parameter
+   -------------      -----------------------------------------------------
+	SSL_DCERT_XIM      symbol defined on the #ximport directive
+   SSL_DCERT_UID      offset from beginning of User ID block.  This is the
+                      location of a long integer which contains the length
+                      of the immediately following certificate data.
+   SSL_DCERT_Z        char far *, pointer to null-term string name of Zserver
+                      resource containing the DER or PEM certificate.
+
+RETURN VALUE: 0 on success, non-zero on failure
+
+SEE ALSO: SSL_extract_cert, SSL_get_chain_size, SSL_get_cert_len,
+          SSL_free_cert, SSL_new_cert
+
+END DESCRIPTION **********************************************************/
+int SSL_set_private_key(SSL_Cert_t __far* cert, long addr,
+						SSL_Cert_Import_t import_type);
+/*** EndHeader */
+#define _SNC_RET(x) { rc = -(x); goto _ret; }
+
+
+__SSL_CERT_DEBUG__
+int SSL_set_private_key(SSL_Cert_t __far* cert, long addr,
+						SSL_Cert_Import_t import_type)
+{
+   auto char temp_buf[SSL_CERT_BUF_SIZE]; // Temporary root buffer
+	auto char __far * buf;
+	auto long len, lcertlen;
+	auto size_t uoffs, rdoffs, cert_len;
+	auto int rc;
+	auto struct RSA_key_t __far * key;
+
+#ifdef SSL_CERT_VERBOSE
+	printf("SSL_set_private_key: cert=%08lX addr=%08lX type=%d\n",
+		cert, addr, (int)import_type);
+#endif
+
+	// Check for NULL
+	if (!addr && import_type != SSL_DCERT_UID)
+    	_SNC_RET(ERR_BADPOINTER)
+
+
+	switch (import_type) {
+	case SSL_DCERT_XIM:
+      buf = (char __far *)addr;
+      len = *(long __far *)buf;
+      buf += sizeof(long);
+ 		goto _common_der;
+#ifndef SSL_DISABLE_USERBLOCK
+	case SSL_DCERT_UID:
+		uoffs = (size_t)addr;
+		rc = readUserBlock(&lcertlen, uoffs, sizeof(lcertlen));
+		if (rc > 0)
+			_SNC_RET(EBUSY)
+		else if (rc < 0)
+			_SNC_RET(ENODEV)
+		// Assume can read successfully now...
+		uoffs += sizeof(lcertlen);	// skip length field
+		cert_len = (size_t)lcertlen;
+		buf = _sys_malloc(cert_len);
+      if (!buf)
+         _SNC_RET(ENOMEM)
+      // Read cert by bouncing through root buffer
+      for (rdoffs = 0;
+           rdoffs + sizeof(temp_buf) < cert_len;
+           rdoffs += sizeof(temp_buf)) {
+			readUserBlock(temp_buf, uoffs + rdoffs, sizeof(temp_buf));
+			_f_memcpy((char __far *)buf + rdoffs, temp_buf, sizeof(temp_buf));
+		}
+		readUserBlock(temp_buf, uoffs + rdoffs, cert_len - rdoffs);
+		_f_memcpy((char __far *)buf + rdoffs, temp_buf, cert_len - rdoffs);
+		len = cert_len;
+ 		goto _common_der;
+#endif
+#ifdef __ZSERVER_LIB
+	case SSL_DCERT_Z:
+		_f_strcpy(temp_buf, (char __far *)addr);
+		// Need to use stubs for following, because _sys_malloc() etc is a function-form macro
+		rc = _sspec_dup(-1, &buf, &len, temp_buf, _ssl_globals.context, _sys_malloc_stub, _sys_free_stub);
+   	if (rc < 0)
+   		goto _ret;
+#endif
+	_common_der:
+		key = crypto_private_key_import(buf, (size_t)len, &rc);
+		if (import_type == SSL_DCERT_Z || import_type == SSL_DCERT_UID)
+			_sys_free(buf);
+		if (!key)
+			goto _ret;
+#ifdef SSL_CERT_VERBOSE
+		printf("  crypto_private_key_import() returns %08lX\n", key);
+#endif
+		// If there was already an rsa_key set up in the cert, then it was extracted
+		// from the cert.  We could thus verify that the keys actually match (same public
+		// modulus and exponent).  In any case, the old key (if any) is freed and
+		// replaced with this one, since private keys also include public data.
+		if (cert) {
+	      if (cert->rsa_key) {
+#ifdef SSL_CERT_VERBOSE
+				printf("    replacing old public key at %08lX\n", cert->rsa_key);
+#endif
+	         crypto_public_key_free(cert->rsa_key);
+	      }
+	      cert->rsa_key = key;
+		}
+		break;
+
+   default:
+   	// Not a supported resource import type for private keys.
+      _SNC_RET(EINVAL)
+   }
+
+   // Success!
+#ifdef SSL_CERT_VERBOSE
+	printf("SSL_set_private_key: OK\n");
+#endif
+   return 0;
+_ret:
+#ifdef SSL_CERT_VERBOSE
+	printf("SSL_set_private_key: ERROR: return code=%d\n", rc);
+#endif
+	return rc;
+}
+#undef _SNC_RET
+
+/*** BeginHeader SSL_free_cert */
+/* START FUNCTION DESCRIPTION ********************************************
+SSL_free_cert							   <SSL_CERT.LIB>
+
+SYNTAX:  int SSL_free_cert(SSL_Cert_t far* cert);
+
+DESCRIPTION: Free any resources allocated for this cert.  This frees the
+             entire chain (if any).  This basically allows the certificate
+             object to be re-used for a new certificate or cert. chain.
+
+PARAMETER 1: Certificate object e.g. from SSL_new_cert().
+
+RETURN VALUE: 0
+
+SEE ALSO: SSL_extract_cert, SSL_get_chain_size, SSL_get_cert_len,
+			 SSL_set_private_key, SSL_new_cert
+
+END DESCRIPTION **********************************************************/
+int SSL_free_cert(SSL_Cert_t __far* cert);
+/*** EndHeader */
+__SSL_CERT_DEBUG__
+int SSL_free_cert(SSL_Cert_t __far* cert)
+{
+#ifdef SSL_CERT_VERBOSE
+	printf("SSL_free_cert: cert=%08lX format=%u\n", cert, cert->format);
+#endif
+	// Check for NULL pointers
+   if (!cert)
+    	return -ERR_BADPOINTER;
+
+   if (cert->rsa_key) {
+#ifdef SSL_CERT_VERBOSE
+		printf("  crypto_private_key_free(%08lX)\n", cert->rsa_key);
+#endif
+      crypto_private_key_free(cert->rsa_key);
+      cert->rsa_key = NULL;
+   }
+
+	switch (cert->format) {
+
+	case SSL_CERT_FORMAT_DER:
+		if (cert->u.x509_cert) {
+			x509_certificate_chain_free(cert->u.x509_cert);
+			cert->u.x509_cert = NULL;
+		}
+		break;
+	default:
+#ifndef SSL_DISABLE_LEGACY_DCC
+		if (cert->u.dcc_cert) {
+			_sys_free(cert->u.dcc_cert);
+			cert->u.dcc_cert = NULL;
+		}
+#endif
+		break;
+	}
+	return 0;
+}
+
+
+/*** BeginHeader SSL_get_cert_len */
+/* START FUNCTION DESCRIPTION ********************************************
+SSL_get_cert_len							   <SSL_CERT.LIB>
+
+SYNTAX:  int SSL_get_cert_len(SSL_Cert_t far* cert, size_t N);
+
+DESCRIPTION: Get certificate length (of DER formatted part, not the extra
+             info in the DCC format) of the Nth cert (starting at 0) in the
+             chain
+
+PARAMETER 1: Certificate object e.g. from SSL_new_cert().
+PARAMETER 2: Certificate number on the chain, starting at 0.
+
+RETURN VALUE: Length of certificate, or -EINVAL if cert is NULL.
+
+SEE ALSO: SSL_extract_cert, SSL_get_chain_size, SSL_free_cert,
+          SSL_set_private_key, SSL_new_cert, SSL_get_store_cert_len
+
+END DESCRIPTION **********************************************************/
+int SSL_get_cert_len(SSL_Cert_t __far* cert, size_t N);
+/*** EndHeader */
+
+__SSL_CERT_DEBUG__
+int SSL_get_cert_len(SSL_Cert_t __far* cert, size_t N)
+{
+	struct x509_certificate __far * c;
+
+	// Check for NULL pointers
+   if (!cert)
+    	return -EINVAL;
+
+	switch (cert->format) {
+	case SSL_CERT_FORMAT_DER:
+		if (cert->u.x509_cert) {
+			for (c = cert->u.x509_cert; c && N; c = c->next, --N);
+			if (c)
+				return c->cert_len;
+		}
+		break;
+ 	default:
+#ifndef SSL_DISABLE_LEGACY_DCC
+ 		if (cert->u.dcc_cert)
+ 			return cert->u.dcc_cert->cert_size;
+#endif
+		break;
+
+ 	}
+ 	return 0;
+}
+
+
+
+/*** BeginHeader SSL_get_store_cert_len */
+/* START FUNCTION DESCRIPTION ********************************************
+SSL_get_store_cert_len							   <SSL_CERT.LIB>
+
+SYNTAX:  int SSL_get_store_cert_len(SSL_Cert_t far* cert, size_t N,
+              size_t * priv_data_len);
+
+DESCRIPTION: Get length of storage required for the use of the
+             SSL_store_cert() function.  This length includes an initial
+             4-byte length field, the certificate itself, and the length
+             of any private key data if it exists.
+
+PARAMETER 1: Certificate object e.g. from SSL_new_cert().
+PARAMETER 2: Certificate number on the chain, starting at 0.
+PARAMETER 3: If not NULL, used to return the size of the private key data.
+             This may currently be either 0 or sizeof(RSA_key).
+
+RETURN VALUE: Length of storage area required, or a negative number if
+             the certificate is invalid.
+
+SEE ALSO: SSL_store_cert, SSL_get_chain_size, SSL_get_cert_len
+
+END DESCRIPTION **********************************************************/
+int SSL_get_store_cert_len(SSL_Cert_t __far* cert, size_t N,
+              size_t * priv_data_len);
+/*** EndHeader */
+
+__SSL_CERT_DEBUG__
+int SSL_get_store_cert_len(SSL_Cert_t __far* cert, size_t N,
+              size_t * priv_data_len)
+{
+	auto int cert_len;
+
+	cert_len = SSL_get_cert_len(cert, N);
+	if (cert_len < 0)
+		return cert_len;
+	if (cert->rsa_key && cert->rsa_key->public.private_key) {
+		cert_len += sizeof(RSA_key);
+		if (priv_data_len)
+			*priv_data_len = sizeof(RSA_key);
+	}
+	else
+		if (priv_data_len)
+			*priv_data_len = 0;
+	return 4 + cert_len;
+}
+
+/*** BeginHeader SSL_get_chain_size */
+/* START FUNCTION DESCRIPTION ********************************************
+SSL_get_chain_size							   <SSL_CERT.LIB>
+
+SYNTAX:  size_t SSL_get_chain_size(SSL_Cert_t far* cert, long * oal);
+
+DESCRIPTION: Return the total size of a certificate chain.  This does
+             not include any extra such as the length fields which are
+             required in TLS when sending the chain.  It is simply the
+             sum of the lengths of each certificate in binary form.
+
+PARAMETER 1: Certificate object e.g. from SSL_new_cert().
+PARAMETER 2: Pointer to value where total length is stored.
+
+RETURN VALUE: Number of certificates found in the chain.
+
+SEE ALSO: SSL_extract_cert, SSL_get_cert_len, SSL_free_cert,
+          SSL_set_private_key, SSL_new_cert
+
+END DESCRIPTION **********************************************************/
+
+size_t SSL_get_chain_size(SSL_Cert_t __far* cert, long * oal);
+/*** EndHeader */
+__SSL_CERT_DEBUG__
+size_t SSL_get_chain_size(SSL_Cert_t __far* cert, long * oal)
+{
+	auto size_t count;
+	struct x509_certificate __far * c;
+
+	*oal = 0;
+	if (!cert || !cert->u.generic)
+		return 0;
+
+	if (cert->format != SSL_CERT_FORMAT_DER) {
+		*oal = SSL_get_cert_len(cert, 0);
+		return 1;
+	}
+	for (count = 0, c = cert->u.x509_cert; c; ++count, c = c->next)
+		*oal += c->cert_len;
+	return count;
+}
+
+/*** BeginHeader SSL_extract_cert */
+int SSL_extract_cert(SSL_Cert_t __far* cert, char __far * cert_buf, size_t N);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+SSL_extract_cert							   <SSL_CERT.LIB>
+
+SYNTAX: int SSL_extract_cert(SSL_Cert_t far* cert,
+                     char far * cert_buf, size_t N);
+
+DESCRIPTION: Extract a DER (binary) format certificate from a certificate
+             object or certificate chain.  This is normally used only when
+             transmitting a certificate over a network connection.
+
+PARAMETER 1: Certificate object e.g. from SSL_new_cert().
+PARAMETER 2: Return buffer xmem address, will contain the certificate.
+             This must be sized appropriately: the size of the certificate
+             may be obtained from SSL_get_cert_len() or
+             SSL_get_chain_size().
+PARAMETER 3: Certificate number in chain.  0 is the first certificate.
+
+RETURN VALUE: 0 on success, non-zero on failure; -EINVAL if cert is NULL
+
+SEE ALSO: SSL_get_chain_size, SSL_get_cert_len, SSL_free_cert,
+          SSL_set_private_key, SSL_new_cert
+
+END DESCRIPTION **********************************************************/
+
+__SSL_CERT_DEBUG__
+int SSL_extract_cert(SSL_Cert_t __far * cert, char __far * cert_buf, size_t N) {
+	auto long offset;
+   auto int i, frag_len;
+   auto char *p;
+   auto int sspec;
+	auto size_t count;
+	struct x509_certificate __far * c;
+
+	// Check for NULL pointers
+   if (!cert || !cert_buf)
+    	return -EINVAL;
+
+	switch (cert->cert_type) {
+
+	case SSL_DCERT_X509:
+	case SSL_DCERT_TBUF:
+	case SSL_DCERT_XIM:
+	case SSL_DCERT_UID:
+	case SSL_DCERT_Z:
+		for (c = cert->u.x509_cert; c && N; c = c->next, --N);
+		// Certificate follows this struct
+		if (c)
+ 			_f_memcpy(cert_buf, c->cert_start, c->cert_len);
+		else
+			return -1;
+		break;
+#ifndef SSL_DISABLE_LEGACY_DCC
+   // The certificate is #ximported
+   case SSL_CERT_XIM:
+	   // Load cert
+ 		_f_memcpy(cert_buf, cert->addr.farptr + cert->u.dcc_cert->cert_offs, cert->u.dcc_cert->cert_size);
+		break;
+#endif
+   default:
+   	// Unsupported mode, return error
+    	return -1;
+   }
+
+   // Success!
+   return 0;
+}
+
+
+
+/*** BeginHeader SSL_store_cert */
+int SSL_store_cert(SSL_Cert_t __far* cert, size_t offset, size_t N,
+						size_t * next_offs);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+SSL_store_cert							   <SSL_CERT.LIB>
+
+SYNTAX: int SSL_store_cert(SSL_Cert_t far* cert, size_t offset, size_t N,
+						size_t * next_offs);
+
+DESCRIPTION: Store a DER (binary) format certificate from a certificate
+             object or certificate chain in the userID block.
+
+             This is typically used to store CA (root) certificates or
+             server certificates in non-volatile storage, particularly on
+             small boards where there is no FAT filesystem available.
+
+             If there is any private RSA key data associated with this
+             certificate, it is also stored, and will be available
+             automatically when the certificate is subsequently imported from
+             the userID block.
+
+             Most common usage is to somehow receive the certificate (e.g.
+             via HTTPS file upload), parse and verify the certificate using
+             SSL_new_cert(), then call this routine to store the result
+             in the userID block.  When this certificate is subsequently used,
+             it is obtained using SSL_new_cert() with the same "offset"
+             value, and SSL_DCERT_UID import type.  For example:
+
+               SSL_Cert_t  cert;
+
+               memset(&cert, 0, sizeof(cert));
+               SSL_new_cert(&cert, ....); // appropriate initial import
+               SSL_set_private_key(&cert, ....); // optional
+               SSL_store_cert(&cert, MY_CERT_OFFSET, 0, NULL);
+               SSL_free_cert(&cert);
+
+               // then, whenever the certificate is required (even after
+               // reboot etc.)
+
+               memset(&cert, 0, sizeof(cert));
+               SSL_new_cert(&cert, MY_CERT_OFFSET, SSL_DCERT_UID, 0);
+               // ...private key (if any) automatically restored, hence
+               // for HTTPS server certificate we can simply...
+               https_set_cert(&cert);
+
+             This function will *not* be available if you #define
+             SSL_DISABLE_USERBLOCK.
+
+PARAMETER 1: Certificate object e.g. from SSL_new_cert().
+PARAMETER 2: Offset of where to store the certificate in the userID block.
+             Your application is responsible for managing the storage
+             layout in the userID block.  This library assumes that the
+             entire certificate (plus a 4-byte length field, and possibly
+             the private RSA key data) can be stored at the given offset.
+             The size of the required storage may be obtained by calling
+             SSL_get_store_cert_len().
+
+             Note that this offset value is the same value as passed to
+             SSL_new_cert() when it is desired to read the stored
+             certificate using the SSL_DCERT_UID import type.
+PARAMETER 3: Certificate number in chain.  0 is the first certificate.
+PARAMETER 4: If not NULL, this is used to return the offset in the userID
+             block which immediately follows the end of the stored
+             certificate.  This is useful when storing several certificates
+             (or other data) in the userID block.  The value will always be
+             offset + SSL_get_store_cert_len(cert, N, NULL).
+
+RETURN VALUE: 0 on success, non-zero on failure; -EINVAL if cert is NULL,
+              -ENOMEM if insufficient system malloc() storage for temporary
+              buffer. -EBUSY indicates the userID block is stored on a
+              serial flash, but the serial flash is already in use.  Try again
+              later.
+
+SEE ALSO: SSL_get_chain_size, SSL_get_cert_len, SSL_free_cert,
+          SSL_set_private_key, SSL_new_cert, SSL_get_store_cert_len
+
+END DESCRIPTION **********************************************************/
+
+#ifdef SSL_DISABLE_USERBLOCK
+	#error "To use SSL_store_cert(), you must not define SSL_DISABLE_USERBLOCK"
+#endif
+
+__SSL_CERT_DEBUG__
+int SSL_store_cert(SSL_Cert_t __far* cert, size_t offset, size_t N,
+						size_t * next_offs) {
+   auto char temp_buf[512];
+	auto char __far * buf;
+	auto size_t cert_len, tot_len;
+	auto int rc;
+	auto size_t wroffs;
+
+	// Check for NULL pointers
+   if (!cert)
+    	return -EINVAL;
+
+	cert_len = SSL_get_cert_len(cert, N);
+	tot_len = SSL_get_store_cert_len(cert, N, NULL);
+	if ((int)cert_len < 0)
+		return (int)cert_len;
+	buf = _sys_malloc(tot_len);
+	if (!buf)
+		return -ENOMEM;
+	rc = SSL_extract_cert(cert, buf + 4, N);
+	if (cert->rsa_key && cert->rsa_key->public.private_key) {
+		*(long __far *)buf = (long)(tot_len-4) | (long)cert_len<<16;
+		_f_memcpy(buf + 4 + cert_len, cert->rsa_key, sizeof(*cert->rsa_key));
+	}
+	else
+		*(long __far *)buf = (long)(tot_len-4);
+
+	if (rc) {
+		_sys_free(buf);
+		return rc;
+	}
+	cert_len = tot_len - 4;
+   for (wroffs=0; wroffs + sizeof(temp_buf) < cert_len; wroffs += sizeof(temp_buf))
+   {
+      _f_memcpy(temp_buf, buf+wroffs, sizeof(temp_buf));
+      rc = writeUserBlock(offset+wroffs, temp_buf, sizeof(temp_buf));
+      if (rc) {
+			_sys_free(buf);
+			if (rc > 0)
+				return -EBUSY;
+			return rc;
+		}
+   }
+   _f_memcpy(temp_buf, buf+wroffs, sizeof(temp_buf));
+   rc = writeUserBlock(offset+wroffs, temp_buf, cert_len-wroffs);
+   _sys_free(buf);
+   if (rc) {
+      if (rc > 0)
+         return -EBUSY;
+      return rc;
+   }
+   if (next_offs)
+   	*next_offs = offset + tot_len;
+   // Success!
+   return 0;
+}
+
+
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
