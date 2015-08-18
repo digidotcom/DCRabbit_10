@@ -1,6 +1,12 @@
+/*
+   Copyright (c) 2015 Digi International Inc.
+
+   This Source Code Form is subject to the terms of the Mozilla Public
+   License, v. 2.0. If a copy of the MPL was not distributed with this
+   file, You can obtain one at http://mozilla.org/MPL/2.0/.
+*/
 /* START LIBRARY DESCRIPTION *********************************************
 default.h
-	Copyright (c) 2007, Rabbit Semiconductor, Inc.
 
 DESCRIPTION:    Default libraries to be used for the boards. The use
 					statements do not necessarily compile anything, it is just

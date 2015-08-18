@@ -2,8 +2,6 @@
 
      readme.c
 
-     Digi International, Copyright © 2008.  All rights reserved.
-
      Here's the location of the RabbitNet board specific sample programs
      that are available to run on the BLxS2xx SBC board:
 

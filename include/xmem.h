@@ -1,3 +1,10 @@
+/*
+   Copyright (c) 2015 Digi International Inc.
+
+   This Source Code Form is subject to the terms of the Mozilla Public
+   License, v. 2.0. If a copy of the MPL was not distributed with this
+   file, You can obtain one at http://mozilla.org/MPL/2.0/.
+*/
 // A macro to be used in assembler code.  On entry, AHL contains
 // linear 24-bit address.  Converts this to segmented form
 // with XPC value in JK, and logical part in HL (in range 0xE000-0xEFFF).
