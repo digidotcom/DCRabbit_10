@@ -1,0 +1,175 @@
+/*
+ *  Copyright (c) 1996-2007 Digi International Inc., All Rights Reserved
+ *
+ *  This software contains proprietary and confidential information of Digi
+ *  International Inc.  By accepting transfer of this copy, Recipient agrees
+ *  to retain this software in confidence, to prevent disclosure to others,
+ *  and to make no use of this software other than that for which it was
+ *  delivered.  This is an unpublished copyrighted work of Digi International
+ *  Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+ *  prohibited.
+ *
+ *  Restricted Rights Legend
+ *
+ *  Use, duplication, or disclosure by the Government is subject to
+ *  restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+ *  Technical Data and Computer Software clause at DFARS 252.227-7031 or
+ *  subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+ *  Restricted Rights at 48 CFR 52.227-19, as applicable.
+ *
+ *  Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+ *
+ *
+ * USB.lib - This is a front-end for the Rabbit6000 version of the USB
+ *           driver.  It basically includes other libraries which
+ *           are required, including malloc, pool, ucos and possibly FAT.
+ *
+ *    Most applications should only need to #use this library after defining
+ *    the macros below.  No other USB libraries need to be explicitly
+ *    included for basic USB support.
+ *
+ * MACROS:
+ *   Define one or more of the following macros in order to incorporate
+ *   library support for the specified USB device(s)
+ *     USB_USE_MASS_STORAGE - mass storage devices.  Will automatically
+ *                            include FAT16.LIB.
+ *     USB_USE_MOUSE        - Generic mouse support
+ *
+ *     USB_NO_UCOS_DEFINES  - override the default UC/OS-II macro definitions
+ *                            in this library.  If this is required, use the
+ *                            definitions herein as a basis for your
+ *                            application's UC/OS-II configuration, since
+ *                            the USB libraries have some definite requirements.
+ *                            Defining this macro also removes the automatic
+ *                            #use of "ucos.lib", so you need to put it in
+ *                            your application code.
+ *
+ * Revision History:
+ *         Date           Author    Description
+ *         Aug. 26, 2009  SJH       Created.
+ *************************************************************************/
+
+
+/*** BeginHeader _usb_init */
+#ifndef __USB_INCL__
+#define __USB_INCL__
+
+#ifdef USB_DEBUG
+	#define _usb_debug __debug
+#else
+	#define _usb_debug __nodebug
+#endif
+
+#ifndef MALLOC_H_Incl
+#use "malloc.lib"
+#endif
+#use "pool.lib"
+
+
+#ifndef USB_NO_UCOS_DEFINES
+	// Redefine uC/OS-II configuration constants as necessary
+	#define OS_MUTEX_EN            1    // Enable mutexes
+	#define OS_SEM_EN              1    // Enable semaphores
+	#define OS_TIME_DLY_HMSM_EN    1    // Enable hour, min, sec, ms delays
+	#define OS_TASK_SUSPEND_EN     1    // Enable task ssuspension
+
+	#define TASK_STK_SIZE       4096    // Size of each task's stacks (# of bytes)
+	#define STACK_CNT_1K           0
+	#define STACK_CNT_2K           0
+	#define STACK_CNT_4K           5
+	#define STACK_CNT_256          1
+	#define STACK_CNT_512          0    // number of 512 byte stacks (application tasks + stat task + prog stacks)
+	#define OS_MAX_EVENTS         12    // Maximum number of events (semaphores, queues, mailboxes)
+	#define OS_MAX_TASKS           8    // Maximum number of tasks system can create (less stat and idle tasks)
+	#define OS_SEM_QUERY_EN        1
+	#define OS_SEM_DEL_EN          1
+	#define OS_FLAG_EN             1
+
+
+	// Bring in libraries
+	#use "ucos2.lib"
+#endif
+
+#ifdef USB_USE_MASS_STORAGE
+	// Must use mutexes to multitask with FAT,
+	//  and must use blocking mode
+	#define FAT_USE_UCOS_MUTEX
+	#define FAT_BLOCK
+	#use "fat16.lib"
+	#ifndef FAT_VERSION
+	  #error "USB mass storage library requires FAT16"
+	#endif
+#endif
+
+
+// Interim error exit codes
+#define USB_SEMAPHORE_ERROR 333
+#define  USB_SEMAPHORE_TIMEOUT 500
+
+
+#use "R6USB_HW.LIB"
+#use "USBHOSTAPI.LIB"
+#use "USB_OHCI_DEFS.LIB"
+#use "USBOHCI.LIB"
+
+#ifdef USB_USE_MASS_STORAGE
+	#use "USB_FAT.LIB"
+	#use "usbMassStorage.LIB"
+#endif
+
+#ifdef USB_USE_MOUSE
+	#use "usbMouse.LIB"
+#endif
+
+#ifdef USB_USE_CAMERA
+	#use "usbCamera.LIB"
+#endif
+
+#endif
+void _usb_init(void);
+
+/*** EndHeader */
+
+// Generic initializer, which should be called from each device init
+// function.  It is idempotent.
+// An alternative is to have a "highest" priority task do the initialization,
+// which then suspends itself indefinitely after completion, allowing all
+// dependent tasks to then assume that initialization is complete.  This
+// function, however, does the same job without requiring a throw-away task.
+
+int _usb_init_started;
+int _usb_init_complete;
+
+_usb_debug
+void _usb_init(void)
+{
+	auto int start_init, err;
+	#GLOBAL_INIT { _usb_init_started = 0; _usb_init_complete = 0; }
+
+	#asm
+	clr	hl
+	ld	(sp+@sp+start_init),hl
+	ld	hl,_usb_init_started
+	bit 0,(hl)
+	set 0,(hl)	// test and set
+	jr nz,.skip
+	ld	(sp+@sp+start_init),hl	// HL contains a non-zero value
+.skip:
+	#endasm
+	if (start_init) {
+		// This task is responsible for initialization of the main USB stack
+	   usb_host_init(256, 0, &err);
+	   usb_host_start(&err);
+	   _usb_init_complete = 1;
+	}
+	else {
+		// Otherwise, check if initialization completed
+		while (!_usb_init_complete) {
+	      // Waiting for another task to complete initialization.  Simplest to
+	      // just yield for a while to allow completion.
+	      OSTimeDlyHMSM(0,0,0,50);
+	   }
+	}
+}
+
+

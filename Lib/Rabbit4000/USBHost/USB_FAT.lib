@@ -1,0 +1,538 @@
+/*** BeginHeader */
+#ifndef __USB_FAT_LIB
+#define __USB_FAT_LIB
+
+/*** EndHeader */
+
+/************************************************************************
+usb_fat.lib
+Copyright Rabbit Semconductor 2009
+
+mid-level FAT driver for OCHI mass storage
+
+Quick & Dirty implementation using SD card mid-level drivers
+as template. NOT READY FOR PRIME_TIME! But it works well enough
+for R6000 verification.
+
+
+Filesystem specific functions for USB mass storage card devices.
+Used as a device driver with the FAT filesystem module.
+
+The only function that will need to be called directly is usbms_InitDriver()
+
+*************************************************************************/
+
+/*** BeginHeader */
+
+typedef struct usbms_device_st
+{
+   struct usbms_device_st *next;  // next element in linked list
+   long sectors;               // # of usable 512 byte sectors on the card
+   int write_state;            // state for write timeout (used by FAT)
+   unsigned long write_sector; // current sector being written (used by FAT)
+//   char *bptr;                 // pointer to current write source buffer
+} usbms_device;
+
+
+#ifndef FAT_BLOCK
+ #define USBMS_NON_BLOCK
+#endif
+
+#use "part_defs.lib"
+
+#ifdef USBFAT_DEBUG
+#define _usbmsfat_debug
+#else
+#define _usbmsfat_debug __nodebug
+#endif
+
+#define USBMS_MAX_DEVS 1
+
+#ifndef MBR_DRIVER_INIT
+#define MBR_DRIVER_INIT usb_InitDriver(root_driver, NULL)
+#define MBR_SIG "USBFLASH-1"
+#endif
+
+
+/*** EndHeader */
+
+/*** BeginHeader usbms_getDevice */
+usbms_device *usbms_getDevice(usbms_device *head, int index);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+usbms_getDevice                 <USB_FAT.LIB>
+
+SYNTAX: int usbms_getDevice(usbms_device *head, int index);
+
+DESCRIPTION:   Helper function. Walks a linked list of usbms_device structures,
+					to retrieve the one at position 'index'
+
+PARAMETER1:		head - first usbms_device structure in linked list
+PARAMETER2:    devnum - device number (index) of the desired
+                         usbms_device structure
+
+RETURN VALUE:  address of usbms_device struct in list or NULL if
+					end of list is reached.
+
+END DESCRIPTION **********************************************************/
+
+_usbmsfat_debug
+usbms_device *usbms_getDevice(usbms_device *head, int devnum)
+{
+	auto int i;
+   auto usbms_device *element;
+
+   element = head;
+   for(i = 0;i < devnum;i++)
+   {
+   	if(element->next)
+      {
+      	element = element->next;
+      }
+      else
+      {
+      	return (usbms_device *)NULL;
+      }
+   }
+   return element;
+}
+
+/*** BeginHeader usbms_EnumDevice */
+int usbms_EnumDevice(mbr_drvr *driver, mbr_dev *dev, int devnum);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+usbms_EnumDevice                <USB_FAT.LIB>
+
+SYNTAX: int usb_EnumDevice(mbr_drvr *driver, mbr_dev *dev, int devnum);
+
+DESCRIPTION:   Callback used by FAT filesystem code to initialize the
+					storage device
+
+PARAMETER1:		driver - pointer to the device controller handle
+PARAMETER2:    dev - pointer to a device structure that will be filled in
+PARAMETER3:		the number of the device that is being initialized
+
+
+RETURN VALUE:  returns 0 on success,
+                 -EIO          I/O Error
+                 -ENODEV if device doesn't exist or not initialized
+                 -ENOMEDIUM if the device has been removed
+                 -ESHAREDBUSY  SPI port busy
+
+END DESCRIPTION **********************************************************/
+
+_usbmsfat_debug
+int usbms_EnumDevice(mbr_drvr *driver, mbr_dev *device,int devnum)
+{
+	auto unsigned long sectors, sectors_per_track;
+   auto unsigned int tracks, base_size, sector_size;
+   auto int rc, status;
+   usbms_device *dev;
+
+   dev = usbms_getDevice( (usbms_device *)(driver->dev_struct), devnum);
+
+   if(!dev)
+   {
+   	return -ENODEV;     // Device doesn't exist or not initialized
+   }
+//   if (!USB_cardDetect(dev)) {
+//      return -ENOMEDIUM;      // Device has been removed
+//   }
+
+   if (!dev->sectors) {   // Re-initialize the card if it has been unmounted
+//	   if ((rc = sdspi_init_card(dev)) == -EIO) {
+//	      rc = sdspi_init_card(dev);
+//	   }
+   }
+
+   sectors_per_track = dev->sectors;   // Start with 1 track
+   tracks = 1;
+   while(sectors_per_track > 0xFFFF)
+   {
+   	sectors_per_track /= 2;          // And adjust till balance found
+      tracks *= 2;
+   }
+
+   //fill in device structure
+	device->cylinder = tracks;               // Save computed track & SPT
+   device->sec_track = (unsigned int)sectors_per_track;
+   device->seccount = dev->sectors;         // Number of usable sectors
+   device->heads = 1;
+   device->byte_sec = 512;                  // Sectors are always 512 bytes
+   device->byte_page = 512; //dev->pagesize & 0xff00; // Size on 256 byte boundary
+   device->driver = driver;
+   device->dev_num = devnum;
+
+#ifdef USBMSFLASH_VERBOSE
+   printf("Device %d Enumerated\n", devnum);
+   //usbms_print_dev(dev);
+#endif
+
+   return 0;
+}
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+usbms_InitDriver               <USB_FAT.LIB>
+
+SYNTAX: int usbms_InitDriver(mbr_drvr *driver, void *device_list);
+
+DESCRIPTION:   Initializes the serial flash controller.
+
+PARAMETER1:		driver - empty mbr_drvr structure. It must be initialized
+						with this function before it can be used with the FAT
+                  filesystem.
+PARAMETER2:    device_list - if this argument is NULL, then a single device
+						will be initialized using usbms_init(). Otherwise it must point
+                  to a linked list of usbms_device structures for flash devices
+                  that have already been initialized.
+
+RETURN VALUE:  returns 0 on succesful initialization,
+                 -EIO if a device I/O error occured
+                 -EINVAL if an invalid parameter was given
+                 -ENODEV if device doesn't exist or not initialized
+                 -ENOMEDIUM if the device has been removed
+                 -EBUSY if a write is in progress
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader usbms_InitDriver */
+
+__root int usbms_InitDriver(mbr_drvr *driver, void *device_list);
+
+/*** EndHeader */
+
+
+_usbmsfat_debug
+__root int usbms_InitDriver(mbr_drvr *driver, void *device_list)
+{
+   int rc;
+
+   /* pointer to function able to identify the devices */
+	driver->xxx_EnumDevice = usbms_EnumDevice;
+	/* pointer to function able to read a sector */
+	driver->xxx_ReadSector = usbms_ReadSector;
+	/* pointer to function able to write a sector */
+	driver->xxx_WriteSector = usbms_WriteSector;
+	/* pointer to function able to physically format a cylinder */
+	driver->xxx_FormatCylinder = NULL;
+	/* pointer to function for returning status of a device */
+	driver->xxx_InformStatus = usbms_InformStatus;
+
+   //setup other parameters in driver struct
+ 	driver->ndev = 0;
+   driver->maxdev = 1;
+   driver->dlist = NULL;
+   driver->next = NULL;
+   driver->type[0] = 0x80;
+  	driver->dev_struct = &USBMS[0];
+//   if(device_list == NULL)
+   {
+	  USBMS[0].write_state = 0;
+
+#ifdef USBMSFLASH_VERBOSE
+ //    	printf("ERROR: usbms_InitDriver: (%d)\n", rc);
+#endif
+
+      return usbms_initDev(&USBMS[0]);
+   }
+//   else
+   {
+//   	driver->dev_struct = device_list;
+//      return 0; // must be initialized beforehand
+   }
+}
+
+/*** BeginHeader usbms_ReadSector */
+int usbms_ReadSector(unsigned long sector,
+					   __far char *buffer,
+                  __far char *spare,
+    					mbr_dev *device);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+usbms_ReadSector                <USB_FAT.LIB>
+
+SYNTAX: int usbms_ReadSector(unsigned long sector,
+							     far char *buffer,
+                          far char *spare,
+                          mbr_dev *device);
+
+DESCRIPTION:   Callback used by FAT filesystem code.
+					Reads out a sector from the device.
+
+PARAMETER1:		sector - the sector to read.  (512 bytes)
+PARAMETER2:    buffer - a buffer in far memory to read the data into
+PARAMETER3:		spare  - dummy parameter for API consistency - not used
+PARAMETER4:		device - mbr_dev structure for the device being read
+
+
+RETURN VALUE:  returns 0 on success, or a FAT filesystem error code
+
+                 -EIO if a device I/O error occured
+                 -ENODEV if device doesn't exist or not initialized
+                 -ENOMEDIUM if the device has been removed
+                 -EBUSY if a write is in progress
+END DESCRIPTION **********************************************************/
+
+_usbmsfat_debug
+int usbms_ReadSector(unsigned long sector,
+         				__far char *buffer,
+                     __far char *spare,
+    					   mbr_dev *device)
+{
+   auto usbms_device *dev;
+   int rc;
+
+   dev = usbms_getDevice( (usbms_device *)(device->driver->dev_struct),
+   						 	device->dev_num );
+   if(!dev) {
+   	return -ENODEV;     // Device doesn't exist or not initialized
+   }
+//   if (!SD_cardDetect(dev)) {
+//      return -ENOMEDIUM;      // Device has been removed
+//   }
+
+	//block if previous write operation has not completed
+   if(dev->write_state)
+   {
+   	rc = usbms_WriteContinue(dev);
+      if (rc) {
+#ifdef USBMSFLASH_VERBOSE
+         if (rc != -EBUSY) {
+          	printf("ERROR: usbms_writeContinue: (%d)\n", rc);
+         }
+#endif
+         return rc;
+      }
+   }
+
+   // Auto retry read calls once if an I/O error is received
+   if ((rc = usbms_read_sector(dev, sector, buffer)) == -EIO) {
+      rc = usbms_read_sector(dev, sector, buffer);
+   }
+#ifdef USBMSLASH_VERBOSE
+   printf("Read Sector %08lx\n", sector);
+#endif
+
+   if (rc) {
+#ifdef USBMSFLASH_VERBOSE
+   	printf("ERROR: usbms_readSector (%d)\n", rc);
+#endif
+   }
+
+	return rc;
+}
+
+/*** BeginHeader usbms_WriteContinue */
+int usbms_WriteContinue(usbms_device *device);
+
+/* _START FUNCTION DESCRIPTION ********************************************
+usbms_WriteContinue                <USB_FAT.LIB>
+
+SYNTAX: int usbms_WriteContinue(usbms_device *device);
+
+DESCRIPTION:   Checks current progress of a sector write operation, and
+					begins the next write if necessary for a multi-page write
+               operation.
+
+PARAMETER1:		device - mbr_dev structure for the device
+
+RETURN VALUE:  returns 0 if there is no pending write activity,
+							 -EBUSY if a write is still in progress
+                      -EIO if a device error occured
+
+END DESCRIPTION **********************************************************/
+
+/*** EndHeader */
+
+_usbmsfat_debug
+int usbms_WriteContinue(usbms_device *device)
+{
+    int count, result, status;
+
+
+    while(device->write_state == 1);
+
+    result = 0;
+/*
+
+    // Wait for write operation to complete
+    if (sdspi_notbusy(sd->port)) {
+       sd->write_state = 0;
+
+       // Check status response from SD card
+       result = sdspi_get_status_reg(sd, &status);
+       if (!result && status) {
+#ifdef SDFLASH_VERBOSE
+          printf("sdspi_writeContinue: Write operation failed (%04x).\n",
+                            status);
+#endif
+          result = -EIO;
+       }
+    }
+    else {  // SD card still busy, increment write_state as timeout
+       if (++sd->write_state > BUSY_RETRIES) {
+	    SD_DISABLECS(sd->SDintf);
+       sd->write_state = 0;
+	    _SPIfreeSemaphore(SPI_SD);
+#ifdef SDFLASH_VERBOSE
+          printf("sdspi_writeContinue: Write busy timeout.\n");
+#endif
+          result = -EIO;
+       }
+       else {
+          result = -EBUSY;
+       }
+    }
+*/
+    return result;
+}
+
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+usbms_WriteSector                <USB_FAT.LIB>
+
+SYNTAX: int usbms_WriteSector(unsigned long sector,
+							     far char *buffer,
+                          far char *spare,
+                          mbr_dev *device)
+
+DESCRIPTION:   Callback used by FAT filesystem code.
+					Writes to a sector on the specified device
+
+PARAMETER1:		sector - the sector to write to.  (512 bytes)
+PARAMETER2:    buffer - a buffer in far memory to write the data from.
+PARAMETER3:		spare  - dummy parameter for API consistency - not used
+PARAMETER4:		device - mbr_dev structure for the device being written to
+
+RETURN VALUE:  returns 0 on success, or a FAT filesystem error code
+
+                 -EIO if a device I/O error occured
+                 -EINVAL if an invalid parameter was given
+                 -ENODEV if device doesn't exist or not initialized
+                 -ENOMEDIUM if the device has been removed
+                 -EACCES if the card is locked/write protected
+                 -EBUSY if a write is in progress
+END DESCRIPTION **********************************************************/
+/*** BeginHeader usbms_WriteSector  */
+int usbms_WriteSector(unsigned long sector,
+						__far char *buffer,
+                  __far char *spare,
+                  mbr_dev *device);
+/*** EndHeader */
+
+_usbmsfat_debug
+int usbms_WriteSector( unsigned long sector,
+ 						     __far char *buffer,
+                       __far char *spare,
+                  	  mbr_dev *device )
+{
+   static usbms_device *dev;
+   static int rc;
+
+   dev = usbms_getDevice( (usbms_device *)(device->driver->dev_struct),
+   							device->dev_num);
+   if(!dev) {
+   	return -ENODEV;     // Device doesn't exist or not initialized
+   }
+//   if (!USBMS_Detect(dev)) {
+//      return -ENOMEDIUM;    // Device has been removed
+//   }
+
+#ifdef USBMS_NON_BLOCK
+	//Finish previous write operation if it has not completed
+   if(dev->write_state)
+   {
+   	rc = usbms_WriteContinue(dev);
+   }
+   else {  // Otherwise, start new write to device
+#endif
+	   rc = 0;
+	   dev->write_sector  = sector;
+	   dev->write_state = 1;
+
+#ifdef USBMSFLASH_VERBOSE
+   	printf("Write sector %08lx\n", sector);
+#endif
+	   rc = usbms_write_sector(dev, dev->write_sector, buffer);
+#ifdef USBMS_NON_BLOCK
+	}
+   if (rc == -EBUSY) return -EBUSY;
+#endif
+
+   if (rc) {
+#ifdef USBMSFLASH_VERBOSE
+   	printf("ERROR: usbms_writeSector (%d)\n", rc);
+#endif
+   }
+
+   dev->write_state = 0;  // reset the write state
+   return rc;
+}
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+usbms_InformStatus                <USB_FAT.LIB>
+
+SYNTAX: int usbms_InformStatus(mbr_dev *device, int status)
+
+DESCRIPTION:   Callback used by FAT filesystem code
+
+PARAMETER1:		device - mbr_dev structure for the device
+PARAMETER2:		status - device status passed to driver from filesystem.
+							    0 = No change in status
+                         1 = Unmounted - device has been unmounted
+
+RETURN VALUE:  returns 0 if there is no pending write activity,
+
+                 -EIO if a device I/O error occured
+                 -ENODEV if device doesn't exist or not initialized
+                 -ENOMEDIUM if the device has been removed
+                 -EBUSY if a write is in progress
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader usbms_InformStatus */
+int usbms_InformStatus(mbr_dev *device, int status);
+/*** EndHeader */
+
+_usbmsfat_debug
+int usbms_InformStatus(mbr_dev *device, int status)
+{
+	auto usbms_device *dev;
+   auto int rc;
+
+   dev = usbms_getDevice( (usbms_device *)(device->driver->dev_struct),
+   							device->dev_num);
+   if(!dev)
+   {
+   	return -ENODEV;
+   }
+
+   // Check if device has been removed
+//   if (!SD_cardDetect(dev)) {
+//      sdspi_setLED(dev, 0);  // Turn off LED if no card in socket
+//      return -ENOMEDIUM;     // Return SD card not present error
+//   }
+
+	if(dev->write_state)
+   {
+      rc = usbms_WriteContinue(dev);
+     	return rc;
+   }
+   else
+   {
+		return 0;
+   }
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+
+
+

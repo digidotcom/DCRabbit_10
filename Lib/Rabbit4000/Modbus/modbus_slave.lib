@@ -1,0 +1,824 @@
+/* START LIBRARY DESCRIPTION *********************************************
+
+Copyright RabbitSemiconductor November 2005
+
+Modbus_slave.LIB		Version 1.02
+
+Modifications: - most reccent at top
+JLC	1.02 July 2006	fixed bug in mbsWriteRegs to correct byte order
+							fixed bug that accessed byte instead of word
+JLC	1.01 June 2006	added MODBUS_CRC
+
+		Copyright (c) 2005 	RabbitSemiconductor, Inc
+		Copyright (c) 2002 	IAS, Inc.
+		Copyright (c) 2000 	Z-World, Inc.
+		Copyright (c) 1997  	CFControls.
+
+DESCRIPTION:	Dynamic C MODBus Slave functions.
+The functions in this library are not dependant on the physical media which is
+being used for ModBus communications.
+
+None of the functions in this library are meant to be accessed directly by the
+user program.
+
+The following functions MUST be defined in the user program or board-specific
+library:
+
+mbsStart ( void )	pre-process the packet - usually a null function
+mbsDone ( void )	post-process the packet - usually a null function
+
+			Single bit access
+mbsDigOutRd	( CoilNbr, *nState )		command 0x01 = Read Coil Status
+mbsDigIn		( InputNbr, *nState ) 	command 0x02 =	Read Input Status
+mbsDigOut	( wCoil, wData )	  		command 0x05 = Write Single Coil
+
+			16 bit access
+mbsRegOutRd	( RegNbr, *wData ) 		command 0x03 =	Read Holding Registers
+mbsRegIn		( RegNbr, *wData )		command 0x04 =	Read Input Registers
+mbsRegOut	( wAddr, wData )	  		command 0x06 =	Write Single Register
+
+command 0x0F =	Write Multiple Coils				uses mbsDigOut
+command 0x10 =	Write Multiple Registers		uses mbsRegOut
+command 0x16 =	Mask Write Register				uses mbsRegOut and mbsRegOutRd
+command 0x17 =	Read/Write Multiple Registers	uses mbsRegOut and mbsRegIn
+
+
+      Release History.
+==========================================================================
+Date		Ver		History
+Nov 2005	1			initial port from IAS Inc.
+
+==========================================================================
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader */
+#ifndef __MBSLAVE
+#define __MBSLAVE
+
+#ifndef MY_MODBUS_ADDRESS
+#define MY_MODBUS_ADDRESS 0
+#endif
+
+//	Supported MODBus Exceptions
+#define 	MB_SUCCESS		0			// success
+#define	MB_BADFUNC		0x01		//	Illegal Function
+#define	MB_BADADDR		0x02		//	Illegal Data Address
+#define	MB_BADDATA		0x03		//	Illegal Data Value
+#define	MB_SLAVEFAILURE 0x04		// Slave Device Failure
+#define	MB_BUSY			0x06		//	Target is busy with another request
+#define	MB_NORESP		0x0B		//	No response from target
+#define	MB_DEVNOTSET	0x10		// device not properly set up
+#define	MB_TIMEOUT		-1
+#define	MB_CRC_ERROR		-5
+/*** EndHeader */
+
+
+/*** BeginHeader wMSCmd, MODBUS_flags0 */
+
+unsigned _mbsCmdWord		( unsigned wOff );
+int		_mbsReplyByte	( char cByte );
+int		_mbsReplyWord	( unsigned wWord );
+void		_mbsReplyInit	( unsigned wCmd );
+int		_mbsReplyErr		( unsigned wCode );
+void		_mbsError			( void );
+
+extern char				*pcMSCmd, *pcMSReply;
+extern char				acMSCmd[256], acMSReply[256];
+extern unsigned 		wMSCmd;				//	Command Opcode
+extern unsigned		MODBUS_flags0; 	// special flags
+
+#ifndef MODBUS_SLAVE_DEBUG
+#define MODBUS_SLAVE_DEBUG __nodebug
+#endif
+
+#ifndef MODBUS_SLAVE_DEBUG_PRINT
+#define MODBUS_SLAVE_DEBUG_PRINT 0
+#endif
+
+/*** EndHeader */
+
+unsigned	wMSCmd;
+unsigned MODBUS_flags0;
+
+char		acMSCmd[256];			//	Command Buffer
+char		*pcMSReply;				//	Reply Pointer
+char		acMSReply[256];		//	Reply Buffer
+
+
+/************************************************************************/
+/********************** Utility Functions *******************************/
+/************************************************************************/
+
+
+/*=======================================================================*\
+	Extract Word (MSB First) from Command Body
+
+	Parameter 1:	byte offset into acMSCmd for MSByte of word - the value
+   					is Big Endian - most significant byte is at the lowest
+                  address
+	return value:	unsigned word value
+\*=======================================================================*/
+MODBUS_SLAVE_DEBUG
+unsigned _mbsCmdWord ( unsigned wOff )
+{	unsigned CommandWord;
+	CommandWord = (acMSCmd[wOff] << 8) & 0xFF00;
+	CommandWord |= acMSCmd[wOff + 1];
+	return CommandWord;
+}
+
+
+/*=======================================================================*\
+	Add Byte to Reply Body
+
+   Parameter 1: byte to store at *pcMSReply (pointing to acMSReply)
+   pcMSReply is  updated
+   return value:
+   		1 = pcMSReply pointing beyond acMSReply array
+         0 = success
+\*=======================================================================*/
+MODBUS_SLAVE_DEBUG
+int _mbsReplyByte (char cByte)
+{
+	if ( pcMSReply > &acMSReply[sizeof(acMSReply) - 1] )
+	{
+		return 1;
+	}
+	*pcMSReply++ = cByte;					// store the byte
+	return MB_SUCCESS;
+}
+
+
+/*=======================================================================*\
+	Add Word to Reply (MSB First)
+
+   parameter 1: word to store, MSB 1st, at *pcMSReply (pointing to acMSReply)
+   pcMSReply is  updated
+   return value:
+   		1 = pcMSReply pointing beyond acMSReply array
+         0 = success
+\*=======================================================================*/
+MODBUS_SLAVE_DEBUG
+int _mbsReplyWord(unsigned wWord)
+{
+	return _mbsReplyByte(wWord >> 8)  ||  _mbsReplyByte(wWord);
+}
+
+
+/*=======================================================================*\
+	Start New Reply
+
+   Parameter 1: command byte
+   Initialize pcMSReply to point to start of acMSReply
+   Store slave address and command into message
+
+\*=======================================================================*/
+MODBUS_SLAVE_DEBUG
+void _mbsReplyInit(unsigned wCmd)
+{
+	pcMSReply = acMSReply;					//	Reset Reply Pointer
+	_mbsReplyByte ( MY_MODBUS_ADDRESS ); //	insert Slave Address
+	_mbsReplyByte ( wCmd );					//		and Command Opcode
+}
+
+
+/*=======================================================================*\
+	Compose Exception Reply
+
+   Parameter 1: error code
+	Return value: error code
+   Start new message with command code and error code in header
+\*=======================================================================*/
+MODBUS_SLAVE_DEBUG
+int _mbsReplyErr(unsigned wCode)
+{	_mbsReplyInit ( 0x80|wMSCmd );		//	Start Reply (Set Error Flag)
+	_mbsReplyByte ( wCode );				//	Error Code
+	return wCode;
+}
+
+
+/*=======================================================================*\
+ Handle Error (Reset Packet Processing)
+\*=======================================================================*/
+MODBUS_SLAVE_DEBUG
+void _mbsError ( void )
+{
+}
+
+
+/*** BeginHeader msExec */
+void  msExec ( void );
+/*** EndHeader */
+
+/*=======================================================================*\
+	msExec: Process & Execute Command
+   MODBUS_TCP_tick => ms_Handler => mbPkt => msExec
+
+This function acts as a dispatcher for the ModBus function.  It uses the
+function code to determine which ModBus function to execute.  This local
+function then parses the remaining data to determine the parameters to send
+to the appropriate function in the board-specific ModBus library.
+
+Enter with:
+	acMSCmd = the entire ModBus PDU:
+		byte 0 = ModBus address
+   	byte 1 = function code
+      bytes 2..n = data
+      bytes n+1, n+2 = CRC (serial only)
+
+   return value: none
+
+   Supported MODBUS commands
+		0x01	Read Coil Status						 1 bit
+      0x02	Read Input Status						 1 bit
+      0x03	Read Holding Registers				16 bits
+      0x04	Read Input Registers			  		16 bits
+      0x05	Write Single Coil						 1 bit
+      0x06	Write Single Register				16 bits
+		0x0F	Write Multiple Coils					 1 bit
+      0x10	Write Multiple Registers			16 bits
+      0x16	Mask Write Register					16 bits
+      0x17	Read/Write Multiple Registers		16 bits
+
+      For 16 bit ( 2 byte ) data, the MSByte is first ( Big Endian ).
+
+NOTE: the calling function must calculate the CRC if required.  The number
+of bytes as well as the data to be used is based on the "current" value
+of pcMSReply and the reply in acMSReply:
+		CRCvalue = getcrc ( acMSReply, pcMSReply-acMSReply, 0xFFFF );
+      _mbsReplyWord (CRCvalue); // append the CRC
+
+\*=======================================================================*/
+MODBUS_SLAVE_DEBUG
+void msExec ( void )
+{
+	auto int nErr;
+
+	wMSCmd = acMSCmd[1];						//	Extract Command Opcode
+	mbsStart ();								//	Start Packet Processing
+	_mbsReplyInit ( wMSCmd );				//	new reply: insert 1st 2 bytes
+	switch ( wMSCmd ) {						//	Dispatch Handler
+		case	0x01	:							//	Read Coil Status
+			nErr = mbsCoilRd ( mbsDigOutRd );
+			break;
+		case	0x02	:							//	Read Input Status
+			nErr = mbsCoilRd ( mbsDigIn );
+			break;
+		case	0x03	:							//	Read Holding Registers
+			nErr = mbsRegRd ( mbsRegOutRd );
+			break;
+		case	0x04	:							//	Read Input Registers
+			nErr = mbsRegRd ( mbsRegIn );
+			break;
+		case	0x05	:							//	Write Single Coil
+			nErr = mbsForceCoil ();
+			break;
+		case	0x06	:							//	Write Single Register
+			nErr = mbsWriteReg ();
+			break;
+		case	0x0F	:							//	Write Multiple Coils
+			nErr = mbsForceCoils ();
+			break;
+		case	0x10	:							//	Write Multiple Registers
+			nErr = mbsWriteRegs ();
+			break;
+		case	0x16	:							//	Mask Write Register
+			nErr = mbsRegMask ();
+			break;
+		case	0x17	:							//	Read/Write Multiple Registers
+			nErr = mbsRegRdWr ();
+			break;
+
+		// the following are not currently supported by this module
+		case	0x07	:							//	Read Exception Status
+		case	0x08	:							//	Diagnostics
+		case	0x0B	:							//	Fetch Comm Event Counter
+		case	0x0C	:							//	Fetch Comm Event Log
+		case	0x11	:							//	Report Slave ID
+		case	0x14	:							//	Read General Reference
+		case	0x15	:							//	Write General Reference
+		case	0x18	:							//	Read FIFO Queue
+		default		:							//	All Non-MODBus Opcodes
+			nErr = MB_BADFUNC;
+         break;
+	}
+	mbsDone ();									// Packet Processing Done
+	if (nErr != MB_SUCCESS)
+	{
+		_mbsReplyErr ( nErr );
+	}
+	return;
+} // msExec
+
+
+
+/************************************************************************/
+/*************************************************************************
+The following utilities call the user defined functions required by the
+specific ModBus command.
+*************************************************************************/
+/************************************************************************/
+
+
+/*=======================================================================*\
+	Read Individual Coils: Output [0x01] or Input [0x02]
+
+   Parameter 1: address of user function msOutRd or msIn,
+	Requires:
+  		acMSCmd[2,3] = starting coil number
+      acMSCmd[4,5] = coil count
+      wMSCmd = current command
+   return value:
+      MB_SUCCESS = success (even if user function fails!)
+   Reply message
+		[0] = slave address
+   	[1] = function code [0x01] or [0x02]
+      [2] = byte count = nbr of data bytes with 8 coils per byte
+      [3..n] = data bytes (2 per register) - high byte first
+\*=======================================================================*/
+
+/*** BeginHeader mbsCoilRd */
+int mbsCoilRd(int (*pxRd)());
+/*** EndHeader */
+
+MODBUS_SLAVE_DEBUG
+int mbsCoilRd (int (*pxRd)())
+{
+	auto unsigned CoilNbr, CoilCnt;
+	auto int nState, nErr;
+	auto char cAcc, cMask;
+
+	CoilNbr = _mbsCmdWord(2);				//	Starting coil nbr
+	CoilCnt = _mbsCmdWord(4);				//	Count
+	_mbsReplyByte( (CoilCnt + 7) >> 3 ); // calculate and insert Byte Count
+
+	while (CoilCnt) {							// for each coil/input bit
+		cAcc = 0;								// initialize return value
+		for (cMask = 0x01; cMask && CoilCnt; cMask <<= 1, CoilCnt--) {
+			nErr = pxRd (CoilNbr++, &nState); // get state of one coil
+			if (nErr != MB_SUCCESS)
+			{
+				return nErr;
+			}
+			if (nState)
+			{
+				cAcc |= cMask;		// insert state value if state == 1
+			}
+		}
+		_mbsReplyByte(cAcc);					//	add coil states to reply packet
+	}
+	return MB_SUCCESS;						//	Success
+} // mbsCoilRd
+
+
+/*=======================================================================*\
+	Read 8 bit Registers: Input [0x04], [0x17] or Holding [0x03]
+
+   Parameter 1: address of user function msRead or msInput
+  		acMSCmd[2,3] = starting register number
+      acMSCmd[4,5] = register count
+   return value:
+      MB_SUCCESS = success
+   Reply message
+		[0] = slave address
+   	[1] = function code [0x03], [0x04] or [0x17]
+      [2] = byte count = register count * 2
+      		each register, although only 8 bits each, occupies 2 bytes in
+            the response
+      [3..n] = data bytes (2 per register) - high byte first
+\*=======================================================================*/
+
+/*** BeginHeader mbsRegRd */
+int mbsRegRd(int (*pxRd)());
+/*** EndHeader */
+
+MODBUS_SLAVE_DEBUG
+int mbsRegRd(int (*pxRd)())
+{
+	auto unsigned RegNbr, RegCnt, wData;
+	auto int nErr;
+
+	RegNbr = _mbsCmdWord(2);				//	Starting register nbr
+	RegCnt = _mbsCmdWord(4);				//	Count
+	_mbsReplyByte( 2 * RegCnt );			//	calculate and insert Byte Count
+
+	while (RegCnt--)						//	for each requested Register
+	{
+		nErr = pxRd(RegNbr++, &wData);	// read it
+		if (nErr != MB_SUCCESS)
+		{
+			return nErr;
+		}
+		_mbsReplyWord(wData);				//	add data to reply packet
+	}
+	return MB_SUCCESS;						//	Success
+} // mbsRegRd
+
+
+/*=======================================================================*\
+	Write Registers (No Reply) ( 0x10 and 0x17 )
+   		acMSCmd[wOff] = starting register number
+         acMSCmd[wOff+2] = register count
+         acMSCmd[wOff+5] = byte value for first register - 2 per register
+\*=======================================================================*/
+
+/*** BeginHeader mbsRegWr */
+mbsRegWr(unsigned wOff);
+/*** EndHeader */
+
+MODBUS_SLAVE_DEBUG
+int mbsRegWr(unsigned wOff)
+{
+	auto unsigned RegNbr, RegCnt;
+	auto int nErr;
+
+	RegNbr = _mbsCmdWord(wOff);			//	starting Register Address
+	RegCnt = _mbsCmdWord(wOff + 2);		//	Register Count
+	wOff += 5;									//	point to first data value
+
+	while (RegCnt--)						//	Write Registers
+	{
+		nErr = mbsRegOut( RegNbr++, _mbsCmdWord(wOff++) );
+		if (nErr != MB_SUCCESS)
+		{
+			return nErr;
+		}
+	}
+	return MB_SUCCESS;
+}
+
+
+/*=======================================================================*\
+	[0x05] Force Single Coil
+  		acMSCmd[2,3] = coil number
+      acMSCmd[4,5] = coil value
+   return value:
+      MB_SUCCESS = success
+   Reply message
+		[0] = slave address
+   	[1] = function code [0x05]
+      [2,3] = coil number
+      [4,5] = coil value
+\*=======================================================================*/
+
+/*** BeginHeader mbsForceCoil */
+int mbsForceCoil	(	void );
+/*** EndHeader */
+
+MODBUS_SLAVE_DEBUG
+int mbsForceCoil ( void )
+{	auto unsigned		wCoil,wData;
+	auto int			nErr;
+
+	nErr = MB_BADDATA;
+	wCoil = _mbsCmdWord ( 2 );				//	get Coil Number
+	wData = _mbsCmdWord ( 4 );				//	and Coil State
+	_mbsReplyWord ( wCoil );				//	save Coil Number
+	_mbsReplyWord ( wData );				//	and Coil State for response
+
+	nErr = mbsDigOut ( wCoil, wData );
+	if (nErr != MB_SUCCESS)
+	{
+		return nErr;
+	}
+	return MB_SUCCESS;						//	Success
+} // mbsForceCoil
+
+
+/*=======================================================================*\
+	[0x06] Write Single Register
+  		acMSCmd[2,3] = Register number
+      acMSCmd[4,5] = Register value
+   return value:
+      MB_SUCCESS = success
+   Reply message
+		[0] = slave address
+   	[1] = function code [0x06]
+      [2,3] = Register number
+      [4,5] = Register value
+\*=======================================================================*/
+
+/*** BeginHeader mbsWriteReg */
+int mbsWriteReg	(	void );
+/*** EndHeader */
+
+MODBUS_SLAVE_DEBUG
+int mbsWriteReg	(	void )
+{	auto unsigned wAddr, wData;
+	auto int	nErr;
+
+	wAddr = _mbsCmdWord ( 2 );				//	get Register Address
+	wData = _mbsCmdWord ( 4 );				//	and Register Value
+	_mbsReplyWord ( wAddr );				//	save Register Address
+	_mbsReplyWord ( wData );				//	and Register Data for response
+
+	nErr = mbsRegOut ( wAddr, wData );	//	Write Register
+	if (nErr != MB_SUCCESS)
+	{
+		return nErr;
+	}
+	return MB_SUCCESS;						//	Success
+}
+
+
+/*=======================================================================*\
+	[0x0F] Force Multiple Coils
+  		acMSCmd[2,3] = starting coil number
+      acMSCmd[4,5] = coil count
+		acMSCmd[6] = byte count = coil count/8 + ( rem(coil count/8) != 0 )
+      acMSCmd[7] = byte value for first 8 coils, bit 0 = 1st coil state
+   return value:
+      MB_SUCCESS = success
+   Reply message
+		[0] = slave address
+   	[1] = function code [0x0F]
+      [2,3] = starting coil number
+      [4,5] = coil count
+\*=======================================================================*/
+
+/*** BeginHeader mbsForceCoils */
+int mbsForceCoils	(	void );
+/*** EndHeader */
+
+MODBUS_SLAVE_DEBUG
+int mbsForceCoils	(	void )
+{
+	auto unsigned CoilNbr, CoilCnt, wState, wBit;
+	auto char *pcState;
+	auto int nErr;
+
+	CoilNbr = _mbsCmdWord ( 2 );			//	get starting Coil Address
+	CoilCnt = _mbsCmdWord ( 4 );			//	and Coil Count
+	pcState = &acMSCmd[7];					//	get address of first data byte
+	_mbsReplyWord ( CoilNbr );				//	save starting Coil number
+	_mbsReplyWord ( CoilCnt );				//	and Coil Count for reply
+
+	while (CoilCnt)
+   {
+		wState = *pcState++;
+		for ( wBit=8; wBit-- && CoilCnt; wState>>=1, CoilCnt--)
+		{	nErr = mbsDigOut ( CoilNbr++, wState&1 );
+			if (nErr != MB_SUCCESS)
+			{
+				return nErr;
+			}
+      }
+	}
+	return MB_SUCCESS;						//	Success
+} // mbsForceCoils
+
+
+/*=======================================================================*\
+	[0x10] Write Multiple Registers
+  		acMSCmd[2,3] = starting register number
+      acMSCmd[4,5] = register count
+		acMSCmd[6] = byte count
+		acMSCmd[7...] = data bytes - 2 per register
+   return value:
+      MB_SUCCESS = success
+   Reply message
+		[0] = slave address
+   	[1] = function code [0x10]
+      [2,3] = starting register number
+      [4,5] = register count
+\*=======================================================================*/
+
+/*** BeginHeader mbsWriteRegs */
+int mbsWriteRegs	( void );
+/*** EndHeader */
+
+MODBUS_SLAVE_DEBUG
+int mbsWriteRegs	(	void )
+{	auto int wAddr, wData;					// register Address and data value
+	auto int pData;							// index to the data
+   auto int RegCount;						// nbr of registers
+   auto int nErr;
+
+	wAddr = _mbsCmdWord ( 2 );
+   RegCount = _mbsCmdWord ( 4 );
+	pData = 7;									// index to first data value
+	_mbsReplyWord ( wAddr );				//	save starting register
+	_mbsReplyWord ( RegCount );			//	and register count for response
+
+   while ( RegCount-- )
+   {	wData = _mbsCmdWord ( pData );	//	get Register Value
+   	nErr = mbsRegOut ( wAddr, wData );
+		if (nErr != MB_SUCCESS)
+		{
+			return nErr;
+		}
+		wAddr += 1;								// next register nbr
+      pData += 2;								// index to next data word
+	}
+
+	return MB_SUCCESS;						//	Success
+} // mbsWriteRegs
+
+
+/*=======================================================================*\
+	[0x16] Mask Write Register
+   		acMSCmd[2,3] = register number
+         acMSCmd[4,5] = AND mask
+         acMSCmd[6,7] = OR mask
+   return value:
+      MB_SUCCESS = success
+   Reply message
+		[0] = slave address
+   	[1] = function code [0x16]
+      [2,3] = register number
+      [4,5] = AND mask
+      [6,7] = OR mask
+\*=======================================================================*/
+
+/*** BeginHeader mbsRegMask */
+int mbsRegMask		(	void);
+/*** EndHeader */
+
+MODBUS_SLAVE_DEBUG
+int mbsRegMask		(	void)
+{	auto unsigned wReg, wAnd, wOr, wData;
+	auto int nErr;
+
+	wReg = _mbsCmdWord ( 2 );				//	get Register Address,
+	wAnd = _mbsCmdWord ( 4 );				//	AND Mask
+	wOr = _mbsCmdWord ( 6 );				//	and OR Mask
+	_mbsReplyWord ( wReg );					//	save Register Address,
+	_mbsReplyWord ( wAnd );					//	AND Mask
+	_mbsReplyWord ( wOr );					//	and OR Mask for response
+
+	nErr = mbsRegOutRd ( wReg, &wData );
+	if (nErr != MB_SUCCESS)
+	{
+		return nErr;
+	}
+	wData = (wData & wAnd) | (wOr & ~wAnd);
+	nErr = mbsRegOut ( wReg, wData );
+	if (nErr != MB_SUCCESS)
+	{
+		return nErr;
+   }
+	return MB_SUCCESS;						//	Success
+} // mbsRegMask
+
+
+/*=======================================================================*\
+	[0x17] Read/Write Registers
+  		acMSCmd[2,3] = starting read register number
+      acMSCmd[4,5] = read register count
+  		acMSCmd[6,7] = starting write register number
+      acMSCmd[8,9] = write register count
+		acMSCmd[10] = write byte count
+		acMSCmd[11...] = data bytes - 2 per register
+   return value:
+      MB_SUCCESS = success
+      MB_... if error
+   Reply message
+		[0] = slave address
+   	[1] = function code [0x17]
+		[2] = read byte count = read register count * 2
+		[3..n] read register data - 2 bytes per register
+\*=======================================================================*/
+
+/*** BeginHeader mbsRegRdWr */
+int mbsRegRdWr		(	void 	);
+/*** EndHeader */
+
+MODBUS_SLAVE_DEBUG
+int mbsRegRdWr		(	void 	)
+{	auto int nErr;
+
+	nErr = mbsRegWr(6);						// Decode & Write Registers
+	if ( nErr == MB_SUCCESS )
+   {
+		nErr = mbsRegRd ( mbsRegIn );		//	Read Regs & Reply
+	}
+	return nErr;
+}
+
+/* START FUNCTION DESCRIPTION ********************************************
+MODBUS_Serial_tick	<MODBUS_Slave.LIB>
+
+SYNTAX:			void MODBUS_Serial_tick ( void );
+
+DESCRIPTION:	Check for a command from a MODBUS master
+
+PARAMETER1:		none
+
+RETURN VALUE:	none
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader MODBUS_Serial_tick */
+void MODBUS_Serial_tick ( void );
+/*** EndHeader */
+
+MODBUS_SLAVE_DEBUG
+void MODBUS_Serial_tick ( void )
+{	auto int ByteCount;
+
+	ByteCount = MODBUS_Serial_Rx (acMSReply);	// check for a message
+
+#if MODBUS_DEBUG_PRINT & 2
+	printf ( "ByteCount=%2d  MBaddress=%2d  MBcmd=%2d\n\r",
+   				ByteCount,    acMSReply[0], acMSReply[1] );
+#endif
+
+	if ( ByteCount > 0 )						// if valid byte count
+   {
+		if (acMSReply[0] == MY_MODBUS_ADDRESS )
+   	{
+	   	memcpy ( acMSCmd, acMSReply, ByteCount ); // copy for msExec
+         msExec ();							// execute the command
+         ByteCount = pcMSReply-acMSReply; // byte count of response
+         MODBUS_Serial_Tx ( acMSReply, ByteCount );
+      }
+   }
+   return;
+}
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+MODBUS_CRC		<MODBUS_Slave.LIB>
+
+SYNTAX:        unsigned MODBUS_CRC(unsigned char *pcMess, unsigned wLen)
+
+DESCRIPTION:	alternate CRC calculation
+
+PARAMETER1:		address of bytes for CRC calculation
+
+PARAMETER2:		number of bytes in paraameter1
+
+RETURN VALUE:	CRC value
+
+Note: to use this alternate CRC function you must insert
+#define USE_MODBUS_CRC
+before the #use directives for the modbus libraries.
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader MODBUS_CRC */
+unsigned MODBUS_CRC(unsigned char *pcMess, unsigned wLen);
+/*** EndHeader */
+
+/*=========================================================================*\
+	Compute Cyclic Redundancy Check
+\*=========================================================================*/
+
+const unsigned char MODBUS_CRC_MSB[] ={
+	0x00,0xC1,0x81,0x40,	0x01,0xC0,0x80,0x41,	0x01,0xC0,0x80,0x41,	0x00,0xC1,0x81,0x40,
+	0x01,0xC0,0x80,0x41,	0x00,0xC1,0x81,0x40,	0x00,0xC1,0x81,0x40,	0x01,0xC0,0x80,0x41,
+	0x01,0xC0,0x80,0x41,	0x00,0xC1,0x81,0x40,	0x00,0xC1,0x81,0x40,	0x01,0xC0,0x80,0x41,
+	0x00,0xC1,0x81,0x40,	0x01,0xC0,0x80,0x41,	0x01,0xC0,0x80,0x41,	0x00,0xC1,0x81,0x40,
+	0x01,0xC0,0x80,0x41,	0x00,0xC1,0x81,0x40,	0x00,0xC1,0x81,0x40,	0x01,0xC0,0x80,0x41,
+	0x00,0xC1,0x81,0x40,	0x01,0xC0,0x80,0x41,	0x01,0xC0,0x80,0x41,	0x00,0xC1,0x81,0x40,
+	0x00,0xC1,0x81,0x40,	0x01,0xC0,0x80,0x41,	0x01,0xC0,0x80,0x41,	0x00,0xC1,0x81,0x40,
+	0x01,0xC0,0x80,0x41,	0x00,0xC1,0x81,0x40, 0x00,0xC1,0x81,0x40,	0x01,0xC0,0x80,0x41,
+	0x01,0xC0,0x80,0x41,	0x00,0xC1,0x81,0x40,	0x00,0xC1,0x81,0x40,	0x01,0xC0,0x80,0x41,
+	0x00,0xC1,0x81,0x40,	0x01,0xC0,0x80,0x41,	0x01,0xC0,0x80,0x41,	0x00,0xC1,0x81,0x40,
+	0x00,0xC1,0x81,0x40,	0x01,0xC0,0x80,0x41,	0x01,0xC0,0x80,0x41,	0x00,0xC1,0x81,0x40,
+	0x01,0xC0,0x80,0x41,	0x00,0xC1,0x81,0x40,	0x00,0xC1,0x81,0x40,	0x01,0xC0,0x80,0x41,
+	0x00,0xC1,0x81,0x40,	0x01,0xC0,0x80,0x41,	0x01,0xC0,0x80,0x41,	0x00,0xC1,0x81,0x40,
+	0x01,0xC0,0x80,0x41,	0x00,0xC1,0x81,0x40,	0x00,0xC1,0x81,0x40,	0x01,0xC0,0x80,0x41,
+	0x01,0xC0,0x80,0x41,	0x00,0xC1,0x81,0x40,	0x00,0xC1,0x81,0x40,	0x01,0xC0,0x80,0x41,
+	0x00,0xC1,0x81,0x40,	0x01,0xC0,0x80,0x41,	0x01,0xC0,0x80,0x41,	0x00,0xC1,0x81,0x40
+};
+
+const unsigned char MODBUS_CRC_LSB[] ={
+   0x00,0xC0,0xC1,0x01, 0xC3,0x03,0x02,0xC2,	0xC6,0x06,0x07,0xC7,	0x05,0xC5,0xC4,0x04,
+   0xCC,0x0C,0x0D,0xCD,	0x0F,0xCF,0xCE,0x0E, 0x0A,0xCA,0xCB,0x0B,	0xC9,0x09,0x08,0xC8,
+   0xD8,0x18,0x19,0xD9, 0x1B,0xDB,0xDA,0x1A,	0x1E,0xDE,0xDF,0x1F, 0xDD,0x1D,0x1C,0xDC,
+   0x14,0xD4,0xD5,0x15,	0xD7,0x17,0x16,0xD6, 0xD2,0x12,0x13,0xD3,	0x11,0xD1,0xD0,0x10,
+   0xF0,0x30,0x31,0xF1,	0x33,0xF3,0xF2,0x32,	0x36,0xF6,0xF7,0x37,	0xF5,0x35,0x34,0xF4,
+	0x3C,0xFC,0xFD,0x3D,	0xFF,0x3F,0x3E,0xFE,	0xFA,0x3A,0x3B,0xFB,	0x39,0xF9,0xF8,0x38,
+	0x28,0xE8,0xE9,0x29,	0xEB,0x2B,0x2A,0xEA,	0xEE,0x2E,0x2F,0xEF,	0x2D,0xED,0xEC,0x2C,
+	0xE4,0x24,0x25,0xE5,	0x27,0xE7,0xE6,0x26,	0x22,0xE2,0xE3,0x23,	0xE1,0x21,0x20,0xE0,
+	0xA0,0x60,0x61,0xA1,	0x63,0xA3,0xA2,0x62,	0x66,0xA6,0xA7,0x67,	0xA5,0x65,0x64,0xA4,
+	0x6C,0xAC,0xAD,0x6D,	0xAF,0x6F,0x6E,0xAE,	0xAA,0x6A,0x6B,0xAB,	0x69,0xA9,0xA8,0x68,
+	0x78,0xB8,0xB9,0x79,	0xBB,0x7B,0x7A,0xBA,	0xBE,0x7E,0x7F,0xBF,	0x7D,0xBD,0xBC,0x7C,
+	0xB4,0x74,0x75,0xB5,	0x77,0xB7,0xB6,0x76,	0x72,0xB2,0xB3,0x73,	0xB1,0x71,0x70,0xB0,
+	0x50,0x90,0x91,0x51,	0x93,0x53,0x52,0x92,	0x96,0x56,0x57,0x97,	0x55,0x95,0x94,0x54,
+	0x9C,0x5C,0x5D,0x9D,	0x5F,0x9F,0x9E,0x5E,	0x5A,0x9A,0x9B,0x5B,	0x99,0x59,0x58,0x98,
+	0x88,0x48,0x49,0x89,	0x4B,0x8B,0x8A,0x4A,	0x4E,0x8E,0x8F,0x4F,	0x8D,0x4D,0x4C,0x8C,
+	0x44,0x84,0x85,0x45,	0x87,0x47,0x46,0x86,	0x82,0x42,0x43,0x83,	0x41,0x81,0x80,0x40
+};
+
+MODBUS_SLAVE_DEBUG
+unsigned MODBUS_CRC(unsigned char *pcMess, unsigned wLen)
+{
+	auto unsigned char cHi,cLo;			//	CRC Accumulators (MSB & LSB)
+	auto unsigned w;							//	CRC Shift In Index
+
+	cHi = cLo = 0xFF;							//	Init CRC
+	while(wLen--)
+	{												//	For Each Byte
+		w = cHi ^ *pcMess++;					//	Next Table Index
+		cHi = cLo ^ MODBUS_CRC_MSB[w];	//	Next CRC
+		cLo = MODBUS_CRC_LSB[w];
+	}
+	return ((unsigned) cHi << 8) | cLo;	//	merge the bytes and return
+}
+
+/*** BeginHeader */
+#endif	// __MBSLAVE
+/*** EndHeader */
+

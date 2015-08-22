@@ -1,0 +1,3015 @@
+/*
+	arp.lib
+	Copyright (c) 2008 Digi International Inc., All Rights Reserved
+
+	This software contains proprietary and confidential information of Digi
+	International Inc.  By accepting transfer of this copy, Recipient agrees
+	to retain this software in confidence, to prevent disclosure to others,
+	and to make no use of this software other than that for which it was
+	delivered.  This is a published copyrighted work of Digi International
+	Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+	prohibited.
+
+	Restricted Rights Legend
+
+	Use, duplication, or disclosure by the Government is subject to
+	restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+	Technical Data and Computer Software clause at DFARS 252.227-7031 or
+	subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+	Restricted Rights at 48 CFR 52.227-19, as applicable.
+
+	Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+
+	Portions used with permission of Erick Engelke.
+*/
+
+/* START LIBRARY DESCRIPTION ************************************************
+
+	Address Resolution Protocol.
+
+	Macros:
+
+	ARP_VERBOSE - If defined, library will print status messages to STDOUT.
+
+	ARP_DEBUG - If defined, functions will be debuggable (i.e., you can set
+				breakpoints and single-step into them).
+
+	ARP_LONG_EXPIRY - Number of seconds that a normal entry stays current
+				(Default 1200).
+
+	ARP_SHORT_EXPIRY - Number of seconds that a volatile entry stays current
+				(Default 300).
+
+	ARP_PURGE_TIME -  Number of seconds until a flushed entry is actually
+				deleted (purged) (Default 7200).
+
+   ARP_NO_ANNOUNCE - If defined, don't announce our hardware address at
+   			sock_init().
+
+	ARP_CONFLICT_CALLBACK - Define a function to call in case of IP address
+				conflict.  This function takes an arp_Header pointer as the first
+				and only parameter.  It should return one of
+	            0: do not take any action
+	            0xFFFFFFFF: abort all open sockets with NETERR_IPADDR_CONFLICT
+	            other: a new IP address to use.  Open sockets are aborted with
+	            		NETERR_IPADDR_CHANGE
+
+	ARP_PERSISTENCE - Number of retries allowed for an active ARP resolve
+				request to come to fruition.  If no response is received after
+				this many requests, then the host is assumed to be dead.  Set to
+				a number between 0 and 7.  This number relates to the total time
+				spent waiting for a response as follows:
+
+					timeout = 2**(ARP_PERSISTENCE+1) - 1.
+
+				e.g. for 0 the timeout is 1 second.  For 4 it is 31 seconds.  For
+				7 it is 255 seconds.  If you set this to 8 or higher, then ARP
+				will persist forever, retrying at 128 second intervals.
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader */
+#ifndef ARP_H
+#define ARP_H
+
+#ifdef ARP_DEBUG
+	#define _arp_nodebug __debug
+#else
+	#define _arp_nodebug __nodebug
+#endif
+
+#ifndef IP_H
+	#use "ip.lib"
+#endif
+
+// Default configuration definitions.  See LIBRARY DESCRIPTION above for
+// descriptions of each macro.
+#ifndef ARP_LONG_EXPIRY
+	#define ARP_LONG_EXPIRY				1200
+#endif
+#ifndef ARP_SHORT_EXPIRY
+	#define ARP_SHORT_EXPIRY			300
+#endif
+#ifndef ARP_PURGE_TIME
+	#define ARP_PURGE_TIME				7200
+#endif
+#ifndef ARP_PERSISTENCE
+	#define ARP_PERSISTENCE				4
+#endif
+
+// ARP types, in network byte order
+#define arp_TypeEther	0x0100
+
+// ARP op codes, in network byte order
+#define ARP_REQUEST		0x0100
+#define ARP_REPLY			0x0200
+
+// ARP packet structure
+typedef struct {
+	word				hwType;
+	word				protType;
+	word				hwProtAddrLen;  // hw and prot addr lengths
+	word				opcode;
+	eth_address		srcEthAddr;
+	longword			srcIPAddr;
+	eth_address		dstEthAddr;
+	longword			dstIPAddr;
+} arp_Header;
+
+#define ATH2INDEX(ath) ((ath) & 0x00FF)
+#define ATH2SEQNO(ath) ((ath) >> 8)
+
+/*
+ * ARP cache table entry (ATE).  Each ATE contains host-related information; most
+ * importantly the hardware address of the next hop to get to the host.
+ */
+typedef struct _ATEntry {
+	ATHandle			ath;				// Handle for this entry (0 if not used)
+	longword			ip;				// IP address of destination host
+	eth_address		hwa;				// Corresponding hardware (ethernet or MAC) address
+	byte				iface;			// Interface number to use
+	byte				router_used;	// If ATE_ROUTER_HOP, then this refers to router table entry
+	longword			timestamp;		// Expiration time as ms value compared to MS_TIMER.
+	struct _ATEntry * nextto;		// Next entry to timeout.
+	word				flags;			// Flags as follows:
+#define ATE_PERMANENT		0x0001	// Do not expire this entry
+#define ATE_RESOLVING		0x0002	// In process of being resolved
+#define ATE_ROUTER_ENT		0x0004	// This is a router entry
+#define ATE_FLUSH				0x0008	// Upper layer requested flush
+#define ATE_VOLATILE			0x0010	// Short timeout for this entry
+#define ATE_GRACE				0x0020	// This entry in grace period i.e. known but being re-resolved
+#define ATE_NOARP				0x0040	// Timeout with no ARP response
+#define ATE_ROUTER_HOP		0x0080	// IP address not on this subnet - use "router_used"
+#define ATE_PATHMTU_DISC	0x0100	// Path MTU discovery in progress
+#define ATE_RESOLVED			0x0200	// HWA is valid (resolved)
+#define ATE_MULTICAST		0x0400	// Represents a multicast address
+#define ATE_RETRY_MASK		0x7000	// Retry count when resolving
+#define ATE_RETRY_SHIFT		12			//   ...corresponding bit shift
+#define ATE_REDIRECTED		0x8000	// This entry was ICMP redirected
+
+	union {
+		struct {
+			// Per-host information
+			word			path_mtu;		// Path MTU (if known, else 0)
+			longword		rtt_avg;			// Average round-trip time (if known, else 0)
+			longword		rtt_dev;			// RTT average deviation
+		} perhost;
+		struct {
+			byte			userflag;		// Has the user explicitly joined this group?
+			int			slot;				// Value to which this group address hashes
+		} multicast;
+	} u;
+} ATEntry;
+
+
+/*
+ * Router table entry (RTE).  One or more of these for each router ("gateway") which
+ * allows access to hosts not on the local subnet.
+ */
+typedef struct {
+	ATHandle			ath;				// Handle into ATE table for this router (the entry will
+											// have ATE_ROUTER_ENT set).  0 if this entry not used.
+											// May also be ATH_P2P+iface for a point-to-point route.
+	word				flags;			// Flag bits as follows:
+#define RTE_TRANSIENT		0x0001	// This entry added by ICMP router discovery
+#define RTE_DHCP				0x0002	// This entry added by DHCP
+#define RTE_REDIRECT			0x0004	// This entry added by ICMP redirect
+													//  - if not any of the above, was preconfigured.
+#define RTE_DEAD				0x0008	// Router appears to be defunct
+	union {
+		struct {
+			// subnet and mask only valid for preconfigured routers, to try to select the best first hop
+			// based on the IP address.
+			longword			subnet;			// Subnet handled by this router entry
+			longword			mask;				// Subnet mask for the above
+		} preconfig;
+
+		struct {
+			// preference and timestamp only valid for transient routers
+			long				preference;		// Relative preference as default router
+			longword			timestamp;		// Time at which this entry expires
+		} transient;
+	} u;
+} RTEntry;
+/*** EndHeader */
+
+/*** BeginHeader _arp_data, _arp_seqnum, _arp_resolved, _arp_towait,
+						_arp_gate_data */
+extern ATEntry _arp_data[ARP_TABLE_SIZE];
+extern int _arp_seqnum;
+extern ATHandle _arp_resolved;
+extern ATEntry * _arp_towait;
+extern RTEntry _arp_gate_data[ARP_ROUTER_TABLE_SIZE];
+/*** EndHeader */
+ATEntry _arp_data[ARP_TABLE_SIZE];
+int _arp_seqnum;
+ATHandle _arp_resolved;
+ATEntry * _arp_towait;
+RTEntry _arp_gate_data[ARP_ROUTER_TABLE_SIZE];
+
+/*** BeginHeader arp_dumpHeader */
+void arp_dumpHeader( arp_Header __far *arp);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ******************************
+arp_dumpHeader							<ARP.LIB>
+
+Syntax:			void arp_dumpHeader( arp_Header far *arp)
+
+Description:	Dump ARP header to stdout.
+
+Parameter:		Pointer to ARP header.
+
+Return Value:	none
+
+END DESCRIPTION ********************************************/
+_arp_nodebug
+void arp_dumpHeader( arp_Header __far *arp)
+{
+	char ipbuf[16];
+	char ethbuf[18];
+	byte ethaddr[6];
+	char *op;
+	char opbuf[7];
+
+	switch (arp->opcode)
+	{
+		case ARP_REQUEST:
+			op = "ARP_REQUEST";
+			break;
+
+		case ARP_REPLY:
+			op = "ARP_REPLY";
+			break;
+
+		default:
+			op = opbuf;
+			sprintf( opbuf, "0x%04x", ntohs( arp->opcode));
+	}
+
+	printf( "hwType=0x%04x  protType=0x%04x  hardsz=%u  protsz=%u  op=%s\n",
+		ntohs( arp->hwType), ntohs( arp->protType), arp->hwProtAddrLen & 0xFF,
+		arp->hwProtAddrLen >> 8, op);
+
+	if (arp->hwProtAddrLen == 0x0406)
+	{
+	   _f_memcpy( ethaddr, &arp->srcEthAddr, 6);
+	   printf( "%s=%s   %s\n", "source", inet_ethtoa( ethbuf, ethaddr),
+	   	inet_ntoa( ipbuf, ntohl( arp->srcIPAddr)));
+
+	   _f_memcpy( ethaddr, &arp->dstEthAddr, 6);
+	   printf( "%s=%s   %s\n", "target", inet_ethtoa( ethbuf, ethaddr),
+	   	inet_ntoa( ipbuf, ntohl( arp->dstIPAddr)));
+	}
+}
+
+/*** BeginHeader arp_getArpData */
+ATEntry *arp_getArpData(void);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ******************************
+arp_getArpData							<ARP.LIB>
+
+Syntax:			ATEntry *arp_getArpData(void)
+
+Description:	return address of _arp_data[]
+
+Parameter:		none
+
+Return Value:	address
+
+END DESCRIPTION ********************************************/
+__nodebug
+ATEntry *arp_getArpData(void)
+{
+	return _arp_data;
+} //arp_getArpData()
+
+/*** BeginHeader arp_getArpGateData */
+RTEntry *arp_getArpGateData (void);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ******************************
+arp_getArpGateData							<ARP.LIB>
+
+Syntax:			ATEntry *arp_getArpGateData(void)
+
+Description:	return address of _arp_gate_data[]
+
+Parameter:		none
+
+Return Value:	address
+
+END DESCRIPTION ********************************************/
+__nodebug
+RTEntry *arp_getArpGateData (void)
+{
+	return _arp_gate_data;
+} //arp_getArpGateData()
+
+/*** BeginHeader _arp_add_gateway */
+// This function deprecated owing to use of string parameter,
+// and no return code.  Use router_add() instead.
+void _arp_add_gateway( char *data, longword ip );
+/*** EndHeader */
+
+/*
+ * _arp_add_gateway - if data is NULL, don't use string
+ */
+_arp_nodebug void _arp_add_gateway( char *data, longword ip )
+{
+   auto int i;
+   auto char *subnetp, *maskp;
+   auto longword subnet, mask;
+
+   subnet = mask = 0;
+   if( data ) {
+      maskp = NULL;
+      if( (subnetp = _n_strchr( data, ',' )) != NULL ) {
+         *subnetp++ = 0;
+         if( (maskp = _n_strchr( subnetp, ',' )) != NULL ) {
+            *maskp++ = 0;
+            mask = aton( maskp );
+            subnet = aton( subnetp );
+         } else {
+            subnet = aton( subnetp );
+            switch( (int)(subnet >> 30) ) {
+            case 0 :
+            case 1 : mask = 0xff000000L; break;
+            case 2 : mask = 0xfffffe00L; break;   /* minimal class b */
+            case 3 : mask = 0xffffff00L; break;
+            }
+         }
+      }
+      ip = aton( data );
+   }
+	router_add(ip, IF_DEFAULT, subnet, mask, 0);
+}
+
+/*** BeginHeader _arp_request */
+void _arp_request(longword dstip, longword srcip, word iface);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ******************************
+_arp_request							<ARP.LIB>
+
+Syntax:			void _arp_request(longword dstip, longword srcip, word iface)
+
+Description:	Send arp request for <dstip> using <srcip> in the source IP
+					field.
+
+Parameter 1: 	The IP address to request, in host byte order.
+
+Parameter 2:	The IP address to use in the source IP field, or 0xFFFFFFFF
+					to automatically select the interface's current IP.  Can be
+					set to 0 for sending probe requests checking for address
+					conflicts before assigning an IP to an interface.
+
+Parameter 3:	Interface to send request on.
+
+Return Value:	none
+
+END DESCRIPTION ********************************************/
+_arp_nodebug
+void _arp_request(longword dstip, longword srcip, word iface)
+{
+#ifndef ARP_MINIMAL
+   auto byte pkt_hdr[IP_MAX_LL_HDR + sizeof(arp_Header)];
+	auto ll_Gather g;
+   auto arp_Header * op;
+   auto ether_ll_hdr * ep;
+
+   // Determine interface.  Only local allowed.
+   if (iface == IF_ANY)
+   	iface = ip_iface(dstip, 1);
+
+   // Do not do ARP on PPP interfaces, or non-local addresses
+   if (iface != IF_ANY && !IF_P2P(iface)) {
+   	LOCK_GLOBAL(TCPGlobalLock);
+   	ep = (ether_ll_hdr *)pkt_hdr;
+   	//ep->iface = iface;
+   	ep->type = ARP_TYPE;
+      memset(ep->dest, 0xFF, 6);	// Broadcast link-layer
+      memcpy(ep->src, my_eth_addr[iface], 6);
+   	op = (arp_Header *)(ep+1);
+   	op->hwType = arp_TypeEther;
+   	op->protType = IP_TYPE;
+   	op->hwProtAddrLen = sizeof(eth_address) + (sizeof(longword)<<8);
+   	op->opcode = ARP_REQUEST;
+   	if (srcip == 0xFFFFFFFFul)
+   	{
+	   	op->srcIPAddr = intel(_if_tab[iface].ipaddr);
+	   }
+	   else
+	   {
+			op->srcIPAddr = intel(srcip);
+	   }
+   	memcpy(&op->srcEthAddr, my_eth_addr[iface], sizeof(eth_address));
+	   op->dstIPAddr = intel(dstip);
+	   memset(&op->dstEthAddr, 0, sizeof(eth_address));
+#ifdef ARP_VERBOSE
+		printf("ARP: asking who has %08lX? (on i/f %u, using srcIP %08lX)\n",
+			dstip, iface, intel(op->srcIPAddr));
+#endif
+
+	   /* ...and send the packet */
+	   memset(&g, 0, sizeof(g));
+	   g.iface = iface;
+	   g.len1 = sizeof(*ep) + sizeof(*op);
+	   g.data1 = (char __far *)ep;
+	   pkt_gather(&g);
+	   UNLOCK_GLOBAL(TCPGlobalLock);
+   }
+#endif
+}
+
+
+/*** BeginHeader _arp_init */
+void _arp_init(void);
+/*** EndHeader */
+_arp_nodebug
+void _arp_init(void)
+{
+	_arp_seqnum = 0;
+	_arp_towait = NULL;
+	memset(_arp_data, 0, sizeof(_arp_data));
+	memset(_arp_gate_data, 0, sizeof(_arp_gate_data));
+}
+
+/*** BeginHeader _arp_unlink_to */
+void _arp_unlink_to(ATEntry * ate);
+/*** EndHeader */
+_arp_nodebug
+void _arp_unlink_to(ATEntry * ate)
+{
+#ifndef ARP_MINIMAL
+	// Caller must have global lock
+	auto ATEntry ** p;
+
+	p = &_arp_towait;
+	while (*p) {
+		if (*p == ate) {
+			*p = ate->nextto;
+			ate->nextto = NULL;
+			return;
+		}
+		p = &(*p)->nextto;
+	}
+#endif
+}
+/*** BeginHeader _arp_sched_to */
+// Schedule timeout for this table entry in msec milliseconds from now.
+// Automatically removed from timeout chain if already in chain.
+void _arp_sched_to(ATEntry * ate, longword msec);
+/*** EndHeader */
+_arp_nodebug
+void _arp_sched_to(ATEntry * ate, longword msec)
+{
+#ifndef ARP_MINIMAL
+	auto ATEntry ** p, * q;
+
+	// Caller must have global lock
+	_arp_unlink_to(ate);
+	p = &_arp_towait;
+	msec += MS_TIMER;
+	q = *p;
+	while (q) {
+		if ((long)(q->timestamp - msec) >= 0)
+			break;
+		p = &q->nextto;
+		q = *p;
+	}
+	ate->nextto = q;
+	*p = ate;
+	ate->timestamp = msec;
+#endif
+}
+
+
+/*** BeginHeader arpcache_purge_iface */
+void arpcache_purge_iface(word iface);
+/*** EndHeader */
+_arp_nodebug
+void arpcache_purge_iface(word iface)
+{
+	// Purge all entries associated with the given interface number.  This is used when
+   // an interface is brought down, since ARP cache entries will be generally invalidated.
+   // The exception is for routers, which are retained (but marked as unresolved).
+#ifndef ARP_MINIMAL
+	auto word i, j;
+	auto RTEntry * rte;
+	auto ATEntry * ate;
+
+#ifdef ARP_VERBOSE
+	printf("ARP: purging all entries for i/f %u\n", iface);
+#endif
+   LOCK_GLOBAL(TCPGlobalLock);
+	for (i = 0; i < ARP_TABLE_SIZE; i++) {
+   	ate = _arp_data + i;
+		if (ate->ath && (iface == IF_ANY || iface == ate->iface)) {
+#ifdef ARP_VERBOSE
+			printf("ARP: ...IP %08lX\n", ate->ip);
+#endif
+         if (ate->flags & ATE_ROUTER_ENT)
+         	// Don't purge routers; just mark the ATE as unresolved
+            ate->flags &= ~(ATE_RESOLVING | ATE_RESOLVED);
+#ifdef USE_MULTICAST
+			else if (ate->flags & ATE_MULTICAST)
+			{
+				// Don't purge multicast entries, just ignore them
+			}
+#endif
+         else
+				ate->ath = 0;
+         // Since interface is being purged, don't do refresh timeouts etc.
+         _arp_unlink_to(ate);
+      }
+	}
+   UNLOCK_GLOBAL(TCPGlobalLock);
+#endif
+}
+
+
+
+/*** BeginHeader arpcache_search */
+ATHandle arpcache_search(longword ipaddr, int virt);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+arpcache_search									<ARP.LIB>
+
+SYNTAX: ATHandle arpcache_search(longword ipaddr, int virt)
+
+KEYWORDS:      tcpip, arp
+
+DESCRIPTION:   Return handle which refers to the ARP cache table entry
+               for the given IP address.  This does not do any resolving.
+               It only consults the existing cache entries.  The returned
+               handle is guaranteed to be valid at least until the next
+               call to tcp_tick().  Usually the handle will be valid for
+               considerably longer, however it is possible for the handle
+               to become obsolete if the cache entry is re-used for a
+               different address.  The caller should be able to deal with
+               this possibility.  The entry returned for the broadcast
+               address is guaranteed to be permanent.
+
+PARAMETER1:    IP address to locate in the cache.  This may be -1L to
+               locate the broadcast entry or our own IP address to return
+               the "loopback" entry.
+PARAMETER2:    0: do not return the broadcast or loopback entries
+               1: allow the broadcast or loopback entries.
+
+RETURN VALUE:  Positive value: handle to the entry.
+               ATH_NOTFOUND: no entry exists for the given IP address.
+END DESCRIPTION **********************************************************/
+
+
+_arp_nodebug ATHandle arpcache_search(longword ipaddr, int virt)
+{
+	return arpcache_search_iface(ipaddr, virt, IF_ANY);
+}
+
+
+/*** BeginHeader arpcache_search_iface */
+ATHandle arpcache_search_iface(longword ipaddr, int virt, word iface);
+/*** EndHeader */
+
+_arp_nodebug ATHandle arpcache_search_iface(longword ipaddr, int virt, word iface)
+{
+	auto int i;
+
+	if (virt) {
+		if (IS_ANY_BCAST_ADDR(ipaddr))
+			return ATH_BROADCAST;
+		if (IS_ANY_MY_ADDR(ipaddr))
+			return ATH_LOOPBACK;
+	}
+
+   LOCK_GLOBAL(TCPGlobalLock);
+	for (i = 0; i < ARP_TABLE_SIZE; i++)
+		if (_arp_data[i].ath &&
+          ipaddr == _arp_data[i].ip &&
+		    (iface == IF_ANY || iface == _arp_data[i].iface)) {
+		   UNLOCK_GLOBAL(TCPGlobalLock);
+			return _arp_data[i].ath;
+		}
+   UNLOCK_GLOBAL(TCPGlobalLock);
+	return ATH_NOTFOUND;
+}
+
+/*** BeginHeader arpcache_hwa */
+ATHandle arpcache_hwa(ATHandle ath, void * hwa);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+arpcache_hwa									<ARP.LIB>
+
+SYNTAX: ATHandle arpcache_hwa(ATHandle ath, void * hwa)
+
+KEYWORDS:      tcpip, arp
+
+DESCRIPTION:   Copy the ethernet (hardware) address from the given ARP
+               cache table entry into the specified area.
+
+PARAMETER1:    ARP cache table entry.
+PARAMETER2:    Address of where to store the hardware address (6 bytes).
+
+RETURN VALUE:  Positive value: handle to the entry.
+               ATH_UNUSED: the table entry was unused
+               ATH_INVALID: the ath parameter was not a valid handle
+               ATH_OBSOLETE: the given handle was valid, but obsoleted by
+                 a more recent entry.  No change made.
+END DESCRIPTION **********************************************************/
+
+
+_arp_nodebug ATHandle arpcache_hwa(ATHandle ath, void * hwa)
+{
+#ifndef ARP_MINIMAL
+	auto word idx;
+	auto ATEntry * ate;
+
+	if (ATH_IS_P2P(ath)) {
+		// No h/w address for p2p
+		return ath;
+	}
+	if (ath == ATH_BROADCAST) {
+		memset(hwa, 0xFF, sizeof(eth_address));
+		return ath;
+	}
+	if (ath == ATH_LOOPBACK) {
+   	// Do nothing, HWA not applicable to loopback interface
+		return ath;
+	}
+
+	idx = ATH2INDEX(ath);
+	if (idx >= ARP_TABLE_SIZE)
+		return ATH_INVALID;
+	ate = _arp_data + idx;
+	if (!ate->ath)
+		return ATH_INVALID;
+	if (ate->ath != ath)
+		return ATH_OBSOLETE;
+	memcpy(hwa, &ate->hwa, sizeof(eth_address));
+#endif
+	return ath;
+}
+
+
+/*** BeginHeader arpcache_iface */
+ATHandle arpcache_iface(ATHandle ath, word * iface);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+arpcache_iface									<ARP.LIB>
+
+SYNTAX: ATHandle arpcache_iface(ATHandle ath, word * iface)
+
+KEYWORDS:      tcpip, arp
+
+DESCRIPTION:   Copy the interface number from the given ARP cache table
+               entry into the specified area.
+
+               If the ath parameter refers to a broadcast or loopback
+               entry, then *iface is set to IF_DEFAULT (and ATH_INVALID
+               is returned, since we can't really determine which of
+               the interfaces to broadcast from).
+
+PARAMETER1:    ARP cache table entry.
+PARAMETER2:    Address of where to store the interface number (1 byte).
+
+RETURN VALUE:  Positive value: handle to the entry.
+               ATH_UNUSED: the table entry was unused
+               ATH_INVALID: the ath parameter was not a valid handle, or
+                 was a broadcast, multicast or loopback handle.
+               ATH_OBSOLETE: the given handle was valid, but obsoleted by
+                 a more recent entry.
+END DESCRIPTION **********************************************************/
+
+
+_arp_nodebug ATHandle arpcache_iface(ATHandle ath, word * iface)
+{
+#ifndef ARP_MINIMAL
+	auto word idx;
+	auto ATEntry * ate;
+
+	if (ATH_IS_P2P(ath)) {
+		*iface = ath - ATH_P2P;
+		return ath;
+	}
+   if (ath == ATH_LOOPBACK) {
+   	#ifdef IF_LOOPBACK
+      *iface = IF_LOOPBACK;
+      return ath;
+      #else
+      return ATH_INVALID;
+      #endif
+   }
+	idx = ATH2INDEX(ath);
+	*iface = IF_DEFAULT;	// Set to something rational if broadcast handle
+	if (idx >= ARP_TABLE_SIZE)
+		return ATH_INVALID;
+	ate = _arp_data + idx;
+	if (!ate->ath)
+		return ATH_INVALID;
+	if (ate->ath != ath)
+		return ATH_OBSOLETE;
+	*iface = ate->iface;
+#else
+	#ifdef IF_LOOPBACK
+	if (ath == ATH_LOOPBACK)
+   	*iface = IF_LOOPBACK;
+   else
+   #endif
+	*iface = ath - ATH_P2P;
+#endif
+	return ath;
+}
+
+
+/*** BeginHeader arpcache_ipaddr */
+ATHandle arpcache_ipaddr(ATHandle ath, longword * ipaddr);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+arpcache_ipaddr									<ARP.LIB>
+
+SYNTAX: ATHandle arpcache_ipaddr(ATHandle ath, longword * ipaddr)
+
+KEYWORDS:      tcpip, arp
+
+DESCRIPTION:   Copy the IP address from the given ARP
+               cache table entry into the specified area.  If the
+               ath parameter refers to a broadcast entry, then the
+               subnet broadcast IP is for the default interface is
+               returned.
+
+PARAMETER1:    ARP cache table entry.
+PARAMETER2:    Address of where to store the IP address (4 bytes).
+
+RETURN VALUE:  Positive value: handle to the entry.
+               ATH_UNUSED: the table entry was unused
+               ATH_INVALID: the ath parameter was not a valid handle, or
+                 was a point-point, broadcast, multicast or loopback
+                 handle.
+               ATH_OBSOLETE: the given handle was valid, but obsoleted by
+                 a more recent entry.
+END DESCRIPTION **********************************************************/
+
+
+_arp_nodebug ATHandle arpcache_ipaddr(ATHandle ath,
+	longword * ipaddr)
+{
+#ifndef ARP_MINIMAL
+	auto word idx;
+	auto ATEntry * ate;
+
+	idx = ATH2INDEX(ath);
+	if (ath == ATH_BROADCAST) {
+		// Subnet broadcast (on default i/f) - dev note: multi-interface programs should
+      // not rely on this behavior, since assumes default interface.
+		*ipaddr = _if_tab[IF_DEFAULT].ipaddr | ~_if_tab[IF_DEFAULT].mask;
+		return ath;
+	}
+	if (ath == ATH_LOOPBACK) {
+   	*ipaddr = 0x7F000000;
+		return ath;
+	}
+	if (ATH_IS_P2P(ath)) {
+		*ipaddr = _if_tab[idx - ATH_P2P].u.ppp.peeraddr;
+		return ath;
+	}
+	if (idx >= ARP_TABLE_SIZE)
+		return ATH_INVALID;
+	ate = _arp_data + idx;
+	if (!ate->ath)
+		return ATH_INVALID;
+	if (ate->ath != ath)
+		return ATH_OBSOLETE;
+	*ipaddr = ate->ip;
+#else
+	*ipaddr = _if_tab[ath - ATH_P2P].u.ppp.peeraddr;
+#endif
+	return ath;
+}
+
+
+/*** BeginHeader arpcache_flush */
+ATHandle arpcache_flush(ATHandle ath);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+arpcache_flush									<ARP.LIB>
+
+SYNTAX: ATHandle arpcache_flush(ATHandle ath)
+
+KEYWORDS:      tcpip, arp
+
+DESCRIPTION:   Mark an ARP cache table entry for flushing.  This means
+               that the given table entry will be the first entry to be
+               re-used for a different IP address, if necessary.
+               Any entry (including permanent and router entries) may
+               be flushed except for the broadcast entry.
+
+PARAMETER1:    ARP Table Handle obtained from e.g. arpcache_search().
+
+RETURN VALUE:  Positive value: success.
+               ATH_UNUSED: the table entry was unused
+               ATH_INVALID: the ath parameter was not a valid handle
+               ATH_OBSOLETE: the given handle was valid, but obsoleted by
+                 a more recent entry.  No change made.
+END DESCRIPTION **********************************************************/
+
+
+_arp_nodebug ATHandle arpcache_flush(ATHandle ath)
+{
+#ifndef ARP_MINIMAL
+	auto word idx;
+	auto ATEntry * ate;
+
+	idx = ATH2INDEX(ath);
+	if (idx >= ARP_TABLE_SIZE)
+		return ATH_INVALID;
+	ate = _arp_data + idx;
+	if (!ate->ath)
+		return ATH_UNUSED;
+	if (ate->ath != ath)
+		return ATH_OBSOLETE;
+
+#ifdef ARP_VERBOSE
+	printf("ARP: flushing entry %u (IP %08lX)\n", idx, ate->ip);
+#endif
+   LOCK_GLOBAL(TCPGlobalLock);
+	// OK, it all checks out.
+	ate->flags |= ATE_FLUSH;
+	ate->flags &= ~(ATE_RESOLVING | ATE_NOARP);
+	_arp_sched_to(ate, ARP_PURGE_TIME*1000L);	// Next event far off.
+   UNLOCK_GLOBAL(TCPGlobalLock);
+#endif
+	return ath;
+}
+
+
+/*** BeginHeader arpcache_create */
+ATHandle arpcache_create(longword ipaddr);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+arpcache_create									<ARP.LIB>
+
+SYNTAX: ATHandle arpcache_create(longword ipaddr)
+
+KEYWORDS:      tcpip, arp
+
+DESCRIPTION:   Create a new entry in the ARP cache table for the specified
+               IP address.  If a matching entry for that address already
+               exists, then that entry is returned.  Otherwise, a new
+               entry is initialized and returned.  If a new entry is
+               created, then an old entry may need to be purged.  If this
+               is not possible, then ATH_NOENTRIES is returned.
+
+PARAMETER1:    IP address of entry.
+
+RETURN VALUE:  Positive value: success.
+               ATH_NOENTRIES: no space is available in the table, and none
+                 of the entries could be purged, because they were all
+                 marked as permanent or router entries.
+END DESCRIPTION **********************************************************/
+
+
+_arp_nodebug ATHandle arpcache_create(longword ipaddr)
+{
+	return arpcache_create_iface(ipaddr, IF_ANY);
+}
+
+/*** BeginHeader arpcache_create_iface */
+ATHandle arpcache_create_iface(longword ipaddr, word iface);
+/*** EndHeader */
+
+_arp_nodebug ATHandle arpcache_create_iface(longword ipaddr, word iface)
+{
+	auto word idx;
+	auto ATEntry * ate;
+	auto ATHandle ath;
+	auto word i;
+	auto int f, g;
+	auto long remtime, age, xtime, ftime;
+
+   LOCK_GLOBAL(TCPGlobalLock);
+
+	ath = arpcache_search_iface(ipaddr, 1, iface);
+	if (ath > 0)
+		goto _arp_finish;
+
+	// Find a suitable entry.  Out of the existing table entries, we do not
+	// consider any with ATE_PERMANENT, ATE_ROUTER_ENT or ATE_RESOLVING.  Of
+	// the remaining entries, we select in the following order of preference:
+	//   First unused entry (ath == 0)
+	//   First entry with ATE_NOARP set
+	//   Entry with ATE_GRACE with shortest remaining time
+	//   Oldest entry marked with the ATE_FLUSH flag (i.e. arpcache_flush() called)
+	//     - note that this does actually consider permanent and router entries, but not
+	//       resolving.  (Resolving entries cannot have flush anyway).
+	//   Remaining entry, with shortest remaining time to expiry.
+	// Only if all these tests fail to select an entry will NOENTRIES be returned.
+
+	for (i = 0; i < ARP_TABLE_SIZE; i++)
+		if (!_arp_data[i].ath)
+			goto _arp_got_entry;
+
+	for (i = 0; i < ARP_TABLE_SIZE; i++)
+		if (_arp_data[i].flags & ATE_NOARP &&
+		    !(_arp_data[i].flags & (ATE_PERMANENT | ATE_ROUTER_ENT | ATE_RESOLVING)))
+			goto _arp_got_entry;
+
+	g = -1;
+	f = -1;
+	for (i = 0; i < ARP_TABLE_SIZE; i++)
+		if (!(_arp_data[i].flags & (ATE_PERMANENT | ATE_ROUTER_ENT | ATE_RESOLVING))) {
+			remtime = (long)(_arp_data[i].timestamp - MS_TIMER);
+			if (_arp_data[i].flags & ATE_GRACE && (g < 0 || remtime < xtime)) {
+				xtime = remtime;
+				g = i;
+			}
+			if (f < 0 || remtime < ftime) {
+				ftime = remtime;
+				f = i;
+			}
+		}
+	if (g >= 0) {
+		i = g;
+		goto _arp_got_entry;
+	}
+
+	g = -1;
+	for (i = 0; i < ARP_TABLE_SIZE; i++)
+		if (_arp_data[i].flags & ATE_FLUSH &&
+		    !(_arp_data[i].flags & (ATE_PERMANENT | ATE_ROUTER_ENT | ATE_RESOLVING))) {
+			age = (long)(MS_TIMER - _arp_data[i].timestamp);
+			if (g < 0 || age > xtime) {
+				xtime = age;
+				g = i;
+			}
+		}
+	if (g >= 0) {
+		i = g;
+		goto _arp_got_entry;
+	}
+	if (f >= 0) {
+		i = f;
+		goto _arp_got_entry;
+	}
+#ifdef ARP_VERBOSE
+	printf("ARP: could not create new entry for IP %08lX, i/f %d\n", ipaddr, iface);
+#endif
+	ath = ATH_NOENTRIES;
+_arp_finish:
+   UNLOCK_GLOBAL(TCPGlobalLock);
+	return ath;
+
+_arp_got_entry:
+	// Found suitable entry (index in i).
+	ate = _arp_data + i;
+	_arp_seqnum += 0x0100;
+	if (_arp_seqnum < 0)
+		_arp_seqnum = 0x0100;
+	ath = i + _arp_seqnum;			// New sequence number, plus index i
+	memset(ate, 0, sizeof(*ate));
+	ate->ath = ath;
+	ate->ip = ipaddr;
+   ate->iface = iface;
+	_arp_unlink_to(ate);		// Remove from timeout chain
+#ifdef ARP_VERBOSE
+	printf("ARP: created new entry %d (for %08lX on i/f %d)\n", i, ipaddr, iface);
+#endif
+	goto _arp_finish;
+}
+
+/*** BeginHeader arpcache_new */
+ATHandle arpcache_new(longword source, void * _hwa, word iface);
+/*** EndHeader */
+_arp_nodebug ATHandle arpcache_new(longword source, void * _hwa, word iface)
+{
+#ifndef ARP_MINIMAL
+	// Assumed that caller holds global lock.  This function called out of
+	// TCP and UDP handler when new host sends SYN or UDP packet.  This creates
+	// an entry (maybe volatile) since we probably want to send reply etc.
+	auto ATHandle ath;
+	auto word aflags, i;
+	auto byte ru;
+
+   if (IF_P2P(iface))
+   	return ATH_P2P + iface;
+   else {
+		if ((ath = arpcache_create_iface(source, iface)) < 0)
+			return ath;
+
+		// Do not create an ARP entry for a virtual handle (>= ATH_LOOPBACK)
+		i = ATH2INDEX(ath);
+		if (i < ATH_LOOPBACK) {
+			aflags = _arp_data[i].flags;
+			ru = _arp_data[i].router_used;
+			if (!aflags)
+				aflags = ATE_VOLATILE;
+			aflags |= ATE_RESOLVED;
+			if (IS_NONLOCAL_SUBNET(source, iface))
+				aflags |= ATE_ROUTER_HOP;	// Must be via router if not local to this i/f
+			aflags &= ~(ATE_RESOLVING|ATE_GRACE|ATE_NOARP);
+			arpcache_load(ath, _hwa, iface, aflags, ru);
+		}
+	}
+	return ath;
+#else
+	return ATH_P2P + iface;
+#endif
+}
+
+/*** BeginHeader arpcache_printflags */
+char * arpcache_printflags(char * buf, word flags);
+/*** EndHeader */
+
+_arp_nodebug char * arpcache_printflags(char * buf, word flags)
+{
+	// Buffer should be at least 43 chars
+	buf[0] = 0;
+	buf[1] = 0;
+	if (flags & ATE_PERMANENT) strcat(buf, " Perm");
+	if (flags & ATE_RESOLVING) strcat(buf, " Query");
+	if (flags & ATE_ROUTER_ENT) strcat(buf, " GW");
+	if (flags & ATE_FLUSH) strcat(buf, " Flu");
+	if (flags & ATE_VOLATILE) strcat(buf, " Vol");
+	if (flags & ATE_ROUTER_HOP) strcat(buf, " Hop");
+	if (flags & ATE_REDIRECTED) strcat(buf, " Redir");
+	if (flags & ATE_MULTICAST) strcat(buf, " Mcast");
+	if (flags & ATE_RESOLVED) strcat(buf, " OK");
+	return buf+1;
+}
+
+/*** BeginHeader arpcache_print */
+void arpcache_print(word e);
+/*** EndHeader */
+
+_arp_nodebug void arpcache_print(word e)
+{
+	auto ATEntry * ate;
+   auto char ipaddr[16];
+   auto char ethaddr[18];
+	auto char tempflgs[43];
+
+	if (e >= ARP_TABLE_SIZE || !_arp_data[e].ath)
+		return;
+	ate = _arp_data + e;
+
+   printf("%2u %2u %1u %-15s %-17s %2u %s\n",
+   	ATH2INDEX(ate->ath),
+      ATH2SEQNO(ate->ath),
+      ate->iface,
+      inet_ntoa(ipaddr, ate->ip),
+      inet_ethtoa(ethaddr, (byte *)&ate->hwa),
+      ate->router_used,
+		arpcache_printflags(tempflgs, ate->flags)
+      );
+
+}
+
+
+/*** BeginHeader arpcache_printall */
+void arpcache_printall(void);
+/*** EndHeader */
+
+_arp_nodebug
+void arpcache_printall(void)
+{
+	auto word i;
+   for (i = 0; i < ARP_TABLE_SIZE; i++)
+   	if (_arp_data[i].ath)
+      	break;
+   if (i == ARP_TABLE_SIZE)
+   	return;
+	printf("\nARP cache:\n\n");
+   printf("#  v  i ip              eth               ru flags\n");
+   printf("-- -- - --------------- ----------------- -- ---------------------\n");
+   for (i = 0; i < ARP_TABLE_SIZE; i++)
+     	arpcache_print(i);
+}
+
+
+/*** BeginHeader arpcache_load */
+ATHandle arpcache_load(ATHandle ath, void * _hwa, word iface,
+	word flags, byte router_used);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+arpcache_load									<ARP.LIB>
+
+SYNTAX: ATHandle arpcache_load(ATHandle ath,void * hwa, byte iface,
+                               word flags, byte router_used)
+
+KEYWORDS:      tcpip, arp
+
+DESCRIPTION:   Load an entry in the ARP cache table.  The entry must have
+               been created using arpcache_create(), or be an existing
+               valid entry located via arpcache_search().
+
+               This function is primarily intended for internal use by the
+               ARP library, although advanced applications could also use
+               it.  Most applications should not need to call this
+               function directly.
+
+PARAMETER1:    Handle for the entry.
+PARAMETER2:    Hardware (ethernet) address, or NULL.  Pass NULL if the
+               current hardware address is not to be changed.  Points
+               to 6 bytes of storage containing the address.
+PARAMETER3:    Interface to use (IF_DEFAULT to use default, IF_ANY to
+               not change current setting).
+PARAMETER4:    Flags for entry: one or more of the following values, OR'd
+               together:
+                 ATE_PERMANENT: permanent entry
+                 ATE_RESOLVING: initiate network resolve for this entry
+                   (hwa is ignored if this flag is set)
+                 ATE_RESOLVED: this entry now resolved
+                 ATE_ROUTER_ENT: this is a router entry
+                 ATE_FLUSH: mark this entry for flush
+                 ATE_VOLATILE: set short timeout for this entry
+                 ATE_ROUTER_HOP: this entry uses the specified router
+                   as the first hop.  hwa ignored.
+                 ATE_REDIRECTED: this entry redirected by ICMP.
+               Only one of ATE_ROUTER_ENT or ATE_ROUTER_HOP should be
+               set.  For either of these, the next parameter indicates
+               the router table entry to use.
+               Only one of ATE_RESOLVING or ATE_RESOLVED should be set.
+PARAMETER5:    Router table entry.  Only used if one of ATE_ROUTER_ENT
+               or ATE_ROUTER_HOP is set in the flags parameter.
+
+RETURN VALUE:  Positive value: success.
+               ATH_NOROUTER: the specified router entry number is invalid.
+               	This can be because the router_used parameter is bad, or
+               	because the router entry has a mismatching ATH.
+               ATH_INVALID: invalid table handle passed (or unused entry).
+               ATH_OBSOLETE: the given handle was valid, but obsoleted by
+                 a more recent entry.  No change made.
+END DESCRIPTION **********************************************************/
+
+
+_arp_nodebug ATHandle arpcache_load(ATHandle ath, void * _hwa,
+	word iface, word flags, byte router_used)
+{
+#ifndef ARP_MINIMAL
+#define _ARP_LOADABLE_FLAGS (ATE_PERMANENT | ATE_RESOLVING | ATE_ROUTER_ENT | ATE_FLUSH | \
+	         ATE_VOLATILE | ATE_ROUTER_HOP | ATE_REDIRECTED | ATE_RESOLVED | ATE_MULTICAST)
+	auto word idx, didx;
+	auto ATEntry * ate;
+	auto ATEntry * dep;
+	auto RTEntry * rte;
+	auto byte * hwa;
+
+	if (ATH_IS_P2P(ath))
+		// Allow "loading" of point-to-point virtual entries.  The ath value itself
+		// specifies everything we need to know, since only the interface number is
+		// important.  Hence we can safely ignore the given information (which may be
+		// spurious if the caller is not aware of the underlying interface type).
+		return ath;
+
+	idx = ATH2INDEX(ath);
+	if (idx >= ARP_TABLE_SIZE)
+		return ATH_INVALID;
+	ate = _arp_data + idx;
+	if (!ate->ath)
+		return ATH_INVALID;
+	if (ate->ath != ath)
+		return ATH_OBSOLETE;
+	hwa = (byte *)_hwa;
+
+   LOCK_GLOBAL(TCPGlobalLock);
+	// Zero out inappropriate flags
+	flags &= _ARP_LOADABLE_FLAGS;
+	if (flags & (ATE_ROUTER_ENT | ATE_ROUTER_HOP) == (ATE_ROUTER_ENT | ATE_ROUTER_HOP))
+		flags &= ~ATE_ROUTER_ENT;		// Assume hop if mutual exclusion not satisfied
+
+	if (flags & ATE_RESOLVED) {
+		flags &= ~ATE_RESOLVING;
+		ate->flags &= ~(ATE_RETRY_MASK|ATE_GRACE|ATE_NOARP);
+
+		// Set a flag for upper layers indicating most recently resolved entry.
+		// If e.g. a TCP socket is waiting for resolve, then this is a quick test
+		// to get it going as soon as possible.
+		_arp_resolved = ath;
+	}
+
+	ate->flags &= ~_ARP_LOADABLE_FLAGS;
+	ate->flags |= flags;
+
+	if (flags & ATE_RESOLVED && flags & ATE_ROUTER_ENT) {
+		// If this is a router entry which is resolved, then check if any other
+		// entries (specific hosts) are dependent on this entry.  If such entries
+		// are found (whether resolved or not) recursively resolve them to
+		// this router's address.  Only one extra level of recursion is possible.
+		// This ensures that all dependent entries are kept up-to-date.
+		for (dep = _arp_data, didx = 0; didx < ARP_TABLE_SIZE; didx++, dep++) {
+			if (!dep->ath || !(dep->flags & ATE_ROUTER_HOP))
+				continue;
+			rte = _arp_gate_data + dep->router_used;
+			if (rte->ath == ath) {
+				// Found a reference
+#ifdef ARP_VERBOSE
+				if (!(dep->flags & ATE_RESOLVED))
+					printf("ARP: Following entry loaded because router resolved...\n");
+#endif
+				arpcache_load(dep->ath, hwa, iface, dep->flags | ATE_RESOLVED,
+					dep->router_used);
+			}
+		}
+	}
+
+
+	if (hwa)
+		memcpy(&ate->hwa, hwa, sizeof(ate->hwa));
+
+	if (iface != IF_ANY)
+		ate->iface = iface;
+
+	if (flags & ATE_RESOLVED && !(flags & (ATE_PERMANENT|ATE_ROUTER_HOP))) {
+		// Set refresh timeouts.  This is not done for entries which refer to a router,
+		// since the router entry itself gets refreshed appropriately.
+		if (flags & ATE_VOLATILE)
+			_arp_sched_to(ate, ARP_SHORT_EXPIRY*1000L);
+		else
+			_arp_sched_to(ate, ARP_LONG_EXPIRY*1000L);
+	}
+
+	if (flags & ATE_ROUTER_HOP)
+		ate->router_used = router_used;
+
+#ifdef ARP_VERBOSE
+	printf("ARP: loaded entry:\n");
+	arpcache_print(idx);
+#endif
+_arp_finish:
+   UNLOCK_GLOBAL(TCPGlobalLock);
+#endif
+	return ath;
+}
+
+/*** BeginHeader arpresolve_start */
+ATHandle arpresolve_start(longword ipaddr);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+arpresolve_start									<ARP.LIB>
+
+SYNTAX: ATHandle arpresolve_start(longword ipaddr)
+
+KEYWORDS:      tcpip, arp
+
+DESCRIPTION:   Start resolve process for the given IP address.  This may
+               return immediately if the IP address is in the ARP cache
+               table and still valid.  Otherwise, if the IP address is
+               on the local subnet then an ARP resolve request is issued
+               through the appropriate interface.  If the address is not
+               on the local subnet, then a router table entry is used
+               and no network activity is necessary (unless the router
+               itself is not resolved, in which case its resolution is
+               commenced).
+
+               If ipaddr is zero, then the broadcast entry is returned,
+               since this is required for DHCP when our IP address is
+               not yet known.
+
+PARAMETER1:    IP address of host whose hardware address is to be resolved.
+
+RETURN VALUE:  Positive value: success.  The value is actually the ATH of
+                 the ARP cache table entry which is (or will be) used.
+                 This value should be passed to subsequent calls to
+                 arpresolve_check().
+               ATH_NOENTRIES: no space is available in the table, and none
+                 of the entries could be purged, because they were all
+                 marked as permanent or router entries.
+               ATH_NOROUTER: no router ("gateway") is configured for the
+                 specified address, which is not on the local subnet.
+
+SEE ALSO:      arpresolve_start_iface
+END DESCRIPTION **********************************************************/
+
+
+_arp_nodebug ATHandle arpresolve_start(longword ipaddr)
+{
+	return arpresolve_start_iface(ipaddr, IF_ANY);
+}
+
+/*** BeginHeader arpresolve_start_iface */
+ATHandle arpresolve_start_iface(longword ipaddr, word iface);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+arpresolve_start_iface									<ARP.LIB>
+
+SYNTAX: ATHandle arpresolve_start_iface(longword ipaddr, word iface)
+
+KEYWORDS:      tcpip, arp
+
+DESCRIPTION:   Start resolve process for the given IP address.  This may
+               return immediately if the IP address is in the ARP cache
+               table and still valid.  Otherwise, if the IP address is
+               on the local subnet of the specified interface then an ARP
+               resolve request is issued through that interface.  If the
+               address is not on the local subnet, then a router table
+               entry (with router on the given interface) is used
+               and no network activity is necessary (unless the router
+               itself is not resolved, in which case its resolution is
+               commenced).
+
+               If ipaddr is zero, then the broadcast entry is returned,
+               since this is required for DHCP when our IP address is
+               not yet known.
+
+               This function is identical to arpresolve_start() if the
+               iface parameter is set to IF_ANY.
+
+PARAMETER1:    IP address of host whose hardware address is to be resolved.
+PARAMETER2:    Specific interface (or IF_ANY to get the library to select
+               the most appropriate interface).  A specific interface
+               forces the use of that interface, even if there is no
+               route available.  This function should only be used to
+               override the normal interface selection procedure.
+
+RETURN VALUE:  Positive value: success.  The value is actually the ATH of
+                 the ARP cache table entry which is (or will be) used.
+                 This value should be passed to subsequent calls to
+                 arpresolve_check().
+               ATH_NOENTRIES: no space is available in the table, and none
+                 of the entries could be purged, because they were all
+                 marked as permanent or router entries.
+               ATH_NOROUTER: no router ("gateway") is configured for the
+                 specified address, which is not on the local subnet of
+                 the specified interface.
+
+SEE ALSO:      arpresolve_start
+END DESCRIPTION **********************************************************/
+
+
+_arp_nodebug ATHandle arpresolve_start_iface(longword ipaddr, word iface)
+{
+	auto ATHandle ath, rath;
+	auto ATEntry * ate, * rate;
+	auto word r_used, r_iface;
+
+#ifdef ARP_VERBOSE
+	printf("ARP: arpresolve_start for IP %08lX  i/f %u...\n", ipaddr, iface);
+#endif
+	if (IS_SUBNET_BCAST_ADDR(ipaddr, iface) || !ipaddr)
+		return ATH_BROADCAST;
+   if (IS_LOOPBACK_ADDR(ipaddr))
+   	return ATH_LOOPBACK;
+
+   LOCK_GLOBAL(TCPGlobalLock);
+#ifndef ARP_MINIMAL
+	if (iface == IF_ANY ? IS_ALL_NONLOCAL_SUBNET(ipaddr) : IS_NONLOCAL_SUBNET(ipaddr, iface)) {
+		// Locate router entry.
+		rath = router_for_iface(ipaddr, &r_used, &r_iface, iface);
+		if (rath < 0) {
+			ath = rath;
+			goto _arp_finish;	// No router located
+		}
+		if (ATH_IS_P2P(rath)) {
+			// Router is point-to-point, no real ARP required
+			ath = rath;
+			goto _arp_finish;
+		}
+	}
+	else {
+   	// If local address, determine the correct specific interface
+   	if (iface == IF_ANY) {
+   		iface = ip_iface(ipaddr, 1);
+   		if (iface == IF_ANY) {
+   			ath = ATH_NOTFOUND;
+   			goto _arp_finish;
+   		}
+   	}
+      if (IF_P2P(iface)) {
+      	// If that is a point-point peer, use pseudo entry.
+      	ath = ATH_P2P + iface;
+         goto _arp_finish;
+      }
+		rath = 0;
+   }
+	ath = arpcache_search_iface(ipaddr, 1, iface);
+	if (ath > 0) {
+#ifdef ARP_VERBOSE
+		printf("ARP: ...in cache entry %u\n", ATH2INDEX(ath));
+#endif
+		if (ATH2INDEX(ath) >= ARP_TABLE_SIZE)
+			goto _arp_finish;
+      // Since requesting it, make it non-volatile
+      _arp_data[ATH2INDEX(ath)].flags &= ~ATE_VOLATILE;
+	}
+	else {
+		ath = arpcache_create_iface(ipaddr, iface);
+		if (ath < 0)
+			goto _arp_finish;
+	}
+	ate = _arp_data + ATH2INDEX(ath);
+	if (ate->flags & ATE_RESOLVED)
+		goto _arp_finish;
+
+	if (rath) {
+		// Found router entry, above.
+		ate->router_used = r_used;
+		ate->iface = r_iface;
+		rate = _arp_data + ATH2INDEX(rath);
+		ate->flags |= ATE_ROUTER_HOP;
+		if (rate->flags & ATE_RESOLVED) {
+			ate->flags |= ATE_RESOLVED;
+			memcpy(&ate->hwa, &rate->hwa, sizeof(ate->hwa));
+			goto _arp_finish;
+		}
+		ate->flags |= ATE_RESOLVING;
+		ate = rate;
+	}
+	if (!(ate->flags & ATE_RESOLVING)) {
+		ate->flags |= ATE_RESOLVING;
+		ate->flags &= ~ATE_RETRY_MASK;
+		_arp_request(ate->ip, -1, iface);
+		_arp_sched_to(ate, 1000L);	// First timeout at 1 second.
+	}
+#else
+	ath = router_for_iface(ipaddr, &r_used, &r_iface, iface);
+#endif
+_arp_finish:
+   UNLOCK_GLOBAL(TCPGlobalLock);
+	return ath;
+}
+
+
+/*** BeginHeader arpresolve_ipaddr */
+longword arpresolve_ipaddr(ATHandle ath);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+arpresolve_ipaddr									<ARP.LIB>
+
+SYNTAX: longword arpresolve_ipaddr(ATHandle ath)
+
+KEYWORDS:      tcpip, arp
+
+DESCRIPTION:   Given an ARP table handle, return the IP address of the
+               corresponding table entry.
+
+PARAMETER1:    ARP Table Handle obtained from e.g. router_for_iface().
+
+RETURN VALUE:  Zero: an error occurred, such as an invalid or obsolete
+                 handle.
+               0xFFFFFFFF: the handle refers to either the broadcast
+                 address, or to a point-to-point entry whose IP address
+                 is not defined.
+               Else: an IP address.  This may be 127.0.0.1 for the
+                 loopback entry.
+END DESCRIPTION **********************************************************/
+
+
+_arp_nodebug longword arpresolve_ipaddr(ATHandle ath)
+{
+	auto unsigned idx;
+	auto ATEntry * ate;
+
+	idx = ATH2INDEX(ath);
+	if (idx >= ATH_LOOPBACK) {
+		if (ath == ATH_LOOPBACK)
+			return 0x7F000000;
+		else
+			return 0xFFFFFFFF;
+	}
+	if (idx >= ARP_TABLE_SIZE)
+		return 0;
+	ate = _arp_data + ATH2INDEX(ath);
+	if (ate->ath != ath)
+		return 0;
+	return ate->ip;
+}
+
+/*** BeginHeader arpresolve_check */
+ATHandle arpresolve_check(ATHandle ath, longword ipaddr);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+arpresolve_check									<ARP.LIB>
+
+SYNTAX: ATHandle arpresolve_check(ATHandle ath, longword ipaddr)
+
+KEYWORDS:      tcpip, arp
+
+DESCRIPTION:   Check up on status of resolve process initiated by
+               arpresolve_start().  This function should be called
+               regularly to ensure that an ARP table handle is
+               pointing to the correct entry, and that the entry is
+               still current.
+
+               The caller must call tcp_tick() if spinning on this
+               function.
+
+PARAMETER1:    ARP Table Handle obtained from arpresolve_start().
+PARAMETER2:    IP address specified to arpresolve_start().  If this is
+               zero, no check is performed.  Otherwise, the ARP table
+               entry is checked to see that it is the correct entry
+               for the specified IP address.
+
+RETURN VALUE:  Positive value: completed successfully.  The return
+                 value will be the same as the ath parameter.
+               ATH_AGAIN: not yet completed, try again later.
+               ATH_FAILED: completed in error.  Address cannot be
+                 resolved because of a network configuration problem.
+               ATH_TIMEDOUT: resolve timed out.  No response from
+                 addressee within the configured time limit.
+               ATH_INVALID: the ath parameter was not a valid handle
+               ATH_OBSOLETE: the given handle was valid, but obsoleted by
+                 a more recent entry.  Restart using arpresolve_start().
+                 This is also returned if the implied interface is
+                 currently down.
+               ATH_MISMATCH: the ipaddr parameter was not zero, and the
+                 IP address does not match the table entry.
+END DESCRIPTION **********************************************************/
+
+
+_arp_nodebug _system ATHandle arpresolve_check(ATHandle ath,
+	longword ipaddr)
+{
+	auto unsigned idx;
+	auto ATEntry * ate;
+   auto word iface;
+   longword mask;
+
+   if (ath < 0)
+   	return ATH_INVALID;
+	idx = ATH2INDEX(ath);
+	if (idx >= ATH_LOOPBACK) {
+		if (idx >= ATH_P2P) {
+      	iface = idx - ATH_P2P;
+#ifdef ARP_VERBOSE
+			printf("ARP: check returns point-to-point i/f %d\n", iface);
+#endif
+			if (!ifstatus(iface)) {
+#ifdef ARP_VERBOSE
+				printf("ARP: ...which is now DOWN\n");
+#endif
+         	return ATH_OBSOLETE;
+         }
+			return ath;
+		}
+#ifdef ARP_VERBOSE
+		printf("ARP: check returns bcast/loopback\n");
+#endif
+		if (ipaddr) {
+			// Check that the IP address is indeed the loopback address (127.x.x.x)
+			// or the broadcast address as appropriate.
+			if (idx < ARP_TABLE_SIZE && _arp_data[idx].iface < IF_MAX+VIRTUAL_ETH)
+				mask = _if_tab[_arp_data[idx].iface].mask;
+			else
+				mask = 0xFFFFFFFFuL;
+			if (ath == ATH_LOOPBACK && !IS_LOOPBACK_ADDR(ipaddr) ||
+			    ath == ATH_BROADCAST && ~ipaddr & ~mask)
+				return ATH_MISMATCH;
+		}
+		return ath;
+	}
+#ifndef ARP_MINIMAL
+   LOCK_GLOBAL(TCPGlobalLock);
+	if (idx >= ARP_TABLE_SIZE) {
+#ifdef ARP_VERBOSE
+		printf("ARP: check returns INVALID (bad handle)\n");
+#endif
+		ath = ATH_INVALID;
+		goto _arp_finish;
+	}
+	ate = _arp_data + idx;
+	if (!ate->ath) {
+#ifdef ARP_VERBOSE
+		printf("ARP: check returns INVALID (unused)\n");
+#endif
+		ath = ATH_INVALID;
+		goto _arp_finish;
+	}
+	if (ate->ath != ath) {
+#ifdef ARP_VERBOSE
+		printf("ARP: check returns OBSOLETE\n");
+#endif
+		ath = ATH_OBSOLETE;
+		goto _arp_finish;
+	}
+
+	if (ipaddr && ate->ip != ipaddr) {
+#ifdef ARP_VERBOSE
+		printf("ARP: check returns MISMATCH\n");
+#endif
+		ath = ATH_MISMATCH;
+		goto _arp_finish;
+	}
+   if (!ifstatus(ate->iface)) {
+#ifdef ARP_VERBOSE
+		printf("ARP: check returns OBSOLETE (i/f %d DOWN)\n", ate->iface);
+#endif
+		ath = ATH_OBSOLETE;
+		goto _arp_finish;
+   }
+
+	if (ate->flags & ATE_RESOLVED)
+		goto _arp_finish;
+
+	if (ate->flags & ATE_RESOLVING) {
+		ath = ATH_AGAIN;
+		goto _arp_finish;
+	}
+	if (ate->flags & ATE_NOARP) {
+#ifdef ARP_VERBOSE
+		printf("ARP: check returns TIMEDOUT\n");
+#endif
+		// After the first return of TIMEDOUT, flush the entry so it can be reused.
+		arpcache_flush(ath);
+		ath = ATH_TIMEDOUT;
+	}
+	else {
+#ifdef ARP_VERBOSE
+		printf("ARP: check returns FAILED\n");
+#endif
+		ath = ATH_FAILED;
+	}
+_arp_finish:
+   UNLOCK_GLOBAL(TCPGlobalLock);
+#else
+	ath = ATH_INVALID;
+#endif
+	return ath;
+}
+
+
+/*** BeginHeader router_ipaddr */
+longword router_ipaddr(RTEntry * rte);
+/*** EndHeader */
+_arp_nodebug longword router_ipaddr(RTEntry * rte)
+{
+#ifndef ARP_MINIMAL
+	if (ATH_IS_P2P(rte->ath))
+		return _if_tab[rte->ath - ATH_P2P].u.ppp.peeraddr;
+	else
+		return _arp_data[ATH2INDEX(rte->ath)].ip;
+#else
+	return _if_tab[rte->ath - ATH_P2P].u.ppp.peeraddr;
+#endif
+}
+
+
+/*** BeginHeader router_add */
+ATHandle router_add(longword ipaddr, word iface, longword subnet,
+	longword mask, word flags);
+extern int _router_last_add;
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+router_add									<ARP.LIB>
+
+SYNTAX: ATHandle router_add(longword ipaddr, byte iface, longword subnet,
+                            longword mask, word flags)
+
+KEYWORDS:      tcpip, arp
+
+DESCRIPTION:   Add a router to the router table.  The same router can be
+               added multiple times, with different subnet and mask.
+               Normally, only one entry is needed in order to access
+               non-local subnets: this entry should be specified with
+               a zero mask.  The hardware address of the router is not
+               immediately resolved, however this can be done explicitly
+               by calling arpresolve_start() with the same IP address.
+               Otherwise, the router will be resolved only when it first
+               becomes necessary.
+
+               If the specified IP address for the router is not on the
+               local subnet of the specified interface, then the entry
+               is still added.  This may cause routing problems, however
+               it is not possible to check at this point since the
+               subnet mask or ip address of the interface may be changed
+               subsequently.  It is up to the application to perform
+               a sanity check first!  If routers are specified by DHCP,
+               it will not add any router which does not appear to be
+               locally accessible, given the current interface status.
+
+PARAMETER1:    IP address of the router.  This address should be on the
+               local subnet, since non-local routers are not supported.
+PARAMETER2:    Interface to use to access this router, or IF_DEFAULT.
+               Set to IF_ANY if the appropriate interface is to be
+               selected according to current IP address/netmask.  If
+               this cannot be determined, then ATH_INVALID is returned.
+PARAMETER3:    Subnet accessible through this entry.
+PARAMETER4:    Subnet mask for this entry.
+PARAMETER5:    Flags word: set to zero (non-zero reserved for internal
+                 use).
+
+RETURN VALUE:  Positive value: completed successfully.  The return
+                 value is the ARP cache table entry for this router.
+               ATH_NOENTRIES: insufficient space in either the router-
+                 or ARP cache tables.
+               ATH_INVALID: the iface parameter was IF_ANY, but no current
+                 interface could access the router IP address locally.
+END DESCRIPTION **********************************************************/
+
+// After calling router_add(), this contains the table entry number for the router.
+int _router_last_add;
+
+_arp_nodebug ATHandle router_add(longword ipaddr, word iface,
+	longword subnet, longword mask, word flags)
+{
+	auto unsigned i;
+	auto ATHandle ath;
+	auto RTEntry * rte;
+
+   if (iface == IF_ANY) {
+   	iface = ip_iface(ipaddr, 2);
+      if (iface == IF_ANY) {
+#ifdef ARP_VERBOSE
+			printf("ARP: router_add %08lX - not local\n", ipaddr);
+#endif
+      	return ATH_INVALID;
+      }
+   }
+
+   LOCK_GLOBAL(TCPGlobalLock);
+
+#ifndef ARP_MINIMAL
+   if (IF_P2P(iface)) {
+   	ath = ATH_P2P + iface;
+   }
+	else {
+		// Search for existing entry in ARP cache table.
+		ath = arpcache_search_iface(ipaddr, 0, iface);
+		if (ath == ATH_BROADCAST || ath == ATH_LOOPBACK) {
+#ifdef ARP_VERBOSE
+			printf("ARP: router_add %08lX - bad IP addr\n", ipaddr);
+#endif
+			ath = ATH_INVALID;	// Rounter address bad.
+			goto _arp_finish;
+		}
+	}
+#else
+	ath = ATH_P2P + iface;
+#endif
+
+   if (ath > 0) {
+   	// If in the ATE already, locate its RTE.
+		for (i = 0, rte = _arp_gate_data; i < ARP_ROUTER_TABLE_SIZE; i++, rte++)
+			if (rte->ath && ATH2INDEX(rte->ath) == ATH2INDEX(ath)) {
+				if (!flags && (subnet != rte->u.preconfig.subnet || mask != rte->u.preconfig.mask))
+					continue;	// Skip if preconfigured, but not exactly matching parameters
+#ifdef ARP_VERBOSE
+				printf("ARP: router_add %08lX - entry already in\n", ipaddr);
+#endif
+				if (!(rte->flags & (RTE_TRANSIENT | RTE_DHCP | RTE_REDIRECT))) {
+					// Don't override preconfigured - these values set back in below.
+					flags &= ~(RTE_TRANSIENT | RTE_DHCP | RTE_REDIRECT);
+					subnet = rte->u.preconfig.subnet;
+					mask = rte->u.preconfig.mask;
+				}
+				if (flags & RTE_REDIRECT && rte->flags & (RTE_TRANSIENT | RTE_DHCP))
+					flags &= ~RTE_REDIRECT;	// Don't mark transients as redirects.
+				goto _arp_set_entry;
+			}
+   }
+
+	// Find free entry in router table
+	for (i = 0, rte = _arp_gate_data; i < ARP_ROUTER_TABLE_SIZE; i++, rte++)
+		if (!rte->ath)
+			break;
+	if (i == ARP_ROUTER_TABLE_SIZE) {
+#ifdef ARP_VERBOSE
+		printf("ARP: router_add %08lX - no free entries in RTE\n", ipaddr);
+#endif
+		ath = ATH_NOENTRIES;
+		goto _arp_finish;
+	}
+
+#ifndef ARP_MINIMAL
+	if (ath == ATH_NOTFOUND) {
+#ifdef ARP_VERBOSE
+		printf("ARP: router_add %08lX - new entry\n", ipaddr);
+#endif
+		ath = arpcache_create_iface(ipaddr, iface);
+		if (ath < 0)
+			goto _arp_finish;
+		rte->ath = ath;
+		ath = arpcache_load(ath, NULL, iface, ATE_ROUTER_ENT, i);
+		if (ath < 0) {
+			rte->ath = 0;
+			goto _arp_finish;
+		}
+	}
+#ifdef ARP_VERBOSE
+	else
+		printf("ARP: router_add %08lX - additional entry\n", ipaddr);
+#endif
+#else
+	printf("ARP: router_add %08lX - additional entry\n", ipaddr);
+#endif
+	rte->ath = ath;
+_arp_set_entry:
+	rte->flags = flags;
+	if (!flags) {
+		rte->u.preconfig.subnet = subnet;
+		rte->u.preconfig.mask = mask;
+	}
+	else {
+		rte->u.transient.preference = (long)subnet;
+		rte->u.transient.timestamp = _SET_TIMEOUT(mask);
+	}
+_arp_finish:
+	_router_last_add = i;
+   UNLOCK_GLOBAL(TCPGlobalLock);
+	return ath;
+}
+
+
+/*** BeginHeader router_delete */
+ATHandle router_delete(longword ipaddr);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+router_delete									<ARP.LIB>
+
+SYNTAX: ATHandle router_delete(longword ipaddr)
+
+KEYWORDS:      tcpip, arp
+
+DESCRIPTION:   Delete a router from the router table.  All instances of
+               the router's IP address are deleted, and the ARP cache
+               table entry is flushed.
+
+PARAMETER1:    IP address of the router.  This address should be on the
+               local subnet, since non-local routers are not supported.
+
+RETURN VALUE:  Positive value: completed successfully.
+               ATH_NOTFOUND: specified entry did not exist.
+END DESCRIPTION **********************************************************/
+
+
+_arp_nodebug _system ATHandle router_delete(longword ipaddr)
+{
+	auto unsigned i;
+	auto RTEntry * rte;
+	auto ATEntry * ate;
+	auto ATHandle ath;
+
+	ath = ATH_NOTFOUND;
+   LOCK_GLOBAL(TCPGlobalLock);
+	for (i = 0, rte = _arp_gate_data; i < ARP_ROUTER_TABLE_SIZE; i++, rte++)
+		if (rte->ath && router_ipaddr(rte) == ipaddr) {
+      	ath = rte->ath;
+#ifndef ARP_MINIMAL
+			ate = _arp_data + ATH2INDEX(ath);
+         if (ate->ath == ath)
+         	ate->flags &= ~ATE_ROUTER_ENT;	// No router any more
+			arpcache_flush(ath);
+#endif
+			rte->ath = 0;	// Mark unused
+		}
+
+
+   UNLOCK_GLOBAL(TCPGlobalLock);
+	return ath;
+}
+
+
+/*** BeginHeader router_del_all */
+void router_del_all(void);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+router_del_all									<ARP.LIB>
+
+SYNTAX: void router_del_all(void)
+
+KEYWORDS:      tcpip, arp
+
+DESCRIPTION:   Delete all router table entries.  This will make any host
+               which is not on the local subnet inaccessible.  This
+               function is usually called in preparation for adding a
+               new router entry.
+
+END DESCRIPTION **********************************************************/
+
+
+_arp_nodebug void router_del_all(void)
+{
+	auto unsigned i;
+	auto RTEntry * rte;
+	auto ATHandle ath;
+
+	// This function may be called pre-sock_init().  If so, then there will
+	// be no ARP cache entries, so flush will not be called.
+   LOCK_GLOBAL_IF_INIT(TCPGlobalLock);
+#ifndef ARP_MINIMAL
+	for (i = 0, rte = _arp_gate_data; i < ARP_ROUTER_TABLE_SIZE; i++, rte++)
+		if (rte->ath) {
+			ath = ATH2INDEX(rte->ath);
+			if (ath < ARP_TABLE_SIZE)
+				arpcache_flush(rte->ath);
+			rte->ath = 0;
+		}
+#else
+	memset(_arp_gate_data, 0, sizeof(_arp_gate_data));
+#endif
+   UNLOCK_GLOBAL_IF_INIT(TCPGlobalLock);
+}
+
+/*** BeginHeader router_reachable_iface */
+int router_reachable_iface(longword rip, ATHandle ath, word iface);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+router_reachable_iface									<ARP.LIB>
+
+SYNTAX:	int router_reachable_iface(longword rip, ATHandle ath, word iface)
+
+KEYWORDS:      tcpip, arp
+
+DESCRIPTION:	Test if specified router is directly reachable on the
+					given interface.  "Reachable" is defined as the router
+					being directly on the subnet of the interface.
+
+					If the interface is not up, or its IP address is not
+					known, or the router IP address is not accessible under
+					the netmask, then false is returned.  Also, the router
+					must not be the subnet network address or the subnet broadcast
+					address, and must not be equal to the interface address.
+
+					Note that there is no network activity generated (e.g.
+					to test that the router can actually be used).  This is
+					only a test based on local knowledge of the network
+					configuration.
+
+PARAMETER1:    IP address of the router to test (or zero to use next parameter).
+PARAMETER2:    If parameter 1 is zero, then use this ARP table handle instead.
+PARAMETER3:    Interface number.  May also be IF_ANY, in which case any one
+					interface from which the router is reachable gives a positive
+					result.
+
+RETURN VALUE:  Positive: router is currently reachable.
+               0: not reachable according to current configuration.
+
+SEE ALSO:      router_for_iface
+
+END DESCRIPTION **********************************************************/
+
+_arp_nodebug int router_reachable_iface(longword rip, ATHandle ath, word iface)
+{
+	auto longword m, a;
+	auto word il, ih;
+	if (!rip)
+		if (arpcache_ipaddr(ath, &rip) < 0)
+			return 0;
+	if (iface == IF_ANY) {
+		il = 0;
+		ih = IF_MAX;
+	}
+	else {
+		il = iface;
+		ih = iface + 1;
+	}
+	for (iface = il; iface < ih; ++iface) {
+	   if (ifpending(iface) != IF_UP)
+	      continue;
+	   m = _if_tab[iface].mask;
+	   if ((rip & m) != (_if_tab[iface].ipaddr & m))
+	      continue;
+	   if (rip == _if_tab[iface].ipaddr)
+	      continue;
+	   a = rip & ~m;
+	   if (!a || a == ~m)
+	      continue;
+	   return 1;
+	}
+	return 0;
+}
+
+
+
+/*** BeginHeader router_for_iface */
+ATHandle router_for_iface(longword ipaddr, word * router_used,
+	word * r_iface, word siface);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+router_for_iface									<ARP.LIB>
+
+SYNTAX: ATHandle router_for_iface(longword ipaddr, word * router_used,
+                            word * r_iface, word siface)
+
+KEYWORDS:      tcpip, arp
+
+DESCRIPTION:   Return the ARP cache table entry corresponding to the
+               router which handles the given IP address on a specific
+               interface.
+
+               If the siface parameter is IF_ANY, then
+               return the ARP cache table entry corresponding to the
+               router which handles the given IP address.  If there is
+               a preconfigured router for the given address, it is
+               selected.  Otherwise, routers discovered via DHCP or
+               ICMP router discovery are searched, with the highest
+               preference being selected.  Failing this, if there is
+               a point-to-point interface, this is selected as the
+               default.
+
+               If the specified IP address already has an entry in the
+               ARP cache table, and there is a router already defined
+               for that address, then the current router is returned.
+               This overrides any other selection process.
+
+               Where multiple routers can be used to access the given
+               IP address, the one whose entry has the most specific
+               netmask is used.  If the netmasks are equal, then an
+               arbitrary entry is used.
+
+               An alternative mode of calling this function is invoked
+               if ipaddr is zero.  In this case, the default router
+               for the specified interface (siface) is returned.
+               If siface is IF_ANY, then the most general router entry
+               is returned i.e. the overall default.
+
+               If siface is a virtual ethernet i/f, then if
+               there is no specific router defined, then the router
+               for the underlying real interface will be used.  This
+               may not be satisfactory if the router is not on the
+               subnet defined for the virtual i/f.  Thus, if non-
+               overlapping subnets are used then the virtual i/f should
+               have a valid router explicitly defined.
+
+PARAMETER1:    IP address of the host which is not on the local subnet,
+               or zero to find a default router.
+PARAMETER2:    If not NULL, the word at this location is set to the
+               index of the router in the router table.
+PARAMETER3:    If ipaddr is non-zero this is an output parameter:
+                 If not NULL, the word at this location is set to the
+                 interface number that can access the router.
+PARAMETER4:    Specific interface, or IF_ANY to select the best router
+               for the given IP address.
+               The returned router (if any) will also
+               be checked that it is "reachable" i.e. valid for the
+               interface.  In particular, if the interface is not currently
+               up, then no router will be returned.  Also, any misconfigured
+               router will not be returned.
+
+RETURN VALUE:  Positive value: completed successfully.
+               ATH_NOROUTER: no suitable router found.  Either no router
+                 is configured, or the given IP address is on the local
+                 subnet of the specified interface, or no router on the
+                 specified interface can handle the address based on the
+                 router network/netmask information in the router table.
+
+SEE ALSO:      router_add
+
+END DESCRIPTION **********************************************************/
+
+_arp_nodebug ATHandle router_for_iface(longword ipaddr,
+	word * router_used, word * r_iface, word siface)
+{
+	auto word i, rx, first;
+	auto RTEntry * rte;
+	auto ATEntry * ate;
+	auto ATHandle ath, ath2;
+	auto long maxpref;
+	auto word iface2, riface;
+	auto int dflt_mode;
+	auto longword maxmask, rip;
+
+#if VIRTUAL_ETH
+   auto int viface;
+
+   // Check if this is a virtual interface
+   viface = (siface != IF_ANY && siface >= IF_MAX);
+_retry_real:
+#endif
+
+	ath = ATH_NOROUTER;
+	if (!ipaddr) {
+		dflt_mode = 1;
+      if (siface == IF_ANY) {
+         // Special mode to locate overall default.  This is taken to be the
+         // first preconfigured entry with 0 mask, or the first DHCP entry encountered.
+         for (i = 0, rte = _arp_gate_data; i < ARP_ROUTER_TABLE_SIZE; i++, rte++)
+            if (rte->ath && (!rte->flags && !rte->u.preconfig.mask || rte->flags & RTE_DHCP)) {
+            	// Also, should be reachable
+            	if (!router_reachable_iface(0, rte->ath, siface))
+            		continue;
+               ath = rte->ath;
+               rx = i;
+               break;
+            }
+         goto _rf_setresult;
+      }
+#ifdef ARP_VERBOSE
+		printf("ARP: default router_for i/f %u...\n", siface);
+#endif
+	}
+	else {
+		dflt_mode = 0;
+#ifdef ARP_VERBOSE
+		if (siface == IF_ANY)
+			printf("ARP: router_for %08lX on any i/f...\n", ipaddr);
+		else
+			printf("ARP: router_for %08lX (forced i/f %u)...\n", ipaddr, siface);
+#endif
+	}
+
+#ifndef ARP_MINIMAL
+	if (!dflt_mode) {
+		if (siface != IF_ANY) {
+			if (IS_LOCAL_SUBNET(ipaddr, siface)) {
+#ifdef ARP_VERBOSE
+				printf("ARP: no router for %08lX on specific i/f: local subnet\n", ipaddr);
+#endif
+				return ath;
+			}
+		}
+		else for (iface2 = 0; iface2 < IF_MAX; iface2++)
+			if (ifstatus(iface2) && IS_LOCAL_SUBNET(ipaddr,iface2)) {
+#ifdef ARP_VERBOSE
+				printf("ARP: no router for %08lX: local subnet\n", ipaddr);
+#endif
+				return ath;
+			}
+	}
+#endif
+
+   LOCK_GLOBAL(TCPGlobalLock);
+   // First choice: if the table has an entry for ipaddr, and that entry already refers to a
+   // router, return that router.  This allows ICMP redirects to be persistent.
+   // The interface must be up, otherwise we try a different router
+   if (!dflt_mode) {
+   	ath2 = arpcache_search_iface(ipaddr, 0, siface);
+	   if (ath2 > 0) {
+  	 		ate = _arp_data + ATH2INDEX(ath2);
+         if (ifstatus(ate->iface) &&
+   		    ate->flags & ATE_ROUTER_HOP &&
+   		    router_reachable_iface(0, ath2, siface)) {
+   			rx = ate->router_used;
+#ifdef ARP_VERBOSE
+				printf("ARP: (previous entry #%d)\n", rx);
+#endif
+   			ath = _arp_gate_data[rx].ath;
+   		}
+   	}
+   }
+
+   // Next choice: a preconfigured router with appropriate subnet/mask.  Search all entries
+   // to locate the one with "most specific" mask, i.e. numerically highest mask which
+   // matches.  If we happen to find an exact match, i.e. the destination address is a
+   // router itself, return that entry directly.  Again, we ignore routers on 'down' interfaces.
+   first = 1;
+	if (ath < 0) for (i = 0, rte = _arp_gate_data; i < ARP_ROUTER_TABLE_SIZE; i++, rte++)
+		if (rte->ath) {
+      	if (!ATH_IS_P2P(rte->ath) && rte->ath != _arp_data[rte->ath & 0xFF].ath)
+         	// ARP cache was purged for this rounter.  Don't consider it.
+         	continue;
+			if (rte->flags & (RTE_TRANSIENT | RTE_DHCP | RTE_REDIRECT | RTE_DEAD))
+				continue;
+#ifndef ARP_MINIMAL
+         if (!ATH_IS_P2P(rte->ath)) {
+				ate = _arp_data + ATH2INDEX(rte->ath);
+         	riface = ate->iface;
+         }
+         else
+#endif
+         	riface = rte->ath - ATH_P2P;
+			if (!ifstatus(riface))
+         	continue;
+			if (dflt_mode) {
+         	if (riface != siface)
+            	continue;
+			}
+			else {
+				rip = router_ipaddr(rte);
+				if (siface != IF_ANY && IS_NONLOCAL_SUBNET(rip, siface))
+					continue;
+				if (ipaddr == rip) {
+					ath = rte->ath;
+					rx = i;
+					break;
+				}
+				if ((ipaddr ^ rte->u.preconfig.subnet) & rte->u.preconfig.mask)
+					continue;
+				if (first || rte->u.preconfig.mask > maxmask) {
+					maxmask = rte->u.preconfig.mask;
+					rx = i;
+					ath = rte->ath;
+					first = 0;
+				}
+			}
+			if (dflt_mode) {
+				ath = rte->ath;
+				rx = i;
+				break;
+			}
+		}
+
+	// Last choice: the non-redirect router with highest preference, which has not yet
+	// exceeded its lifetime.
+	if (ath < 0) {
+		maxpref = 0x80000000;	// min long
+		for (i = 0, rte = _arp_gate_data; i < ARP_ROUTER_TABLE_SIZE; i++, rte++) {
+			if (!rte->ath || !(rte->flags & (RTE_TRANSIENT | RTE_DHCP)) || rte->flags & RTE_DEAD ||
+               !ATH_IS_P2P(rte->ath) && rte->ath != _arp_data[rte->ath & 0xFF].ath)
+				continue;
+#ifndef ARP_MINIMAL
+         if (!ATH_IS_P2P(rte->ath)) {
+				ate = _arp_data + ATH2INDEX(rte->ath);
+         	riface = ate->iface;
+         }
+         else
+#endif
+         	riface = rte->ath - ATH_P2P;
+			if (!ifstatus(riface))
+         	continue;
+			if (rte->flags & RTE_TRANSIENT && chk_timeout(rte->u.transient.timestamp))
+				// Exceeded its lifetime
+				continue;
+			if (dflt_mode) {
+         	if (riface != siface)
+            	continue;
+			}
+			else {
+				rip = router_ipaddr(rte);
+				if (siface != IF_ANY && IS_NONLOCAL_SUBNET(rip, siface))
+					continue;
+			}
+			if (rte->u.transient.preference > maxpref) {
+				maxpref = rte->u.transient.preference;
+				ath = rte->ath;
+				rx = i;
+			}
+		}
+		if (!dflt_mode && ath < 0 && IF_P2P(IF_DEFAULT)) {
+			ath = ATH_P2P + IF_DEFAULT;
+			rx = 0;
+		}
+	}
+
+	// If we have a valid ATH, set in the requested results.
+	// At this point:
+	//   rx = router table entry number
+	//   ath = router entry in ARP cache ( > 0 if valid)
+_rf_setresult:
+	if (ath > 0) {
+		if (router_used)
+			*router_used = (byte)rx;
+		if (!dflt_mode && r_iface) {
+#ifndef ARP_MINIMAL
+			if (ATH_IS_P2P(ath))
+				*r_iface = ath - ATH_P2P;
+			else
+				*r_iface = _arp_data[ATH2INDEX(ath)].iface;
+#else
+			*r_iface = ath - ATH_P2P;
+#endif
+		}
+	}
+
+#if VIRTUAL_ETH
+	if (ath < 0 && viface) {
+	#ifdef ARP_VERBOSE
+		printf("ARP: ...no router for virtual i/f %d, trying real i/f\n", (int)siface);
+	#endif
+      siface = _if_tab[siface].u.eth.riface;
+   	viface = 0;
+      goto _retry_real;
+   }
+#endif
+
+#ifdef ARP_VERBOSE
+	if (dflt_mode)
+		if (ath < 0)
+			printf("ARP: ...no router for i/f %d\n", (int)siface);
+		else {
+			printf("ARP: ...router for i/f %d is entry ATE=%u:\n", (int)siface, ATH2INDEX(ath));
+			router_print(rx);
+		}
+	else
+		if (ath < 0)
+			if (siface == IF_ANY)
+				printf("ARP: ...no router for %08lX on any i/f\n", ipaddr);
+			else
+				printf("ARP: ...no router for %08lX on i/f %u\n", ipaddr, siface);
+		else {
+			printf("ARP: ...router for %08lX is entry ATE=%u:\n", ipaddr, ATH2INDEX(ath));
+			router_print(rx);
+		}
+#endif
+   UNLOCK_GLOBAL(TCPGlobalLock);
+	return ath;
+}
+
+
+
+/*** BeginHeader router_print */
+int router_print(word r);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+router_print									<ARP.LIB>
+
+SYNTAX: int router_print(word r)
+
+KEYWORDS:      tcpip, arp
+
+DESCRIPTION:   Print a router table entry, indexed by 'r'.  This is for
+               debugging only, since the reults are printed to the
+               Dynamic C stdio window.  'r' may be obtained from the
+               router_for_iface() function, by passing &r as the
+               router_used parameter to that function.
+
+               If the specified router entry is not in use, nothing is
+               printed and the return value is non-zero.  Otherwise,
+               the information is printed and 0 returned.
+
+               See router_printall() for a description of the output
+               fields printed.
+
+PARAMETER1:    Router table index.  A number from 0 through
+               (ARP_ROUTER_TABLE_SIZE-1).
+
+RETURN VALUE:  0: OK.
+               else: entry not in use
+
+SEE ALSO:      router_printall
+END DESCRIPTION **********************************************************/
+_arp_nodebug
+int router_print(word r)
+{
+	auto RTEntry * rte;
+	auto ATEntry * ate;
+	auto char ip_string[32];
+	auto char rte_flags[7];
+	auto char ip_subnet[16];
+	auto char ip_mask[16];
+	auto int rsvd;
+	auto word iface;
+
+	if (r >= ARP_ROUTER_TABLE_SIZE || !_arp_gate_data[r].ath)
+		return -1;
+	rte = _arp_gate_data + r;
+	if (ATH_IS_P2P(rte->ath)) {
+		iface = (word)rte->ath - ATH_P2P;
+		sprintf(ip_string, "%-15s %u"
+			, inet_ntoa(ip_mask, _if_tab[iface].u.ppp.peeraddr)
+			, iface);
+		ate = NULL;
+		rsvd = 1;
+	}
+	else {
+		ate = _arp_data + ATH2INDEX(rte->ath);
+		sprintf(ip_string, "%-15s %u"
+	     ,inet_ntoa(ip_mask, ate->ip)
+	     ,(word)ate->iface
+	   	);
+	  	rsvd = ate->flags & ATE_RESOLVED;
+	}
+	sprintf(rte_flags, "%c%c%c%c%c"
+		  ,ATH_IS_P2P(rte->ath) ? '@' :
+		   rte->flags & RTE_TRANSIENT ? 'T' :
+		   !(rte->flags & (RTE_TRANSIENT|RTE_DHCP|RTE_REDIRECT)) ? 'P' : ' '
+		  ,rte->flags & RTE_DHCP ? 'D' : ' '
+		  ,rte->flags & RTE_REDIRECT ? 'R' : ' '
+		  ,rte->flags & RTE_DEAD ? '?' : ' '
+		  ,rsvd ? 'H' : ' '
+			);
+	if (rte->flags & (RTE_TRANSIENT|RTE_DHCP|RTE_REDIRECT))
+		printf("%2u %s %17s %15d %15d\n"
+		  ,(unsigned)r
+		  ,rte_flags
+		  ,ip_string
+		  ,rte->u.transient.preference
+		  ,(long)(rte->u.transient.timestamp - MS_TIMER) / 1000
+			);
+	else
+		printf("%2u %s %17s %-15s %-15s\n"
+		  ,(unsigned)r
+		  ,rte_flags
+		  ,ip_string
+		  ,inet_ntoa(ip_subnet, rte->u.preconfig.subnet & rte->u.preconfig.mask)
+		  ,inet_ntoa(ip_mask, rte->u.preconfig.mask)
+			);
+	return 0;
+}
+
+/*** BeginHeader router_printall */
+int router_printall(void);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+router_printall									<ARP.LIB>
+
+SYNTAX: int router_printall(void)
+
+KEYWORDS:      tcpip, arp
+
+DESCRIPTION:   Print all router table entries.  This is for debugging only,
+               since the results are printed to the Dynamic C stdio window.
+               If no routers exist in the table, nothing is printed and
+               the return value is non-zero.
+
+               There are 6 fields for each router entry:
+                 #:
+                   the entry number
+                 Flags:
+                   A list of the following characters:
+                     P = this entry preconfigured
+                     @ = this is point-to-point interface
+                     T = transient entry
+                     D = added by DHCP/BOOTP
+                     R = added by ICMP redirect
+                     ? = router not reachable
+                     H = router's hardware address resolved (or is pt-pt)
+                 Address:
+                   The router's IP address, or the peer's address if this
+                   is a point-to-point interface.
+                 i/f:
+                   Interface number
+                 Net/preference
+                   For preconfigured entries, indicates the network(s)
+                   which are served by this entry (the Mask indicates
+                   which bits of the IP address are used to match with
+                   the network address).  For non-preconfigured entries,
+                   this is the "preference value" assigned.
+                 Mask/exp(sec)
+                   For preconfigured entries, the bitmask to apply to IP
+                   addresses when matching against the above network.
+                   Otherwise, is the expiry time from the present, in
+                   seconds, of a transient entry.
+
+RETURN VALUE:  0: OK.
+               else: no routers
+END DESCRIPTION **********************************************************/
+_arp_nodebug
+int router_printall(void)
+{
+	auto word r;
+
+	for (r = 0; r < ARP_ROUTER_TABLE_SIZE; r++)
+		if (_arp_gate_data[r].ath)
+			break;
+	if (r == ARP_ROUTER_TABLE_SIZE)
+		return -1;
+
+	printf("\nRouter table:\n\n");
+	printf("#  Flags Address       i/f Net/preference  Mask/exp(sec)\n");
+	printf("-- ----- ------------- --- --------------- ---------------\n");
+	for (r = 0; r < ARP_ROUTER_TABLE_SIZE; r++)
+		router_print(r);
+	return 0;
+}
+
+
+/*** BeginHeader _arp_tick */
+void _arp_tick(void);
+/*** EndHeader */
+
+_arp_nodebug void _arp_tick(void)
+{
+	// Since the shortest timeout is 1 second, this function should only be called
+	// about twice per second for best efficiency.
+	// Caller must hold global lock.
+	auto word retry;
+
+	if (_arp_towait && (long)(MS_TIMER - _arp_towait->timestamp) >= 0) {
+		// The next ARP table entry with a timeout has expired.  Determine the
+		// reason for the timeout and take action.
+		if (_arp_towait->flags & ATE_RESOLVING) {
+			// No response to last ARP request packet
+			retry = (_arp_towait->flags & ATE_RETRY_MASK) >> ATE_RETRY_SHIFT;
+			if (retry >= ARP_PERSISTENCE) {
+				// Too many retries.  This host must be dead.
+#ifdef ARP_VERBOSE
+				printf("ARP: nobody has %08lX i/f %d :-(\n", _arp_towait->ip, _arp_towait->iface);
+#endif
+				_arp_towait->flags &= ~(ATE_GRACE | ATE_RESOLVING | ATE_RESOLVED);
+				_arp_towait->flags |= ATE_NOARP | ATE_FLUSH;
+				_arp_sched_to(_arp_towait, ARP_PURGE_TIME*1000L);	// Next event far off.
+			}
+			else {
+				if (retry < 7)
+					retry++;
+				_arp_towait->flags &= ~ATE_RETRY_MASK;
+				_arp_towait->flags |= retry << ATE_RETRY_SHIFT;
+				_arp_request(_arp_towait->ip, -1, _arp_towait->iface);
+				_arp_sched_to(_arp_towait, 1000L << retry);	// Exponential backoff (up to 128 seconds).
+			}
+		}
+#ifdef USE_IGMP
+		else if (_arp_towait->flags & ATE_MULTICAST) {
+			// Not an ARP entry, but an IGMP group that needs a report sent
+			_igmp_sendreport(_arp_towait->iface, _arp_towait->ip,
+			                 _IGMP_MEMBERSHIP_REPORT);
+			_arp_unlink_to(_arp_towait);
+		}
+#endif
+		else if (_arp_towait->flags & ATE_FLUSH) {
+			// End of life for flushed entry.  Set it to unused.
+#ifdef ARP_VERBOSE
+			printf("ARP: purging flushed entry %08lX i/f %d\n", _arp_towait->ip, _arp_towait->iface);
+#endif
+			// If the entry is for a router, we don't delete it, since router entries are persistent
+         // even if ARP fails.  This should only occur if the application called arpcache_flush()
+         // for a router entry.  The library itself should never do this.
+         if (_arp_towait->flags & ATE_ROUTER_ENT) {
+#ifdef ARP_VERBOSE
+            printf("ARP: ...was router, keeping it\n");
+#endif
+				_arp_towait->flags &= ~ATE_FLUSH;
+         }
+			else
+				_arp_towait->ath = 0;
+			_arp_unlink_to(_arp_towait);
+		}
+		else if (!(_arp_towait->flags & ATE_VOLATILE)) {
+			// Expiration of normal entry lifetime.  Move to grace period and redo resolve, unless
+         // this is a volatile entry.
+#ifdef ARP_VERBOSE
+			printf("ARP: refreshing %08lX i/f %d\n", _arp_towait->ip, _arp_towait->iface);
+#endif
+			_arp_towait->flags |= ATE_RESOLVING | ATE_GRACE;
+			_arp_towait->flags &= ~ATE_RETRY_MASK;
+			_arp_request(_arp_towait->ip, -1, _arp_towait->iface);
+			_arp_sched_to(_arp_towait, 1000L);	// First timeout at 1 second.
+		}
+      else {
+      	// Volatile.  Flush the entry instead.
+         arpcache_flush(_arp_towait->ath);
+      }
+	}
+}
+
+/*** BeginHeader _arp_send_response */
+int _arp_send_response( word iface, arp_Header __far *arp);
+/*** EndHeader */
+// returns 0 if successfully sent, 1 if calling pkt_gather failed
+_arp_nodebug
+int _arp_send_response( word iface, arp_Header __far *in)
+{
+	// Caller must hold global lock
+   auto byte pkt_hdr[IP_MAX_LL_HDR + sizeof(arp_Header)];
+   auto ether_ll_hdr * ep;
+	auto ll_Gather g;
+	auto arp_Header *op;
+
+   ep = (ether_ll_hdr *)pkt_hdr;
+   //ep->iface = (byte)iface;
+   ep->type = ARP_TYPE;
+	// Per RFC 3927 Section 2.5: "All ARP packets (*replies* as well as requests)
+	// that contain a link-local sender IP address MUST be sent using a
+	// link-layer broadcast instead of link-layer unicast.  This aids timely
+	// detection of duplicate addresses."
+	if (IS_LINKLOCAL_ADDR( intel( in->dstIPAddr)))
+	{
+		memset( ep->dest, 0xFF, sizeof(eth_address));
+	}
+	else
+	{
+	   _f_memcpy(ep->dest, &in->srcEthAddr, sizeof(eth_address));
+	}
+   memcpy(ep->src, my_eth_addr[iface], sizeof(eth_address));
+   op = (arp_Header *)(ep + 1);
+   op->hwType = arp_TypeEther;
+   op->protType = IP_TYPE;
+   op->hwProtAddrLen = sizeof(eth_address) + (sizeof(longword) << 8 );
+   op->opcode = ARP_REPLY;
+
+   op->dstIPAddr = in->srcIPAddr;
+   op->srcIPAddr = in->dstIPAddr;
+   memcpy(&op->srcEthAddr, my_eth_addr[iface], sizeof(eth_address));
+   _f_memcpy(&op->dstEthAddr, &in->srcEthAddr, sizeof(eth_address));
+#ifdef ARP_VERBOSE
+	printf("ARP: telling %08lX that I have %08lX on i/f %u\n",
+		intel(in->srcIPAddr), intel(in->dstIPAddr), iface);
+#endif
+   memset(&g, 0, sizeof(g));
+   g.iface = (byte)iface;
+   g.len1 = sizeof(*ep) + sizeof(*op);
+   g.data1 = (char __far *)ep;
+
+   return pkt_gather(&g);
+}
+
+/*** BeginHeader _arp_handler */
+ll_prefix __far * _arp_handler(ll_prefix __far * LL, byte * hdrbuf);
+/*** EndHeader */
+
+/*
+ * _arp_handler - handle incoming ARP packets
+ */
+_arp_nodebug ll_prefix __far * _arp_handler(ll_prefix __far * LL, byte * hdrbuf)
+{
+	// Caller must hold global lock
+   auto arp_Header *in;
+   auto longword his_ip, dst_ip, new_ip;
+   auto ATEntry *ate;
+   auto ATHandle ath;
+   auto word flags;
+   auto int query_me;
+   auto word iface;
+   auto int impersonate;
+#if VIRTUAL_ETH
+	auto word viface;
+#endif
+
+   if (LL->len < LL->net_offs + sizeof(arp_Header))
+   	return LL;	// Discard it, too short to contain ARP header
+
+   _pkt_buf2root(LL, in = (arp_Header *)(hdrbuf+LL->net_offs), sizeof(arp_Header), LL->net_offs);
+  	LL->net_proto = NET_PROTO_ARP;	// Got valid ARP packet
+
+   if (in->hwType != arp_TypeEther ||      // have ethernet hardware,
+       in->protType != IP_TYPE ||          // and IP network layer
+       in->opcode != ARP_REQUEST && in->opcode != ARP_REPLY) {	// Normal ARP (not RARP)
+#ifdef ARP_VERBOSE
+		printf("ARP: handler got non-ethernet/IP/ARP - ignoring\n");
+#endif
+      return LL;
+   }
+
+   iface = LL->iface;
+
+#ifdef USE_LINKLOCAL
+	// linklocal library needs to see all ARP packets for address selection
+	if (linklocal_arphandler( iface, in))
+	{
+		// handled by link-local library, no additional processing necessary
+		return LL;
+	}
+#endif
+
+   // continuously accept data - but only for people we talk to.
+   his_ip = intel(in->srcIPAddr);
+   dst_ip = intel(in->dstIPAddr);
+   impersonate = IS_MY_ADDR(his_ip, iface);
+#if VIRTUAL_ETH
+   if (!IS_MY_ADDR(dst_ip, iface)) {
+		for (viface = IF_MAX; viface < IF_MAX+VIRTUAL_ETH; viface++)
+      	if (!(_if_tab[viface].u.eth.eflags & EFLAG_VIRT))
+         	break;
+      	else if (IS_MY_ADDR(dst_ip, viface)) {
+            iface = viface;
+            break;
+         }
+   }
+#endif
+   query_me = in->opcode == ARP_REQUEST &&
+					IS_MY_ADDR(dst_ip, iface);
+
+#ifdef USE_DHCP
+	// DHCP operating when interface is pending up.  Forward ARP replies to DHCP since this
+   // may indicate a misconfigured DHCP server or other host.
+   if (ifpending(iface) == IF_COMING_UP && in->opcode == ARP_REPLY) {
+   	dhcp_handle_arp(iface, his_ip);
+      return LL;
+   }
+#endif
+
+#ifdef ARP_VERBOSE
+	if (query_me)
+		printf("ARP: %08lX is asking for my address on i/f %u\n", his_ip, iface);
+	else if (in->opcode == ARP_REQUEST)
+		printf("ARP: who has %08lX? Tell %08lX  i/f %d\n", dst_ip, his_ip, iface);
+	else
+		printf("ARP: %08lX replying to %08lX  i/f %d\n", his_ip, dst_ip, iface);
+#endif
+
+	// Note that we allow '0' as a valid local source address, since we may need to respond
+   // to hosts who are not yet configured.
+   // If we are being queried, allow any supposed source address, since some hosts will ARP us
+   // from an IP address belonging to an interface which is not on the local subnet (but that host
+   // has another i/f which is on the local subnet).
+   // Note that some applications (bridges/routers) might like to bypass this
+   // test, hence the #ifndef...
+#ifndef _ARP_IGNORE_INVALID_SOURCE_IP
+	if (!query_me && his_ip && !IS_VALID_LOCAL_SOURCE(his_ip, iface)) {
+#ifdef ARP_VERBOSE
+		printf("ARP: ignored because invalid source IP address\n");
+#endif
+		return LL;
+	}
+#endif
+
+#if VIRTUAL_ETH
+	if (!impersonate)
+	   for (viface = IF_MAX; viface < IF_MAX+VIRTUAL_ETH; viface++)
+	      if (!(_if_tab[viface].u.eth.eflags & EFLAG_VIRT))
+	         break;
+	      else if (IS_MY_ADDR(his_ip, viface)) {
+	         impersonate = 1;
+            iface = viface;
+	         break;
+	      }
+#endif
+
+	if (impersonate) {
+		// Uh oh, somebody else is impersonating us!  This indicates a misconfigured
+		// network.  Consult the application to determine what to do.
+		if (in->opcode == ARP_REQUEST)
+		{
+			if (his_ip == dst_ip)
+			{
+	         // This is a gratuitous ARP: we are first with the address, so let's
+	         // respond saying we have it, and do nothing else.
+#ifdef ARP_VERBOSE
+				printf("ARP: responding to gratuitous ARP with apparent address " \
+					"conflict on i/f %u\n", iface);
+#endif
+	         _arp_send_response( iface, in);
+	      }
+	      else
+	      {
+				// Someone is using our IP address, and is asking about some other
+				// address (his_ip matches our IP, but not dst_ip).  Send a
+				// gratuitous ARP so everyone knows that we're using that IP.
+#ifdef ARP_VERBOSE
+				printf("ARP: responding to apparent address conflict on i/f %u " \
+					"with gratuitous ARP\n", iface);
+#endif
+				_arp_send_gratuitous( iface);
+	      }
+			return LL;
+		}
+
+		// If it's a reply, it is more serious for us.
+#ifdef ARP_VERBOSE
+      printf("ARP: someone else replying to REQUEST for my IP %08lX (i/f %u)\n",
+         his_ip, iface);
+#endif
+#ifdef ARP_CONFLICT_CALLBACK
+		new_ip = ARP_CONFLICT_CALLBACK(in);
+		if (new_ip) {
+			if (new_ip != 0xFFFFFFFF) {
+				// Callback specified that we change our IP address.  Abort all
+				// open sockets.
+				_abort_socks(NETERR_IPADDR_CHANGE, iface);
+				_if_tab[iface].ipaddr = new_ip;
+			}
+			else {
+				// Callback specified that we just abort all open sockets.
+				_abort_socks(NETERR_IPADDR_CONFLICT, iface);
+				_if_tab[iface].ipaddr = 0;
+			}
+		}
+#endif
+		return LL;
+	}
+
+   ath = arpcache_search_iface(his_ip, 0, iface);
+   if (ath > 0) {
+   	// If the sender's IP address is in our cache, update the cache entry.
+		ate = _arp_data + ATH2INDEX(ath);
+		flags = ate->flags;
+#ifdef ARP_VERBOSE
+		printf("ARP: reloading because his IP address in cache\n");
+#endif
+		ath = arpcache_load(ath, (byte *)&in->srcEthAddr, (byte)iface, flags | ATE_RESOLVED, 0);
+   }
+   else if (query_me && his_ip) {
+   	// If we are being queried from a valid IP (not 0.0.0.0), create a
+   	// volatile entry if we can, since we will probably be talking to him
+   	// real soon.
+   	ath = arpcache_create_iface(his_ip, iface);
+#ifdef ARP_VERBOSE
+		printf("ARP: speculative loading because query_me\n");
+#endif
+   	ath = arpcache_load(ath, (byte *)&in->srcEthAddr, (byte)iface,
+   				ATE_VOLATILE | ATE_RESOLVED, 0);
+   }
+
+   if (query_me) {
+   	// We had better respond.
+   	_arp_send_response( iface, in);
+   }
+
+   return LL;
+}
+
+/*** BeginHeader _arp_send_gratuitous */
+int _arp_send_gratuitous(word iface);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+_arp_send_gratuitous			<ARP.LIB>
+
+SYNTAX: int _arp_send_gratuitous(word iface);
+
+KEYWORDS:		tcpip, arp
+
+DESCRIPTION:   When a host sends an ARP request to resolve its own IP address,
+					it is called gratuitous ARP. In the ARP request packet,
+					the source IP address and destination IP address are
+					filled with the same source IP address itself. The
+					destination MAC address is the Ethernet broadcast
+					address (FF:FF:FF:FF:FF:FF).
+
+					Gratuitous ARP is used for the following:
+						1. In a properly configured network, there will
+						not be an ARP reply for a gratuitous ARP
+						request. But if another host in the network
+						is also configured with the same IP address
+						as the source host, then the source host will
+						get an ARP reply. In this way, a host can
+						determine whether another host is also
+						configured with its IP address.
+
+						2. When the network interface card in a system
+						is changed, the MAC address to its IP
+						address mapping is changed. In this case,
+						when the host is rebooted, it will send an
+						ARP request packet for its own IP address.
+						As this is a broadcast packet, all the hosts
+						in the network will receive and process
+						this packet. They will update their
+						old mapping in the ARP cache
+						with this new mapping.
+
+PARAMETER1:    Interface number.
+
+RETURN VALUE:  1 for success; 0 for failure.
+
+END DESCRIPTION **********************************************************/
+_arp_nodebug int _arp_send_gratuitous(word iface)
+{
+	_arp_request( _if_tab[iface].ipaddr, _if_tab[iface].ipaddr, iface);
+	return 1;
+}
+
+
+/*** BeginHeader _arp_resolve */
+int _arp_resolve( longword ina, eth_address *ethap, int nowait );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+_arp_resolve									<ARP.LIB>
+
+SYNTAX: int _arp_resolve(longword ina, eth_address *ethap, int nowait);
+
+KEYWORDS:		tcpip, arp
+
+DESCRIPTION: 	_arp_resolve can be used to get the ethernet address for
+					the given ip address.  This function is deprecated,
+					but retained for compatibility with existing code.  New
+					code should use the arpresolve_start()/check() functions.
+
+PARAMETER1: 	IP address to resolve to ethernet address
+PARAMETER2: 	buffer to hold the address
+               if NULL do not return the ethernet address
+PARAMETER3: 	if non-zero return quickly, else wait up to 5 seconds
+               trying to resolve the address
+
+RETURN VALUE:  1 for success; 0 for failure.
+END DESCRIPTION **********************************************************/
+
+/*
+ * _arp_resolve - resolve IP address to hardware address
+ */
+_arp_nodebug int _arp_resolve(longword ina, eth_address *ethap,
+	int nowait )
+{
+	auto ATHandle ath, rc;
+	auto longword timeout;
+
+#ifdef ARP_VERBOSE
+	printf("ARP: old-fashioned resolve for %08lX (%s)\n", ina, nowait ? "nowait" : "wait 5 sec");
+#endif
+   ath = arpresolve_start(ina);
+   if (ath < 0)
+   	return 0;
+
+   timeout = _SET_TIMEOUT(5000);
+   do {
+   	tcp_tick(NULL);
+   	rc = arpresolve_check(ath, ina);
+   	if (rc > 0) {
+#ifndef ARP_MINIMAL
+   		if (ethap)
+   			arpcache_hwa(ath, (byte *)ethap);
+#endif
+   		return 1;
+   	}
+   	if (nowait)
+   		break;
+   	if (chk_timeout(timeout))
+   		break;
+   } while (rc == ATH_AGAIN);
+   arpcache_flush(ath);
+   return 0;
+}
+
+/*** BeginHeader _arpcache_multicast_setuserflag */
+ATHandle _arpcache_multicast_setuserflag(ATHandle ath, byte userflag);
+/*** EndHeader */
+
+_arp_nodebug ATHandle _arpcache_multicast_setuserflag(ATHandle ath, byte userflag)
+{
+	auto ATEntry * ate;
+
+	// NOTE: No consistency checking on this function, since it is internal
+	ate = _arp_data + ATH2INDEX(ath);
+	ate->u.multicast.userflag = userflag;
+
+	return ath;
+}
+
+/*** BeginHeader _arpcache_multicast_getuserflag */
+ATHandle _arpcache_multicast_getuserflag(ATHandle ath, byte* userflag);
+/*** EndHeader */
+
+_arp_nodebug ATHandle _arpcache_multicast_getuserflag(ATHandle ath, byte* userflag)
+{
+	auto ATEntry * ate;
+
+	// NOTE: No consistency checking on this function, since it is internal
+	ate = _arp_data + ATH2INDEX(ath);
+	*userflag = ate->u.multicast.userflag;
+
+	return ath;
+}
+
+/*** BeginHeader _arpcache_multicast_saveslot */
+ATHandle _arpcache_multicast_saveslot(ATHandle ath, int slot);
+/*** EndHeader */
+
+_arp_nodebug ATHandle _arpcache_multicast_saveslot(ATHandle ath, int slot)
+{
+	auto ATEntry * ate;
+
+	// NOTE: No consistency checking on this function, since it is internal
+	ate = _arp_data + ATH2INDEX(ath);
+	ate->u.multicast.slot = slot;
+
+	return ath;
+}
+
+/*** BeginHeader _arpcache_mc_checkhashremove */
+int _arpcache_mc_checkhashremove(ATHandle ath);
+/*** EndHeader */
+
+_arp_nodebug int _arpcache_mc_checkhashremove(ATHandle ath)
+{
+	auto ATEntry * ate;
+	auto int i;
+
+	// Check if there are any other multicast addresses that hash to the
+	// save value on the given interface
+	// Return 1 if there is at least one other of the same hash
+	// Return 0 if it is OK to remove
+
+	// NOTE: No consistency checking on this function, since it is internal
+	ate = _arp_data + ATH2INDEX(ath);
+
+	for (i = 0; i < ARP_TABLE_SIZE; i++) {
+		if (_arp_data[i].ath != 0 &&
+		    _arp_data[i].ath != ath &&
+		    (_arp_data[i].flags & ATE_MULTICAST) &&
+		    _arp_data[i].iface == ate->iface &&
+		    _arp_data[i].u.multicast.slot == ate->u.multicast.slot) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/*** BeginHeader _arpcache_delete */
+void _arpcache_delete(ATHandle ath);
+/*** EndHeader */
+_arp_nodebug
+void _arpcache_delete(ATHandle ath)
+{
+	auto ATEntry * ate;
+
+	// NOTE: No consistency checking on this function, since it is internal
+	ate = _arp_data + ATH2INDEX(ath);
+	_arp_unlink_to(ate);
+	memset(ate, 0, sizeof(ATEntry));
+}
+
+/*** BeginHeader _arpcache_report_all_multicasts */
+void _arpcache_report_all_multicasts(word iface, int deciseconds);
+/*** EndHeader */
+_arp_nodebug
+void _arpcache_report_all_multicasts(word iface, int deciseconds)
+{
+	auto int i;
+
+	// Loop through all arp cache entries, and schedule membership
+	// reports for each multicast entry
+	for (i = 0; i < ARP_TABLE_SIZE; i++) {
+		if (_arp_data[i].ath != 0 && (_arp_data[i].flags & ATE_MULTICAST) &&
+		    _arp_data[i].iface == iface) {
+			_arp_sched_to_multicast_random(_arp_data[i].ath, deciseconds);
+		}
+	}
+}
+
+/*** BeginHeader _arp_sched_to_multicast */
+// Schedule timeout for this table entry to number of deciseconds
+// from now
+void _arp_sched_to_multicast(ATHandle ath, byte deciseconds);
+/*** EndHeader */
+_arp_nodebug
+void _arp_sched_to_multicast(ATHandle ath, byte deciseconds)
+{
+	_arp_sched_to(&(_arp_data[ATH2INDEX(ath)]),
+	              deciseconds * 100uL);
+}
+
+/*** BeginHeader _arp_sched_to_multicast_random */
+// Schedule timeout for this table entry from 0 to deciseconds
+// from now
+void _arp_sched_to_multicast_random(ATHandle ath, byte deciseconds);
+/*** EndHeader */
+_arp_nodebug
+void _arp_sched_to_multicast_random(ATHandle ath, byte deciseconds)
+{
+	auto byte ds;
+
+	ds = (byte)(TICK_TIMER % deciseconds);
+	_arp_sched_to(&(_arp_data[ATH2INDEX(ath)]), ds * 100uL);
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

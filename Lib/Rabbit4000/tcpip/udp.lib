@@ -1,0 +1,1778 @@
+/*
+ *    udp.lib
+ *    Copyright (C) Rabbit Semiconductor, Inc. All rights reserved.
+ *    Portions used with permission of Erick Engelke.
+ *
+ * User Datagram Protocol.
+ */
+/*** BeginHeader */
+#ifndef UDP_H
+#define UDP_H
+
+#ifdef UDP_DEBUG
+	#define _udp_nodebug __debug
+#else
+	#define _udp_nodebug __nodebug
+#endif
+
+#ifndef IP_H
+	#use "ip.lib"
+#endif
+#ifndef ICMP_H
+	#use "icmp.lib"
+#endif
+
+// Default time-to-live of UDP datagrams.  This value from Internet STD0002
+#ifndef UDP_TTL
+	#define UDP_TTL 64
+#endif
+// Default type-of-service
+#ifndef UDP_TOS
+	#define UDP_TOS IPTOS_DEFAULT
+#endif
+
+typedef struct {
+   word     srcPort;
+   word     dstPort;
+   word     length;
+   word     checksum;
+} udp_Header;
+
+#define UDP_LENGTH sizeof(udp_Header)
+
+#if (MAX_UDP_SOCKET_BUFFERS > 0)
+	void* _udp_buffers[MAX_UDP_SOCKET_BUFFERS];
+#endif
+long _udp_buf_area;
+
+/*
+ * UDP data handler event type codes
+ */
+
+#define UDP_DH_INDATA		3				// New inbound datagram received
+#define UDP_DH_ICMPMSG		10				// Incoming ICMP message
+
+/*
+ * Data structure for a UDP datagram in the socket buffer.  See documentation
+ * under udp_peek().
+ */
+typedef struct {
+	longword remip;			// Peer's IP address
+	word     remport;			// Peer's port
+	int      len;				// Length of following datagram
+	word		flags;			// Flags as follows:
+// Received datagrams:
+#define UDI_ICMP_ERROR		0x0001	// This is an ICMP error entry: data
+												//		following is a _udp_icmp_message.
+#define UDI_TOS_MASK			0x001E	// Mask for received TOS bits
+#define UDI_HWA_VALID		0x0020	// Hardware address field is valid
+#define UDI_BROADCAST_LL	0x0040	// Received on broadcast link-layer address
+												//		(0xFFFFFFFFFFFF)
+#define UDI_BROADCAST_IP	0x0080	// Received on broadcast IP address (local
+												///	or all subnets or 0xFFFFFFFF)
+#define UDI_MULTICAST_LL	0x0100	// Received on multicast link-layer address
+#define UDI_MULTICAST_IP	0x0200	// Received on multicast IP address
+// Transmit (outgoing) datagrams
+#define UDI_OFFSET_MASK		0x1FFF	// Offset (in units of 8 bytes).  If
+												// non-zero, is not first fragment.
+#define UDI_WAIT_ARP			0x4000	// Transmit buffered because not resolved
+#define UDI_TX_BUFFERED		0x8000	// Transmit buffered for any reason (incl ARP)
+	// Note that when buffered, the UDI stored in the tx buffer has its
+	// len field set to the length of the original datagram, however the length
+	// of data that follows the UDI in the tx buffer is actually len-offset
+	// where offset = (flags & UDI_OFFSET_MASK)<<3.
+
+	byte		iface;			// Interface on which received
+	byte		hwa[6];			// Peer's hardware (ethernet) address, if applicable
+} _udp_datagram_info;
+
+typedef struct {
+	word myport;				// Local port from which issued
+	byte icmp_type;			// One of the ICMPTYPE_* values (see ICMP.LIB)
+	byte icmp_code;			// The corresponding ICMP code
+} _udp_icmp_message;
+
+/*** EndHeader */
+
+
+
+/*** BeginHeader udp_sock_init */
+void udp_sock_init(void);
+/*** EndHeader */
+_udp_nodebug void udp_sock_init(void)
+{
+#if (MAX_UDP_SOCKET_BUFFERS > 0)
+	memset(_udp_buffers, 0, sizeof(_udp_buffers));
+#endif
+
+	// Exit here if we've already run sock_init()
+   if(_initialized) return;
+#if (MAX_UDP_SOCKET_BUFFERS > 0)
+	_udp_buf_area = xalloc(MAX_UDP_SOCKET_BUFFERS * (long)UDP_BUF_SIZE);
+#endif
+
+}
+
+/*** BeginHeader udp_alloc_buffer */
+char __far * udp_alloc_buffer(void* sockaddr);
+/*** EndHeader */
+
+_udp_nodebug char __far * udp_alloc_buffer(void* sockaddr)
+{
+#if (MAX_UDP_SOCKET_BUFFERS == 0)
+	return NULL;
+#else
+	auto int i,max,bsize;
+
+	max = MAX_UDP_SOCKET_BUFFERS;
+	bsize = UDP_BUF_SIZE;
+
+	i = 0;
+	while ((i < max) &&
+	       (_udp_buffers[i] != NULL) &&
+	       (_udp_buffers[i] != sockaddr)) {
+		i++;
+	}
+	if (i >= max) {
+		return NULL;
+	} else if (_udp_buffers[i] == NULL) {
+		_udp_buffers[i] = sockaddr;
+	}
+	return (char __far *)(_udp_buf_area + i * bsize);
+#endif
+}
+
+/*** BeginHeader */
+#define udp_open( s, lport, remip, port, datahandler ) \
+	(udp_extopen(s, IF_DEFAULT, lport, remip, port, datahandler, 0, 0))
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+udp_open                               <UDP.LIB>
+
+SYNTAX: int udp_open( udp_Socket *s, word lport, longword remip,
+                      word port, dataHandler_t datahandler );
+
+KEYWORDS:		udp
+
+DESCRIPTION:   Implemented as a MACRO.
+
+					This function opens a UDP socket on the given local port
+					(lport).  If the remote IP address is specified (remip),
+					then only UDP datagrams from that host will be accepted.
+					If remip is 0, then the first datagram received on the
+					local port will complete a connection, so that only the
+					remote host and/or port can subsequently send datagrams to
+					this socket.  Datagrams can not be sent until the
+					connection is completed.  If remip is -1, then all remote
+					hosts can send datagrams to this socket.  Datagrams will
+					be sent to the broadcast address.  The remote port
+					parameter (port) specifies the remote port from which we
+					will accept datagrams.  If remip is 0, then this parameter
+					is filled in on the first datagram received on the socket.
+					If remip is -1, then this parameter is ignored.  If port
+					is 0, then it will be filled in on the first datagram
+					received on the socket.
+
+					Be sure that you have allocated enough UDP socket buffers
+					with MAX_UDP_SOCKET_BUFFERS.  Note that this macro
+					defaults to 0, so any usage of udp_open() requires a
+					definition of MAX_UDP_SOCKET_BUFFERS in your program.
+
+					This function also works with multicast addresses.  If
+					remip is a multicast address, then packets sent with this
+					function will go to the multicast address, and packets
+					received will also be from that multicast address.  Also,
+					if enabled, IGMP will be used to join the multicast groups.
+					The group will be left when the socket is closed.  Note
+					that if port is 0 and remip is a multicast address, the
+					port will not be filled in on the first received datagram
+					(that is, the socket is non-binding to the port).
+
+PARAMETER1:    socket
+PARAMETER2:    local port, or 0 to pick the next available one.
+PARAMETER3:    acceptable remote ip, or:
+						0 for all peers, with binding to first one
+						0xFFFFFFFFuL for all peers, without binding.
+					"Binding" means that the first datagram reveived for this
+					socket will bind to the source IP address and port number.
+					Without binding, the socket accepts datagrams from all
+					source IP addesses and port numbers, and it is up to the
+					application to determine whether the sender is acceptable
+					(using the parameters returned by sock_recvfrom()).
+					Most applications should use the non-binding form, since the
+					binding semantics can indicate a potential abuse of UDP as
+					a "connection oriented" protocol.  It is generally preferable
+					to use TCP if binding is desired.
+PARAMETER4:    acceptable remote port, 0 to connect on first datagram
+PARAMETER5:    function to call when data is received, NULL for placing
+               data in the socket's receive buffer.
+
+RETURN VALUE:  !0  successfully opened socket
+					 0  error opening socket (such as if a buffer could not
+					    be allocated)
+
+SEE ALSO:      udp_extopen
+
+END DESCRIPTION **********************************************************/
+
+
+/*** BeginHeader udp_extopen */
+// Flag may be ORed with 'buflen' parameter to udp_extopen().  Enables
+// transmit buffering.
+#define UDP_MODE_TX_BUFFER 0x8000
+int udp_extopen(udp_Socket *s, int iface, word lport,
+	longword remip, word port, dataHandler_t datahandler,
+	long buffer,int buflen );
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+udp_extopen                            <UDP.LIB>
+
+SYNTAX: int udp_extopen( udp_Socket *s, int iface, word lport,
+                         longword remip, word port,
+                         dataHandler_t datahandler,
+                         long buffer, int buflen );
+
+KEYWORDS:		udp
+
+DESCRIPTION: 	This function is an extended version of udp_open.  It
+					opens a socket on a given network interface (iface) on a
+					given local port (lport).  If the remote IP address is
+					specified (remip), then only UDP datagrams from that host
+					will be accepted.  If remip is 0, then the first datagram
+					received on the local port will complete a connection, so
+					that only the remote host and/or port can subsequently
+					send datagrams to this socket.  Datagrams can not be sent
+					until the connection is completed.  If remip is -1, then
+					all remote hosts can send datagrams to this socket.
+					Datagrams will be sent to the	broadcast address, unless
+					udp_sendto() specifies otherwise.  The remote port
+					parameter (port) specifies the remote port from which we
+					will accept datagrams.  If remip is 0, then this parameter
+					is filled in on the first datagram received on the socket.
+					If remip is	-1, then this parameter is ignored.  If port
+					is 0, then it will be filled in on the first datagram
+					received on the socket.
+
+					The buffer and buflen parameters allow a user to supply
+					a socket buffer, instead of using a socket buffer from the
+					pool.
+
+					If remip is non-zero, then the process of resolving the
+					correct destination hardware address is started.  Datagrams
+					cannot be sent until sock_resolved() returns TRUE.  If you
+					attempt to send datagrams before this, then the datagrams
+					may not get sent.  The exception to this is if remip is
+					-1 (broadcast) in which case datagrams may be sent
+					immediately after calling this function.  As of DC10.66,
+					you can open a UDP socket with a transmit buffer, if you
+					pass a negative buffer length parameter.  In this case,
+					datagrams will not be dropped pending ARP resolution.
+
+					This function also works with multicast addresses.  If
+					remip is a multicast address, then packets sent with this
+					function will go to the multicast address, and packets
+					received will also be from that multicast address.  Also,
+					if enabled, IGMP will be used to join the multicast groups.
+					The group will be left when the socket is closed.  Note
+					that if port is 0 and remip is a multicast address, the
+					port will not be filled in on the first received datagram
+					(that is, the socket is non-binding to the port).
+
+PARAMETER1:    socket
+PARAMETER2:		local interface on which to open the socket.  Use IF_ANY
+               if the socket is to accept datagrams from any interface.
+               Otherwise, datagrams will be accepted only from the
+               specified interface.
+PARAMETER3:    local port, or 0 to pick the next available one.
+PARAMETER4:    acceptable remote ip, or:
+						0 for all peers, with binding to first one
+						0xFFFFFFFFuL for all peers, without binding.
+					"Binding" means that the first datagram reveived for this
+					socket will bind to the source IP address and port number.
+					Without binding, the socket accepts datagrams from all
+					source IP addesses and port numbers, and it is up to the
+					application to determine whether the sender is acceptable
+					(using the parameters returned by sock_recvfrom()).
+					Most applications should use the non-binding form, since the
+					binding semantics can indicate a potential abuse of UDP as
+					a "connection oriented" protocol.  It is generally preferable
+					to use TCP if binding is desired.
+PARAMETER5:    acceptable remote port, or 0 for all
+PARAMETER6:    function to call when data is received, NULL for placing
+               data in the sockets receive buffer.
+PARAMETER7:		address of user-supplied socket buffer in xmem, 0 to use a
+					buffer from the socket buffer pool
+PARAMETER8:		length of user-supplied socket buffer.  If this value is
+               ORed with the value UDP_MODE_TX_BUFFER then
+               the buffer is split into two equal parts; the first half is
+               used as a receive buffer, and the second for transmit.
+               Without this flag, or if "buffer" is null, then the
+               entire buffer is used for receive and none for transmit.
+               Ability to specify a transmit buffer is new in DC10.66, and
+               alleviates some of the problems with unbuffered transmit:
+               - Initial packets to a peer are not dropped because of the
+               need to ARP resolve the peer's next-hop hardware address.
+               - Packet bursts are more likely to be completely sent even
+               with slow interfaces like PPP or low-rate Wifi.
+
+RETURN VALUE:  !0  successfully opened socket
+					 0  error opening socket (such as if a buffer could not
+					    be allocated)
+
+SEE ALSO:      udp_open, sock_resolved
+
+END DESCRIPTION **********************************************************/
+
+_udp_nodebug
+int udp_extopen(udp_Socket *s, int iface, word lport,
+	longword remip, word port, dataHandler_t datahandler,long buffer, int buflen)
+{
+#ifdef MCOS_LOCKS
+	static OS_EVENT *lock_backup;
+
+   if(InitSocketLock((sock_type *)s))
+   	return 0;
+   lock_backup = s->lock;
+#endif
+
+	udp_close( s );
+   /* this does not blank the rdbuffer buffer - this should not be a problem,
+   though */
+   memset( s, 0, sizeof( udp_Socket ));
+
+#ifdef MCOS_LOCKS
+	s->lock = lock_backup;
+	s->lock_count = 0;
+#endif
+
+#ifdef MCOS
+	if(s>=((udp_Socket*)STACKORG)) {
+		exception(-ERR_TCPSOCKETISAUTO);
+	}
+#endif
+
+   s->ip_type = UDP_PROTO;
+   s->iface = iface;
+
+	if (buffer == 0) {
+		// Use a buffer from the pool
+   	if (!(s->rd.buf = udp_alloc_buffer((void *)s))) {
+#ifdef UDP_VERBOSE
+			printf("UDP: could not allocate buffer from pool\n");
+#endif
+			sock_msg(s, NETERR_OUT_OF_MEMORY);
+   		return 0;
+   	}
+		s->rd.maxlen =	UDP_BUF_SIZE - 1;
+   	s->wr.maxlen = 0;
+   } else {
+   	// Use the user-supplied buffer
+   	s->rd.buf = (char __far *)buffer;
+   	if (buflen & UDP_MODE_TX_BUFFER) {
+   		// Negative buffer length, split evenly into rx and tx halves.
+   		s->rd.maxlen = (buflen & ~UDP_MODE_TX_BUFFER)/2;
+   		s->wr.buf = (char __far *)buffer + s->rd.maxlen;
+   		s->wr.maxlen = s->rd.maxlen;
+   	}
+   	else {
+   		s->rd.maxlen = buflen;
+   		s->wr.maxlen = 0;
+   	}
+   }
+   _tbuf_reset(&s->rd);
+   _tbuf_reset(&s->wr);
+
+   s->ttl = UDP_TTL;
+   s->tos = UDP_TOS;
+   lport = findfreeport(lport, 0);
+   s->myport = lport;
+#ifdef USE_MULTICAST
+	if (remip && ~remip && !IS_MULTICAST_ADDR(remip))
+#else
+   if (remip && ~remip)
+#endif
+		s->sath = arpresolve_start_iface(remip, iface);
+#ifdef USE_MULTICAST
+	if (IS_MULTICAST_ADDR(remip))
+		_multicast_joingroup_userflag(iface, remip, 0);
+#endif
+   s->hisaddr = remip;
+   s->hisport = port;
+   s->dataHandler = datahandler;
+   s->usr_yield = system_yield;
+   LOCK_QUICK();
+   s->next = udp_allsocs;
+   udp_allsocs = s;
+   UNLOCK_QUICK();
+   return( 1 );
+}
+
+/*** BeginHeader udp_waitopen */
+/* START FUNCTION DESCRIPTION ********************************************
+udp_waitopen                            <UDP.LIB>
+
+SYNTAX: int udp_waitopen( udp_Socket *s, int iface, word lport,
+                         longword remip, word port,
+                         dataHandler_t datahandler,
+                         long buffer, int buflen, longword millisecs );
+
+KEYWORDS:		udp
+
+DESCRIPTION: 	This function is identical to udp_extopen(), except that
+               it also waits a specified amount of time for the hardware
+               address of the destination to be resolved.
+
+               While waiting, this function calls tcp_tick().
+
+               *** For applications which can afford extra buffer
+               memory for the UDP socket, it is preferable to
+               call udp_extopen() directly, and specify a receive plus
+               transmit buffer, which solves the original issue for
+               which this function was created. ***
+
+PARAMETER1:    socket
+PARAMETER2:		local interface on which to open the socket (not yet
+					implemented--use IF_DEFAULT for now)
+PARAMETER3:    local port, or 0 to pick the next available one.
+PARAMETER4:    acceptable remote ip, or:
+						0 for all peers, with binding to first one
+						0xFFFFFFFFuL for all peers, without binding.
+					"Binding" means that the first datagram reveived for this
+					socket will bind to the source IP address and port number.
+					Without binding, the socket accepts datagrams from all
+					source IP addesses and port numbers, and it is up to the
+					application to determine whether the sender is acceptable
+					(using the parameters returned by sock_recvfrom()).
+					Most applications should use the non-binding form, since the
+					binding semantics can indicate a potential abuse of UDP as
+					a "connection oriented" protocol.  It is generally preferable
+					to use TCP if binding is desired.
+PARAMETER5:    acceptable remote port, or 0 for all
+PARAMETER6:    function to call when data is received, NULL for placing
+               data in the sockets receive buffer.
+PARAMETER7:		address of user-supplied socket buffer in xmem, 0 to use a
+					buffer from the socket buffer pool
+PARAMETER8:		length of user-supplied socket buffer (may be ORed with
+               UDP_MODE_TX_BUFFER to split buffer between transmit and
+               receive - see udp_extopen()).
+PARAMETER9:    Maximum milliseconds to wait for the hardware address to
+               be resolved.
+
+RETURN VALUE:  > 0  successfully opened socket
+               0   timed out without resolving address
+					-1  error opening socket (such as if a buffer could not
+					    be allocated)
+
+SEE ALSO:      udp_extopen, sock_resolved
+
+END DESCRIPTION **********************************************************/
+
+int udp_waitopen( udp_Socket *s, int iface, word lport, longword remip,
+                 word port, dataHandler_t datahandler, long buffer,
+                 int buflen, longword millisecs );
+
+/*** EndHeader */
+
+_udp_nodebug int udp_waitopen( udp_Socket *s, int iface, word lport,
+                         longword remip, word port, dataHandler_t datahandler,
+                         long buffer, int buflen, longword millisecs )
+{
+	auto int rc;
+	auto longword timer;
+
+	rc = udp_extopen(s, iface, lport, remip, port, datahandler, buffer, buflen);
+	if (!rc)
+		return -1;
+	timer = _SET_TIMEOUT(millisecs);
+	while (!sock_resolved(s)) {
+		tcp_tick(NULL);
+		if (chk_timeout(timer))
+			return 0;
+	}
+	return 1;
+}
+/*** BeginHeader udp_close */
+int udp_close( udp_Socket *ds );
+/*** EndHeader */
+
+_udp_nodebug int udp_close( udp_Socket *ds )
+{
+   auto udp_Socket *s, **sp;
+   auto word iface;
+
+   LOCK_GLOBAL(TCPGlobalLock);
+   LOCK_SOCK(ds);
+   if (ds->sath) {
+   	arpcache_flush(ds->sath);
+   	ds->sath = 0;
+   }
+   sp = &udp_allsocs;
+   for(;;) {
+      s = *sp;
+      if( s == ds )
+      {
+         *sp = s->next;
+         break;
+      }
+      if( !s ) break;
+      sp = &s->next;
+   }
+#ifdef USE_MULTICAST
+	if (IS_MULTICAST_ADDR(ds->hisaddr)) {
+		if (ds->iface == IF_ANY) {
+			for (iface = 0; iface < IF_MAX; ++iface)
+				if (IF_MCAST_CAPABLE(iface))
+					_multicast_leavegroup_userflag(iface, ds->hisaddr, 0);
+		}
+		else if (IF_MCAST_CAPABLE(ds->iface))
+			_multicast_leavegroup_userflag(ds->iface, ds->hisaddr, 0);
+	}
+#endif
+   UNLOCK_SOCK(ds);
+   UNLOCK_GLOBAL(TCPGlobalLock);
+   return( 0 );
+}
+
+/*** BeginHeader udp_handler */
+ll_prefix __far * udp_handler(ll_prefix __far * LL, byte * hdrbuf);
+/*** EndHeader */
+
+/*
+ * Handler for incoming packets.
+ */
+_udp_nodebug ll_prefix __far * udp_handler(ll_prefix __far * LL, byte * hdrbuf)
+{
+	auto in_Header *ip;
+   auto udp_Header *up;
+   auto tcp_PseudoHeader ph;
+   auto long blen;
+   auto char __far * bbuf;
+   auto ll_Gather g;
+   auto word iface;
+   auto word len;
+   auto word dp;
+   auto ATHandle ath;
+   auto udp_Socket *s;
+   auto _udp_datagram_info udp_datagram_info;
+   auto longword destination, source;
+   auto word dstPort, srcPort;
+   auto int bcastdest;
+   auto int rc;
+
+	// Assume that a datagram does not have a broadcast destination
+	bcastdest = 0;
+
+   ip = (in_Header *)(hdrbuf + LL->net_offs);
+   iface = LL->iface;
+
+   // Copy the UDP header to hdrbuf
+   if (LL->len < LL->tport_offs + sizeof(udp_Header))
+   	return LL;	// Discard it, too short to contain UDP header
+
+   _pkt_buf2root(LL, up = (udp_Header *)(hdrbuf+LL->tport_offs),
+   	sizeof(udp_Header), LL->tport_offs);
+   LL->payload = LL->tport_offs + sizeof(udp_Header);
+
+	destination = intel(ip->destination);
+	source = intel(ip->source);
+   len = intel16( up->length );
+
+   dstPort = intel16(up->dstPort);
+   srcPort = intel16(up->srcPort);
+
+#ifdef UDP_VERBOSE
+	if (debug_on > 4)
+		printf("UDP: got pkt %08lX:%u -> %08lX:%u payload=%d i/f=%u\n",
+					source, srcPort, destination, dstPort, len-UDP_LENGTH, iface);
+#endif
+
+	// Drop if source is claiming broadcast address.  That's a no-no.
+	// Accept the packet, however, if it is from 0.0.0.0 (needed to be able to
+	// implement a DHCP server on the Rabbit, for example).
+	if (source && !IS_VALID_SOURCE(source, iface)) {
+#ifdef UDP_VERBOSE
+		printf("UDP: dropping because invalid source addr\n");
+#endif
+		return LL;
+	}
+
+#ifdef USE_MULTICAST
+	if (IS_MULTICAST_ADDR(destination)) {
+		// Check if we are accepting from this multicast address
+		if (arpcache_search_iface(destination, 0, iface) > 0) {
+			bcastdest = 1;
+		}
+	}
+	else {
+#endif
+		bcastdest = IS_SUBNET_BCAST_ADDR(destination,iface);
+#ifdef USE_MULTICAST
+	}
+#endif
+
+   if( (!bcastdest									// not a broadcast packet
+        && !IS_MY_ADDR(destination,iface)		// not my address
+        && _if_tab[iface].ipaddr)) {			// and I know my address
+#ifdef UDP_VERBOSE
+		if (debug_on)
+			printf("UDP: dropping because dest addr (%08lX) is not mine (%08lX)\n",
+				destination, _if_tab[iface].ipaddr);
+#endif
+      return LL;
+   }
+
+	if (LL->chksum_flags != CHKSUM_IGNORE && up->checksum) {
+	   ph.src = ip->source;    // still in network order
+	   ph.dst = ip->destination;
+	   ph.mbz = 0;
+	   ph.protocol = UDP_PROTO;
+	   ph.length = up->length;
+      if ((LL->chksum_flags & CHKSUM_TPORT) && (USING_PPPOE == 0))
+      	ph.checksum = LL->chksum;
+      else
+	      ph.checksum = lchecksum(LL, LL->tport_offs, len);
+      if (fchecksum(&ph, sizeof(tcp_PseudoHeader)) != 0xffff) {
+#ifdef UDP_VERBOSE
+         printf("UDP: bad checksum\n");
+#endif
+         return LL;
+      }
+   }
+
+  	udp_datagram_info.remip = source;
+	udp_datagram_info.remport = srcPort;
+	len -= UDP_LENGTH;
+	udp_datagram_info.len = len;
+	udp_datagram_info.flags = ip->tos & UDI_TOS_MASK;
+	if (IS_SUBNET_BCAST_ADDR(destination,iface))
+		udp_datagram_info.flags |= UDI_BROADCAST_IP;
+#ifdef USE_MULTICAST
+	else if (IS_MULTICAST_ADDR(destination))
+		udp_datagram_info.flags |= UDI_MULTICAST_IP;
+#endif
+	udp_datagram_info.iface = iface;
+
+	if (!IF_P2P(iface)) {
+		udp_datagram_info.flags |= UDI_HWA_VALID;
+		memcpy(udp_datagram_info.hwa, &((eth_Header *)hdrbuf)->source, 6);
+	}
+
+#ifdef USE_DHCP
+   // Special processing for DHCP.
+	if (dstPort == IPPORT_BOOTPC)
+   	// Message directed to DHCP client port.  Invoke dhcp_handler.  It may
+   	// return non-zero to tell tcp_tick() not to release the system packet
+   	// buffer.
+   	if (dhcp_handler(&udp_datagram_info, LL, ip, up, (long)LL->data1+LL->payload))
+      	return NULL;
+      else
+      	return LL;
+#endif
+
+   /*
+    * Logic changed to allow demux to UDP ports in all possible states:
+    *  1. hisaddr=known, hisport=known
+    *  2. hisaddr=0/-1, hisport=0
+    *  3. hisaddr=known, hisport=0
+    *  4. hisaddr=0/-1, hisport=known
+    * Cases 1,2,4 were already handled.  New case 3 allows known host to
+    * get back to us from an unknown port number, which is filled in
+    * for future communication.  Done for TFTP.
+    */
+
+   LOCK_GLOBAL(TCPGlobalLock);
+   /* demux to active sockets */
+   for (s = udp_allsocs; s; s = s->next) {
+		if (s->iface != IF_ANY && s->iface != iface)
+			continue;
+      if (s->hisport &&
+          dstPort == s->myport) {
+#ifdef USE_MULTICAST
+      	if ((source == s->hisaddr && srcPort == s->hisport) ||
+      	    (IS_MULTICAST_ADDR(s->hisaddr) && (destination == s->hisaddr)))
+#else
+			if (source == s->hisaddr && srcPort == s->hisport)
+#endif
+      		break;
+      }
+      else if (!s->hisport &&
+               dstPort == s->myport) {
+      	if (source == s->hisaddr &&
+      	    s->hisaddr != 0 &&
+      	    s->hisaddr != 0xffffffffuL) {
+      		s->hisport = srcPort;
+      		break;
+      	}
+#ifdef USE_MULTICAST
+      	else if (IS_MULTICAST_ADDR(s->hisaddr) &&
+      	         (destination == s->hisaddr)) {
+      		// Do not set the remote port number for a multicast socket
+      		break;
+      	}
+#endif
+      }
+   }
+
+   if( !s ) {
+      /* demux to passive sockets */
+      for( s = udp_allsocs; s; s = s->next ) {
+         if ((s->hisaddr == 0 || s->hisaddr == 0xffffffffuL) &&
+             dstPort == s->myport) {
+#ifdef MULTI_IF
+            if (s->iface != IF_ANY && s->iface != iface)
+            	continue;
+#endif
+#ifdef USE_MULTICAST
+				if (IS_MULTICAST_ADDR(destination) &&
+				    arpcache_search_iface(destination, 0, iface) <= 0)
+					continue;
+#endif
+            LOCK_SOCK(s);
+            if( s->hisaddr == 0 ) {
+               s->hisaddr = source;
+               s->hisport = srcPort;
+               s->iface = (byte)iface;
+            }
+            UNLOCK_SOCK(s);
+            break;
+			}
+		}
+   }
+
+   UNLOCK_GLOBAL(TCPGlobalLock);
+
+   if( !s ) {
+      // return ICMP port unreachable on non-broadcast
+#ifdef UDP_VERBOSE
+		if (debug_on) printf("UDP: no applicable socket\n");
+#endif
+      if(_if_tab[iface].ipaddr && !bcastdest) {
+#ifdef UDP_VERBOSE
+         if (debug_on) printf("UDP: sending ICMP unreach\n");
+#endif
+         icmp_Unreach(LL, hdrbuf, ICMP_UNREACH_PORT);
+      }
+      return LL;
+   }
+
+   LOCK_SOCK(s);
+
+   // Cache the hardware address, since we probably want to respond
+   //ath = arpcache_new(source, udp_datagram_info.hwa, iface);
+   //Vantive 23956: now use ARP lookup instead of sending back to source's MAC address.
+   ath = arpresolve_start_iface(source, iface);
+   if (ath > 0 && (ath = arpresolve_check(ath, source)) > 0) {
+		// Router/localhost resolved, use its MAC
+#ifdef UDP_VERBOSE
+		if (debug_on > 0) printf("UDP: ...using ARP table entry\n");
+#endif
+   }
+
+   if (ath > 0)
+   	s->sath = ath;
+
+   /* process user data */
+   dp = LL->payload;
+
+   //
+   if (s->dataHandler) {
+   	g.iface = iface;
+      // Provide the IP and UDP headers
+   	g.len1 = dp - LL->net_offs;
+   	g.data1 = (__far char *)paddr(hdrbuf) + LL->net_offs;
+      // Unfortunately, prior to xmem buffers, handlers expected at most two
+      // xmem areas, although only one contiguous area was provided in practice.
+      // Thus, we have to extract the entire packet if it's bigger than 2
+      // buffers (1024 bytes incl headers).
+      bbuf = NULL;
+      if (len + dp < 513) {
+      	// Small enough to fit in one area without copy.
+      	g.len2 = len;
+         g.len3 = 0;
+         g.data2 = LL->data1 + dp;
+      }
+      else if (s->sock_mode & UDP_MODE_NOCONTIG) {
+      	// We can provide noncontiguous data
+	      if (len + dp < 1025) {
+	         g.len2 = 512 - dp;
+	         g.len3 = len + dp - 512;
+	         g.data2 = LL->data1 + dp;
+	         g.data3 = LL->data2;
+	      }
+	      else {
+	         // Is big - copy the last 2 areas to temp xmem
+	         blen = dp + len - 512;
+	         if (_xavail(NULL, 1, XALLOC_MAYBBB) < blen)
+	            goto _udph_finish;
+	         g.len3 = (word)blen;
+	         g.len2 = 512 - dp;
+	         g.data2 = LL->data1 + dp;
+	         g.data3 = (char __far *)_xalloc(&blen, 0, XALLOC_ANY);
+	         bbuf = g.data3;
+	         _pkt_buf2xmem(LL, bbuf, g.len3, 512);
+	      }
+      }
+      else {
+      	// Dynamic C prior to 9.0 compatibility: must make all data contiguous
+         blen = len;
+         if (_xavail(NULL, 1, XALLOC_MAYBBB) < blen)
+            goto _udph_finish;
+         g.len3 = 0;
+         g.len2 = len;
+         g.data2 = (char __far *)_xalloc(&blen, 0, XALLOC_ANY);
+         bbuf = g.data2;
+         _pkt_buf2xmem(LL, bbuf, g.len2, dp);
+      }
+   	rc = s->dataHandler(UDP_DH_INDATA, s, &g, &udp_datagram_info);
+      if (bbuf)
+      	xrelease((long)bbuf, blen);
+      if (rc)
+   		goto _udph_finish;
+   }
+
+  	// Is there enough space?  If not, then just drop it
+  	if ((len + sizeof(_udp_datagram_info)) <= _tbuf_remain(&s->rd)) {
+		_tbuf_append(&s->rd, (char __far *)&udp_datagram_info, sizeof(_udp_datagram_info));
+		_tbuf_bappend(&s->rd, LL, dp, len);
+  	}
+#ifdef UDP_VERBOSE
+	else
+     	printf("UDP: insufficient rx buffer space for %d bytes\n", len);
+#endif
+
+_udph_finish:
+   UNLOCK_SOCK(s);
+   return LL;
+}
+
+/*** BeginHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+udp_send                               <UDP.LIB>
+
+SYNTAX: 			int udp_send(udp_Socket* s, void far * buffer, int len)
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION:   Implemented as a MACRO
+
+					Send a single UDP datagram on a UDP socket.  It will not
+					work for a socket for which the remip parameter to
+					udp_open() was 0, unless a datagram has first been received
+					on the socket.  If the remip parameter to udp_open() was
+					-1, then the datagram will be send to the broadcast
+					address.
+
+PARAMETER1: 	UDP socket on which to send the datagram
+PARAMETER2:		buffer that contains the UDP datagram
+PARAMETER3:		length of the UDP datagram
+
+RETURN VALUE:  >=0	number of bytes sent
+					-1		failure
+					-2    failed because hardware address not resolved
+
+SEE ALSO:      udp_sendto, udp_recv, udp_recvfrom, udp_open
+
+END DESCRIPTION **********************************************************/
+#define udp_send(s, buffer, len) \
+   udp_sendto(s, buffer, len, 0, 0)
+/*** EndHeader */
+
+/*** BeginHeader udp_sendto */
+
+/* START FUNCTION DESCRIPTION ********************************************
+udp_sendto                             <UDP.LIB>
+
+SYNTAX: 			int udp_sendto(udp_Socket* s, void far * buffer, int len,
+					               longword remip, word remport)
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION:	Send a single UDP datagram on a UDP socket.  It will
+					send the datagram to the IP address specified by remip,
+					and the port specified by remport.  Note that this
+					function can be used even on a socket that has been
+					"bound" to a specific remote host and port.
+
+PARAMETER1: 	UDP socket on which to send the datagram
+PARAMETER2:		buffer that contains the UDP datagram
+PARAMETER3:		length of the UDP datagram
+PARAMETER4:		IP address of the remote host
+PARAMETER5:		port number of the remote host
+
+RETURN VALUE:  >=0	number of bytes sent
+					-1		failure
+					-2    failed because hardware address not resolved
+
+SEE ALSO:      udp_send, udp_recv, udp_recvfrom, udp_open
+
+END DESCRIPTION **********************************************************/
+
+int udp_sendto(udp_Socket* s, void __far * buffer, int len, longword remip,
+	word remport);
+/*** EndHeader */
+
+_udp_nodebug
+int udp_sendto(udp_Socket* s, void __far * buffer, int len,
+	longword remip,word remport)
+{
+	auto _udp_datagram_info udi;
+	auto int offset, oldlen, oldmode;
+	auto int temp;
+   auto ATHandle ath;
+   auto word uiface;
+
+	oldlen = len;
+	offset = 0;
+
+	if (s->ip_type != UDP_PROTO) {
+#ifdef UDP_VERBOSE
+		printf("UDP: udp_sendto: invalid socket\n");
+#endif
+		return -1;
+	}
+
+	LOCK_GLOBAL(TCPGlobalLock);
+	LOCK_SOCK(s);
+
+	if (remip)
+		udi.remip = remip;
+	else
+		udi.remip = s->hisaddr;
+	if (remport)
+		udi.remport = remport;
+	else
+		udi.remport = s->hisport;
+   udi.flags = 0;
+   if (s->hisethaddr) {
+   	// Bypass ARP in effect
+   	udi.iface = s->iface;
+   	memcpy(udi.hwa, s->hisethaddr, 6);
+   }
+   else if ((udi.remip == 0xffffffff) || (IS_MULTICAST_ADDR(udi.remip))) {
+   	if (s->iface == IF_ANY) {
+			// Cannot broadcast or multicast on IF_ANY
+#ifdef UDP_VERBOSE
+			printf("UDP: cannot broadcast to IF_ANY\n");
+#endif
+   		UNLOCK_SOCK(s);
+   		UNLOCK_GLOBAL(TCPGlobalLock);
+   		return -1;
+   	}
+   	else if (udi.remip == 0xffffffff) {
+			udi.iface = s->iface;
+			arpcache_hwa(ATH_BROADCAST, udi.hwa);
+   	}
+   	else if (IS_MULTICAST_ADDR(udi.remip)) {
+			udi.iface = s->iface;
+			multicast_iptohw(udi.hwa, udi.remip);
+   	}
+   }
+   else {
+   	if (s->sath)
+   		ath = arpresolve_check(s->sath, udi.remip);
+   	// restart if we're not continuing, or the _check returned an error
+   	if (!s->sath || (ath < 0 && ath != ATH_AGAIN)) {
+   		s->sath = arpresolve_start_iface(udi.remip, s->iface);
+   		ath = arpresolve_check(s->sath, udi.remip);
+   	}
+   	if (ath < 0) {
+   		if (ath != ATH_AGAIN) {
+   			// resolve failed so reset handle to table entry
+   			// calling udp_send again will re-start ARP resolution of IP
+				s->sath = 0;
+   		}
+   		// Failed the resolve, or not yet resolved, so can't send.
+   		if (_tbuf_remain(&s->wr) > sizeof(udi) + len) {
+   			// Can buffer...
+   			udi.flags = UDI_WAIT_ARP | UDI_TX_BUFFERED;
+   			udi.len = len;
+   			udi.iface = IF_ANY;	// Don't know yet
+   			_tbuf_append(&s->wr, &udi, sizeof(udi));
+   			_tbuf_append(&s->wr, buffer, len);
+#ifdef UDP_VERBOSE
+				if (debug_on > 4) printf("UDP: deferred send, not resolved\n");
+#endif
+	         UNLOCK_SOCK(s);
+	         UNLOCK_GLOBAL(TCPGlobalLock);
+	         return len;	// OK, will do in background
+   		}
+#ifdef UDP_VERBOSE
+			if (debug_on > 4) printf("UDP: cannot send, not resolved\n");
+#endif
+   		sock_msg(s, NETERR_NOHOST_ARP);
+			UNLOCK_SOCK(s);
+			UNLOCK_GLOBAL(TCPGlobalLock);
+   		return -2;	// Not resolved indicator
+   	}
+		arpcache_iface(ath, &uiface);
+      udi.iface = uiface;
+      arpcache_hwa(ath, udi.hwa);
+   }
+
+	if (len == 0)
+		temp = udp_write(s, (void __far *)NULL, 0, 0, &udi);
+	else while (len > 0) {
+		temp = udp_write(s, (char __far *)buffer + offset, len, offset, &udi);
+		if (temp < 0)
+			break;
+		offset += temp;
+		len = oldlen - offset;
+		if (len > 0 && s->usr_yield)
+         s->usr_yield();
+	}
+	if (temp < 0) {
+		// pkt_gather() failed due to buffer shortage.  Place remaining
+		// data to transmit in the tx buffer.
+      if (_tbuf_remain(&s->wr) > sizeof(udi) + len) {
+         // Can buffer...
+         udi.flags = UDI_TX_BUFFERED | offset>>3;
+         udi.len = oldlen;
+         _tbuf_append(&s->wr, &udi, sizeof(udi));
+         _tbuf_append(&s->wr, (char __far *)buffer + offset, len);
+#ifdef UDP_VERBOSE
+         if (debug_on > 4) printf("UDP: deferred send\n");
+#endif
+      }
+      else {
+#ifdef UDP_VERBOSE
+			if (debug_on > 4) printf("UDP: cannot send, insufficient buffer\n");
+#endif
+			oldlen = -1;
+      }
+	}
+	UNLOCK_SOCK(s);
+	UNLOCK_GLOBAL(TCPGlobalLock);
+	return oldlen;
+}
+
+/*** BeginHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+udp_xsendto                             <UDP.LIB>
+
+SYNTAX: 			int udp_xsendto(udp_Socket* s, long buffer, int len,
+					               longword remip, word remport)
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	Send a single UDP datagram on a UDP socket.  It will
+					send the datagram to the IP address specified by remip,
+					and the port specified by remport.  Note that this
+					function can be used even on a socket that has been
+					"connected" to a remote host and port.
+
+					This function is identical to udp_sendto() except that
+					the data address is specified as a physical address.
+
+					As of DC10.62, this function is deprecated.  Use
+					udp_sendto() with the second parameter cast to
+					void far *.
+
+PARAMETER1: 	UDP socket on which to send the datagram
+PARAMETER2:		buffer that contains the UDP datagram
+PARAMETER3:		length of the UDP datagram
+PARAMETER4:		IP address of the remote host
+PARAMETER5:		port number of the remote host
+
+RETURN VALUE:  >=0	number of bytes sent
+					-1		failure
+					-2    failed because hardware address not resolved
+
+SEE ALSO:      udp_send, udp_recv, udp_recvfrom, udp_open, udp_sendto
+
+END DESCRIPTION **********************************************************/
+#define udp_xsendto(s, buffer, len, remip, remport) \
+	udp_sendto(s, (void __far *)(buffer), len, remip, remport)
+/*** EndHeader */
+
+
+/*** BeginHeader udp_waitsend */
+
+/* START FUNCTION DESCRIPTION ********************************************
+udp_waitsend                             <UDP.LIB>
+
+SYNTAX: 			int udp_waitsend(udp_Socket* s, void far * buffer, int len,
+					       longword remip, word remport, word millisecs)
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	This is identical to udp_sendto(), except that it will
+               block for up to the specified amount of time waiting
+               for the hardware address to be resolved.  Normally,
+               you should not have to specify more than 100ms for the
+               timeout.  If it takes longer than this, the destination
+               is probably unavailable.
+
+PARAMETER1: 	UDP socket on which to send the datagram
+PARAMETER2:		buffer that contains the UDP datagram
+PARAMETER3:		length of the UDP datagram
+PARAMETER4:		IP address of the remote host
+PARAMETER5:		port number of the remote host
+PARAMETER6:		Number of milliseconds to wait for hardware address
+                 resolution.  Reasonable values are between 50 and 750
+                 milliseconds.
+
+RETURN VALUE:  >=0	number of bytes sent
+               -1    failure (invalid UDP socket etc.)
+					-2		failure (timed out, no datagram sent)
+
+SEE ALSO:      udp_sendto, udp_recvfrom, udp_bypass_arp
+
+END DESCRIPTION **********************************************************/
+int udp_waitsend(udp_Socket* s, void __far * buffer, int len,
+	longword remip, word remport, word millisecs);
+/*** EndHeader */
+
+_udp_nodebug int udp_waitsend(udp_Socket* s, void __far * buffer, int len,
+	longword remip, word remport, word millisecs)
+{
+	auto longword timer;
+	auto int rc;
+
+	timer = _SET_TIMEOUT(millisecs);
+	while ((rc = udp_sendto(s, buffer, len, remip, remport)) == -2) {
+		tcp_tick(NULL);
+		if (chk_timeout(timer))
+			break;
+	}
+	return rc;
+}
+
+/*** BeginHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+udp_recv                               <UDP.LIB>
+
+SYNTAX: 			int udp_recv(udp_Socket* s, void far * buffer, int len)
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION:	Receive a single UDP datagram on a UDP socket.  If the
+					buffer is not large enough for the datagram, then the
+					datagram will be truncated, with the remainder being
+					discarded.
+
+PARAMETER1: 	UDP socket on which to receive the datagram
+PARAMETER2:		buffer where the UDP datagram will be stored
+PARAMETER3:		maximum length of the buffer
+
+RETURN VALUE:  >=0	number of bytes received
+					-1		no datagram waiting
+					< -1	error
+
+SEE ALSO:      udp_recvfrom, udp_send, udp_sendto, udp_open
+
+END DESCRIPTION **********************************************************/
+
+#define udp_recv(s, buffer, len) \
+	udp_recvfrom((s), (buffer), (len), NULL, NULL)
+/*** EndHeader */
+
+/*** BeginHeader udp_recvfrom */
+
+/* START FUNCTION DESCRIPTION ********************************************
+udp_recvfrom                           <UDP.LIB>
+
+SYNTAX: 			int udp_recvfrom(udp_Socket* s, void far * buffer, int len,
+					                 longword* remip, word* remport)
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION:	Receive a single UDP datagram on a UDP socket.  remip and
+					remport should be pointers to the locations where the
+					remote IP address and remote port from which the datagram
+					originated are placed.  If the buffer is not large enough
+					for the datagram, then the datagram will be truncated,
+					with the remainder being discarded.
+
+					If and only if the UDP_MODE_ICMP or UDP_MODE_DICMP modes
+					are set for this socket, then a return code of -3 indicates
+					that an ICMP error message is being returned in the
+					buffer instead of a normal datagram.  In this case, buffer
+					will contain fixed data in the form of a structure of
+					type _udp_icmp_message.  The definition of this structure
+					is
+
+                 typedef struct {
+                   word myport;     // Originating port on this host
+                   byte icmp_type;  // One of the ICMPTYPE_* values
+                   byte icmp_code;  // The corresponding ICMP code
+                 } _udp_icmp_message;
+
+PARAMETER1: 	UDP socket on which to receive the datagram
+PARAMETER2:		buffer where the UDP datagram will be stored
+PARAMETER3:		maximum length of the buffer
+PARAMETER4:		IP address of the remote host of the received datagram
+PARAMETER5:		port number of the remote host of the received datagram
+
+RETURN VALUE:  >=0   number of bytes received (normal datagram)
+					-1	   no datagram waiting
+					-2    error - not a UDP socket
+					-3    the returned buffer contains an ICMP error which
+					      was queued previously.
+
+SEE ALSO:      udp_recv, udp_send, udp_sendto, udp_open, udp_peek
+
+END DESCRIPTION **********************************************************/
+int udp_recvfrom(udp_Socket* s, void __far * buffer, int len,
+	longword* remip, word* remport);
+/*** EndHeader */
+
+_udp_nodebug
+int udp_recvfrom(udp_Socket* s, void __far * buffer, int len,
+	longword* remip, word* remport)
+{
+	auto _udp_datagram_info udp_datagram_info;
+	auto int length;
+
+	if (s->ip_type != UDP_PROTO)
+		return -2;
+
+	LOCK_GLOBAL(TCPGlobalLock);
+	LOCK_SOCK(s);
+
+nextpkt:
+	if (s->rd.len < sizeof(_udp_datagram_info)) {
+		length = -1;
+		goto finish;
+	}
+	_tbuf_extract((char __far *)&udp_datagram_info, &s->rd,
+	                sizeof(_udp_datagram_info));
+
+	if (remip)
+		*remip = udp_datagram_info.remip;
+	if (remport)
+		*remport = udp_datagram_info.remport;
+	length = udp_datagram_info.len;
+	if (length > len)
+		length = len;
+
+	if (buffer)
+		_tbuf_xread((char __far *)buffer, &s->rd, 0, length);
+	// Remove the entire datagram, even if it wasn't all read
+	_tbuf_delete(&s->rd, udp_datagram_info.len);
+
+	// Was it an ICMP error?
+	if (udp_datagram_info.flags & UDI_ICMP_ERROR) {
+		if (!(s->sock_mode & (UDP_MODE_ICMP | UDP_MODE_DICMP)))
+			// Not interested in these for this socket: get next
+			goto nextpkt;
+		length = -3;
+	}
+
+finish:
+	// Return the number of characters written into the buffer
+	UNLOCK_SOCK(s);
+	UNLOCK_GLOBAL(TCPGlobalLock);
+	return (length);
+}
+
+/*** BeginHeader udp_peek */
+
+/* START FUNCTION DESCRIPTION ********************************************
+udp_peek                           <UDP.LIB>
+
+SYNTAX: 			int udp_peek(udp_Socket* s, _udp_datagram_info far * udi)
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION:	Look into the UDP socket receive buffer to see if there is
+               a datagram ready to be read using udp_recvfrom().  This
+               function does not remove the datagram from the buffer,
+               but it allows the application to determine the full
+               details about the next datagram, including whether the
+               datagram was broadcast.
+
+               The returned data is put in *udi.  udi must point to a
+               valid data structure, or be NULL.  The data structure is
+                 typedef struct {
+	                longword remip;    // Remote host IP address
+	                word     remport;  // Remote host port number
+	                int      len;      // Length of datagram
+	                word     flags;    // Flags as follows:
+	                	// This is an ICMP error entry
+	                	#define UDI_ICMP_ERROR		0x0001
+	                	// Type-of-service bit mask
+	                	#define UDI_TOS_MASK       0x001E
+	                	// Hardware address field is valid
+	                	#define UDI_HWA_VALID		0x0020
+	                  // Received on broadcast link-layer address.
+                     #define UDI_BROADCAST_LL	0x0040
+                     // Received on broadcast network (IP) address.
+                     #define UDI_BROADCAST_IP	0x0080
+	                  // Received on broadcast link-layer address.
+                     #define UDI_MULTICAST_LL	0x0100
+                     // Received on broadcast network (IP) address.
+                     #define UDI_MULTICAST_IP	0x0200
+                   byte     iface;    // Interface number
+                   byte     hwa[6];   // Peer's hardware (Ethernet) MAC
+                 } _udp_datagram_info;
+
+PARAMETER1: 	UDP socket to check
+PARAMETER2:		Where to store the returned information.
+
+RETURN VALUE:  1	   a normal datagram is in the receive buffer
+					0		no datagram waiting
+					-3    an ICMP error message is in the receive buffer - this
+							will only be returned if udi parameter is not NULL.
+
+SEE ALSO:      udp_recvfrom
+
+END DESCRIPTION **********************************************************/
+int udp_peek(udp_Socket* s, _udp_datagram_info __far * udi);
+/*** EndHeader */
+
+_udp_nodebug
+int udp_peek(udp_Socket* s, _udp_datagram_info __far * udi)
+{
+	auto int rc;
+
+	LOCK_GLOBAL(TCPGlobalLock);
+	LOCK_SOCK(s);
+
+	if (s->rd.len < sizeof(_udp_datagram_info)) {
+		UNLOCK_SOCK(s);
+		UNLOCK_GLOBAL(TCPGlobalLock);
+		return 0;
+	}
+	rc = 1;
+	if (udi) {
+		_tbuf_xread((char __far *)udi, &s->rd, 0, sizeof(_udp_datagram_info));
+		if (udi->flags & UDI_ICMP_ERROR)
+			rc = -3;
+	}
+
+	UNLOCK_SOCK(s);
+	UNLOCK_GLOBAL(TCPGlobalLock);
+
+	return rc;
+}
+
+
+/*** BeginHeader udp_bypass_arp */
+/* START FUNCTION DESCRIPTION ********************************************
+udp_bypass_arp                           <UDP.LIB>
+
+SYNTAX: 			void udp_bypass_arp(udp_Socket *s, eth_address * eth)
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION:	Override the normal Address Resolution Protocol for this
+               UDP socket.  This is sometimes necessary for special
+               purposes such as if the ethernet address is to remain
+               fixed, or if the ethernet address is not obtainable using
+               ARP.  The great majority of applications should not use
+               this function.
+
+               If ARP bypass is in effect for a UDP socket, then
+               udp_sendto() will never return the -2 return code.
+
+               The destination interface is also forced to be
+               IF_DEFAULT.  If the supplied hardware address is accessible
+               from a non-default interface only, then you will need
+               to manually set the s->iface field.
+
+PARAMETER1: 	UDP socket
+PARAMETER2:		Pointer to override address.  If NULL, then resume normal
+               operation i.e. use ARP to resolve ethernet addresses.
+               Note that the specified ethernet address must be in static
+               storage, since only the pointer is stored.
+
+SEE ALSO:      udp_sendto, udp_waitsend, sock_resolved
+
+END DESCRIPTION **********************************************************/
+void udp_bypass_arp(udp_Socket *s, eth_address * eth);
+/*** EndHeader */
+
+_udp_nodebug
+void udp_bypass_arp(udp_Socket *s, eth_address * eth)
+{
+	s->hisethaddr = eth;
+	s->iface = IF_DEFAULT;
+}
+
+/*** BeginHeader udp_Retransmitter */
+int udp_Retransmitter(void);
+/*** EndHeader */
+_udp_nodebug
+int udp_Retransmitter(void)
+{
+	auto _udp_datagram_info udi;
+	auto _tbuf t;
+   auto udp_Socket *s;
+   auto ATHandle ath;
+   auto int rc, offs, len;
+   auto word uiface;
+
+   for( s = udp_allsocs; s; s = s->next ) {
+   	LOCK_SOCK(s);
+   	// Have we got anything in tx buffer?
+   	while (s->wr.len) {
+   		// Yes.  Data must be a UDI followed by packet data.
+   		// Clone tbuf, since may need to leave original unchanged.
+   		_tbuf_overlay(&t, &s->wr, 0, -1);
+   		_tbuf_extract(&udi, &t, sizeof(udi));
+   		if (udi.flags & UDI_WAIT_ARP) {
+   			// Held up waiting for ARP resolve.  Break if not yet
+   			// resolved, else fill in the HWA.  To avoid indefinite
+   			// hangup, we don't ever retry the resolve which is always
+   			// started in udp_sendto().
+	         if (s->sath)
+	            ath = arpresolve_check(s->sath, udi.remip);
+	         else
+	         	ath = -1;
+	         if (ath < 0) {
+	            if (ath != ATH_AGAIN) {
+	               // resolve failed so reset handle to table entry, and
+	               // trash this packet.
+	               s->sath = 0;
+	               _tbuf_delete(&s->wr, sizeof(udi) + udi.len);
+	               continue;
+	            }
+	            // Not yet resolved, go to next socket.
+	            break;
+	         }
+	         arpcache_iface(ath, &uiface);
+	         udi.iface = uiface;
+	         arpcache_hwa(ath, udi.hwa);
+	         udi.flags &= ~UDI_WAIT_ARP;
+#ifdef UDP_VERBOSE
+	         if (debug_on > 4)
+	            printf("UDP: HWA resolved for dest %08lX:%u\n",
+	            	udi.remip, udi.remport);
+#endif
+	         // Update buffered copy
+	         _tbuf_xwrite(&s->wr, 0, &udi, sizeof(udi));
+   		}
+   		offs = (udi.flags & UDI_OFFSET_MASK) << 3;
+			rc = udp_write(s, t.buf + t.begin, len = udi.len - offs, offs, &udi);
+			if (rc < 0) {
+				// pkt_gather() failed, so return and retry next time.  Break
+				// completely, since unlikely to fulfil any further requests.
+   			UNLOCK_SOCK(s);
+   			return 1;
+   		}
+			// Else rc was the amount of data sent, so update the offset
+			// and adjust the buffer.
+			if (rc == len) {
+				// Done, discard last data and the UDI.
+	         _tbuf_delete(&s->wr, rc + sizeof(udi));
+#ifdef UDP_VERBOSE
+	         if (debug_on > 4)
+	            printf("UDP: Frags complete for dest %08lX:%u (to go tx=%u)\n",
+	            	udi.remip, udi.remport, s->wr.len);
+#endif
+			}
+			else {
+	         _tbuf_delete(&s->wr, rc);
+	         udi.flags &= ~UDI_OFFSET_MASK;
+	         udi.flags |= (offs + rc)>>3;
+	         _tbuf_xwrite(&s->wr, 0, &udi, sizeof(udi));
+	      }
+   	}
+   	UNLOCK_SOCK(s);
+   }
+   return 0;
+}
+
+/*** BeginHeader udp_write */
+int udp_write(udp_Socket *s, void __far * datap, word len, word offset,
+                  _udp_datagram_info __far * udi);
+/*** EndHeader */
+
+/*
+ * udp_write() handles fragmented UDP by assuming it'll be called
+ *    once for all fragments with no intervening calls.
+ * Always returns length of data written, which may be less than 'len' parameter
+ * 	if fragmentation required.  May also return -1 if pkt_gather() failed,
+ *    which usually indicates the interface device send queue is full.
+ * Caller must hold global and socket locks.
+ * udi fields set as follows:
+ *  udi->remip: remote IP
+ *  udi->remport: remote port
+ *  udi->len: not used, untouched (unless s is NULL, see below)
+ *  udi->iface: interface number
+ *  udi->hwa: dest MAC address (required if ethernet)
+ *  udi->flags: UDI_TX_BUFFERED flag must be set if retrying buffered datagram
+ *              This is only allowed if s is not NULL since s contains the
+ *              buffer.
+ * If s is null, sending without a socket.  In this case, more of the udi
+ * fields are used:
+ *  udi->len abused to contain the local port number (len parameter is the
+ *		actual length)
+ *  udi->flags & UDI_TOS_MASK used for the TOS
+ *  TTL set to overall UDP default (UDP_TTL define)
+ *  Checksum unconditionally generated
+ */
+
+_udp_nodebug
+int udp_write(udp_Socket *s, void __far * datap, word len, word offset,
+	_udp_datagram_info __far * udi)
+{
+   tcp_PseudoHeader ph;
+   auto struct udp_pkt {
+      in_Header  in;
+      udp_Header udp;
+      int      data;
+   } *pkt;
+   auto byte pkt_hdr[IP_MAX_UDP_HDR];
+   auto char __far * lhdr;
+	auto ll_Gather g;
+	auto ll_prefix LL;
+   auto byte *dp;
+   auto in_Header *inp;
+   auto udp_Header *udpp;
+   auto word maxlen;
+   auto int more_frags;
+   auto word origlen, flen;
+   auto eth_address ethaddr;
+   auto longword remip;
+   auto word remport, myport;
+   auto int buffered = udi->flags & UDI_TX_BUFFERED;
+   auto int pgrc;
+
+   origlen = len;
+  	remip = udi->remip;
+  	remport = udi->remport;
+  	LL.iface = udi->iface;
+   myport = s ? s->myport : udi->len;
+  	pkt = (struct udp_pkt *)pkt_reply_ip(udi->iface, pkt_hdr, &g,
+  		(eth_address __far *)udi->hwa);
+
+   lhdr = g.data1;
+
+   if (offset)							// this is not the first fragment
+      dp = (byte *) &pkt->udp;	// data goes right after IP header
+   else {
+      dp = (byte *) &pkt->data;
+      udpp = &pkt->udp;
+
+      udpp->srcPort = intel16(myport);
+      udpp->dstPort = intel16(remport);
+      udpp->checksum = 0;
+      udpp->length = intel16( UDP_LENGTH + len );
+   }
+   inp = &pkt->in;
+
+   memset(inp, 0, sizeof(in_Header));
+
+   maxlen = ifmtu(g.iface,remip) - (sizeof(in_Header) + sizeof(udp_Header));
+   if (offset) {
+      maxlen += sizeof(udp_Header);
+      maxlen &= 0xFFF8;      // make a multiple of 8
+   }
+
+   if (len > maxlen) {
+      maxlen &= 0xFFF8;    // multiple of 8
+      len = maxlen;
+      more_frags = 1;
+   }
+   else
+   	more_frags = 0;
+
+   inp->length = intel16(sizeof(in_Header) + (offset ? 0 : UDP_LENGTH) + len );
+
+   /* internet header */
+   inp->ver_hdrlen=0x45;
+   /* if offset non-zero, then is part of a prev datagram so don't incr ID */
+   inp->identification = intel16( offset ? ip_id : ++ip_id );
+   inp->frags = (offset ? intel16((offset + UDP_LENGTH) >> 3) : 0);
+   if (more_frags) inp->frags |= IP_MF;
+   inp->ttl = s ? s->ttl : UDP_TTL;
+   inp->tos = s ? s->tos : udi->flags & UDI_TOS_MASK;
+   inp->proto = UDP_PROTO;
+   inp->source = intel(_if_tab[g.iface].ipaddr);
+   inp->destination = intel(remip);
+   if (!IF_CHKSUM_OFFLOAD(g.iface))
+   	inp->checksum = ~fchecksum(inp, sizeof(in_Header));
+
+  	g.data2 = (char __far *)datap;
+	// Max possible first part length...
+	if (buffered)
+		flen = (word)(s->wr.buf + s->wr.maxlen - g.data2);
+
+
+   /* compute udp checksum if desired */
+   if(!offset) {  // only first of frags has UDP header for entire UDP dgram
+      if (IF_CHKSUM_OFFLOAD(g.iface) || s && (s->sock_mode & UDP_MODE_NOCHK))
+         udpp->checksum = 0;
+      else {
+         ph.src = inp->source;  /* already INTELled */
+         ph.dst = inp->destination;
+         ph.mbz = 0;
+         ph.protocol = UDP_PROTO;  /* udp */
+         ph.length = udpp->length; /* already INTELled */
+         g.len1 = sizeof(ph);
+         g.data1 = (char __far *)paddr(&ph);
+         if (buffered) {
+	         if (flen < origlen)
+	            g.len3 = origlen - flen; // last part length (after wrap-around)
+	         else
+	            g.len3 = 0;
+	         g.len2 = origlen - g.len3;
+	         g.data3 = s->wr.buf;
+         }
+         else {
+         	g.len2 = origlen;
+         	g.len3 = 0;
+         }
+         ph.checksum = fchecksum(&pkt->udp, UDP_LENGTH);
+         udpp->checksum = ~gchecksum(&g, 0);
+         g.data1 = lhdr;
+
+         if (!udpp->checksum)
+         	// Equivalent in 1's complement.
+         	udpp->checksum = 0xFFFF;
+      }
+   }
+
+	if (buffered) {
+		// Tx buffered datagram.  Data may wrap around, necessitating use
+		// of g.data3.  Assumed to be buffered in s->wr, and 'datap' must
+		// be in that buffer, at offset 0.  This routine does not modify
+		// the buffer.
+		if (flen < len)
+			g.len3 = len - flen;	// last part length (after wrap-around)
+		else
+			g.len3 = 0;
+		g.len2 = len - g.len3;
+		g.data3 = s->wr.buf;
+	}
+	else {
+		g.len2 = len;
+		g.len3 = 0;
+	}
+   g.len1 =  (word)((char __far *)paddr(dp) - lhdr);
+
+#ifdef UDP_VERBOSE
+	if (debug_on > 4)
+		printf("UDP: sending pkt %08lX:%u -> %08lX:%u payload=%d %s\n",
+					intel(inp->source), myport, remip, remport, len,
+					buffered ? "buffered" : "");
+#endif
+   pgrc = pkt_gather(&g);
+#ifdef UDP_VERBOSE
+	if (pgrc && debug_on > 0)
+		printf("UDP: pkt_gather() balked\n");
+#endif
+
+   return pgrc ? -1 : len;
+}
+
+
+/*** BeginHeader _udp_notify */
+void _udp_notify(icmp_ip_t * icmp, byte msg, ll_prefix __far * LL);
+/*** EndHeader */
+
+_udp_nodebug void _udp_notify(icmp_ip_t * icmp, byte msg, ll_prefix __far * LL)
+{
+	/* This is upcalled from ICMP when we get a message relating to the UDP
+		protocol. If the ICMP socket info can be demuxed to an active UDP socket,
+		we record the ICMP error message in the socket (up to two of them).  It
+		is really up to the application to deal with this situation, by regularly
+		checking the socket status (using sock_error()).  In addition, socket may
+		have UDP_MODE_ICMP/DICMP set in which case more details will be stored in
+		the socket's receive queue.
+	*/
+	auto in_Header * ip;
+	auto _udp_datagram_info udi;
+	auto _udp_icmp_message uim;
+	auto ll_Gather g;
+   auto int len, dlen;
+   auto udp_Header *up;
+   auto udp_Socket *s;
+   auto udp_Socket *rs;
+   auto udp_Socket *ds;
+   auto word myport, hisport;
+   auto longword hisip;
+
+   ip = &icmp->ip;		// Reflected IP header
+
+   LOCK_GLOBAL(TCPGlobalLock);
+
+   len = in_GetHdrlenBytes(ip);
+   up = (udp_Header *)((byte *)ip + len);   // Reflected UDP header.
+   myport = intel16(up->srcPort);
+   hisport = intel16(up->dstPort);
+   hisip = intel(ip->destination);
+
+   // Find the socket with matching parameters.
+   rs = NULL;
+   ds = NULL;
+   for( s = udp_allsocs; s; s = s->next ) {
+      if (!rs &&
+          hisport == s->hisport &&
+          myport == s->myport &&
+          hisip == s->hisaddr )
+      	rs = s;
+      if (s->sock_mode & UDP_MODE_DICMP)
+      	ds = s;
+   }
+
+   if (!rs && ds)
+   	rs = ds;
+   else if (rs && ds && rs->sock_mode & UDP_MODE_ICMP)
+   	ds = rs;
+
+   if (rs) {
+      sock_msg(rs, msg ? msg : NETERR_ICMP);
+      if (ds) {
+      	// This socket wants ICMP messages to be queued
+      	// Is there enough space?  If not, then just drop it
+      	dlen = sizeof(uim);
+      	uim.myport = myport;
+      	uim.icmp_type = icmp->type;
+      	uim.icmp_code = icmp->code;
+      	if (dlen + sizeof(udi) <= _tbuf_remain(&ds->rd)) {
+	      	udi.remip = hisip;
+   	   	udi.remport = hisport;
+      		udi.len = dlen;
+      		udi.flags = ip->tos & UDI_TOS_MASK | UDI_ICMP_ERROR;
+      		udi.iface = LL->iface;
+   			if (ds->dataHandler) {
+   				g.iface = udi.iface;
+			   	g.len1 = 0;
+  				 	g.data1 = (char __far *)LL + 1;
+			   	g.len2 = dlen;
+			   	g.data2 = (char __far *)paddr(&uim);
+			   	g.len3 = 0;
+			   	if (ds->dataHandler(UDP_DH_ICMPMSG, ds, &g, &udi))
+			   		goto _untf_finish;
+			   }
+				_tbuf_append(&ds->rd, (char __far *)&udi, sizeof(udi));
+				_tbuf_append(&ds->rd, (char __far *)&uim, dlen);
+      	}
+#ifdef UDP_VERBOSE
+			else
+         	printf("UDP: insufficient rx buffer space for ICMP msg\n");
+#endif
+
+      }
+   }
+_untf_finish:
+   UNLOCK_GLOBAL(TCPGlobalLock);
+}
+
+/*** BeginHeader _udp_check_multicast_sockets */
+int _udp_check_multicast_sockets(byte iface, longword ipaddr);
+/*** EndHeader */
+
+_udp_nodebug int _udp_check_multicast_sockets(byte iface, longword ipaddr)
+{
+	auto udp_Socket* s;
+
+   LOCK_GLOBAL(TCPGlobalLock);
+   for (s = udp_allsocs; s; s = s->next) {
+   	if (s->iface == iface && s->hisaddr == ipaddr) {
+		   UNLOCK_GLOBAL(TCPGlobalLock);
+   		return 1;
+   	}
+   }
+   UNLOCK_GLOBAL(TCPGlobalLock);
+   return 0;
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

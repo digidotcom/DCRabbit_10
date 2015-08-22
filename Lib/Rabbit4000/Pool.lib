@@ -1,0 +1,3315 @@
+/*** BeginHeader  **********************************/
+#ifndef __POOL
+#define __POOL
+
+/* START LIBRARY DESCRIPTION *********************************************
+POOL.LIB
+	Copyright (c) 2006-2009, Rabbit Semiconductor.
+
+	NOTE: functions with 'x' in their name (xmem versions) also have
+	equivalent macros/functions with 'f' instead of 'x' which use
+	far pointers rather than 'long' physical addresses.
+
+DESCRIPTION:
+	Simple dynamic allocation functions for fixed-size blocks of
+   memory.
+
+   To use these functions, create a static struct of type Pool_t (the
+   same struct is used for xmem and root pools).
+
+   Designate an area of memory to use.  This should be of a size
+   equal to the desired number of elements, times the element size.
+   For a root pool, this should be a char (or other type) of array
+   allocated by the compiler in root data.  For an xmem pool, you
+   need to allocate an area of xmem using xalloc().
+
+   Then, call pool_init() or pool_xinit() (as appropriate) to fully
+   initialize the Pool_t structure and tie it to the designated
+   memory area.  This should be done once only, at program startup
+   time.
+
+   After initializing the pool, you can also tell the pool to
+   maintain a doubly-linked list of allocated elements, using the
+   pool_link() function.  If used, you must do this before calling
+   any allocation function.  Since the linked list requires two
+   pointers at the start of each data block, this takes up 4 (root)
+   or 8 (xmem) bytes per element.  You must factor this overhead
+   into the element size parameter to pool_[x]init().
+
+   Whenever the application needs a temporary block of memory, it
+   can call the palloc(), pxalloc(), pcalloc() or pxcalloc()
+   functions.
+
+   When finished using the block, the application returns it to the
+   correct pool using pfree() or pxfree().
+
+   Your application can also test the "high water mark" of a pool,
+   using the phwm() function.  This enables the programmer to determine
+   the best size for the pool.  You can use pavail() to check the current
+   number of free elements.
+
+   If necessary, your application can add more memory area(s) to the
+   initial amount.  These do not have to be contiguous, but the element
+   size must be the same as the initial pool.  You cannot remove
+   any data areas once they are added, so it is probably best to
+   create all the data areas at startup.  Only use pool_append()
+   or pool_xappend() if your application needs to split the pool
+   into more than one area.  For example, if you have an xmem pool
+   but you also want the same pool to manage some root data, you can
+   append the root data to the xmem pool by "pretending" that the
+   root area is xmem (using the paddr() function to generate an xmem
+   address from a root address) then adding it to the xmem pool.
+
+   If you use pool_link(), then some more functions are available
+   for scanning the linked list of allocated entries.
+
+   Caveats:
+
+     The minimum element size for a root pool is 2 bytes.  The minimum
+     element size for an xmem pool is 4 bytes.  The maximum element
+     size is 65535.
+
+     If you are using the '*link' versions of the
+     allocation functions, then be aware that the linking fields
+     use the first 4 bytes of the element (for root) or 8 bytes
+     (for xmem).  Thus, the minimum practical element size for a
+     root pool (with linking) is 5 bytes, and 9 bytes for xmem.
+
+     The maximum number of elements is 65535, and the minimum is 1.
+     (In practice, the size of root pools will be limited by the
+     available root memory).
+
+     The product of 'nel' and 'elsize' must be less than 65536 for
+     root pools, but may exceed this for xmem pools.
+
+     If you allocate without ever freeing, the pool will run out of
+     free elements.  In this case, the allocation functions will
+     return NULL (for root) or 0 (for xmem).
+
+     When you free an element, you must pass the pointer which was
+     returned by the original allocation function, and the same
+     Pool_t must be used.  If you free something which was not
+     allocated (or was already free, or belongs to another pool)
+     then your program will definitely malfunction.
+
+     You can turn on some debugging to help iron out many (but
+     not all) such application errors.  Define the symbol
+
+       POOL_DEBUG
+
+     to turn on parameter checking.  You can leave this setting
+     on in production code, but it will lower efficiency.
+
+     You can also turn on
+
+       POOL_VERBOSE
+
+     to cause helpful diagnostics to be printed to stdout.  Do not
+     leave this on in production code.
+
+MULTITASKING NOTES:
+
+   All functions are re-entrant in themselves.  Your application
+   should serialize access to pools which are shared between
+   multiple tasks.  Alternatively, you can define the symbol
+
+     POOL_IPSET
+
+   to the IP level which will be used to protect critical sections
+   in the library.  Any task or ISR running at that level or below
+   can call any function without further serialization.  [Note that
+   the *fast (assembler) versions of these functions do not honor
+   the IPSET level].
+
+   WARNING: the IPSET facility is NECESSARY but NOT SUFFICIENT for
+   shared access to pools from different tasks (contexts) or
+   ISRs.  Additional serialization may be necessary when e.g.
+   pointers to elements are stored in one context, but the
+   same element(s) may deleted in another context.
+
+   One task should be responsible for calling pool_init() or
+   pool_xinit() on a given Pool_t, since these functions are not
+   serialized.
+
+CONFIGURATION MACROS:
+
+	POOL_DEBUG
+
+      Turn on Dynamic C single stepping, as well as enable
+      parameter checking.
+
+   POOL_VERBOSE
+
+      Turn on printf() messages.  This has no effect unless you
+      also define POOL_DEBUG.
+
+   POOL_IPSET  1
+
+      Turn on ipset protection of critical sections.  This allows
+      ISRs and multitasking to work reliably.  The macro should
+      be defined to the desired CPU priority level.
+
+      By default, this is defined to '1' if you have included
+      uC/OS; otherwise it is zero.
+
+      You can define this to 0, 1, 2 or 3.  1 is usually
+      sufficient unless higher priority ISRs are using these
+      functions (unlikely).
+
+      If not zero, there will be some additional interrupt
+      latency experienced at that level or below.  This is
+      not very much since the pool allocation functions are
+      very efficient, however you should consider this side-
+      effect.
+
+      A compile-time warning is issued if this is not zero, and
+      you have turned on POOL_DEBUG.  This is because the
+      debugging code may not work correctly in a multitasking
+      environment.
+
+
+FUNCTION DICTIONARY:
+
+	Wrapper functions which use malloc() to obtain memory areas:
+
+	pool_create()  - allocate and initialize a far memory pool.
+	pool_create_linked()
+					   - as above, creating a linked pool.
+
+	Basic functions which do not themselves allocate memory:
+
+	pool_init()		- initialize a root memory pool
+   pool_xinit()	- initialize an xmem pool
+   pool_append()	- add another data area to existing root pool
+   pool_xappend()	- add another data area to existing xmem pool
+   pool_link()		- tell a pool to maintain a doubly-linked list of
+   						allocated elements.
+   palloc()			- allocate next element from root pool
+   pxalloc()		- allocate next element from xmem pool
+   pcalloc()		- allocate and zero next element from root pool
+   pxcalloc()		- allocate and zero next element from xmem pool
+   pfree()			- return element to root pool
+   pxfree()			- return element to xmem pool
+   phwm()			- get high water mark (max allocated elements) in pool
+   pavail()			- get current number of free elements
+   pnel()			- get total number of elements, free or used
+
+   If a linked pool is used, then the following functions are available:
+
+   For root pools:
+   pfirst()			- get pointer to first allocated element
+   plast()			- get pointer to last allocated element
+   pnext()			- get pointer to next element
+   pprev()			- get pointer to previous element
+   preorder()		- atomically remove an allocated element and re-insert
+                    it after or before a specified allocated element.
+	pmovebetween() - atomically move an element between the two adjacent
+                    elements.  This function checks that the adjacent
+                    elements really are adjacent - if not, then the function
+                    safely exits without doing anything and the caller should
+                    retry.
+	pputlast()		- atomically move the specified element to the end of the
+                    allocated list.
+
+   For xmem pools:
+   pxfirst()		- get pointer to first allocated element
+   pxlast()			- get pointer to last allocated element
+   pxnext()			- get pointer to next element
+   pxprev()			- get pointer to previous element
+     Note: there is currently no xmem versions of preorder() or pmovebetween()
+
+   The following functions are for calling from assembler only (since they
+   use non-standard parameter passing conventions).  These versions are
+   very fast, but do not honor the verbose or debug settings; do not
+   issue IPSET protection; and do not update the high water mark.
+
+   palloc_fast::
+   pxalloc_fast::
+   pfree_fast::
+   pxfree_fast::
+   pavail_fast::
+	pfirst_fast::
+   plast_fast::
+   pnext_fast::
+   pprev_fast::
+   pmovebetween_fast::
+   pputlast_fast::
+	pxfirst_fast::
+   pxlast_fast::
+   pxnext_fast::
+   pxprev_fast::
+
+
+SAMPLE PROGRAM:
+
+   See samples\pool.c
+
+END DESCRIPTION **********************************************************/
+
+#ifdef POOL_DEBUG
+	#define pool_debug	__debug
+#else
+	#define pool_debug	__nodebug
+#endif
+
+#ifdef MCOS
+	#ifndef POOL_IPSET
+   	#define POOL_IPSET	1
+   #endif
+#endif
+
+#ifndef POOL_IPSET
+	#define POOL_IPSET	0
+#endif
+
+
+typedef struct _Pool_t
+{
+   // Following fields used only if allocated elements are in linked list
+   // i.e. POOL_LINKED flag (below) is set.  *** These fields MUST be first in this
+   // struct, because it speeds up the linked-list handling code.  In the allocated
+   // element, the same mapping is used, except the pointers are called 'next' and
+   // 'prev'. ***
+	union {
+   	char * r[3];			// First [0] and last [1] allocated element (root), or NULL
+      long   x[3];			// First [0] and last [1] allocated element (xmem), or 0
+      char __far * f[3];
+      // Note: 3rd element in above arrays is the address of the pool itself.  This is needed
+      // to determine the end-of-list, since the Pool_t struct is included in the linked list.
+   } link;
+
+   // Following fields used for all types.
+	word		flags;
+#define POOL_XMEM		0x0001		// Pool is in xmem (else root)
+#define POOL_LINKED	0x0002		// Pool maintains doubly-linked list
+#define POOL_AUNLK	0x0004		// If linked pool, initial allocation does not link to end
+											// of list.  The application must call pmovebetween() or
+                                 // preorder() to insert the element at the appropriate position.
+                                 // This flag is supported for root pools only.
+	union {
+     	char * r;			// Base address for root pool
+      long	 x;			// Base address for xmem pool
+      char __far * f;
+   } base;
+	word		nel;			// Number of elements
+   word		elsize;		// Size of each element (bytes) - min 2 for root unlinked,
+   							// 4 for root linked or xmem unlinked, or 8 for xmem linked.
+	union {
+   	char * r;			// Next free element (root), or NULL
+      long   x;			// Next free element (xmem), or 0
+      char __far * f;
+   } next;
+   word		used;			// Number of currently used elements (<= nel)
+   word		hwm;			// High water mark of used elements (<= nel)
+
+} Pool_t;
+
+Pool_t * __pool__;		// Dummy, for asm references
+
+// Option flags for preorder()
+#define POOL_INSERT_AFTER	0x0000
+#define POOL_INSERT_BEFORE	0x0001
+
+// Parameter values for pool_link() and pool_create()
+#define POOL_NOT_LINKED 		0
+#define POOL_LINKED_AUTO		1
+#define POOL_LINKED_BY_APP 	2
+#define POOL_ALIGNED				4
+#define POOL_SYS_MALLOC			8
+
+
+/*** EndHeader ***********************************************/
+
+
+/*** BeginHeader pool_init */
+int pool_init(Pool_t * p, void * base, word nel, word elsize);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pool_init                       <POOL.LIB>
+
+SYNTAX: int pool_init(Pool_t * p, void * base, word nel, word elsize);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Initialize a root memory pool.  A pool is a linked list of
+               fixed-size blocks taken from a contiguous area.  You can
+               use pools instead of malloc() when fixed-size blocks
+               are all that is needed.  You can have several pools,
+               with different size blocks.  Using memory pools is very
+               efficient compared with more general functions like
+               malloc() [see malloc.lib].
+
+               This function should only be called once for each pool
+               to be used, at program startup time.
+
+               Note: the product of nel and elsize must be less than
+               65535 (however this will usually be limited further by
+               the actual amount of root memory available).
+
+               After calling this function, your application must not
+               change any of the fields in the Pool_t structure.
+
+PARAMETER1:		Pool "handle" structure.  This is allocated by caller, but
+               this function will initialize it.  Normally, this would
+               be allocated in static memory by declaring a global
+               variable of type Pool_t.
+PARAMETER2:		Base address of the root data memory area to be managed
+               in this pool.  This must be nel*elsize bytes long.
+               Typically, this would be a static (global) array.
+PARAMETER3:		Number of elements in the memory area. 1..32767
+PARAMETER4:    Size of each element in the meory area. 2..32767.  If you
+               are intending to call pool_link() on this pool, then add an
+               extra 4 bytes to this parameter to account for the space
+               required by the linkage pointers.
+
+RETURN VALUE:  Currently always zero.  If you define the macro
+               POOL_DEBUG, then parameters are checked.  If the
+               parameters look bad, then an exception is raised.  You
+               can define POOL_VERBOSE to get printf() messages.
+
+SEE ALSO:		pool_xinit, palloc, pcalloc, pfree, phwm, pavail
+
+END DESCRIPTION **********************************************************/
+
+pool_debug int pool_init(Pool_t * p, void * base, word nel, word elsize)
+{
+	auto word i;
+   auto char ** q;
+
+#ifdef POOL_DEBUG
+	if (!p || elsize < 2 || !nel || !base) {
+   #ifdef POOL_VERBOSE
+   	printf("POOL: init bad parameter p=%04X, base=%04X, nel=%u, elsize=%u\n",
+      	p, base, nel, elsize);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+#endif
+	memset(p, 0, sizeof(*p));
+   p->base.r = (char *)base;
+   p->nel = nel;
+	p->elsize = elsize;
+   p->next.r = p->base.r;
+	for (i = 0, q = (char **)base; i < nel; ++i, q = (char **)((char *)q + elsize)) {
+		if (i+1 == nel)
+      	*q = NULL;
+      else
+      	*q = (char *)q + elsize;
+   }
+   return 0;
+}
+
+/*** BeginHeader pool_append */
+int pool_append(Pool_t * p, void * base, word nel);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pool_append                       <POOL.LIB>
+
+SYNTAX: int pool_append(Pool_t * p, void * base, word nel);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Add another root memory area to an existing pool.  It is
+               assumed that the element size is the same as the existing
+               pool's element size.
+
+               The data area does not have to be contiguous with the
+               existing data area, but it must be nel*elsize bytes
+               long (where elsize if the existing pool's element
+               size, and nel is the parameter to this function).
+
+               The total pool size must obey the constraints documented
+               with pool_init().
+
+PARAMETER1:		Pool "handle" structure, as passed to pool_init().
+PARAMETER2:		Base address of the root data memory area to append
+               to this pool.  This must be nel*elsize bytes long.
+               Typically, this would be a static (global) array.
+PARAMETER3:		Number of elements in the memory area. 1..32766
+					The sum of this and the current number of elements
+               must not exceed 32767.
+
+RETURN VALUE:  Currently always zero.  If you define the macro
+               POOL_DEBUG, then parameters are checked.  If the
+               parameters look bad, then an exception is raised.  You
+               can define POOL_VERBOSE to get printf() messages.
+
+SEE ALSO:		pool_init
+
+END DESCRIPTION **********************************************************/
+
+pool_debug int pool_append(Pool_t * p, void * base, word nel)
+{
+	auto word i;
+   auto char ** q;
+
+#ifdef POOL_DEBUG
+	if (!p || !nel || !base || p->flags & POOL_XMEM) {
+   #ifdef POOL_VERBOSE
+   	printf("POOL: append bad parameter p=%04X, base=%04X, nel=%u\n",
+      	p, base, nel);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+#endif
+	for (i = 0, q = (char **)base; i < nel; ++i, q = (char **)((char *)q + p->elsize)) {
+		if (i+1 == nel) {
+	   #if POOL_IPSET
+	      asm ipset POOL_IPSET;
+	   #endif
+      	*q = (char *)p->next.r;
+      }
+      else
+      	*q = (char *)q + p->elsize;
+   }
+   p->next.r = (char *)base;
+   p->nel += nel;
+#if POOL_IPSET
+	asm ipres;
+#endif
+   return 0;
+}
+
+/*** BeginHeader pool_xinit */
+int pool_xinit(Pool_t * p, long base, word nel, word elsize);
+#define pool_finit(p, base, nel, elsize) pool_xinit(p, (long)(base), nel, elsize)
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pool_xinit                       <POOL.LIB>
+
+SYNTAX: int pool_xinit(Pool_t * p, long base, word nel, word elsize);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Initialize an xmem memory pool.  A pool is a linked list of
+               fixed-size blocks taken from a contiguous area.  You can
+               use pools instead of malloc() when fixed-size blocks
+               are all that is needed.  You can have several pools,
+               with different size blocks.  Using memory pools is very
+               efficient compared with more general functions like
+               malloc() [there is currently no malloc() implementation
+               with Dynamic C].
+
+               This function should only be called once for each pool
+               to be used, at program startup time.
+
+               After calling this function, your application must not
+               change any of the fields in the Pool_t structure.
+
+PARAMETER1:		Pool "handle" structure.  This is allocated by caller, but
+               this function will initialize it.  Normally, this would
+               be allocated in static memory by declaring a global
+               variable of type Pool_t.
+PARAMETER2:		Base address of the xmem data memory area to be managed
+               in this pool.  This must be nel*elsize bytes long.
+               Typically, this would be an area allocated by xalloc()
+               when your program starts..
+PARAMETER3:		Number of elements in the memory area. 1..65535
+PARAMETER4:    Size of each element in the memory area. 4..65535.  If you
+               are intending to call pool_link() on this pool, then add an
+               extra 8 bytes to this parameter to account for the space
+               required by the linkage pointers.
+
+RETURN VALUE:  Currently always zero.  If you define the macro
+               POOL_DEBUG, then parameters are checked.  If the
+               parameters look bad, then an exception is raised.  You
+               can define POOL_VERBOSE to get printf() messages.
+
+SEE ALSO:		pool_init, pxalloc, pxcalloc, pxfree, phwm, pavail
+
+END DESCRIPTION **********************************************************/
+
+pool_debug int pool_xinit(Pool_t * p, long base, word nel, word elsize)
+{
+	auto word i;
+   auto long q;
+
+#ifdef POOL_DEBUG
+	if (!p || elsize < 4 || !nel || !base) {
+   #ifdef POOL_VERBOSE
+   	printf("POOL: xinit bad parameter p=%04X, base=%08lX, nel=%u, elsize=%u\n",
+      	p, base, nel, elsize);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+#endif
+	memset(p, 0, sizeof(*p));
+   p->flags = POOL_XMEM;
+   p->base.x = base;
+   p->nel = nel;
+	p->elsize = elsize;
+   p->next.x = p->base.x;
+	for (i = 0, q = base; i < nel; ++i, q += elsize) {
+		if (i+1 == nel)
+      	xsetlong(q, 0);
+      else
+      	xsetlong(q, q + elsize);
+   }
+   return 0;
+}
+
+/*** BeginHeader pool_xappend */
+int pool_xappend(Pool_t * p, long base, word nel);
+#define pool_fappend(p, base, nel) pool_xappend(p, (long)(base), nel)
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pool_xappend                       <POOL.LIB>
+
+SYNTAX: int pool_xappend(Pool_t * p, long base, word nel);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Add another xmem memory area to an existing pool.  It is
+               assumed that the element size is the same as the existing
+               pool's element size.
+
+               The data area does not have to be contiguous with the
+               existing data area, but it must be nel*elsize bytes
+               long (where elsize is the element size of the existing
+               pool, and nel is the parameter to this function).
+
+               The total pool size must obey the constraints documented
+               with pool_xinit().
+
+PARAMETER1:		Pool "handle" structure, as passed to pool_xinit().
+PARAMETER2:		Base address of the xmem data memory area to append
+               to this pool.  This must be nel*elsize bytes long.
+               Typically, this would be an area allocated using
+               xalloc().
+PARAMETER3:		Number of elements in the memory area. 1..65534.
+					The sum of this and the current number of elements
+               must not exceed 65535.
+
+RETURN VALUE:  Currently always zero.  If you define the macro
+               POOL_DEBUG, then parameters are checked.  If the
+               parameters look bad, then an exception is raised.  You
+               can define POOL_VERBOSE to get printf() messages.
+
+SEE ALSO:		pool_xinit
+
+END DESCRIPTION **********************************************************/
+
+pool_debug int pool_xappend(Pool_t * p, long base, word nel)
+{
+	auto word i;
+   auto long q;
+
+#ifdef POOL_DEBUG
+	if (!p || !nel || !base || !(p->flags & POOL_XMEM)) {
+   #ifdef POOL_VERBOSE
+   	printf("POOL: xappend bad parameter p=%04X, base=%08lX, nel=%u\n",
+      	p, base, nel);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+#endif
+	for (i = 0, q = base; i < nel; ++i, q += p->elsize) {
+		if (i+1 == nel) {
+	   #if POOL_IPSET
+	      asm ipset POOL_IPSET;
+	   #endif
+      	xsetlong(q, p->next.x);
+      }
+      else
+      	xsetlong(q, q + p->elsize);
+   }
+   p->next.x = base;
+   p->nel += nel;
+#if POOL_IPSET
+	asm ipres;
+#endif
+   return 0;
+}
+
+
+/*** BeginHeader pool_create */
+int pool_create(Pool_t * p, word nel, word elsize, word opts, word alignment);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pool_create                       <POOL.LIB>
+
+SYNTAX: int pool_create(Pool_t * p, word nel, word elsize, word opts,
+								word alignment);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Allocate the data area for a pool (using _sys_memalign()
+               or memalign() as requested) then initialize the pool
+               using pool_finit() and possibly pool_link().
+
+               This is a convenience function for creating pools and their
+               data areas in one call.
+
+PARAMETER1:		Pool "handle" structure.  This is allocated by caller, but
+               this function will initialize it.  Normally, this would
+               be allocated in static memory by declaring a global
+               variable of type Pool_t.
+PARAMETER2:		Number of elements in the memory area. 1..65535
+PARAMETER3:    Size of each element in the memory area. 4..65535.  This is
+					the desired size of the elements returned by pfalloc(),
+					regardless of whether POOL_LINKED_AUTO option is set. (cf.
+					pool_xinit())
+PARAMETER4:    Option flags.  Use one or more of the following flags ORed
+					together:
+						POOL_LINKED_AUTO
+						  Create a linked pool i.e. call pool_link() after
+						  creation.
+						POOL_ALIGNED
+						  Adjust the size and address of each pool element so that
+						  it is aligned on an address boundary commensurate with
+						  elsize.  See below for further details.
+						POOL_SYS_MALLOC
+						  Allocate memory from the system memory space (otherwise,
+						  the application memory space is assumed).
+PARAMETER5:		Alignment amount (will be rounded to next higher integer power
+               of 2).  Allowed range is 8, 16, 32,...4096.
+
+					Most Rabbit applications do not need to worry about address
+					alignment, since there is not much (if any) performance gain.
+					However, some of the libraries (such as USB) require alignment
+					because of peripheral (DMA) requirements.
+
+					If the POOL_ALIGNED flag is set:
+					  If POOL_LINKED_AUTO is NOT set then all elements returned
+					  by pfalloc() etc. will be aligned on the specified boundary.
+					  If POOL_LINKED_AUTO is set, then there is an additional 8-byte
+					  offset added to the element address, because the double linkage
+					  pointers are stored "before" the element.  Thus, it is not
+					  recommended to combine alignment greater than 8 with pool
+					  linkage, since it somewhat defeats the purpose.
+
+RETURN VALUE:  0 : success.
+					non-zero: -ENOMEM if malloc failed.
+
+SEE ALSO:		pool_xinit, pool_link
+
+END DESCRIPTION **********************************************************/
+
+pool_debug
+int pool_create(Pool_t * p, word nel, word elsize, word opts, word alignment)
+{
+	void __far * base;
+	word asize;
+#ifdef POOL_DEBUG
+	if (!p || elsize < 4 || !nel || opts&POOL_ALIGNED && (!alignment||alignment > 4096)) {
+   #ifdef POOL_VERBOSE
+   	printf("POOL: xinit bad parameter p=%04X, nel=%u, elsize=%u\n",
+      	p, nel, elsize);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+#endif
+	// Make room for linkage pointers
+	if (opts & POOL_LINKED_AUTO)
+		elsize += 8;
+	if (opts & POOL_ALIGNED) {
+		if (alignment & (alignment-1)) {
+			// Not a power of 2, round it up
+			asize = 8;
+			while (asize < alignment)
+				asize <<= 1;
+			alignment = asize;
+		}
+		elsize = elsize + (alignment-1) & ~(alignment-1);
+	}
+	else
+		alignment = 8;	// This has no effect on mspace_memalign().
+	if (opts & POOL_SYS_MALLOC)
+		base = _sys_memalign((long)elsize * nel, alignment);
+	else
+		base = memalign((long)elsize * nel, alignment);
+	if (!base)
+		return -ENOMEM;
+
+	pool_finit(p, base, nel, elsize);
+	if (opts & POOL_LINKED_AUTO)
+		pool_link(p, POOL_LINKED_AUTO);
+	return 0;
+}
+
+/*** BeginHeader pool_link */
+int pool_link(Pool_t * p, int link);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pool_link                       <POOL.LIB>
+
+SYNTAX: int pool_link(Pool_t * p, int link);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Tell the specified pool to maintain a doubly-linked list
+               of allocated elements.
+
+               This function should only be called when the pool is
+               completely free (i.e. pavail() == pnel()).
+
+PARAMETER1:		Pool "handle" structure, as passed to pool_init() or
+               pool_xinit().
+PARAMETER2:		POOL_NOT_LINKED (0): the pool is not to be linked.
+               POOL_LINKED_AUTO (1): the pool is linked, and newly
+                  allocated elements are always added at the end of the
+                  list.
+               POOL_LINKED_BY_APP (2): the pool is linked, but newly
+                  allocated elements are not added to the list.  The
+                  application must call preorder() or pmovebetween() to
+                  insert the element.  This option is only available for
+                  root pools.
+
+               WARNING: if you set the POOL_LINKED_BY_APP option, then
+               the allocated element must NOT be passed to any other
+               pool API function except for pfree(), preorder() (as the
+               'e' parameter) or pmovebetween() (as the 'e' parm).
+               After calling preorder() or pmovebetween(), then it is
+               safe to pass this element to all appropriate functions.
+
+RETURN VALUE:  Currently always zero.  If you define the macro
+               POOL_DEBUG, then parameters are checked.  If the
+               parameters look bad, then an exception is raised.  You
+               can define POOL_VERBOSE to get printf() messages.
+
+SEE ALSO:		pool_init, pool_xinit, pavail
+
+END DESCRIPTION **********************************************************/
+
+pool_debug int pool_link(Pool_t * p, int link)
+{
+	auto word i;
+   auto long q;
+
+#ifdef POOL_DEBUG
+	if (!p) {
+   #ifdef POOL_VERBOSE
+   	printf("POOL: pool_link bad parameter p=%04X\n", p);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+   if (pavail(p) != p->nel) {
+   #ifdef POOL_VERBOSE
+   	printf("POOL: pool_link being called when not all free\n");
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+#endif
+	if (link) {
+   	p->flags |= POOL_LINKED;
+      if (link == POOL_LINKED_BY_APP) {
+      	p->flags |= POOL_AUNLK;
+#ifdef POOL_DEBUG
+   		if (p->flags & POOL_XMEM) {
+   #ifdef POOL_VERBOSE
+   			printf("POOL: pool_link: POOL_LINKED_BY_APP only available for root pools\n");
+   #endif
+   			exception(-ERR_BADPARAMETER);
+   		}
+#endif
+      }
+      else
+      	p->flags &= ~POOL_AUNLK;
+      // Set up condition for empty list...
+      if (p->flags & POOL_XMEM)
+      	p->link.x[0] = p->link.x[1] = p->link.x[2] = paddr(p);
+      else
+      	p->link.r[0] = p->link.r[1] = p->link.r[2] = (void *)p;
+   }
+   else
+   	p->flags &= ~POOL_LINKED;
+   return 0;
+}
+
+/*** BeginHeader palloc */
+void * palloc(Pool_t * p);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+palloc                       <POOL.LIB>
+
+SYNTAX: void * palloc(Pool_t * p);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Return next available free element from the given pool.
+               Eventually, your application should return this element
+               to the pool using pfree() to avoid "memory leaks".
+
+               Assembler code can call palloc_fast:: instead.
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_init().
+
+RETURN VALUE:  NULL: no free elements were available.
+               Otherwise: pointer to an element.
+
+               If the pool is non-linked, your application can
+               use this element provided it does not write more than
+               p->elsize bytes to it (this was the elsize parameter
+               passed to pool_init()).
+
+               If the pool is linked, you application can only write
+               (p->elsize - 4) bytes to it.
+
+SEE ALSO:		pool_init, pcalloc, pfree, phwm, pavail, palloc_fast,
+					pxalloc, pool_link
+
+END DESCRIPTION **********************************************************/
+
+pool_debug void * palloc(Pool_t * p)
+{
+#ifdef POOL_DEBUG
+	if (!p || p->flags & POOL_XMEM) {
+   #ifdef POOL_VERBOSE
+   	printf("POOL: palloc null or xmem pool  p=%04X\n", p);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+#endif
+	if (p->used == p->nel) {
+#ifdef POOL_DEBUG
+	#ifdef POOL_VERBOSE
+   	printf("POOL: palloc pool full  p=%04X\n", p);
+   #endif
+#endif
+   	return NULL;
+   }
+   // This is not strictly correct when considering serialization,
+   // but it's OK for statistical purposes.
+   if (p->used >= p->hwm)
+   	p->hwm = p->used+1;
+	#asm
+   push	ix
+   ld		ix,(sp+@sp+p+2)
+#if POOL_IPSET
+	ipset POOL_IPSET
+#endif
+   lcall	palloc_fast
+#if POOL_IPSET
+	ipres
+#endif
+   pop	ix
+   jr		nc,.ok
+   ld		hl,0
+.ok:
+   #endasm
+}
+
+
+/*** BeginHeader palloc_fast */
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+palloc_fast                       <POOL.LIB>
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Return next available free element from the given pool,
+					which must be a root pool.
+
+               This is an assembler-only version of palloc().
+               *** Do _not_ call this function from C. ***
+
+               palloc_fast does not perform any IPSET protection,
+               parameter validation, or update the high-water mark.
+               The parameter must be passed in IX, and the returned
+               element address is in HL.
+
+REGISTERS:     Parameter in IX
+               Trashes F, BC, DE
+               Return value in HL, carry flag.
+
+EXAMPLE:			ld		ix,my_pool
+					lcall	palloc_fast
+               jr		c,.no_free
+               ; HL points to element
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_init().  Pass this in IX register.
+
+RETURN VALUE:  C flag set: no free elements were available.
+               C flag clear (NC): HL points to an element.
+               If the pool is not linked, your application can
+               use this element provided it does not write more than
+               p->elsize bytes to it (this was the elsize parameter
+               passed to pool_init()).  If the pool is linked,
+               you can write p->elsize-4 bytes to it.
+
+SEE ALSO:		pool_init, pfree_fast, pavail_fast, palloc
+
+END DESCRIPTION **********************************************************/
+
+	#asm __xmem
+palloc_fast::
+   ld		hl,(ix+[__pool__]+used)
+   ex		de,hl			; DE = used
+   ld		hl,(ix+[__pool__]+nel)	; HL = number of elements
+   scf
+   sbc	hl,de
+   jr		nc,.skip
+   lret									; No free entries (nel - used - 1 < 0)
+.skip:
+	inc	de
+   ex		de,hl
+   ld		(ix+[__pool__]+used),hl	; Increment used count
+   ld		hl,(ix+[__pool__]+next)
+   ld		d,h							; Save ret value in DE
+   ld		e,L
+   ld		hl,(hl)
+   ld		(ix+[__pool__]+next),hl	; New 'next free elem' pointer
+   ex		de,hl							; Return value in HL
+   ;bit	1,(ix+[__pool__]+flags)
+   ld		e,(ix+[__pool__]+flags)
+   bit	1,e
+   jr		nz,.skip2
+   ; Return if not linked pool
+   lret									; NC flag still set from test
+.skip2:
+   ; Maintain the linked list
+   bit	2,e							; Test AUNLK flag
+   jr		nz,.nolink
+
+	push	ix
+   pop	de
+   ld		(hl),e
+   inc	hl
+   ld		(hl),d
+   dec	hl
+   ex		de,hl
+   ld		hl,(ix+[__pool__]+link+2)
+   ; Now DE is new element, HL is old last element
+   ld		(hl),e
+   inc	hl
+   ld		(hl),d
+   dec	hl
+   ex		de,hl
+   ld		(ix+[__pool__]+link+2),hl
+   inc	hl
+   inc	hl
+   ; Now HL is new element (pointing to 'prev' field), DE is old last element
+   ld		(hl),e
+   inc	hl
+   ld		(hl),d
+   inc	hl
+   ; HL points past link fields
+   lret								; NC flag still set from test
+.nolink:
+	ld		b,0
+   ld		(hl),b
+   inc	hl
+   ld		(hl),b
+   inc	hl
+   ld		(hl),b
+   inc	hl
+   ld		(hl),b					; Zero out next/prev fields
+   inc	hl
+   lret
+#endasm
+
+
+/*** BeginHeader pxalloc */
+long pxalloc(Pool_t * p);
+#define pfalloc(p) ((void __far *)pxalloc(p))
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pxalloc                       <POOL.LIB>
+
+SYNTAX: long pxalloc(Pool_t * p);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Return next available free element from the given pool.
+               Eventually, your application should return this element
+               to the pool using pxfree() to avoid "memory leaks".
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_xinit().
+
+RETURN VALUE:  0: no free elements were available.
+               Otherwise: physical (xmem address) of an element.
+               If the pool is not linked, your
+               application can use this element provided it does not write
+               more than p->elsize bytes to it (this was the elsize
+               parameter passed to pool_xinit()).
+               If the pool is linked, you can write up to (p->elsize-8)
+               bytes to it.
+
+SEE ALSO:		pool_xinit, pxcalloc, pxfree, phwm, pavail
+
+END DESCRIPTION **********************************************************/
+
+pool_debug long pxalloc(Pool_t * p)
+{
+	auto long r, s;
+
+#ifdef POOL_DEBUG
+	if (!p || !(p->flags & POOL_XMEM)) {
+   #ifdef POOL_VERBOSE
+   	printf("POOL: palloc null or root pool  p=%04X\n", p);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+#endif
+	if (p->used == p->nel) {
+#ifdef POOL_DEBUG
+	#ifdef POOL_VERBOSE
+   	printf("POOL: pxalloc pool full  p=%04X\n", p);
+   #endif
+#endif
+   	return 0L;
+	}
+   // This is not strictly correct when considering serialization,
+   // but it's OK for statistical purposes.
+   if (p->used >= p->hwm)
+   	p->hwm = p->used+1;
+	#asm
+   push	ix
+   ld		ix,(sp+@sp+p+2)
+#if POOL_IPSET
+	ipset POOL_IPSET
+#endif
+   lcall	pxalloc_fast
+#if POOL_IPSET
+	ipres
+#endif
+   pop	ix
+   jr		nc,.ok
+   ld		bc,0
+   ld		de,0
+.ok:
+   #endasm
+}
+
+/*** BeginHeader pxalloc_fast */
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pxalloc_fast                       <POOL.LIB>
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Return next available free element from the given pool.
+               Eventually, your application should return this element
+               to the pool using pxfree() to avoid "memory leaks".
+
+               This is an assembler-only version of pxalloc().
+               *** Do _not_ call this function from C. ***
+
+               pxalloc_fast does not perform any IPSET protection,
+               parameter validation, or update the high-water mark.
+               The parameter must be passed in IX, and the returned
+               element address is in BCDE.
+
+REGISTERS:     Parameter in IX
+               Trashes AF, HL, PX, PY, PZ
+               Return value in BCDE, carry flag.
+
+EXAMPLE:			ld		ix,my_pool
+					lcall	pxalloc_fast
+               jr		c,.no_free
+               ; BCDE points to element
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_init().  Pass this in IX register.
+
+RETURN VALUE:  C flag set: no free elements were available. (BCDE is
+                 undefined in this case).
+               NC flag: BCDE points to an element.  If the pool is
+               not linked, your application can
+               use this element provided it does not write more than
+               p->elsize bytes to it (this was the elsize parameter
+               passed to pool_xinit()).  If the pool is linked,
+               you can write p->elsize-8 bytes to it.
+
+SEE ALSO:		pool_init, pfree_fast, pavail_fast, pxalloc
+
+END DESCRIPTION **********************************************************/
+
+#asm __xmem
+pxalloc_fast::
+   ld		hl,(ix+[__pool__]+used)
+   ex		de,hl			; DE = used
+   ld		hl,(ix+[__pool__]+nel)	; HL = number of elements
+   scf
+   sbc	hl,de
+   jr		nc,.skip
+   lret									; No free entries
+.skip:
+	ldl	px,ix
+	inc	de
+   ex		de,hl
+   ld		(px+[__pool__]+used),hl	; Increment used count
+   ld		py,(px+[__pool__]+next)	; py = r
+   ld		bcde,(py)
+   ld		(px+[__pool__]+next),bcde	; New 'next free elem' pointer
+   ld		a,(px+[__pool__]+flags)
+   bit	1,a
+   ; Return if not linked pool
+   jr		nz,.pxlinked
+   ld		bcde,py					; Pop r into BCDE for return
+   or		a
+   lret
+
+.pxlinked:
+   ld		bcde,(px+[__pool__]+link+8)  ; p->link.x[2]
+   ld		(py),bcde			; *r = p->link.x[2]
+   ld		pz,(px+[__pool__]+link+4)	; s = p->link.x[1] (use pz)
+   ld		(pz),py				; *(p->link.x[1]) = r
+   ld		(py+4),pz		; *(r+4) = s
+	ld		(px+[__pool__]+link+4),py	; x[1] = r
+   ld		py,py+8			; Add 8 to skip over link fields
+   ld		bcde,py
+   or		a								; Clear carry flag
+   lret
+#endasm
+
+
+/*** BeginHeader pcalloc */
+void * pcalloc(Pool_t * p);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pcalloc                       <POOL.LIB>
+
+SYNTAX: void * pcalloc(Pool_t * p);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Return next available free element from the given pool.
+               Eventually, your application should return this element
+               to the pool using pfree() to avoid "memory leaks".
+
+               The element is set to all zero bytes before returning.
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_init().
+
+RETURN VALUE:  NULL: no free elements were available.
+               Otherwise: pointer to an element.  Your application can
+               use this element provided it does not write more than
+               p->elsize bytes to it (this was the elsize parameter
+               passed to pool_init()).  If the pool is linked,
+               you can write p->elsize-4 bytes to it.
+
+SEE ALSO:		pool_init, palloc, pfree, phwm, pavail
+
+END DESCRIPTION **********************************************************/
+
+pool_debug void * pcalloc(Pool_t * p)
+{
+	auto void * r;
+
+   if (r = palloc(p)) {
+   	if (p->flags & POOL_LINKED)
+   		memset(r, 0, p->elsize - 2*sizeof(void *));
+      else
+   		memset(r, 0, p->elsize);
+   }
+   return r;
+}
+
+/*** BeginHeader pxcalloc */
+long pxcalloc(Pool_t * p);
+#define pfcalloc(p) ((void __far *)pxcalloc(p))
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pxcalloc                       <POOL.LIB>
+
+SYNTAX: long pxcalloc(Pool_t * p);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Return next available free element from the given pool.
+               Eventually, your application should return this element
+               to the pool using pxfree() to avoid "memory leaks".
+
+               The element is set to all zero bytes before returning.
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_xinit().
+
+RETURN VALUE:  0: no free elements were available.
+               Otherwise: physical (xmem address) of an element.  Your
+               application can use this element provided it does not write
+               more than p->elsize bytes to it (this was the elsize
+               parameter passed to pool_xinit()).  If the pool is linked,
+               you can write p->elsize-8 bytes to it.
+
+SEE ALSO:		pool_xinit, pxalloc, pxfree, phwm, pavail
+
+END DESCRIPTION **********************************************************/
+
+pool_debug long pxcalloc(Pool_t * p)
+{
+	auto long r;
+
+   if (r = pxalloc(p)) {
+   	if (p->flags & POOL_LINKED)
+	   	_f_memset((void __far *)r, 0, p->elsize - 2*sizeof(long));
+      else
+	   	_f_memset((void __far *)r, 0, p->elsize);
+   }
+   return r;
+}
+
+/*** BeginHeader pfree */
+void pfree(Pool_t * p, void * e);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pfree                       <POOL.LIB>
+
+SYNTAX: void pfree(Pool_t * p, void * e);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Free an element which was previously obtained via palloc().
+
+               Note: if you free an element that was not allocated from
+               this pool, or was already free, or was outside the pool,
+               then your application will crash!  You can detect most of
+               these programming errors by defining the following
+               symbols before #use pool.lib:
+                 POOL_DEBUG
+                 POOL_VERBOSE
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               palloc().
+PARAMETER2:		Element to free, which was returned from palloc().
+
+SEE ALSO:		pool_init, palloc, pcalloc, phwm, pavail
+
+END DESCRIPTION **********************************************************/
+
+pool_debug void pfree(Pool_t * p, void * e)
+{
+#ifdef POOL_DEBUG
+	auto word d, i;
+   auto char * r, * f;
+#endif
+
+
+#ifdef POOL_DEBUG
+	if (p->flags & POOL_LINKED)
+   	f = (char *)e - 2*sizeof(void *);	// Adjust back to point to lin fields
+   else
+   	f = (char *)e;
+	if (!p || !p->used || p->flags & POOL_XMEM) {
+	#ifdef POOL_VERBOSE
+   	printf("POOL: pfree bad parameter  p=%04X\n", p);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+   // If debugging, check that e is feasible
+   /* Unfortunately, can't do this because we now support non-contiguous pools
+   d = ((word)f - (word)p->base.r) / p->elsize;
+	if ((word)f < (word)p->base.r ||
+       (word)f >= (word)p->base.r + p->nel*p->elsize ||
+       d * p->elsize + (word)p->base.r != (word)f) {
+	#ifdef POOL_VERBOSE
+   	printf("POOL: pfree element does not belong to pool  p=%04X, e=%04X\n", p, e);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+   */
+   // Also see if not already in free list.  Also do count in case linked list
+   // has been trashed by overwrite past end of element.
+   for (r = p->next.r, i = 0; r && i < p->nel-p->used; r = *(char **)r, ++i)
+   	if (r == f) {
+	#ifdef POOL_VERBOSE
+	   	printf("POOL: pfree element already free  p=%04X, e=%04X\n", p, e);
+   #endif
+	   	exception(-ERR_BADPARAMETER);
+      }
+	if (r) {
+	#ifdef POOL_VERBOSE
+   	printf("POOL: pfree linked list trashed!  p=%04X, e=%04X\n", p, e);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+#endif
+
+	#asm
+   push	ix
+   ld		ix,(sp+@sp+p+2)
+   ld		hl,(sp+@sp+e+2)
+   ex		de,hl
+#if POOL_IPSET
+	ipset POOL_IPSET
+#endif
+   lcall	pfree_fast
+#if POOL_IPSET
+	ipres
+#endif
+   pop	ix
+   #endasm
+}
+
+/*** BeginHeader pfree_fast */
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pfree_fast                       <POOL.LIB>
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Free an element which was previously obtained via palloc().
+
+               This is an assembler-only version of pfree().
+               *** Do _not_ call this function from C. ***
+
+               pfree_fast does not perform any IPSET protection or
+               parameter validation.
+               pfree_fast is an xmem function.  The parameters must be
+               passed in machine registers.
+
+REGISTERS:     Parameters in IX, DE respectively
+               Trashes BC, DE, HL
+
+EXAMPLE:			ld		ix,my_pool
+					ld		de,(element_addr)
+					lcall	pfree_fast
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               palloc() or palloc_fast.  This must be in the IX register.
+PARAMETER2:		Element to free, which was returned from palloc().
+               This must be in the DE register
+
+SEE ALSO:		pool_init, palloc_fast, pavail_fast, pxfree_fast
+
+END DESCRIPTION **********************************************************/
+
+#asm __xmem
+pfree_fast::
+	;bit	1,(ix+[__pool__]+flags)
+	ld		h,(ix+[__pool__]+flags)
+   bit	1,h
+   jr		z,.notlinked
+   ; Decrement by 4 if linked, to point to link fields
+   ld		hl,-4
+   add	hl,de
+   ; Unlink from linked lists
+	push	hl
+	ld		e,(hl)
+   inc	hl
+   ld		d,(hl)
+   inc	hl
+   ld		c,(hl)
+   ld		(hl),0		; Null out original prev pointer (this allows pmovebetween to determine if element freed)
+   inc	hl
+   ld		b,(hl)		; bc = prev; de = next (from element being freed)
+   ld		(hl),0
+   ld		l,e
+	ld		h,d			; hl = de = next
+   bool	hl
+   jr		z,.notinLL	; skip if not in linked list (null 'next' pointer)
+   ld		l,e
+   ld		h,d
+   inc	hl
+   inc	hl
+	ld		(hl),c
+   inc	hl
+   ld		(hl),b		; next.prev = prev
+   ld		h,b
+   ld		l,c
+   ld		(hl),e
+   inc	hl
+   ld		(hl),d		; prev.next = next
+.notinLL:
+   pop	de				; pop element being freed
+.notlinked:
+	ld		hl,(ix+[__pool__]+next)
+   ex		de,hl
+   ld		(hl),e
+   inc	hl
+   ld		(hl),d
+   dec	hl
+   ld		(ix+[__pool__]+next),hl
+   ld		hl,(ix+[__pool__]+used)
+   dec	hl
+   ld		(ix+[__pool__]+used),hl
+   lret
+#endasm
+
+/*** BeginHeader pxfree */
+void pxfree(Pool_t * p, long e);
+#define pffree(p, e) pxfree(p, (long)(e))
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pxfree                       <POOL.LIB>
+
+SYNTAX: void pxfree(Pool_t * p, long e);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Free an element which was previously obtained via pxalloc().
+
+               Note: if you free an element that was not allocated from
+               this pool, or was already free, or was outside the pool,
+               then your application will crash!  You can detect most of
+               these programming errors by defining the following
+               symbols before #use pool.lib:
+                 POOL_DEBUG
+                 POOL_VERBOSE
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pxalloc().
+PARAMETER2:		Element to free, which was returned from pxalloc().
+
+SEE ALSO:		pool_xinit, pxalloc, pxcalloc, phwm, pavail
+
+END DESCRIPTION **********************************************************/
+
+pool_debug void pxfree(Pool_t * p, long e)
+{
+#ifdef POOL_DEBUG
+	auto word d, i;
+   auto long r, f;
+#endif
+
+
+#ifdef POOL_DEBUG
+   if (p->flags & POOL_LINKED)
+   	f = e - 2*sizeof(long);
+   else
+   	f = e;
+	if (!p || !p->used || !(p->flags & POOL_XMEM)) {
+	#ifdef POOL_VERBOSE
+   	printf("POOL: pxfree bad parameter  p=%04X\n", p);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+   // If debugging, check that e is feasible
+   /* Unfortunately, can't do this because we now support non-contiguous pools
+   d = (word)((f - p->base.x) / p->elsize);
+	if (f < p->base.x ||
+       f >= p->base.x + (long)p->nel*p->elsize ||
+       (long)d * p->elsize + p->base.x != f) {
+	#ifdef POOL_VERBOSE
+   	printf("POOL: pxfree element does not belong to pool  p=%04X, e=%08lX\n", p, e);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+   */
+   // Also see if not already in linked list.  Also do count in case linked list
+   // has been trashed by overwrite past end of element.
+   for (r = p->next.x, i = 0; r && i < p->nel-p->used; r = xgetlong(r), ++i)
+   	if (r == f) {
+	#ifdef POOL_VERBOSE
+	   	printf("POOL: pxfree element already free  p=%04X, e=%08lX\n", p, e);
+   #endif
+	   	exception(-ERR_BADPARAMETER);
+      }
+	if (r) {
+	#ifdef POOL_VERBOSE
+   	printf("POOL: pxfree linked list trashed!  p=%04X, e=%08lX\n", p, e);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+#endif
+
+	#asm
+   push	ix
+   ld		ix,(sp+@sp+p+2)
+   ld		hl,(sp+@sp+e+2)
+   ex		de,hl
+   ld		hl,(sp+@sp+e+4)
+   ld		b,h
+   ld		c,L
+#if POOL_IPSET
+	ipset POOL_IPSET
+#endif
+   lcall	pxfree_fast
+#if POOL_IPSET
+	ipres
+#endif
+   pop	ix
+   #endasm
+}
+
+/*** BeginHeader pxfree_fast */
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pxfree_fast                       <POOL.LIB>
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Free an element which was previously obtained via pxalloc().
+
+               This is an assembler-only version of pxfree().
+               *** Do _not_ call this function from C. ***
+
+               pxfree_fast does not perform any IPSET protection or
+               parameter validation.
+               pxfree_fast is an xmem function.  The parameters must be
+               passed in machine registers.
+
+REGISTERS:     Parameters in IX, BCDE respectively
+               Trashes AF, BC, DE, HL, JK, PX, PY, PZ
+
+EXAMPLE:			ld		ix,my_pool
+					ld		de,(element_addr)
+               ld		bc,(element_addr+2)
+					lcall	pxfree_fast
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               palloc() or palloc_fast.  This must be in the IX register.
+PARAMETER2:		Element to free, which was returned from palloc().
+               This must be in the BCDE register (physical address)
+
+SEE ALSO:		pool_init, pxalloc_fast, pavail_fast, pfree_fast
+
+END DESCRIPTION **********************************************************/
+
+#asm __xmem
+pxfree_fast::
+	ldl	px,ix
+   ld		py,bcde		; py = element to be freed
+	bit	1,(ix+[__pool__]+flags)
+   jr		z,.nolink
+	; Pool is linked.  Subtract 8 from element address to point to link fields.
+	ld		py,py-8
+
+   ld		bcde,(py)		; next = bcde = *e
+   ld		pz,(py+4)		; prev = *(e+4)
+	ld		jkhl,pz
+   ld		(pz),bcde		; *prev = next
+	ld		pz,bcde
+   ld		(pz+4),jkhl		; *(next+4) = prev
+
+.nolink:
+	ld		pz,(px+[__pool__]+next)	; p->next
+	ld		(py),pz						; *e = p->next
+   ld		(px+[__pool__]+next),py	; p->next = e
+   ld		hl,(px+[__pool__]+used)
+   dec	hl
+   ld		(px+[__pool__]+used),hl
+   lret
+#endasm
+
+/*** BeginHeader phwm */
+word phwm(Pool_t * p);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+phwm                       <POOL.LIB>
+
+SYNTAX: word phwm(Pool_t * p);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Return the largest number of elements ever simultaneously
+               allocated from the given pool -- the pool "high water mark".
+
+               You can use this function to help size a pool, since it may
+               be difficult to determine the optimum number of elements
+               without running a trial program.
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_init() or pool_xinit().
+
+RETURN VALUE:	Max number of elements ever allocated.
+
+SEE ALSO:		pool_init, pool_xinit, pavail
+
+END DESCRIPTION **********************************************************/
+
+pool_debug word phwm(Pool_t * p)
+{
+#ifdef POOL_DEBUG
+	if (!p)
+   	exception(-ERR_BADPARAMETER);
+#endif
+   return p->hwm;
+}
+
+/*** BeginHeader pavail */
+word pavail(Pool_t * p);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pavail                       <POOL.LIB>
+
+SYNTAX: word pavail(Pool_t * p);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Return the number of elements which are currently available
+					for allocation.
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_init() or pool_xinit().
+
+RETURN VALUE:	Number of elements available for allocation.
+
+SEE ALSO:		pool_init, pool_xinit, phwm, pnel
+
+END DESCRIPTION **********************************************************/
+
+pool_debug word pavail(Pool_t * p)
+{
+#ifdef POOL_DEBUG
+	if (!p)
+   	exception(-ERR_BADPARAMETER);
+#endif
+   return p->nel - p->used;
+}
+
+/*** BeginHeader pavail_fast */
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pavail_fast                       <POOL.LIB>
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Return the number of elements which are currently available
+					for allocation.
+
+               This is an assembler-only version of pavail().
+               *** Do _not_ call this function from C. ***
+
+REGISTERS:     Parameter in IX
+               Trashes F, DE
+               Return value in HL, Z flag.
+
+EXAMPLE:			ld		ix,my_pool
+					lcall	pavail_fast
+               ; HL contains number of available elements
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_init() or pool_xinit().  This must be provided
+               in the IX register.
+
+RETURN VALUE:	Number of elements available for allocation.  The return
+               value is placed in HL.  In addition, the 'Z' flag is set
+               if there are no free elements.
+
+SEE ALSO:		pool_init, pool_xinit, phwm, pnel
+
+END DESCRIPTION **********************************************************/
+
+#asm	__xmem
+pavail_fast::
+	ld		hl,(ix+[__pool__]+used)
+   ex		de,hl
+	ld		hl,(ix+[__pool__]+nel)
+   or		a
+   sbc	hl,de
+   lret
+#endasm
+
+
+/*** BeginHeader pnel */
+word pnel(Pool_t * p);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pnel                       <POOL.LIB>
+
+SYNTAX: word pnel(Pool_t * p);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Return the number of elements which are in the pool,
+					both free and used.  This includes elements appended
+               using pool_append() etc.
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_init() or pool_xinit().
+
+RETURN VALUE:	Number of elements total.
+
+SEE ALSO:		pool_init, pool_xinit, pavail
+
+END DESCRIPTION **********************************************************/
+
+pool_debug word pnel(Pool_t * p)
+{
+#ifdef POOL_DEBUG
+	if (!p)
+   	exception(-ERR_BADPARAMETER);
+#endif
+   return p->nel;
+}
+
+/*** BeginHeader pfirst */
+void * pfirst(Pool_t * p);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pfirst                       <POOL.LIB>
+
+SYNTAX: void * pfirst(Pool_t * p);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Get the first allocated element in a root pool.  The pool
+               MUST be set to being a linked pool by using
+                 pool_link(p, <non-zero>)
+               otherwise the results are undefined.
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_init().
+
+RETURN VALUE:	NULL: there are no allocated elements.
+					else points to first ('oldest') allocated element.
+
+SEE ALSO:		pool_init, pool_link, palloc, pfree, plast, pnext, pprev
+
+END DESCRIPTION **********************************************************/
+pool_debug void * pfirst(Pool_t * p)
+{
+	auto void * r;
+#ifdef POOL_DEBUG
+	if (!p || !(p->flags & POOL_LINKED) || p->flags & POOL_XMEM) {
+   #ifdef POOL_VERBOSE
+   	printf("pfirst: pool (%04X) is NULL or not linked or not root\n", p);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+#endif
+	#asm
+   push	ix
+   ld		ix,(sp+@sp+p+2)
+   lcall	pfirst_fast
+   pop	ix
+   #endasm
+}
+
+
+/*** BeginHeader pfirst_fast, plast_fast */
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pfirst_fast                       <POOL.LIB>
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Get the first allocated element in a root pool.  The pool
+               MUST be set to being a linked pool by using
+                 pool_link(p, <non-zero>)
+               otherwise the results are undefined.
+
+               This is an assembler-only version of pfirst().
+               *** Do _not_ call this function from C. ***
+
+REGISTERS:     Parameter in IX
+               Trashes F, DE
+               Return value in HL, carry flag.
+
+EXAMPLE:			ld		ix,my_pool
+					lcall	pfirst_fast
+               jr		c,.no_elems
+               ; HL points to first element
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_init().  Pass this in IX register.
+
+RETURN VALUE:	C flag set, HL=0: there are no allocated elements.
+					Else C flag clear (NC) and HL points to first element.
+
+SEE ALSO:		pool_init, pool_link, pfirst, pnext_fast
+
+END DESCRIPTION **********************************************************/
+/* START FUNCTION DESCRIPTION ********************************************
+plast_fast                       <POOL.LIB>
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Get the last allocated element in a root pool.  The pool
+               MUST be set to being a linked pool by using
+                 pool_link(p, <non-zero>)
+               otherwise the results are undefined.
+
+               This is an assembler-only version of plast().
+               *** Do _not_ call this function from C. ***
+
+REGISTERS:     Parameter in IX
+               Trashes F, DE
+               Return value in HL, carry flag.
+
+EXAMPLE:			ld		ix,my_pool
+					lcall	plast_fast
+               jr		c,.no_elems
+               ; HL points to last element
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_init().  Pass this in IX register.
+
+RETURN VALUE:	C flag set, HL=0: there are no allocated elements.
+					Else C flag clear (NC) and HL points to last element.
+
+SEE ALSO:		pool_init, pool_link, plast, pprev_fast
+
+END DESCRIPTION **********************************************************/
+
+
+#asm __xmem
+plast_fast::
+	ld		hl,(ix+[__pool__]+link+2)
+   jr		.cont
+pfirst_fast::
+	ld		hl,(ix+[__pool__]+link)
+.cont:
+   ex		de,hl
+   ld		hl,ix
+   or		a
+   sbc	hl,de
+   scf
+   jr		nz,.skip
+   lret		; Return with C flag set (and HL zero) if no elements.
+.skip:
+   ld		hl,4
+   add	hl,de
+   or		a
+   lret			; Return with NC and HL pointing to first element (past link fields).
+
+#endasm
+
+/*** BeginHeader plast */
+void * plast(Pool_t * p);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+plast                       <POOL.LIB>
+
+SYNTAX: void * plast(Pool_t * p);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Get the last allocated element in a root pool.  The pool
+               MUST be set to being a linked pool by using
+                 pool_link(p, <non-zero>)
+               otherwise the results are undefined.
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_init().
+
+RETURN VALUE:	NULL: there are no allocated elements.
+					else points to last ('youngest') allocated element.
+
+SEE ALSO:		pool_init, pool_link, palloc, pfree, pfirst
+
+END DESCRIPTION **********************************************************/
+pool_debug void * plast(Pool_t * p)
+{
+	auto void * r;
+#ifdef POOL_DEBUG
+	if (!p || !(p->flags & POOL_LINKED) || p->flags & POOL_XMEM) {
+   #ifdef POOL_VERBOSE
+   	printf("plast: pool (%04X) is NULL or not linked or not root\n", p);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+#endif
+	#asm
+   push	ix
+   ld		ix,(sp+@sp+p+2)
+   lcall	plast_fast
+   pop	ix
+   #endasm
+}
+
+
+
+/*** BeginHeader pnext */
+void * pnext(Pool_t * p, void * e);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pnext                       <POOL.LIB>
+
+SYNTAX: void * pnext(Pool_t * p, void * e);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Get the next allocated element in a root pool.  The pool
+               MUST be set to being a linked pool by using
+                 pool_link(p, <non-zero>)
+               otherwise the results are undefined.
+
+               You can easily iterate through all of the allocated
+               elements of a root pool using the following construct:
+
+                 void * e;
+                 Pool_t * p;
+
+                 for (e = pfirst(p); e; e = pnext(p, e)) {
+                 		...
+                 }
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_init().
+PARAMETER2:		Previous element address, obtained by e.g. pfirst().
+					This must be an allocated element in the given pool,
+               otherwise the results are undefined.  Be careful when
+               iterating through a list and deleting elements using
+               pfree(): once the element is deleted, is is no longer
+               valid to pass its address to this function.
+               If this parameter is NULL, then the result is the
+               same as pfirst().  This ensures the invariant
+                 pnext(p, pprev(p, e)) == e.
+
+RETURN VALUE:	NULL: there are no more elements.
+					else points to next allocated element.
+
+SEE ALSO:		pool_init, pool_link, palloc, pfree, pfirst, pprev
+
+END DESCRIPTION **********************************************************/
+pool_debug void * pnext(Pool_t * p, void * e)
+{
+	auto void * r;
+#ifdef POOL_DEBUG
+	auto void * x;
+#endif
+
+	if (!e)
+   	return pfirst(p);
+
+#ifdef POOL_DEBUG
+	if (!p || !(p->flags & POOL_LINKED) || p->flags & POOL_XMEM) {
+   #ifdef POOL_VERBOSE
+   	printf("pnext: pool (%04X) is NULL or not linked or not root\n", p);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+   // See if element is actually allocated
+   for (x = pfirst(p); x; x = pnext(p, x))
+   	if (x == e)
+      	break;
+   if (!x) {
+   #ifdef POOL_VERBOSE
+   	printf("pnext: element %04X in pool %04X is not allocated\n", e, p);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+#endif
+	#asm
+   push	ix
+   ld		ix,(sp+@sp+p+2)
+   ld		hl,(sp+@sp+e+2)
+   ex		de,hl
+   lcall	pnext_fast
+   pop	ix
+   #endasm
+}
+
+
+/*** BeginHeader pnext_fast, pprev_fast */
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pnext_fast                       <POOL.LIB>
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Get the next allocated element in a root pool.  The pool
+               MUST be set to being a linked pool by using
+                 pool_link(p, <non-zero>)
+               otherwise the results are undefined.
+
+               This is an assembler-only version of pnext().
+               *** Do _not_ call this function from C. ***
+
+REGISTERS:     Parameters in IX, DE respectively
+               Trashes F, DE
+               Return value in HL, carry flag.
+
+EXAMPLE:			ld		ix,my_pool
+					ld		de,(current_element)
+					lcall	pnext_fast
+               jr		c,.no_more_elems
+               ; HL points to next allocated element
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_init().  Pass this in IX register.
+PARAMETER2:		Current element, address in DE register.  See pnext()
+               for fuller description.
+
+RETURN VALUE:	C flag set, HL=0: there are no more elements.
+					Else C flag clear (NC) and HL points to next element.
+
+SEE ALSO:		pool_init, pool_link, palloc, pfree, pfirst, pprev
+
+END DESCRIPTION **********************************************************/
+/* START FUNCTION DESCRIPTION ********************************************
+pprev_fast                       <POOL.LIB>
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Get the previous allocated element in a root pool.  The
+               pool MUST be set to being a linked pool by using
+                 pool_link(p, <non-zero>)
+               otherwise the results are undefined.
+
+               This is an assembler-only version of pnext().
+               *** Do _not_ call this function from C. ***
+
+REGISTERS:     Parameters in IX, DE respectively
+               Trashes F, DE
+               Return value in HL, carry flag.
+
+EXAMPLE:			ld		ix,my_pool
+					ld		de,(current_element)
+					lcall	pprev_fast
+               jr		c,.no_more_elems
+               ; HL points to previous allocated element
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_init().  Pass this in IX register.
+PARAMETER2:		Current element, address in DE register.  See pprev()
+               for fuller description.
+
+RETURN VALUE:	C flag set, HL=0: there are no more elements.
+					Else C flag clear (NC) and HL points to previous element.
+
+SEE ALSO:		pool_init, pool_link, palloc, pprev
+
+END DESCRIPTION **********************************************************/
+
+#asm __xmem
+pprev_fast::
+	ld		h,d
+   ld		l,e
+   bool	hl
+   jp		z,plast_fast
+	ex		de,hl
+   ld		hl,(hl-2)
+   jr		.cont
+pnext_fast::
+	ld		h,d
+   ld		l,e
+   bool	hl
+   jp		z,pfirst_fast
+	ex		de,hl
+   ld		hl,(hl-4)
+.cont:
+   ex		de,hl
+   ld		hl,ix
+   or		a
+   sbc	hl,de
+   scf
+   jr		nz,.skip
+   lret
+.skip:
+   ld		hl,4
+   add	hl,de
+   or		a
+   lret
+
+#endasm
+
+
+/*** BeginHeader pprev */
+void * pprev(Pool_t * p, void * e);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pprev                       <POOL.LIB>
+
+SYNTAX: void * pprev(Pool_t * p, void * e);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Get the previous allocated element in a root pool.  The
+               pool MUST be set to being a linked pool by using
+                 pool_link(p, <non-zero>)
+               otherwise the results are undefined.
+
+               You can easily iterate through all of the allocated
+               elements of a root pool using the following construct:
+
+                 void * e;
+                 Pool_t * p;
+
+                 for (e = plast(p); e; e = pprev(p, e)) {
+                 		...
+                 }
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_init().
+PARAMETER2:		Previous element address, obtained by e.g. plast().
+					This must be an allocated element in the given pool,
+               otherwise the results are undefined.  Be careful when
+               iterating through a list and deleting elements using
+               pfree(): once the element is deleted, is is no longer
+               valid to pass its address to this function.
+               If this parameter is NULL, then the result is the
+               same as plast().  This ensures the invariant
+                 pprev(p, pnext(p, e)) == e.
+
+RETURN VALUE:	NULL: there are no more elements.
+					else points to previous allocated element.
+
+SEE ALSO:		pool_init, pool_link, palloc, pfree, plast, pnext
+
+END DESCRIPTION **********************************************************/
+pool_debug void * pprev(Pool_t * p, void * e)
+{
+	auto void * r;
+#ifdef POOL_DEBUG
+	auto void * x;
+#endif
+
+	if (!e)
+   	return plast(p);
+
+#ifdef POOL_DEBUG
+	if (!p || !(p->flags & POOL_LINKED) || p->flags & POOL_XMEM) {
+   #ifdef POOL_VERBOSE
+   	printf("pprev: pool (%04X) is NULL or not linked or not root\n", p);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+   // See if element is actually allocated
+   for (x = pfirst(p); x; x = pnext(p, x))
+   	if (x == e)
+      	break;
+   if (!x) {
+   #ifdef POOL_VERBOSE
+   	printf("pprev: element %04X in pool %04X is not allocated\n", e, p);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+
+#endif
+	#asm
+   push	ix
+   ld		ix,(sp+@sp+p+2)
+   ld		hl,(sp+@sp+e+2)
+   ex		de,hl
+   lcall	pprev_fast
+   pop	ix
+   #endasm
+}
+
+
+/*** BeginHeader pxfirst */
+long pxfirst(Pool_t * p);
+#define pffirst(p) ((void __far *)pxfirst(p))
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pxfirst                       <POOL.LIB>
+
+SYNTAX: long pxfirst(Pool_t * p);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Get the first allocated element in an xmem pool.  The pool
+               MUST be set to being a linked pool by using
+                 pool_link(p, <non-zero>)
+               otherwise the results are undefined.
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_xinit().
+
+RETURN VALUE:	0: there are no allocated elements.
+					else points to first ('oldest') allocated element.
+
+SEE ALSO:		pool_xinit, pool_link, pxalloc, pxfree, pxlast, pxnext,
+					pxprev
+
+END DESCRIPTION **********************************************************/
+pool_debug long pxfirst(Pool_t * p)
+{
+	auto long r;
+#ifdef POOL_DEBUG
+	if (!p || !(p->flags & POOL_LINKED) || !(p->flags & POOL_XMEM)) {
+   #ifdef POOL_VERBOSE
+   	printf("pxfirst: pool (%04X) is NULL or not linked or not xmem\n", p);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+#endif
+	#asm
+   push	ix
+   ld		ix,(sp+@sp+p+2)
+   lcall	pxfirst_fast
+   pop	ix
+   jr		nc,.ok
+   ld		bc,0
+   ld		de,0
+.ok:
+   #endasm
+}
+
+
+/*** BeginHeader pxfirst_fast, pxlast_fast */
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pxfirst_fast                       <POOL.LIB>
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Get the first allocated element in an xmem pool.  The pool
+               MUST be set to being a linked pool by using
+                 pool_link(p, <non-zero>)
+               otherwise the results are undefined.
+
+               This is an assembler-only version of pxfirst().
+               *** Do _not_ call this function from C. ***
+
+REGISTERS:     Parameter in IX
+               Trashes F, HL, JK
+               Return value in BCDE, carry flag.
+
+EXAMPLE:			ld		ix,my_pool
+					lcall	pxfirst_fast
+               jr		c,.no_elems
+               ; BCDE points to first element
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_xinit().  Pass this in IX register.
+
+RETURN VALUE:	C flag set: there are no allocated elements.
+					Else C flag clear (NC) and BCDE points to first element.
+
+SEE ALSO:		pool_xinit, pool_link, pxfirst, pxnext_fast
+
+END DESCRIPTION **********************************************************/
+/* START FUNCTION DESCRIPTION ********************************************
+pxlast_fast                       <POOL.LIB>
+
+SYNTAX: xmem long pxlast_fast(Pool_t * p);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Get the last allocated element in an xmem pool.  The pool
+               MUST be set to being a linked pool by using
+                 pool_link(p, <non-zero>)
+               otherwise the results are undefined.
+
+               This is an assembler-only version of pxlast().
+               *** Do _not_ call this function from C. ***
+
+REGISTERS:     Parameter in IX
+               Trashes F, HL, JK
+               Return value in BCDE, carry flag.
+
+EXAMPLE:			ld		ix,my_pool
+					lcall	pxlast_fast
+               jr		c,.no_elems
+               ; BCDE points to last element
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_xinit().  Pass this in IX register.
+
+RETURN VALUE:	C flag set: there are no allocated elements.
+					Else C flag clear (NC) and BCDE points to last element.
+
+SEE ALSO:		pool_xinit, pool_link, pxlast, pxprev_fast
+
+END DESCRIPTION **********************************************************/
+
+
+#asm __xmem
+pxlast_fast::
+   ld		bcde,(ix+[__pool__]+link+4)
+   jr		.cont
+pxfirst_fast::
+   ld		bcde,(ix+[__pool__]+link)
+.cont:
+	ld		jkhl,(ix+[__pool__]+link+8)	; Pool (self) paddr (x[2])
+   cp		jkhl,bcde
+   scf
+   jr		nz,.notMT
+   lret				; Return with C flag set if no elements.
+.notMT:
+   ld		jkhl,8
+   add	jkhl,bcde
+   ex		jkhl,bcde
+   or		a
+   lret		 		; Return with NC and BCDE pointing to first or last element (past link fields).
+#endasm
+
+/*** BeginHeader pxlast */
+long pxlast(Pool_t * p);
+#define pflast(p) ((void __far *)pxlast(p))
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pxlast                       <POOL.LIB>
+
+SYNTAX: long pxlast(Pool_t * p);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Get the last allocated element in an xmem pool.  The pool
+               MUST be set to being a linked pool by using
+                 pool_link(p, <non-zero>)
+               otherwise the results are undefined.
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_xinit().
+
+RETURN VALUE:	0: there are no allocated elements.
+					else points to last ('youngest') allocated element.
+
+SEE ALSO:		pool_xinit, pool_link, pxalloc, pxfree, pxfirst
+
+END DESCRIPTION **********************************************************/
+pool_debug long pxlast(Pool_t * p)
+{
+	auto long r;
+#ifdef POOL_DEBUG
+	if (!p || !(p->flags & POOL_LINKED) || !(p->flags & POOL_XMEM)) {
+   #ifdef POOL_VERBOSE
+   	printf("pxlast: pool (%04X) is NULL or not linked or not xmem\n", p);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+#endif
+	#asm
+   push	ix
+   ld		ix,(sp+@sp+p+2)
+   lcall	pxlast_fast
+   pop	ix
+   jr		nc,.ok
+   ld		bc,0
+   ld		de,0
+.ok:
+   #endasm
+}
+
+
+/*** BeginHeader pxnext */
+long pxnext(Pool_t * p, long e);
+#define pfnext(p, e) ((void __far *)pxnext(p, (long)(e)))
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pxnext                       <POOL.LIB>
+
+SYNTAX: long pxnext(Pool_t * p, long e);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Get the next allocated element in an xmem pool.  The pool
+               MUST be set to being a linked pool by using
+                 pool_link(p, <non-zero>)
+               otherwise the results are undefined.
+
+               You can easily iterate through all of the allocated
+               elements of a root pool using the following construct:
+
+                 long e;
+                 Pool_t * p;
+
+                 for (e = pxfirst(p); e; e = pxnext(p, e)) {
+                 		...
+                 }
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_xinit().
+PARAMETER2:		Previous element address, obtained by e.g. pxfirst().
+					This must be an allocated element in the given pool,
+               otherwise the results are undefined.  Be careful when
+               iterating through a list and deleting elements using
+               pxfree(): once the element is deleted, is is no longer
+               valid to pass its address to this function.
+               If this parameter is zero, then the result is the
+               same as pxfirst().  This ensures the invariant
+                 pxnext(p, pxprev(p, e)) == e.
+
+RETURN VALUE:	0: there are no more elements.
+					else points to next allocated element.
+
+SEE ALSO:		pool_xinit, pool_link, pxalloc, pxfree, pxfirst, pxprev
+
+END DESCRIPTION **********************************************************/
+pool_debug long pxnext(Pool_t * p, long e)
+{
+	auto long r;
+#ifdef POOL_DEBUG
+	auto long x;
+#endif
+
+	if (!e)
+   	return pxfirst(p);
+
+#ifdef POOL_DEBUG
+	if (!p || !(p->flags & POOL_LINKED) || !(p->flags & POOL_XMEM)) {
+   #ifdef POOL_VERBOSE
+   	printf("pxnext: pool (%04X) is NULL or not linked or not xmem\n", p);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+   // See if element is actually allocated
+   for (x = pxfirst(p); x; x = pxnext(p, x))
+   	if (x == e)
+      	break;
+   if (!x) {
+   #ifdef POOL_VERBOSE
+   	printf("pxnext: element %08lX in pool %04X is not allocated\n", e, p);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+#endif
+	#asm
+   push	ix
+   ld		ix,(sp+@sp+p+2)
+   ld		hl,(sp+@sp+e+2)
+   ex		de,hl
+   ld		hl,(sp+@sp+e+4)
+   ld		b,h
+   ld		c,L
+   lcall	pxnext_fast
+   pop	ix
+   jr		nc,.ok
+   ld		bc,0
+   ld		de,0
+.ok:
+   #endasm
+}
+
+
+/*** BeginHeader pxnext_fast, pxprev_fast */
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pxnext_fast                       <POOL.LIB>
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Get the next allocated element in an xmem pool.  The pool
+               MUST be set to being a linked pool by using
+                 pool_link(p, <non-zero>)
+               otherwise the results are undefined.
+
+               This is an assembler-only version of pxnext().
+               *** Do _not_ call this function from C. ***
+
+REGISTERS:     Parameters in IX, BCDE respectively
+               Trashes AF, HL, PX, JK
+               Return value in BCDE, carry flag.
+
+EXAMPLE:			ld		ix,my_pool
+					ld		bcde,(current_element)
+					lcall	pxnext_fast
+               jr		c,.no_more_elems
+               ; BCDE points to next allocated element
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_xinit().  Pass this in IX register.
+PARAMETER2:		Current element, address in BCDE register.  See pxnext()
+               for fuller description.
+
+RETURN VALUE:	C flag set: there are no more elements.
+					Else C flag clear (NC) and BCDE points to next element.
+
+SEE ALSO:		pool_xinit, pool_link, pxalloc, pxfree, pxfirst, pxprev
+
+END DESCRIPTION **********************************************************/
+/* START FUNCTION DESCRIPTION ********************************************
+pxprev_fast                       <POOL.LIB>
+
+SYNTAX: xmem long pxprev_fast(Pool_t * p, long e);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Get the previous allocated element in an xmem pool.  The
+               pool MUST be set to being a linked pool by using
+                 pool_link(p, <non-zero>)
+               otherwise the results are undefined.
+
+               This is an assembler-only version of pxprev().
+               *** Do _not_ call this function from C. ***
+
+REGISTERS:     Parameters in IX, DE respectively
+               Trashes AF, HL, PX, JK
+               Return value in BCDE, carry flag.
+
+EXAMPLE:			ld		ix,my_pool
+					ld		de,(current_element)
+					ld		bc,(current_element+2)
+					lcall	pxprev_fast
+               jr		c,.no_more_elems
+               ; BCDE points to previous allocated element
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_xinit().  Pass this in IX register.
+PARAMETER2:		Current element, address in BCDE register.  See pxprev()
+               for fuller description.
+
+RETURN VALUE:	C flag set: there are no more elements.
+					Else C flag clear (NC) and BCDE points to previous element.
+
+SEE ALSO:		pool_xinit, pool_link, pxalloc, pxprev
+
+END DESCRIPTION **********************************************************/
+
+#asm __xmem
+pxprev_fast::
+	test	bcde
+   jp		z,pxlast_fast
+   ld		jkhl,-4
+   jr		.cont
+
+pxnext_fast::
+	test	bcde
+   jp		z,pxfirst_fast
+   ld		jkhl,-8
+.cont:
+	add	jkhl,bcde
+   ld		px,jkhl
+   ld		bcde,(px)	; Get next/prev pointer in BCDE
+	ld		jkhl,(ix+[__pool__]+link+8)
+   cp		jkhl,bcde
+	scf
+   jr		nz,.skip
+   lret				; Return with Cy flag if no next/prev element
+.skip:
+   ld		jkhl,8
+   add	jkhl,bcde	; Skip link fields
+   ex		jkhl,bcde
+   or		a				; Clear the Cy and return with element in BCDE
+   lret
+#endasm
+
+
+/*** BeginHeader pxprev */
+long pxprev(Pool_t * p, long e);
+#define pfprev(p, e) ((void __far *)pxprev(p, (long)(e)))
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pxprev                       <POOL.LIB>
+
+SYNTAX: long pxprev(Pool_t * p, long e);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Get the previous allocated element in an xmem pool.  The
+               pool MUST be set to being a linked pool by using
+                 pool_link(p, <non-zero>)
+               otherwise the results are undefined.
+
+               You can easily iterate through all of the allocated
+               elements of an xmem pool using the following construct:
+
+                 long e;
+                 Pool_t * p;
+
+                 for (e = pxlast(p); e; e = pxprev(p, e)) {
+                 		...
+                 }
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_xinit().
+PARAMETER2:		Previous element address, obtained by e.g. pxlast().
+					This must be an allocated element in the given pool,
+               otherwise the results are undefined.  Be careful when
+               iterating through a list and deleting elements using
+               pxfree(): once the element is deleted, is is no longer
+               valid to pass its address to this function.
+               If this parameter is zero, then the result is the
+               same as pxlast().  This ensures the invariant
+                 pxlast(p, pxnext(p, e)) == e.
+
+RETURN VALUE:	0: there are no more elements.
+					else points to previous allocated element.
+
+SEE ALSO:		pool_xinit, pool_link, pxalloc, pxfree, pxlast, pxnext
+
+END DESCRIPTION **********************************************************/
+pool_debug long pxprev(Pool_t * p, long e)
+{
+	auto long r;
+#ifdef POOL_DEBUG
+	auto long x;
+#endif
+
+	if (!e)
+   	return pxlast(p);
+
+#ifdef POOL_DEBUG
+	if (!p || !(p->flags & POOL_LINKED) || !(p->flags & POOL_XMEM)) {
+   #ifdef POOL_VERBOSE
+   	printf("pxprev: pool (%04X) is NULL or not linked or not xmem\n", p);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+   // See if element is actually allocated
+   for (x = pxfirst(p); x; x = pxnext(p, x))
+   	if (x == e)
+      	break;
+   if (!x) {
+   #ifdef POOL_VERBOSE
+   	printf("pxprev: element %08lX in pool %04X is not allocated\n", e, p);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+
+#endif
+	#asm
+   push	ix
+   ld		ix,(sp+@sp+p+2)
+   ld		hl,(sp+@sp+e+2)
+   ex		de,hl
+   ld		hl,(sp+@sp+e+4)
+   ld		b,h
+   ld		c,L
+   lcall	pxprev_fast
+   pop	ix
+   jr		nc,.ok
+   ld		bc,0
+   ld		de,0
+.ok:
+   #endasm
+}
+
+
+/*** BeginHeader preorder */
+void * preorder(Pool_t * p, void * e, void * where, word options);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+preorder                       <POOL.LIB>
+
+SYNTAX: void * preorder(Pool_t * p, void * e, void * where, word options);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Atomically remove allocated element 'e', and re-insert it
+               before or after element 'where'.  'Atomically' means that
+               the POOL_IPSET level is used to lock out other CPU contexts
+               from altering the pool while this operation is in progress.
+
+               The pool MUST be set to being a linked pool by using
+                 pool_link(p, <non-zero>)
+               otherwise the results are undefined.
+
+EXAMPLES:		void * r;
+               void * s;
+
+               s = pnext(p, pfirst(p));	// s is second element
+               r = plast(p);					// r is last element
+               preorder(p, s, r, POOL_INSERT_AFTER);
+               // If s != r, then s will become the new last element.
+
+               // You can use null parameters to perform the common
+               // case of moving the last element to the head of
+               // the list...
+               preorder(p, NULL, NULL, POOL_INSERT_BEFORE);
+               // which is identical to...
+               preorder(p, plast(p), pfirst(p), POOL_INSERT_BEFORE);
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_init().
+PARAMETER2:		Address of element to move, obtained by e.g. plast().
+					This must be an allocated element in the given pool,
+               otherwise the results are undefined.  If NULL, then
+               the last element is implied (i.e. whatever plast()
+               would return).  If there are no elements at all, or
+               this parameter does not point to a valid allocated
+               element, then the results are undefined (and probably
+               catastrophic).
+PARAMETER3:    The reference element.  The element 'e' will be inserted
+					before or after this element, depending on the options
+               parameter.  If e==where, then there is no action.  If
+               this parameter is NULL, then the reference element is
+               assumed to be the first element (i.e. whatever pfirst()
+					would return).  If there are no elements at all, or
+               this parameter does not point to a valid allocated
+               element, then the results are undefined (and probably
+               catastrophic).
+PARAMETER4:		Option flags.  Currently, the only option is
+                 POOL_INSERT_BEFORE (0x0001) or
+                 POOL_INSERT_AFTER (0x0000)
+               which specifies whether 'e' is to be inserted before or
+               after 'where'.
+
+RETURN VALUE:	Returns the parameter value 'e', unless e was NULL in
+               which case the value of plast(), when called at function
+               entry, would be returned.
+
+               Important: if NULL is returned, that means that some other
+               task (context, or ISR) modified the linked list while this
+               operation was in progress.  In this case, the application
+               should call this function again with the same parameters,
+               since this operation will NOT have completed.
+               This would be a rare occurrence, however multitasking
+               applications should handle this case correctly.
+
+SEE ALSO:		pool_init, pool_link, plast, pfirst, pnext, pprev,
+               pmovebetween
+
+END DESCRIPTION **********************************************************/
+pool_debug void * preorder(Pool_t * p, void * e, void * where, word options)
+{
+#ifdef POOL_DEBUG
+	auto void * x;		// Used for debug
+#endif
+   auto void * q;	// q, s bracket insertion point
+   auto void * s;
+
+#ifdef POOL_DEBUG
+	if (!p || !(p->flags & POOL_LINKED) || p->flags & POOL_XMEM) {
+   #ifdef POOL_VERBOSE
+   	printf("preorder: pool (%04X) is NULL or not linked or not root\n", p);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+   // See if element is actually allocated
+   if (where) {
+	   for (x = pfirst(p); x; x = pnext(p, x))
+	      if (x == where)
+	         break;
+	   if (!x) {
+	   #ifdef POOL_VERBOSE
+	      printf("preorder: element %04X (where) in pool %04X is not allocated\n", where, p);
+	   #endif
+	      exception(-ERR_BADPARAMETER);
+	   }
+   }
+#endif
+
+   if (!where)
+   	where = pfirst(p);
+
+	// Point to the adjacent element
+   if (options & POOL_INSERT_BEFORE) {
+   	q = pprev(p, where);
+      s = where;
+   }
+   else {
+   	s = pnext(p, where);
+      q = where;
+   }
+
+   return pmovebetween(p, e, q, s);
+}
+
+/*** BeginHeader pmovebetween */
+void * pmovebetween(Pool_t * p, void * e, void * d, void * f);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pmovebetween                       <POOL.LIB>
+
+SYNTAX: void * pmovebetween(Pool_t * p, void * e, void * d, void * f);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Atomically remove allocated element 'e', and re-insert it
+               between allocated elements d and f.  'Atomically' means that
+               the POOL_IPSET level is used to lock out other CPU contexts
+               from altering the pool while this operation is in progress.
+               In addition, d and f are checked to ensure that the
+               following conditions still hold:
+                 pprev(p, f) == d
+               and
+                 pnext(p, d) == f
+               in other words, f follows d.  This is useful, since your
+               application may have determined d and f some time ago, but
+               in the meantime some other task may have re-ordered the queue
+               or deleted these elements.  In this case, the return value
+               will be NULL.  Your application should then re-evaluate the
+               appropriate queue elements and retry this function.
+
+               The pool MUST be set to being a linked pool by using
+                 pool_link(p, <non-zero>)
+               otherwise the results are undefined.
+
+EXAMPLES:		void * d, * e, * f;
+
+					e = plast(p);		// element to move
+               f = pnext(p, d = pfirst(p));  // d,f are first 2 el's
+               pmovebetween(p, e, d, f);
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_init().
+PARAMETER2:		Address of element to move, obtained by e.g. plast().
+					This must be an allocated element in the given pool,
+               otherwise the results are undefined.  If NULL, then
+               the last element is implied (i.e. whatever plast()
+               would return).  If there are no elements at all, or
+               this parameter does not point to a valid allocated
+               element, then the results are undefined (and probably
+               catastrophic).
+               If e == d or e == f, then there is no action except
+               to check whether f follows d.
+               This parameter may refer to an unlinked (but allocated)
+               element - see description for pool_link().
+PARAMETER3:    The first reference element.  The element 'e' will be
+               inserted after this element.  On entry, it must be
+               true that pnext(p, d) == f.  Otherwise, NULL is returned.
+               If this parameter is NULL, then f must point to the first
+               element in the list, and e is inserted at the start of
+               the list.
+PARAMETER4:    The second reference element.  The element 'e' will be
+               inserted before this element.  On entry, it must be
+               true that pprev(p, f) == d.  Otherwise, NULL is returned.
+               If this parameter is NULL, then d must point to the last
+               element in the list, and e is inserted at the end of
+               the list.
+               NOTE: if both d and f are NULL, then it must be true that
+               there are no allocated elements in the linked list, and
+               the element e is added as the only element in the list.
+               This proviso only obtains when the element e is initially
+               allocated from an empty pool with
+               	pool_link(p, POOL_LINKED_BY_APP)
+               i.e. the allocated element is not in the linked list of
+               allocated elements.
+
+RETURN VALUE:	Returns the parameter value 'e', unless e was NULL in
+               which case the value of plast(), if called at function
+               entry, would be returned.
+               If the initial conditions for d and f do not hold, then
+               NULL is returned with no further action.
+
+SEE ALSO:		pool_init, pool_link, plast, pfirst, pnext, pprev, preorder
+
+END DESCRIPTION **********************************************************/
+pool_debug void * pmovebetween(Pool_t * p, void * e, void * d, void * f)
+{
+#ifdef POOL_DEBUG
+	auto void * x;		// Used for debug
+#endif
+   auto void ** dd;	// Normalized d
+   auto void ** ff;	// Normalized f
+   auto void ** ddd;	// Original surrounding e
+   auto void ** fff;	//
+   auto void ** ee;	// Normalized e
+
+#ifdef POOL_DEBUG
+	if (!p || !(p->flags & POOL_LINKED) || p->flags & POOL_XMEM) {
+   #ifdef POOL_VERBOSE
+   	printf("pmovebetween: pool (%04X) is NULL or not linked or not root\n", p);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+   // See if element is actually allocated
+   if (e) {
+   	ee = (void **)e - 2;
+      if (ee[0]) {
+	      for (x = pfirst(p); x; x = pnext(p, x))
+	         if (x == e)
+	            break;
+	      if (!x) {
+	      #ifdef POOL_VERBOSE
+	         printf("pmovebetween: element %04X (e) in pool %04X is not allocated\n", e, p);
+	      #endif
+	         exception(-ERR_BADPARAMETER);
+	      }
+      }
+   }
+   if (d) {
+	   for (x = pfirst(p); x; x = pnext(p, x))
+	      if (x == d)
+	         break;
+	   if (!x) {
+	   #ifdef POOL_VERBOSE
+	      printf("pmovebetween: element %04X (d) in pool %04X is not allocated\n", d, p);
+	   #endif
+	      exception(-ERR_BADPARAMETER);
+	   }
+   }
+   if (f) {
+	   for (x = pfirst(p); x; x = pnext(p, x))
+	      if (x == f)
+	         break;
+	   if (!x) {
+	   #ifdef POOL_VERBOSE
+	      printf("pmovebetween: element %04X (f) in pool %04X is not allocated\n", f, p);
+	   #endif
+	      exception(-ERR_BADPARAMETER);
+	   }
+   }
+#endif
+
+	#asm
+   push	ix
+   ld		ix,(sp+@sp+p+2)
+   ld		hl,(sp+@sp+e+2)
+   ex		de,hl
+   ld		hl,(sp+@sp+d+2)
+   ld		b,h
+   ld		c,L
+   ld		hl,(sp+@sp+f+2)
+#if POOL_IPSET
+	ipset POOL_IPSET
+#endif
+   lcall	pmovebetween_fast
+#if POOL_IPSET
+	ipres
+#endif
+   pop	ix
+   #endasm
+
+#if 0		// The C implementation follows... (don't enable this - it is for documentation)
+#if POOL_IPSET
+	asm ipset POOL_IPSET;
+#endif
+	if (!e) {
+   	e = plast(p);
+      if (!e)
+      	goto _exit;
+   }
+   ee = (void **)e - 2;
+   if (!d)
+   	dd = (void **)p;
+   else
+   	dd = (void **)d - 2;
+   if (!f)
+   	ff = (void **)p;
+   else
+   	ff = (void **)f - 2;
+  	// Check the precondition (this works even for empty pool, since prev and next point to self)
+   if (dd[0] != (void *)ff || ff[1] != (void *)dd) {
+   	e = NULL;
+      goto _exit;
+   }
+
+   if (ee == dd || ee == ff)	// Cannot insert element before or after itself
+   	goto _exit;
+
+	if (fff = ee[0]) {
+	   ddd = ee[1];
+
+	   // Remove e from between d and f
+	   ddd[0] = fff;
+	   fff[1] = ddd;
+   }
+
+   // Insert ee between dd and ff
+	dd[0] = ee;
+   ff[1] = ee;
+   ee[0] = ff;
+   ee[1] = dd;
+
+_exit:
+#if POOL_IPSET
+	asm ipres;
+#endif
+   return e;
+#endif	// the C implementation
+}
+
+/*** BeginHeader pmovebetween_fast */
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pmovebetween_fast                       <POOL.LIB>
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	See description under pmovebetween().  This is an assembler-
+					callable version (do not call from C).  It does not issue
+               IPSET protection or check parameters.
+
+REGISTERS:     Parameters in IX, DE, BC, HL respectively
+               Trashes AF, BC, DE, BC', DE', HL'
+               Return value in HL, carry flag.
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_init().  - Pass in IX register
+PARAMETER2:		Address of element to move, pass in DE register.
+PARAMETER3:    The first reference element.  Pass in BC register.
+PARAMETER4:    The second reference element.  Pass in HL register.
+
+RETURN VALUE:	In HL.  Either set to 'e' parameter, or 0.  The carry
+               flag is set if HL==0, otherwise it is clear.
+
+SEE ALSO:		pmovebetween
+
+END DESCRIPTION **********************************************************/
+
+#asm	__xmem
+pmovebetween_fast::
+	push	de		; Remember element
+	push	hl		; Remember 'F'
+   ld		a,d
+   or		e
+   jr		nz,.skip1
+   ; Set e = plast(p)
+	lcall	plast_fast
+   jr		c,.exitnull
+   ex		de,hl
+.skip1:
+	ld		hl,-4
+   add	hl,de
+   ; HL is normalized element addr
+   push	hl
+   ld		a,b
+   or		c
+   jr		z,.dfirst
+   ld		hl,-4
+   add	hl,bc
+   ld		b,h
+   ld		c,L
+   jr		.cont1
+.exitnull:
+   add	sp,4
+	bool	hl
+   ld		l,h
+   scf
+   lret				; HL = 0, Cy flag set.
+.dfirst:
+	ld		hl,ix
+   ld		b,h
+   ld		c,L
+.cont1:
+	; BC is now normalized 'D'.  Do same for 'F'
+   ld		hl,(sp+2)	; get F
+   ex		de,hl
+   ld		a,d
+   or		e
+   jr		z,.flast
+   ld		hl,-4
+   add	hl,de
+   ex		de,hl
+   jr		.cont2
+.exitnull2:
+   add	sp,6
+	bool	hl
+   ld		l,h
+   scf
+   lret				; HL = 0, Cy flag set.
+.flast:
+	ld		hl,ix
+   ex		de,hl
+.cont2:
+	; DE is now normalized 'F'.
+   ; Now check for next(D)==F and prev(F)==D
+   ld		h,b
+   ld		l,c
+   ld		hl,(hl)
+   or		a
+   sbc	hl,de
+   jr		nz,.exitnull2
+   ld		h,d
+   ld		l,e
+   ld		hl,(hl+2)
+   sbc	hl,bc
+   jr		nz,.exitnull2
+   ; Precondition holds OK.  Check that element to insert is not D or F
+   ld		hl,(sp)			; Get element addr
+   sbc	hl,bc
+   jr		z,.exitok
+   ld		hl,(sp)
+   or		a
+   sbc	hl,de
+   jr		z,.exitok
+   ; If element already in linked list, remove it
+   exx
+	ld		hl,(sp)
+   ld		hl,(hl)
+   ld		a,h
+   or		L
+   jr		z,.notinLL
+   ex		de,hl			; de now FFF
+   ld		hl,(sp)
+   ld		hl,(hl+2)
+   ld		b,h
+   ld		c,L			; bc now DDD
+   ld		h,d			; hl now FFF
+   ld		l,e
+   inc	hl
+   inc	hl
+   ld		(hl),c
+   inc	hl
+   ld		(hl),b
+   ld		h,b
+   ld		l,c
+   ld		(hl),e
+   inc	hl
+   ld		(hl),d
+.notinLL:
+	exx
+   ; Now back to bc=D, de=F
+   ; Insert e between d and f
+   ld		hl,(sp)
+   ld		(hl),e
+   inc	hl
+   ld		(hl),d
+   inc	hl
+   ld		(hl),c
+   inc	hl
+   ld		(hl),b
+   dec	hl
+   dec	hl
+   dec	hl
+   ex		de,hl
+   inc	hl
+   inc	hl
+   ld		(hl),e
+   inc	hl
+   ld		(hl),d
+   ld		h,b
+   ld		l,c
+   ld		(hl),e
+   inc	hl
+   ld		(hl),d
+
+.exitok:
+	add	sp,4
+   pop	hl
+   or		a
+	lret
+
+#endasm
+
+/*** BeginHeader pputlast */
+__xmem void * pputlast(Pool_t * p, void * e);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pputlast                       <POOL.LIB>
+
+SYNTAX: void * pputlast(Pool_t * p, void * e);
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	Atomically remove allocated element 'e', and re-insert it
+               at the end of the allocated list.  'Atomically' means that
+               the POOL_IPSET level is used to lock out other CPU contexts
+               from altering the pool while this operation is in progress.
+
+               This is equivalent to pmovebetween(p, e, plast(p), NULL),
+               but is considerably faster.
+
+               A common use for this function is to insert an element
+               allocated when the POOL_LINKED_BY_APP attribute is set for
+               the pool, at the end of the allocated list.  This is useful
+               when, say, an ISR allocates and uses a buffer without
+               placing it on the allocated list.  Only when the buffer is
+               complete does the ISR use this function to place it on
+               the queue for reading by the main application.
+
+               The pool MUST be set to being a linked pool by using
+                 pool_link(p, <non-zero>)
+               otherwise the results are undefined.
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_init().
+PARAMETER2:		Address of element to move.  If NULL,
+               then this function behaves as plast().
+
+RETURN VALUE:	Same as the 'e' parameter, unless e is NULL in which
+               case the existing last element is returned as per plast().
+
+SEE ALSO:		pmovebetween, pool_link
+
+END DESCRIPTION **********************************************************/
+
+pool_debug void * pputlast(Pool_t * p, void * e)
+{
+#ifdef POOL_DEBUG
+	auto void * x;		// Used for debug
+#endif
+
+#ifdef POOL_DEBUG
+	if (!p || !(p->flags & POOL_LINKED) || p->flags & POOL_XMEM) {
+   #ifdef POOL_VERBOSE
+   	printf("pputlast: pool (%04X) is NULL or not linked or not root\n", p);
+   #endif
+   	exception(-ERR_BADPARAMETER);
+   }
+   // See if element is actually allocated
+   if (e) {
+   	ee = (void **)e - 2;
+      if (ee[0]) {
+	      for (x = pfirst(p); x; x = pnext(p, x))
+	         if (x == e)
+	            break;
+	      if (!x) {
+	      #ifdef POOL_VERBOSE
+	         printf("pputlast: element %04X (e) in pool %04X is not allocated\n", e, p);
+	      #endif
+	         exception(-ERR_BADPARAMETER);
+	      }
+      }
+   }
+#endif
+
+	#asm
+   push	ix
+   ld		ix,(sp+@sp+p+2)
+   ld		hl,(sp+@sp+e+2)
+   ex		de,hl
+#if POOL_IPSET
+	ipset POOL_IPSET
+#endif
+   lcall	pputlast_fast
+#if POOL_IPSET
+	ipres
+#endif
+   pop	ix
+   #endasm
+}
+
+/*** BeginHeader pputlast_fast */
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+pputlast_fast                       <POOL.LIB>
+
+KEYWORDS:		memory, pool
+
+DESCRIPTION:	See description under pputlast().  This is an assembler-
+					callable version (do not call from C).  It does not issue
+               IPSET protection or check parameters.
+
+REGISTERS:     Parameters in IX, DE respectively
+               Trashes F, DE, BC
+               Return value in HL.
+
+PARAMETER1:		Pool "handle" structure, as previously passed to
+               pool_init().  - Pass in IX register
+PARAMETER2:		Address of element to move, pass in DE register.  If NULL,
+               then this function behaves as plast_fast.
+
+RETURN VALUE:	In HL.  Same as the 'e' parameter, unless e is NULL in which
+               case the existing last element is returned as per plast_fast.
+
+SEE ALSO:		pmovebetween, pool_link
+
+END DESCRIPTION **********************************************************/
+
+#asm	__xmem
+pputlast_fast::
+   ld		h,d
+   ld		l,e
+   bool	hl
+   jr		nz,.cont
+   ljp	plast_fast	; Do as if plast_fast.  No change to struct, since already last.
+.cont:
+	ld		hl,-4
+   add	hl,de
+	; HL is normalized element address
+   ; Unlink from linked lists
+	push	hl
+	ld		e,(hl)
+   inc	hl
+   ld		d,(hl)
+   inc	hl
+   ld		c,(hl)
+   ld		(hl),0		; Null out original prev pointer
+   inc	hl
+   ld		b,(hl)		; bc = prev; de = next (from element being freed)
+   ld		(hl),0
+   ld		l,e
+	ld		h,d			; hl = de = next
+   bool	hl
+   jr		z,.notinLL	; skip if not in linked list (null 'next' pointer)
+   ld		l,e
+   ld		h,d
+   inc	hl
+   inc	hl
+	ld		(hl),c
+   inc	hl
+   ld		(hl),b		; next.prev = prev
+   ld		h,b
+   ld		l,c
+   ld		(hl),e
+   inc	hl
+   ld		(hl),d		; prev.next = next
+.notinLL:
+   pop	hl				; pop element being freed
+
+   ; Add the element back to end of list
+	push	ix
+   pop	de
+   ld		(hl),e
+   inc	hl
+   ld		(hl),d
+   dec	hl
+   ex		de,hl
+   ld		hl,(ix+[__pool__]+link+2)
+   ; Now DE is new element, HL is old last element
+   ld		(hl),e
+   inc	hl
+   ld		(hl),d
+   dec	hl
+   ex		de,hl
+   ld		(ix+[__pool__]+link+2),hl
+   inc	hl
+   inc	hl
+   ; Now HL is new element (pointing to 'prev' field), DE is old last element
+   ld		(hl),e
+   inc	hl
+   ld		(hl),d
+   inc	hl
+   ; HL points past link fields
+   lret								; NC flag still set from test
+
+#endasm
+
+/*** BeginHeader  ***********************************/
+#endif
+/*** EndHeader ***********************************************/
+
+

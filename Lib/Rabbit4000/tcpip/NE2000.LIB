@@ -1,0 +1,671 @@
+/*
+ *		ne2000.lib
+ *		Copyright (c) 2006, Rabbit Semiconductor
+ *
+ * Note: this is always included by asix.lib.
+ */
+
+/*** BeginHeader */
+#ifndef __NE2000_LIB
+#define __NE2000_LIB
+
+// a struct describing the current NE2000 configuration
+typedef struct {
+	/* NOTE.  This first part must be common to all ne2000 variants */
+   /****************************************************************/
+	NetControllerDevice * ncd;
+#if PLD_ETH_COMPILING || USE_ETH_PRELOADED_DRIVER
+   void * pld_rscblock;
+#endif
+   word	iface;			// Interface number
+
+	// IO base addresses
+	int	WR1;				// MUST BE AT OFFSET 4 and 6 IN THIS STRUCT
+	int	RD1;
+
+	// hardware reset line
+	char	reset_port;				// the parport that the reset line is on
+	char	*reset_port_shadow;	// pointer to the shadow register
+	char	reset_mask;				// mask to set the reset line high
+
+   char	hwa[6];					// Current MAC address (shadow)
+
+	/* End of part which must be common to all ne2000 variants      */
+   /****************************************************************/
+
+} _NE2kConfig;
+
+// NE2000 Specific Registers
+
+// Registers that work for any page
+#define PD_RESET		0x1F
+#define PD_IOPORT		0x10
+
+// Page 0 registers
+#define PD_PAGESTART	0x01
+#define PD_PAGESTOP	0x02
+#define PD_BOUNDARY	0x03
+#define PD_TXSTATUS	0x04
+#define PD_TXPAGE		0x04
+#define PD_TXBCNT0	0x05
+#define PD_NCR			0x05
+#define PD_TXBCNT1	0x06
+#define PD_INTSTATUS	0x07
+#define PD_RMTSADR0	0x08
+#define PD_CRDMA0		0x08
+#define PD_RMTSADR1	0x09
+#define PD_CRDMA1		0x09
+#define PD_RMTBCNT0	0x0A
+#define PD_RMTBCNT1	0x0B
+#define PD_RXSTATUS	0x0C
+#define PD_RXCFG		0x0C
+#define PD_TXCFG		0x0D
+#define PD_DATACFG	0x0E
+#define PD_INTMASK	0x0F
+
+// Page 1 registers
+#define PD_PAR0		0x01
+#define PD_CURRENT	0x07
+#define PD_MAR0		0x08
+
+#if PLD_ETH_COMPILING == 1
+	#define ne2k_internal_call(xlabel) 	asm db 0xcd $ dw logical_addr(xlabel)
+   #define ne2k_internal_func				__xmem __call__ __nodebug
+   #define ne2k_external_func          __xmem __nodebug
+   #define ne2k_mem							__xmem
+#else
+	#define ne2k_internal_call(xlabel)	asm call xlabel
+   #define ne2k_internal_func				__xmem __nodebug
+   #define ne2k_external_func          __xmem __nodebug
+   #define ne2k_mem							__xmem
+#endif
+
+
+/*** EndHeader */
+
+/*** BeginHeader ne2k_load_io_pointers */
+ne2k_internal_func _NE2kConfig * ne2k_load_io_pointers(_NE2kConfig * k);	// Not C callable
+/*** EndHeader */
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	pld_eth_xcode		resume
+#endif
+
+ne2k_internal_func _NE2kConfig * ne2k_load_io_pointers(_NE2kConfig * k)
+{
+#asm __nodebug
+		push	hl										; save nic
+		ld		ix,hl
+      ld		hl,(ix+[_NE2kConfig]+RD1)		; (ix+[_ne2kconf_]+RD1)
+      ld		iy,hl									; iy has RD1
+		ld		hl,(ix+[_NE2kConfig]+WR1)		; (ix+[_ne2kconf_]+WR1)
+		ld		ix,hl									; ix has WR1
+		pop	hl										; return it
+#endasm
+}
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	xmemcode		resume
+#endif
+
+/*** BeginHeader ne2k_addmulticast, ne2k_removemulticast */
+ne2k_internal_func int ne2k_addmulticast(_NE2kConfig * nic, char* EthAddress, int* slot);
+ne2k_internal_func int ne2k_removemulticast(_NE2kConfig * nic, char* EthAddress);
+/*** EndHeader */
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	pld_eth_xcode		resume
+#endif
+
+ne2k_internal_func
+__nouseix int ne2k_addmulticast(_NE2kConfig * nic, char* EthAddress, int* slot)
+{
+	auto word hash;
+	auto unsigned long crc;
+	auto int i;
+
+#if PLD_ETH_COMPILING == 1
+	auto pld_eth_rscblk_t* res_block;
+   res_block = nic->pld_rscblock;
+#endif
+
+#if PLD_ETH_COMPILING == 1
+
+#asm
+	ld		hl,(sp+@sp+EthAddress)
+   push	hl
+	PLD_IMPORT_CALL(res_block, PLD_ETH_CALC_CRC, 2)
+   add	sp,2
+	ld		(sp+@sp+hash),hl
+	ex		de,hl			; de = hash
+	ld		hl,(sp+@sp+slot)
+	ld		ix,hl
+   bool	hl
+   jr		z,.ne2k_amnoslot
+   ex		de,hl
+	ld		(ix),hl
+
+.ne2k_amnoslot:
+	PLD_IMPORT_CALL(res_block, PLD_ETH_LOCKGLOBAL, 0)
+#endasm
+
+#else
+	// Only upper 6 bits used in the hash
+	crc = 0xffffffff;
+	for (i = 0; i < 6; i++) {
+		crc = pd_calc_crc(EthAddress[i], crc);
+	}
+	hash = (word)(crc >> 26);
+	if (slot) {
+		*slot = hash;
+	}
+
+	LOCK_GLOBAL(TCPGlobalLock);
+#endif
+
+#asm
+	push	ix
+	push	iy
+
+	ld		hl, (sp+@SP+nic+4)
+	ne2k_internal_call(ne2k_load_io_pointers)
+
+	; Load the hashed address
+	ld		hl, (sp+@SP+hash+4)
+	ld		c, L		; save the hash value
+
+	; Compute the MAR register to update
+	ld		a, L
+	srl	a
+	srl	a
+	srl	a
+	; We now have the correct MAR register offset -- place in de,
+	; and save a copy in b
+	ld		d, 0
+	ld		e, a
+	ld		b, a
+
+   ; Load page 0 to clear PD_RMTBCNTx registers
+	ioe ld (ix), 0x20
+	ioe ld (ix+PD_RMTBCNT0),0x00			; clear remote byte count register
+	ioe ld (ix+PD_RMTBCNT1),0x00			; clear remote byte count register
+	; Load page 1
+	ioe ld (ix), 0x60
+	; Read the MARx register
+	ld		hl, iy
+	add	hl, de
+	ld		de, PD_MAR0
+	add	hl, de
+	ioe ld a, (hl)
+
+	; a contains the value of the appropriate MARx register
+	; b contains the offset of the appropriate MARx register
+	; c contains the 6-bit hash value
+
+	; Start computation of the new value of the MARx register
+	; Compute the bit number we need to turn on/off
+	ld		e, b		; save the offset of the appropriate MARx register
+	ld		d, a		; save the value of the MARx register
+	ld		a, 0x07
+	and	c
+
+	; We now need to create the mask with which to OR the current
+	; MARx value
+	inc	a
+	ld		b, a
+	xor	a
+	scf
+.loop:
+	rla
+	djnz	.loop
+
+	; a now contains the OR mask, and d contains the value of the MARx
+	; register
+	or		d
+	; Load the new value
+	ld		d, 0
+	ld		hl, ix
+	add	hl, de
+	ld		de, PD_MAR0
+	add	hl, de
+	ioe ld (hl), a
+
+   ; Return to page 0
+	ioe ld (ix), 0x20
+
+	pop	iy
+	pop	ix
+#endasm
+
+#if PLD_ETH_COMPILING == 1
+	#asm
+	PLD_IMPORT_CALL(res_block, PLD_ETH_UNLOCKGLOBAL, 0)
+	#endasm
+#else
+	UNLOCK_GLOBAL(TCPGlobalLock);
+#endif
+
+	return 0;
+}
+
+ne2k_internal_func
+__nouseix int ne2k_removemulticast(_NE2kConfig * nic, char* EthAddress)
+{
+	auto word hash;
+	auto unsigned long crc;
+	auto int i;
+
+#ifdef USE_IGMP
+	auto word hashcheck;
+#endif
+
+#if PLD_ETH_COMPILING == 1
+	auto pld_eth_rscblk_t* res_block;
+   res_block = nic->pld_rscblock;
+#endif
+
+#if PLD_ETH_COMPILING == 1
+	#asm
+	ld		hl,(sp+@sp+EthAddress)
+   push	hl
+	PLD_IMPORT_CALL(res_block, PLD_ETH_CALC_CRC, 2)
+   add	sp,2
+	ld		(sp+@sp+hash),hl
+
+	#ifdef USE_IGMP
+	// Make sure we aren't removing the hash entry that lets us
+	// receive the ALL-HOSTS (224.0.0.1) IGMP messages
+c  _IGMP_ALL_HOSTS_IPADDR;
+	push	bc
+   push	de
+   ld		hl,EthAddress
+   push	hl
+   PLD_IMPORT_CALL(res_block, PLD_ETH_MULTICAST_IPTOHW, 6)
+   add	sp,6
+	ld		hl,(sp+@sp+EthAddress)
+   push	hl
+	PLD_IMPORT_CALL(res_block, PLD_ETH_CALC_CRC, 2)
+   add	sp,2
+   ex		de,hl
+   ld		hl,(sp+@sp+hash)
+   xor	a
+   sbc	hl,de
+   jp		z,.ne2k_rmdone
+	#endif
+
+	PLD_IMPORT_CALL(res_block, PLD_ETH_LOCKGLOBAL, 0)
+	#endasm
+
+#else
+	// Only upper 6 bits used in the hash
+	crc = 0xffffffff;
+	for (i = 0; i < 6; i++) {
+		crc = pd_calc_crc(EthAddress[i], crc);
+	}
+	hash = (word)(crc >> 26);
+
+	#ifdef USE_IGMP
+	// Make sure we aren't removing the hash entry that lets us
+	// receive the ALL-HOSTS (224.0.0.1) IGMP messages
+	multicast_iptohw(EthAddress, _IGMP_ALL_HOSTS_IPADDR);
+	crc = 0xffffffff;
+	for (i = 0; i < 6; i++) {
+		crc = pd_calc_crc(EthAddress[i], crc);
+	}
+	hashcheck = (word)(crc >> 26);
+	if (hash == hashcheck) {
+		return 0;
+	}
+	#endif
+
+	LOCK_GLOBAL(TCPGlobalLock);
+#endif
+
+#asm
+	push	ix
+	push	iy
+
+	ld		hl, (sp+@SP+nic+4)
+	ne2k_internal_call(ne2k_load_io_pointers)
+
+	; Load the hashed address
+	ld		hl, (sp+@SP+hash+4)
+	ld		c, L		; save the hash value
+	; Compute the MAR register to update
+	ld		a, L
+	srl	a
+	srl	a
+	srl	a
+	; We now have the correct MAR register offset -- place in de,
+	; and save a copy in b
+	ld		d, 0
+	ld		e, a
+	ld		b, a
+	; Load page 0 to clear PD_RMTBCNTx registers
+	ioe ld (ix), 0x20
+	ioe ld (ix+PD_RMTBCNT0),0x00			; clear remote byte count register
+	ioe ld (ix+PD_RMTBCNT1),0x00			; clear remote byte count register
+	; Load page 1
+	ioe ld (ix), 0x60
+	; Read the MARx register
+	ld		hl, iy
+	add	hl, de
+	ld		de, PD_MAR0
+	add	hl, de
+	ioe ld a, (hl)
+
+	; a contains the value of the appropriate MARx register
+	; b contains the offset of the appropriate MARx register
+	; c contains the 6-bit hash value
+
+	; Compute the new value of the MARx register
+	; First, compute the bit number we need to turn on
+	ld		e, b		; save the offset of the appropriate MARx register
+	ld		d, a		; save the value of the MARx register
+	ld		a, 0x07
+	and	c
+	; We now need to create the mask with which to AND the current
+	; MARx value
+	inc	a
+	ld		b, a
+	ld		a, 0xff
+	scf
+	ccf
+.loop:
+	rla
+	djnz	.loop
+
+	; a now contains the AND mask, and d contains the value of the MARx
+	; register
+	and	d
+	; Load the new value
+	ld		d, 0
+	ld		hl, ix
+	add	hl, de
+	ld		de, PD_MAR0
+	add	hl, de
+	ioe ld (hl), a
+
+   ; Return to page 0
+	ioe ld (ix), 0x20
+
+	pop	iy
+	pop	ix
+#endasm
+
+#if PLD_ETH_COMPILING == 1
+	#asm
+	PLD_IMPORT_CALL(res_block, PLD_ETH_UNLOCKGLOBAL, 0)
+.ne2k_rmdone:
+	#endasm
+#else
+	UNLOCK_GLOBAL(TCPGlobalLock);
+#endif
+
+	return 0;
+}
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	xmemcode		resume
+#endif
+
+/*** BeginHeader ne2k_sendpacket */
+
+ne2k_mem int ne2k_sendpacket(_NE2kConfig * nic, ll_Gather * packet);
+
+//word ne2k_ts[20];
+//#define NE2K_STAMP(n) push hl $ ioi ld (RTC0R),a $ ioi ld hl,(RTC0R) $ ld (ne2k_ts+n),hl $ pop hl
+
+/*** EndHeader */
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	pld_eth_xcode		resume
+#endif
+
+ne2k_external_func int ne2k_sendpacket(_NE2kConfig * nic, ll_Gather * packet)
+{
+#if PLD_ETH_COMPILING == 1
+	auto pld_eth_rscblk_t* res_block;
+   res_block = nic->pld_rscblock;
+#endif
+	//ne2k_ts[0] = ne2k_ts[7];
+#asm __nodebug
+;
+; pd_sendpacket - transmit a packet
+		;NE2K_STAMP(2)
+;
+; Expected:
+; packet == ll_Gather pointer
+; nic == nic to send on
+;
+		push	ix
+		push	iy
+
+		ld		hl,(sp+@SP+nic+4)
+		ne2k_internal_call(ne2k_load_io_pointers)
+
+		ld		hl,(sp+@SP+packet+4)			; hl=ll_Gather
+		push	ix
+		ld		ix,hl
+		; IX points to ll_Gather struct.  Compute actual length by summing length fields.
+		ld		hl,(ix+[_llg_]+len1)						; ll_Gather.len1
+		ex		de,hl
+		ld		hl,(ix+[_llg_]+len2)						; ll_Gather.len2
+		add	hl,de
+		ex		de,hl
+		ld		hl,(ix+[_llg_]+len3)						; ll_Gather.len3
+		add	hl,de
+		ld		bc,hl								; BC = total gathered length
+		ld		hl,ETH_MIN-1
+		or		a
+		sbc	hl,bc
+		jr		c,pds_glenok
+		; Total length too small.  Adjust len3 to compensate (will transmit rubbish at end, but doesn't matter)
+		inc	hl
+		ex		de,hl
+		ld		hl,(ix+[_llg_]+len3)						; ll_Gather.len3
+		add	hl,de
+		ld		(ix+[_llg_]+len3),hl						; ll_Gather.len3 updated to make total length correct
+		ld		bc,ETH_MIN						; adjust to minimum length of 60
+pds_glenok:
+		ld		hl,ix
+		pop	ix
+
+pds_getpacket:
+		;NE2K_STAMP(4)
+		ex		de,hl								; DE points to ll_Gather
+
+		; Save off the current time
+#if PLD_ETH_COMPILING == 1
+		ld		hl,(sp+@sp+res_block)
+      ld		hl,(hl+[pld_eth_rscblk_t]+tick_timer)
+      ld		a,(hl)
+#else
+		ld		a,(TICK_TIMER)					; Only care about lsb (short timeout)
+#endif
+      ld		l,a
+pds_stilltx:
+		; wait for done transmitting prev pkt
+      ; (note that we work around an instruction bug on the Rabbit 2000)
+ioe	bit	2,(iy)
+													; (checking tx complete bit in pkt status field?)
+		jr		z,pds_txready					; Check if we're ready to transmit
+		; Check the timeout.  We are checking if TICK_TIMER has incremented by
+      ; 5 ticks or more (5 * 488 us, 2.0-2.5 ms)
+#if PLD_ETH_COMPILING == 1
+		push	hl
+		ld		hl,(sp+@sp+res_block)
+      ld		hl,(hl+[pld_eth_rscblk_t]+tick_timer)
+      ld		a,(hl)
+      pop	hl
+#else
+		ld		a,(TICK_TIMER)
+#endif
+      sub	L
+      cp		5
+      jr		c,pds_stilltx
+      ; Past the timeout.  Return -1 to indicate an error.
+      ld		hl,-1
+      jp		pds_done
+
+pds_txready:
+		;NE2K_STAMP(6)
+
+ioe	ld		(ix+PD_RMTBCNT0),c			; amount to transmit to NIC
+ioe	ld		(ix+PD_RMTBCNT1),b
+
+ioe	ld		(ix+PD_RMTSADR0),0x00		; where to put it on NIC
+ioe	ld		(ix+PD_RMTSADR1),0x40
+
+ioe	ld		(ix),0x12						; write and start
+
+		push	bc									; save adjusted count
+
+pds_gather:
+		push	iy									; Save I/O base
+		ld		hl,ix
+		push	hl									; save I/O base
+		ld		l,PD_IOPORT
+		ex		de,hl
+		ldl	py,hl
+		; PY points to ll_Gather struct
+		; DE = NIC data port address
+		ld		hl, (py+[_llg_]+len1)		; ll_Gather.len1
+		test	hl
+		jr		z, pds_sect2
+
+		ld		bc, hl
+		ld		px, (py+[_llg_]+data1)		; ll_Gather.data1
+.tt1:
+		ld		a, (px+0)	; 8
+		ld		px, px+1		; 6
+		ioe	ld (de), a	; 2+7
+		dwjnz	.tt1			; 8 (loop total is 31 cycles)
+
+pds_sect2:
+		;NE2K_STAMP(8)
+
+		ld		hl, (py+[_llg_]+len2)		; ll_Gather.len2
+		test	hl
+		jr		z, pds_sect3
+
+		ld		bc, hl
+		ld		px, (py+[_llg_]+data2)		; ll_Gather.data2
+.tt2:
+		ld		a, (px+0)	; 8
+		ld		px, px+1		; 6
+		ioe	ld (de), a	; 2+7
+		dwjnz	.tt2			; 8 (loop total is 31 cycles)
+
+pds_sect3:
+		;NE2K_STAMP(10)
+		ld		hl, (py+[_llg_]+len3)		; ll_Gather.len3
+		test	hl
+		jr		z, pds_sect3_end
+
+		ld		bc, hl
+		ld		px, (py+[_llg_]+data3)		; ll_Gather.data3
+.tt3:
+		ld		a, (px+0)	; 8
+		ld		px, px+1		; 6
+		ioe	ld (de), a	; 2+7
+		dwjnz	.tt3			; 8 (loop total is 31 cycles)
+
+pds_sect3_end:
+		;NE2K_STAMP(12)
+		pop	ix									; restore I/O bases
+		pop	iy
+
+pds_endgather:
+		pop	bc									; restore count
+		ld		hl, iy
+		ld		l, PD_INTSTATUS				; wait for dma to finish
+		align	2									; even-align the following ioi bit X,(hl)
+pds_chkdma:
+ioe	bit	6,(hl)							; remote dma complete bit in INTSTATUS
+		jr		z,pds_chkdma
+
+		ld		a,0x40h							; clear dma bit in isr
+ioe	ld		(ix+PD_INTSTATUS),a
+ioe	ld		(ix+PD_TXPAGE),a					; where in ring to transmit (0x4000)
+
+ioe	ld		(ix+PD_TXBCNT0),c				; set number of bytes to transmit
+ioe	ld		(ix+PD_TXBCNT1),b
+
+ioe	ld		(ix),0x26						; start it transmiting and shut off remote dma
+
+		bool	hl									; exit - wait for tx to finish is
+		ld		l,h								; at the begining of next tx.
+pds_done:
+		pop	iy
+		pop	ix
+		;NE2K_STAMP(14)
+#endasm
+}
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	xmemcode		resume
+#endif
+
+/*** BeginHeader ne2k_sethwaddr */
+ne2k_internal_func void ne2k_sethwaddr(_NE2kConfig * nic, char* hwa);
+/*** EndHeader */
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	pld_eth_xcode		resume
+#endif
+
+ne2k_internal_func
+void ne2k_sethwaddr(_NE2kConfig * nic, char* hwaddr)
+{
+#asm
+		//memcpy(nic->hwa,hwa,6);
+		ld		hl,(sp+@sp+nic)
+      ld		de,[_NE2kConfig]+hwa
+		add	hl,de
+      ex		de,hl
+      ld		hl,(sp+@sp+hwaddr)
+      ld		bc,6
+#if PLD_ETH_COMPILING == 1
+.loop:
+		ldi
+      jp v,.loop
+#else
+      ldir
+#endif
+		push	ix
+
+		ld		hl, (sp+@SP+nic+2)
+		ne2k_internal_call(ne2k_load_io_pointers)
+
+  ; Load page 0 to clear PD_RMTBCNTx registers
+ioe   ld (ix), 0x20
+ioe	ld	(ix+PD_RMTBCNT0),0x00	; clear remote byte count register
+ioe	ld	(ix+PD_RMTBCNT1),0x00	; clear remote byte count register
+ioe	ld	(ix),0x60						; page 1
+
+		ld		hl,ix								; copy eth address to NIC registers
+		inc	hl
+		ex		de,hl
+		ld		hl,(sp+@SP+hwaddr+2)
+ioe	ldi
+ioe	ldi
+ioe	ldi
+ioe	ldi
+ioe	ldi
+ioe	ldi
+
+   ; Return to page 0
+ioe 	ld (ix), 0x20
+
+		pop	ix
+#endasm
+}
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	xmemcode		resume
+#endif
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

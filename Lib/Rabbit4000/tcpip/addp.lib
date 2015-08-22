@@ -1,0 +1,1243 @@
+/*
+	addp.lib
+	Copyright (c) 2008 Digi International Inc., All Rights Reserved
+
+	This software contains proprietary and confidential information of Digi
+	International Inc.  By accepting transfer of this copy, Recipient agrees
+	to retain this software in confidence, to prevent disclosure to others,
+	and to make no use of this software other than that for which it was
+	delivered.  This is a published copyrighted work of Digi International
+	Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+	prohibited.
+
+	Restricted Rights Legend
+
+	Use, duplication, or disclosure by the Government is subject to
+	restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+	Technical Data and Computer Software clause at DFARS 252.227-7031 or
+	subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+	Restricted Rights at 48 CFR 52.227-19, as applicable.
+
+	Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+*/
+/* START LIBRARY DESCRIPTION ************************************************
+
+	Advanced Device Discovery Protocol (ADDP) Server/Daemon
+
+	This library services requests from the Digi Device Discovery and Device
+	Setup Wizard applications (included in Dynamic C's utilities directory).
+
+	This implementation does not include MD5 Challenge/Response for sending
+	hashed passwords.  It does not include support for the ADDP_CMD_SET_WL
+	and ADDP_CMD_COUNTRY_LIST_REQ commands.
+
+	See Samples/tcpip/addp.c for an example of how to use this library.  See
+	Utilities/ADDP for two Windows ADDP clients, and source code for integrating
+	ADDP support into your existing Windows apps, or for creating your own
+	stand-alone ADDP client.
+
+	Required Macros:
+
+	ADDP_CALLBACK_IF( iface, ip, mask, gw) - This macro is called when the
+			ADDP client makes changes to the network settings.  The first
+			parameter, iface, is set to the interface that received the
+			configuration request.  If the client has enabled DHCP, <ip> will
+			be set to 0.  Should return 0 if address successfully changed, or
+			non-zero error if change failed.
+
+			Your program should define ADDP_CALLBACK to a function that updates
+			the device's saved network settings.  In order to maintain a connection
+			to the client, actual network settings should only be changed after
+			the client sends a reboot request.
+
+	ADDP_CALLBACK( ip, mask, gw) - This is an alternate to ADDP_CALLBACK_IF
+			macro for boards with a single interface.  If ADDP_CALLBACK_IF is
+			not defined, this macro is called instead.
+			the client sends a reboot request.
+
+	ADDP_PASSWORD - Password required to make changes from ADDP client.
+
+	Optional Macros:
+
+	ADDP_REBOOT_FUNCTION - Function to call when an ADDP client sends a reboot
+			command.  Defaults to exit(0).
+
+	ADDP_COOKIE - 32-bit value used by ADDP client programs to find matching
+			devices on the network.  The Digi clients use "DIGI" (0x44494749) and
+			the ADDP DLL for building your own client use "DVKT" (0x44564B54).
+			Defaults to "DIGI" (0x44494749).
+
+	ADDP_GUID - 16-byte "Globally Unique Identifier" used in addition to
+			ADDP_COOKIE to match requests to a group of devices on the network.
+			If a GUID hasn't been specified, the ADDP server will ignore the GUID
+			in configuration requests.
+
+			ADDP_GUID should be a pointer to a 16-byte array containing the GUID.
+
+				// GUID array for "bf6db409-c83d-44a3-a36d-21797d2f73f9"
+	         const byte addp_guid[ADDP_GUID_LEN] = {
+	            0xbf, 0x6d, 0xb4, 0x09,    0xc8, 0x3d,    0x44, 0xa3,
+	            0xa3, 0x6d,       0x21, 0x79, 0x7d, 0x2f, 0x73, 0xf9 };
+	         #define ADDP_GUID addp_guid
+
+			If using the utility from [ADDP Utility Source.zip] in the
+			Utilities/ADDP directory, you'll want to change the GUID to
+			one that you generate and use in your version of the utility.
+
+	ADDP_NAME - String sent as ADDP_OP_NAME to identify the product.  Could be
+			a unique name assigned to the device by the end-user.  No default
+			value -- only sent if defined.
+
+	ADDP_HWNAME - String sent as ADDP_OP_HWNAME in response to CONF_REQ opcode.
+			If not defined, defaults to "Rabbit <productname>", where <productname>
+			is the core module or SBC's name (e.g., "RCM4200", "BL4S100", etc.)
+
+	ADDP_VERBOSE - If defined, library will print status messages to STDOUT.
+
+	ADDP_DEBUG - If defined, functions will be debuggable (i.e., you can set
+			breakpoints and single-step into them).
+
+END DESCRIPTION **********************************************************/
+
+/*
+	Dev Notes:
+
+	Note that all multi-byte values are big-endian (MSB first) and need to
+	be converted using ntohs or ntohl.
+
+*/
+
+/*** BeginHeader */
+#include <string.h>
+
+// Make sure USE_MULTICAST was defined.  No way to test whether it was defined
+// before dcrtcp.lib, or after dcrtcp.lib and before addp.lib.
+#ifndef USE_MULTICAST
+	#fatal "addp.lib requires multicast (need to #define USE_MULTICAST)"
+#endif
+
+#if ! (defined ADDP_CALLBACK || defined ADDP_CALLBACK_IF)
+	#fatal "Must define ADDP_CALLBACK of ADDP_CALLBACK_IF function macro."
+#endif
+
+#ifdef ADDP_DEBUG
+	#define _addp_debug __debug
+#else
+	#define _addp_debug __nodebug
+#endif
+
+#ifdef ADDP_VERBOSE
+	#define _addp_err(me, error, func) \
+	   printf( "%s, line %u: error %d (%ls) calling %s\n", \
+	      me, __LINE__, error, strerror(error), func)
+#else
+	#define _addp_err(me, error, func)
+#endif
+
+/*** EndHeader */
+
+/*** BeginHeader */
+
+// The ADDP protocol ALWAYS uses port 2362 on multicast IP 224.0.5.128.  But,
+// allow customer code to override setting (perhaps to match a custom ADDP
+// client using a port registered to the customer).  There should almost never
+// be a need to modify these defaults.
+#ifndef ADDP_PORT
+	#define ADDP_PORT		2362
+#endif
+#ifndef ADDP_ADDR
+	#define ADDP_ADDR		IPADDR(224,0,5,128)
+#endif
+
+// This library implements ADDPv2
+#define ADDP_VERSION	0x0200
+
+#ifndef ADDP_HWNAME
+	#ifdef _BOARD_NAME_
+		#define ADDP_HWNAME ("Rabbit " _BOARD_NAME_)
+	#else
+		#define ADDP_HWNAME "Rabbit"
+	#endif
+#endif
+#ifndef ADDP_PASSWORD
+	#fatal "You must specify a password before you [#use \"addp.lib\"]."
+#endif
+#ifndef ADDP_COOKIE
+	#define ADDP_COOKIE		0x44494749		// 'D', 'I', 'G', 'I'
+#endif
+#ifndef ADDP_REBOOT_FUNCTION
+   #define ADDP_REBOOT_FUNCTION     exit(0)
+#endif
+
+// Defines based on addp.hh from NetOS for ConnectPort
+// Commented macros aren't referenced in the ported code, but are left in
+// for possible future use.
+
+#define ADDP_MAC_WIDTH				6
+//#define SSID_MAX				32
+//#define RID_AUTHENTICATION_OPEN_SYSTEM		0x0001
+//#define RID_AUTHENTICATION_SHARED_KEY		0x0002
+//#define RID_AUTHENTICATION_OPEN_SHARED_KEY	0x0003
+//#define WADAP_ENCRYPTION_MODE_NONE		1
+//#define WADAP_ENCRYPTION_MODE_WEP40		2
+//#define WADAP_ENCRYPTION_MODE_WEP128		3
+//#define ENCRYPTION_KEY_MAX			13
+
+// NetOS used 1456 for message size, but since we store the message on the stack
+// of addp_tick, and since all requests and our responses are small, lower the
+// it to a more efficient size.  The largest packet would be a
+// ADDP_CMD_CONF_REPLY, with a maximum size dependent on the ADDP_NAME and
+// ADDP_HWNAME macro settings.  Typical responses well under 384 bytes, allow
+// 512 bytes for safety.
+#define ADDP_MSG_SIZE		512
+
+//#define ADDP_PRIMED		0
+//#define ADDP_RUNNING		1
+//#define ADDP_NOT_RUNNING	2
+
+// values for ADDP_OP_RESULT
+#define ADDP_SUCCESS		0x00
+#define ADDP_FAILURE		0xFF
+
+#define ADDP_GUID_LEN		16
+#define ADDP_CHALLENGE_LEN	14
+#define ADDP_MD5_LEN			16
+
+enum ADDP_OPCODE {
+   ADDP_OP_PAD,						// 0x00: NOP, used to align fields (0-byte)
+   ADDP_OP_MAC,						// 0x01: MAC address (6-byte)
+   ADDP_OP_IPADDR,					// 0x02: IP Address (4-byte)
+   ADDP_OP_SUBMASK,					// 0x03: Subnet Mask (4-byte)
+   ADDP_OP_NAME,						// 0x04: Unit Name (n-byte, no null-terminator)
+   ADDP_OP_DOMAIN,					// 0x05 (deprecated in ADDPv2)
+   ADDP_OP_HWTYPE,					// 0x06 (deprecated in ADDPv2)
+   ADDP_OP_HWREV,						// 0x07 (deprecated in ADDPv2)
+   ADDP_OP_FEPREV,					// 0x08 (deprecated in ADDPv2)
+   ADDP_OP_MSG,						// 0x09: A message string (n-byte)
+   ADDP_OP_RESULT,					// 0x0a: Result code for an operation (1-byte)
+   ADDP_OP_GATEWAY,					// 0x0b: Default Gateway IP Address (4-byte)
+   ADDP_OP_ADVISORY,					// 0x0c: Advisory Information (2-byte)
+   ADDP_OP_HWNAME,					// 0x0d: Hardware name (n-byte)
+   ADDP_OP_REALPORT,					// 0x0e (deprecated in ADDPv2)
+   ADDP_OP_DNS,						// 0x0f: DNS IP address (4-byte)
+   ADDP_OP_DHCP,						// 0x10: DHCP Mode (1=on, 0=off)
+   ADDP_OP_ERRCODE,					// 0x11: Result of operation (1-byte)
+   ADDP_OP_PORT_CNT,					// 0x12 (deprecated in ADDPv2)
+   ADDP_OP_SECURE_REALPORT,		// 0x13 (deprecated in ADDPv2)
+   ADDP_OP_VERSION,					// 0x14: ADDP Version number (2-byte)
+   ADDP_OP_VENDOR_GUID,				// 0x15: Vendor GUID (16-byte)
+   ADDP_OP_IF_TYPE,					// 0x16: Interface Type (1-byte)
+   ADDP_OP_CHALLENGE,				// 0x17: MD5 Challenge (14-byte)
+   ADDP_OP_VENDOR_DATA,				// 0x18:
+
+   ADDP_OP_WL_SSID = 0xe0,			// 0xe0: SSID (up to 32 bytes)
+   ADDP_OP_WL_AUTO_SSID,			// 0xe1: Auto SSID mode (1=on, 0=off)
+   ADDP_OP_WL_TX_ENH_POWER,		// 0xe2: Transmit enhance power
+   ADDP_OP_WL_AUTH_MODE,			// 0xe3: Authentication mode (1=open, 2=PSK)
+   ADDP_OP_WL_ENC_MODE,				// 0xe4: Encryption mode
+   										//				(1=none, 2=WEP40, 3=WEP128)
+   ADDP_OP_WL_ENC_KEY,				// 0xe5: Encryption key (n-byte)
+   ADDP_OP_WL_CUR_COUNTRY,			// 0xe6: Country code (2-byte)
+   ADDP_OP_WL_COUNTRY_LIST,		// 0xe7: Country List (n-byte)
+};
+
+enum ADDP_CMD {
+   ADDP_CMD_NULL,						// 0x0000
+   ADDP_CMD_CONF_REQ,				// 0x0001: Request configuration parameters
+   ADDP_CMD_CONF_REPLY,				// 0x0002: Reply configuration parameters
+   ADDP_CMD_SET_ADDR,				// 0x0003: Configure network parameters
+   ADDP_CMD_SET_ADDR_REPLY,		// 0x0004: Reply to network config request
+   ADDP_CMD_REBOOT,					// 0x0005: Request device reboot
+   ADDP_CMD_REBOOT_REPLY,			// 0x0006: Reply to reboot request
+   ADDP_CMD_SET_DHCP,				// 0x0007: Request to enable/disable DHCP
+   ADDP_CMD_DHCP_REPLY,				// 0x0008: Reply to DHCP request
+
+   // Unsupported commands
+   ADDP_CMD_SET_WL,					// 0x0009: Request to configure wireless
+   ADDP_CMD_SET_WL_REPLY,			// 0x000a: Result of wireless configuration
+   ADDP_CMD_COUNTRY_LIST_REQ,		// 0x000b
+   ADDP_CMD_COUNTRY_LIST_REPLY,	// 0x000c
+
+   ADDP_CMD_COMMAND_COUNT,
+};
+
+enum ADDP_ADVISORY {
+   ADDP_ADV_NONE,						// 0x00
+   ADDP_ADV_MIS_CONFIGURED,		// 0x01
+};
+
+enum ADDP_ERROR {
+   ADDP_ERR_NO_ERROR,				// 0x00
+   ADDP_ERR_AUTH_FAIL,				// 0x01
+   ADDP_ERR_UNIT_HAS_ADDR,			// 0x02
+   ADDP_ERR_INVALID_VALUE,			// 0x03
+   ADDP_ERR_INVALID_DATA,			// 0x04
+   ADDP_ERR_UNSUPPORTED_CMD,		// 0x05
+   ADDP_ERR_DB_FAIL,					// 0x06
+
+   ADDP_ERR_MAX
+};
+
+enum {
+   ADDP_IF_ETHER = 1,
+};
+
+
+typedef struct {
+   uint32	cookie;				// magic cookie (set to macro ADDP_COOKIE)
+   uint16	cmd;					// fill with enum ADDP_CMD
+   uint16	len;					// number of bytes following header
+} ADDP_HEADER;
+
+#define ADDP_HDR_SIZE	(int)(sizeof(ADDP_HEADER))
+
+typedef struct {
+   char		mac_addr[ADDP_MAC_WIDTH];
+   char		options[1];			// variable-length byte groupings, start with
+   									// a 1-byte opcode from enum ADDP_OPCODE, followed
+   									// by a 1-byte length and then <length> bytes.
+   									// See _addp_conf_req() or ADDP spec for details.
+} ADDP_FRAME_CONF_REQ;
+
+typedef struct {
+   uint32	ip_addr;
+   uint32   submask;
+   uint32	gateway;
+   char		mac_addr[ADDP_MAC_WIDTH];
+   char		passwd_len;
+   char		passwd[1];			// variable length
+} ADDP_FRAME_SET_ADDR;
+
+typedef struct {
+   char		mac_addr[ADDP_MAC_WIDTH];
+   char		passwd_len;
+   char		passwd[1];			// variable length
+} ADDP_FRAME_REBOOT;
+
+typedef struct {
+   char		dhcp_mode;
+   char		mac_addr[ADDP_MAC_WIDTH];
+   char		passwd_len;
+   char		passwd[1];			// variable length
+} ADDP_FRAME_SET_DHCP;
+
+typedef struct {
+   char		mac_addr[ADDP_MAC_WIDTH];
+   char		passwd_len;
+   char		passwd[1];			// variable length
+} ADDP_FRAME_SET_WL;
+
+typedef struct {
+   char		mac_addr[ADDP_MAC_WIDTH];
+} ADDP_FRAME_COUNTRY_LIST_REQ;
+
+
+/*** EndHeader */
+
+/*** BeginHeader addp_close */
+void addp_close();
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+addp_close	                  											<addp.lib>
+
+SYNTAX: void addp_close()
+
+DESCRIPTION:	Stop listening for ADDP packets.
+
+RETURN VALUE:	none
+
+SEE ALSO:		addp_init, addp_tick
+
+END DESCRIPTION **********************************************************/
+_addp_debug
+void addp_close()
+{
+	sock_close( &addp_socket);
+}
+
+/*** BeginHeader addp_init, addp_tick, addp_socket */
+int addp_init( int iface, const void *unused);
+int addp_tick();
+
+extern udp_Socket			addp_socket;
+/*** EndHeader */
+
+udp_Socket			addp_socket;
+
+/* START FUNCTION DESCRIPTION ********************************************
+addp_init	                  											<addp.lib>
+
+SYNTAX: int addp_init( int iface, const void *unused)
+
+DESCRIPTION:	Start listening for ADDP packets.  After calling addp_init,
+					user code must call addp_tick regularly to check for and
+					respond to ADDP requests.
+
+PARAMETER 1:	Interface to listen on.  Use IF_ANY to listen on multiple
+					interfaces.
+
+PARAMETER 2:	Unused parameter.
+
+RETURN VALUE:	 0: Success
+	            -NETERR_OUT_OF_MEMORY: couldn't open socket to listen for
+	            		multicast  messages.  Try increasing
+	            		MAX_UDP_SOCKET_BUFFERS.
+
+SEE ALSO:		addp_tick, addp_close
+
+END DESCRIPTION **********************************************************/
+_addp_debug
+int addp_init( int iface, const void *unused)
+{
+	auto int retval;
+
+	retval = udp_extopen( &addp_socket, iface, ADDP_PORT, ADDP_ADDR, 0,
+		NULL, 0, 0);
+
+	if (retval)
+	{
+		return 0;
+	}
+	else
+	{
+		return -NETERR_OUT_OF_MEMORY;
+	}
+}
+
+/* START FUNCTION DESCRIPTION ********************************************
+addp_tick	                  											<addp.lib>
+
+SYNTAX: int addp_tick()
+
+DESCRIPTION:	Check for and respond to ADDP requests.
+
+RETURN VALUE:	 1: Responded to ADDP request.
+					 0: Received request, but did not respond (not for this device).
+					-ENODATA: No requests to service.
+					-ENOSYS: Received an unsupported ADDP request.
+					-EBADMSG: Invalid request (too short, wrong cookie) received
+							(and ignored).
+					-ENOTSOCK: Error, ADDP socket not open (need to call addp_init
+							before calling addp_tick).
+
+SEE ALSO:		addp_init, addp_close
+
+END DESCRIPTION **********************************************************/
+_addp_debug
+int addp_tick()
+{
+	auto char addp_buffer[ADDP_MSG_SIZE];
+	auto _udp_datagram_info	udi;
+
+	auto unsigned long remip;		// remote IP
+	auto word remport;				// remote port
+	auto int bytesin;
+	auto int peek;
+	auto int retval;
+	auto word command, datalen;
+	auto ADDP_HEADER *header;
+	auto char *payload;
+	auto int old_iface;
+
+	// Peek at the datagram so we can get to the sender's MAC address
+	// and bypass ARP for the response.
+   if ( ! (peek = udp_peek( &addp_socket, &udi)) )
+   {
+      // no datagrams waiting
+      return -ENODATA;
+   }
+
+   bytesin = udp_recvfrom( &addp_socket, addp_buffer, sizeof(addp_buffer),
+      &remip, &remport);
+	if (bytesin < 0)
+	{
+		#ifdef ADDP_VERBOSE
+	      if (bytesin < -1)
+	      {
+	         _addp_err( "addp_tick", bytesin, "udp_recvfrom");
+	      }
+	   #endif
+      return (bytesin == -1) ? -ENODATA : -ENOTSOCK;
+	}
+
+   if (bytesin < sizeof(ADDP_HEADER))
+   {
+		#ifdef ADDP_VERBOSE
+	      printf( "addp: incomplete frame of %d bytes received\n", bytesin);
+	      printf( "addp: packet dump:\n");
+	      mem_dump( addp_buffer, bytesin);
+		#endif
+
+      return -EBADMSG;
+   }
+
+   header = (ADDP_HEADER *) addp_buffer;
+   if (ntohl( header->cookie) != ADDP_COOKIE)
+   {
+	   #ifdef ADDP_VERBOSE
+	      printf( "addp: received %d byte datagram\n", bytesin);
+	      printf( "addp: header had wrong cookie (0x%08lx != 0x%08lx)\n",
+	         ntohl( header->cookie), ADDP_COOKIE);
+	      printf( "addp: packet dump:\n");
+	      mem_dump( addp_buffer, bytesin);
+	   #endif
+
+      return -EBADMSG;
+   }
+
+   // bypass ARP on response and reply directly to sender's MAC
+	addp_socket.hisethaddr = (eth_address	*) udi.hwa;
+	old_iface = addp_socket.iface;
+	addp_socket.iface = udi.iface;
+
+	command = ntohs( header->cmd);
+	datalen = ntohs( header->len);
+	payload = &addp_buffer[sizeof(ADDP_HEADER)];
+
+	#ifdef ADDP_VERBOSE
+	   printf( "addp: received packet, cmd=0x%04x, len=%u\n", command, datalen);
+	   printf( "addp: payload:\n");
+	   mem_dump( payload, bytesin - sizeof(ADDP_HEADER));
+	#endif
+
+	switch (ntohs( header->cmd))
+	{
+   	case ADDP_CMD_CONF_REQ:					// 0x0001
+   		retval = _addp_conf_req( udi.iface, (ADDP_FRAME_CONF_REQ *) payload,
+   			datalen, remip, remport);
+			break;
+
+   	case ADDP_CMD_SET_ADDR:					// 0x0003
+			retval = _addp_set_addr( udi.iface, (ADDP_FRAME_SET_ADDR *) payload,
+				datalen, remip, remport);
+			break;
+
+   	case ADDP_CMD_REBOOT:					// 0x0005
+			retval = _addp_reboot( udi.iface, (ADDP_FRAME_REBOOT *) payload,
+				datalen, remip, remport);
+			break;
+
+   	case ADDP_CMD_SET_DHCP:					// 0x0007
+			retval = _addp_set_dhcp( udi.iface, (ADDP_FRAME_SET_DHCP *) payload,
+				datalen, remip, remport);
+			break;
+
+		// commands that we send, but should never receive
+   	case ADDP_CMD_CONF_REPLY:				// 0x0002
+   	case ADDP_CMD_SET_ADDR_REPLY:			// 0x0004
+   	case ADDP_CMD_REBOOT_REPLY:			// 0x0006
+   	case ADDP_CMD_DHCP_REPLY:				// 0x0008
+
+		// response types for requests we don't parse
+   	case ADDP_CMD_SET_WL_REPLY:			// 0x000A
+   	case ADDP_CMD_COUNTRY_LIST_REPLY:	// 0x000C
+
+		// unsupported commands (unknown or undocumented format)
+   	case ADDP_CMD_NULL:						// 0x0000
+   	case ADDP_CMD_SET_WL:					// 0x0009
+   	case ADDP_CMD_COUNTRY_LIST_REQ:		// 0x000B
+   	case ADDP_CMD_COMMAND_COUNT:			// 0x000D
+
+		default:
+			#ifdef ADDP_VERBOSE
+				printf( "addp: no handler for command 0x%04x\n",
+					ntohs( header->cmd));
+			#endif
+			retval = -ENOSYS;
+	}
+
+	// Turn off ARP bypass on socket before stack (and udi.hwa, the current
+	// address stored in .hisethaddr) goes away.
+	addp_socket.hisethaddr = NULL;
+	addp_socket.iface = old_iface;
+
+	return retval;
+}
+
+/*** BeginHeader _addp_send_response */
+int _addp_send_response( ADDP_HEADER *header, int length, unsigned long remip,
+	word remport);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+_addp_send_response	                  									<addp.lib>
+
+SYNTAX: int _addp_send_response( ADDP_HEADER *header, int length,
+				unsigned long remip, word remport)
+
+DESCRIPTION:	Send a response to an ADDP request.  Automatically adds version
+					add GUID fields to the response.
+
+PARAMETER 1:	Buffer with response.
+
+PARAMETER 2:	Length of payload (will actually send
+						(length + sizeof(ADDP_HEADER)) bytes)
+
+PARAMETER 3:	IP address of host to send to.
+
+PARAMETER 4:	UDP port to send to.
+
+RETURN VALUE:	 1: Sent response.
+					-ENOTSOCK: Error, ADDP socket not open (need to call addp_init
+							before calling addp_tick).
+
+SEE ALSO:		addp_init, addp_close
+
+END DESCRIPTION **********************************************************/
+_addp_debug
+int _addp_send_response( ADDP_HEADER *header, int length, unsigned long remip,
+	word remport)
+{
+	auto int retval;
+	auto char *p;
+
+	// add ADDP version and GUID fields to end of response
+	p = (char *) header + sizeof(ADDP_HEADER) + length;
+	*p++ = ADDP_OP_VERSION;
+	*p++ = 2;		// length of version option
+	*(word *)p = htons( ADDP_VERSION);
+	p += 2;
+	length += 4;
+
+	#ifdef ADDP_GUID
+		*p++ = ADDP_OP_VENDOR_GUID;
+		*p++ = ADDP_GUID_LEN;
+		_n_memcpy( p, ADDP_GUID, ADDP_GUID_LEN);
+		p += ADDP_GUID_LEN;
+		length += ADDP_GUID_LEN + 2;
+	#endif
+
+	header->len = htons( length);
+	header->cookie = htonl( ADDP_COOKIE);
+
+	// send the packet back out
+	// return is # of bytes sent, -1 for failure, -2 for ARP failure
+	// Since we're bypassing ARP, udp_sendto() will never return -2
+	retval = udp_sendto( &addp_socket, header, length + sizeof(ADDP_HEADER),
+		remip, remport);
+
+	#ifdef ADDP_VERBOSE
+		printf( "addp: send %d-byte response (type 0x%02x):\n",
+			length + sizeof(ADDP_HEADER), htons( header->cmd));
+		mem_dump( header, length + sizeof(ADDP_HEADER));
+		printf( "%s: %s returned %d\n", __FUNCTION__, "udp_sendto",
+			retval);
+	#endif
+
+	return	(retval == -1) ? -ENOTSOCK : 1;
+}
+
+/*** BeginHeader _addp_bad_password */
+int _addp_bad_password( const char *check_pw, int length);
+/*** EndHeader */
+// Compare password from request to device's password.
+// return 1 if bad, 0 if good.
+_addp_debug
+int _addp_bad_password( const char *check_pw, int length)
+{
+	char *good_pw;
+
+	// ADDP_PASSWORD may be defined as a function, copy the pointer so we
+	// don't call it repeatedly.
+	good_pw = ADDP_PASSWORD;
+
+	// Passwords match only if <length> bytes match and the good password is
+	// <length> bytes long (since we match all bytes before the null-terminator,
+	// we don't need to check the actual length of good_pw, just that there
+	// aren't any additional characters to match).
+	return (memcmp( check_pw, good_pw, length) || good_pw[length] != '\0');
+}
+
+/*** BeginHeader */
+// These macros are used by multiple functions to build up a response
+#define _ADDP_APPEND_BYTE( op, val) \
+	{ *p++ = op; *p++ = 1; *p++ = val; }
+
+// in this macro, use temp int i to avoid calculating b three times
+// (as we would do if strlen(str) was the third macro parameter)
+#define _ADDP_APPEND_BYTES( op, mem, b) \
+	{ *p++ = op; *p++ = i = b; memcpy( p, mem, i); p += i; }
+
+#define _ADDP_APPEND_STR( op, str) _ADDP_APPEND_BYTES( op, str, strlen( str))
+
+#define _ADDP_APPEND_IP( op, ip) \
+	{ *p++ = op; *p++ = 4; *(unsigned long *)p = htonl( ip); p += 4; }
+/*** EndHeader */
+
+/*** BeginHeader _addp_conf_req */
+int _addp_conf_req( int iface, const ADDP_FRAME_CONF_REQ *req, int datalen,
+	unsigned long remip, word remport);
+/*** EndHeader */
+
+// table to map ADDP opcodes to ifconfig parameters for reading network settings
+const struct {
+	word		ifc_opt;
+	word		addp_opt;
+} _addp_conf_ips[] = {
+	{ IFG_IPADDR, ADDP_OP_IPADDR },
+	{ IFG_NETMASK, ADDP_OP_SUBMASK },
+	{ IFG_ROUTER_DEFAULT, ADDP_OP_GATEWAY }
+};
+#define _ADDP_CONF_IPS (sizeof(_addp_conf_ips)/sizeof(_addp_conf_ips[0]))
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_addp_guid_str                                                   <addp.lib>
+
+SYNTAX:	char *_addp_guid_str( char buffer[37], const byte guid[16])
+
+DESCRIPTION:	Convert a 16-byte Globally Unique ID (GUID) to a printable
+					string.  Prints hex bytes separated by hyphen (-) in groups
+					of 4, 2, 2, 2 and 6.
+
+PARAMETER 1:	37-byte (or larger) buffer to store the null-terminated ASCII
+					version of the GUID.
+
+PARAMETER 2:	16-byte GUID to convert to ASCII.
+
+RETURN VALUE:	Returns parameter 1.
+
+END DESCRIPTION **********************************************************/
+char *_addp_guid_str( char buffer[37], const byte guid[16])
+{
+	static const char lower_hexits[] = "0123456789abcdef";
+	auto int i;
+	char *out;
+	const byte *in;
+	int b;
+
+	out = buffer;
+	in = guid;
+	for (i = 0; i < 16; ++i)
+	{
+		b = *in++;
+		*out++ = lower_hexits[b >> 4];
+		*out++ = lower_hexits[b & 0x000F];
+		if (i == 3 || i == 5 || i == 7 || i == 9)
+		{
+			*out++ = '-';
+		}
+	}
+	*out = '\0';			// add null terminator
+
+	return buffer;
+}
+/* START _FUNCTION DESCRIPTION ********************************************
+_addp_conf_req	                  											<addp.lib>
+
+SYNTAX:	int _addp_conf_req( int iface, const ADDP_FRAME_CONF_REQ *req,
+										int datalen, unsigned long remip, word remport)
+
+DESCRIPTION:	Send a response to an ADDP CONF_REQ frame.
+
+PARAMETER 1:	Buffer with CONF_REQ frame.
+
+PARAMETER 2:	Length of frame received from ADDP client.
+
+PARAMETER 3:	IP address of host that sent request.
+
+PARAMETER 4:	UDP port to respond to.
+
+RETURN VALUE:	 1: Sent response.
+					 0: Received request, but did not respond (not for this device).
+					-EBADMSG: Invalid request (too short, wrong cookie) received
+							(and ignored).
+					-ENOTSOCK: Error, ADDP socket not open (need to call addp_init
+							before calling addp_tick).
+
+SEE ALSO:		_addp_send_response
+
+END DESCRIPTION **********************************************************/
+_addp_debug
+int _addp_conf_req( int iface, const ADDP_FRAME_CONF_REQ *req, int datalen,
+	unsigned long remip, word remport)
+{
+	auto char response[256];
+	auto eth_address addp_mac;
+	auto struct tm time;
+	auto const char *eom;
+	auto const char *parse;
+	auto word addp_ver;
+	auto ADDP_HEADER *header;
+	auto char *payload;
+	auto unsigned long ip;
+	auto int retval;
+	auto word ver;
+	auto int dhcp;
+
+	// variables used by _ADDP_APPEND macros
+	auto char *p;
+	auto int i;
+
+	addp_ver = 0x0100;
+	if (datalen != 6)
+	{
+		if (datalen > 6)
+		{
+			parse = req->options;
+			if (*parse != ADDP_OP_VERSION)
+			{
+	         #ifdef ADDP_VERBOSE
+	            printf( "%s: bad packet, version field must follow MAC address",
+	            	__FUNCTION__);
+	         #endif
+	         return -EBADMSG;
+			}
+			eom = (char *)req + datalen;
+			while (parse < eom)
+			{
+				switch (*parse)
+				{
+					case ADDP_OP_VERSION:
+						parse += 2;		// point to version
+						addp_ver = ntohs( *(word *)parse);		// ADDPv2 is 0x0200
+						parse += 2;		// point to next option
+						break;
+
+					case ADDP_OP_VENDOR_GUID:
+						// parse the GUID, re-using <response> to hold ASCII version
+						parse += 2;
+						_addp_guid_str( response, parse);
+
+						#ifdef ADDP_VERBOSE
+	                  printf( "%s: Vendor GUID is %s.\n", __FUNCTION__,
+	                     response);
+						#endif
+
+						#ifdef ADDP_GUID
+							if (memcmp( ADDP_GUID, parse, 16))
+							{
+								// The Vendor GUID field doesn't match our GUID, so
+								// ignore the request.
+	                     #ifdef ADDP_VERBOSE
+	                        printf( "%s: Vendor GUID != %s.\n", __FUNCTION__,
+	                        	_addp_guid_str( response, parse));
+	                     #endif
+								return 0;
+							}
+						#endif
+						parse += 16;		// point to next option
+						break;
+
+					default:
+						// some unknown op, use length field to skip over
+						parse += parse[1];
+				}
+			}
+		}
+		else
+		{
+	      #ifdef ADDP_VERBOSE
+	         printf( "%s: bad length %d, expected %d", __FUNCTION__,
+	            datalen, 6);
+	      #endif
+	      return -EBADMSG;
+		}
+	}
+
+	// if request isn't broadcast, and doesn't match our MAC, return
+	ifconfig( iface, IFG_HWA, &addp_mac, IFS_END);
+   if (memcmp( req->mac_addr, "\xFF\xFF\xFF\xFF\xFF\xFF", 6)
+   	&& memcmp( req->mac_addr, &addp_mac, sizeof(addp_mac)) )
+   {
+      #ifdef ADDP_VERBOSE
+         printf( "%s: ignoring %s for someone else\n", __FUNCTION__,
+         	"CONF_REQ");
+      #endif
+      return 0;
+   }
+
+	// build the response to the request
+	header = (ADDP_HEADER *) response;
+	p = payload = &response[sizeof(ADDP_HEADER)];
+
+	header->cmd = htons( ADDP_CMD_CONF_REPLY);
+
+	_ADDP_APPEND_BYTES( ADDP_OP_MAC, &addp_mac, sizeof(addp_mac));
+
+	for (i = 0; i < _ADDP_CONF_IPS; i++)
+	{
+		ifconfig( iface, _addp_conf_ips[i].ifc_opt, &ip, IFS_END);
+		_ADDP_APPEND_IP( _addp_conf_ips[i].addp_opt, ip);
+	}
+
+	// DNS servers
+	for (i = 0; i < _dns_server_table.num; i++)
+	{
+		_ADDP_APPEND_IP( ADDP_OP_DNS, _dns_server_table.table[i].ip);
+	}
+
+	#ifdef USE_DHCP
+		ifconfig( iface, IFG_DHCP, &dhcp, IFS_END);
+	#else
+		dhcp = 0;
+	#endif
+	_ADDP_APPEND_BYTE( ADDP_OP_DHCP, dhcp);
+
+	#ifdef ADDP_NAME
+		_ADDP_APPEND_STR( ADDP_OP_NAME, ADDP_NAME);
+	#endif
+
+	_ADDP_APPEND_STR( ADDP_OP_HWNAME, ADDP_HWNAME);
+
+	// insert firmware version string for ADDPv1 clients
+	if (addp_ver == 0x0100)
+	{
+	   mktm (&time, _firmware_info.build_timestamp);
+	   ver = _firmware_info.version;
+	   *p++ = ADDP_OP_FEPREV;
+	   i = sprintf( &p[1], "Version %d.%d.%d %d/%02d/%d",
+	      ver >> 8, ver >> 4 & 0x000F, ver & 0x000F,
+	      tm_mon2month(time.tm_mon), time.tm_mday, time.tm_year + 1900);
+	   *p++ = i;
+	   p += i;
+	}
+
+	return _addp_send_response( header, (int) (p - payload), remip, remport);
+}
+
+/*** BeginHeader _addp_set_addr */
+int _addp_set_addr( int iface, const ADDP_FRAME_SET_ADDR *req, int datalen,
+	unsigned long remip, word remport);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+_addp_set_addr	                  											<addp.lib>
+
+SYNTAX:	int _addp_set_addr( int iface, const ADDP_FRAME_SET_ADDR *req,
+										int datalen, unsigned long remip, word remport)
+
+
+DESCRIPTION:	Send a response to an ADDP SET_ADDR frame.
+
+PARAMETER 1:	Buffer with SET_ADDR frame.
+
+PARAMETER 2:	Length of frame received from ADDP client.
+
+PARAMETER 3:	IP address of host that sent request.
+
+PARAMETER 4:	UDP port to respond to.
+
+RETURN VALUE:	 1: Sent response.
+					 0: Received request, but did not respond (not for this device).
+					-EBADMSG: Invalid request (too short, wrong cookie) received
+							(and ignored).
+					-ENOTSOCK: Error, ADDP socket not open (need to call addp_init
+							before calling addp_tick).
+
+SEE ALSO:		_addp_send_response
+
+END DESCRIPTION **********************************************************/
+_addp_debug
+int _addp_set_addr( int iface, const ADDP_FRAME_SET_ADDR *req, int datalen,
+	unsigned long remip, word remport)
+{
+	auto char response[128];
+	auto char ipbuf[16], ethbuf[18];
+	auto eth_address addp_mac;
+	auto ADDP_HEADER *header;
+	auto char *payload;
+	auto int error;
+
+	// variables used by _ADDP_APPEND macros
+	auto char *p;
+	auto int i;
+
+   #ifdef ADDP_VERBOSE
+	   printf( "got set addr request\n");
+	   printf( "ip_addr: %s\n", inet_ntoa( ipbuf, ntohl( req->ip_addr)));
+	   printf( "submask: %s\n", inet_ntoa( ipbuf, ntohl( req->submask)));
+	   printf( "gateway: %s\n", inet_ntoa( ipbuf, ntohl( req->gateway)));
+	   printf( "mac_addr: %s\n", inet_ethtoa( ethbuf, req->mac_addr));
+	   printf( "passwd: [%.*s]\n", req->passwd_len, req->passwd);
+	#endif
+
+	if (datalen != sizeof(ADDP_FRAME_SET_ADDR) + req->passwd_len - 1)
+	{
+		#ifdef ADDP_VERBOSE
+			printf( "%s: bad length %d, expected %d", __FUNCTION__,
+				datalen, sizeof(ADDP_FRAME_SET_ADDR) + req->passwd_len - 1);
+		#endif
+		return -EBADMSG;
+	}
+
+	// if request doesn't match our MAC, return
+	ifconfig( iface, IFG_HWA, &addp_mac, IFS_END);
+   if (memcmp( req->mac_addr, &addp_mac, sizeof(addp_mac)))
+   {
+      #ifdef ADDP_VERBOSE
+         printf( "%s: ignoring %s for someone else\n", __FUNCTION__,
+         	"SET_ADDR");
+      #endif
+      return 0;
+   }
+
+	// build the response to the request
+	header = (ADDP_HEADER *) response;
+	p = payload = &response[sizeof(ADDP_HEADER)];
+
+	header->cmd = htons( ADDP_CMD_SET_ADDR_REPLY);
+
+	_ADDP_APPEND_BYTES( ADDP_OP_MAC, &addp_mac, sizeof(addp_mac));
+
+	// check the password
+	if (_addp_bad_password( req->passwd, req->passwd_len))
+	{
+      #ifdef ADDP_VERBOSE
+         printf( "%s: password mismatch ('%.*s' != '%s')\n", __FUNCTION__,
+         	req->passwd_len, req->passwd, ADDP_PASSWORD);
+      #endif
+	   _ADDP_APPEND_BYTE( ADDP_OP_RESULT, ADDP_FAILURE);
+	   _ADDP_APPEND_STR( ADDP_OP_MSG, "Incorrect Password");
+	   _ADDP_APPEND_BYTE( ADDP_OP_ERRCODE, ADDP_ERR_AUTH_FAIL);
+	}
+	else
+	{
+		#ifdef ADDP_CALLBACK_IF
+			error = ADDP_CALLBACK_IF( iface, ntohl( req->ip_addr),
+				ntohl( req->submask), ntohl( req->gateway));
+		#else
+			error = ADDP_CALLBACK( ntohl( req->ip_addr), ntohl( req->submask),
+				ntohl( req->gateway));
+		#endif
+		if (error)
+		{
+	      _ADDP_APPEND_BYTE( ADDP_OP_RESULT, ADDP_FAILURE);
+	      _ADDP_APPEND_STR( ADDP_OP_MSG, "Couldn't modify network settings");
+	      _ADDP_APPEND_BYTE( ADDP_OP_ERRCODE, ADDP_ERR_INVALID_VALUE);
+		}
+		else
+		{
+	      _ADDP_APPEND_BYTE( ADDP_OP_RESULT, ADDP_SUCCESS);
+	      _ADDP_APPEND_STR( ADDP_OP_MSG, "Operation Successful");
+	      _ADDP_APPEND_BYTE( ADDP_OP_ERRCODE, ADDP_ERR_NO_ERROR);
+		}
+	}
+
+	return _addp_send_response( header, (int) (p - payload), remip, remport);
+}
+
+/*** BeginHeader _addp_reboot */
+int _addp_reboot( int iface, const ADDP_FRAME_REBOOT *req, int datalen,
+	unsigned long remip, word remport);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+_addp_reboot	                  											<addp.lib>
+
+SYNTAX:	int _addp_reboot( int iface, const ADDP_FRAME_REBOOT *req, int datalen,
+															unsigned long remip, word remport)
+
+
+DESCRIPTION:	Send a response to an ADDP REBOOT frame.
+
+PARAMETER 1:	Buffer with REBOOT frame.
+
+PARAMETER 2:	Length of frame received from ADDP client.
+
+PARAMETER 3:	IP address of host that sent request.
+
+PARAMETER 4:	UDP port to respond to.
+
+RETURN VALUE:	 1: Sent response.
+					 0: Received request, but did not respond (not for this device).
+					-EBADMSG: Invalid request (too short, wrong cookie) received
+							(and ignored).
+					-ENOTSOCK: Error, ADDP socket not open (need to call addp_init
+							before calling addp_tick).
+
+SEE ALSO:		_addp_send_response
+
+END DESCRIPTION **********************************************************/
+_addp_debug
+int _addp_reboot( int iface, const ADDP_FRAME_REBOOT *req, int datalen,
+	unsigned long remip, word remport)
+{
+	auto char response[128];
+	auto char ethbuf[18];
+	auto eth_address addp_mac;
+	auto ADDP_HEADER *header;
+	auto char *payload;
+	auto int retval, reboot;
+
+	// variables used by _ADDP_APPEND macros
+	auto char *p;
+	auto int i;
+
+   #ifdef ADDP_VERBOSE
+	   printf( "got reboot request\n");
+	   printf( "mac_addr: %s\n", inet_ethtoa( ethbuf, req->mac_addr));
+	   printf( "passwd: [%.*s]\n", req->passwd_len, req->passwd);
+	#endif
+
+	if (datalen != sizeof(ADDP_FRAME_REBOOT) + req->passwd_len - 1)
+	{
+		#ifdef ADDP_VERBOSE
+			printf( "%s: bad length %d, expected %d", __FUNCTION__,
+				datalen, sizeof(ADDP_FRAME_REBOOT) + req->passwd_len - 1);
+		#endif
+		return -EBADMSG;
+	}
+
+	// if request doesn't match our MAC, return
+	ifconfig( iface, IFG_HWA, &addp_mac, IFS_END);
+   if (memcmp( req->mac_addr, &addp_mac, sizeof(addp_mac)))
+   {
+      #ifdef ADDP_VERBOSE
+         printf( "%s: ignoring %s for someone else\n", __FUNCTION__,
+         	"REBOOT");
+      #endif
+      return 0;
+   }
+
+	// build the response to the request
+	header = (ADDP_HEADER *) response;
+	p = payload = &response[sizeof(ADDP_HEADER)];
+
+	header->cmd = htons( ADDP_CMD_REBOOT_REPLY);
+
+	_ADDP_APPEND_BYTES( ADDP_OP_MAC, &addp_mac, sizeof(addp_mac));
+
+	// check the password
+	if (_addp_bad_password( req->passwd, req->passwd_len))
+	{
+      #ifdef ADDP_VERBOSE
+         printf( "%s: password mismatch ('%.*s' != '%s')\n", __FUNCTION__,
+         	req->passwd_len, req->passwd, ADDP_PASSWORD);
+      #endif
+	   _ADDP_APPEND_BYTE( ADDP_OP_RESULT, ADDP_FAILURE);
+	   _ADDP_APPEND_STR( ADDP_OP_MSG, "Incorrect Password");
+	   _ADDP_APPEND_BYTE( ADDP_OP_ERRCODE, ADDP_ERR_AUTH_FAIL);
+	   return _addp_send_response( header, (int) (p - payload), remip, remport);
+	}
+	else
+	{
+      _ADDP_APPEND_BYTE( ADDP_OP_RESULT, ADDP_SUCCESS);
+      _ADDP_APPEND_STR( ADDP_OP_MSG, "Operation Successful");
+      _ADDP_APPEND_BYTE( ADDP_OP_ERRCODE, ADDP_ERR_NO_ERROR);
+
+		// Send the response and reboot the board
+      _addp_send_response( header, (int) (p - payload), remip, remport);
+      ADDP_REBOOT_FUNCTION;		// defaults to exit(0)
+	}
+
+}
+
+/*** BeginHeader _addp_set_dhcp */
+int _addp_set_dhcp( int iface, const ADDP_FRAME_SET_DHCP *req, int datalen,
+	unsigned long remip, word remport);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+_addp_set_dhcp	                  											<addp.lib>
+
+SYNTAX:	int _addp_set_dhcp( int iface, const ADDP_FRAME_SET_DHCP *req,
+										int datalen, unsigned long remip, word remport)
+
+
+DESCRIPTION:	Send a response to an ADDP SET_DHCP frame.
+
+PARAMETER 1:	Buffer with SET_DHCP frame.
+
+PARAMETER 2:	Length of frame received from ADDP client.
+
+PARAMETER 3:	IP address of host that sent request.
+
+PARAMETER 4:	UDP port to respond to.
+
+RETURN VALUE:	 1: Sent response.
+					 0: Received request, but did not respond (not for this device).
+					-EBADMSG: Invalid request (too short, wrong cookie) received
+							(and ignored).
+					-ENOTSOCK: Error, ADDP socket not open (need to call addp_init
+							before calling addp_tick).
+
+SEE ALSO:		_addp_send_response
+
+END DESCRIPTION **********************************************************/
+_addp_debug
+int _addp_set_dhcp( int iface, const ADDP_FRAME_SET_DHCP *req, int datalen,
+	unsigned long remip, word remport)
+{
+	auto char response[128];
+	auto char ethbuf[18];
+	auto eth_address addp_mac;
+	auto ADDP_HEADER *header;
+	auto char *payload;
+	auto int retval, reboot;
+	auto int error;
+
+	// variables used by _ADDP_APPEND macros
+	auto char *p;
+	auto int i;
+
+   #ifdef ADDP_VERBOSE
+	   printf( "got set dhcp request\n");
+	   printf( "dhcp: %d\n", req->dhcp_mode);
+	   printf( "mac_addr: %s\n", inet_ethtoa( ethbuf, req->mac_addr));
+	   printf( "passwd: [%.*s]\n", req->passwd_len, req->passwd);
+	#endif
+
+	if (datalen != sizeof(ADDP_FRAME_SET_DHCP) + req->passwd_len - 1)
+	{
+		#ifdef ADDP_VERBOSE
+			printf( "%s: bad length %d, expected %d", __FUNCTION__,
+				datalen, sizeof(ADDP_FRAME_SET_DHCP) + req->passwd_len - 1);
+		#endif
+		return -EBADMSG;
+	}
+
+	// if request doesn't match our MAC, return
+	ifconfig( iface, IFG_HWA, &addp_mac, IFS_END);
+   if (memcmp( req->mac_addr, &addp_mac, sizeof(addp_mac)))
+   {
+      #ifdef ADDP_VERBOSE
+         printf( "%s: ignoring %s for someone else\n", __FUNCTION__,
+         	"SET_DHCP");
+      #endif
+      return 0;
+   }
+
+	// build the response to the request
+	header = (ADDP_HEADER *) response;
+	p = payload = &response[sizeof(ADDP_HEADER)];
+
+	header->cmd = htons( ADDP_CMD_DHCP_REPLY);
+
+	_ADDP_APPEND_BYTES( ADDP_OP_MAC, &addp_mac, sizeof(addp_mac));
+
+	// check the password
+	if (_addp_bad_password( req->passwd, req->passwd_len))
+	{
+      #ifdef ADDP_VERBOSE
+         printf( "%s: password mismatch ('%.*s' != '%s')\n", __FUNCTION__,
+         	req->passwd_len, req->passwd, ADDP_PASSWORD);
+      #endif
+	   _ADDP_APPEND_BYTE( ADDP_OP_RESULT, ADDP_FAILURE);
+	   _ADDP_APPEND_STR( ADDP_OP_MSG, "Incorrect Password");
+	   _ADDP_APPEND_BYTE( ADDP_OP_ERRCODE, ADDP_ERR_AUTH_FAIL);
+	}
+	else
+	{
+		#ifdef USE_DHCP
+			#ifdef ADDP_CALLBACK_IF
+	      	error = ADDP_CALLBACK_IF( iface, 0, 0, 0);
+			#else
+	      	error = ADDP_CALLBACK( 0, 0, 0);
+	      #endif
+	      if (error)
+	      {
+	         _ADDP_APPEND_BYTE( ADDP_OP_RESULT, ADDP_FAILURE);
+	         _ADDP_APPEND_STR( ADDP_OP_MSG, "Couldn't modify network settings");
+	         _ADDP_APPEND_BYTE( ADDP_OP_ERRCODE, ADDP_ERR_INVALID_VALUE);
+	      }
+	      else
+	      {
+	         _ADDP_APPEND_BYTE( ADDP_OP_RESULT, ADDP_SUCCESS);
+	         _ADDP_APPEND_STR( ADDP_OP_MSG, "Operation Successful");
+	         _ADDP_APPEND_BYTE( ADDP_OP_ERRCODE, ADDP_ERR_NO_ERROR);
+	      }
+		#else
+	      _ADDP_APPEND_BYTE( ADDP_OP_RESULT, ADDP_FAILURE);
+	      _ADDP_APPEND_STR( ADDP_OP_MSG, "DHCP not available");
+	      _ADDP_APPEND_BYTE( ADDP_OP_ERRCODE, ADDP_ERR_UNSUPPORTED_CMD);
+		#endif
+	}
+
+   return _addp_send_response( header, (int) (p - payload), remip, remport);
+}

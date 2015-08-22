@@ -1,0 +1,634 @@
+/* START LIBRARY DESCRIPTION ********************************************
+ PART.LIB
+
+ PARTITION LIBRARY
+
+ Creates, opens and maintains DOS style Master Boot Records (MBR) with
+ partition tables.  This gives a common set of low level routines for all
+ filesystems to use for partitioned devices.  The library was designed to
+ handle different media types and requires a low level devicer that
+ contains the minimum routines as specified in the MBR Partition
+ Library design document.
+
+
+COPYRIGHT - NCT AG (c) 2006 - 2003
+COPYRIGHT - Rabbit Semiconductor (c) 2006 - 2004
+
+HISTORY:
+		RELEASE  A 01.00										January 2004
+		- Initial Release
+      - Change in structure names, parameters and comments
+
+END DESCRIPTION *********************************************************/
+
+/*** BeginHeader */
+#ifndef __PART_LIB
+#define __PART_LIB
+
+#ifdef PART_DEBUG
+	#define _part_nodebug __debug
+#else
+	#define _part_nodebug __nodebug
+#endif
+
+/*  return codes used by the partition library are all from ERRNO .
+ *  Negate them before returning.
+ */
+#include <errno.h>
+
+#use "part_defs.lib"
+
+#ifndef MBR_START_DEFINED
+/* The MBR that we use to partition the device. */
+const __far char mbr_start[] = {
+	"\xFA\x33\xC0\x8E\xD0\xBC\x00\x7C\x8B\xF4\x50\x07\x50\x1F\xFB\xFC" \
+	"\xBF\x00\x06\xB9\x00\x01\xF2\xA5\xEA\x1D\x06\x00\x00\xBE\xBE\x07" \
+	"\xB3\x04\x80\x3C\x80\x74\x0E\x80\x3C\x00\x75\x1C\x83\xC6\x10\xFE" \
+	"\xCB\x75\xEF\xCD\x18\x8B\x14\x8B\x4C\x02\x8B\xEE\x83\xC6\x10\xFE" \
+	"\xCB\x74\x1A\x80\x3C\x00\x74\xF4\xBE\x8B\x06\xAC\x3C\x00\x74\x0B" \
+	"\x56\xBB\x07\x00\xB4\x0E\xCD\x10\x5E\xEB\xF0\xEB\xFE\xBF\x05\x00" \
+	"\xBB\x00\x7C\xB8\x01\x02\x57\xCD\x13\x5F\x73\x0C\x33\xC0\xCD\x13" \
+	"\x4F\x75\xED\xBE\xA3\x06\xEB\xD3\xBE\xC2\x06\xBF\xFE\x7D\x81\x3D" \
+	"\x55\xAA\x75\xC7\x8B\xF5\xEA\x00\x7C\x00\x00\x49\x6E\x76\x61\x6C" \
+	"\x69\x64\x20\x70\x61\x72\x74\x69\x74\x69\x6F\x6E\x20\x74\x61\x62" \
+	"\x6C\x65\x00\x45\x72\x72\x6F\x72\x20\x6C\x6F\x61\x64\x69\x6E\x67" \
+	"\x20\x6F\x70\x65\x72\x61\x74\x69\x6E\x67\x20\x73\x79\x73\x74\x65" \
+	"\x6D\x00\x4D\x69\x73\x73\x69\x6E\x67\x20\x6F\x70\x65\x72\x61\x74" \
+	"\x69\x6E\x67\x20\x73\x79\x73\x74\x65\x6D\x00\x00\x00\x00\x00\x00"
+};
+#define MBR_START_DEFINED
+#endif
+
+/*** EndHeader */
+
+
+/*** BeginHeader mbr_ValidatePartitions */
+int mbr_ValidatePartitions( mbr_dev * );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION *******************************************
+mbr_ValidatePartitions                   <PART.LIB>
+
+SYNTAX:       mbr_ValidatePartitions( mbr_dev *dev );
+
+DESCRIPTION:  This routine will validate the partition table contained in
+				  the device structure passed.  It will verify that all
+              partitions fit within the bounds of the device and that no
+              partitions overlap.
+
+PARAMETER1:   dev - Pointer to a device structure to be verified.
+
+RETURNS:	     0 for Success
+              -EINVAL if the Partition table in device stucture is invalid.
+*************************************************************************/
+
+_part_nodebug int mbr_ValidatePartitions( mbr_dev *dev )
+{
+	auto int i, j;
+	auto mbr_part *ptr_part;
+   auto unsigned long part_ends[2][4], k;
+
+   /* Get the endpoints to all partitions */
+   for (i = 4; i--; ) {
+   	ptr_part = &(dev->part[i]);
+      /* Get partition end points */
+      if (ptr_part && ptr_part->partsecsize) {
+  			if (ptr_part->bootflag & 0x7F) {
+         	return -EINVAL;
+         }
+	      if (ptr_part->starthead == 0xFE) {
+   	   	part_ends[0][i] = ptr_part->startsector;
+  	   	   part_ends[1][i] = ptr_part->startsector + ptr_part->partsecsize-1;
+         }
+  	      else {
+		   	part_ends[0][i] = ((ptr_part->startseccyl >> 8) * dev->sec_track
+              * dev->heads) + ((ptr_part->startseccyl & 0xFF) * dev->heads)
+              + ptr_part->starthead;
+		   	part_ends[1][i] = ((ptr_part->endseccyl >> 8) * dev->sec_track
+              * dev->heads) + ((ptr_part->endseccyl & 0xFF) * dev->heads)
+              + ptr_part->endhead;
+            if (part_ends[0][i] > part_ends[1][i]) {
+            	return -EINVAL;
+            }
+	      }
+      }
+      else {
+  	   	part_ends[0][i] = part_ends[1][i] = 0L;
+      }
+   }
+
+   /* Sort the partitions by their start sector */
+   for (i = 4; --i; ) {
+   	for (j = 0; j < i; j++) {
+         if (part_ends[0][j] > part_ends[0][j+1])
+         {
+            k = part_ends[0][j];
+            part_ends[0][j] = part_ends[0][j+1];
+            part_ends[0][j+1] = k;
+            k = part_ends[1][j];
+            part_ends[1][j] = part_ends[1][j+1];
+            part_ends[1][j+1] = k;
+	      }
+      }
+   }
+
+   /* Check for overlapping of in use partitions and valid bootcode */
+   for (i = 4; --i; ) {
+   	if ((part_ends[0][i] <= part_ends[1][i-1]) && part_ends[1][i-1]) {
+        	return -EINVAL;
+      }
+   }
+
+   /* Check that all partitions fit on the device */
+   if (part_ends[1][3] >= ((unsigned long)dev->heads * dev->cylinder
+                                   * dev->sec_track)) {
+   	return -EINVAL;
+   }
+
+	return 0;			// All Partitions Valid !!!
+}
+
+/*** BeginHeader mbr_EnumDevice */
+int mbr_EnumDevice( mbr_drvr *, mbr_dev *, int, int (*checktype)() );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION *******************************************
+mbr_EnumDevice                        <PART.LIB>
+
+SYNTAX:       mbr_EnumDevice(mbr_drvr *driver, mbr_dev *dev, int devnum,
+										 int (*checktype)() );
+
+DESCRIPTION:  This routine is called to learn about devices present on
+              the driver passed in.  The device will be added to the
+              linked list of enumerated devices.  Partition information
+              will be filled in from the master boot record.  Pointers
+              to file system level partition information structures will
+              be set to NULL.
+
+PARAMETER1:   driver - Pointer to a DOS contoller structure (setup during
+                      init of storage device devicer.)
+
+PARAMETER2:   dev - Pointer to a device structure to be filled in.
+
+PARAMETER3:   devnum - Physical device number of device on the driver.
+
+PARAMETER4:   checktype - Routine that takes an unsigned char partition
+							 type	and returns 1 if of sought type and 0 if not.
+                      Pass NULL for this parameter to bypass this check.
+
+RETURNS:	     0 for Success
+				  -EIO for Error trying to read the device or structure.
+              -EINVAL if devnum invalid or does not exist.
+              -ENOMEM if memory for page buffer is not available.
+              -EUNFORMAT if the device is accessible, but not formatted.
+              			You can use it provided it is formatted/partitioned
+                     by either this library or another system.
+              -EBADPART if the partition table on the device is invalid
+              -ENOPART if the device does not have any sought partitions,
+              			If checktype parameter is NULL, this test is bypassed.
+                     This code is superceded by any other error detected.
+				  -EEXIST if the device has already been enumerated.
+              -EBUSY if the device is busy.
+*************************************************************************/
+
+_part_nodebug int mbr_EnumDevice( mbr_drvr *driver, mbr_dev *dev, int devnum
+									, int (*checktype)() )
+{
+	auto int i;
+   auto mbr_dev *dp;
+	auto int rc;
+	auto long mbr_buf_size;
+	auto __far char *mbr_buf;
+
+   if (driver) {
+   	if (driver->ndev) {
+	   	for (i = 0, dp = driver->dlist; i < driver->ndev; ) {
+	         if (dp) {
+   	   		if (dp->dev_num == devnum) {
+  	   	   	   return -EEXIST;		// Device already enumerated
+               }
+            	else {
+	            	if (++i < driver->ndev)
+   	            	dp = dp->next; // Move to next device in chain
+               }
+      	   }
+   	      else {
+	         	return -EIO;		// Bad device chain
+            }
+         }
+      }
+   }
+   else {
+   	return -EIO;					// Bad driver structure
+   }
+
+	memset( dev, 0, sizeof( mbr_dev ) );
+	if (( rc = driver->xxx_EnumDevice( driver, dev, devnum) ) != 0 ) {
+		return rc;						// Echo error from xxx_EnumDevice
+   }
+	dev->dev_num = devnum;
+	dev->driver = driver;
+
+   /* Get far buffer for direct page read */
+   if (xavail(NULL) >= dev->byte_page) {
+     	mbr_buf_size = dev->byte_page;
+	  	mbr_buf = (char __far *)_xalloc(&mbr_buf_size, 0, XALLOC_MAYBBB);
+   }
+   else {
+  		return -ENOMEM;
+   }
+
+	/* See if we can read the MBR (Save the error code) */
+   while ((rc = dev->driver->xxx_ReadSector(0L, mbr_buf,
+                                           (char __far *)NULL, dev)) == -EBUSY);
+   if (!rc) {
+      // Must have signature word AND be formatted by this FAT
+      //  Factory formatted cards have no boot block
+      rc = xgetint( mbr_buf + 510 );
+      if (rc == 0xAA55 && !memcmp(mbr_start, mbr_buf, 0xE0)) {
+	   	for (i = 4; i--; ) {
+	      	_f_memcpy(((char __far *)(&dev->part[i])), mbr_buf+0x01BE+(i<<4), 16);
+         }
+         rc = mbr_ValidatePartitions(dev);
+         if (rc) {
+         	rc = -EBADPART;
+         }
+         else {
+         	if ( checktype ) {
+		         for (i = 4; i--; ) {
+   		      	if ( checktype(dev->part[i].parttype) ) {
+                     break;
+                  }
+               }
+      		   if (i < 0) {
+                  rc = -ENOPART;
+               }
+            }
+         }
+   	}
+	   else {
+   		rc = -EUNFORMAT;
+      }
+   }
+
+	/* Must have an MBR (partitioned device) or return rc error or -EUNFORMAT */
+   i = *((int __far *)( mbr_buf )) & 0xFF;
+  	xrelease( (long) mbr_buf, mbr_buf_size);
+	if ( rc || i == 0xEB || i == 0xE9)
+	{
+		memset( dev, 0, sizeof( mbr_dev ) );
+      if (!rc) rc = -EUNFORMAT;
+		return rc;
+	}
+
+   if (driver->ndev) {
+   	dp->next = dev;
+   }
+   else {
+   	driver->dlist = dev;
+   }
+
+   driver->ndev++;
+
+	return 0;			// Device Enumerated !!!
+}
+
+/*** BeginHeader mbr_FormatDevice */
+int mbr_FormatDevice( mbr_dev * );
+/*** EndHeader */
+
+// Default spare data info for FTL layer, [0] = Standard, [1] = Small block
+const char spare_init[2][16] = {
+ { 0xFF, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0x88, 0x88, 0, 0, 0 },
+ { 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0x88, 0x88, 0, 0, 0 } };
+
+/* START FUNCTION DESCRIPTION *******************************************
+mbr_FormatDevice                        <PART.LIB>
+
+SYNTAX:       mbr_FormatDevice( mbr_dev *dev );
+
+DESCRIPTION:  Creates or rewrites the Master Boot Record on the device
+				  given. The routine will only rewrite the Boot Loader code
+              if an MBR already exists on the device.  The existing
+              partition table will be preserved.  To modify an existing
+              partition table use mbr_CreatePartion.  NOTE: This routine
+              is NOT PROTECTED from power loss and can make existing
+              partitions inaccessible if interrupted.
+
+              NOTE:  THIS FUNCTION IS BLOCKING!!!
+
+PARAMETER1:   dev - Pointer to a MBR device structure
+
+RETURNS:	     0 for Success
+				  -EEXIST if the MBR exists, writing Boot Loader only
+				  -EIO for Error trying to read the device or structure.
+              -EINVAL if the Device structure is not valid.
+              -ENOMEM if memory for page buffer is not available.
+              -EPERM if device has mounted or FS enumerated partition(s)
+*************************************************************************/
+
+_part_nodebug int mbr_FormatDevice( mbr_dev *dev )
+{
+	auto int rc;
+   auto char prev;
+   auto char pbuf[sizeof(mbr_part) * 4];
+   auto char spare[16];
+   auto mbr_dev *dp;
+	auto long mbr_buf_size;
+	auto char __far *mbr_buf;
+
+   /* See if device & driver pointers are useable */
+   if ((dev == NULL) || (dev->driver == NULL)) {
+		return -EINVAL;
+   }
+
+   /* Make sure all partitions are unmounted */
+   for (rc = 4; rc--; ) {
+   	if ((dev->part[rc].status & MBRP_MOUNTED) || dev->fs_part[rc])
+  	   	return -EPERM;
+   }
+
+   /* Validate partition table in device structure */
+	if (( rc = mbr_ValidatePartitions( dev )) < 0) {
+      return rc;
+   }
+
+   /* Get far buffer for direct page read/write */
+   if (xavail(NULL) >= dev->byte_page) {
+      mbr_buf_size = dev->byte_page;
+	  	mbr_buf = (char __far *)_xalloc(&mbr_buf_size, 0, XALLOC_MAYBBB);
+   }
+   else {
+  		return -ENOMEM;
+   }
+
+   /* Read current MBR sector from device */
+   while ((rc = dev->driver->xxx_ReadSector(0L, mbr_buf,
+                                           (char __far *)NULL, dev)) == -EBUSY);
+	if (rc < 0) {
+   	if (rc != -EBADDATA) {
+	   	xrelease((long)mbr_buf, mbr_buf_size);
+			return rc;
+      }
+   }
+
+   /* Look for current MBR on the device */
+  	rc = xgetint( (long)mbr_buf + 510 );
+
+   // Must have signature word AND be formatted by this FAT
+   //  Factory formatted cards have no boot block
+   if (rc == 0xAA55 && !memcmp(mbr_start, mbr_buf, 0xE0)) {
+      // MBR signature id on device.
+      // Validate the partition table
+      memcpy(pbuf, dev->part, sizeof(pbuf));
+      for (rc = 4; rc--; ) {
+         _f_memcpy(((char __far *)&(dev->part[rc])), mbr_buf+0x1BE+(rc<<4), 16);
+      }
+      if (mbr_ValidatePartitions(dev)) {
+         memcpy(dev->part, pbuf, sizeof(pbuf));
+         prev = 0;
+      }
+      else {
+         prev = 1;
+      }
+   }
+   else {
+   	prev = 0;
+   }
+
+   if (!prev) {
+	  	for (rc = 4; rc--; ) {
+     		_f_memcpy((mbr_buf+0x01BE+(rc<<4)), (char __far *)&(dev->part[rc]),16);
+      }
+   }
+   *((int __far *)(mbr_buf+510)) = 0xAA55; // Put MBR Signature in last 2 bytes
+  	_f_memcpy(mbr_buf, mbr_start, 0xE0 );	 // Copy Boot Loader Code
+	_f_memset((mbr_buf + 0xE0), 0, 222);    // Zero gap up to partition table
+   memcpy( spare, spare_init[(dev->sec_block == 32) ? 1 : 0], 16 );
+
+   /* Write out MBR */
+  	while ((rc = dev->driver->xxx_WriteSector(0L, mbr_buf,
+                                   (char __far *)&spare, dev)) == -EDRVBUSY);
+  	xrelease((long)mbr_buf, mbr_buf_size);
+
+   while (rc == -EBUSY) {
+      rc = dev->driver->xxx_InformStatus(dev, 0);
+   }
+
+   if (!rc && prev) {
+	   rc = -EEXIST;
+	}
+
+	return rc;
+}
+
+/*** BeginHeader mbr_CreatePartition */
+int mbr_CreatePartition( mbr_dev *, int, char );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION *******************************************
+mbr_CreatePartition                        <PART.LIB>
+
+SYNTAX:       mbr_CreatePartition(mbr_dev *dev, int pnum, char type);
+
+DESCRIPTION:  Creates or modifies the partition specified. The new
+				  partition values should be placed in the appropriate
+              partition structure within the device structure. The type
+              parameter should match the type as it currently exists on
+              the device, unless this is unused. The partition being
+              modified must not be mounted, and should be released by
+              filesystem use (its fs_part pointer must be NULL).
+
+              NOTE:  THIS FUNCTION IS BLOCKING!!!
+
+PARAMETER1:   dev - Pointer to a MBR device structure
+
+PARAMETER2:   pnum - Partition number to be created or modified.
+
+PARAMETER3:   type - Type that exists on the physical device partition now
+
+RETURNS:	     0 for Success
+				  -EIO for Error trying to read device or structures.
+              -EINVAL if device structure, pnum or type is invalid.
+              -EPERM if the partition has not been enumerated or is
+              			  currently	mounted.
+              -EUNFORMAT if the device is accessible, but not formatted.
+*************************************************************************/
+
+_part_nodebug int mbr_CreatePartition( mbr_dev *dev, int pnum, char type )
+{
+	auto int rc;
+	auto mbr_part tmp_part, *ptr_part;
+   auto char *ptr;
+	auto long mbr_buf_size;
+	auto char __far *mbr_buf;
+   auto char spare[16];
+
+	/* See if the device & driver pointers are useable and pnum is valid */
+	if (( dev == NULL) || (dev->driver == NULL) || (pnum < 0) || (pnum > 3))
+		return -EINVAL;
+
+   /* Validate partition table in device structure */
+	if (( rc = mbr_ValidatePartitions( dev )) < 0) {
+      return rc;
+   }
+
+   // See that partition is unmounted
+   ptr_part = &(dev->part[pnum]);
+   if (ptr_part->status & MBRP_MOUNTED) {
+   	return -EPERM;
+   }
+
+   /* Get far buffer for direct page read/write */
+   if (xavail(NULL) >= dev->byte_page) {
+      mbr_buf_size = dev->byte_page;
+	  	mbr_buf = (char __far *)_xalloc(&mbr_buf_size, 0, XALLOC_MAYBBB);
+   }
+   else {
+  		return -ENOMEM;
+   }
+
+	/* Read the MBR (Return error code on failure) */
+   while ((rc = dev->driver->xxx_ReadSector(0L, mbr_buf,
+                                        (char __far *)&spare, dev)) == -EBUSY);
+	if (rc < 0) {
+   	if (rc == -EBADDATA) {
+        	_f_memset((mbr_buf + 0x01BE), 0, 64);
+         rc = 4;
+      }
+      else {
+	   	xrelease((long)mbr_buf, mbr_buf_size);
+			return rc;
+      }
+   }
+
+   // Look for current MBR on the device. Must have MBR created by this LIB
+   if (*((int __far *)(mbr_buf+510))!= 0xAA55 || memcmp(mbr_start,mbr_buf,0xE0))
+   {
+   	xrelease((long)mbr_buf, mbr_buf_size);
+     	return -EUNFORMAT;
+   }
+
+   // MBR signature on device, validate the partition table
+	/* Get current partition info on entry being modified in tmp_part */
+	_f_memcpy((char __far *)&tmp_part, (mbr_buf + 0x01BE + (pnum * 16)), 16 );
+
+   /* Caller must be aware of current parttype from the device (if in use)*/
+  	if (!tmp_part.parttype || (tmp_part.parttype == type)) {
+     	// Verify that partitions in device struct match those on the device
+      //  rc is either 0 or 4 based on the status of reading the MBR
+     	for ( ; rc < 4; rc++) {
+        	if (rc != pnum) {
+				_f_memcpy((char __far *)&tmp_part, (mbr_buf + 0x01BE + (rc * 16)),16);
+            if ((tmp_part.partsecsize != dev->part[rc].partsecsize) ||
+                 		(tmp_part.startsector != dev->part[rc].startsector))
+            {
+              	rc = -EINVAL;
+               break;
+            }
+         }
+      }
+      if (rc == 4) {
+     		_f_memcpy((mbr_buf + 0x01BE + (pnum * 16)), (char __far *)ptr_part, 16);
+         while ((rc = dev->driver->xxx_WriteSector( 0L, mbr_buf,
+                                    (char __far *)&spare, dev)) == -EDRVBUSY);
+ 	   }
+   }
+  	else {
+  		rc = -EINVAL;
+   }
+
+  	xrelease((long)mbr_buf, mbr_buf_size);
+   while (rc == -EBUSY) {
+      rc = dev->driver->xxx_InformStatus(dev, 0);
+   }
+	return rc;
+}
+
+/*** BeginHeader mbr_MountPartition */
+int mbr_MountPartition( mbr_dev *, int );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION *******************************************
+mbr_MountPartition                        <PART.LIB>
+
+SYNTAX:       mbr_MountPartition( mbr_dev *dev, int pnum)
+
+DESCRIPTION:  Marks the partition as mounted.  It is the higher level
+				  codes responsibility to verify that the fs_part pointer
+              for a partition is not in use (NULL) as this would
+              indicate that another system is in the process of mounting
+              this device.
+
+PARAMETER1:   dev - Pointer to a MBR device structure
+
+PARAMETER2:   pnum - Partition number to be mounted
+
+RETURNS:	     0 for Success
+              -EINVAL if Device or Partition structure or pnum is invalid.
+              -ENOPART if Partition does not exist on the device.
+*************************************************************************/
+
+_part_nodebug int mbr_MountPartition( mbr_dev *dev, int pnum)
+{
+	// See if the device, driver & part pointers are useable and pnum is valid
+	if (( dev == NULL) || (dev->driver == NULL) || (pnum < 0) ||(pnum > 3)) {
+		return -EINVAL;
+   }
+
+   if (dev->part[pnum].parttype) {
+      dev->part[pnum].status |= MBRP_MOUNTED |
+	      					(dev->driver->type[dev->dev_num] & MBRP_READONLY);
+   }
+   else {
+   	return -ENOPART;
+   }
+
+	return 0;
+}
+
+/*** BeginHeader mbr_UnmountPartition */
+int mbr_UnmountPartition( mbr_dev *dev, int pnum );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION *******************************************
+mbr_UnmountPartition                        <PART.LIB>
+
+SYNTAX:       mbr_UnmountPartition(mbr_dev *dev, int pnum);
+
+DESCRIPTION:  Marks the partition as unmounted.  The partition must not
+				  have any user partition data attached (through mounting
+              at a higher level).  If the fs_part pointer for the
+              partition being unmounted is not NULL, an EPERM error is
+              returned.
+
+PARAMETER1:   dev - Pointer to device structure containing the partition
+
+PARAMETER2:	  pnum - Partition number to be unmounted
+
+RETURNS:	     0 for Success
+              -EINVAL if the device structure or pnum are invalid.
+              -EPERM if the partition is enumerated at a higher level.
+*************************************************************************/
+
+_part_nodebug int mbr_UnmountPartition( mbr_dev *dev, int pnum)
+{
+	// See if the device, driver & part pointers are useable and pnum is valid
+	if (( dev == NULL) || (dev->driver == NULL) || (pnum < 0) ||(pnum > 3)) {
+		return -EINVAL;
+   }
+
+   if (dev->fs_part[pnum] == NULL) {
+	   dev->part[pnum].status = 0;
+   }
+   else {
+   	return -EPERM;
+   }
+
+	return 0;
+}
+
+/*** BeginHeader */
+#endif  // __PART_LIB
+/*** EndHeader */
+

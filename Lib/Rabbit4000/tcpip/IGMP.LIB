@@ -1,0 +1,610 @@
+/*** BeginHeader  ********************************************/
+#ifndef __IGMP_LIB
+#define __IGMP_LIB
+/*** EndHeader ***********************************************/
+
+/*
+ *    igmp.lib
+ *    Copyright (C) Rabbit Semiconductor, Inc. All rights reserved.
+ *
+ *		Implements IGMPv2 (Internet Group Management Protocol).
+ *		Also contains some of the multicasting support.
+ *
+ */
+
+/*** BeginHeader */
+#ifdef IGMP_DEBUG
+	#define _igmp_nodebug __debug
+#else
+	#define _igmp_nodebug __nodebug
+#endif
+
+
+#ifdef USE_IGMP
+	#ifndef USE_MULTICAST
+		#define USE_MULTICAST
+	#endif
+#endif
+
+#ifndef IGMP_V1_ROUTER_PRESENT_TIMEOUT
+	#define IGMP_V1_ROUTER_PRESENT_TIMEOUT 400
+#endif
+
+// Defines the number of deciseconds between the initial two membership
+// reports
+#ifndef IGMP_UNSOLICITED_REPORT_INTERVAL
+	#define IGMP_UNSOLICITED_REPORT_INTERVAL	100
+#endif
+
+// Multicast messages intended for all hosts (224.0.0.1)
+#define _IGMP_ALL_HOSTS_IPADDR	0xe0000001uL
+// Multicast messages intended for all routers (224.0.0.2)
+#define _IGMP_ALL_ROUTERS_IPADDR 0xe0000002uL
+
+// Types that are used in the call to _igmp_sendreport()
+#define _IGMP_MEMBERSHIP_REPORT	0
+#define _IGMP_LEAVE_MESSAGE		1
+
+// Type numbers in an IGMP packet
+#define _IGMP_TYPE_MEMBERSHIP_QUERY			0x11
+#define _IGMP_TYPE_V1_MEMBERSHIP_REPORT	0x12
+#define _IGMP_TYPE_V2_MEMBERSHIP_REPORT	0x16
+#define _IGMP_TYPE_LEAVE_GROUP				0x17
+
+typedef struct {
+	byte type;
+	byte maxresptime;
+	word checksum;
+	longword groupaddress;
+} _igmp_pkt;
+
+#use ip.lib
+typedef struct {
+	in_Header	in;
+	longword		routerattn;
+	_igmp_pkt	igmp;
+} _igmp_ippkt;
+
+/*** EndHeader */
+
+/*** BeginHeader _igmp_init */
+void _igmp_init(void);
+/*** EndHeader */
+
+_igmp_nodebug void _igmp_init(void)
+{
+	auto char EthAddress[6];
+	auto int i;
+	auto ATHandle handle;
+
+	// Listen for messages to ALL-HOSTS (224.0.0.1).  This is needed for
+	// receiving IGMP general queries.
+	multicast_iptohw(EthAddress, _IGMP_ALL_HOSTS_IPADDR);
+	for (i = 0; i < IF_MAX; i++) {
+		if (IF_MCAST_CAPABLE(i)) {
+			pd_addmulticast(i, EthAddress, NULL);
+		}
+	}
+
+	// Add an ARP entry for ALL-ROUTERS (224.0.0.2).  This is needed since
+	// leave messages must be sent to the ALL-ROUTERS address.
+	multicast_iptohw(EthAddress, _IGMP_ALL_ROUTERS_IPADDR);
+	handle = arpcache_create_iface(_IGMP_ALL_ROUTERS_IPADDR, IF_ANY);
+	arpcache_load(handle, EthAddress, IF_ANY,
+		ATE_PERMANENT | ATE_RESOLVED, 0);
+}
+
+/*** BeginHeader _igmp_tick */
+void _igmp_tick(void);
+/*** EndHeader */
+
+_igmp_nodebug void _igmp_tick(void)
+{
+	auto int i;
+
+	for (i = 0; i < IF_MAX; i++) {
+		if ((_if_tab[i].flags & IFF_IGMP_V1_ROUTER) &&
+		    (chk_timeout(_if_tab[i].lastv1msg))) {
+			_if_tab[i].flags ^= IFF_IGMP_V1_ROUTER;
+#ifdef IGMP_VERBOSE
+			printf("Going back to IGMPv2 host behavior\n");
+#endif
+		}
+	}
+}
+
+/*** BeginHeader _igmp_handler */
+ll_prefix __far * _igmp_handler(ll_prefix __far * LL, byte * hdrbuf);
+/*** EndHeader */
+
+_igmp_nodebug ll_prefix __far * _igmp_handler(ll_prefix __far * LL, byte * hdrbuf)
+{
+	auto in_Header *ip;
+	auto _igmp_pkt *igmp;
+	auto word iphdr_len;
+	auto word igmp_len;
+	auto longword ipaddr;
+	auto byte iface;
+	auto ATHandle ath;
+	auto byte maxresptime;
+
+   ip = (in_Header *)(hdrbuf + LL->net_offs);
+   _pkt_buf2root(LL, igmp = (_igmp_pkt *)(hdrbuf+LL->tport_offs),
+   	sizeof(_igmp_pkt), LL->tport_offs);
+
+	iphdr_len = in_GetHdrlenBytes(ip);
+	igmp_len = intel16(ip->length) - iphdr_len;
+	iface = LL->iface;
+
+#ifdef IGMP_VERBOSE
+	printf("IGMP: incoming on i/f %u\n", iface);
+#endif
+	// Verify the checksum
+	if (fchecksum(igmp, igmp_len) != 0xffff) {
+#ifdef IGMP_VERBOSE
+		printf("igmp_len: %d\n", igmp_len);
+		printf("IGMP: bad checksum\n");
+#endif
+		return LL;
+	}
+
+	// If this is not a query, then discard
+	if (igmp->type != _IGMP_TYPE_MEMBERSHIP_QUERY) {
+		return LL;
+	}
+
+	ipaddr = intel(ip->destination);
+	LOCK_GLOBAL(TCPGlobalLock);
+
+#if (USE_IGMP == 1)
+	maxresptime = 100;
+#else
+	if (igmp->maxresptime == 0) {
+		_if_tab[iface].flags |= IFF_IGMP_V1_ROUTER;
+		_if_tab[iface].lastv1msg = set_timeout(IGMP_V1_ROUTER_PRESENT_TIMEOUT);
+		// Treat as 10 seconds
+		maxresptime = 100;
+	}
+	else {
+		maxresptime = igmp->maxresptime;
+	}
+#endif
+
+	// Check if it is the ALL-HOSTS address (224.0.0.1)
+	if (ipaddr == _IGMP_ALL_HOSTS_IPADDR) {
+		// This must be a General Query--the group address must be 0
+		if (igmp->groupaddress != 0) {
+#ifdef IGMP_VERBOSE
+			printf("Received a General Query with nonzero group address!\n");
+			printf("   Buggy IGMP router present?\n");
+			printf("   Discarding query...\n");
+#endif
+			UNLOCK_GLOBAL(TCPGlobalLock);
+			return LL;
+		}
+		_arpcache_report_all_multicasts(iface, maxresptime);
+		UNLOCK_GLOBAL(TCPGlobalLock);
+		return LL;
+	}
+
+	// Must be a group query--make sure that the group address matches
+	if (ip->destination != igmp->groupaddress) {
+#ifdef IGMP_VERBOSE
+		printf("Received a Group Query where the IP destination address does\n");
+		printf("   not match the IGMP group address!\n");
+		printf("   Buggy IGMP router present?\n");
+		printf("   Discarding query...\n");
+#endif
+		UNLOCK_GLOBAL(TCPGlobalLock);
+		return LL;
+	}
+
+	// Check if it is a group of which we are a member
+	ath = arpcache_search_iface(ipaddr, 0, iface);
+	if (ath > 0) {
+		// Found the entry--schedule the report
+		_arp_sched_to_multicast_random(ath, maxresptime);
+	}
+	UNLOCK_GLOBAL(TCPGlobalLock);
+   return LL;
+}
+
+/*** BeginHeader multicast_iptohw */
+int multicast_iptohw(char* hwaddr, longword ipaddr);
+/*** EndHeader */
+
+// Convert a multicast IP address into an Ethernet address.  Return
+// 0 on success, !0 on error (not a multicast IP address).
+_igmp_nodebug int multicast_iptohw(char* hwaddr, longword ipaddr)
+{
+	if (!IS_MULTICAST_ADDR(ipaddr)) {
+		return 1;
+	}
+	// Only the last 23 bits are copied into the Ethernet address
+	hwaddr[0] = 0x01;
+	hwaddr[1] = 0x00;
+	hwaddr[2] = 0x5e;
+	hwaddr[3] = ((char *)(&ipaddr))[2] & 0x7f;
+	hwaddr[4] = ((char *)(&ipaddr))[1];
+	hwaddr[5] = ((char *)(&ipaddr))[0];
+
+	return 0;
+}
+
+/*** BeginHeader multicast_joingroup */
+int multicast_joingroup(int iface, longword ipaddr);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+multicast_joingroup							<IGMP.LIB>
+
+SYNTAX: int multicast_joingroup(int iface, longword ipaddr);
+
+KEYWORDS:		tcpip, multicast, igmp
+
+DESCRIPTION: 	This function joins the specified multicast group (class
+					D IP address--from 224.0.0.0 to 239.255.255.255) on the
+					specified interface.  For an Ethernet interface, it
+					configures the hardware to accept multicast packets for
+					the specified address.
+
+					Note that this function is called automatically when
+					udp_open() is used to open a multicast address.
+
+PARAMETER1: 	interface on which to join the group (such as IF_ETH0 or
+					IF_DEFAULT)
+PARAMETER2: 	multicast group to join
+
+RETURN VALUE:  0 for success; 1 for failure (such as if the address is not
+					a multicast address, or there are not enough available ARP
+					entries to hold the group)
+END DESCRIPTION **********************************************************/
+
+_igmp_nodebug
+int multicast_joingroup(int iface, longword ipaddr)
+{
+	return _multicast_joingroup_userflag(iface, ipaddr, 1);
+}
+
+/*** BeginHeader _multicast_joingroup_userflag */
+// Join the group on the specified interface.  For IF_ANY, it will loop
+// through all available interfaces.
+int _multicast_joingroup_userflag(int iface, longword ipaddr, byte useradded);
+/*** EndHeader */
+
+_igmp_nodebug int _multicast_joingroup_userflag(int iface, longword ipaddr,
+                                                byte useradded)
+{
+	auto int i;
+	auto int retval;
+	auto int final_return;
+
+	final_return = 0;
+	if (iface == IF_ANY) {
+		for (i = 0; i < IF_MAX; i++) {
+			if (IF_MCAST_CAPABLE(i)) {
+				retval = _multicast_jg_userflag_iface(i, ipaddr, useradded);
+				// Remember if there was an error
+				if (retval != 0) {
+					final_return = 1;
+				}
+			}
+		}
+	}
+	else {
+		final_return = _multicast_jg_userflag_iface(iface, ipaddr,
+		                                                   useradded);
+	}
+	return final_return;
+}
+
+/*** BeginHeader _multicast_jg_userflag_iface */
+// Join the group on the specified interface--this version does not
+// work with IF_ANY (see _multicast_joingroup_userflag() for that)
+int _multicast_jg_userflag_iface(int iface, longword ipaddr,
+	byte useradded);
+/*** EndHeader */
+
+_igmp_nodebug int _multicast_jg_userflag_iface(int iface,
+	longword ipaddr, byte useradded)
+{
+	auto char EthAddress[6];
+	auto ATHandle handle;
+	auto int slot;
+
+	slot = 0;
+
+	if (multicast_iptohw(EthAddress, ipaddr)) {
+		// IP address is not a multicast address
+		return 1;
+	}
+	LOCK_GLOBAL(TCPGlobalLock);
+	// Configure the nic to listen for this multicast address
+#if USING_ETHERNET || USING_WIFI
+	if (IF_MCAST_CAPABLE(iface)) {
+		pd_addmulticast(iface, EthAddress, &slot);
+	}
+#endif
+
+	// Create the entry for this multicast group in the ARP cache, if
+	// it does not already exist
+	handle = arpcache_search_iface(ipaddr, 0, (byte)iface);
+	if (handle > 0) {
+		// Already exists...Check if we need to set the user-added flag
+		if (useradded) {
+			_arpcache_multicast_setuserflag(handle, 1);
+		}
+		UNLOCK_GLOBAL(TCPGlobalLock);
+		return 0;
+	}
+	handle = arpcache_create_iface(ipaddr, (byte)iface);
+	if (handle <= 0) {
+		// Could not get a handle
+		UNLOCK_GLOBAL(TCPGlobalLock);
+		return 1;
+	}
+	handle = arpcache_load(handle, EthAddress, (byte)iface,
+	                       ATE_PERMANENT | ATE_RESOLVED | ATE_MULTICAST, 0);
+	if (handle <= 0) {
+		// Error loading ARP entry
+		UNLOCK_GLOBAL(TCPGlobalLock);
+		return 1;
+	}
+	// Indicate if this was a user-added group (and hence shouldn't be
+	// automatically left on a udp_close() of the same group)
+	_arpcache_multicast_setuserflag(handle, useradded);
+
+	// Save the slot from which the hardware multicast address is recognized
+	// (used in Ethernet drivers where the "slot" is a hash of the address)
+	_arpcache_multicast_saveslot(handle, slot);
+
+#ifdef USE_IGMP
+	_igmp_sendreport(iface, ipaddr, _IGMP_MEMBERSHIP_REPORT);
+
+	_arp_sched_to_multicast(handle, IGMP_UNSOLICITED_REPORT_INTERVAL);
+#endif
+
+	UNLOCK_GLOBAL(TCPGlobalLock);
+	return 0;
+}
+
+/*** BeginHeader multicast_leavegroup */
+int multicast_leavegroup(int iface, longword ipaddr);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+multicast_leavegroup							<IGMP.LIB>
+
+SYNTAX: int multicast_leavegroup(int iface, longword ipaddr);
+
+KEYWORDS:		tcpip, multicast, igmp
+
+DESCRIPTION: 	This function leaves the specified multicast group (class
+					D IP address--from 224.0.0.0 to 239.255.255.255) on the
+					specified interface.  For an Ethernet interface, it
+					configures the hardware to no longer accept multicast
+					packets for the specified address.  This function will
+					leave the group no matter how many multicast_joingroup()
+					calls were made on that group.  However, note that this
+					function will not actually leave a group for which there
+					are UDP sockets.  However, when those UDP sockets close,
+					the group will be left.
+
+					Note that this function is called automatically when a
+					multicast UDP socket is closed.
+
+PARAMETER1: 	interface on which to leave the group (such as IF_ETH0 or
+					IF_DEFAULT)
+PARAMETER2: 	multicast group to leave
+
+RETURN VALUE:  0 for success; 1 for failure (such as if the address is not
+					a multicast address)
+END DESCRIPTION **********************************************************/
+
+_igmp_nodebug
+int multicast_leavegroup(int iface, longword ipaddr)
+{
+	return _multicast_leavegroup_userflag(iface, ipaddr, 1);
+}
+
+/*** BeginHeader _multicast_leavegroup_userflag */
+int _multicast_leavegroup_userflag(int iface, longword ipaddr, byte userdeleted);
+/*** EndHeader */
+
+_igmp_nodebug int _multicast_leavegroup_userflag(int iface, longword ipaddr,
+	byte userdeleted)
+{
+	auto char EthAddress[6];
+	auto ATHandle handle;
+	auto int delentry;
+	auto byte userflag;
+
+	if (multicast_iptohw(EthAddress, ipaddr)) {
+		// IP address is not a multicast address
+		return 1;
+	}
+
+	LOCK_GLOBAL(TCPGlobalLock);
+	// Find the ARP entry corresponding to this group
+	handle = arpcache_search_iface(ipaddr, 0, (byte)iface);
+	if (handle <= 0) {
+		// Error finding ARP entry
+		UNLOCK_GLOBAL(TCPGlobalLock);
+		return 1;
+	}
+
+	delentry = 0;
+	_arpcache_multicast_getuserflag(handle, &userflag);
+	// Check if there are other UDP sockets on this multicast group
+	// on this interface
+	if (!_udp_check_multicast_sockets(iface, ipaddr)) {
+		//  There are no other sockets on this group
+		if (userflag) {
+			// The user has explicitly joined this group...
+			if (userdeleted) {
+				// ...and the user is explicitly leaving the group
+				delentry = 1;
+			}
+		}
+		else {
+			// No other sockets, and not a user-joined group, so we can leave it
+			delentry = 1;
+		}
+	}
+
+	if (delentry) {
+#if USING_ETHERNET || USING_WIFI
+		if (IF_MCAST_CAPABLE(iface)) {
+			// Do a search for the same resulting hash in other multicast entries
+			if (!_arpcache_mc_checkhashremove(handle)) {
+#ifdef USE_IGMP
+				// Send the leave message
+				_igmp_sendreport(iface, ipaddr, _IGMP_LEAVE_MESSAGE);
+#endif
+				// Instruct the Ethernet hardware to not accept this address
+				pd_removemulticast(iface, EthAddress);
+			}
+		}
+#endif
+		_arpcache_delete(handle);
+	}
+	else if (userdeleted) {
+		_arpcache_multicast_setuserflag(handle, 0);
+	}
+
+	UNLOCK_GLOBAL(TCPGlobalLock);
+	return 0;
+}
+
+/*** BeginHeader multicast_ingroup */
+int multicast_ingroup(int iface, longword ipaddr);
+/*** EndHeader */
+
+_igmp_nodebug int multicast_ingroup(int iface, longword ipaddr)
+{
+	auto ATHandle handle;
+	auto byte userflag;
+
+	if (!IS_MULTICAST_ADDR(ipaddr)) {
+		return -1;
+	}
+
+	LOCK_GLOBAL(TCPGlobalLock);
+	handle = arpcache_search_iface(ipaddr, 0, (byte)iface);
+	if (handle <= 0) {
+		UNLOCK_GLOBAL(TCPGlobalLock);
+		return 0;
+	}
+	_arpcache_multicast_getuserflag(handle, &userflag);
+	if (userflag) {
+		UNLOCK_GLOBAL(TCPGlobalLock);
+		return 2;
+	}
+	else {
+		UNLOCK_GLOBAL(TCPGlobalLock);
+		return 1;
+	}
+}
+
+/*** BeginHeader _igmp_sendreport */
+int _igmp_sendreport(int iface, longword ipaddr, byte type);
+/*** EndHeader */
+
+_igmp_nodebug int _igmp_sendreport(int iface, longword ipaddr, byte type)
+{
+	auto ATHandle ath;
+	// LL and IP headers (with the Router Alert option), plus IGMP
+	auto byte pkt_hdr[IP_MAX_IP_HDR + IP_OPT_ROUTERALERT_LEN +
+	                  sizeof(_igmp_pkt)];
+	auto ll_Gather g;
+   auto _igmp_ippkt *p;
+   auto in_Header *ip;
+   auto longword *routerattn;
+   auto _igmp_pkt *igmp;
+
+#if (USE_IGMP == 1)
+	if (type == _IGMP_LEAVE_MESSAGE) {
+		return 0;
+	}
+#else
+	if ((_if_tab[iface].flags & IFF_IGMP_V1_ROUTER) &&
+	    type == _IGMP_LEAVE_MESSAGE) {
+		return 0;
+	}
+#endif
+
+	if (type == _IGMP_MEMBERSHIP_REPORT) {
+		ath = arpcache_search_iface(ipaddr, 0, (byte)iface);
+	}
+	else {
+		ath = arpcache_search_iface(_IGMP_ALL_ROUTERS_IPADDR, 0, IF_ANY);
+	}
+	// Make sure we got a match
+	if (ath <= 0) {
+		return 1;
+	}
+
+#ifdef IGMP_VERBOSE
+	if (type == _IGMP_MEMBERSHIP_REPORT) {
+		printf("IGMP: sending membership report\n");
+	}
+	else {
+		printf("IGMP: sending leave message\n");
+	}
+#endif
+
+	p = (_igmp_ippkt *)pkt_make_ip(ath, pkt_hdr, &g);
+
+   ip = &(p->in);
+   memset(ip, 0, sizeof(in_Header));
+	routerattn = &(p->routerattn);
+	igmp = &(p->igmp);
+
+#if (USE_IGMP == 1)
+	igmp->type = _IGMP_TYPE_V1_MEMBERSHIP_REPORT;
+#else
+	if (type == _IGMP_MEMBERSHIP_REPORT) {
+		if (_if_tab[iface].flags & IFF_IGMP_V1_ROUTER) {
+			igmp->type = _IGMP_TYPE_V1_MEMBERSHIP_REPORT;
+		}
+		else {
+			igmp->type = _IGMP_TYPE_V2_MEMBERSHIP_REPORT;
+		}
+	}
+	else {
+		igmp->type = _IGMP_TYPE_LEAVE_GROUP;
+	}
+#endif
+	igmp->maxresptime = 0;
+	igmp->groupaddress = intel(ipaddr);
+	igmp->checksum = 0;
+	igmp->checksum = ~fchecksum(igmp, sizeof(_igmp_pkt));
+
+	ip->ver_hdrlen = 0x46;
+	ip->length = intel16(sizeof(in_Header) + IP_OPT_ROUTERALERT_LEN +
+	                     sizeof(_igmp_pkt));
+	ip->tos = 0;
+	ip->identification = intel16(++ip_id);
+	ip->ttl = 1;
+	ip->proto = IGMP_PROTO;
+	ip->source = intel(_if_tab[g.iface].ipaddr);
+#if (USE_IGMP == 1)
+	ip->destination = intel(ipaddr);
+#else
+	if (type == _IGMP_MEMBERSHIP_REPORT) {
+		ip->destination = intel(ipaddr);
+	}
+	else {
+		ip->destination = intel(_IGMP_ALL_ROUTERS_IPADDR);
+	}
+#endif
+	*routerattn = 0x00000494;
+	ip->checksum = ~fchecksum(ip, sizeof(in_Header) + IP_OPT_ROUTERALERT_LEN);
+
+	g.len1 = sizeof(_igmp_pkt) + (word)((char __far *)paddr(igmp) - g.data1);
+	return pkt_gather(&g);
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

@@ -1,0 +1,1161 @@
+/*** BeginHeader pop3_init, pop3_getmail, pop3_tick */
+/*
+ *	This POP3 client will fetch e-mails from a remote site.
+ * These e-mails can be passed to a client program through a
+ * function called storemail(). This is a client program
+ * provided function, and should have the following prototype:
+ *
+ * By default:
+ * int storemail(int number, char *buf, int size);
+ *
+ * If POP_PARSE_EXTRA is defined:
+ * int storemail(int number, char *to, char *from, char *subject, char *body, int size);
+ *
+ * By default:
+ * "size"	== size of "buf" in bytes
+ * "buf"		== a text buffer containing part of an e-mail
+ * "number" == the e-mail number currently being transfered
+ *
+ * If multiple e-mails are received, this function may be called
+ * several times per e-mail, with "number" changing for each e-mail.
+ *
+ * An example:
+ *		2 e-mails are received
+ *			- the first is 20 bytes & one line
+ *			- the second is 40 & two lines.
+ *
+ *	storemail(1, email_buffer, 20);
+ * storemail(2, email_buffer, 33);
+ * storemail(2, email_buffer, 7);
+ *
+ * Each line of the e-mail is sent in a separate call to storemail.  The CRLF
+ * (end of line mark) has been REMOVED from each line and replaced with a
+ * null terminator.
+ *
+ * NOTE - "number" is NOT guaranteed to be in ascending order.
+ *
+ * If POP_PARSE_EXTRA is defined:
+ *
+ * "number" is the same as above.
+ * "to" is who the e-mail is sent to.
+ * "from" is who the e-mail is from.
+ * "subject" is the subject line.
+ * "body" containes one line at a time of the body.
+ * "size" is the length of body in bytes. All other buffers are null ( \0 ) terminated.
+ *
+ * You must copy the data out of these buffers, as when the function returns, they
+ * will all be overwritten.
+ *
+ * Number, To, From, and Subject will all be the same for a given e-mail, while the
+ * "body" buffer will change between each call.
+ *
+ * All buffers except body (that is to, from, subject) will be truncated down to
+ * POP_BUFFER_SIZE.
+ *
+ * ----------------------
+ *
+ * Server options:
+ *
+ * // leave the e-mails on the server
+ * #define POP_NODELETE
+ *
+ * // set the timeout in seconds
+ * #define POP_TIMEOUT 30
+ *
+ * // Use alternative parsing method, for easier use
+ * #define POP_PARSE_EXTRA
+ *
+ * // set the buffer size for POP_PARSE_EXTRA, in bytes
+ * #define POP_BUFFER_SIZE 128
+ */
+#ifndef __POP3_LIB
+#define __POP3_LIB
+
+
+/*
+ *   POP_VERBOSE allows you to view a complete log of
+ *   a POP3 session in Dynamic C's STDIO window.
+ */
+//#define POP_VERBOSE
+
+#ifdef POP_DEBUG
+	#define pop_debug __debug
+#else
+	#define pop_debug __nodebug
+#endif
+
+/*
+ * Maximum length of POP3 server name
+ */
+
+#ifndef POP_MAX_SERVERLEN
+	#define POP_MAX_SERVERLEN MAX_STRING
+#endif
+
+/*
+ *   POP_SERVER is a machine which stores messages for us.
+ *   This is the default if pop_setserver() not called.
+ */
+
+#ifndef POP_SERVER
+	#define POP_SERVER ""
+#endif
+
+#ifndef POP_PORT
+	#define POP_PORT 110
+#endif
+
+#ifndef POP_IFACE
+	#define POP_IFACE	IF_ANY
+#endif
+
+/*
+ *	#define POP_AUTH_TLS 1
+ * to include TLS security.
+ * In addition, before calling pop3_tick(), call pop3_set_tls() with
+ * the appropriate flags and settings.  Note that there are 2 different
+ * ways in which TLS is used with POP3 in common use.  You need to select
+ * one.
+ */
+
+#ifndef POP_AUTH_TLS
+	#define POP_AUTH_TLS 0
+#endif
+
+#ifndef POP_TLS_RX_BUFFER_SIZE
+	#if _BOARD_TYPE_ == RCM5700
+		// This board only has 128k RAM, so we can't afford the full
+		// amount, however 6k will work in the majority of cases
+		// and allows this small board to work with a single TLS
+		// socket at a time.
+		#define POP_TLS_RX_BUFFER_SIZE 6000
+	#else
+		#define POP_TLS_RX_BUFFER_SIZE 16420
+	#endif
+#endif
+
+#if POP_AUTH_TLS
+	#ifndef _SSL_SOCK_H
+		#error "POP_AUTH_TLS requires #use ssl_sock.lib before #use pop3.lib"
+	#endif
+#endif
+
+/*
+ * Following optional macros have analogous meaning to those in SMTP.LIB.
+ * Refer to that library for details.
+ */
+//#define POP_ALLOW_ANY_SERVER_CERT
+//#define POP_ALLOW_CLEARTEXT
+//#define POP_ALLOW_CERT_CN_MISMATCH
+//#define POP_AUTH_FAIL_IF_NO_AUTH
+
+
+// Use these macros consistently for dealing with TCP and/or SSL sockets
+#define _TCP_SOCK_OF_POP(state) (&state.pop_sock)
+#if POP_AUTH_TLS
+	#define _SOCK_OF_POP(state) (state.pop_s)
+	#define _SSL_SOCK_OF_POP(state) (state.pop_n_ssl)
+#else
+	#define _SOCK_OF_POP(state) _TCP_SOCK(state.pop_s)
+	#define _SSL_SOCK_OF_POP(state) NULL	// should never be used
+#endif
+
+
+
+/* pop3_tick() return values (plus negative codes from DNS) */
+#define POP_PENDING	1
+#define POP_SUCCESS	2
+#define POP_ERROR 	3
+#define POP_TIME		4	/* we timed out */
+
+/* set the default timeout */
+#ifndef POP_TIMEOUT
+	#define POP_TIMEOUT 30
+#endif
+
+/* set our internal buffer size */
+#ifndef POP_BUFFER_SIZE
+	#define POP_BUFFER_SIZE 64
+#endif
+
+
+
+/*
+ * Our local vars
+ */
+typedef struct {
+	int            state;
+	int            (*pop_storemail)();
+	int            pop_delete;
+	char *         pop_username;
+	char *			pop_password;
+	longword       server_ip;
+	int				dns;				// Handle for nameserver resolve
+	word				port;				// POP3 server port number (defaults to POP_PORT)
+	unsigned long  pop_timeout;
+#if POP_AUTH_TLS
+   ssl_Socket * pop_n_ssl;			// This is same as above.
+   SSL_Cert_t __far * pop_cert; 		// Pointer to the certificate structure
+#endif
+	tcp_Socket     pop_sock;
+	void *			pop_s /*= &pop_sock*/ ;
+	int            pop_retval;
+	char           pop_line[512]; /* line of data read from the socket */
+	char           pop_tok[16]; /* mail id number */
+	int            pop_msgnum;
+	int				pop_msgcount;
+#ifdef POP_PARSE_EXTRA
+	char           pop_to[POP_BUFFER_SIZE];
+	char           pop_from[POP_BUFFER_SIZE];
+	char           pop_subject[POP_BUFFER_SIZE];
+	int            pop_body;
+	int            pop_datasent;
+#endif
+	word				capa_flags;		// Capability (CAPA) flags as follows:
+#define POP_CAPA_STLS	0x0001		// STLS (start TLS) supported
+#define POP_CAPA_PIPE	0x0002		// PIPELINING supported
+#define POP_CAPA_TOP		0x0004		// TOP extension supported
+#define POP_TLS_TUNNEL	0x4000		// This flag set if TLS tunneling (port 995)
+#define POP_CAPA_ERR		0x8000		// This flag set (an no others) if CAPA
+												//  command got -ERR from server.
+#if POP_AUTH_TLS
+	char		secured;					// If true, socket currently secured.
+	// Following fields set using pop_set_tls().  See that function for details.
+	word 		tls_flags;
+	SSL_Cert_t __far * my_cert;
+	SSL_Cert_t __far * trusted;
+	int (*policy)(ssl_Socket far * state,
+	                       int trusted,
+	                       struct x509_certificate far * cert,
+                          void __far * data);
+	word 		pop_flags;
+	#define POP_F_TLS_TUNNEL	0x0001
+	#define POP_F_TLS_CAPA		0x0002
+#endif
+	char server[POP_MAX_SERVERLEN];	// Server domain name (or dotted quad).
+} POPState;
+
+extern POPState pop_state;
+
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+pop3_init                            <POP3.LIB>
+
+SYNTAX: int pop3_init(int (*storemail)());
+
+KEYWORDS:		pop3, mail
+
+DESCRIPTION: 	This function will set the call-back where the incoming
+					e-mail will be passed to, and also initializes the
+					default server IP address to zero and the port to
+					POP_PORT.  It is OK to call this just once in a program,
+					before calling the other POP3 routines.
+
+PARAMETER1: 	A function pointer to the call-back function.
+
+RETURN VALUE:  0 on success, 1 on failure
+
+SEE ALSO:      pop3_init, pop3_getmail, pop3_tick
+
+END DESCRIPTION **********************************************************/
+int pop3_init(int (*storemail)());
+
+/* START FUNCTION DESCRIPTION ********************************************
+pop3_getmail                            <POP3.LIB>
+
+SYNTAX: int pop3_getmail(char *username, char *password, long server);
+
+KEYWORDS:		pop3, mail
+
+DESCRIPTION: 	This function will initiate a POP3 request to a remote
+					e-mail server. IMPORTANT NOTE - the buffers for 'username'
+					and 'password', as described below, must NOT change until
+					pop3_tick() returnes something besides POP_PENDING. These
+					values are not saved internally, and depend on the buffers
+					not changing.
+
+PARAMETER1: 	The username of the account to access.
+PARAMETER2:		The password of the account to access.
+PARAMETER3:		The IP address of the server to connect to, as returned
+					from the function resolve().
+
+RETURN VALUE:  0 on success, 1 on failure
+
+SEE ALSO:      pop3_init, pop3_getmail, pop3_tick
+
+END DESCRIPTION **********************************************************/
+int pop3_getmail(char *username, char *password, long server);
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+pop3_tick                            <POP3.LIB>
+
+SYNTAX: int pop3_tick(void);
+
+KEYWORDS:		pop3, mail
+
+DESCRIPTION: 	A standard tick function, to run the daemon. Continue to
+					call it as it returnes POP_PENDING.
+
+RETURN VALUE:  POP_PENDING	- Transfer is not done; call pop3_tick again.
+					POP_SUCCESS	- All e-mails were received successfully.
+					POP_ERROR   - Error opening socket
+					POP_TIME		- The session timed-out. Try it again, or use
+										POP_TIMEOUT to increase the timeout length.
+					negative    - Failed to DNS resolve server domain.  Return
+										code from resolve_name_start() etc.
+SEE ALSO:      pop3_init, pop3_getmail, pop3_tick
+
+END DESCRIPTION **********************************************************/
+int pop3_tick(void);
+
+
+/*** EndHeader */
+
+POPState pop_state;
+
+/*
+ * The states
+ */
+#define POP_INIT				0
+#define POP_RESOLVING		1
+#define POP_WAITCONNECT 	2
+#define POP_WAITWELCOME		3
+#define POP_USERNAME			4
+#define POP_WAITUSERNAME	5
+#define POP_PASSWORD			6
+#define POP_WAITPASSWORD	7
+#define POP_LIST				8
+#define POP_LIST1				9
+#define POP_LIST2				10
+#define POP_LIST3				11
+#define POP_RETR				12
+#define POP_RETR1				13
+#define POP_RETR2				14
+#define POP_DELE				15
+#define POP_WAITDELE			16
+#define POP_QUIT				22
+#define POP_WAITQUIT			23
+#define POP_CLOSE				24
+#define POP_WAITCLOSE		25
+
+#define POP_SENDCAPA			30
+#define POP_GETCAPA			31
+#define POP_READCAPA			32
+#define POP_WAITSTLSOK		33
+#define POP_STLS				34
+#define POP_WAITFORTLSESTAB 35
+/******************
+ * Helper functions
+ */
+
+#define POP_MSG_GOOD		1	// '+' in response code
+#define POP_MSG_BAD		2	// '-' in response code
+#define POP_MSG_ERROR	2	// Currently, bad and error are the same thing
+#define POP_MSG_PENDING	3	// Waiting for server response
+
+
+pop_debug
+int pop_getline(void) {
+	// Internal function: get next CRLF-delimited line.  Return >0 if OK (in which
+	// case pop_state.pop_line contains the line, with CRLF changed to null term).
+	// Returns 0 when pending, or -1 if error.  In latter case, state is also set
+	// to POP_CLOSE.
+	word delim;
+	int rc;
+
+   delim = DELIM_CRLF;
+   rc = sock_stringready(pop_state.pop_s, &delim, sizeof(pop_state.pop_line));
+   if (rc > 0) {
+      sock_gets(pop_state.pop_s, pop_state.pop_line, sizeof(pop_state.pop_line));
+#ifdef POP_VERBOSE
+		printf("POP: read '%s'\n", pop_state.pop_line);
+#endif
+   }
+   else if (rc < 0)
+		pop_state.state = POP_CLOSE;
+	return rc;
+}
+
+
+pop_debug
+int pop_getmessage(int new_state_if_good, int new_state_if_bad)
+{
+	int rc;
+
+	if((rc = pop_getline()) > 0) {
+		if(pop_state.pop_line[0] == '+') {
+			if (new_state_if_good)
+				pop_state.state = new_state_if_good;
+			return POP_MSG_GOOD;
+		}
+		//if(pop_state.pop_line[0] == '-')
+		//	return POP_MSG_BAD;
+		if (new_state_if_bad)
+			pop_state.state = new_state_if_bad;
+		return POP_MSG_BAD;
+	}
+	return POP_MSG_PENDING;
+}
+
+pop_debug
+void pop_msg(char *str, char *insert)
+{
+	auto char buf[128];
+	auto int length, offset;
+
+	offset = 0;
+	if (insert) {
+		/* insert into string (assumes str has a '%s' in it) */
+		sprintf(buf, str, insert);
+	} else {
+		strcpy(buf, str);
+	}
+
+#ifdef POP_VERBOSE
+	printf("POP_WRITE> '%s'\n", buf);
+#endif
+
+	strcat(buf, "\r\n");
+	length = strlen(buf);
+	while(offset < length) {
+		if (!tcp_tick(pop_state.pop_s))
+			return;
+		offset += sock_fastwrite(pop_state.pop_s, buf + offset, length - offset);
+	}
+	pop_state.pop_timeout = _SET_TIMEOUT(1000uL * POP_TIMEOUT);
+}
+
+/********************
+ * Main API functions
+ */
+
+pop_debug
+int pop3_init(int (*storemail)())
+{
+	pop_state.pop_storemail = storemail;
+	pop_state.server_ip = 0;
+	pop_state.port = POP_PORT;
+	return 0;
+}
+
+pop_debug
+int pop3_getmail(char *username, char *password, long server)
+{
+	pop_state.pop_username = username;
+	pop_state.pop_password = password;
+	if (server)
+		pop_state.server_ip = server;
+
+	pop_state.state = POP_INIT;
+	pop_state.pop_timeout = _SET_TIMEOUT(1000uL * POP_TIMEOUT);
+	pop_state.pop_retval = POP_ERROR;
+	pop_state.pop_msgnum = 0;
+
+	pop_state.capa_flags = 0;
+#if POP_AUTH_TLS
+	pop_state.secured = 0;
+#endif
+
+	return 0;
+}
+
+
+
+#if POP_AUTH_TLS
+int _pop_dflt_policy(ssl_Socket __far * state, int trusted,
+	                       struct x509_certificate __far * cert,
+                          void __far * data)
+{
+#ifdef POP_ALLOW_CERT_CN_MISMATCH
+	return 0;	// All sweetness and light
+#else
+	// Default is to reject if not matching CN.
+	return strcmp(cert->subject.cn, pop3_getserver());
+#endif
+}
+#endif
+
+
+
+pop_debug
+int pop3_tick(void)
+{
+	auto char *p;
+	auto int rc;
+	auto char* server;
+
+	tcp_tick(NULL);
+
+	/* did the socket die? */
+	if (pop_state.state >= POP_WAITCONNECT && !sock_alive(pop_state.pop_s)) {
+#ifdef POP_VERBOSE
+		printf("POP> Socket closed!\n");
+#endif
+		return pop_state.pop_retval;
+	}
+
+	/* timeout? */
+	if(_CHK_TIMEOUT(pop_state.pop_timeout)) {
+		/* we have timed out - return error */
+#ifdef POP_VERBOSE
+		printf("POP> TIMEOUT!\n");
+#endif
+		pop_state.pop_retval = POP_TIME;
+		pop_state.state = POP_CLOSE;
+		pop_state.pop_timeout = _SET_TIMEOUT(1000uL * POP_TIMEOUT);
+	}
+
+	/* the main state machine */
+	switch(pop_state.state) {
+	case POP_INIT:
+#ifdef POP_VERBOSE
+		printf("POP> Opening socket\n");
+#endif
+		pop_state.pop_s = &pop_state.pop_sock;
+      if (!pop_state.server_ip)
+      {
+         server = pop3_getserver();
+#ifdef POP_VERBOSE
+         printf("POP3: Resolving %s\n", server);
+#endif
+#ifdef DISABLE_DNS
+         pop_state.server_ip = resolve(server);
+         if (pop_state.server_ip == 0)
+#else
+         pop_state.dns = resolve_name_start(server);
+         if (pop_state.dns < 0)
+#endif
+         {
+			_pop_dnserror:
+#ifdef POP_VERBOSE
+            printf("POP3: Error resolving server (%x).\n", pop_state.dns);
+#endif
+            return pop_state.dns;
+         }
+#ifndef DISABLE_DNS
+         pop_state.state=POP_RESOLVING;
+#endif
+         break;
+      }
+	_pop_open:
+#ifdef POP_VERBOSE
+		printf("POP3: Opening IP=%08lX port=%u\n", pop_state.server_ip, pop_state.port);
+#endif
+		if (!tcp_extopen(pop_state.pop_s, POP_IFACE, 0,
+								pop_state.server_ip, pop_state.port,
+								NULL, 0, POP_AUTH_TLS ? -POP_TLS_RX_BUFFER_SIZE : 0)) {
+#ifdef POP_VERBOSE
+		 	printf("POP3: Error opening socket.\n");
+#endif
+			return POP_ERROR;
+		}
+		pop_state.state = POP_WAITCONNECT;
+		break;
+
+   case POP_RESOLVING:
+#ifndef DISABLE_DNS
+      if ((rc = resolve_name_check(pop_state.dns, &pop_state.server_ip)) ==
+         RESOLVE_SUCCESS)
+         goto _pop_open;
+      if (rc != RESOLVE_AGAIN)
+         goto _pop_dnserror;
+#endif
+      break;
+
+
+	case POP_WAITCONNECT:
+		if(sock_established(pop_state.pop_s)) {
+#ifdef POP_VERBOSE
+			printf("POP> Socket connected!\n");
+#endif
+			//sock_mode(pop_state.pop_s, TCP_MODE_ASCII); /* set mode to ASCII */
+			pop_state.state = POP_WAITWELCOME;
+#if POP_AUTH_TLS
+			if ((pop_state.pop_flags & POP_F_TLS_TUNNEL) ||
+			    !(pop_state.pop_flags & POP_F_TLS_CAPA) && pop_state.port == 995) {
+				// Want to use tunneled TLS mode.
+				pop_state.capa_flags |= POP_TLS_TUNNEL;
+				goto _starttls;
+			}
+#endif
+		}
+		break;
+
+	case POP_WAITWELCOME:
+		/* wait for welcome message */
+		pop_getmessage(POP_SENDCAPA, POP_CLOSE);
+		break;
+
+	case POP_SENDCAPA:
+		pop_msg("CAPA", NULL);
+		pop_state.state = POP_GETCAPA;
+		break;
+
+	case POP_GETCAPA:
+		pop_getmessage(POP_READCAPA, POP_USERNAME);
+		if (pop_state.state == POP_USERNAME)
+			// If server responded with -ERR, flag that this is unsupported.
+			// Proceed with username processing as usual.
+			pop_state.capa_flags = POP_CAPA_ERR;
+		break;
+
+	case POP_READCAPA:
+		if (pop_getline() > 0) {
+			if (!strncmp(pop_state.pop_line, "STLS", 4))
+				pop_state.capa_flags |= POP_CAPA_STLS;
+			else if (!strncmp(pop_state.pop_line, "PIPELINING", 10))
+				pop_state.capa_flags |= POP_CAPA_PIPE;
+			else if (!strncmp(pop_state.pop_line, "TOP", 3))
+				pop_state.capa_flags |= POP_CAPA_TOP;
+			else if (!strcmp(pop_state.pop_line, ".")) {
+				// End of CAPA list.
+				pop_state.state = POP_USERNAME;
+			#ifdef POP_AUTH_FAIL_IF_NO_AUTH
+				if (!pop_state.secured && !(pop_state.capa_flags & POP_CAPA_STLS))
+					pop_state.state = POP_CLOSE;
+			#endif
+			#if POP_AUTH_TLS
+				if (pop_state.capa_flags & POP_CAPA_STLS && !pop_state.secured) {
+					// OK, we have TLS and server supports it.  Start it up!
+#ifdef POP_VERBOSE
+					printf("POP> Using STLS...\n");
+#endif
+					pop_msg("STLS", NULL);
+					pop_state.state = POP_WAITSTLSOK;
+				}
+			#endif
+			}
+		}
+		break;
+
+#if POP_AUTH_TLS
+	case POP_WAITSTLSOK:
+		pop_getmessage(POP_STLS, POP_CLOSE);
+		if (pop_state.state == POP_STLS) {
+		_starttls:
+	         // OK, secure this socket and re-jig pointers so that server struct
+	         // points to secure socket rather than direct transport.
+	         // App data buffers are sized to be the same as the transport (TCP socket)
+	         // buffer sizes, and dynamically allocated.
+	         rc = sock_secure(_TCP_SOCK_OF_POP(pop_state), &pop_state.pop_n_ssl,
+#ifdef TLS_OLDBUF
+	                      pop_state.pop_sock.rd.maxlen, NULL, // Read buffer
+	                      pop_state.pop_sock.wr.maxlen, NULL, // Write buffer
+#else
+	                      TCP_BUF_SIZE*3>>2, NULL, // Read buffer (3/4)
+	                      TCP_BUF_SIZE>>2, NULL, // Write buffer (1/4)
+#endif
+	                      1,   // Is a client
+	                      pop_state.tls_flags,
+	                      0, 0, 0, 0,
+	                      pop_state.my_cert,
+	                      pop_state.trusted,
+	                      NULL          // No session to resume
+	                      );
+	         if (!rc) {
+	            pop_state.pop_s = pop_state.pop_n_ssl;
+	            if (pop_state.policy)
+						pop_state.pop_n_ssl->policy = pop_state.policy;
+					else
+						pop_state.pop_n_ssl->policy = _pop_dflt_policy;
+	         }
+	         else
+	            // Error securing socket, most likely because of malloc or other
+	            // resource failure.  Application is unlikely to expect, let alone
+	            // handle, this failure, so take safe path and exit.
+	            exit(rc);
+				pop_state.state = POP_WAITFORTLSESTAB;
+		}
+		break;
+
+   case POP_WAITFORTLSESTAB:
+      /*
+       *   Wait for the TLS connection to become established
+       */
+
+      if (sock_established(pop_state.pop_s))
+      {
+#ifdef POP_VERBOSE
+				printf("POP3: Secured with TLS\n");
+#endif
+			if (pop_state.capa_flags & POP_TLS_TUNNEL)
+				// We were using tunneling, so go back to start now.
+				pop_state.state = POP_WAITWELCOME;
+			else
+         	// Go back to CAPA test
+         	pop_state.state = POP_SENDCAPA;
+         // Indicate secured, but zero out other knowledge we obtained...
+         pop_state.secured = 1;
+         pop_state.capa_flags = 0;
+      }
+      break;
+
+#endif
+	case POP_USERNAME:
+		pop_msg("USER %s", pop_state.pop_username);
+		pop_state.state = POP_WAITUSERNAME;
+		break;
+
+	case POP_WAITUSERNAME:
+		pop_getmessage(POP_PASSWORD, POP_CLOSE);
+		break;
+
+	case POP_PASSWORD:
+		pop_msg("PASS %s", pop_state.pop_password);
+		pop_state.state = POP_WAITPASSWORD;
+		break;
+
+	case POP_WAITPASSWORD:
+		pop_getmessage(POP_LIST, POP_CLOSE);
+		break;
+
+	case POP_LIST:
+		pop_msg("LIST", NULL);
+		pop_state.state = POP_LIST1;
+		pop_state.pop_msgcount = pop_state.pop_msgnum;
+		break;
+
+	case POP_LIST1:
+		pop_getmessage(POP_LIST2, POP_CLOSE);
+		break;
+
+	case POP_LIST2:
+		if (pop_getline() > 0) {
+
+#ifdef POP_NODELETE
+			/* remove the lines we have already parsed */
+			if(pop_state.pop_msgcount > 0) {
+				pop_state.pop_msgcount -= 1;
+				break;
+			}
+#endif
+
+			if (pop_state.pop_line[0] == '.' && !pop_state.pop_line[1]) {
+				/* no more messages */
+#ifdef POP_VERBOSE
+				printf("POP> No more messages\n");
+#endif
+				pop_state.state = POP_QUIT;
+				break;
+			} else {
+				/* first token in pop_line[] has the next message number */
+				if(NULL == (p = _n_strtok(pop_state.pop_line, " "))) {
+					pop_state.state = POP_CLOSE;
+					break;
+				}
+
+				strcpy(pop_state.pop_tok, p);
+#ifdef POP_VERBOSE
+				printf("POP> Next mail is: '%s'\n", pop_state.pop_tok);
+#endif
+				pop_state.state = POP_LIST3;
+			}
+		}
+		break;
+
+	case POP_LIST3:
+		if (pop_getline() > 0) {
+			if (pop_state.pop_line[0] == '.' && pop_state.pop_line[1] != '.') {
+				/* received the entire list */
+				pop_state.state = POP_RETR;
+			}
+		}
+		break;
+
+	case POP_RETR:
+		/* get the message */
+		pop_state.pop_msgnum += 1; /* increment how many messages we have seen */
+#ifdef POP_PARSE_EXTRA
+		pop_state.pop_body = 0;
+		pop_state.pop_datasent = 0;
+		pop_state.pop_to[0] = '\0';
+		pop_state.pop_from[0] = '\0';
+		pop_state.pop_subject[0] = '\0';
+#endif
+
+		pop_msg("RETR %s", pop_state.pop_tok);
+		pop_state.state = POP_RETR1;
+		break;
+
+	case POP_RETR1:
+		pop_getmessage(POP_RETR2, POP_CLOSE);
+		break;
+
+	case POP_RETR2:
+		if (pop_getline()) {
+			if (pop_state.pop_line[0] == '.' && pop_state.pop_line[1] != '.') {
+				/* all done */
+
+#ifdef POP_PARSE_EXTRA
+				if(0 == pop_state.pop_datasent) {
+					/* never sent a line to the user - send one now, so they get the headers */
+					pop_state.pop_line[0] = '\0';
+					pop_state.pop_storemail(pop_state.pop_msgnum,
+									pop_state.pop_to,
+									pop_state.pop_from,
+									pop_state.pop_subject,
+									pop_state.pop_line,
+									strlen(pop_state.pop_line));
+				}
+#endif
+
+#ifdef POP_NODELETE
+				pop_state.state = POP_LIST;
+#else
+				pop_state.state = POP_DELE;
+#endif
+				break;
+			}
+
+			/* store the line to the user */
+#ifdef POP_PARSE_EXTRA
+			if(pop_state.pop_body) {
+				/* send the body line to the user */
+				pop_state.pop_storemail(pop_state.pop_msgnum,
+									pop_state.pop_to,
+									pop_state.pop_from,
+									pop_state.pop_subject,
+									pop_state.pop_line,
+									strlen(pop_state.pop_line));
+				pop_state.pop_datasent = 1;
+			} else {
+				/* are we done with the header? */
+				if (!pop_state.pop_line[0]) {
+					/* last line in header */
+					pop_state.pop_body = 1;
+				} else {
+					if (!strncmp(pop_state.pop_line, "From: ", 6)) {
+						strncpy(pop_state.pop_from, pop_state.pop_line + 6, POP_BUFFER_SIZE - 6);
+						pop_state.pop_from[POP_BUFFER_SIZE - 1] = '\0';
+					}
+					if (!strncmp(pop_state.pop_line, "To: ", 4)) {
+						strncpy(pop_state.pop_to, pop_state.pop_line + 4, POP_BUFFER_SIZE - 4);
+						pop_state.pop_to[POP_BUFFER_SIZE - 1] = '\0';
+					}
+					if (!strncmp(pop_state.pop_line, "Subject: ", 9)) {
+						strncpy(pop_state.pop_subject, pop_state.pop_line + 9, POP_BUFFER_SIZE - 9);
+						pop_state.pop_subject[POP_BUFFER_SIZE - 1] = '\0';
+					}
+				}
+			}
+#else
+			pop_state.pop_storemail(pop_state.pop_msgnum,
+										pop_state.pop_line,
+										strlen(pop_state.pop_line));
+#endif
+		}
+		break;
+
+#ifndef POP_NODELETE
+	case POP_DELE:
+		/* remove current message */
+		pop_msg("DELE %s", pop_state.pop_tok);
+		pop_state.state = POP_WAITDELE;
+		break;
+
+	case POP_WAITDELE:
+		pop_getmessage(POP_LIST, POP_CLOSE);
+		break;
+#endif /* NODELETE */
+
+	case POP_QUIT:
+		pop_msg("QUIT", NULL);
+		pop_state.pop_retval = POP_SUCCESS;
+		pop_state.state = POP_WAITQUIT;
+		break;
+
+	case POP_WAITQUIT:
+		pop_getmessage(POP_CLOSE, POP_CLOSE);
+		break;
+
+	case POP_CLOSE:
+#if POP_AUTH_TLS
+      if (pop_state.secured) {
+#ifdef POP_VERBOSE
+         printf("POP3: Shutting down TLS\n");
+#endif
+         sock_unsecure(pop_state.pop_n_ssl);
+         pop_state.secured = 0;
+         pop_state.pop_s = &pop_state.pop_sock;
+      }
+#endif
+		sock_close(pop_state.pop_s);
+		pop_state.state = POP_WAITCLOSE;
+		break;
+
+	case POP_WAITCLOSE:
+		// Test at top of code will terminate process when sock no longer active.
+		break;
+
+	}
+
+	return POP_PENDING;
+}
+
+
+/*** BeginHeader pop3_setserver */
+
+/* START FUNCTION DESCRIPTION ********************************************
+pop3_setserver          		<POP3.LIB>
+
+SYNTAX: int pop3_setserver(char* server);
+
+DESCRIPTION: 	Sets the POP3 server.  This value overrides POP_SERVER.
+               If you called pop_setserver_ip() before, the IP address
+               specified by that function is forgotten.
+
+PARAMETER1:	   Server name string.  This is copied into the POP3 state
+               structure.  This name is not resolved to an IP address
+               until you start calling pop3_tick().
+
+RETURN VALUE: 	0         - server name was set successfully
+					-1			 - the server name was too long
+
+END DESCRIPTION **********************************************************/
+
+int pop3_setserver(char* server);
+/*** EndHeader */
+
+pop_debug
+int pop3_setserver(char* server)
+{
+	if (strlen(server) < POP_MAX_SERVERLEN) {
+		strcpy(pop_state.server, server);
+		pop_state.server_ip = 0;
+		return 0;
+	}
+	else
+		return -1;
+}
+
+
+/*** BeginHeader pop3_getserver */
+
+/* START FUNCTION DESCRIPTION ********************************************
+pop3_getserver          		<POP3.LIB>
+
+SYNTAX: char * pop3_getserver();
+
+DESCRIPTION: 	Get the server domain name as set by pop3_setserver() or
+               POP_SERVER macro.
+
+RETURN VALUE:  Server name string
+
+SEE ALSO: 	pop3_setserver
+
+END DESCRIPTION **********************************************************/
+
+char * pop3_getserver();
+/*** EndHeader */
+
+pop_debug
+char * pop3_getserver()
+{
+	return pop_state.server[0] ? pop_state.server : POP_SERVER;
+}
+
+
+/*** BeginHeader pop3_setport */
+
+/* START FUNCTION DESCRIPTION ********************************************
+pop3_setport          		<POP3.LIB>
+
+SYNTAX: int pop3_setport(word port);
+
+DESCRIPTION: 	Sets the POP3 server port.  This value overrides POP_PORT.
+               Setting a different port number is important if using
+               normal POP (port 110) mixed with secure POP (which generally
+               uses non-standard port numbers).
+
+PARAMETER1:	   TCP well-known port number of POP3 server.  If set to zero,
+               then the default defined by the POP_PORT macro will be
+               used.
+
+RETURN VALUE: 	0
+
+SEE ALSO: 	pop3_setserver
+
+END DESCRIPTION **********************************************************/
+
+int pop3_setport(word port);
+/*** EndHeader */
+
+pop_debug
+int pop3_setport(word port)
+{
+	pop_state.port = port;
+}
+
+/*** BeginHeader pop3_setserver_ip */
+
+/* START FUNCTION DESCRIPTION ********************************************
+pop3_setserver_ip          		<POP3.LIB>
+
+SYNTAX: int pop3_setserver_ip(longword server);
+
+DESCRIPTION: 	Sets the POP3 server.  This value overrides the value set
+               by pop3_setserver, and is used when the IP address of the
+               mail server is known.
+
+PARAMETER1:	   Server IP address.
+
+RETURN VALUE: 	0          - server IP was set successfully
+
+END DESCRIPTION **********************************************************/
+
+int pop3_setserver_ip(longword server);
+/*** EndHeader */
+
+pop_debug
+int pop3_setserver_ip(longword server)
+{
+	pop_state.server_ip = server;
+	return 0;
+}
+
+
+
+/*** BeginHeader pop3_set_tls */
+
+/* START FUNCTION DESCRIPTION ********************************************
+pop3_set_tls          		<POP3.LIB>
+
+SYNTAX: int pop3_set_tls(word flags,
+					SSL_Cert_t far * my_cert,
+	 				SSL_Cert_t far * trusted,
+	 				int (*policy)(),
+	 				word pop_flags);
+
+DESCRIPTION:	Set various options for POP3 over TLS.  See RFC 2595 for
+               details of the protocol used, plus the Dynamic C documentation
+               for the sock_secure() function.  The sample code
+               	samples/tcpip/pop3/pop_tls.c
+               shows an example of use.
+
+               This function is only available if you first #use "ssl_sock.lib"
+               before #use this library.  It is highly advisable to
+                 #define POP_AUTH_FAIL_IF_NO_AUTH
+               otherwise mail will be sent in cleartext with no authentication
+               if the server does not offer TLS.
+
+               The options provided here are basically passed to sock_secure()
+               when the POP3 session performs the STLS command.
+
+               NOTE: this function only copies the pointers, not the objects
+               to which they refer.  Thus, the application should be careful
+               not to modify or delete the relevant objects.  The application
+               is responsible for all certificate management.
+
+               NOTE: settings provided by this function persist over multiple
+               calls to pop_getmail() etc.
+
+PARAMETER 1: flags:
+				 A bitwise combination of the following flags:
+               SSL_F_REQUIRE_CERT  Require certificate from peer.
+               SSL_F_PEER_CERT_OK  Pretend all certs are valid.  This is mainly
+                         for debugging.
+               SSL_F_NO_RESUME     Set to not attempt session resumption.
+               SSL_S_ALLOW_NULL    Permit NULL bulk encryption suites.  This
+											  allows eavesdropping, but still requires
+											  strong authentication and message integrity.
+					SSL_S_FORBID_RC4    Do not permit RC4 stream cipher (force AES)
+					SSL_S_FORBID_MD5    Do not permit MD5-based hash (force SHA-1)
+PARAMETER 2:my_cert:
+				 If not NULL, is a parsed certificate including private key
+				 information.  This certificate will be presented to the server
+				 if requested.  This is not normally required, since most publicly
+				 accessible POP3 servers will use account details provided by
+				 USER/PASS rather than a client certificate provided by this
+				 function.
+PARAMETER 3:trusted:
+				 Pre-parsed certificate chain representing the list of trusted
+				 authorities.  This is required if server authentication is
+				 required by the application.  If the application is intended to
+				 work with a single POP3 server, then it is sufficient to provide
+				 the server's certificate only.  Otherwise, it may be necessary
+				 to provide a relatively long list of CA certificates, or allow
+				 CA certificates to be provided at run-time.
+PARAMETER 4:policy
+				 Callback function which is called by this library when a server
+				 certificate is provided.  Prototype of such a callback must be:
+					int pop_server_policy(
+									ssl_Socket far * state,
+	                       	int trusted,
+	                       	struct x509_certificate far * cert
+										);
+				 Pass NULL to remove this callback.  If not NULL, this callback
+				 is called if and only if the SSL_F_REQUIRE_CERT flag is set,
+				 after a valid certificate is available.  If trusted is false, then
+				 no trusted CA list was specified. If there is a trusted CA list,
+				 but the certificate could not be validated, then this function
+				 will not be called since this always causes an error.
+             Function should return 0 to proceed (allow) or non-zero to
+             disallow. In the latter case, an access_denied alert will be sent
+             to the peer.
+             cert parameter is the peer certificate.  This has several fields
+             (see X509.lib) which indicate the subject and issuer etc.  Most
+             useful field is cert->subject which points to a struct containing
+             ascii representations of the various certificate subject name
+             fields.  Function may call x509_name_string() to get a formatted
+             subject name e.g. for messages.
+
+             NOTE: the policy callback prototype is identical to that for
+             the SMTP server (if used), and often the same function can
+             be used for both, if that function accepts the domain name
+             of either the SMTP or the POP3 server.
+PARAMETER 5:pop_flags
+				 Flags specific to use of TLS with POP3:
+				   POP_F_TLS_TUNNEL	0x0001
+				   	This forces tunneling mode i.e. the entire session is
+				   	secured with TLS.  This is normally used with port 995.
+				   POP_F_TLS_CAPA		0x0002
+				   	This forces ordinary POP, with negotiation of use of
+				   	TLS via the CAPA command (which returns STLS as a
+				   	capability).  This is used with port 110 (normally
+				   	plaintext POP).
+				   -- if neither of the above flags are set, then tunneled
+				   TLS is used only if the port is 995.  Don't set both flags.
+
+RETURN VALUE: 	0
+
+END DESCRIPTION **********************************************************/
+
+#if POP_AUTH_TLS
+int pop3_set_tls(
+					word flags,
+					SSL_Cert_t __far * my_cert,
+	 				SSL_Cert_t __far * trusted,
+	 				int (*policy)( /* ssl_Socket far * state,
+	                       int trusted,
+	                       struct x509_certificate far * cert */ ),
+	 				word pop_flags
+					);
+#endif
+/*** EndHeader */
+
+pop_debug
+int pop3_set_tls(
+					word flags,
+					SSL_Cert_t __far * my_cert,
+	 				SSL_Cert_t __far * trusted,
+	 				int (*policy)( /* ssl_Socket far * state,
+	                       int trusted,
+	                       struct x509_certificate far * cert */ ),
+	 				word pop_flags
+					)
+{
+	pop_state.tls_flags = flags;
+	pop_state.my_cert = my_cert;
+	pop_state.trusted = trusted;
+	pop_state.policy = policy;
+	pop_state.pop_flags = pop_flags;
+	return 0;
+}
+
+
+
+/*** BeginHeader */
+#endif /*__POP3_LIB*/
+/*** EndHeader */

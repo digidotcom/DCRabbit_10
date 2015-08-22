@@ -1,0 +1,437 @@
+/*** BeginHeader  ********************************************/
+#include <time.h>
+#ifndef __RTCLOCK_LIB
+#define __RTCLOCK_LIB
+/*** EndHeader ***********************************************/
+
+/* START LIBRARY DESCRIPTION *********************************************
+RTCLOCK.LIB
+Copyright (c) 2006 Rabbit Semiconductor Inc.
+
+DESCRIPTION: Library for real-time clock drivers on Rabbit processor.
+
+void write_rtc( time_t time); 				// writes seconds to RTC
+time_t read_rtc(void);							// reads seconds from RTC
+unsigned int mktm(struct tm *timeptr, time_t time); // secs to structure
+int tm_wr(struct tm *t);						// writes tm struct to RTC
+int tm_rd(struct tm *t);						// reads tm struct from SEC_TIMER NOT
+														// from RTC, see function description)
+
+
+The format of the tm structure used is:
+
+struct tm
+{
+	char tm_sec;             // seconds 0-59
+	char tm_min;             // 0-59
+	char tm_hour;            // 0-59
+	char tm_mday;            // 1-31
+	char tm_mon;             // 1-12
+	char tm_year;            // 80-147	(1980-2047)
+	char tm_wday;            // 0-6 0==sunday
+};
+
+
+Note: UTC versus local time.
+----------------------------
+
+Prior to 8.05, it was assumed that the RTC was set to "local time".  This is
+still the case by default.  If, however, the macro RTC_IS_UTC is defined,
+then the library assumes the RTC is set to co-ordinated universal time (UTC)
+a.k.a "GMT".
+
+This does not have much relevance to the basic RTC library routines, however
+some of the TCP/IP servers (such as HTTP) need to make the distinction in
+order to correctly report the server's time to the client.
+
+Whether or not RTC_IS_UTC is defined, the symbol TIMEZONE may be defined
+to a floating point (but usually integer) value representing hours east of
+Greenwich of the local time zone.  If not defined, then the difference is
+assumed to be zero.  Otherwise, the given value is used as a default time
+zone difference by the library routines which need to make a distinction.
+[None of the functions in RTCLOCK.LIB make use of RTC_IS_UTC.  The
+distinction is only important to libraries which need to communicate with
+external users with unambiguous representation of date/time.]
+
+If defined, it is recommended that TIMEZONE be defined to the name of a
+floating point _variable_ which will make it easier to adjust the timezone
+twice per year to account for daylight saving time -- without recompiling
+the firmware.
+
+The function rtc_timezone() is a new function which should be used
+consistently to obtain the current timezone offset.
+
+In addition to the timezone offset (in seconds), this function can
+optionally return a timezone name of between 0 and 6 characters, as
+defined by the TZNAME macro.  TZNAME should either be defined to an
+ascii string, or not defined at all.  As with TIMEZONE, this macro should
+be defined to be the name of a string (char[]) variable so that the
+timezone name can be updated programatically.
+
+END DESCRIPTION **********************************************************/
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+write_rtc                       <RTCLOCK.LIB>
+
+SYNTAX: void write_rtc( time_t time);
+
+KEYWORDS: Real-time clock
+
+DESCRIPTION: Writes a 32 bit seconds value to the RTC, zeros other bits. This
+function does not stop or delay periodic interrupt. This function does not
+affect the SEC_TIMER or MS_TIMER variables.
+
+PARAMETER1:	unsigned long int representing the number of seconds since
+January 1, 1980.
+
+RETURN VALUE: none
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader write_rtc */
+void write_rtc(time_t time);
+/*** EndHeader */
+
+__nodebug
+void write_rtc(time_t time)
+{
+	auto char k,b1,b2,b3,b4,b5; // the bytes of the clock
+	auto int j;
+
+	b5=(char)((time & 0xFE000000)>>25);
+	b4=(char)((time & 0x01FE0000)>>17);
+	b3=(char)((time & 0x0001FE00)>>9);
+	b2=(char)((time & 0x000001FE)>>1);
+	b1=(char)((time & 0x00000001)<<7);
+
+	WrPortI(RTCCR,NULL,0x40); // arm real time clock
+	WrPortI(RTCCR,NULL,0xc0); // enter byte increment mode
+	for(j=0; j<257; j++) {
+		k=0x40;
+		if(b5) {k=k+32; --b5;}
+		if(b4) {k=k+16; --b4;}
+		if(b3) {k=k+8; --b3;}
+		if(b2) {k=k+4; --b2;}
+		if(b1) {k=k+2; --b1;}
+		if(k != 0x040)
+			WrPortI(RTCCR,NULL,k); // dec. bytes, increment counters
+		else
+		{
+			WrPortI(RTCCR,NULL,0);
+			return;
+		} // end byte increment mode
+  	}
+}
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+read_rtc                       <RTCLOCK.LIB>
+
+SYNTAX: time_t read_rtc(void);
+
+KEYWORDS: Real-time clock
+
+DESCRIPTION: Reads seconds (32-bits) directly from RTC - use with caution!
+In most cases use long variable SEC_TIMER which contains same result,
+unless the RTC has been changed since the start of the program.
+
+RETURN VALUE: Time in seconds since January 1, 1980 (if RTC set correctly).
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader read_rtc */
+time_t read_rtc(void);
+/*** EndHeader */
+
+__nodebug
+time_t read_rtc(void)
+{
+#asm xmemok
+; Returns unsigned long with seconds since January 1, 1980 directly from RTC.
+; Reads RTC until back-to-back reads are identical since it's possible to latch
+; the RTC in mid-ripple and get a bad value.  It's safe to use 0xFFFFFFFF
+; as the fake first "read", since an actual read of 0xFFFFFFFF can't possibly
+; be rippling.  If our first real read is 0xFFFFFFFF, that is the actual time.
+
+		ld		bcde, -1		; fake first "read" is all 1's
+.read_rtc0:
+		ex		jkhl, bcde	; copy previous read to JKHL
+
+ioi	ld (RTC0R), a  	; latch RTC to holding registers
+ioi	ld a, (RTC1R) 		; top bit is bit 0 of seconds
+ioi	ld bcde, (RTC2R)	; bits 1 to 31 of seconds
+
+		rla					; get top bit of A (bit 0 of seconds) into CF
+		rl		1, bcde		; bcde now has seconds from RTC
+
+		cp		jkhl, bcde	; make sure the two reads are identical
+		jr		nz, .read_rtc0
+		; RTC seconds returned in BCDE
+#endasm
+}
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+read_rtc_32kHz                  <RTCLOCK.LIB>
+
+SYNTAX: time_t read_rtc_32kHz(void);
+
+KEYWORDS: Real-time clock
+
+DESCRIPTION:  This is a deprecated function, use read_rtc instead.
+Reads the real-time clock directly when the Rabbit processor is running
+off the 32kHz oscillator.  See read_rtc() for more details.
+
+RETURN VALUE: Time in seconds since January 1, 1980 (if RTC set correctly).
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader read_rtc_32kHz */
+time_t read_rtc_32kHz(void);
+/*** EndHeader */
+#warnt "read_rtc_32kHz() has been deprecated, please use read_rtc() instead."
+__nodebug
+time_t read_rtc_32kHz(void)
+{
+	return read_rtc();
+}
+
+
+/*** BeginHeader _mktm_date */
+void _mktm_date(struct tm *timeptr, unsigned int day);
+#define _mktm_date( timeptr, day)	_gmtime( timeptr, (day) * 86400UL)
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_mktm_date                       <RTCLOCK.LIB>
+
+SYNTAX: void _mktm_date(struct tm *timeptr, unsigned int day)
+
+KEYWORDS: Real-time clock
+
+DESCRIPTION: Converts days into the month, day and year into timeptr.
+
+PARAMETER1: Address of tm struct to store month, day, year and day of week.
+PARAMETER2: Number of days since January 1, 1980.
+
+RETURN VALUE: None
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void (_mktm_date)(struct tm *timeptr, unsigned int day)
+{
+	_gmtime( timeptr, day * 86400UL);
+}
+
+/*** Beginheader mktm  */
+unsigned int mktm(struct tm __far *timeptr, time_t time);
+/*** Endheader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+mktm                       <RTCLOCK.LIB>
+
+SYNTAX: unsigned int mktm(struct tm far *timeptr, time_t time)
+
+KEYWORDS: Real-time clock
+
+DESCRIPTION: Converts the seconds to date and time.
+
+PARAMETER1: Address of tm struct to store date and time.
+PARAMETER2: Seconds since January 1, 1980.
+
+RETURN VALUE: Zero.
+
+NOTE: See the function help for mktime() for a description of struct tm.
+
+SEE ALSO:	gmtime, localtime
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+unsigned int mktm(struct tm __far *timeptr, time_t time)
+{
+	_f_gmtime( timeptr, time);
+
+	return 0;
+}
+
+
+/*** BeginHeader tm_wr  */
+int tm_wr(struct tm *t);
+/*** EndHeader  */
+
+/* START FUNCTION DESCRIPTION ********************************************
+tm_wr                        <RTCLOCK.LIB>
+
+SYNTAX: int tm_wr(struct tm *t);
+
+KEYWORDS: Real-time clock
+
+DESCRIPTION: Sets the system time from a tm struct. It is important to note
+that although tm_rd() reads the SEC_TIMER variable, not the RTC, tm_wr()
+writes to the RTC directly, and SEC_TIMER is not changed until the program
+is restarted. The reason for this is so that the DelaySec() function
+continues to work correctly after setting the system time. To make tm_rd()
+match the new time written to the RTC without restarting the program, the
+following should be done:
+
+	tm_wr(tm);
+	SEC_TIMER = mktime(tm);
+
+But this could cause problems if a waitfor(DelaySec(n)) is pending
+completion in a cooperative multitasking program or if the SEC_TIMER
+variable is being used in another way the user, so user beware.
+
+PARAMETER1:	tm struct to read date and time from.
+
+RETURN VALUE: 0 if successful.
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int tm_wr(struct tm *t)
+{
+	// convert struct tm to seconds since 1980 and write to RTC
+	write_rtc( mktime( t));
+
+	return 0;
+}
+
+
+/*** BeginHeader tm_rd */
+int tm_rd(struct tm *t);
+/*** Endheader    */
+
+/* START FUNCTION DESCRIPTION ********************************************
+tm_rd                        <RTCLOCK.LIB>
+
+SYNTAX: int tm_rd(struct tm *t);
+
+KEYWORDS: Real-time clock
+
+DESCRIPTION: Reads the current system time from virtual driver variable
+SEC_TIMER into the structure t.
+
+PARAMETER1: Address of tm struct save date and time in.
+
+WARNING:	The variable SEC_TIMER is initialized when a program is first
+started.  If you change the RTC, this variable will not be updated until
+you restart a program, and the tm_rd function will not return the time
+that the RTC has been reset to.  The read_rtc function will read the
+actual RTC and can be used if necessary.
+
+RETURN VALUE: 0 if successful.
+
+SEE ALSO:	read_rtc
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int tm_rd(struct tm *t)
+{
+	_gmtime( t, SEC_TIMER);
+	return 0;
+}
+
+/*** BeginHeader rtc_timezone */
+int rtc_timezone(long * seconds, char * tzname);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+rtc_timezone                       <RTCLOCK.LIB>
+
+SYNTAX: int rtc_timezone(long * seconds, char * tzname);
+
+KEYWORDS:		Real-time clock
+
+DESCRIPTION: 	This function returns the timezone offset as known by the
+               library.
+
+               The timezone is obtained from the following sources, in
+               order of preference:
+
+               1. The DHCP server.  This can only be used if the TCP/IP
+               stack is in use, and USE_DHCP is defined.
+
+               2. The TIMEZONE macro.  This should be defined by the
+               program to an _hour_ offset - may be floating point.
+
+PARAMETER1:    Pointer to result longword.  This will be set to the number
+               of seconds offset from Coordinated Universal Time (UTC).
+               The value will be negative for west; positive for east of
+               Greenwich.
+PARAMETER2:    If NULL, no timezone name is returned.  Otherwise, this
+               must point to a buffer of at least 7 bytes.  The buffer
+               is set to a null-terminated string of between 0 and 6
+               characters in length, according to the value of the
+               TZNAME macro.  If TZNAME is not defined, then the returned
+               string is zero length ("").
+
+RETURN VALUE:  0 - timezone obtained from DHCP.
+               -1 - timezone obtained from TIMEZONE macro.  The value of
+                   this macro (which may be int, float or a variable name)
+                   is multiplied by 3600 to form the return value.
+       			-2 - timezone is zero since the TIMEZONE macro was not
+                   defined.
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int rtc_timezone(long * seconds, char * tzname)
+{
+	// Currently, timezone name is only obtainable from the TZNAME macro.
+   // Future implementations may be able to get this from a server etc.
+	if (tzname)
+#ifdef TZNAME
+   	strcpy(tzname, TZNAME);
+#else
+  		*tzname = 0;
+#endif
+#ifdef USE_DHCP
+	return dhcp_get_timezone(seconds);
+#else
+	#ifdef TIMEZONE
+	   *seconds = (long)((TIMEZONE) * 3600L);
+	   return -1;
+	#else
+	   *seconds = 0;
+	   return -2;
+	#endif
+#endif
+}
+
+/*** BeginHeader tm_setMDY */
+void tm_setMDY( struct tm *tm, int month, int day, int year);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+tm_setMDY                                                  <RTCLOCK.LIB>
+
+SYNTAX:	void tm_setMDY( struct tm *tm, int month, int day, int year)
+
+DESCRIPTION:	Helper function for setting the month, day and year members of
+					a struct tm.
+
+					Automatically adjusts the tm_mon member for ANSI standard
+					struct tm (0 to 11) or legacy Dynamic C struct tm (1 to 12).
+
+PARAMETER 1:	Time object to set.
+
+PARAMETER 2:	Month to set (1 = January to 12 = December)
+
+PARAMETER 3:	Day to set.
+
+PARAMETER 4:	Year to set (1900 to 2100)
+
+RETURN VALUE:	None
+
+SEE ALSO:	macros tm_mon2month and month2tm_mon
+
+END DESCRIPTION **********************************************************/
+__nodebug
+void tm_setMDY( struct tm *tm, int month, int day, int year)
+{
+	tm->tm_mday = day;
+	tm->tm_year = year - 1900;
+	tm->tm_mon = month2tm_mon(month);
+}
+
+// missing endif
+/*** BeginHeader  ********************************************/
+#endif
+/*** EndHeader ***********************************************/

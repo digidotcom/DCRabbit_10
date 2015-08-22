@@ -1,0 +1,412 @@
+/*************************************************************************
+QD.lib
+Rabbit Semiconductor, 2002
+
+API functions for some of the R3000 peripherals
+Quadrature Decoding:
+	qd_init
+	qd_zero
+	qd_read
+	qd_error
+
+	Rev 1.0	CK		Initial release.
+
+	Rev 1.1	EK		Added conditional 10 bit quadrature decoder capabiltiy
+   					for the R3000A microprocessor. To enable this feature
+                  add the following at the top of the application program.
+
+                  #define QD_10BIT_OPERATION
+
+   Rev 1.2  EK    Fixed possible incorrect overflow condition on channel 1
+                  of the quadrature decoder.
+
+   Rev 1.3	MS		Split QD API from R3000.lib to QD.lib. Added Support for
+   					the Rabbit 4000.
+
+*************************************************************************/
+
+/*** BeginHeader */
+#ifndef __QD_LIB__
+#define __QD_LIB__
+
+//divisor for sampling speed
+#define QD_DIVISOR 255
+
+#define QD_OVERFLOW 0x01
+#define QD_UNDERFLOW 0x02
+
+/*** EndHeader */
+
+/*** BeginHeader qd_init */
+__nodebug void qd_init(int iplevel);
+__xmem void qd_isrinit();
+__root void qd_isr();
+
+extern long qd_count[];
+extern char qd_errorflags[];
+extern char qd_isrflag;
+extern int  qd_10bit_enable;
+
+/*** EndHeader */
+
+long qd_count[2];
+char qd_errorflags[2];
+char qd_isrflag;
+int  qd_10bit_enable;
+
+#ifdef QD_10BIT_OPERATION
+#define QD_10BIT_COUNTER 1
+#else
+#define QD_10BIT_COUNTER 0
+#endif
+
+	#ifdef QD1_USEPORTD
+	#define QD1_USEPORT 0x04
+	#endif
+	#ifdef QD1_USEPORTEL
+	#define QD1_USEPORT 0x08
+	#endif
+	#ifdef QD1_USEPORTEH
+	#define QD1_USEPORT 0x0C
+	#endif
+
+   #ifndef QD1_USEPORT
+   #define QD1_USEPORT 0x00	// DEFAULT = Disabled
+   #endif
+
+	#ifdef QD2_USEPORTD
+	#define QD2_USEPORT 0x40
+	#endif
+	#ifdef QD2_USEPORTEL
+	#define QD2_USEPORT 0x80
+	#endif
+	#ifdef QD2_USEPORTEH
+	#define QD2_USEPORT 0xC0
+	#endif
+
+   #ifndef QD2_USEPORT
+   #define QD2_USEPORT 0x00	// DEFAULT = Disabled
+   #endif
+
+   #define QD_USEPORT (QD1_USEPORT | QD2_USEPORT)
+
+/* START FUNCTION DESCRIPTION ********************************************
+qd_init                   <QD.LIB>
+
+SYNTAX:		   void qd_init(int iplevel);
+
+DESCRIPTION:   Initializes the quadrature decoders and sets up the ISR.
+					This must be called before any other QD functions are used.
+					Sets up the lower nibble of port F to be the QD input pins.
+
+               Note:
+               -----
+               If your board has a Rabbit 3000A microprocessor installed, the
+               quadrature decoder can be set for 10 bit counter operation. For
+               10 bit operation, add the following macro at the top of your
+               application program.
+
+               #define QD_10BIT_OPERATION
+
+               If above macro is not defined then the quadrature decoder
+               defaults to 8 bit counter operation.
+
+               If your board has a Rabbit 3000 microprocessor, the quadrature
+               decoder inputs can be selected with the following macros:
+
+               #define QD1_USEPORTFL    // QD1 uses PF1 & PF0 (default)
+               #define QD1_USEPORTFH    // QD1 uses PF5 & PF4
+               #define QD1_DISABLE
+               #define QD2_USEPORTFL    // QD2 uses PF3 & PF2 (default)
+               #define QD2_USEPORTFH    // QD2 uses PF7 & PF6
+               #define QD2_DISABLE
+
+               If your board has a Rabbit 4000 microprocessor installed, the
+               quadrature decoder inputs must be chosen with one of the follow-
+               ing defines.  Define only one per quadrature decoder.
+
+               #define QD1_USEPORTD		// use port D pins 1 and 0
+               #define QD1_USEPORTEL	// use port E pins 1 and 0
+               #define QD1_USEPORTEH	// use port E pins 5 and 4
+               #define QD1_DISABLE		(default)
+
+               #define QD2_USEPORTD		// use port D pins 3 and 2
+               #define QD2_USEPORTEL	// use port E pins 3 and 2
+               #define QD2_USEPORTEH	// use port E pins 7 and 6
+               #define QD2_DISABLE		(default)
+
+               If no macro is defined for a decoder, that decoder will be
+               disabled.
+
+PARAMETER1:		iplevel - the interrupt priority for the ISR that handles
+						       the count overflow. This should usually be 1
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void qd_init(int iplevel)
+{
+	SetVectIntern(0x19, &qd_isr);
+	qd_zero(1);
+	qd_zero(2);
+   qd_errorflags[0] = qd_errorflags[1] = 0;
+	WrPortI(TAT10R, &TAT10RShadow, QD_DIVISOR);
+
+#if QD_10BIT_COUNTER
+   WrPortI(QDCR, &QDCRShadow, (QD_USEPORT | 0x20) + iplevel);
+   qd_10bit_enable = TRUE;
+
+#else
+   WrPortI(QDCR, &QDCRShadow, QD_USEPORT + iplevel);
+   qd_10bit_enable = FALSE;
+#endif
+}
+
+#asm __root
+qd_isr::
+	 push	 af
+	 push	 bc
+	 push	 de
+	 push	 hl
+
+	 ld	 a, 0x01
+	 ld	 (qd_isrflag), a		;signal there was a rollover
+ioi ld	 a, (QDCSR)
+	 ld	 b, a
+	 and	 0x0c				;anything for channel 1?
+	 jr	 z, .check2
+	 bit	 3, b
+	 jr	 z, .check1_dec
+	 ld	 hl, (qd_count)
+#if QD_10BIT_COUNTER
+	 ld	 de, 0x0400
+#else
+ 	 ld	 de, 0x0100
+#endif
+	 add	 hl, de
+	 ld	 (qd_count), hl
+	 ld	 hl, (qd_count + 2)		;high word
+	 ld	 a, h							;hold high byte for overflow check
+	 ld	 de, 0x0000
+	 adc	 hl, de						;add in possible carry
+	 ld	 (qd_count + 2), hl
+	 xor	 0x80				;invert old high bit
+	 and	 h
+	 and	 0x80				;check if high bit went high (negative)
+	 jr	 z, .check1_dec
+	 ld	 a, (qd_errorflags)
+	 or	 QD_OVERFLOW
+	 ld	 (qd_errorflags), a	;set overflow flag
+.check1_dec:
+	 bit	 2, b
+	 jr	 z, .check2
+	 ld	 hl, (qd_count)
+#if QD_10BIT_COUNTER
+	 ld	 de, 0x0400
+#else
+ 	 ld	 de, 0x0100
+#endif
+	 or	 a					;clear carry
+	 sbc	 hl, de
+	 ld	 (qd_count), hl
+	 ld	 hl, (qd_count + 2)
+	 ld	 a, h				;hold high byte for underflow check
+	 ld	 de, 0x0000
+	 sbc	 hl, de			;subtract carry if it is there
+	 ld	 (qd_count + 2), hl
+	 xor	 0x80				;invert old high bit
+	 or	 h
+	 and	 0x80				;check if high bit went low (positive)
+	 jr	 nz, .check2
+	 ld	 a, (qd_errorflags)
+	 or	 QD_UNDERFLOW
+	 ld	 (qd_errorflags), a	;set overflow flag
+.check2:
+	 bit	 7, b
+	 jr	 z, .check2_dec
+	 ld	 hl, (qd_count + 4)				;second long in array
+#if QD_10BIT_COUNTER
+	 ld	 de, 0x0400
+#else
+ 	 ld	 de, 0x0100
+#endif
+	 add	 hl, de
+	 ld	 (qd_count + 4), hl
+	 ld	 hl, (qd_count + 6)				;get high word
+	 ld	 a, h									;hold high byte for overflow check
+	 ld	 de, 0x0000
+	 adc	 hl, de								;add carry bit
+	 ld	 (qd_count + 6), hl
+	 xor	 0x80				;invert old high bit
+	 and	 h
+	 and	 0x80				;check if high bit changed
+	 jr	 z, .check2_dec
+	 ld	 a, (qd_errorflags + 1)
+	 or	 QD_OVERFLOW
+	 ld	 (qd_errorflags + 1), a	;set overflow flag
+.check2_dec:
+	 bit	 6, b
+	 jr	 z, .cleanup
+	 ld	 hl, (qd_count + 4)
+#if QD_10BIT_COUNTER
+	 ld	 de, 0x0400
+#else
+ 	 ld	 de, 0x0100
+#endif
+	 or	 a							;clear carry
+	 sbc	 hl, de
+	 ld	 (qd_count + 4), hl
+	 ld	 hl, (qd_count + 6)
+	 ld	 de, 0x0000
+	 sbc	 hl, de					;subtract carry bit
+	 ld	 a, h						;hold high byte for underflow check
+	 ld	 (qd_count + 6), hl
+	 xor	 0x80				;invert old high bit
+	 or	 h
+	 and	 0x80				;check if high bit went low (positive)
+	 jr	 nz, .cleanup
+	 ld	 a, (qd_errorflags + 1)
+	 or	 QD_UNDERFLOW
+	 ld	 (qd_errorflags + 1), a	;set overflow flag
+.cleanup:
+	 pop	 hl
+	 pop	 de
+	 pop	 bc
+	 pop	 af
+	 ipres
+	 ret
+
+#endasm
+
+/*** BeginHeader qd_zero */
+__nodebug void qd_zero(int channel);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+qd_zero                   <QD.LIB>
+
+SYNTAX:		   void qd_zero(int channel);
+
+DESCRIPTION:   Sets the count for a channel to 0
+
+PARAMETER1:		channel - which channel to reset (currently 1 or 2)
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void qd_zero(int channel)
+{
+	auto char temp;
+	if(channel == 1)
+	{
+		WrPortI(QDCSR, &QDCSRShadow, 0x01); //reset low byte counter
+		qd_count[0] = 0;
+	}
+	else
+	{
+		WrPortI(QDCSR, &QDCSRShadow, 0x10); //reset low byte counter
+		qd_count[1] = 0;
+	}
+}
+
+/*** BeginHeader qd_read */
+__nodebug long qd_read(int channel);
+/*** EndHeader */
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+qd_read                   <QD.LIB>
+
+SYNTAX:		   long qd_read(int channel);
+
+DESCRIPTION:   Reads the current quadrature decoder count.
+					Since this function waits for a clear reading, it
+					can potentially block if there is enough flutter in
+					the decoder count.
+
+PARAMETER1:		channel - which channel to read (currently 1 or 2)
+
+RETURN VALUE:	returns a signed long for the current count.
+END DESCRIPTION **********************************************************/
+
+__nodebug
+long qd_read(int channel)
+{
+	auto long qd_reading;
+   auto int qd_counter;
+   auto long save_value;
+	if(channel == 1)
+	{
+		while(1)
+		{
+			qd_isrflag = 0;
+         if(qd_10bit_enable)
+         {
+         	qd_counter = RdPortI(QDC1R);
+         	qd_counter = qd_counter | (RdPortI(QDC1HR)<<8);
+				qd_reading = qd_count[0] + qd_counter;
+         }
+         else
+         {
+         	qd_reading = qd_count[0] + RdPortI(QDC1R);
+         }
+         if(qd_isrflag == 0)
+			{
+            return qd_reading;
+			}
+		}
+	}
+	else
+	{
+		while(1)
+		{
+			qd_isrflag = 0;
+         if(qd_10bit_enable)
+         {
+         	qd_counter = RdPortI(QDC2R);
+         	qd_counter = qd_counter | (RdPortI(QDC2HR)<<8);
+				qd_reading = qd_count[1] + qd_counter;
+         }
+         else
+         {
+         	qd_reading = qd_count[1] + RdPortI(QDC2R);
+         }
+			if(qd_isrflag == 0)
+			{
+				return qd_reading;
+			}
+		}
+	}
+}
+
+/*** BeginHeader qd_error */
+__nodebug char qd_error(int channel);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+qd_error                   <QD.LIB>
+
+SYNTAX:		   char qd_error(int channel);
+
+DESCRIPTION:   Gets the current error bits for that qd channel
+
+PARAMETER1:		channel - which channel to read errors from
+								(currently 1 or 2)
+RETURN VALUE:	set of error flags, which can be decoded with masks:
+					QD_OVERFLOW 0x01
+					QD_UNDERFLOW 0x02
+END DESCRIPTION **********************************************************/
+
+__nodebug
+char qd_error(int channel)
+{
+	auto char error_value;
+
+	error_value = qd_errorflags[channel - 1];
+	qd_errorflags[channel - 1] = 0;
+	return error_value;
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

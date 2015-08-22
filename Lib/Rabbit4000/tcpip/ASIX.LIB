@@ -1,0 +1,2271 @@
+/*
+ *    asix.lib
+ *    Copyright (C) Rabbit Semiconductor, Inc. All rights reserved.
+ *
+ *		Packet driver functions for the ASIX AX88796.
+ *
+ */
+
+/*** BeginHeader _ASIXController */
+#ifndef __ASIX_LIB
+#define __ASIX_LIB
+#use "net_defs.lib"
+#use "ne2000.lib"
+
+// global defines
+
+#if PLD_ETH_COMPILING == 1
+	#define asix_internal_call(xlabel) 	asm db 0xcd $ dw logical_addr(xlabel)
+   #define asix_internal_func				__xmem __call__ __nodebug __nouseix
+   #define asix_external_func				__xmem __nodebug __nouseix
+#else
+	#define asix_internal_call(xlabel)	asm call xlabel
+   #define asix_internal_func 				__xmem _pktdrv_debug __nouseix
+   #define asix_external_func      		__xmem _pktdrv_debug __nouseix
+#endif
+
+#ifndef ASIX_RESETTIME
+#define ASIX_RESETTIME 2000
+#endif
+
+// Using an ethernet packet driver.  Define to number of NICs.
+// This define overridden for 2-chip boards (none of which are currently available for ASIX chip).
+#define USING_ASIX	1
+
+
+/* ***************************************************************************/
+// a struct describing the current ASIX configuration
+typedef struct {
+	/* NOTE.  This first part must be common to all ne2000 variants */
+   /****************************************************************/
+	const NetControllerDevice * ncd;
+#if PLD_ETH_COMPILING || USE_ETH_PRELOADED_DRIVER
+   void * pld_rscblock;
+#endif
+   word	iface;			// Interface number
+
+	// IO base addresses
+	int	WR1;
+	int	RD1;
+
+	// hardware reset line.  NOTE: for the ASIX, only one board configuration is used,
+   // hence the values stored in here are not accessed by the code.  The reset code
+   // uses hard-coded values instead.
+	char	reset_port;				// the parport that the reset line is on
+	char	*reset_port_shadow;	// pointer to the shadow register
+	char	reset_mask;				// mask to set the reset line high
+
+   char	hwa[6];					// Current MAC address (shadow)
+
+	/* End of part which must be common to all ne2000 variants      */
+   /****************************************************************/
+
+	int	flags;
+#define ASIX_FLAGS_LINKFAIL   	0x0001   // Indicate if the link is down (to
+														// work around a PHY bug)
+#define ASIX_FLAGS_PHYWORKAROUND	0x0002	// Do we need to perform the AX88796
+														// PHY workaround?
+#define ASIX_FLAGS_NOAUTONEG		0x0004	// has auto-negotiation been disabled?
+
+	int	(*io_init)();	// func-pointer to the code that sets up the IO strobes
+
+	word pd_overruns;
+	word pd_trashed;
+	word pd_toobig;
+	word pd_nobufs;
+	word pd_received;
+
+   word	overflow;		// Receive overflow state flags
+   char link_fail_timeout; // Time at which the last link check was
+                           // executed (to work around a PHY bug)
+	char pwrstate;			// IF_UP or IF_DOWN (power state)
+
+} _ASIXConfig;
+
+#if PLD_ETH_COMPILING == 0  && USE_ETH_PRELOADED_DRIVER == 0
+_ASIXConfig _asix_conf[USING_ASIX];	// Run-time instances of state structure
+#endif
+
+#if PLD_ETH_COMPILING == 1
+void _AsixController(void);
+#else
+extern const NetControllerDevice _ASIXController;
+#endif
+
+// These macros are used by net.lib to properly initialize all instances.  Each macro is a C initializer
+// (with trailing comma if not null).  First element points to NetControllerDevice, second is a void
+// pointer which points to the specific state structure for the instance, third field is instance number.
+#define ASIX_TABLE1  { &_ASIXController, (void *)_asix_conf, 0 },
+#define ASIX_TABLE2
+
+
+
+/* ***************************************************************************/
+// ASIX-specific #defines
+
+#define	ASIX_CMDR	0x00
+#define	ASIX_PSTART	0x01
+#define	ASIX_PSTOP	0x02
+#define	ASIX_BNDRY	0x03
+#define	ASIX_TPSR	0x04
+#define	ASIX_TBCR0	0x05
+#define	ASIX_TBCR1	0x06
+#define	ASIX_ISR		0x07
+#define	ASIX_RSAR0	0x08
+#define	ASIX_RSAR1	0x09
+#define	ASIX_RCR		0x0C
+#define	ASIX_TCR		0x0D
+#define	ASIX_DCR		0x0E
+#define	ASIX_IMR		0x0F
+#define ASIX_MEMR   0x14
+
+// Page 1
+#define ASIX_PAR0	0x01
+#define ASIX_PAR1	0x02
+#define ASIX_PAR2	0x03
+#define ASIX_PAR3	0x04
+#define ASIX_PAR4	0x05
+#define ASIX_PAR5	0x06
+#define ASIX_CURR	0x07
+
+#define ASIX_MAR0	0x08
+#define ASIX_MAR1	0x09
+#define ASIX_MAR2	0x0A
+#define ASIX_MAR3	0x0B
+#define ASIX_MAR4	0x0C
+#define ASIX_MAR5	0x0D
+#define ASIX_MAR6	0x0E
+#define ASIX_MAR7	0x0F
+
+#define ASIX_DATA		0x10
+#define ASIX_GPI		0x17
+#ifdef _AX88796B
+	#define ASIX_HWAKE	0x1F
+	#define ASIX_PMR		0x0B
+#else
+	#define ASIX_GPOC		0x17
+#endif
+#define ASIX_RESET	0x1F
+
+#define ASIX_TX_BUF_Start	0x40	// Transmit buffer start
+#define ASIX_TX_BUF_Stop	0x46	// Transmit buffer stop
+
+#define ASIX_RX_BUF_Start	0x46	// Receive buffer start
+#define ASIX_RX_BUF_Stop	0x80	// Receive buffer stop
+/*** EndHeader */
+
+// Pointer to this is stored in IFTEntry.ncd field - basically, pointers to specific driver functions.
+#if PLD_ETH_COMPILING || USE_ETH_PRELOADED_DRIVER
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	pld_eth_xcode		resume
+#endif
+
+#asm __xmem
+_ASIXController::
+	dw		sizeof(_ASIXConfig)
+   dw		NCD_POLL
+   db		6
+   dw		USING_ASIX
+   dw		0x0000
+   dw		0x0000
+	dw		0x0000
+	dw		0x0000
+   dw		0x0000
+#endasm
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	defaultxcode		resume
+#endif
+
+#else
+const NetControllerDevice _ASIXController =
+{
+	sizeof(_ASIXConfig)		// sizeof_state
+  ,NCD_POLL|NCD_BCAST|NCD_MCAST							// flags
+  ,6									// sizeof_hwa
+  ,USING_ASIX						// instances
+  ,asix_receive 					// receive()
+	#pragma nowarn warns
+  ,ne2k_sendpacket				// sendpacket()
+	#pragma nowarn warns
+  ,asix_ioctl						// ioctl()
+#ifdef PKTDRV_VERBOSE
+	#pragma nowarn warns
+  ,asix_prt_nicreg				// prtregs()
+#else
+	#pragma nowarn warns
+  ,NULL
+#endif
+	#pragma nowarn warns
+  ,asix_ifctl						// ifctl()
+	#pragma nowarn warns
+};
+#endif
+
+/****************************************************************************
+   Generic ASIX configuration follow...
+
+   Assumes the following macros are defined (usually in BOARD_DEPS.LIB):
+
+	Typical configuration (from RCM3750), with explanation
+
+   #define _ASIX
+   #define ASIX_PKTDRV_LIB    "asix.lib"
+   #define ASIX_INIT_FUNC     pd_setup_asix
+   #define ASIX_WAITS			0xb9
+
+   #define ASIX_RDIO 0x4200
+   #define ASIX_WRIO 0x4200
+
+	#define ASIX_RESPORT PDDR
+   #define ASIX_RESSHAD PDDRShadow
+   #define ASIX_RESMASK 0x01
+
+   #define _AX88796B
+
+   Some explanations:
+
+   ASIX_RDIO, ASIX_WRIO - mapped IO addresses for reading and writing the ASIX.
+
+	ASIX_WAITS - byte to initialize IB2CR (set wait states and whether to use
+	             alternate I/O)
+
+   ASIX_RESPORT - port with reset pin, or 0x00 for no reset (e.g., RCM33xx)
+                  You will need to modify this code to support ports other
+                  than PEDR and PDDR!
+
+   If ASIX_RESPORT is 0x00, you don't need to set ASIX_RESSHAD or ASIX_RESMASK.
+
+   ASIX_RESSHAD - Shadow register for ASIX_RESPORT.
+
+   ASIX_RESMASK - Byte with bit set to match the reset pin position.
+
+   _AX88796B - Define this macro if the board uses an AX88796B instead of
+               an AX88796 chip.
+
+ ***/
+
+/*** BeginHeader pd_setup_asix */
+asix_internal_func int pd_setup_asix(_ASIXConfig *rt);
+/*** EndHeader */
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	pld_eth_xcode		resume
+#endif
+
+#if (ASIX_RESPORT != 0x00) && (ASIX_RESPORT != PDDR) && (ASIX_RESPORT != PEDR)
+	#warns "ASIX_RESPORT must be set to 0x00, PEDR or PDDR"
+#endif
+
+#if ASIX_RESPORT == PDDR
+   #define _asix_rstDDR PDDDR
+#elif ASIX_RESPORT == PEDR
+   #define _asix_rstDDR PEDDR
+#endif
+
+#if PLD_ETH_COMPILING == 1
+	// Note that the parens here are necessary!  We want to load HL with the data
+	// at the indicated address.
+	#define _asix_PEFR_shadow 			(ix+PLD_ETH_PEFRSHADOW_OFS)
+	#define _asix_PEDDR_shadow			(ix+PLD_ETH_PEDDRSHADOW_OFS)
+	#define _asix_IB2CR_shadow			(ix+PLD_ETH_IB2CRSHADOW_OFS)
+	#if ASIX_RESPORT == PDDR
+	   #define _asix_rstDR_shadow		(ix+PLD_ETH_PDDRSHADOW_OFS)
+	   #define _asix_rstDDR_shadow	(ix+PLD_ETH_PDDDRSHADOW_OFS)
+	#elif ASIX_RESPORT == PEDR
+	   #define _asix_rstDR_shadow		(ix+PLD_ETH_PEDRSHADOW_OFS)
+	   #define _asix_rstDDR_shadow	(ix+PLD_ETH_PEDDRSHADOW_OFS)
+	#endif
+#else
+	#define _asix_PEFR_shadow			PEFRShadow
+	#define _asix_PEDDR_shadow			PEDDRShadow
+	#define _asix_IB2CR_shadow			IB2CRShadow
+	#if ASIX_RESPORT == PDDR
+	   #define _asix_rstDR_shadow		PDDRShadow
+	   #define _asix_rstDDR_shadow	PDDDRShadow
+	#elif ASIX_RESPORT == PEDR
+	   #define _asix_rstDR_shadow		PEDRShadow
+	   #define _asix_rstDDR_shadow	PEDDRShadow
+	#endif
+#endif
+
+asix_internal_func
+int pd_setup_asix(_ASIXConfig *asix)
+{
+#if PLD_ETH_COMPILING == 1
+	auto pld_eth_rscblk_t* res_block;
+   res_block = asix->pld_rscblock;
+#endif
+#asm _pktdrv_debug
+		push	ix
+
+      ; set read/write I/O pointers
+      ld    ix,(sp+@SP+asix+2)
+      ld    hl,ASIX_RDIO
+      ld    (ix+[asix]+RD1),hl
+      ld    hl,ASIX_WRIO
+      ld    (ix+[asix]+WR1),hl
+
+      ;
+      ;  Setup I/O strobe
+      ;
+
+#if PLD_ETH_COMPILING == 1
+		; setup ix to point at the base of the shadow register array
+      ld    hl,(sp+@sp+res_block)
+      ld    de,[res_block]+shadows
+      add   hl,de
+      ld    hl,(hl)
+      ld    ix,hl
+#endif
+
+		; enable I/O strobe on PE2 (0x4000-0x6FFF)
+      ld		hl,_asix_PEFR_shadow
+		ld		a,(hl)
+      or    a,0x04
+		ld		(hl),a
+      ioi   ld (PEFR),a
+
+		; Set PE2 to output (is this necessary if PEFR is set?)
+      ld		hl,_asix_PEDDR_shadow
+		ld		a,(hl)
+      or    a,0x04
+		ld		(hl),a
+      ioi   ld (PEDDR),a
+
+		; Set I/O Bank control register (waits, alternate I/O)
+      ld		hl,_asix_IB2CR_shadow
+      ld    a,ASIX_WAITS
+		ld		(hl),a
+      ioi   ld (IB2CR),a
+
+      ;
+      ; Set up the RSTDRV line, if necessary
+      ;
+#if ASIX_RESPORT != 0x00
+      ld		hl,_asix_rstDDR_shadow
+		ld		(hl),a
+      or    a,ASIX_RESMASK
+		ld		(hl),a
+      ioi   ld (_asix_rstDDR),a
+
+      ; Reset the ASIX
+      ld		hl,_asix_rstDR_shadow
+		ld		a,(hl)
+      or    a,ASIX_RESMASK
+		ld		(hl),a
+      ioi   ld (ASIX_RESPORT),a
+
+		; ASIX spec says 4ms minimum for reset duration, original 100ms was too long
+      ld    hl,100                  ; hold the reset for 100 ms
+#if PLD_ETH_COMPILING == 1
+		PLD_IMPORT_CALL(res_block, PLD_ETH_TICKWAIT, 2)
+#else
+		call	mswait
+#endif
+
+      ld		hl,_asix_rstDR_shadow
+		ld		a,(hl)
+      and   a,255-ASIX_RESMASK
+		ld		(hl),a
+      ioi   ld (ASIX_RESPORT),a
+#endif	// ASIX_RESPORT != 0x00
+
+      ld    hl,ASIX_RESETTIME       ; give the ASIX time to initialize
+#if PLD_ETH_COMPILING == 1
+		PLD_IMPORT_CALL(res_block, PLD_ETH_TICKWAIT, 2)
+#else
+		call	mswait
+#endif
+		pop	ix
+#endasm
+}
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	defaultxcode		resume
+#endif
+
+/*** BeginHeader 	asix_resetinterface */
+asix_internal_func
+int asix_resetinterface(_ASIXConfig * asix, word instance, int ifc);
+/*** EndHeader */
+
+/* ***************************************************************************
+/*	Ethernet
+/* **************************************************************************/
+
+#if PLD_ETH_COMPILING || USE_ETH_PRELOADED_DRIVER
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	pld_eth_xcode		resume
+#endif
+
+#asm __xmem
+_asix_config::
+	dw		logical_addr(_ASIXController)	// ncd
+   dw		0x0000                        // pld resource block
+	dw		0x0000                        // iface (this gets overwritten)
+	dw		ASIX_WRIO                     // WR1
+	dw		ASIX_RDIO                     // RD1
+	db		ASIX_RESPORT                  // reset_port
+	dw		ASIX_RESSHAD                  // reset_port_shadow
+	db		ASIX_RESMASK                    // reset_mask
+	db		0,0,0,0,0,0                   // hwa (gets overwritten)
+	dw		ASIX_INIT_FLAGS               // flags
+	dw  	logical_addr(ASIX_INIT_FUNC)	// io_init()
+   dw		0,0,0,0,0,0                   // last 13 bytes worth _ASIXConfig struct
+	db 		0
+#endasm
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	defaultxcode		resume
+#endif
+
+#else
+static const _ASIXConfig _asix_config[1] =
+{
+	{
+	   &_ASIXController        	// ncd
+	  ,0                          // iface
+	  ,ASIX_WRIO                  // WR1
+	  ,ASIX_RDIO                  // RD1
+	  ,ASIX_RESPORT               // reset_port
+	  ,&ASIX_RESSHAD              // reset_port_shadow
+	  ,ASIX_RESMASK               // reset_mask
+	  ,{ 0, }                     // hwa
+	  ,ASIX_INIT_FLAGS            // flags
+	  ,ASIX_INIT_FUNC             // io_init()
+	}
+};
+#endif
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	pld_eth_xcode		resume
+#endif
+
+asix_internal_func
+__nouseix void asix_init(_ASIXConfig * nic, char *EthAddress)
+{
+#if PLD_ETH_COMPILING == 1
+	auto pld_eth_rscblk_t* res_block;
+   res_block = nic->pld_rscblock;
+#endif
+#asm _pktdrv_debug
+		push	ix
+      ld		ix,(sp+@sp+nic+2)
+      ld		hl,(ix+[nic]+RD1)
+      ld		iy,hl
+      ld		hl,(ix+[nic]+WR1)
+      ld		ix,hl
+
+ioe	ld		(ix+ASIX_CMDR),0x21			; page 0, stop, no DMA
+
+		ld		hl,5								; delay 5ms
+#if PLD_ETH_COMPILING == 1
+		push	ix
+		PLD_IMPORT_CALL(res_block, PLD_ETH_TICKWAIT, 4)
+	   pop	ix
+#else
+	   call	tickwait
+#endif
+
+ioe	ld		(ix+ASIX_DCR),0x48			; byte transfer
+
+ioe	ld		(ix+PD_RMTBCNT0),0x00			; clear remote byte count register
+ioe	ld		(ix+PD_RMTBCNT1),0x00			; clear remote byte count register
+
+ioe	ld		(ix+ASIX_IMR),0x00			; init interrupt mask register
+ioe	ld		(ix+ASIX_ISR),0xff			; clear interrupt status register
+
+ioe	ld		(ix+ASIX_RCR),0x20			; monitor, rx off
+ioe	ld		(ix+ASIX_TCR),0x02			; loopback mode 1, tx off
+
+ioe	ld		(ix+ASIX_BNDRY),ASIX_RX_BUF_Start	; init read pointer
+ioe	ld		(ix+ASIX_PSTART),ASIX_RX_BUF_Start	; init RX_BUF start page
+ioe	ld		(ix+ASIX_PSTOP),ASIX_RX_BUF_Stop		; init RX_BUF stop page
+
+ioe	ld		(ix+ASIX_CMDR),0x61			; page 1, stop, no DMA
+
+		ld		hl,ix								; copy eth address to NIC registers
+		inc	hl
+		ex		de,hl
+		ld		hl,(sp+@SP+EthAddress+2)
+ioe	ldi
+ioe	ldi
+ioe	ldi
+ioe	ldi
+ioe	ldi
+ioe	ldi
+
+ioe	ld		(ix+ASIX_CURR),ASIX_RX_BUF_Start+1	; init write pointer
+
+ioe	ld		(ix+ASIX_CMDR),0x22			; page 0, start, no DMA
+
+#ifdef USE_MULTICAST
+ioe	ld		(ix+ASIX_RCR),0x0c			; accept broadcast and multicast
+#else
+ioe	ld		(ix+ASIX_RCR),0x04			; accept broadcast
+#endif
+
+ioe	ld		a,(iy+ASIX_GPI)
+		and	0x02
+		jr		z,ai_0
+		ld		a,0x80							; mode 0, full duplex else mode 0, half duplex
+
+ai_0:
+ioe	ld		(ix+ASIX_TCR),a
+
+#ifndef _AX88796B
+ioe	ld		(ix+ASIX_GPOC),0x10			; normal power, internal PHY
+#endif
+
+		; Check if this is the ASIX 88796 or 88796B (not the 88796A).
+      ; If so, then enable the PHY bug workaround.
+      ld    ix,(sp+@sp+nic+2)
+
+      ; Check if MR2 is 0x0180 - ASIX 88796
+		push	0x0002
+		push	0x0010
+      push	ix
+      asix_internal_call(asix_readphy)
+      add	sp,6
+		ld		de,0x0180
+		cp		hl, de
+		jr		neq, .check_88796B_MR2
+
+      ; Check if MR3 is 0xbb10 - ASIX 88796
+		push	0x0003
+		push	0x0010
+      push	ix
+      asix_internal_call(asix_readphy)
+      add	sp,6
+		ld		de,0xbb10
+		cp		hl, de
+		jr		neq, .exit
+      jr		.set_workaround
+
+.check_88796B_MR2:
+      ; Check if MR2 is 0x003B - ASIX 88796B
+		ld		de,0x003B
+		cp		hl, de
+		jr		neq, .exit
+
+      ; Check if MR3 is 0x1841 - ASIX 88796B
+		push	0x0003
+		push	0x0010
+      push	ix
+      asix_internal_call(asix_readphy)
+      add	sp,6
+		ld		de,0x1841
+		cp		hl, de
+		jr		neq, .exit
+
+.set_workaround:
+      ; Enable the PHY workaround
+      ld		hl,(ix+[nic]+flags)
+      ld    de,ASIX_FLAGS_PHYWORKAROUND
+      or		hl,de
+      ld		(ix+[nic]+flags),hl
+
+.exit:
+		pop	ix
+#endasm
+
+}
+
+/* **************************************************************************/
+
+/**
+ *    asix_resetinterface()
+ * 	Main resetting function for packet driver.  Gets the ASIX in shape,
+ * 	complete with a MAC address (physical).
+ *
+ *		Returns 0 on success, non-zero on error.
+ */
+
+asix_internal_func
+int asix_resetinterface(_ASIXConfig * asix, word instance, int ifc)
+{
+	auto int	i, j;
+#if PLD_ETH_COMPILING == 1
+	auto pld_eth_rscblk_t* res_block;
+   res_block = asix->pld_rscblock;
+#endif
+
+	_if_tab[ifc].lnk = 1;	// Link up flag
+
+#asm
+   //if (instance >= USING_ASIX)
+   //	return -6;	// No such instance
+   ld		hl,(sp+@sp+instance)
+   ld		de,USING_ASIX
+	cp		hl, de
+   jr		c,.asix_instanceok
+	ld		hl,-6
+   jp 	.doreturn
+.asix_instanceok:
+
+#if PLD_ETH_COMPILING == 1
+   ld		hl,sizeof(_ASIXConfig)
+
+	ex		de,hl                           ; de = sizeof(_ASIXConfig)
+   ld		hl,(sp+@sp+instance+2)          ; hl = instance
+	ld		bc, hl                          ; bc = instance
+   mul                                   ; bc = instance * sizeof(_ASIXConfig)
+   ld		hl,logical_addr(_asix_config)   ; hl = _asix_config
+   ex		de,hl									  ; de = _asix_config
+	ld		hl, bc                          ; hl = instance * sizeof(_ASIXConfig)
+   add	hl,de                           ; hl = _ASIXConfig instance
+
+   ex		de,hl
+   ld		hl,(sp+@sp+asix)
+   ex		de,hl
+   ld		bc,sizeof(_ASIXConfig)
+.asix_ricopyloop:
+   ldi
+   jp		v,.asix_ricopyloop
+#else
+	;memcpy(asix, _asix_config + instance, sizeof(*asix));
+   ld		hl,sizeof(_ASIXConfig)
+   push	hl
+
+	ex		de,hl                           ; de = sizeof(_ASIXConfig)
+   ld		hl,(sp+@sp+instance+2)          ; hl = instance
+	ld		bc, hl                          ; bc = instance
+   mul                                   ; bc = instance * sizeof(_ASIXConfig)
+   ld		hl,_asix_config	              ; hl = _asix_config
+   ex		de,hl									  ; de = _asix_config
+	ld		hl, bc                          ; hl = instance * sizeof(_ASIXConfig)
+   add	hl,de                           ; hl = _ASIXConfig instance
+   push	hl
+
+	ld		hl,(sp+@sp+asix+4)
+   push	hl
+   call	_n_memcpy
+   add	sp,6
+#endif
+
+#if PLD_ETH_COMPILING == 1
+c	asix->pld_rscblock = res_block;
+#endif
+
+   ;asix->iface = iface;
+   ld		ix,(sp+@sp+asix)
+   ld		hl,(sp+@sp+ifc)
+   ld		(ix+[_ASIXConfig]+iface),hl
+
+   ;asix->pwrstate = IF_UP
+   ld		(ix+[_ASIXConfig]+pwrstate),IF_UP
+
+//#ifdef ASIX_FULLDUPLEX
+//	asix->flags |= ASIX_FLAGS_FULLDUPLEX;
+//#endif
+
+	/*
+	 * Setup the peripheral IO interface, and fill in the reset of the _ASIXConfig struct
+	 */
+	;if (asix->io_init)
+	;	asix->io_init(asix);
+	ld		hl,(sp+@sp+asix)
+   ld		de,[_ASIXConfig]+io_init
+   add	hl,de
+   ld		hl,(hl)
+
+   ld		a,h
+	or		L
+   jp		z,.io_init_notset
+	ex		de,hl
+   ld		hl,(sp+@sp+asix)
+   push	hl
+   ld		hl,.io_init_ret
+   push	hl
+   ex		de,hl
+   jp		(hl)
+.io_init_ret:
+	add	sp,2
+.io_init_notset:
+
+	/*
+	 * Setup the NIC address
+	 */
+c	j = 0;
+
+	;for (i=0; i<6; i++) {
+	;	asix->hwa[i] = SysIDBlock.macAddr[i];
+	;	j |= asix->hwa[i];
+	;}
+	ld		hl,(sp+@sp+asix)
+   ld		de,[_ASIXConfig]+hwa
+   add	hl,de
+
+#if PLD_ETH_COMPILING == 1
+	push	hl
+   PLD_IMPORT_CALL(res_block, PLD_ETH_GETMACADDR, 2)
+   add	sp,2
+#else
+   ld		ix,SysIDBlock
+   ld		de,[SysIDBlock]+macAddr
+   add	ix,de
+   ex		de,hl
+   ld		hl,ix
+   ld		bc,sizeof(SysIDBlock.macAddr)
+   ldir
+#endif
+	ld		hl,(sp+@sp+asix)
+   ld		de,[_ASIXConfig]+hwa
+   add	hl,de
+
+	xor	a
+   ld		b,6
+.asix_check_mac:
+	or		(hl)
+   inc	hl
+   djnz  .asix_check_mac
+
+   ld		(sp+@sp+j),hl
+
+
+	// is ID block's MAC address zero?
+	;if (!j) {
+	;	exception(ERR_INVALIDMACADDR);
+	;	return -5;
+	;}
+	ld		hl,(sp+@sp+j)
+	bool	hl
+   jr		nz,.asix_noexecption
+
+   ld		hl,-ERR_INVALIDMACADDR
+   push	hl
+#if PLD_ETH_COMPILING == 1
+	PLD_IMPORT_CALL(res_block, PLD_ETH_EXCEPTION, 2)
+#else
+   call	exception
+#endif
+   ld		sp,2
+   ld		hl,-5
+   jp		.doreturn
+
+.asix_noexecption:
+
+	/*
+	 * Write out the NIC address to the device
+	 */
+	;asix_init(asix, asix->hwa);
+	ld		hl,(sp+@sp+asix)
+   ld		de,[_ASIXConfig]+hwa
+   add	hl,de
+
+	push	hl
+   ld		hl,(sp+@sp+asix+2)
+   push	hl
+	asix_internal_call(asix_init)
+   add	sp,4
+
+	// return success!
+	clr	hl
+.doreturn:
+#endasm
+}
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	defaultxcode		resume
+#endif
+
+/*** BeginHeader 	asix_receive */
+
+#ifndef ASIX_RX_BUF_Stop
+	#define ASIX_RX_BUF_Stop   0x60
+#endif
+
+asix_external_func int asix_receive(_ASIXConfig * nic);
+
+
+/*** EndHeader */
+
+#if PLD_ETH_COMPILING == 0
+char _PDHeader[18];	// temporary storage for DMA and Ethernet headers
+#endif
+
+/* **************************************************************************/
+
+/*
+ * Load the IO (WRx, RDx) pointers into the ix and iy registers
+ */
+
+/* **************************************************************************/
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	pld_eth_xcode		resume
+#endif
+
+asix_external_func int asix_receive(_ASIXConfig * nic)
+{
+#if PLD_ETH_COMPILING == 1
+	auto char _PDHeader[18];	// temporary storage for DMA and Ethernet headers
+	auto pld_eth_rscblk_t* res_block;
+   res_block = nic->pld_rscblock;
+#endif
+
+#asm _pktdrv_debug
+/* **************************************************************************/
+;
+; asix_receive(_ASIXConfig * nic)
+;
+; Return:
+;   hl == 0  ; success
+;   hl == 1  ; failure/nobuf
+;
+		push	ix
+		push	iy
+
+		ld		hl, (sp+@SP+nic+4)
+      ld		ix,hl
+
+      ; The following section of code implements a workaround for a bug in
+      ; the AX88796's internal PHY.  Every 2 seconds, a link check is
+      ; executed.  If the link is down, then we power down the PHY.  Next
+      ; time through this routine, the PHY is powered back up.
+
+		; Check if we should actually use the AX88796 PHY workaround
+		ld		hl, (ix+[nic]+flags)
+		ld		de, _cexpr(ASIX_FLAGS_PHYWORKAROUND)
+		; transfer nic->flags into DE for possible repeated use
+		ex		de, hl
+		and	hl, de
+		jp		z, .end_link_check
+
+		; if autonegotiation is disabled, skip this workaround code
+		ld		hl, _cexpr(ASIX_FLAGS_NOAUTONEG)
+		and	hl, de
+		jp		nz, .end_link_check
+
+		ld		hl, _cexpr(RTC2R)
+.rtc_link_check:
+		; Latch the RTC registers' content
+ioi	ld		(RTC0R), a
+		; Load byte 2 of the RTC (counts in 2 second increments)
+ioi	ld		a, (hl)
+		; Re-latch the RTC registers' content
+ioi	ld		(RTC0R), a
+		; Verify byte 2 of the RTC (avoid RTC's asynchronous counter ripple)
+ioi	cp		(hl)
+		jr		nz, .rtc_link_check
+
+		; apply the 2-second mask to the latched RTC2R content
+		;  (don't bother, because RTC2R bit 0 is the 2 second counter)
+		;and	0xFF
+
+		; Compare the time of the last call of the link check
+		;  (skip link checking if still within the same timeout period)
+		cp		(ix+[nic]+link_fail_timeout)
+		jp		nz, .skip_link_check
+
+		; Update the link_fail_timeout with the time of this call
+		ld		(ix+[nic]+link_fail_timeout), a
+
+		; a few seconds have passed, so do the link checking
+		; Check if the linkfail flag is already set
+		ld		hl, _cexpr(ASIX_FLAGS_LINKFAIL)
+		and	hl, de
+		jr		z, .check_link_failed
+
+		; It is already set--now clear the flag and power up the PHY
+		; Clear the flag
+		ld		hl, _cexpr(~ASIX_FLAGS_LINKFAIL)
+		and	hl, de
+		ld		(ix+[nic]+flags), hl
+		; Power up the PHY
+		; asix_writephy(nic, 0x10, 0, 0x1200)
+		push	0x1200
+		clr	hl
+		push	hl
+		push	0x0010
+		ld		hl, ix
+		push	hl
+		asix_internal_call(asix_writephy)
+		add	sp, 8
+		jr		.end_link_check
+
+.check_link_failed:
+		; initialize link check loop down-counter (register B content)
+		ld		b, 2
+.loop_link_failed:
+		; preserve the current link check loop down-count value
+		push	bc
+		; Read MII Register 1 (Status Register)
+		; asix_readphy(nic, 0x10, 1)
+		clr	hl
+		inc	hl
+		push	hl
+		ld		L, 0x10
+		push	hl
+		ld		hl, ix
+		push	hl
+		asix_internal_call(asix_readphy)
+		add	sp, 6
+		; recover the current link check loop down-count value
+		pop	bc
+		; Bit 2 of HL contains the link status
+		bit	2, L
+		jr		nz, .end_link_check
+
+		; done all link checks?
+		djnz	.loop_link_failed
+
+		; The link still shows as being down
+		; Power down AX88796's PHY
+		; asix_writephy(nic, 0x10, 0, 0x1a00)
+		push	0x1a00
+		clr	hl
+		push	hl
+		ld		L, 0x10
+		push	hl
+		ld		hl, ix
+		push	hl
+		asix_internal_call(asix_writephy)
+		add	sp, 8
+		; Set the linkfail flag
+		ld		hl, (ix+[nic]+flags)
+		ld		de, ASIX_FLAGS_LINKFAIL
+		or		hl, de
+		ld		(ix+[nic]+flags), hl
+
+.exit_link_failed:
+		; no link, report error
+		ld		hl, 1
+		jp		.pdr_done
+
+.skip_link_check:
+		; Check if the linkfail flag is already set
+		;  (bail out if so)
+		ld		de, _cexpr(ASIX_FLAGS_LINKFAIL)
+		ld		hl, (ix+[nic]+flags)
+		and	hl, de
+		jr		nz, .exit_link_failed
+
+.end_link_check:
+      ; This ends the ASIX PHY bug workaround code
+
+      ld    hl,ix
+
+      ld		(ix+[nic]+overflow),0		; clear overflow flag
+		asix_internal_call(ne2k_load_io_pointers)
+
+ioe	ld		(ix+ASIX_CMDR),0x62			; page 1
+ioe	ld		b,(iy+ASIX_CURR)				; write pointer
+
+ioe	ld		(ix+ASIX_CMDR),0x22			; page 0
+
+ioe	ld		a,(iy+ASIX_ISR)				; overflow	SJH
+		bit	4,a
+		jr		z, .pdr_checkpkt
+
+; Here, BUFFER RING OVERFLOW status is confirmed.
+      push	ix
+      ld		ix,(sp+@sp+nic+6)
+		ld		(ix+[nic]+overflow), 0x01	; set overflow, reset retransmit flags
+		ld		hl,(ix+[nic]+pd_overruns)
+		inc	hl
+		ld		(ix+[nic]+pd_overruns),hl
+      pop	ix
+
+ioe	ld		a,(iy+ASIX_CMDR)				; grab TXP bit
+; Here, BUFFER RING OVERFLOW recovery step 1 is complete.
+ioe	ld		(ix+ASIX_CMDR),0x21			; stop
+; Here, BUFFER RING OVERFLOW recovery step 2 is complete.
+		ld		hl, 3								; wait at least 1.5ms (3 ticks ~ 2.93 mS)
+#if PLD_ETH_COMPILING == 1
+		push	ix
+		PLD_IMPORT_CALL(res_block, PLD_ETH_TICKWAIT, 6)
+      pop	ix
+#else
+      call	tickwait
+#endif
+; Here, BUFFER RING OVERFLOW recovery step 3 is complete.
+
+ioe	ld		(ix+PD_RMTBCNT0),0x00			; reset DMA byte counts
+ioe	ld		(ix+PD_RMTBCNT1),0x00
+; Here, BUFFER RING OVERFLOW recovery step 4 is complete.
+
+		and	a,0x04							; transmit pending?
+		jr		z, .pdr_setloopback			; if not, go set loopback mode
+
+ioe	ld		a,(iy+ASIX_ISR)				; PTX or TXE set?
+		and	a,0x0a
+		jr		nz, .pdr_setloopback			; if not, go set loopback mode
+
+      push	ix
+      ld		ix,(sp+@sp+nic+6)
+		ld		(ix+[nic]+overflow), 0x81	; set both overflow and retransmit flags
+      pop	ix
+
+.pdr_setloopback:
+; Here, BUFFER RING OVERFLOW recovery step 5 is complete.
+ioe	ld		(ix+ASIX_TCR),0x02			; loopback mode
+; Here, BUFFER RING OVERFLOW recovery step 6 is complete.
+ioe	ld		(ix+ASIX_CMDR),0x22			; start
+; Here, BUFFER RING OVERFLOW recovery step 7 is complete.
+
+		;
+		; check packet
+		;
+
+.pdr_checkpkt:
+ioe	ld		(ix+ASIX_CMDR),0x22			; page 0, start
+ioe	ld		a,(iy+ASIX_BNDRY)
+
+		cp		a,b								; BNDRY should never equal CURR
+		jr		z, .pdr_badpacket
+
+		inc	a									; wrap from start to end
+		cp		ASIX_RX_BUF_Stop
+		jr		nz, .pdr_ringwrap
+		ld		a,ASIX_RX_BUF_Start
+
+.pdr_ringwrap:
+		ld		hl,0x0001						; return 1 if nothing to receive
+		cp		b
+		jp		z, .pdr_done
+
+		;
+		; setup DMA
+		;
+
+ioe	ld		(ix+ASIX_CMDR),0x22			; reset remote DMA status
+ioe	ld		(ix+PD_RMTBCNT0),0xff			; bytes to read
+ioe	ld		(ix+PD_RMTBCNT1),0xff
+
+ioe	ld		(ix+ASIX_RSAR0),0x00			; address on ASIX
+ioe	ld		(ix+ASIX_RSAR1),a
+
+ioe	ld		(ix+ASIX_CMDR),0x0a			; DMA read
+
+		;
+		; read frame
+		;
+#if PLD_ETH_COMPILING == 1
+		ld		hl,@sp+_PDHeader+4
+      add	hl,sp
+      ex		de,hl                      ; de=EthernetFrame, hl=ix+NIC_DATA
+#else
+		ld		de,_PDHeader
+#endif
+		ld		hl,iy
+		ld		L, ASIX_DATA
+
+		ld		b,4								; read DMA header
+.ar_3:
+ioe	ld		a,(hl)
+		ld		(de),a
+		inc	de
+		djnz	.ar_3
+
+#if PLD_ETH_COMPILING == 1
+      ld		hl,(sp+@sp+_PDHeader+4)
+		ld		a, L
+#else
+		ld		a,(_PDHeader)
+#endif
+		and	0xdf
+		cp		a,0x01
+		jr		z, .pdr_goodpacket
+
+		;
+		; bad received packet, dump ring
+		;
+
+.pdr_badpacket:
+ioe	ld		a,(iy+ASIX_CMDR)				; grab TXP bit
+ioe	ld		(ix+ASIX_CMDR),0x21			; stop
+
+		ld		hl,3								; wait 1.5ms
+#if PLD_ETH_COMPILING == 1
+		push	ix
+		PLD_IMPORT_CALL(res_block, PLD_ETH_TICKWAIT, 6)
+      pop	ix
+#else
+      call	tickwait
+#endif
+
+ioe	ld		(ix+PD_RMTBCNT0),0x00			; reset DMA byte counts
+ioe	ld		(ix+PD_RMTBCNT1),0x00
+ioe	ld		(ix+ASIX_TCR),0x02			; loopback mode
+
+ioe	ld		(ix+ASIX_CMDR),0x22
+ioe	ld		(ix+ASIX_CMDR),0x62			; start, page 1
+
+ioe	ld		a,(iy+ASIX_CURR)
+		dec	a
+		cp		a,ASIX_RX_BUF_Start
+		jr		nc, .pdr_nowrapring
+		ld		a,ASIX_RX_BUF_Stop-1
+
+.pdr_nowrapring:
+ioe	ld		(ix+ASIX_CMDR),0x22
+ioe	ld		(ix+ASIX_BNDRY),a
+		ld		hl,0x0001						; return error
+		jp		.pdr_donebadpacket
+
+.pdr_goodpacket:
+#if PLD_ETH_COMPILING == 1
+		ld		hl,(sp+@sp+_PDHeader+2+4)
+		ld		bc, hl                     ; bc=MIN(length,ETH_BUFSIZE)
+#else
+		ld		bc,(_PDHeader+2)				; bc=MIN(length,ETH_BUFSIZE)
+#endif
+		ld		hl,1+ETH_BUFSIZE
+		or		a
+		sbc	hl,bc
+		jr		nc, .pdr_chkpointer
+
+		ld		hl,1518							; make sure the length makes sense
+		sbc	hl,bc
+		jr		c, .pdr_badpacket
+
+		ld		bc,0+ETH_BUFSIZE
+
+.pdr_chkpointer:
+#if PLD_ETH_COMPILING == 1
+		ld		hl,(sp+@sp+_PDHeader+1+4)
+		ld		a, L								; make sure the next pointer makes sense
+#else
+		ld		a,(_PDHeader+1)				; make sure the next pointer makes sense
+#endif
+		cp		a,ASIX_RX_BUF_Start
+		jp		c, .pdr_badpacket
+		cp		a,ASIX_RX_BUF_Stop
+		jp		nc, .pdr_badpacket
+
+      push	ix
+      push	iy									; Save I/O pointers
+		push	bc									; Save length
+#if PLD_ETH_COMPILING == 1
+		PLD_IMPORT_CALL(res_block, PLD_ETH_PB_RESERVE, 10)
+#else
+		lcall	_pb_reserve						; allocate a buffer (ll_prefix) to get pkt in
+		; Pointer in PY.
+#endif
+      pop	bc
+
+		jr		nc,.pdr_gotbuffer
+
+; save the pkt for another time if no buffers
+		pop	iy
+      ld		ix,(sp+@sp+nic+6)
+		ld		hl,(ix+[nic]+pd_nobufs)					; increment error counter
+		inc	hl
+		ld		(ix+[nic]+pd_nobufs),hl
+      pop	ix
+ioe	ld		(ix+ASIX_CMDR),0x22						; abort DMA
+		ld		hl,0x0001
+		jp		.pdr_done
+
+
+.pdr_gotbuffer:
+		ld		hl,(sp+0)						; I/O input base
+		ld		L, ASIX_DATA
+      push	bc
+      ; Copy BC bytes from ioe(HL) to xmem buffers using _pb_ioe2buf
+#if PLD_ETH_COMPILING == 1
+		PLD_IMPORT_CALL(res_block, PLD_ETH_PB_IOE2BUF, 10)
+#else
+      lcall _pb_ioe2buf						; Read the data in
+#endif
+      pop	bc									; Length of packet
+
+		ld		hl,(sp+@sp+nic+8)
+      ld		hl,(hl+[nic]+iface-1)		; Load interface number into H (not L, hence the -1)
+		ld		L, LL_READY					 	; Interface number in H, flags in L
+		ld		e,14								; Length of link-layer (ethernet) header
+#if PLD_ETH_COMPILING == 1
+		PLD_IMPORT_CALL(res_block, PLD_ETH_PB_FINISH, 8)
+#else
+      lcall	_pb_finish						; finish up the pkt (set interface number)
+#endif
+
+      pop	iy
+      pop	ix
+
+ioe	ld		(ix+ASIX_CMDR),0x22			; page 0
+#if PLD_ETH_COMPILING == 1
+		ld		hl,(sp+@sp+_PDHeader+1+4)
+		ld		a, L								; point to next packet
+#else
+		ld		a,(_PDHeader+1)
+#endif
+		dec	a
+		cp		a,ASIX_RX_BUF_Start
+		jr		nc, .pdr_wrapring2
+		ld		a,ASIX_RX_BUF_Stop-1
+.pdr_wrapring2:
+ioe	ld		(ix+ASIX_BNDRY),a
+
+
+		push	ix
+      ld		ix,(sp+@sp+nic+6)
+		ld		hl,(ix+[nic]+pd_received)				; increment packet counter
+		inc	hl
+		ld		(ix+[nic]+pd_received),hl
+
+		clr	hl									; return 0
+
+		ld		a,(ix+[nic]+overflow)					; overflow condition
+		bit	0,a
+      pop	ix
+		jp		z, .pdr_done
+
+.pdr_donebadpacket:
+; Here, BUFFER RING OVERFLOW recovery step 8 is complete.
+ioe	ld		(ix+ASIX_ISR),0x10			; clear overflow
+; Here, BUFFER RING OVERFLOW recovery step 9 is complete.
+ioe	ld		(ix+ASIX_TCR),0x00			; get out of loopback mode
+; Here, BUFFER RING OVERFLOW recovery step 10 is complete.
+
+		push	ix
+      ld		ix,(sp+@sp+nic+6)
+		ld		a, (ix+[nic]+overflow)		; overflow condition
+		bit	7, a								; transmit pending?
+		ld		(ix+[nic]+overflow),0
+      pop	ix
+		jp		z, .pdr_done
+
+ioe	ld		(ix+ASIX_CMDR),0x26			; restart transmit
+
+.pdr_done:
+; Here, BUFFER RING OVERFLOW recovery step 11 is complete.
+		bool	hl
+		pop	iy
+		pop	ix
+#endasm
+}
+
+#if PLD_ETH_COMPILING == 1
+	#asm __xmem
+	pld_eth_end::
+   #endasm
+	#xcodorg	defaultxcode		resume
+#endif
+
+/*** BeginHeader 	asix_ioctl */
+
+asix_external_func int asix_ioctl(_ASIXConfig * nic, int cmd, ...);
+
+/*** EndHeader */
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	pld_eth_xcode		resume
+#endif
+
+asix_external_func int asix_ioctl(_ASIXConfig * nic, int cmd, ...)
+{
+	auto char * stack;
+	auto int retval;
+   stack = (char *)(&cmd + 1);
+#asm
+	;switch (cmd) {
+	ld		hl,(sp+@sp+cmd)      ; load command
+	ex		de,hl
+	;case PD_HASFEATURE:
+   ld		hl,PD_HASFEATURE     ; check for PD_HASFEATURE
+	cp		hl, de
+	jp		eq, .asix_ioctl_hasfeature
+	;case PD_INITIALIZE:
+   ld		hl,PD_INITIALIZE
+	cp		hl, de
+	jp		eq, .asix_ioctl_initialize
+	;case PD_HAVELINK:
+   ld		hl,PD_HAVELINK
+	cp		hl, de
+	jp		eq, .asix_ioctl_havelink
+	;case PD_POWER:
+   ld		hl,PD_POWER
+	cp		hl, de
+	jp		eq, .asix_ioctl_power
+	;case PD_POWERSTATUS:
+   ld		hl,PD_POWERSTATUS
+	cp		hl, de
+	jp		eq, .asix_ioctl_pstatus
+	;case PD_SETHWA:
+	ld		hl,PD_SETHWA
+	cp		hl, de
+	jp		eq, .asix_ioctl_sethwa
+	;case PD_GETHWA:
+   ld		hl,PD_GETHWA
+	cp		hl, de
+	jp		eq, .asix_ioctl_gethwa
+#ifdef USE_MULTICAST
+	;case PD_ADDMULTICAST:
+	ld		hl,PD_ADDMULTICAST
+	cp		hl, de
+	jp		eq, .asix_ioctl_addmulticast
+	;case PD_REMOVEMULTICAST:
+   ld		hl,PD_REMOVEMULTICAST
+	cp		hl, de
+	jp		eq, .asix_ioctl_removemulticast
+#endif
+	;case PD_DUMPREGS:
+	ld		hl,PD_DUMPREGS
+	cp		hl, de
+	jp		eq, .asix_ioctl_readreg
+	;case PD_NETWORK_MODE:
+	ld		hl, PD_NETWORK_MODE
+	cp		hl, de
+	jp		eq, .asix_ioctl_networkmode
+   jp    .asix_ioctl_return
+
+.asix_ioctl_hasfeature:
+   ;case PD_HASFEATURE:
+		;#ifdef USE_MULTICAST
+		;	#define PD_maxCmd PD_REMOVEMULTICAST
+		;#else
+		;	#define PD_maxCmd PD_GETHWA
+		;#endif
+		;cmd = *(int *)stack;
+		;return cmd == PD_NETWORK_MODE || cmd >= PD_HASFEATURE && cmd <= PD_maxCmd
+
+      ld    hl,(sp+@sp+stack)    ; point at first parameter
+      ld    hl,(hl)              ; dereference first parameter
+
+		; cmd == PD_NETWORK_MODE
+		ld		de, PD_NETWORK_MODE
+		cp		hl, de
+		jp		eq, .asix_featuresupported			; cmd == PD_NETWORK_MODE
+
+   #ifdef USE_MULTICAST
+		ld		de, PD_REMOVEMULTICAST
+   #else
+		ld		de, PD_GETHWA
+   #endif
+		cp		hl, de
+		jr		eq, .asix_featuresupported			; cmd == PD_maxCmd
+		jr		nc, .asix_featurenotsupported		; cmd > PD_maxCmd
+      ld    de,PD_HASFEATURE
+		cp		hl, de
+		jr		nc, .asix_featuresupported			; cmd >= PD_HASFEATURE
+   .asix_featurenotsupported:
+		clr	hl
+      jr		.asix_hasfeaturedone
+   .asix_featuresupported:
+		clr	hl
+		inc	hl
+   .asix_hasfeaturedone:
+      ld    (sp+@sp+retval),hl
+		jp		.asix_ioctl_return
+
+.asix_ioctl_initialize:
+   ;case PD_INITIALIZE:
+   	;return asix_resetinterface(nic, *(word *)stack, *(int *)(stack+sizeof(word)));
+      ld    hl,(sp+@sp+stack)
+      ld    hl,(hl+sizeof(word))
+      push  hl
+      ld    hl,(sp+@sp+stack+2)
+      ld    hl,(hl)
+      push  hl
+      ld    hl,(sp+@sp+nic+4)
+      push  hl
+      asix_internal_call(asix_resetinterface)
+      add   sp,6
+      ld    (sp+@sp+retval),hl
+
+      jp    .asix_ioctl_return
+
+.asix_ioctl_havelink:
+   ;case PD_HAVELINK:
+   	;return asix_havelink(nic);
+      ld    hl,(sp+@sp+nic)
+      push  hl
+      asix_internal_call(asix_havelink)
+      add   sp,2
+      ld    (sp+@sp+retval),hl
+      jp    .asix_ioctl_return
+
+.asix_ioctl_power:
+   ;case PD_POWER:
+   ;	if (*(int *)stack)
+   ;   	return asix_powerup(nic);
+   ;   else
+   ;		return asix_powerdown(nic);
+      ld    hl,(sp+@sp+stack)
+      ld    hl,(hl)
+      bool  hl
+      ld    hl,(sp+@sp+nic)
+      push  hl
+      jr    z,.asix_ioctl_powerdown
+      asix_internal_call(asix_powerup)
+      jr    .asix_ioctl_powerdone
+	.asix_ioctl_powerdown:
+      asix_internal_call(asix_powerdown)
+	.asix_ioctl_powerdone:
+      add   sp,2
+      ld    (sp+@sp+retval),hl
+      jp    .asix_ioctl_return
+
+.asix_ioctl_pstatus:
+      ld    hl,(sp+@sp+nic)
+	   ld		hl,(hl+[_ASIXConfig]+pwrstate)
+	   ld		h,0
+      ld    (sp+@sp+retval),hl
+      jp    .asix_ioctl_return
+
+.asix_ioctl_sethwa:
+   ;case PD_SETHWA:
+   ;	ne2k_sethwaddr((_NE2kConfig *)nic, *(char **)stack);
+   ;	break;
+      ld    hl,(sp+@sp+stack)
+      ld    hl,(hl)
+      push  hl
+      ld    hl,(sp+@sp+nic+2)
+      push  hl
+      asix_internal_call(ne2k_sethwaddr)
+      add   sp,4
+		clr	hl
+      ld    (sp+@sp+retval),hl
+      jp    .asix_ioctl_return
+
+.asix_ioctl_gethwa:
+   ;case PD_GETHWA:
+   ;	**(char ***)stack = nic->hwa;
+   ;   return sizeof(nic->hwa);
+      ld    hl,(sp+@sp+nic)
+      ld    de,[nic]+hwa
+      add   hl,de
+      ex    de,hl
+      ld    hl,(sp+@sp+stack)
+      ld    hl,(hl)
+      ld    (hl),e
+      inc   hl
+      ld    (hl),d
+      ld    hl,sizeof(nic->hwa)
+      ld    (sp+@sp+retval),hl
+      jp    .asix_ioctl_return
+
+#ifdef USE_MULTICAST
+.asix_ioctl_addmulticast:
+   ;case PD_ADDMULTICAST:
+   ;	return ne2k_addmulticast((_NE2kConfig *)nic, *(char **)stack, *(int **)(stack + sizeof(char *)));
+      ld    hl,(sp+@sp+stack)
+      ld    de,sizeof(char*)
+      add   hl,de
+      ld    hl,(hl)
+      push  hl
+      ld    hl,(sp+@sp+stack+2)
+      ld    hl,(hl)
+      push  hl
+      ld    hl,(sp+@sp+nic+4)
+      push  hl
+      asix_internal_call(ne2k_addmulticast)
+      add   sp,6
+      ld    (sp+@sp+retval),hl
+      jp    .asix_ioctl_return
+
+.asix_ioctl_removemulticast:
+   ;case PD_REMOVEMULTICAST:
+   ;	return ne2k_removemulticast((_NE2kConfig *)nic, *(char **)stack);
+      ld    hl,(sp+@sp+stack)
+      ld    hl,(hl)
+      push  hl
+      ld    hl,(sp+@sp+nic+2)
+      push  hl
+      asix_internal_call(ne2k_removemulticast)
+      add   sp,4
+      ld    (sp+@sp+retval),hl
+      jp    .asix_ioctl_return
+#endif
+.asix_ioctl_readreg:
+	;case PD_DUMPREGS
+   	;return asix_prt_readreg(nic, (char*)stack);
+      	ld		hl,(sp+@sp+stack)
+         ld		hl,(hl)
+         push	hl
+         ld		hl,(sp+@sp+nic+2)
+         push	hl
+         asix_internal_call(asix_prt_readreg)
+         add	sp,4
+         ld		(sp+@sp+retval),hl
+         jp		.asix_ioctl_return
+.asix_ioctl_networkmode:
+	;case PD_NETWORK_MODE
+		;return asix_networkmode(nic, *(int *) stack, *(int *) (stack + sizeof(int)));
+		ld		hl, (sp+@sp+stack)
+		ld		hl, (hl+sizeof(int))
+		push	hl
+		ld		hl, (sp+@sp+stack+2)
+		ld		hl, (hl)
+		push	hl
+		ld		hl, (sp+@sp+nic+4)
+		push	hl
+		asix_internal_call(asix_networkmode)
+		add	sp, 6
+		ld		(sp+@sp+retval), hl
+		jp		.asix_ioctl_return
+   ;}
+.asix_ioctl_return:
+	ld		hl,(sp+@sp+retval)
+#endasm
+   return retval;
+}
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	defaultxcode		resume
+#endif
+
+/*** BeginHeader asix_ifctl */
+asix_external_func int asix_ifctl(_ASIXConfig * nic, int up, int change);
+/*** EndHeader */
+
+asix_external_func int asix_ifctl(_ASIXConfig * nic, int up, int change)
+{
+	// Just a stub for the default ethernet interface control.
+	return ifctl_ethernet(nic->iface, up, change);
+}
+
+/*** BeginHeader asix_prt_readreg */
+asix_internal_func void asix_prt_readreg(_ASIXConfig* nic, char* buf);
+/*** EndHeader */
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	pld_eth_xcode		resume
+#endif
+
+asix_internal_func void asix_prt_readreg(_ASIXConfig* nic, char* buf)
+{
+#asm _pktdrv_debug xmemok
+	push	ix
+	push	iy
+
+	ld		hl,(sp+@SP+nic+4)
+	asix_internal_call(ne2k_load_io_pointers)
+
+ioe	ld		a,(iy)
+		push	af
+
+		ld		hl,(sp+@sp+buf+6)
+      ex		de,hl
+
+ioe	ld		(ix),0x20
+ioe	ld		(ix+PD_RMTBCNT0),0x00			; clear remote byte count register
+ioe	ld		(ix+PD_RMTBCNT1),0x00			; clear remote byte count register
+
+		ld		b,31
+		ld		hl, iy
+_pd_loop1:
+ioe	ld		a,(hl)
+		ld		(de),a
+		inc	hl
+		inc	de
+		djnz	_pd_loop1
+
+		inc	de				; ignore reset...
+
+ioe	ld		(ix),0x60
+		ld		b,31
+		ld		hl,iy
+_pd_loop2:
+ioe	ld		a,(hl)
+		ld		(de),a
+		inc	hl
+		inc	de
+		djnz	_pd_loop2
+
+		pop	af
+      ld		hl,(sp+@sp+buf+4)
+		ld		(hl),a
+
+; switch back to page 0
+ioe	ld		(ix),0x20
+
+		pop	iy
+		pop	ix
+#endasm
+}
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	defaultxcode		resume
+#endif
+
+
+/*** BeginHeader asix_prt_nicreg */
+void asix_prt_nicreg(_ASIXConfig * nic);
+/*** EndHeader */
+
+#ifdef PKTDRV_VERBOSE
+_pktdrv_debug
+__nouseix void asix_prt_nicreg(_ASIXConfig * nic)
+{
+	auto int x;
+	static char regbuf[64];
+
+	const static char *const name1[32] =
+	{
+		"CR",
+		"PSTART",
+		"PSTOP",
+		"BNRY",
+		"TSR",
+		"NCR",
+		"CPR",
+		"ISR",
+		"CRDA0",
+		"CRDA1",
+		"*",
+		"*",
+		"RSR",
+		"CNTR0",
+		"CNTR1",
+		"CNTR2",
+		"DATA",
+		"DATA",
+		"IFGS1",
+		"IFGS2",
+		"MII",
+		"TEST",
+		"IFG",
+		"GPI",
+		"SPP0",
+		"SPP1",
+		"SPP2",
+		"*",
+		"*",
+		"*",
+		"*",
+		"RESET"
+	};
+
+	const static char *const name2[32] =
+	{
+		"CR",
+		"PADR0",
+		"PADR1",
+		"PADR2",
+		"PADR3",
+		"PADR4",
+		"PADR5",
+		"CPR",
+		"MAR0",
+		"MAR1",
+		"MAR2",
+		"MAR3",
+		"MAR4",
+		"MAR5",
+		"MAR6",
+		"MAR7",
+		"DATA",
+		"DATA",
+		"IFGS1",
+		"IFGS2",
+		"MII",
+		"TEST",
+		"IFG",
+		"GPI",
+		"SPP0",
+		"SPP1",
+		"SPP2",
+		"*",
+		"*",
+		"*",
+		"*",
+		"RESET"
+	};
+
+	memset(regbuf,0,sizeof(regbuf));
+
+   asix_prt_readreg(nic, regbuf);
+
+	for(x=0;x<32;x++) {
+		printf("%s\t%02x\t%s\t%02x\n",name1[x],regbuf[x],name2[x],regbuf[x+32]);
+	}
+
+	printf("\n");
+}
+
+#endif
+
+/*** BeginHeader asix_havelink */
+asix_internal_func int asix_havelink(_ASIXConfig * nic);
+/*** EndHeader */
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	pld_eth_xcode		resume
+#endif
+
+asix_internal_func
+int asix_havelink(_ASIXConfig * nic)
+{
+#asm
+		push	ix
+
+		ld		hl,(sp+@SP+nic+2)
+		asix_internal_call(ne2k_load_io_pointers)
+
+ioe	ld		a,(iy+ASIX_GPI)
+		and	a,0x01
+		clr	hl
+		ld		L, a
+
+		pop	ix
+#endasm
+}
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	defaultxcode		resume
+#endif
+
+/*** BeginHeader asix_powerdown */
+asix_internal_func int asix_powerdown(_ASIXConfig * nic);
+/*** EndHeader */
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	pld_eth_xcode		resume
+#endif
+
+asix_internal_func
+int asix_powerdown(_ASIXConfig * nic)
+{
+#asm
+		push	ix
+
+		ld		ix,(sp+@SP+nic+2)
+		ld		(ix+[_ASIXConfig]+pwrstate),IF_DOWN
+		ld		hl,ix
+		asix_internal_call(ne2k_load_io_pointers)
+
+#ifdef _AX88796B
+ioe	ld		(ix+ASIX_CMDR),0xE0		; page 3, stop
+ioe	ld		(ix+ASIX_PMR),0x12		; go into D2 mode, regulator in standby
+#else
+ioe	ld		(ix+ASIX_GPOC),0x50		; power down PHY
+#endif
+
+		clr	hl								; return success
+
+		pop	ix
+#endasm
+}
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	defaultxcode		resume
+#endif
+
+/*** BeginHeader asix_powerup */
+asix_internal_func int asix_powerup(_ASIXConfig * nic);
+/*** EndHeader */
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	pld_eth_xcode		resume
+#endif
+
+asix_internal_func
+int asix_powerup(_ASIXConfig * nic)
+{
+#asm
+		push	ix
+
+		ld		ix,(sp+@SP+nic+2)
+		ld		(ix+[_ASIXConfig]+pwrstate),IF_UP
+		ld		hl,ix
+
+		asix_internal_call(ne2k_load_io_pointers)
+
+#ifdef _AX88796B
+ioe	ld		(ix+ASIX_HWAKE),0x01		; come out of D2 power saving state
+#else
+ioe	ld		(ix+ASIX_GPOC),0x10		; power up PHY
+#endif
+
+		clr	hl								; return success
+
+		pop	ix
+#endasm
+}
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	defaultxcode		resume
+#endif
+
+/*** BeginHeader asix_writeonetophy, asix_writezerotophy */
+asix_internal_func void asix_writeonetophy();
+asix_internal_func void asix_writezerotophy();
+/*** EndHeader */
+
+/*
+ *    The asix_writeonetophy and asix_writezerotophy
+ *    routines assume that iy is set to the base I/O
+ *    address of the ASIX chip.
+ *
+ *    There is more information about these routines
+ *    in the comment on asix_writephy and asix_readphy.
+ *
+ */
+
+#if PLD_ETH_COMPILING == 1
+   #xcodorg pld_eth_xcode     resume
+#endif
+
+#asm __xmem _pktdrv_debug
+asix_writeonetophy::
+ioe   ld    (iy+ASIX_MEMR),0x48
+ioe   ld    (iy+ASIX_MEMR),0x49
+ioe   ld    (iy+ASIX_MEMR),0x48
+#if PLD_ETH_COMPILING == 1
+		ret
+#else
+		lret
+#endif
+#endasm
+
+#asm __xmem _pktdrv_debug
+asix_writezerotophy::
+ioe   ld    (iy+ASIX_MEMR),0x40
+ioe   ld    (iy+ASIX_MEMR),0x41
+ioe   ld    (iy+ASIX_MEMR),0x40
+#if PLD_ETH_COMPILING == 1
+		ret
+#else
+		lret
+#endif
+#endasm
+
+#if PLD_ETH_COMPILING == 1
+   #xcodorg defaultxcode      resume
+#endif
+
+/*** BeginHeader asix_writephy */
+asix_internal_func void asix_writephy(_ASIXConfig* cfg, int phy, int reg,
+                                      int value);
+/*** EndHeader */
+
+/*
+ *    The PHY on the ASIX chip is communicated with using
+ *    the ASIX_MEMR register which controls the clock and
+ *    data lines on the serial MII interface to the PHY.
+ *
+ *    To write to the PHY we need to toggle the clock low,
+ *    change the data either high or low depending on if
+ *    we want to write a one or zero to the PHY, toggle the
+ *    clock high where the value is read, and toggle the
+ *    the clock low again.
+ *
+ *    The serial MII interface does not care about how
+ *    long the transistions are as long as they are no
+ *    faster than about a half usec.
+ *
+ *    The asix_writezerotophy and asix_writeonetophy
+ *    assembly routines handle writing the appropriate
+ *    values to the MEMR register.
+ *
+ *    When writing to the ASIX chip, you write a preamble
+ *    which is a series of clock changes with data of one,
+ *    a start bit, the operation, the physical address,
+ *    the register addresss, and finally the data.
+ *
+ *    11...111          preamble
+ *    01                start bit
+ *    01                write operation, 10 for read operation
+ *    00000             PHY address
+ *    xxxxx             register address
+ *
+ *    z0                turnaround time
+ *
+ *    xxxxxxxxxxxxxxxx  data
+ *
+ *    The turnaround time toggles the MDOE on the first bit
+ *    and writes a zero on the second.
+ *
+ */
+
+#if PLD_ETH_COMPILING == 1
+   #xcodorg pld_eth_xcode     resume
+#endif
+
+asix_internal_func __nouseix void asix_writephy(_ASIXConfig* cfg, int phy,
+                                              int reg, int value)
+{
+#if PLD_ETH_COMPILING == 1
+   auto pld_eth_rscblk_t* res_block;
+   res_block = cfg->pld_rscblock;
+   #asm
+   PLD_IMPORT_CALL(res_block, PLD_ETH_LOCKGLOBAL, 0)
+   #endasm
+#else
+   LOCK_GLOBAL(TCPGlobalLock);
+#endif
+
+#asm _pktdrv_debug
+		ld		hl,(sp+@SP+cfg)
+		ld		hl,(hl+[cfg]+WR1)
+		ld		iy,hl
+
+ioe   ld    (iy+ASIX_MEMR),0x48
+
+      ld    b,32
+_asix_wp0:
+ioe   ld    (iy+ASIX_MEMR),0x48
+ioe   ld    (iy+ASIX_MEMR),0x49
+      djnz  _asix_wp0
+
+      asix_internal_call(asix_writezerotophy)         ; start bit
+      asix_internal_call(asix_writeonetophy)
+
+      asix_internal_call(asix_writezerotophy)         ; write operation
+      asix_internal_call(asix_writeonetophy)
+
+      ;
+      ; physical address
+      ;
+
+      ld    hl,(sp+@SP+phy)
+      ld    b,5
+_asix_wp1:
+		bit	4, L
+      jr    z,_asix_wp1_0
+      asix_internal_call(asix_writeonetophy)
+      jr    _asix_wp1_1
+_asix_wp1_0:
+      asix_internal_call(asix_writezerotophy)
+_asix_wp1_1:
+      add   hl,hl
+      djnz  _asix_wp1
+
+      ;
+      ; register address
+      ;
+
+      ld    hl,(sp+@SP+reg)
+      ld    b,5
+_asix_wp2:
+		bit	4, L
+      jr    z,_asix_wp2_0
+      asix_internal_call(asix_writeonetophy)
+      jr    _asix_wp2_1
+_asix_wp2_0:
+      asix_internal_call(asix_writezerotophy)
+_asix_wp2_1:
+      add   hl,hl
+      djnz  _asix_wp2
+
+      ;
+      ; send turnaround bits Z0 for MDIO pin
+      ;
+
+ioe   ld    (iy+ASIX_MEMR),0x40
+ioe   ld    (iy+ASIX_MEMR),0x41
+ioe   ld    (iy+ASIX_MEMR),0x40
+
+      asix_internal_call(asix_writezerotophy)
+
+      ;
+      ; write the data
+      ;
+
+      ld    hl,(sp+@SP+value)
+      ld    b,16
+_asix_wp3:
+      add   hl,hl
+      jr    nc,_asix_wp3_0
+      asix_internal_call(asix_writeonetophy)
+      jr    _asix_wp3_1
+_asix_wp3_0:
+      asix_internal_call(asix_writezerotophy)
+_asix_wp3_1:
+      djnz  _asix_wp3
+#endasm
+
+#if PLD_ETH_COMPILING == 1
+   #asm
+   PLD_IMPORT_CALL(res_block, PLD_ETH_UNLOCKGLOBAL, 0)
+   #endasm
+#else
+   UNLOCK_GLOBAL(TCPGlobalLock);
+#endif
+}
+
+#if PLD_ETH_COMPILING == 1
+   #xcodorg defaultxcode   resume
+#endif
+
+/*** BeginHeader asix_readphy */
+asix_internal_func int asix_readphy(_ASIXConfig* cfg, int phy, int reg);
+/*** EndHeader */
+
+/*
+ *    The asix_readphy function reads from the PHY on the
+ *    ASIX chip.  This function is like the asix_writephy
+ *    function, but instead of a write operation we do a
+ *    read operation and we are reading the data instead
+ *    of writing it.
+ *
+ *    This routine reads the data after lowering the clock.
+ *
+ */
+
+#if PLD_ETH_COMPILING == 1
+   #xcodorg pld_eth_xcode     resume
+#endif
+
+asix_internal_func __nouseix int asix_readphy(_ASIXConfig* cfg, int phy, int reg)
+{
+   auto int rval;
+
+#if PLD_ETH_COMPILING == 1
+   auto pld_eth_rscblk_t* res_block;
+   res_block = cfg->pld_rscblock;
+   #asm
+   PLD_IMPORT_CALL(res_block, PLD_ETH_LOCKGLOBAL, 0)
+   #endasm
+#else
+   LOCK_GLOBAL(TCPGlobalLock);
+#endif
+
+#asm _pktdrv_debug
+      push ix
+      ld    ix,(sp+@sp+cfg+2)
+      ld    hl,(ix+[cfg]+WR1)
+      ld    iy,hl
+      ld    hl,(ix+[cfg]+RD1)
+      ld    ix,hl
+
+ioe   ld    (iy+ASIX_MEMR),0x48
+
+      ld    b,32
+_asix_rp0:
+ioe   ld    (iy+ASIX_MEMR),0x48
+ioe   ld    (iy+ASIX_MEMR),0x49
+      djnz  _asix_rp0
+
+      asix_internal_call(asix_writezerotophy)         ; start bit
+      asix_internal_call(asix_writeonetophy)
+
+      asix_internal_call(asix_writeonetophy)          ; read operation
+      asix_internal_call(asix_writezerotophy)
+
+      ;
+      ; physical address
+      ;
+
+      ld    hl,(sp+@SP+phy+2)
+      ld    b,5
+_asix_rp1:
+		bit	4, L
+      jr    z,_asix_rp1_0
+      asix_internal_call(asix_writeonetophy)
+      jr    _asix_rp1_1
+_asix_rp1_0:
+      asix_internal_call(asix_writezerotophy)
+_asix_rp1_1:
+      add   hl,hl
+      djnz  _asix_rp1
+
+      ;
+      ; register address
+      ;
+
+      ld    hl,(sp+@SP+reg+2)
+      ld    b,5
+_asix_rp2:
+		bit	4, L
+      jr    z,_asix_rp2_0
+      asix_internal_call(asix_writeonetophy)
+      jr    _asix_rp2_1
+_asix_rp2_0:
+      asix_internal_call(asix_writezerotophy)
+_asix_rp2_1:
+      add   hl,hl
+      djnz  _asix_rp2
+
+      ;
+      ; send turnaround bits Z0 for MDIO pin
+      ;
+
+ioe   ld    (iy+ASIX_MEMR),0x40
+ioe   ld    (iy+ASIX_MEMR),0x41
+ioe   ld    (iy+ASIX_MEMR),0x40
+
+      asix_internal_call(asix_writezerotophy)
+
+      ;
+      ; read the data
+      ;
+
+		clr	hl
+      ld    b,16
+_asix_rp3:
+      adc   hl,hl
+ioe   ld    (iy+ASIX_MEMR),0x40
+
+ioe   ld    a,(ix+ASIX_MEMR)
+      and   a,0x04
+
+ioe   ld    (iy+ASIX_MEMR),0x41
+ioe   ld    (iy+ASIX_MEMR),0x40
+
+      jr    z,_asix_rp3_0
+      ccf
+_asix_rp3_0:
+      djnz  _asix_rp3
+
+      adc   hl,hl
+      ld    (sp+@SP+rval+2),hl
+      pop ix
+#endasm
+
+#if PLD_ETH_COMPILING == 1
+   #asm
+   PLD_IMPORT_CALL(res_block, PLD_ETH_UNLOCKGLOBAL, 0)
+   #endasm
+#else
+   UNLOCK_GLOBAL(TCPGlobalLock);
+#endif
+
+   return rval;
+}
+
+#if PLD_ETH_COMPILING == 1
+   #xcodorg defaultxcode   resume
+#endif
+
+/*** BeginHeader asix_link_status */
+// Needs to be modified to take an (_ASIXConfig *) parameter, but that would
+// require adding a pd_link_status() function and a new ioctl.
+asix_internal_func int asix_link_status ();
+#define ASIX_LINK_UP   0x01
+#define ASIX_LINK_FDX  0x02
+#define ASIX_LINK_100  0x04
+/*** EndHeader */
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	pld_eth_xcode		resume
+#endif
+
+asix_internal_func
+int asix_link_status()
+{
+#asm
+ioe	ld		a, (ASIX_RDIO+ASIX_GPI)
+		bool	hl
+		ld		L, a
+#endasm
+}
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	defaultxcode		resume
+#endif
+
+/*** BeginHeader asix_networkmode */
+// netspeed = 0 for auto, 1 for 10Mbps, 2 for 100Mbps; netduplex = 0 for half, 1 for full
+asix_internal_func int asix_networkmode(_ASIXConfig * nic, int netspeed, int netduplex);
+/*** EndHeader */
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	pld_eth_xcode		resume
+#endif
+
+asix_internal_func
+int asix_networkmode(_ASIXConfig * nic, int netspeed, int netduplex)
+{
+#asm
+		push	ix
+
+		ld		hl, (sp+@SP+nic+2)
+		ld		ix, hl
+
+		; load current setting into bc to start
+
+		; bc = asix_readphy(nic, 0x10, 0);
+		clr	hl
+		push	hl
+		push	0x0010
+		push	ix
+		asix_internal_call(asix_readphy)
+		add	sp, 6
+		; clear lower 7 bits (read as "don't care", need to write as 0)
+		ld		de, 0xFF80
+		and	hl, de
+		ld		bc, hl
+
+._asix_setspeed:
+		ld		hl, (sp+@SP+netspeed+2)
+
+		; if netspeed == 0, set autonegotiation
+		test	hl
+		jr		z, ._asix_autoneg
+
+		; if netspeed == 1, set 10Mbps
+		dec	hl
+		test	hl
+		jr		z, ._asix_10bt
+
+		; if netspeed == 2, set 100Mbps, else ignore invalid speed setting
+		dec	hl
+		test	hl
+		jr		nz, ._asix_setduplex			; invalid speed
+
+._asix_100bt:
+		res	4, b								; clear bit 12 (auto negotiation)
+		set	5, b								; set bit 13 (100Mbps)
+		jr		._asix_noauto
+
+._asix_autoneg:
+		set	4, b								; set bit 12 (auto negotiation)
+		set	1, b								; set bit 9 (restart auto negotiation)
+
+		; clear the autonegotiation disabled flag
+		; flags &= ~ASIX_FLAGS_NOAUTONEG
+		ld		hl, (ix+[nic]+flags)
+		ld		de, ~ASIX_FLAGS_NOAUTONEG
+		and	hl, de
+		ld		(ix+[nic]+flags), hl
+
+		jr		._asix_setduplex
+
+._asix_10bt:
+		res	4, b								; clear bit 12 (auto negotiation)
+		res	5, b								; clear bit 13 (10Mbps)
+
+._asix_noauto:
+		; set the autonegotiation disabled flag
+		ld		hl, (ix+[nic]+flags)
+		ld		de, ASIX_FLAGS_NOAUTONEG
+		or		hl, de
+		ld		(ix+[nic]+flags), hl
+
+._asix_setduplex:
+		ld		hl, (sp+@SP+netduplex+2)
+		; if netduplex == 0 set half duplex
+		test	hl
+		jr		z, ._asix_halfduplex
+
+		; if netduplex == 1, set full duplex, else ignore invalid duplex setting
+		dec	hl
+		test	hl
+		jr		nz, ._asix_setMR0
+
+._asix_fullduplex:
+		set	0, b								; set bit 8 on BC, full duplex
+		jr		._asix_setMR0
+
+._asix_halfduplex:
+		res	0, b								; clear bit 8 on BC, half duplex
+
+._asix_setMR0:
+		; Set MR0 on the phy
+		; asix_writephy(nic, 0x10, 0, [BC])
+		push	bc
+		clr	hl
+		push	hl
+		push	0x0010
+		push	ix
+		asix_internal_call(asix_writephy)
+		add	sp, 8
+
+		pop	ix
+#endasm
+}
+
+#if PLD_ETH_COMPILING == 1
+	#xcodorg	defaultxcode		resume
+#endif
+
+/*** BeginHeader */
+#endif /*__ASIX_LIB*/
+/*** EndHeader */

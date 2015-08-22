@@ -1,0 +1,687 @@
+/*
+ *  Copyright (c) 1996-2009 Digi International Inc., All Rights Reserved
+ *
+ *  This software contains proprietary and confidential information of Digi
+ *  International Inc.  By accepting transfer of this copy, Recipient agrees
+ *  to retain this software in confidence, to prevent disclosure to others,
+ *  and to make no use of this software other than that for which it was
+ *  delivered.  This is an unpublished copyrighted work of Digi International
+ *  Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+ *  prohibited.
+ *
+ *  Restricted Rights Legend
+ *
+ *  Use, duplication, or disclosure by the Government is subject to
+ *  restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+ *  Technical Data and Computer Software clause at DFARS 252.227-7031 or
+ *  subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+ *  Restricted Rights at 48 CFR 52.227-19, as applicable.
+ *
+ *  Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+ *
+ *  R6000 phase-locked loop (PLL) functions
+ *
+ *************************************************************************/
+
+/*** BeginHeader */
+#ifndef __R6K_PLL_H
+#define __R6K_PLL_H
+/*** EndHeader */
+
+/* START LIBRARY DESCRIPTION *********************************************
+
+PLL.LIB
+
+DESCRIPTION:
+	This library has the functions for using the Rabbit 6000
+	Phase Locked Loop (PLL).
+
+   The following functions are needed by the user application if changes
+   to the PLL frequency are to be made, or if the CPU is to be toggled
+   between using the PLL output and the regular clock. They are
+   also called by default in premain() unless
+     PLL_DO_NOT_USE_PLL_BY_DEFAULT
+   is #define'd:
+
+      PLL_Init()
+      PLL_SwitchCPU()
+
+    The following functions are only of interest to users with custom
+    hardware that doesn't use the limited set of PLL input and output
+    frequencies supported by PLL_Init():
+
+    	PLL_setDebugBaudDividers()
+      PLL_setPreDivider()
+      PLL_setLoopDivider()
+
+END DESCRIPTION **********************************************************/
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+
+   PLL_Init                              <PLL.LIB>
+
+SYNTAX:
+	int PLL_Init(int OutputFreqMHz);
+
+DESCRIPTION:
+ This R6000 function enables the PLL and sets up the PLL pre
+ and loop dividers. It also computes, but doesn't set, the proper
+ baud rates divisor for the debugging serial port. Use PLL_SwitchCPU()
+ and FIM_SwitchPLL() to actually switch the CPU or FIMs to use the
+ PLL output for their clocks.
+
+ This function is called by default in premain() unless
+ PLL_DO_NOT_USE_PLL_BY_DEFAULT is #defined.
+
+ Examples:    (Should check return codes also)
+      PLL_SwitchCPU(0); // Switch CPU from PLL to regular clock
+      PLL_Init(300);    // Initalize PLL dividers for 300MHz
+      PLL_SwitchCPU(1); // Switch CPU to use PLL
+
+      // Just toggle CPU between using the PLL and the regular clock
+      PLL_SwitchCPU(0); // Switch CPU to use the regular clock
+      PLL_SwitchCPU(1); // Switch CPU to use PLL
+
+ This function doesn't need to be called again to re-enable the
+ PLL after it has been switched off unless a different PLL output
+ frequency is desired. But you do need to call PLL_SwitchCPU(0)
+ to switch the CPU to use the regular clock PLL if you are going
+ to call this function to change the PLL speed.
+
+ This function is designed as a quick run-time way to determine
+ the best pre-divider and loop divider values for the PLL for
+ a limited set of input frequencies, and a limited set of output
+ frequencies:
+					 Input Freq. MHz  |   Valid Output Frequencies MHz
+					 ---------------------------------------------
+					 20               |   300, 320, 340, 360, 380, 400
+					 25               |   300, 325, 350, 375, 400
+					 40               |   320, 360, 400
+
+ If PLL_PREDIVIDER and PLL_LOOP_DIVIDER are NOT #define'd (which they
+  are not by default), the clock frequency and the input argument for
+  PLL frequency are used to determine the dividers.
+
+ HOWEVER:
+  If PLL_PREDIVIDER and PLL_LOOP_DIVIDER are #define'd, the function
+  ignores the frequency argument and input frequency and just sets the
+  pre-divider and loop divider bits in GCM0R and GCM1R to the defined
+  values, and computes the appropriate debug serial port baud rate
+  divisors. This can be done for custom products with non-standard
+  clock speeds, or to save some code space at the cost of losing
+  binary-image compatibility between boards with different clock speeds.
+
+ NOTES:
+  * The CPU uses PLL OutputFreqMHz/2 if it uses the PLL
+  * The FIMs use PLL OutputFreqMHz if they use the PLL
+
+  Fo(computed) = (L/P) * Fi,  where Fi  is the undivided, undoubled
+                              main CLK frequency, L is the loop divider,
+                              and P is the predivider.
+
+PARAMETER:
+	OutputFreqMHz - The desired frequency in MHz of the PLL output.
+                   (Ignored if PLL_PREDIVIDER and
+                    PLL_LOOP_DIVIDER are #defined)
+
+RETURN VALUE:
+	0  for success,
+  -1  if input or output frequency invalid
+
+SEE ALSO:
+      PLL_SwitchCPU
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader PLL_Init */
+
+	__xmem int PLL_Init(int OutputFreqMHz);
+
+/*** EndHeader */
+
+#if defined PLL_PREDIVIDER ^ defined PLL_LOOP_DIVIDER
+   // If PLL_PREDIVIDER is #define'd, PLL_LOOP_DIVIDER must also be #define'd.
+   // Use of PLL_PREDIVIDER and PLL_LOOP_DIVIDER precludes run-time binary image
+   // compatibility between boards with different clock speeds, but saves code
+   // and constant space.
+   #fatal "PLL_PREDIVIDER and PLL_LOOP_DIVIDER must both be defined or both" \
+          " be undefined."
+#endif
+
+#if defined PLL_PREDIVIDER
+   #if  PLL_PREDIVIDER < 1 || PLL_PREDIVIDER > 15
+      #fatal "PLL_PREDIVIDER must be between 1 and 15 inclusive."
+   #endif
+   #if  PLL_LOOP_DIVIDER < 1 || PLL_LOOP_DIVIDER > 31
+      #fatal "PLL_LOOP_DIVIDER must be between 1 and 31 inclusive."
+   #endif
+
+   // Compute PLL baudrate divider values at compile time to save a lot of code
+   // space. Rounding down before truncation accounts for Rabbit's N+1 dividers.
+   #define PLL19200DIV \
+           (int) (((_CRYSTAL_SPEED_ / PLL_PREDIVIDER) * PLL_LOOP_DIVIDER) \
+                  / (64.0 * 19200.0) - .5)
+   #define PLL57600DIV \
+           (int) (((_CRYSTAL_SPEED_ / PLL_PREDIVIDER) * PLL_LOOP_DIVIDER) \
+                  / (64.0 * 57600.0) - .5)
+   #define PLL115200DIV \
+           (int) (((_CRYSTAL_SPEED_ / PLL_PREDIVIDER) * PLL_LOOP_DIVIDER) \
+                  / (64.0 * 115200.0) - .5)
+#endif
+
+#if !defined PLL_PREDIVIDER
+   #define PLL_LU_ROWSIZE 14
+   // Look-up table for valid PLL output frequencies.
+   const int __far _PLLKij_[] = {
+      300, 320, 340, 360, 380, 400, 0, // 20
+      300, 325, 350, 375, 400,   0, 0, // 25 MHz
+      320, 360, 400, 0                 // 40 MHz
+   };
+
+   // Look-up table for PLL baudrate divider values.
+   const int __far _PLLKfreq_[] = {
+      // Use the last word for both 57.6 and 115.2k divider values. Within each
+      // row, Fout is at offset 0, 19.2K is at offset 2, and (because Rabbit is
+      // little-endian) 57.6K and 115.2K are at offsets 5 and 4, respectively.
+      // Fout,    19.2K,   (57.6K (in MSB) + 115.2K (in LSB))
+      // -----    ------   ----------------------------------
+         300,     243,     (( 80 << 8) + (40)),
+         320,     259,     (( 86 << 8) + (42)),
+         325,     263,     (( 87 << 8) + (43)),
+         340,     276,     (( 91 << 8) + (45)),
+         350,     284,     (( 94 << 8) + (46)),
+         360,     292,     (( 97 << 8) + (48)),
+         375,     304,     ((101 << 8) + (50)),
+         380,     308,     ((102 << 8) + (51)),
+         400,     325,     ((108 << 8) + (53)),
+         0
+   };
+
+#asm __xmem
+_pllGetBauds::
+   	//**** Validate input *****
+      ex    de, hl
+      ld    px, _PLLKfreq_
+.PLL_findFreq:
+      ld    hl, (px)
+      cp    hl, de
+      jr    z, .PLLvalidInput
+      ld    px, px + 6
+      test  hl
+      jr    nz, .PLL_findFreq
+      ld    hl, -1               // NULL terminator hit with no find
+      lret
+
+.PLLvalidInput:
+      // PX points to 3-word row: Fout(@0), 19.2K(@2), 57.6K(@5)+115.2K(@4)
+      ld    hl, (px+2)           // HL = 19.2K rate divider value word
+      ld    (_pll_19200_div), hl
+      ld    hl, (px+5)           // L = 57.6K rate divider value byte
+      ld    h, 0
+      ld    (_pll_57600_div), hl
+      ld    hl, (px+4)           // L = 115.2K rate divider value byte
+      ld    h, 0
+      ld    (_pll_115200_div), hl
+      clr   hl
+      lret
+#endasm
+#endif
+
+#asm __xmem
+PLL_Init::
+#if !defined PLL_PREDIVIDER
+.PLL_CPUnotUsing:
+      ld    de', hl  // save desired PLL output frequency for later
+      lcall _pllGetBauds
+      test  hl       // check result (0 == OK, -1 == invalid PLL out frequency)
+      jr    nz, .pllInitErrorExit
+
+   	/******************************************
+       Now set:
+               C = lowest Loop Divider value
+               B = Row to re-validate output value in _PLLKij_ (+1)
+               D = Pre-divider value
+      ******************************************/
+      ld    c, 15    // 20 MHz setup
+      ld    b, 1
+      ld    d, 1
+      ld    a, (bios_divider19200)
+      cp    32       // reject below 32 * 614400 = 19.6608 MHz
+      jr    c, .pllInitErrorExit
+.pllTest20MHz:
+      cp    34       // accept up to 33 * 614400 = 20.2752 MHz
+      jr    c, .pllLUdone
+.pllTest25MHz:
+      cp    40       // reject below 40 * 614400 = 24.5760 MHz
+      jr    c, .pllInitErrorExit
+      ld    c, 12    // 25 MHz setup
+      ld    b, 2
+      ld    d, 1
+      cp    42       // accept up to 41 * 614400 = 25.1904 MHz
+      jr    c, .pllLUdone
+.pll40MHz:
+      cp    65       // reject below 65 * 614400 = 39.9360 MHz
+      jr    c, .pllInitErrorExit
+      cp    67       // reject above 66 * 614400 = 40.5504 MHz
+      jr    nc, .pllInitErrorExit
+      ld    c, 8     // 40 MHz setup
+      ld    b, 3
+      ld    d, 2
+.pllLUdone:
+
+      // Ensure desired PLL output frequency is valid for PLL input frequency.
+      ld    px, _PLLKij_- PLL_LU_ROWSIZE
+.pllSetLUrow:
+      ld    px,  px + PLL_LU_ROWSIZE
+      djnz  .pllSetLUrow
+
+      ex    de', hl  // recover saved desired PLL output frequency
+      ex    de,  hl
+.PLL_FindFreq2:
+      ld    hl, (px) // PX pts to correct _PLLKij_ row
+      test  hl
+      jr    z, .pllInitErrorExit // NULL terminator hit with no find
+      cp    hl, de
+      jr    z, .PLLvalidInput2
+      ld    px,  px + 2
+      inc   c
+      jr    .PLL_FindFreq2
+
+.PLLvalidInput2:
+#else
+	// PLL_PREDIVIDER & PLL_LOOP_DIVIDER  pre-#define'd
+
+c     _pll_19200_div  = PLL19200DIV;
+c     _pll_57600_div  = PLL57600DIV;
+c     _pll_115200_div = PLL115200DIV;
+
+      ld    c, PLL_LOOP_DIVIDER
+      ld    d, PLL_PREDIVIDER
+#endif
+
+      // Now C = Loop Divider, D = Pre divider
+      ld    L, c
+      lcall  PLL_setLoopDivider
+      ld    L, d
+      lcall  PLL_setPreDivider
+
+      clr   hl
+      lret
+
+.pllInitErrorExit:
+      ld    hl, -1
+      lret
+#endasm
+
+/* START _FUNCTION DESCRIPTION ********************************************
+  PLL_setPreDivider              <PLL.LIB>
+
+SYNTAX:
+    void PLL_setPreDivider(int pdiv)
+
+DESCRIPTION:
+	This function is used internally by PLL_Init(), and is otherwise
+   only useful for users working with custom HW using non-standard PLL
+   input and output frequencies and PLL_setDebugBaudDividers().
+
+   Sets pre-divider for Rabbit 6000 PLL. Does not validate input,
+   which must at least 1, and no more than 10 (in practice it is
+	unlikely to exceed 4 or 5).
+
+PARAMETER:
+   The pre-divider value
+
+RETURN VALUE:
+   None
+
+SEE ALSO:
+	PLL_setLoopDivider, PLL_Init, PLL_SwitchCPU, PLL_setDebugBaudDividers
+
+END DESCRIPTION **********************************************************/
+/*** BeginHeader PLL_setPreDivider */
+	__xmem void PLL_setPreDivider(int pdiv);
+/*** EndHeader */
+#asm __xmem
+PLL_setPreDivider::
+ioi   ld    a, (GCM1R)
+      and   0xF0      // Bits 3:0 used for divider
+      or    L         // L = pdiv
+      ld    (GCM1RShadow), a
+ioi   ld    (GCM1R), a
+      lret
+#endasm
+
+/* START _FUNCTION DESCRIPTION ********************************************
+  PLL_setLoopDivider              <PLL.LIB>
+
+SYNTAX:
+    void PLL_setLoopDivider(int ldiv)
+
+DESCRIPTION:
+	This function is used internally by PLL_Init(), and is otherwise
+   only useful for users working with custom HW using non-standard PLL
+   input and output frequencies and PLL_setDebugBaudDividers().
+
+   Set loop divider for Rabbit 6000 PLL. Does not validate input,
+   which must at least 1, and no more than 20.
+
+PARAMETER:
+    The loop divider value
+
+RETURN VALUE:
+    None
+
+SEE ALSO:
+    PLL_setPreDivider, PLL_Init, PLL_SwitchCPU, PLL_setDebugBaudDividers
+
+END DESCRIPTION **********************************************************/
+/*** BeginHeader PLL_setLoopDivider */
+	__xmem void PLL_setLoopDivider(int ldiv);
+/*** EndHeader */
+#asm __xmem
+PLL_setLoopDivider::
+ioi   ld    a, (GCM0R)
+      and   0xE0      // Bits 4:0 used for loop divider
+      or    L         // L = ldiv
+      ld    (GCM0RShadow), a
+ioi   ld    (GCM0R), a
+      lret
+#endasm
+
+/*** BeginHeader _PLL_enable */
+	__xmem int _PLL_enable(int on);
+/*** EndHeader */
+#asm __xmem
+_PLL_enable::
+ioi   ld    a, (GCDR)
+      and   0x7F          ; Mask out PLL enable bit
+      bool  hl
+      jr    z, .PLLenableSet
+
+ioi   ld 	a, (GCM1R)    ; Disable spread spectrum
+      res   7, a
+ioi   ld 	(GCM1R), a
+      ld 	(GCM1RShadow), a
+
+      ld    a, 0x80       ; Turn off clock doubler & enable PLL
+.PLLenableSet:
+      ld    (GCDRShadow), a
+ioi   ld    (GCDR), a
+      lret
+#endasm
+
+/* START FUNCTION DESCRIPTION ********************************************
+
+   PLL_SwitchCPU                              <PLL.LIB>
+
+SYNTAX:
+	int int PLL_SwitchCPU(int PLLon);
+
+DESCRIPTION:
+ This Rabbit 6000 function sets the CPU to use the PLL output for its
+ clock and loop dividers. PLL_Init() MUST be called once to set up the PLL
+ predivider and loop divider before this function can be called to enable
+ the PLL. This function may be called to ensure the PLL is disabled before
+ PLL_INit() is called.
+
+ PLL_Init() and this function are called by default in premain(), so there
+ is no need for the user application to call them unless the CPU speed
+ will be changed.
+
+ This function has the following side effects:
+   1) It turns off the clock doubler before running the CPU from the PLL,
+      and sets it to its default state when switching the CPU to run from
+      the regular clock.
+   2) It turns off the spectrum spreader before running the CPU from the
+      PLL. It is assumed that this is the default state, so the spreader
+      is left off if the PLL is turned off.
+
+ IMPORTANT NOTE:
+   This function does not enable the FIMs to run using the PLL. If the
+   FIMs are running from the PLL, it is the user's responsibility to
+   switch back to the main clock before disabling the PLL. There is no
+   need to call PLL_Init() just to toggle the CPU between the PLL and the
+   regular clock unless the PLL output frequency is to be changed.
+
+   Example (should check return codes also):
+      PLL_SwitchCPU(0); // Switch CPU to use regular clock
+      PLL_Init(300);    // Initalize PLL dividers to 300 MHz
+      PLL_SwitchCPU(1); // Switch CPU to use PLL
+
+      PLL_SwitchCPU(0); // Switch CPU to use the regular clock
+      PLL_SwitchCPU(1); // Switch CPU to use PLL
+
+PARAMETER:  0 = turn off, non-zero = turn on.
+
+RETURN VALUES:
+           0   Success,
+      -ETIME   if timed out while waiting for PLL to stabilize
+      -EBUSY   CPU already using PLL, must call PLL_SwitchCPU(0)
+               first.
+SEE ALSO:
+      PLL_Init
+END DESCRIPTION *********************************************************/
+
+/*** BeginHeader PLL_SwitchCPU */
+   __xmem int PLL_SwitchCPU(int PLLon);
+   extern unsigned  _pll_19200_div, _pll_57600_div, _pll_115200_div;
+/*** EndHeader */
+
+unsigned  _pll_19200_div, _pll_57600_div, _pll_115200_div;
+
+// Read-only bit 0 in MSSR indicates that the System PLL is
+//  enabled and stable
+#define PLL_SYSTEM_STABLE 1
+
+#asm __xmem
+
+PLL_SwitchCPU::
+      test  hl
+      jr    nz, .PLLswEnable
+
+      ipset 3
+      // Change debug baud rate divider if we're debugging
+ioi   ld    a, (SPCR)
+      and   0x60
+      cp    0x60
+      jr    nz, .PLLnotDebugMode
+      // Set low-speed divider
+      ld    a, (TAT4RShadowOrig)
+ioi   ld    (TAT4R), a
+      ld    (TAT4RShadow), a
+      // Allow baud clock to run down a bit time
+      //  before reenabling serial interrupts
+      ld    bc, 125    ; This is adequate for up to 50MHz
+.PLL_baudDelay1:
+      dwjnz .PLL_baudDelay1
+
+.PLLnotDebugMode:
+      ld    hl, (freq_dividerOrig)  // Clock doubler is factored in
+      ld    (freq_divider), hl
+
+      ld    a,(_pll_GCDR_initial)
+ioi   ld    (GCDR),a
+      ld    (GCDRShadow),a
+
+      // Disconnect CPU from PLL
+ioi	ld		a,(MSCR)
+      res   7,a
+ioi   ld		(MSCR),a
+		; At this point, CPU clock is no longer running off PLL.
+      xor   a
+      ld    (_pll_CPU_usingPLL),a
+
+      // This is needed to ensure that get_cpu_frequency() works correctly
+      //  if it is called soon.
+      ioi   ld (RTC0R), a
+      ioi   ld hl, (RTC0R)
+      ld    (cpuGf_spd_chg), hl
+      clr   hl          ; Return 0 for success
+      ipres
+      lret
+
+.PLLswEnable:
+      ipset	3 				; Critical section
+      ld    a, (_pll_CPU_usingPLL)		; This is a BIOS variable
+      or    a
+      jr    z, .PLL_CPUnotUsing
+      ipres  				; End critical section
+      ld    hl, -EBUSY
+      lret
+
+.PLL_CPUnotUsing:
+      ld    a,1
+      ld    (_pll_CPU_usingPLL), a
+      ipres             ; End critical section, don't want to busy-wait
+									;  for stable PLL with interrupts off
+      lcall	_PLL_enable    ; HL already non-zero
+
+      //**** Busy wait until PLL stable ****
+      ld    bc, 800        ; Busy loop is 22 cycles per pass. Needs typ. 50us,
+.PLLtestStableLoop:        ; max. 150us to stabilize PLL. 800 passes gives about
+									; 440 us @ 40MHz, which is the max. input frequency
+ioi   ld    a, (MSSR)      		; 8   Check for PLL stable
+      and   PLL_SYSTEM_STABLE		; 4
+      jr    nz,.wait_a_bit_longer; 5
+      dwjnz .PLLtestStableLoop   ; 5
+
+      ld    hl, -ETIME     ; Timeout, 800 passes wasn't enough
+      lret
+
+.wait_a_bit_longer:
+		; Just in case PLL spec is marginal, wait a bit longer (500us @ 40MHz)
+		ld    bc, 4000
+.linger:
+		dwjnz	.linger
+
+      ipset 3
+      // Reset freq_divider and debug baud rate
+      ld    hl, (_pll_19200_div)
+      ld    (freq_divider), hl
+#if (_BIOSBAUD_ == 57600)
+      ld    hl, (_pll_57600_div)
+#else
+      ld    hl, (_pll_115200_div)
+#endif
+      // Change debug baud rate divider if we're debugging
+ioi   ld    a, (SPCR)
+      and   0x60
+      cp    0x60
+      jp    nz, .PLLnotDebugMode2
+      xor   a
+ioi   ld    (SADHR), a
+      ld    a, L
+ioi   ld    (TAT4R), a
+      ld    (TAT4RShadow), a
+
+.PLLnotDebugMode2:
+      // Set CPU to use the the PLL
+ioi	ld		a,(MSCR)
+      set   7,a
+ioi   ld		(MSCR),a
+
+      // This is needed to ensure that get_cpu_frequency() works
+      //  correctly if it is called soon.
+      ioi   ld (RTC0R), a
+      ioi   ld hl, (RTC0R)
+      ld    (cpuGf_spd_chg), hl
+
+      // Allow baud clock to run down a bit time
+      // before reenabling serial interrupts
+      ld    bc, 1000    ; This is adequate for up to 400MHz
+.PLL_baudDelay2:
+      dwjnz .PLL_baudDelay2
+
+      clr   hl          ; Return 0 for success
+      ipres
+      lret
+#endasm
+
+/* START _FUNCTION DESCRIPTION ********************************************
+  PLL_setDebugBaudDividers       <PLL.LIB>
+
+SYNTAX:  int PLL_setDebugBaudDividers(int pdiv, int ldiv);
+
+DESCRIPTION:
+   This function is normally needed only by users with custom products
+   using speeds for which the PLL_Init() and its limited set of valid
+   input and output frequencies doesn't provide adequate granularity
+   of control over the PLL. PLL_Init() uses a small look-up table or
+   optionally, pre-#defined PLL pre and loop dividers to save code
+   space.
+
+   If PLL_PREDIVIDER and PLL_LOOP_DIVIDER are #defined, this function
+   is not needed, and PLL_Init() should be called. But if binary image
+   compatibility between (non-standard) boards with differing clock
+   speeds is desired, this function should be used and pre-#defined
+   dividers should not. PLL_DO_NOT_USE_PLL_BY_DEFAULT should also be
+   #define'd to compile-switch out the call to PLL_Init() from premain
+   if using this function.
+
+   The debugger serial port baud divisors must be calculated in order
+   for the debugger to continue working and for freq_divider from which
+   peripheral timing is set to be correct when setting the CPU to use
+   the PLL.
+
+   Example (should check return codes also):
+      PLL_SwitchCPU(0);     // Switch CPU to use the regular clock
+      PLL_setDebugBaudDividers(1,12);
+      PLL_setPreDivider(1);
+      PLL_setLoopDivider(12);
+      PLL_SwitchCPU(1);     // Switch CPU to use the PLL
+      // PLL_Init() should NOT be called in this case!
+
+   Alternatively (should check return codes also):
+      #define PLL_PREDIVIDER 1
+      #define PLL_LOOP_DIVIDER 12
+
+      PLL_SwitchCPU(0);     // Switch CPU  to use the regular clock
+      PLL_Init(whatever);   // Input argument ignored,
+                            // No need to call PLL_setDebugBaudDividers()
+      PLL_SwitchCPU(1);     // Switch CPU to use the PLL
+
+PARAMETERS:
+   pdiv = PLL pre-divider in the range [1,15]
+   ldiv = PLL loop divider in the range [1,31]
+
+RETURN VALUE:
+   0 - Success
+  -1 - invalid input
+
+SEE ALSO:
+   PLL_Init, PLL_SwitchCPU, PLL_setPreDivider, PLL_setLoopDivider
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader PLL_setDebugBaudDividers */
+	int PLL_setDebugBaudDividers(int pdiv, int ldiv);
+/*** EndHeader */
+
+#ifndef	PLL_DO_NOT_USE_PLL_BY_DEFAULT
+ #error "Must #define PLL_DO_NOT_USE_PLL_BY_DEFAULT"
+ #fatal "  if using custom PLL input and output speeds."
+#endif
+
+int PLL_setDebugBaudDividers(int pdiv, int ldiv)
+{
+   if (pdiv < 1 || pdiv > 15 || ldiv < 1 || ldiv > 31)
+   {
+      return -1;
+   }
+
+   // The baud rate divider register value is given by:
+   //
+   //    (int)((CPU_freq/(BaudRate*32) - 1)
+   //
+   // where CPU_freq = PLL_freq/2 = ((ldiv/pdiv)*CRYSTALSPEED)/2
+   // Subtracting .5 before truncating with an (int) cast does the -1 and
+   // proper rounding in one step.
+   _pll_19200_div  = (int)(ldiv*_CRYSTAL_SPEED_/(pdiv*(64.0*19200.0))-0.5);
+   _pll_57600_div  = (int)(ldiv*_CRYSTAL_SPEED_/(pdiv*(64.0*57600.0))-0.5);
+   _pll_115200_div = (int)(ldiv*_CRYSTAL_SPEED_/(pdiv*(64.0*115200.0))-0.5);
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+

@@ -1,0 +1,388 @@
+/*******************************************************************************
+
+R6USBHOST.LIB
+
+   Copyright(c) Digi International  November 2007.
+
+DESCRIPTION:
+*******************************************************************************/
+
+
+/*** BeginHeader  */
+#ifndef _USB_OHCI_H_
+#define _USB_OHCI_H_
+
+
+#define USB_SEMAPHORE_ERROR 333
+
+#define _usbh_debug __debug
+
+#ifndef INT32
+ #define INT32 long
+#endif
+#ifndef UINT32
+ #define UINT32 unsigned long
+#endif
+
+
+#define TX_SEMAPHORE  OS_EVENT*
+
+TX_SEMAPHORE td_list_sem;
+
+#define physical_address_t UINT32
+
+//
+// Sleep interval defines (in millisecond)
+//
+#define MIN_SLEEP_INTERVAL_MS        10UL                           // Mininum sleep interval in milliseconds - DO NOT change
+#define MIN_POWER_STABLE_DELAY_MS    10UL * MIN_SLEEP_INTERVAL_MS    // Minimum power stable delay required by OHCI spec 100 ms
+#define MAX_POWER_STABLE_DELAY_MS    150UL * MIN_SLEEP_INTERVAL_MS   // Maximum power stable delay allowed by USB stack
+#define SWITCH_DEBOUNCE_DELAY_MS     2UL * MIN_SLEEP_INTERVAL_MS     // Delay for connect/disconnect switch debounce to settle
+
+//
+#define USBD_NOERROR             0
+#define USBD_CRC                 1
+#define USBD_BITSTUFFING         2
+#define USBD_DATATOGGLEMISMATCH  3
+#define USBD_STALL               4
+#define USBD_DEVICENOTRESPONDING 5
+#define USBD_PIDCHECKFAILURE     6
+#define USBD_UNEXPECTEDPID       7
+#define USBD_DATAOVERRUN         8
+#define USBD_DATAUNDERRUN        9
+#define USBD_BUFFEROVERRUN       0xC
+#define USBD_BUFFERUNDERRUN      0xD
+#define USBD_NOTACCESSED         0xe
+#define USBD_NOT_DONE           0x13
+#define USBD_CANCELING          0x14
+#define USBD_NORMAL_COMPLETION  USBD_NOERROR
+#define USBD_CANCELED           0x16
+#define USBD_SEM_NAME_LEN       64
+#define USB_REG_BUF_SIZE        1024*2
+
+#define USBTDSIZE 16
+
+// Maximum number of TD's to allocate
+#define MAX_TDS 132
+#define MAX_NUM_TDS MAX_TDS
+
+//#define ALLOC_ED(x) alloc_ed(x)
+//#define ALLOC_TD(x) alloc_td(x)
+//#define FREE_ED(x) free_ed(x);
+//#define FREE_TD(x) free_td(x);
+
+typedef void          (* usbh_write_reg)();
+typedef unsigned long (* usbh_read_reg)();
+
+
+// USB request structure - from OHCI spec
+typedef struct _USBD_REQUEST
+{
+    char Setup[64];            			  // This must be on a 4-byte boundary
+    char __far *Buffer;           				// Pointer to buffer to be transferred
+    UINT32 BufferLength;          		  // Length of data in bytes
+    unsigned long XferInfo;              // Direction (In/Out) for control and bulk
+    UINT32 MaxIntDelay;           		  // Maximum allowable delay
+    UINT32 Status;                	     // Completion status from HCD to USBD
+    USB_LIST_ENTRY  HcdList;             // List of all transfer descriptiors used for this request
+    OS_EVENT *sem;                        // Semaphore to increment when this request is done
+    usbDeviceIrq  completed;             // Routine to call when the request is complete
+    void          __far *device_id;
+    struct _HCD_ENDPOINT __far *ed;        // Endpoint for this request
+    char sem_name[USBD_SEM_NAME_LEN];    // Semaphore name allocated in ohciQueueGeneralRequest
+    unsigned short ShortXferOk;          // True if short transfers are OK
+    unsigned short PeriodicXfer;         // True if request is for a periodic transfer
+    unsigned long numTDs;                // Number of TDs linked to the request
+    void __far * TD[MAX_NUM_TDS];          // Array of TD pointers linked to the request
+    long           timeout;              // This is called from an ISR
+    USB_CALLBACK   callback;             // Callback used in non-blocking mode
+    void           __far *context;         // Parameter passed to callback
+} USBD_REQUEST;
+
+typedef struct _HCD_TRANSFER_DESCRIPTOR
+{
+    UINT32  info;         // This contains the CC, ED, T, DI, DP and R fields
+    UINT32  curBuf;       // Current Buffer Pointer
+    struct _HCD_TRANSFER_DESCRIPTOR __far * nextTd;       // Next TD Pointer
+    UINT32  bufEnd;       // Memory Buffer End Pointer
+    UINT32  TransferCount;
+    UINT32  pad1;
+    UINT32  pad2;
+    USB_LIST_ENTRY    RequestList; // List of interrupt active TDs for this OHCI
+    USBD_REQUEST __far  *request;
+    struct _HCD_ENDPOINT __far * Endpoint;   // Pointer to endpoint for this TD
+
+} HCD_TRANSFER_DESCRIPTOR;
+
+#define OHCI_TD_ROUND   (1UL << 18)   // buffer rounding bit
+#define OHCI_TD_D       (3UL << 19)   // direction of xfer: bison why offset 11?
+#define OHCI_TD_D_IN    (2UL << 19)
+#define OHCI_TD_D_OUT   (1UL << 19)
+#define OHCI_TD_D_SETUP (0UL)
+#define td_set_dir_in(d)        ((d) ? OHCI_TD_D_IN : OHCI_TD_D_OUT)
+#define td_set_dir_out(d)       ((d) ? OHCI_TD_D_OUT : OHCI_TD_D_IN)
+#define OHCI_TD_IOC_DELAY       (7UL << 21)         // frame delay allowed before INT32.
+#define OHCI_TD_IOC_OFF         (OHCI_TD_IOC_DELAY) // no interrupt on complete
+#define OHCI_TD_DT              (3UL << 24)         // data toggle bits
+#define td_force_toggle(b)      (((b) | 2UL) << 24)
+#define OHCI_TD_ERRCNT          (3UL << 26)         // error count
+#define td_errorcount(td)       (((td) >> 26) & 3UL)
+#define OHCI_TD_CC              (0xfUL << 28)       // condition code
+#define OHCI_TD_CC_NEW          (OHCI_TD_CC)        // set this on all unaccessed TDs!
+#define td_cc_notaccessed(td)   ((td >> 28) == 7UL)
+#define td_cc_accessed(td)      ((td >> 28) != 7UL)
+#define td_cc_noerror(td)       (((td) & OHCI_TD_CC) == 0UL)
+#define td_active(td)           (!td_cc_noerror((td)) && (td_errorcount((td)) < 3))
+#define td_done(td)             (td_cc_noerror((td)) || (td_errorcount((td)) == 3))
+
+// TD Completion Codes
+#define CC_NOERROR             0
+#define CC_CRC                 1
+#define CC_BITSTUFFING         2
+#define CC_DATATOGGLEMISMATCH  3
+#define CC_STALL               4
+#define CC_DEVICENOTRESPONDING 5
+#define CC_PIDCHECKFAILURE     6
+#define CC_UNEXPECTEDPID       7
+#define CC_DATAOVERRUN         8
+#define CC_DATAUNDERRUN        9
+#define CC_BUFFEROVERRUN       0xC
+#define CC_BUFFERUNDERRUN      0xD
+#define CC_NOTACCESSED         0xE
+
+//
+// Read a register and re-write it after ANDing with (m)
+//
+//#define OHCI_WRITEMask(a, m) OHCI_WRITE((UINT32)(a), (OHCI_READ((UINT32)(a))) & (UINT32)(m))
+//#define OHCI_WRITEClr(a, m) OHCI_WRITE((UINT32)(a), (OHCI_READ((UINT32)(a))) & ~((UINT32)(m)))
+
+//
+// Read a register and re-write it after ORing with (b)
+//
+//#define OHCI_WRITESet(a, b) OHCI_WRITE((UINT32)(a), (OHCI_READ((UINT32)(a))) | (UINT32)(b))
+
+//
+// Maximum number of endpoints to allocate
+//
+#define MAX_NUM_EDS 130
+
+//
+// The endpoint descriptors also requires 16-byte alignment
+//
+typedef struct _HCD_ENDPOINT
+{
+    UINT32  status;    // MPS, F, K, S, D EN and FA fields
+    UINT32  tailTd;    // TD Queue tail pointer
+    UINT32  headTd;    // TD Queue head pointer
+    UINT32  nextEd;    // Next ED
+    USBD_REQUEST __far *request;
+    UINT32  bandWidth;
+    struct _HCD_ENDPOINT __far *prevEd;
+    struct _HCD_ENDPOINT __far *baseEd;
+    INT32  dir;               // track I/O direction for endpoints with same endpoint number
+    usbDevice  __far *usbDev;       // pointer to instance of usbDevice structure that uses the endpoint
+} HCD_ENDPOINT;
+
+#define OHCI_ED_SKIP        (1UL << 14)
+#define OHCI_ED_MPS         (0x7ffUL << 16)
+#define ED_SET_MAXPACKET(s) (((s) << 16) & OHCI_ED_MPS)
+#define OHCI_ED_F_NORM      (0UL)
+#define OHCI_ED_F_ISOC      (1UL << 15)
+#define ED_SET_TYPE_ISOC(i) ((i) ? OHCI_ED_F_ISOC : OHCI_ED_F_NORM)
+#define OHCI_ED_S_LOW       (1UL << 13)
+#define OHCI_ED_S_HIGH      (0UL)
+#define ED_SET_SPEED(s)     ((s) ? OHCI_ED_S_LOW : OHCI_ED_S_HIGH)
+#define OHCI_ED_D           (3UL << 11)
+#define OHCI_ED_D_IN        (2UL << 11)
+#define OHCI_ED_D_OUT       (1UL << 11)
+#define ED_SET_DIR_IN(d)    ((d) ? OHCI_ED_D_IN : OHCI_ED_D_OUT)
+#define ED_SET_DIR_OUT(d)   ((d) ? OHCI_ED_D_OUT : OHCI_ED_D_IN)
+#define OHCI_ED_EN          (0xfUL << 7)
+#define OHCI_ED_FA          (0x7fUL)
+
+
+//
+// The HCCA (Host Controller Communications Area) is a 256 byte
+// structure defined in the OHCI spec. that the host controller is
+// told the base address of.  It must be 256-byte aligned.
+//
+#define NUM_INTS 32 // part of the OHCI standard
+
+// HCCA Table
+typedef struct _HCCA_BLOCK
+{
+    UINT32    intTable[NUM_INTS]; // Interrupt ED table
+    UINT32    frame_no_pad1;      // current frame number
+    UINT32    doneHead;           // info returned for an interrupt
+    UINT32    reserved[29];
+    UINT32    padding; // There are 4 bytes missing. Total should be 256bytes
+} HCCA_BLOCK;
+
+struct ohci;
+
+//
+// This is the maximum number of root hub ports.  The OHCI spec allows
+// for up to 15.
+//
+#define MAX_ROOT_PORTS  1  // maximum OHCI root hub ports   //BPM 15
+
+
+#define ED_INTERRUPT_1ms   0
+#define ED_INTERRUPT_2ms   1
+#define ED_INTERRUPT_4ms   3
+#define ED_INTERRUPT_8ms   7
+#define ED_INTERRUPT_16ms 15
+#define ED_INTERRUPT_32ms 31
+#define ED_CONTROL        63
+#define ED_BULK           64
+#define ED_ISOCHRONOUS     0
+#define NUM_ED_LISTS       65
+
+#define ohciToUsb(ohci) (&(ohci)->usb)
+#define usbToOhci(usb)  ((HCD_DEVICE_DATA *)(usb)->hcpriv)
+
+
+// OHCI register set
+/* SJH  - commented out since changed to use I/O port numbers directly
+typedef struct _OHCI_REGS
+{
+    UINT32    revision;
+    UINT32    control;
+    UINT32    cmdstatus;
+    UINT32    intrstatus;
+    UINT32    intrenable;
+    UINT32    intrdisable;
+    UINT32    hcca;
+    UINT32    ed_periodcurrent;
+    UINT32    ed_controlhead;
+    UINT32    ed_controlcurrent;
+    UINT32    ed_bulkhead;
+    UINT32    ed_bulkcurrent;
+    UINT32    donehead;
+    UINT32    fminterval;
+    UINT32    fmremaining;
+    UINT32    fmnumber;
+    UINT32    periodicstart;
+    UINT32    lsthresh;
+    struct  ohci_roothub_regs
+    {
+        UINT32    a;
+        UINT32    b;
+        UINT32    status;
+        UINT32    portstatus[MAX_ROOT_PORTS];
+    } roothub;
+} OHCI_REGS;
+*/
+
+#define PORT_CCS    (1UL)         // port current connect status
+#define PORT_PES    (1UL << 1)    // port enable status
+#define PORT_PSS    (1UL << 2)    // port suspend status
+#define PORT_POCI   (1UL << 3)    // port overcurrent indicator
+#define PORT_PRS    (1UL << 4)    // port reset status
+#define PORT_PPS    (1UL << 8)    // port power status
+#define PORT_LSDA   (1UL << 9)    // port low speed dev. attached
+#define PORT_CSC    (1UL << 16)   // port connect status change
+#define PORT_PESC   (1UL << 17)   // port enable status change
+#define PORT_PSSC   (1UL << 18)   // port suspend status change
+#define PORT_OCIC   (1UL << 19)   // port over current indicator chg
+#define PORT_PRSC   (1UL << 20)   // port reset status change
+
+
+//
+// Interrupt register masks
+//
+#define OHCI_INTR_SO    (1UL)
+#define OHCI_INTR_WDH   (1UL << 1)
+#define OHCI_INTR_SF    (1UL << 2)
+#define OHCI_INTR_RD    (1UL << 3)
+#define OHCI_INTR_UE    (1UL << 4)
+#define OHCI_INTR_FNO   (1UL << 5)
+#define OHCI_INTR_RHSC  (1UL << 6)
+#define OHCI_INTR_OC    (1UL << 30)
+#define OHCI_INTR_MIE   (1UL << 31)
+
+//
+// Control register masks
+//
+#define OHCI_USB_OPER       (2UL << 6)
+#define OHCI_USB_SUSPEND    (3UL << 6)
+
+#define OHCI_CTL_PLE        (1UL << 2)
+#define OHCI_CTL_IE         (1UL << 3)
+#define OHCI_CTL_CLE        (1UL << 4)
+#define OHCI_CTL_BLE        (1UL << 5)
+#define OHCI_CTL_IR         (1UL << 8)
+#define OHCI_CTL_RWC        (1UL << 9)
+#define OHCI_CTL_RWE        (1UL << 10)
+#define OHCI_PSM (1UL << 8)
+#define OHCI_NPS (1UL << 9)
+
+//
+// Root hub status masks
+//
+//#define OHCI_LPS       (1UL)
+#define OHCI_LPSC      (1UL << 16)
+
+//
+// USB Host register map
+//
+//#define USB_HOST_CSR                 (UINT32 *)USB_HOST_REG_BASE_ADDRESS
+//#define USB_HOST_IER                 (UINT32 *)(USB_HOST_REG_BASE_ADDRESS + 0x0C)
+//#define USB_HOST_ISR                 (UINT32 *)(USB_HOST_REG_BASE_ADDRESS + 0x10)
+
+//#define OHCI_BLOCK_OFFSET            0x1000
+//#define OHCI_REG_BASE_ADDRESS        USB_HOST_REG_BASE_ADDRESS + OHCI_BLOCK_OFFSET
+
+
+//#define USB_STACK_SIZE               8 * 1024
+//#define USB_OHCI_STACK_SIZE          8 * 1024
+//#define USB_OHCI_THREAD_PRIORITY     3
+
+typedef struct _HCD_DEVICE_DATA
+{
+    //OHCI_REGS       far *regs;           // OHCI register set
+    USB_LIST_ENTRY  interrupt_list;  // List of interrupt active TDs for this OHCI
+    HCCA_BLOCK      __far    *hcca;
+    HCD_ENDPOINT    __far    *pEd[NUM_ED_LISTS];
+    INT32 lastportstatus[MAX_ROOT_PORTS];
+    INT32               reset_ohci;
+    usbDevice       __far *usb;          // USB devices which are connected
+    INT32               countEd;       // The current number of active endpoints
+    INT32               countTd;       // The current number of active TD's
+} HCD_DEVICE_DATA;
+
+//
+//  This is used for keeping the record of how many
+//  EDs were allocated for this usb device.
+//  This information will get used when removing the
+//  EDs from the list.
+//
+typedef struct _HCD_ENDPOINT_DESCRIPTOR
+{
+    unsigned int      nEds;
+    HCD_ENDPOINT __far *ed[32];	//SJH - this was 64 in NDS code, but could only
+    									// conceivably have 32 EDs (16 in+16 out architected by USB)
+} HCD_ENDPOINT_DESCRIPTOR;
+
+
+//
+// This constant determines the method to synchronize access to usbOhciQueueGeneralRequest.
+// If the constant is set to 1, a semaphore is used as a mutex to prevent more than one
+// task from entering the routine.  If the constant is set 0, there is no mutex and the
+// application is reponsible for ensuring serialized access to this routine.
+//
+#define USE_GENERAL_REQUEST_SEMAPHORE    1
+
+//
+// USB devices address range
+//
+#define FIRST_USB_DEVICE_NUMBER    1
+#define MAX_USB_DEVICES          2
+
+/*** EndHeader */
+
+
+/*** BeginHeader  */
+#endif
+/*** EndHeader */
+

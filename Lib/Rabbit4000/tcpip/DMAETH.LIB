@@ -1,0 +1,2082 @@
+/*
+ *    DMAEth.lib
+ *    Copyright (C) 2006 Rabbit Semiconductor. All rights reserved.
+ *
+ *		Packet driver functions for the Rabbit 4000 on-chip Ethernet (via DMA).
+ *    Note that DMA interrupts are NOT required; everything is done in the
+ *    network interrupt.
+ *
+ *
+ */
+
+/*** BeginHeader _DMAEthController */
+#ifndef __DMAETH_LIB
+#define __DMAETH_LIB
+
+// global defines
+#ifdef DMAETH_DEBUG
+	#define _dmaeth_nodebug __debug
+#else
+	#define _dmaeth_nodebug __nodebug
+#endif
+
+// Using an ethernet packet driver.  Define to number of NICs.  Leave this at '1' for now.
+#define USING_DMAETH	1
+
+// Define max number of buffers queued for transmit packets.  Only '1' or '2' supported.
+// 2 gives slightly better performance, but requires an extra buffer (ETH_MAXBUFS setting).
+#ifndef DMAETH_TXQ
+	#define DMAETH_TXQ 2
+#endif
+
+// Define to use PE7/PE5 as activity/link outputs
+//#define DMAETH_ENAB_ACTLINK
+
+#ifndef DMAETH_NET_IP
+	// Interrupt priority for network port A.  This is also used for the DMA transfer priority.
+	#define DMAETH_NET_IP	2
+#endif
+
+// Whether to lower (or raise) IP within network ISR.  Value is the ipset level
+// to use within the ISR.  This may be any value 0..3, however using 0
+// can cause problems with the debug kernel, so 1 is the default.  Setting
+// this equal to DMAETH_NET_IP is most efficient, since it eliminates some
+// code in the ISR.
+#ifndef DMAETH_ENABISR
+	#define DMAETH_ENABISR 1
+#endif
+
+
+#ifndef DMAETH_PPPOE_TIMEOUT
+	#define DMAETH_PPPOE_TIMEOUT 10000
+#endif
+
+#ifndef PKT_POOL_IPSET
+	#define PKT_POOL_IPSET DMAETH_NET_IP
+#endif
+
+#if PKT_POOL_IPSET < DMAETH_NET_IP
+	#fatal "PKT_POOL_IPSET must be >= DMAETH_NET_IP"
+#endif
+
+
+#ifndef DMAETH_RXCHAN
+	#define DMAETH_RXCHAN   6
+#endif
+#ifndef DMAETH_TXCHAN
+	#define DMAETH_TXCHAN   7
+#endif
+
+
+#ifndef DMAETH_INIT_NATCR
+	#define DMAETH_INIT_NATCR 0	// default setting based on CPU speed
+#endif
+#ifndef DMAETH_INIT_NARCR
+	#define DMAETH_INIT_NARCR 0	// default setting based on CPU speed
+#endif
+#ifndef DMAETH_INIT_NACR
+	#define DMAETH_INIT_NACR 0x46		// 0x46: use PE6 clock, auto neg with full-duplex
+#endif
+#ifndef DMAETH_INIT_NAPCR
+	#define DMAETH_INIT_NAPCR 0x20	// 0x20: dual threshold comparators.
+#endif
+
+
+
+#ifdef DMAETH_SUPERDEBUG
+
+	//#define ISRL_BIGREC
+
+   typedef struct {
+   	char	type;
+      #define ISRL_NET_TX  1
+      #define ISRL_NET_RX  2
+      #define ISRL_RXDMA   3
+      #define ISRL_RXFIRE  4
+      #define ISRL_TXFIRE1 5
+      #define ISRL_TXFIRE2 6
+      #define ISRL_RXGET   7  // Get rx buffer
+      #define ISRL_RXMARK  8  // Mark rx buffer
+      #define ISRL_RXFIN   9  // Finish rx buffer
+      #define ISRL_TXFREE  10  // Free Tx buffer
+      #define ISRL_TXGET   11  // Get Tx buffer
+      #define ISRL_NETRET_TX  12 // Return from NET interrupt
+      #define ISRL_NETRET_RX  13 // Return from NET interrupt
+      #define ISRL_RXDATA1 14 // data1 (xmem addr LSBs)
+      #define ISRL_TOSS    15 // packet tossed (because error etc.)
+      #define ISRL_ALLOC_1 16
+      #define ISRL_ALLOC_2 17
+      #define ISRL_ALLOC_3 18
+      #define ISRL_ALLOC_4 19
+      #define ISRL_ALLOC_5 20
+      #define ISRL_ALLOC_6 21
+      #define ISRL_NET_IP  22
+      #define ISRL_ERR_NOBUF  23
+      #define ISRL_ERR_ORUN   24
+      #define ISRL_ERR_ALIGN  25
+      #define ISRL_ERR_CRC 	26
+      #define ISRL_ERR_DMATO  27
+      #define ISRL_F				28
+      #define ISRL_F2			29
+      #define ISRL_ILEN			30	// Inconsistent length (buffer unused calculation vs. received status)
+		#define ISRL_NET			31
+		#define ISRL_NETRET		32
+		#define ISRL_TXFIRE		33
+      #define ISRL_LAST    	34
+      //    Reg		NET		RXDMA		RXFIRE	TXFIRE	RXGET		RXMARK	RXFIN		TXFREE	TXGET
+      //    -----		------	------	------	------	------	------	------	------	------
+      char	reg1;	//	NACSR    NARSR					lastfired									sending	sending
+      char	reg2;	//	NATSR    used(l)	D0L0R		D1L0R								len(lo)				len(lo)
+      char	reg3;	//	NARSR    used(h)	D0L1R		D1L1R								len(hi)				len(hi)
+      char	reg4;	//	last(l) 	         buf(lo)				buf(lo)				buf(lo)	buf(lo)	buf(lo)
+      char	reg5;	//	last(h)				buf(hi)				buf(hi)				buf(hi)	buf(hi)	buf(hi)
+      word	stamp;	// RTC timestamp
+		// Note that RXDMA records may not be completely accurate if the last buffer is very short, since
+      // the interrupts may then overlap.  In such cases, some of the values for the 2nd last buffer
+      // will actually be overwritten with the values for the last buffer before they are stored.
+      #ifdef ISRL_BIGREC
+      word	rxb1;
+      word	rxb2;
+      char	receiving;
+      char	whichrec;
+      char	lastrec;
+      char	resv;
+      #endif
+   } ISRLog;	// Must be exactly 8 bytes
+#endif
+
+/* ***************************************************************************/
+// a struct describing the current R4000 Ethernet configuration, and other control blocks.
+typedef struct {
+	const NetControllerDevice * ncd;
+   word	iface;			// Interface number
+	char	txchannel;			// Transmit DMA channel number (0-7), not equal to receive DMA
+	char	rxchannel;			// Receive DMA channel number (0-7)
+	char	init_natcr;
+	char	init_narcr;
+	char	init_nacr;
+	char	init_napcr;
+
+	word	flags;
+#define DE_FLAGS_FULLDUPLEX			0x0002		// Full duplex mode
+
+   char	sending;				// 1 or 2 if currently sending a packet.  If > 1, then dmaeth_sendpacket()
+   								// will return 1 (failure) because only 2 packets can be queued at a time.
+   char  whichsend;			// Next send buffer to use: 0 for 1st, 1 for 2nd.
+   char  lastfired;			// Last buffer fired off for transmit: 0 for 1st, 1 for 2nd.
+   ll_prefix __far * txbuf;		// Packet buffer prefix(es) of tx packet(s) (only when 'sending').
+   ll_prefix __far * tx2buf;
+   char			txbit;		// Set to 1<<txchannel
+   word			txinitial;	// Pointer to Tx DMA initial address register (I/O addr)
+
+   char	receiving;			// Non-zero if DMA channel (and buffer) allocated for next receive.
+   								// 1 or 2 if a receive buffer (or two) is allocated.
+   char  whichrec;			// Next receive buffer to use: 0 for 1st, 1 for 2nd.
+   char  lastrec;				// Last buffer fired off for receive: 0 for 1st, 1 for 2nd.
+   ll_prefix __far * rxbuf;		// Packet buffer prefix(es) of rx packet(s) (only when 'receiving').
+   ll_prefix __far * rx2buf;
+   word			rxunused;	// Pointer to Rx DMA buffer unused register (I/O addr).  This addr minus 7 is the
+   								// buffer count register.  Note that both these registers are valid in the network
+                           // interrupt, since the final DMA has already occurred.
+   word			rxinitial;	// Pointer to Rx DMA initial address register (I/O addr)
+   char			rxbit;		// Set to 1<<rxchannel
+   word			rxbu;			// (Receive) buffer unused count
+
+	word pd_overruns;
+	word pd_trashed;
+	word pd_toobig;
+	word pd_nobufs;
+
+	// These count ISR types
+	word pd_received;
+	word pd_rx_error;
+	word pd_rxe_orun, pd_rxe_align, pd_rxe_crc;
+	word pd_transmitted;
+	word pd_tx_error;
+	word pd_txe_urun, pd_txe_colls, pd_txe_defer;
+	word pd_jabber;
+	word pd_linkfail;
+	word pd_tot_net;
+
+   unsigned long	txDescPtr;	// Physical addresses of txDesc/tx2Desc (const)
+   unsigned long	tx2DescPtr;
+
+	unsigned long	rxDescPtr;	// Physical address of rxDesc (const).  This is for loading the DMA IAR.
+	unsigned long	rx2DescPtr;	// Physical address of rx2Desc (const).  This is for loading the DMA IAR.
+
+	word		isr_exit_stamp;	// 32kHz RTC stamp when exited net ISR
+	word		rent_count;			// Count of immediate ISR re-entry
+	word		rent_thresh;		// Threshold count of ISR re-entry at which we throttle further
+										// ISR activity until app calls tcp_tick().
+	char pwrstate;					// IF_UP or IF_DOWN (power state)
+
+   // The following fields should NOT be accessed as offsets from IX/IY/HL, since they are
+   // likely to be beyond the 127 max displacement.
+
+	char	hwa[6];			// Shadow copy of current MAC address
+	char	mar[8];			// Shadow copy of current multicast filter
+
+	DMABufDesc12  txDesc;		// Triple b.d. for transmit
+	DMABufDesc12  txDesc2;		//
+	DMABufDesc12  txDesc3;		//
+
+	DMABufDesc12  tx2Desc;		// Another triple b.d. for transmit
+	DMABufDesc12  tx2Desc2;		//
+	DMABufDesc12  tx2Desc3;		//
+
+	DMABufDesc12  rxDesc;	// Buffer descriptor for receive DMA
+
+	DMABufDesc12  rx2Desc;	// Second queued DMA receive descriptor.
+
+
+} _DMAEthConfig;
+
+
+_DMAEthConfig	_decb[USING_DMAETH];	// Instance of _DMAEthConfig in use by the driver (DMA Ethernet Control Block)
+
+extern const NetControllerDevice _DMAEthController;
+
+// These macros are used by net.lib to properly initialize all instances.  Each macro is a C initializer
+// (with trailing comma if not null).  First element points to NetControllerDevice, second is a void
+// pointer which points to the specific state structure for the instance, third field is instance number.
+#define DMAETH_TABLE1  { &_DMAEthController, (void *)_decb, 0 },
+#define DMAETH_TABLE2
+
+#ifdef DMAETH_SUPERDEBUG
+	#define ILOG_SHIFT   1  // Change this if desired (0..5)
+	#define N_ILOG (256u<<ILOG_SHIFT)
+	ISRLog ilog[N_ILOG];
+	word  ilog_idx;
+	ISRLog _ilog;
+	word _nlog[ISRL_LAST];
+#endif
+
+/*** EndHeader */
+
+// Pointer to this is stored in IFTEntry.ncd field - basically, pointers to specific driver functions.
+const NetControllerDevice _DMAEthController =
+{
+	sizeof(_DMAEthConfig)		// sizeof_state
+  ,NCD_POLL|NCD_BCAST|NCD_MCAST		// flags (needs polling to ensure Rx buffer is ready)
+  ,6									// sizeof_hwa
+  ,USING_DMAETH					// instances
+  ,dmaeth_receive					// receive()
+	#pragma nowarn warns
+  ,dmaeth_sendpacket				// sendpacket()
+	#pragma nowarn warns
+  ,dmaeth_ioctl 					// ioctl()
+#ifdef PKTDRV_VERBOSE
+	#pragma nowarn warns
+  ,dmaeth_prt_nicreg				// prtregs()
+#else
+	#pragma nowarn warns
+  ,NULL
+#endif
+	#pragma nowarn warns
+  ,dmaeth_ifctl					// ifctl()
+	#pragma nowarn warns
+};
+
+
+/*** BeginHeader 	dmaeth_resetinterface, dmaeth_receive, dmaeth_ioctl, dmaeth_prt_nicreg */
+
+
+int dmaeth_resetinterface(_DMAEthConfig * nic, word instance, int iface);
+int dmaeth_receive(_DMAEthConfig * nic);
+int dmaeth_ioctl(_DMAEthConfig * nic, int cmd, ...);
+#ifdef PKTDRV_VERBOSE
+void dmaeth_prt_nicreg(_DMAEthConfig * nic);
+#endif
+// The following routines should be called with IP level 2 or higher, and
+// when the network Rx DMA channel is not in use.  They either
+// retain or delete the latest packet in the ethernet buffers.  Then, the
+// next Rx DMA is set up if there is a free buffer.
+// On return, the 'receiving' control block field is set non-zero if the
+// DMA is set up, else 0 if no buffer was available.
+__root void dmaeth_process_rx(void);
+__root void dmaeth_toss_packet(void);
+__root void dmaeth_alloc_rx(void);
+__root void dmaeth_fire_rx(void);
+
+// Fire off transmit DMA
+__root void dmaeth_txfire(void);
+
+/*** EndHeader */
+
+
+
+const DMABufDesc12 _rxDescTemplate =
+	{ 0, 0xA3, MAX_OVERHEAD + MAX_MTU, NADR, 0 }; // Last buffer, no link, internal source, no interrupt,
+   								  // int I/O source, memory dest.
+
+
+
+/****************************************************************************
+  	Ethernet Interrupt Handler
+ ****************************************************************************/
+
+#asm __nodebug
+
+#ifdef DMAETH_SUPERDEBUG
+; We can save some information about the first 255 ISRs.
+write_ilog::
+	push	iy
+   push	de
+   push	af
+   ld		de,(ilog_idx)
+   inc	de
+   bit	ILOG_SHIFT,d
+   jr		nz,.wret
+   ld		(ilog_idx),de
+   dec	de
+   or		a
+   rl		de
+   rl		de
+   rl		de
+#ifdef ISRL_BIGREC
+   rl		de
+#endif
+   ld		iy,ilog
+   add	iy,de
+   push	hl
+   ld		h,0
+   add	hl,hl
+   ld		de,_nlog
+   add	hl,de
+   ld		e,(hl)
+   inc	hl
+   ld		d,(hl)
+   inc	de
+   ld		(hl),d
+   dec	hl
+   ld		(hl),e
+   pop	hl
+   ; Now IY points to ISRLog entry [0..254]
+	ld		(iy+[_ilog]+type),hl		; Save type (L) and reg1 (H)
+   ld		(iy+[_ilog]+reg2),c
+   ld		(iy+[_ilog]+reg3),b
+   ld		hl,(sp+2)		; Get DE saved on stack
+   ld		(iy+[_ilog]+reg4),hl		; Save as reg4 (E) and reg5 (D)
+ioi ld	(RTC0R),a
+ioi ld	hl,(RTC0R)
+	ld		(iy+[_ilog]+stamp),hl
+#ifdef ISRL_BIGREC
+	; assume ix points to dev struct
+	ld		hl,(ix+[_decb]+rxbuf)
+	ld		(iy+[_ilog]+rxb1),hl
+	ld		hl,(ix+[_decb]+rx2buf)
+	ld		(iy+[_ilog]+rxb2),hl
+	ld		hl,(ix+[_decb]+receiving)
+	ld		(iy+[_ilog]+receiving),hl
+	ld		hl,(ix+[_decb]+lastrec)
+	ld		(iy+[_ilog]+lastrec),hl
+
+#endif
+.wret:
+	pop	af
+   pop	de
+   pop	iy
+   ret
+#endif
+#endasm
+
+#asm
+;------
+; Mark the latest received packet as good, and allocate new buffer for
+; next receive DMA.  This is usually called from the Net Rx ISR, but may be
+; called when 'receiving' is not set, in order to allocate the next buffer for
+; receive.
+; IX points to control struct, IY points to buffer to process.
+; AF, BC, DE, HL, IY may be used (others must be preserved)
+
+dmaeth_process_rx::
+   ioi ld hl,(NAC0R)						; Get the network checksum
+   ld		(py+[_llp_]+chksum),hl		; Store it
+   ld		a,CHKSUM_ETHPL
+   ld		(py+[_llp_]+chksum_flags),a	; Mark as ethernet payload (+crc) checksum
+
+   ; Compute received length = (bufsize - buffer unused)
+	ld		hl,(ix+[_decb]+rxbu)
+	ex		de,hl
+   ld		hl,MAX_MTU+MAX_OVERHEAD
+   or		a
+   sbc	hl,de		; HL = length of last buffer
+   ld		(py+[_llp_]+len1),hl
+   ld		b,h
+   ld		c,L		; BC = total length
+#ifdef DMAETH_SUPERDEBUG
+	ld		jkhl,py
+   ex		de,hl
+   ld		l,ISRL_RXFIN	; type in L
+	call	write_ilog
+#endif
+   ld		h,(ix+[_decb]+iface)			; Load interface number into H
+   ld		l,LL_READY					 	; Flags in L
+	ld		e,14								; Length of link-layer header
+   push	ix
+   lcall	_pb_finish		; Enqueue the packet
+   pop	ix
+   ld    hl,(ix+[_decb]+pd_received)
+   inc   hl
+   ld    (ix+[_decb]+pd_received),hl
+   ret
+
+; Allocate the next buffer for receive
+dmaeth_alloc_rx::
+	push	ix
+	exx
+   ex		af,af'
+	push	de
+   push	af
+   ex		af,af'
+   exx
+   lcall	_pb_reserve
+	exx
+   ex		af,af'
+	pop	af
+   pop	de
+   ex		af,af'
+   exx
+   pop	ix
+   jr		nc,.setupRx
+#ifdef DMAETH_SUPERDEBUG
+   ld		l,ISRL_ERR_NOBUF
+	call	write_ilog
+#endif
+   ; None available, just return without setting up DMA
+   ld		hl,(ix+[_decb]+pd_nobufs)
+   inc	hl
+   ld		(ix+[_decb]+pd_nobufs),hl
+   ; Return with Cy set if none.
+   ret
+
+.setupRx:
+#ifdef DMAETH_SUPERDEBUG
+   ld		jkhl,py
+   ex		de,hl
+   ld		l,ISRL_RXGET	; type in L
+	call	write_ilog
+#endif
+	ld		jkhl,py
+   ld		a,(ix+[_decb]+whichrec)
+   or		a
+   jr		z,.dmp_c
+   ld		(ix+[_decb]+rx2buf),jkhl		; Save its address
+   dec	a
+   ld		de,[_decb]+rx2Desc
+   jr		.dmp_d
+.dmp_c:
+   ld		(ix+[_decb]+rxbuf),jkhl		; Save its address
+   ld		de,[_decb]+rxDesc
+   inc	a
+.dmp_d:
+	ld		(ix+[_decb]+whichrec),a
+   ld		hl,ix
+
+   push	hl
+
+   add	hl,de
+   ld		ix,hl				; Temporarily point IX to same place
+   ex		de,hl				; DE points to first buffer descriptor
+
+   ld		hl,_rxDescTemplate
+   ld		bc,12				; 12 byte template
+   ldir						; Copy template
+
+
+   ; IY contains ll_prefix address.  Set up the DMA descriptor based on the xmem buffers
+   ld		jkhl,(py+[_llp_]+data1)
+   ld		(ix+8),jkhl
+
+   pop	ix
+
+   ; Increment receiving count and return with no Cy
+   inc	(ix+[_decb]+receiving)
+   or		a
+   ret
+
+dmaeth_fire_rx::
+	; lastrec indicates last buffer fired off.  Now fire off next one.
+	; If lastrec==0, fire off rx2, else rx1.
+	; And, increment lastrec (mod 2).
+   ld		a,(ix+[_decb]+lastrec)	; 9
+   or		a								; 2
+   jr		nz,.dmp_x					; 5
+   ld		bc,[_decb]+rx2DescPtr	; 6
+#ifdef DMAETH_SUPERDEBUG
+   ld		jkhl,(ix+[_decb]+rx2buf)
+#endif
+   inc	a								; 2
+   jr		.dmp_y						; 5
+.dmp_x:
+   ld		bc,[_decb]+rxDescPtr
+#ifdef DMAETH_SUPERDEBUG
+   ld		jkhl,(ix+[_decb]+rxbuf)
+#endif
+   dec	a
+.dmp_y:
+	ld		(ix+[_decb]+lastrec),a	; 11
+#ifdef DMAETH_SUPERDEBUG
+   ld		py,jkhl
+#endif
+
+   ; Set the initial address registers
+   ld		hl,(ix+[_decb]+rxinitial)	; 9  I/O register address
+   ex		de,hl							; 2
+   ld		hl,ix							; 4
+   add	hl,bc							; 2  HL points to initial address value
+   ld		bc,3							; 6  Physical address length
+;ioi ldir									; 26
+   call  ioi_ldir_func
+   jr		.startRxDMA					; 5
+
+
+;------
+; dmaeth_toss_packet: re-use the same buffer for the
+; next receive DMA.  This is called from Net Rx ISR.
+dmaeth_toss_packet::
+#ifdef DMAETH_SUPERDEBUG
+   ld		l,ISRL_TOSS
+	call	write_ilog
+#endif
+   ld		a,(ix+[_decb]+lastrec)
+   or		a
+   jr		z,.dtp_a
+   ld		jkhl,(ix+[_decb]+rx2buf)
+   jr		.dtp_b
+.dtp_a:
+   ld		jkhl,(ix+[_decb]+rxbuf)
+.dtp_b:
+   ; Reset the received length field to zero
+   ld		py,jkhl
+   clr	hl
+   ld		(py+[_llp_]+len1),hl
+
+.startRxDMA:
+	; Fire off the DMA, ready for next packet.  Initial address does not need reloading.
+#ifdef DMAETH_SUPERDEBUG
+	ld		jkhl,py
+   ex		de,hl
+   ld		l,ISRL_RXFIRE	; type in L
+	call	write_ilog
+   ld		bcde,(py+[_llp_]+data1)
+   ld		l,ISRL_RXDATA1	; type in L
+	call	write_ilog
+#endif
+
+   ld		a,(ix+[_decb]+rxbit)		; 9
+ioi ld	(DMALR),a					; 11 Start using auto-load.
+											; Auto load transfers 12 bytes with 11 clocks overhead = 35 clocks.
+                                 ; Total clocks from ISR entry to next Rx DMA ready:
+                                 ; 248+127+35=410 = 27.9us @ 14.7MHz
+
+	ret
+
+
+
+; This is called from dmaeth_sendpacket.  Also called from
+; Net ISR when there is a queued second packet to transmit.
+dmaeth_txfire::
+	; IX points to DMAETH control block
+#if DMAETH_TXQ > 1
+   ld		a,(ix+[_decb]+lastfired)
+   xor	1
+   ld    (ix+[_decb]+lastfired),a
+   or		a
+   jr		nz,.send1
+   ld		hl,[_decb]+txDescPtr
+   jr		.send0
+.send1:
+   ld		hl,[_decb]+tx2DescPtr
+.send0:
+	ex		de,hl
+   #else
+   ld		de,[_decb]+txDescPtr
+   #endif
+   ld		hl,ix
+   add	hl,de
+   ex		de,hl
+	; copy 3 bytes from memory to appropriate internal register
+	ld		hl,(ix+[_decb]+txinitial)
+   ex		de,hl		; DE points to initial address register
+   ld		bc,3		; Length of IAR
+   ;ioi	ldir
+   call  ioi_ldir_func
+
+	#ifdef DMAETH_SUPERDEBUG
+	   ld    bc,0      ; Get length into BC (not known, need to add it up)
+   ld    h,(ix+[_decb]+lastfired)
+	   ld    l,ISRL_TXFIRE  ; type in L
+	   call  write_ilog
+	#endif
+
+   ld		a,(ix+[_decb]+txbit)
+   ioi ld (DMALR),a			; Fire it off
+   ret
+
+;------------------------------------------------------------------------------
+; Network interrupt handler.
+;------------------------------------------------------------------------------
+netport_isr::
+	push	af				; 10
+	push	bc				; 10
+	push	ix				; 12
+   push	de				; 10
+   push	iy				; 12
+   ld		ix,_decb		; 8
+
+	; also preserve these if in this assembler mode, since they are trashed in
+	; some of the packet driver routines.
+	push	jkhl
+   ld		hl, lxpc
+   push	hl
+   push	px
+   push	py
+   push	pz
+
+	ioi ld	(RTC0R),a
+	ioi ld	hl,(RTC0R)
+	; Lower priority
+	ld		a,0xFC
+	ioi ld (NACSR),a	; Disable further network interrupts
+#if DMAETH_ENABISR != DMAETH_NET_IP
+	push ip
+	ipset DMAETH_ENABISR
+#endif
+
+	ex		de,hl
+	ld		hl,(ix+[_decb]+isr_exit_stamp)
+	cp		hl,de
+	jr		nz,.reset_rc
+	ld		hl,(ix+[_decb]+rent_count)
+	inc	hl
+	ld		(ix+[_decb]+rent_count),hl
+	jr		.cont00
+.reset_rc:
+	bool	hl
+	ld		l,h
+	ld		(ix+[_decb]+rent_count),hl
+.cont00:
+   ld		hl,(ix+[_decb]+pd_tot_net)	; 9
+   inc	hl									; 2
+   ld		(ix+[_decb]+pd_tot_net),hl	; 11
+
+
+ioi ld	a,(NACSR)			; 11
+
+#ifdef DMAETH_SUPERDEBUG
+ioi ld	bc,(NATSR)		; Get NATSR in C, NARSR in B
+	ld		h,a				; Save NACSR in H
+   ld		l,ISRL_NET		; type in L
+	call	write_ilog
+#endif
+
+
+	bit	7,a					; 4
+   jp		z,.test_rx_error	; 5
+   ; Received packet OK
+   push	af						; 10
+
+   ; The Net ISR gets triggered by EFD, but the DMA may still be emptying out the
+   ; FIFO.  Wait here for the DMA to complete.  If this is not done, then data may
+   ; be lost.  It is possible for the DMA bit to get stuck if 3 or more packets come
+   ; in quick succession.  To handle this case, we also set a timeout.
+   ld		de,512
+   ld		hl,DMCSR
+.wait01:
+   dec	de
+	ld		a,d
+   or		e
+   jr		z,.dmato				; timeout waiting, missed packet
+	ioi   ld a,(hl)
+   and	(ix+[_decb]+rxbit)
+   jr		nz,.wait01
+.donewait:
+
+   ; Get buffer unused and buffer counts ASAP and cache them
+	ld		hl,(ix+[_decb]+rxunused)	; 9
+ioi ld	hl,(hl)				; 13
+	ld		(ix+[_decb]+rxbu),hl ; 11
+   ; Fire off DMA for next packet if we have one
+   ld		a,(ix+[_decb]+receiving)
+   or		a
+   jr		nz,.cont23			; 5  Skip if vlid arrival.
+
+   ; Got packet, but had no outstanding DMA to receive it.
+#ifdef DMAETH_SUPERDEBUG
+   ld		l,ISRL_ALLOC_1
+	call	write_ilog
+#endif
+   call	dmaeth_alloc_rx
+   jr		c,.cont22			; bail right out, go process tx if no buffers available
+   call	dmaeth_fire_rx		; fire off newly allocated (1st and only)
+   jr		.cont24				; then try allocating another to keep the rx queue ready
+
+
+.cont23:
+	; 'receiving' was set, so we have a packet which just arrived, to process.
+   dec	a
+   ld		(ix+[_decb]+receiving),a	; one less available
+
+   ld		a,(ix+[_decb]+lastrec)
+	; Get the appropriate buffer to process
+   or		a
+   jr		z,.dmp_a
+	ld		jkhl,(ix+[_decb]+rx2buf)
+   jr		.dmp_b
+.dmp_a:
+	ld		jkhl,(ix+[_decb]+rxbuf)
+.dmp_b:
+
+   push	jkhl									; save current packet completed
+	; test whether 'receiving' was decremented to zero...
+	ld		a,(ix+[_decb]+receiving)
+	or		a
+   jr		nz,.cont20			; 5 - jump if it is not zero, i.e. it was 2
+	; yes, receiving was 1, therefore we need to immediately allocate a new rx buffer and fire it off.
+   ; Otherwise, there was already one ready, so just fire it off.
+#ifdef DMAETH_SUPERDEBUG
+   ld		l,ISRL_ALLOC_2
+	call	write_ilog
+#endif
+	call	dmaeth_alloc_rx
+   jr		c,.cont21
+.cont20:
+   call	dmaeth_fire_rx
+.cont21:
+	pop	py						; get current packet completed
+	call	dmaeth_process_rx	; and process it (i.e. pass to tcp/ip stack)
+   ; If receiving is currently <=1, allocate next packet (but don't fire)
+   ld		a,(ix+[_decb]+receiving)
+	cp		2
+   jr		nc,.cont22
+.cont24:
+#ifdef DMAETH_SUPERDEBUG
+   ld		l,ISRL_ALLOC_3
+	call	write_ilog
+#endif
+   call	dmaeth_alloc_rx
+.cont22:
+   pop	af						; restore NACSR value
+   jr		.test_tx_ok
+
+.dmato:
+	; Get here if got net interrupt, but DMA failed to complete.
+#ifdef DMAETH_SUPERDEBUG
+   ld		l,ISRL_ERR_DMATO
+	call	write_ilog
+#endif
+	jr		.rxe3
+
+.test_rx_error:
+	bit	6,a
+   jr		z,.test_tx_ok
+   ; Received packet in error.  Check NARSR for details
+   push	af
+   ld		hl,(ix+[_decb]+pd_rx_error)
+   inc	hl
+   ld		(ix+[_decb]+pd_rx_error),hl
+
+ioi ld	a,(NARSR)
+	bit	4,a
+   jr		z,.rxe1
+   ld		hl,(ix+[_decb]+pd_rxe_orun)
+   inc	hl
+   ld		(ix+[_decb]+pd_rxe_orun),hl
+#ifdef DMAETH_SUPERDEBUG
+   ld		l,ISRL_ERR_ORUN
+	call	write_ilog
+#endif
+   jr		.rxe3
+.rxe1:
+	bit	5,a
+   jr		z,.rxe2
+   ld		hl,(ix+[_decb]+pd_rxe_align)
+   inc	hl
+   ld		(ix+[_decb]+pd_rxe_align),hl
+#ifdef DMAETH_SUPERDEBUG
+   ld		l,ISRL_ERR_ALIGN
+	call	write_ilog
+#endif
+   jr		.rxe3
+.rxe2:
+	bit	6,a
+   jr		z,.rxe3
+   ld		hl,(ix+[_decb]+pd_rxe_crc)
+   inc	hl
+   ld		(ix+[_decb]+pd_rxe_crc),hl
+#ifdef DMAETH_SUPERDEBUG
+   ld		l,ISRL_ERR_CRC
+	call	write_ilog
+#endif
+.rxe3:
+   ld		a,(ix+[_decb]+receiving)
+   or		a
+   jr		z,.cont29				; 5  Skip if no outstanding rx.
+	call	dmaeth_toss_packet	; This basically just restarts the DMA
+	jr		.cont30
+   ld		a,(ix+[_decb]+receiving)
+.cont29:
+	; receiving was <2, therefore we need to allocate a new rx buffer.
+#ifdef DMAETH_SUPERDEBUG
+   ld		l,ISRL_ALLOC_4
+	call	write_ilog
+#endif
+	call	dmaeth_alloc_rx
+	jr		c,.cont30
+   ;ld		a,(ix+[_decb]+receiving)
+   ;cp		2
+   ;jr		nc,.cont30
+   call	dmaeth_fire_rx
+
+
+.cont30:
+   pop	af
+
+.test_tx_ok:
+	ld		b,0				; Assume don't need to clean up aborted Tx DMA
+	bit	5,a
+   jr		z,.test_tx_error
+   ; Transmitted packet OK
+   ld		hl,(ix+[_decb]+pd_transmitted)
+   inc	hl
+   ld		(ix+[_decb]+pd_transmitted),hl
+   jp		.netTxDMA_free
+
+.test_tx_error:
+	bit	4,a
+   jr		z,.test_jabber
+   ; Transmitted packet in error.  Check NATSR for details
+   ld		b,1						; Signal need to clean up aborted Tx DMA
+   push	af
+   ld		hl,(ix+[_decb]+pd_tx_error)
+   inc	hl
+   ld		(ix+[_decb]+pd_tx_error),hl
+ioi ld	a,(NATSR)
+	bit	4,a
+   jr		z,.txe1
+   ld		hl,(ix+[_decb]+pd_txe_urun)
+   inc	hl
+   ld		(ix+[_decb]+pd_txe_urun),hl
+   jr		.txe3
+.txe1:
+	bit	5,a
+   jr		z,.txe2
+	ld		b,1		; Reset aborted Tx DMA due to 16 collisions
+   ld		hl,(ix+[_decb]+pd_txe_colls)
+   inc	hl
+   ld		(ix+[_decb]+pd_txe_colls),hl
+   jr		.txe3
+.txe2:
+	ld		b,0		; For deferred Tx, don't reset Tx DMA
+	bit	6,a
+   jr		z,.txe3
+   ld		hl,(ix+[_decb]+pd_txe_defer)
+   inc	hl
+   ld		(ix+[_decb]+pd_txe_defer),hl
+.txe3:
+	pop	af
+
+.test_jabber:
+	bit	2,a
+   jr		z,.ret
+   ld		b,1						; Signal need to clean up aborted Tx DMA
+   ; In this case, either link fail for jabber.  If the latter, then
+   ; also need to reset the network port.
+ioi ld	a,(NASR)
+	rra
+   jr		c,.jabber
+   ; Just link fail
+   ld		hl,(ix+[_decb]+pd_linkfail)
+   inc	hl
+   ld		(ix+[_decb]+pd_linkfail),hl
+   jr		.ret
+.jabber:
+   ; Jabber the hut is transmitting
+   ld		hl,(ix+[_decb]+pd_jabber)
+   inc	hl
+   ld		(ix+[_decb]+pd_jabber),hl
+	ld a, 0x00
+   ioi ld (NATCR), a    ; disable transmitter
+	ld a, 0xC0
+   ioi ld (NARR), a     ; reset transmitter
+	ld a, 0x80
+   ioi ld (NATCR), a    ; enable transmitter
+.ret:
+	; Test for need to clean up aborted DMA (B==1)
+   djnz	.no_cleanup
+   ; Halt the current DMA
+   ld		a,(ix+[_decb]+txbit)
+ioi ld	(DMHR),a
+
+   ; Reset Net if Tx error
+	ld a, 0x00
+	ioi ld (NATCR), a    ; disable transmitter
+   ld		a,0x80    		; Reset Tx
+	ioi ld	(NARR),a		; Tx should be in "idle state".
+	ld a, 0x80
+	ioi ld (NATCR), a    ; enable transmitter
+
+.netTxDMA_free:
+   ld		a,(ix+[_decb]+sending)
+   or		a
+   jr		z,.no_cleanup
+
+   dec	(ix+[_decb]+sending)	; Not sending this one any more.
+   ; We test this again at end to see if there is a pending further transmit
+
+   ; Return buffer to packet buffer pool
+	ld		jkhl,(ix+[_decb]+txbuf)
+#if DMAETH_TXQ > 1
+	ld		a,(ix+[_decb]+lastfired)
+   or		a
+   jr		z,.fired1
+	ld		jkhl,(ix+[_decb]+tx2buf)
+.fired1:
+	#endif
+   ld		py,jkhl
+
+#ifdef DMAETH_SUPERDEBUG
+   ex		de,hl
+   ld		h,(ix+[_decb]+sending)
+   ld		l,ISRL_TXFREE		; type in L
+	call	write_ilog
+#endif
+
+#if DMAETH_TXQ > 1
+	push	ix
+   lcall	_pb_free
+   pop	ix
+
+   ld		a,(ix+[_decb]+sending)
+   or		a
+   jr		z,.no_cleanup
+
+   ; Another queued packet to send.  Fire it off.
+   call	dmaeth_txfire
+#else
+	push	ix
+   lcall	_pb_free
+   pop	ix
+#endif
+
+.no_cleanup:
+#ifdef DMAETH_SUPERDEBUG
+   ld		l,ISRL_NETRET
+	call	write_ilog
+#endif
+
+	ld		hl,(ix+[_decb]+rent_count)
+	ex		de,hl
+	ld		hl,(ix+[_decb]+rent_thresh)
+	cp		hl,de			; Cy set if rent_count > rent_thresh
+	jr		nc,.normal_exit
+#if DMAETH_ENABISR != DMAETH_NET_IP
+	pop	ip
+#endif
+	; Back to IP 2, but guaranteed no pending interrupt.  This path ensures
+	; that another network interrupt will not be handled until the application
+	; (via tcp_tick()) has had a chance to run.  tcp_tick() is responsible
+	; for re-enabling network interrupts by setting NACSR appropriately.
+	jr		.isr_exit
+
+.normal_exit:
+
+	; Raise priority
+#if DMAETH_ENABISR != DMAETH_NET_IP
+	pop ip
+#endif
+	; Now back to normal ipset level; reinstate normal net ISR handling
+	ld		a,0xFC+DMAETH_NET_IP
+	ioi ld (NACSR),a
+.isr_exit:
+
+
+	ioi ld	(RTC0R),a
+	ioi ld	hl,(RTC0R)
+	ld		(ix+[_decb]+isr_exit_stamp),hl
+
+	pop	pz
+   pop	py
+   pop	px
+   pop	hl
+   ld		lxpc, hl
+   pop	jkhl
+   pop	iy
+   pop	de
+	pop	ix
+	pop	bc
+	pop	af
+	ipres
+	ret
+
+
+
+#endasm
+
+/* **************************************************************************/
+
+
+_dmaeth_nodebug void dmaeth_init(_DMAEthConfig * nic, char *EthAddress)
+{
+#ifdef DMAETH_VERBOSE
+	printf("DMAETH: dmaeth_init()\n");
+#endif
+
+	// set up global DMA settings
+   //FIXME: need global DMA manager
+	WrPortI(DMCR, NULL, 0);		// DMA transfer and interrupt priority: disabled
+	//WrPortI(DMTCR, NULL, 0x38);	// fixed channel priority, max 64 bytes/burst,
+	   							  		//		min 12 clocks betw. bursts
+	//WrPortI(DMTCR, NULL, 0x20);	// fixed channel priority, max 8 bytes/burst,
+	   							  		//		min 12 clocks betw. bursts
+	//WrPortI(DMTCR, NULL, 0x10);	// fixed channel priority, max 3 bytes/burst,
+	   							  		//		min 12 clocks betw. bursts
+	//WrPortI(DMTCR, NULL, 0xB0);	// rotate per byte, max 32 bytes/burst,
+	   							  		//		min 12 clocks betw. bursts
+	WrPortI(DMTCR, NULL, 0x30);	// fixed pri, max 32 bytes/burst,
+	   							  		//		min 12 clocks betw. bursts
+	nic->rxDescPtr  = paddr(&nic->rxDesc);
+	nic->rx2DescPtr  = paddr(&nic->rx2Desc);
+   nic->txDescPtr = paddr(&nic->txDesc);
+   nic->tx2DescPtr = paddr(&nic->tx2Desc);
+   nic->rxunused = D0BU0R + (nic->rxchannel<<4);	// Appropriate buffer unused reg address
+   nic->rxinitial = D0IA0R + (nic->rxchannel<<4);	// Appropriate initial address reg address
+   nic->txinitial = D0IA0R + (nic->txchannel<<4);	// Appropriate initial address reg address
+   nic->rxbit = 1<<nic->rxchannel;						// A bit setting (used to start DMA channel)
+   nic->txbit = 1<<nic->txchannel;						// A bit setting (used to start DMA channel)
+
+	// Allocate channels to prevent reallocation
+	DMAalloc(nic->txbit, 1);
+	DMAalloc(nic->rxbit, 1);
+
+   #ifdef DMAETH_ENAB_ACTLINK
+	// enable ACTV and LINK lights (PE7, PE5, active low)
+   WrPortI(PEDDR, &PEDDRShadow, PEDDRShadow | 0xA0);
+   WrPortI(PEFR, &PEFRShadow, PEFRShadow | 0xA0);
+	WrPortI(PEAHR, &PEAHRShadow, PEAHRShadow & ~0xCC | 0x44);
+   #endif
+
+   dmaeth_sethwaddr(nic, EthAddress);
+   dmaeth_setmar(nic);
+
+}
+
+static const _DMAEthConfig _dmaeth_config[USING_DMAETH] =
+{
+	{
+	   &_DMAEthController        	// ncd
+	  ,0                          // iface
+     ,DMAETH_TXCHAN					// txchannel
+     ,DMAETH_RXCHAN					// rxchannel
+     ,DMAETH_INIT_NATCR
+     ,DMAETH_INIT_NARCR
+     ,DMAETH_INIT_NACR
+     ,DMAETH_INIT_NAPCR
+	}
+};
+
+
+
+/* **************************************************************************/
+
+/*
+ * Reset Network port A
+ */
+_dmaeth_nodebug int dmaeth_hardwarereset(_DMAEthConfig * nic)
+{
+#ifdef DMAETH_VERBOSE
+	printf("DMAETH: dmaeth_hardwarereset()\n");
+#endif
+	//FIXME: need to wait for last transmit DMA to finish, but no longer than 2ms.
+	WrPortI(NATCR, NULL, 0x00);	// disable transmitter
+	WrPortI(NARCR, NULL, 0x00);	// disable receiver
+	WrPortI(NARR, NULL, 0xF0);		// reset network port, purge FIFO
+
+	nic->rent_thresh = 1;
+	nic->rent_count = 0;
+	nic->pwrstate = IF_UP;
+	_if_tab[nic->iface].lnk = 1;
+
+	if (nic->init_natcr)
+		WrPortI(NATCR, NULL, nic->init_natcr);
+	else
+	WrPortI(NATCR, NULL, 0xC0);	// enable transmitter, fast FIFO
+	//WrPortI(NATCR, NULL, 0x80);	// enable transmitter, slow FIFO
+
+	if (nic->init_narcr)
+		WrPortI(NARCR, NULL, nic->init_narcr);
+	else
+		WrPortI(NARCR, NULL, 0xC6);	// enable receiver, fast FIFO, accept b'cast, m'cast and unicast
+
+	// Other alternatives...
+	//WrPortI(NARCR, NULL, 0x9F);	// enable receiver, accept EVERYTHING
+	//WrPortI(NARCR, NULL, 0xC4);	// enable receiver, fast FIFO, accept b'cast and unicast
+	//WrPortI(NARCR, NULL, 0x86);	// enable receiver, slow FIFO, accept b'cast, m'cast and unicast
+	//WrPortI(NARCR, NULL, 0x84);	// enable receiver, slow FIFO, accept b'cast and unicast
+
+	WrPortI(NACR, NULL, nic->init_nacr);
+	//WrPortI(NACR, NULL, 0x42);		// use PE6 clock, force full-duplex
+	//WrPortI(NACR, NULL, 0x82);		// use system clock, force full-duplex
+
+   // If PE6 is being used as the Ethernet clock input, then set PE6 to be an
+   // input
+   if ((nic->init_nacr & 0xc0) == 0x40) {
+   	BitWrPortI(PEDDR, &PEDDRShadow, 0, 6);
+   }
+
+	WrPortI(NAPCR, NULL, nic->init_napcr);
+	// return success
+	return 0;
+}
+
+/*
+ * Setup the interrupt vectors
+ */
+_dmaeth_nodebug int dmaeth_setupinterrupts(_DMAEthConfig *rt)
+{
+#ifdef DMAETH_VERBOSE
+	printf("DMAETH: setupinterrupts()\n");
+#endif
+   WrPortI(NACSR, NULL, 0x00);	// Disable interrupts for now.
+#ifdef DMAETH_SUPERDEBUG
+	ilog_idx = 0;
+#endif
+	// set up Network Port interrupt vectors
+   SetVectIntern(0x1E, netport_isr);
+
+   return 0;
+}
+
+
+/**
+ *    dmaeth_resetinterface()
+ * 	Main resetting function for packet driver.  Gets the network port in shape,
+ * 	complete with a MAC address (physical).
+ *
+ *		Returns 0 on success, non-zero on error.
+ */
+
+
+_pktdrv_debug
+__nouseix int dmaeth_resetinterface(_DMAEthConfig * nic, word instance, int iface)
+{
+	auto int	i, j;
+   auto int st_reg;
+   auto unsigned long timeout;
+   auto longword timer;
+
+   if (instance >= USING_DMAETH)
+   	return -6;	// No such instance
+
+	memcpy(nic, _dmaeth_config + instance, sizeof(*nic));
+   nic->iface = iface;
+   nic->lastfired = 1;
+   nic->lastrec = 1;
+
+#ifdef DMAETH_FULLDUPLEX
+	nic->flags |= DE_FLAGS_FULLDUPLEX;
+#endif
+
+	dmaeth_hardwarereset(nic);
+
+	dmaeth_setupinterrupts(nic);
+
+	/*
+	 * Setup the NIC address
+	 */
+	j = 0;
+	for (i=0; i<6; i++) {
+		nic->hwa[i] = SysIDBlock.macAddr[i];
+		j |= nic->hwa[i];
+	}
+
+	// is ID block's MAC address zero?
+	if (!j) {
+	   // Fake it if no ID block
+	   //memcpy(nic->hwa, "\x00\x99\x88\x77\x66\x55", 6);
+		exception(-ERR_INVALIDMACADDR);
+		return -5;
+	}
+	/*
+	 * Write out the NIC address and multicast filter (all zeros) to the device
+	 */
+   memset(nic->mar, 0, sizeof(nic->mar));
+	dmaeth_init(nic, nic->hwa);
+
+   // Allocate the first receive buffer
+   #asm
+   push  ix
+   ld    ix,(sp+@sp+nic+2)
+#ifdef DMAETH_SUPERDEBUG
+   ld		l,ISRL_ALLOC_5
+	call	write_ilog
+#endif
+   call dmaeth_alloc_rx
+   jr		c,.cont1
+   call dmaeth_fire_rx
+.cont1:
+   pop   ix
+   #endasm
+
+
+#if (USING_PPPOE)
+
+   // Wait for the network interface to complete auto-neg and have link.
+   st_reg = RdPortI(NASR);
+   timeout = MS_TIMER + DMAETH_PPPOE_TIMEOUT;
+   while((st_reg & 0x13) != 0x12)
+   {
+   	// Wait for a valid link
+		if((long) (MS_TIMER-timeout) >= 0 )
+      	break;
+      st_reg = RdPortI(NASR);
+   }
+	// Check for link, then wait for 1 second for network port to become ready
+   if((st_reg & 0x13) == 0x12)
+   {
+ 		timer = _SET_SHORT_TIMEOUT(1000);
+ 		while (!_CHK_SHORT_TIMEOUT(timer));
+   }
+#endif
+
+	// Clear status before enabling interrupts
+   RdPortI(NACSR);
+   RdPortI(NARSR);
+   RdPortI(NATSR);
+
+   nic->isr_exit_stamp = (word)MS_TIMER-1;
+   // Enable the network interrupt
+   WrPortI(NACSR, NULL, 0xFC+DMAETH_NET_IP); // All interrrupts serviced.
+
+ 	// DMA transfer priority the same as net interrupt.  Net DMAs do not use interrupts.
+ 	WrPortI(DMCR, NULL, DMAETH_NET_IP<<2);
+
+	// return success!
+	return 0;
+}
+
+/* **************************************************************************/
+
+
+_dmaeth_nodebug int dmaeth_receive(_DMAEthConfig * nic)
+{
+	// For the R4000 ethernet, this is basically a dummy function because receive processing
+   // is interrupt-driven (i.e. we don't need to poll an external device).
+   // Thus, we always return '1' (no new packet).
+
+   // There is, however, one thing we need to do: If the 'receiving' field in _decb is
+   // not set, then no Rx DMA buffer has been allocated.  We see to it here that
+   // one is ready to go.  This happens at startup, and if a buffer could not be allocated
+   // previously, for some reason.
+
+   // Re-enable network interrupts
+   WrPortI(NACSR, NULL, 0xFC + DMAETH_NET_IP);
+
+   if (nic->receiving < 2) {
+#ifdef DMAETH_VERBOSE
+		if (debug_on > 3)
+			printf("DMAETH: allocating Rx buffer\n");
+#endif
+		#asm
+      push	ix
+      ld		ix,(sp+@sp+nic+2)
+      ipset	DMAETH_NET_IP
+      ; Test again now that disabled, to avoid possible race
+      ld		a,(ix+[_decb]+receiving)
+      cp		2
+      jr		nc,.cont1
+#ifdef DMAETH_SUPERDEBUG
+   ld		l,ISRL_ALLOC_6
+	call	write_ilog
+#endif
+		call dmaeth_alloc_rx
+      jr		c,.cont1
+      ld		a,(ix+[_decb]+receiving)
+      cp		2
+      jr		nc,.cont1		; only fire off the first!
+      call dmaeth_fire_rx
+.cont1:
+		ipres
+      pop	ix
+      #endasm
+   }
+   return 1;
+}
+
+
+_pktdrv_debug int dmaeth_ioctl(_DMAEthConfig * nic, int cmd, ...)
+{
+	auto char * stack;
+
+   stack = (char *)(&cmd + 1);
+	switch (cmd) {
+   case PD_HASFEATURE:
+		cmd = *(int *)stack;
+      return cmd >= PD_HASFEATURE && cmd <=
+        #ifdef USE_MULTICAST
+        		PD_REMOVEMULTICAST
+        #else
+        		PD_GETHWA
+        #endif
+        ;
+   case PD_INITIALIZE:
+   	return dmaeth_resetinterface(nic, *(word *)stack, *(int *)(stack+sizeof(word)));
+   case PD_HAVELINK:
+   	return dmaeth_havelink(nic);
+   case PD_POWER:
+   	if (*(int *)stack)
+      	return dmaeth_powerup(nic);
+      else
+   		return dmaeth_powerdown(nic);
+   case PD_POWERSTATUS:
+   	return nic->pwrstate;
+   case PD_SETHWA:
+   	dmaeth_sethwaddr(nic, *(char **)stack);
+   	break;
+   case PD_GETHWA:
+   	**(char ***)stack = nic->hwa;
+      return sizeof(nic->hwa);
+#ifdef USE_MULTICAST
+   case PD_ADDMULTICAST:
+   	return dmaeth_addmulticast(nic, *(char **)stack, *(int **)(stack + sizeof(char *)));
+   case PD_REMOVEMULTICAST:
+   	return dmaeth_removemulticast(nic, *(char **)stack);
+#endif
+   }
+   return 0;
+}
+
+#ifdef PKTDRV_VERBOSE
+_dmaeth_nodebug void dmaeth_prt_nicreg(_DMAEthConfig * nic)
+{
+	auto char
+   	natsr,
+      narsr,
+      nacsr,
+      nasr,
+      nacr,
+      natcr,
+      narcr,
+      namfr[8],
+      namhr,
+      nacdr,
+      naaer,
+      nacer,
+      namissedfr;
+   auto word nachr;	// IP checksum reg
+   auto word temp;
+
+	if (!nic)
+   	nic = _decb;
+
+	LOCK_GLOBAL(TCPGlobalLock);
+
+#asm xmemok
+	ld		iy,0
+   add	iy,sp
+	ipset	DMAETH_NET_IP
+
+   ioi ld a,(NATSR)
+   ld		(iy+@sp+natsr),a
+
+   ioi ld a,(NARSR)
+   ld		(iy+@sp+narsr),a
+
+   ioi ld a,(NACSR)
+   ld		(iy+@sp+nacsr),a
+
+   ioi ld a,(NASR)
+   ld		(iy+@sp+nasr),a
+
+   ioi ld a,(NACR)
+   ld		(iy+@sp+nacr),a
+
+   ioi ld a,(NATCR)
+   ld		(iy+@sp+natcr),a
+
+   ioi ld a,(NARCR)
+   ld		(iy+@sp+narcr),a
+
+   ioi ld hl,(NAMF0R)
+   ld		(iy+@sp+namfr+0),hl
+   ioi ld hl,(NAMF2R)
+   ld		(iy+@sp+namfr+2),hl
+   ioi ld hl,(NAMF4R)
+   ld		(iy+@sp+namfr+4),hl
+   ioi ld hl,(NAMF6R)
+   ld		(iy+@sp+namfr+6),hl
+
+   ioi ld a,(NAMHR)
+   ld		(iy+@sp+namhr),a
+
+   ioi ld a,(NACDR)
+   ld		(iy+@sp+nacdr),a
+
+   ioi ld a,(NAAER)
+   ld		(iy+@sp+naaer),a
+
+   ioi ld a,(NACER)
+   ld		(iy+@sp+nacer),a
+
+   ioi ld a,(NAMFR)
+   ld		(iy+@sp+namissedfr),a
+
+   ioi ld hl,(NAC0R)
+   ld		(iy+@sp+nachr),hl
+
+   ipres
+#endasm
+
+	UNLOCK_GLOBAL(TCPGlobalLock);
+
+	printf("\nDMA Eth regs i/f %d:\n", nic->iface);
+
+   printf("NATSR  %02X   %s %s\n",
+   	natsr,
+      natsr & 0x80 ? "TxOK" :
+      natsr & 0x40 ? "Deferred" :
+      natsr & 0x20 ? "ExcColl" :
+      natsr & 0x10 ? "Underrun" :
+                     "Disabled/noTx",
+      natsr & 0x02 ? "Collision" : ""
+      );
+
+   temp = narsr & 0x03;
+   printf("NARSR  %02X   %s\n",
+   	narsr,
+      interp_narsr(narsr));
+
+   printf("NACSR  %02X   %s %s %s %s %s %s\n",
+   	nacsr,
+   	nacsr & 0x80 ? "RxOK" : "    ",
+   	nacsr & 0x40 ? "RxErr" : "     ",
+   	nacsr & 0x20 ? "TxOK" : "    ",
+   	nacsr & 0x10 ? "TxErr" : "     ",
+   	nacsr & 0x08 ? "ErrCtOv" : "    ",
+   	nacsr & 0x04 ? "Jabber/LinkFail" : "    "
+      );
+
+   printf("NASR   %02X   %s %s %s %s\n",
+   	nasr,
+   	nasr & 0x40 ? "FDX" : "HDX",
+      nasr & 0x10 ? "AutoNegComplete" : nacr & 0x04 ? "AutoNegInProg" : "noAutoNeg",
+      nasr & 0x02 ? "LinkUp" : "LinkDown",
+      nasr & 0x01 ? "Jabber" : "noJabber"
+      );
+
+   temp = (nacr & 0xC0) >> 6;
+   printf("NACR   %02X   Clock:%s %s %s %s\n",
+   	nacr,
+		temp == 0 ? "Disab" :
+      temp == 1 ? "PE6" :
+      temp == 2 ? "System" :
+                  "Sys/2",
+      nacr & 0x08 ? "RestartAutoNeg" : "",
+      nacr & 0x04 ? "EnabAutoNeg" : "DisabAutoNeg",
+      nacr & 0x02 ? "EnabFDX" : "ForceHDX"
+      );
+
+   printf("NATCR  %02X   %s\n",
+   	natcr,
+      natcr & 0x80 ? "TxEnabled" : "TxDisabled"
+      );
+
+   printf("NARCR  %02X   %s %s %s %s %s %s %s\n",
+   	narcr,
+      narcr & 0x80 ? "RxEnabled" : "RxDisabled",
+      narcr & 0x20 ? "Monitor" : "Norm",
+      narcr & 0x10 ? "8Frames" : "64Frames",
+      narcr & 0x08 ? "AcceptErr" : "DiscardErr",
+      narcr & 0x04 ? "Bcast" : "noBcast",
+      narcr & 0x02 ? "Mcast" : "noMcast",
+      narcr & 0x01 ? "Promisc" : "noPromisc"
+      );
+
+   printf("NAPAxR %02X %02X %02X %02X %02X %02X (shadow)\n",
+   	nic->hwa[0], nic->hwa[1], nic->hwa[2], nic->hwa[3], nic->hwa[4], nic->hwa[5]
+      );
+
+   printf("NAMFxR %02X %02X %02X %02X %02X %02X %02X %02X (shadow)\n",
+   	nic->mar[0], nic->mar[1], nic->mar[2], nic->mar[3], nic->mar[4], nic->mar[5], nic->mar[6], nic->mar[7]
+      );
+
+   printf("NAMHR  %02X last hash\n", namhr);
+
+   printf("NACDR  %02X collisions\n", nacdr);
+   printf("NAAER  %02X align errs\n", naaer);
+   printf("NACER  %02X CRC errs\n", nacer);
+   printf("NAMFR  %02X missed frames\n", namissedfr);
+
+   printf("NACxR  %04X IP cksum\n", nachr);
+
+   printf("Using DMA channels %d (tx%s x %u)  %d (rx%s x %u)\n",
+   	nic->txchannel,
+      nic->sending ? " in use" : " idle",
+      nic->sending,
+      nic->rxchannel,
+      nic->receiving ? " in use" : " idle",
+      nic->receiving
+      );
+
+   printf("Net ISR counts: total=%u received=%u rx_error=%u\n" \
+   		 "  transmitted=%u tx_error=%u jabber=%u linkfail=%u\n",
+      nic->pd_tot_net, nic->pd_received, nic->pd_rx_error,
+      nic->pd_transmitted, nic->pd_tx_error, nic->pd_jabber, nic->pd_linkfail
+      );
+   printf("  tx errs: urun=%u colls=%u defer=%u\n",
+   	nic->pd_txe_urun, nic->pd_txe_colls, nic->pd_txe_defer);
+   printf("  rx errs: orun=%u align=%u crc=%u\n",
+   	nic->pd_rxe_orun, nic->pd_rxe_align, nic->pd_rxe_crc);
+
+   printf("Other conds: nobufs=%d\n",
+   	nic->pd_nobufs
+      );
+
+   printf("-------------\n");
+#ifdef DMAETH_SUPERDEBUG
+	prt_isrlog(nic);
+#endif
+
+}
+#endif
+
+/* **************************************************************************/
+
+
+/*** BeginHeader dmaeth_sendpacket */
+int dmaeth_sendpacket(_DMAEthConfig * nic, ll_Gather * g);
+/*** EndHeader */
+
+_dmaeth_nodebug int dmaeth_sendpacket(_DMAEthConfig * nic, ll_Gather * g)
+{
+	auto word totlen;
+	auto ll_prefix __far * buf;
+	auto ll_prefix __far ** whichtxbuf;
+   auto DMABufDesc12 * d;
+   auto word addlen;
+   auto word sflag;
+
+#ifdef DMAETH_VERBOSE
+	if (debug_on > 2)
+		printf("DMAETH: sendpacket()\n");
+#endif
+
+	if (nic->sending >= DMAETH_TXQ)
+	{
+#ifdef DMAETH_VERBOSE
+		if (debug_on)
+			printf("DMAETH: sendpacket: queue full\n");
+#endif
+   	return 1;		// Tx DMA in use
+   }
+
+	// Not currently busy sending (or only sending one packet).  Do the following steps:
+	totlen = g->len1 + g->len2 + g->len3;
+#ifdef DMAETH_VERBOSE
+	if (debug_on > 3)
+		printf("DMAETH: sendpacket totlen=%u\n", totlen);
+#endif
+	if (!totlen)
+		return -1;	// Cannot transmit that zero length packet!
+
+
+#if DMAETH_TXQ > 1
+   if (!nic->whichsend) {
+   	whichtxbuf = &nic->txbuf;
+   	d = &nic->txDesc;
+   }
+   else {
+   	whichtxbuf = &nic->tx2buf;
+   	d = &nic->tx2Desc;
+   }
+#else
+   whichtxbuf = &nic->txbuf;
+   d = &nic->txDesc;
+#endif
+
+
+	#asm
+	ld		hl,(sp+@sp+g)	; Point to ll_Gather struct
+   push	ix
+	lcall	_pb_resv_send
+   pop	ix
+   jr		nc,.ok
+   ld		py,0
+.ok:
+	ld		(sp+@sp+buf),py
+#ifdef DMAETH_SUPERDEBUG
+	ld		bcde,py
+   ld		hl,(sp+@sp+totlen)
+   ld		b,h
+   ld		c,L
+   push	ix
+   ld		ix,(sp+@sp+nic+2)
+   ld		h,(ix+[_decb]+sending)
+   pop	ix
+   ld		l,ISRL_TXGET		; type in L
+   ipset	DMAETH_NET_IP
+	call	write_ilog
+   ipres
+#endif
+	#endasm
+	if (!buf) {
+#ifdef DMAETH_VERBOSE
+		printf("DMAETH: sendpacket no buffer avail\n");
+#endif
+		return 1;	// Could not get a buffer
+   }
+
+   nic->whichsend = !nic->whichsend;
+	*whichtxbuf = buf;
+
+
+   if (totlen < ETH_MIN) {
+   	// Increase packet size to minimum allowed.  This will transmit rubbish at end,
+      // but that doesn't really matter (since the IP header has the real length).
+		addlen = ETH_MIN - totlen;
+   	totlen = ETH_MIN;
+      if (buf->len3)
+      	buf->len3 += addlen;
+      else if (buf->len2)
+      	buf->len2 += addlen;
+      else
+      	buf->len1 += addlen;
+   }
+
+#ifdef DMAETH_VERBOSE
+   if (debug_on > 5)
+   	_pkt_dump(buf);
+#endif
+
+ 	// Set up transmit DMA
+   d->chanControl = 0xAC;     // Final buffer, no link addr, special last byte, no interupt on completion,
+                                                     // source is memory (auto inc), dest is internal I/O
+   d->bufLength = buf->len1;
+   d->srcAddress = (long)buf->data1;
+   d->destAddress = NADR;
+
+   if (buf->len2) {
+      d->chanControl = 0x0C;  // Update previous descr. control; not last buffer.
+      ++d;
+      d->chanControl = 0xAC;
+      d->bufLength = buf->len2;
+      d->srcAddress = (long)buf->data2;
+      if(buf->len2 == 1 && buf->len3 == 0)
+      	d->destAddress = NALDR;
+      else
+       	d->destAddress = NADR;
+
+      if (buf->len3) {
+         d->chanControl = 0x0C;  // Update previous descr. control; not last buffer.
+         ++d;
+         d->chanControl = 0xAC;
+         d->bufLength = buf->len3;
+         d->srcAddress = (long)buf->data3;
+         if(buf->len3 == 1)
+         	d->destAddress = NALDR;
+         else
+            d->destAddress = NADR;
+      }
+   }
+
+#ifdef DMAETH_VERBOSE
+	if (debug_on > 3) {
+   	printf("DMAETH: Tx DMA (chan %u) buffer descriptors...\n", nic->txchannel);
+      #if DMAETH_TXQ > 1
+   	d = nic->whichsend ? &nic->txDesc : &nic->tx2Desc;
+      #else
+      d = &nic->txDesc;
+   	#endif
+   	#if 0
+		print_DMABufDesc(d, 0);
+      if (!(d->chanControl & 0x80)) {
+			print_DMABufDesc(++d, 0);
+	      if (!(d->chanControl & 0x80)) {
+	         print_DMABufDesc(++d, 0);
+	      }
+      }
+      #endif
+   }
+#endif
+
+   #asm
+   push	ix
+   ld		ix,(sp+@sp+nic+2)
+   #if DMAETH_TXQ > 1
+	ipset DMAETH_NET_IP
+   ld		a,(ix+[_decb]+sending)
+   inc	a
+   ld		(ix+[_decb]+sending),a
+   dec	a
+   jr		nz,.nofire
+   call	dmaeth_txfire
+.nofire:
+   ipres
+   #else
+   inc	(ix+[_decb]+sending)
+   call	dmaeth_txfire
+   #endif
+   pop	ix
+   #endasm
+
+	return 0;
+}
+
+
+/*** BeginHeader dmaeth_sethwaddr */
+__root int dmaeth_sethwaddr(_DMAEthConfig * nic, char* hwa);
+/*** EndHeader */
+
+_dmaeth_nodebug __root int dmaeth_sethwaddr(_DMAEthConfig *  nic, char* hwa)
+{
+#ifdef DMAETH_VERBOSE
+	printf("DMAETH: sethwaddr()\n");
+#endif
+	memcpy(nic->hwa, hwa, sizeof(nic->hwa));	// Keep shadow copy
+#asm
+	ld		hl,(sp+@sp+hwa)
+   ld		de,NAPA0R
+   ld		bc,6
+   call  ioi_ldir_func
+	;ioi ldir
+#endasm
+}
+
+/*** BeginHeader dmaeth_setmar */
+// internal function to update the multicast hash filter
+__root int dmaeth_setmar(_DMAEthConfig * nic);
+/*** EndHeader */
+
+_dmaeth_nodebug __root int dmaeth_setmar(_DMAEthConfig *  nic)
+{
+#ifdef DMAETH_VERBOSE
+	printf("DMAETH: setmar()\n");
+#endif
+
+#asm
+   ld		hl,(sp+@sp+nic)
+   ld		de,[_decb]+mar
+	add	hl,de
+   ld		de,NAMF0R
+   ld		bc,8
+   call  ioi_ldir_func
+	;ioi ldir
+#endasm
+}
+
+/*** BeginHeader dmaeth_powerdown */
+int dmaeth_powerdown(_DMAEthConfig * nic);
+/*** EndHeader */
+_dmaeth_nodebug int dmaeth_powerdown(_DMAEthConfig * nic)
+{
+#ifdef DMAETH_VERBOSE
+	printf("DMAETH: dmaeth_powerdown()\n");
+#endif
+	nic->pwrstate = IF_DOWN;
+
+#asm xmemok __nodebug
+	xor	a
+ioi ld	(NATCR), a		; disable transmitter
+ioi ld	(NARCR), a		; disable receiver
+
+	ld		a, 0xF0
+ioi ld	(NARR), a		; reset network port, purge FIFO
+
+	xor	a
+ioi ld	(NACR), a		; disable clock
+
+#ifdef DMAETH_ENAB_ACTLINK
+   ; turn off Link and Activity LEDs (PE7, PE5, active low)
+
+	; clear bits 5 and 7 of PEFR (change from /LINK and /ACT to normal output)
+	ld		hl, PEFRShadow
+	ld		de, PEFR
+	xor	a				; clear bits
+ioi cbm	0xA0			; only change bits 5 and 7
+
+	; set bits 5 and 7 of PEDR (set PE5 and PE7 high to turn off LEDs)
+	ld		hl, PEDRShadow
+	ld		de, PEDR
+	ld		a, 0xFF		; set bits
+ioi cbm	0xA0			; only change bits 5 and 7
+
+#endif
+
+#endasm
+	return 0;	// return success
+}
+
+/*** BeginHeader dmaeth_powerup */
+int dmaeth_powerup(_DMAEthConfig * nic);
+/*** EndHeader */
+_dmaeth_nodebug int dmaeth_powerup(_DMAEthConfig * nic)
+{
+#ifdef DMAETH_VERBOSE
+	printf("DMAETH: dmaeth_powerup()\n");
+#endif
+#ifdef DMAETH_ENAB_ACTLINK
+#asm xmemok __nodebug
+	; switch PE5 and PE7 back to alternate output (/LINK and /ACT) by setting
+	; bits in PEFR
+	ld		hl, PEFRShadow
+	ld		de, PEFR
+	ld		a, 0xFF		; set bits
+ioi cbm	0xA0			; only change bits 5 and 7
+#endasm
+#endif
+	// dmaeth_hardwarereset() will bring the nic back up
+	return dmaeth_hardwarereset (nic);
+}
+
+/*** BeginHeader dmaeth_havelink */
+int dmaeth_havelink(_DMAEthConfig * nic);
+/*** EndHeader */
+
+_dmaeth_nodebug int dmaeth_havelink(_DMAEthConfig * nic)
+{
+#asm xmemok
+ioi ld	a,(NASR)
+	and	0x02		; Isolate link up/down bit
+   bool	hl
+   ld		L,a
+#endasm
+}
+
+/*** BeginHeader dmaeth_addmulticast, dmaeth_removemulticast */
+
+// Multicast support.  See NE2000.LIB for more details on what is expected of these functions.
+
+int dmaeth_addmulticast(_DMAEthConfig* nic, char* EthAddress, int* slot);
+int dmaeth_removemulticast(_DMAEthConfig* nic, char* EthAddress);
+/*** EndHeader */
+
+_pktdrv_debug
+__nouseix int dmaeth_addmulticast(_DMAEthConfig* nic, char* EthAddress, int* slot)
+{
+	auto word hash;
+	auto unsigned long crc;
+	auto int i;
+
+	// Only upper 6 bits used in the hash.  This is the most common type of hash.  The device
+   // may, however, require something completely different.
+	crc = 0xffffffff;
+	for (i = 0; i < 6; i++) {
+		crc = pd_calc_crc(EthAddress[i], crc);
+	}
+	hash = (word)(crc >> 26);
+	if (slot) {
+		*slot = hash;
+	}
+
+   nic->mar[hash >> 3] |= 1u << (hash & 7);
+   dmaeth_setmar(nic);
+
+	return 0;
+}
+
+_pktdrv_debug
+__nouseix int dmaeth_removemulticast(_DMAEthConfig* nic, char* EthAddress)
+{
+	auto word hash;
+	auto unsigned long crc;
+	auto int i;
+#ifdef USE_IGMP
+	auto word hashcheck;
+#endif
+
+	// Only upper 6 bits used in the hash
+	crc = 0xffffffff;
+	for (i = 0; i < 6; i++) {
+		crc = pd_calc_crc(EthAddress[i], crc);
+	}
+	hash = (word)(crc >> 26);
+
+#ifdef USE_IGMP
+	// Make sure we aren't removing the hash entry that lets us
+	// receive the ALL-HOSTS (224.0.0.1) IGMP messages
+	multicast_iptohw(EthAddress, _IGMP_ALL_HOSTS_IPADDR);
+	crc = 0xffffffff;
+	for (i = 0; i < 6; i++) {
+		crc = pd_calc_crc(EthAddress[i], crc);
+	}
+	hashcheck = (word)(crc >> 26);
+	if (hash == hashcheck) {
+		return 0;
+	}
+#endif
+
+   nic->mar[hash >> 3] &= ~(1u << (hash & 7));
+   dmaeth_setmar(nic);
+
+	return 0;
+}
+
+/*** BeginHeader dmaeth_ifctl */
+int dmaeth_ifctl(_DMAEthConfig * nic, int up, int change);
+/*** EndHeader */
+
+_pktdrv_debug int dmaeth_ifctl(_DMAEthConfig * nic, int up, int change)
+{
+	// Just a stub for the default ethernet interface control.
+	return ifctl_ethernet(nic->iface, up, change);
+}
+
+
+/*** BeginHeader interp_narsr */
+char * interp_narsr(char narsr);
+/*** EndHeader */
+_dmaeth_nodebug char * interp_narsr(char narsr)
+{
+	static char s[40];
+   word m;
+
+   s[0] = 0;
+   m = narsr & 0x03;
+   narsr &= 0xF0;
+   if (!narsr)
+   	return "NoRx";
+   else if (narsr & 0x80)
+   	strcpy(s, "RxOK ");
+   else {
+      if (narsr & 0x40)
+      	strcat(s, "CRCErr ");
+      if (narsr & 0x20)
+      	strcat(s, "AlignErr ");
+   	if (narsr & 0x10)
+      	strcat(s, "Overrun ");
+   }
+   switch (m) {
+   case 0: strcat(s, "Unicast"); break;
+   case 1: strcat(s, "Promisc"); break;
+   case 2: strcat(s, "Multicast"); break;
+   case 3: strcat(s, "Broadcast"); break;
+	}
+   return s;
+}
+
+/*** BeginHeader prt_isrlog */
+void prt_isrlog(_DMAEthConfig * nic);
+/*** EndHeader */
+
+char * prt_isrlog_basic(ISRLog * k)
+{
+	static char buf[50];
+#ifdef ISRL_BIGREC
+	sprintf(buf, "t=%u  b1=%04X b2=%04X r=%d w=%d l=%d",
+		k->stamp, k->rxb1, k->rxb2, k->receiving, k->whichrec, k->lastrec);
+#else
+	sprintf(buf, "t=%u", k->stamp);
+#endif
+	return buf;
+}
+
+_dmaeth_nodebug void prt_isrlog(_DMAEthConfig * nic)
+{
+	auto word i;
+   auto ISRLog * k;
+   auto word nacsr, natsr, narsr, bu, temp;
+
+	printf("ISR log (first %u encountered)...\n", ilog_idx);
+   for (i = 0; i < ilog_idx; ++i) {
+   	k = ilog + i;
+		switch (k->type) {
+      	case ISRL_NETRET:
+         	printf("NETRET: %s\n", prt_isrlog_basic(k));
+            break;
+      	case ISRL_NET:
+         	printf("NET:    %s\n", prt_isrlog_basic(k));
+            nacsr = k->reg1;
+            natsr = k->reg2;
+            narsr = k->reg3;
+	         printf("  NACSR  %02X   %s %s %s %s %s %s\n",
+	            nacsr,
+	            nacsr & 0x80 ? "RxOK" : "    ",
+	            nacsr & 0x40 ? "RxErr" : "     ",
+	            nacsr & 0x20 ? "TxOK" : "    ",
+	            nacsr & 0x10 ? "TxErr" : "     ",
+	            nacsr & 0x08 ? "ErrCtOv" : "    ",
+	            nacsr & 0x04 ? "Jabber/LinkFail" : "    "
+	            );
+	         printf("  NATSR  %02X   %s %s\n",
+	            natsr,
+	            natsr & 0x80 ? "TxOK" :
+	            natsr & 0x40 ? "Deferred" :
+	            natsr & 0x20 ? "ExcColl" :
+	            natsr & 0x10 ? "Underrun" :
+	                           "Disabled/noTx",
+	            natsr & 0x02 ? "Collision" : ""
+	            );
+
+	         temp = narsr & 0x03;
+	         printf("  NARSR  %02X   %s\n",
+	            narsr,
+	            interp_narsr(narsr));
+            //printf("  lastrx=%u\n", k->reg4 + ((word)k->reg5 << 8));
+
+            //temp = k->reg4;
+            //printf("  SYN2   %02X   (%d, %d, %s)\n",
+            //     temp, (temp+0x28 & 0x78) >> 3, (temp & 0x06) >> 1,  temp & 1 ? "fwd" : "rev");
+            break;
+      	case ISRL_RXDMA:
+         	printf("RxD:    %s xbuf=%08lX\n", prt_isrlog_basic(k), *(long *)&k->reg2);
+            break;
+      	case ISRL_TXFIRE:
+         	printf("TxFIRE: %s  lastfire=%u\n", prt_isrlog_basic(k), k->reg1);
+            //printf("  len=%u\n", k->reg2 + ((word)k->reg3 << 8));
+            break;
+      	case ISRL_RXFIRE:
+         	printf("RxFIRE: %s\n", prt_isrlog_basic(k));
+            printf("  addr=%04X\n", k->reg4 + ((word)k->reg5 << 8));
+            //printf("  addr=%04X len=%u\n", k->reg4 + ((word)k->reg5 << 8), k->reg2 + ((word)k->reg3 << 8));
+            break;
+         case ISRL_RXDATA1:
+         	//printf("+ RxDATA1: t=%u\n", k->stamp);
+            //printf("  addr=%04X len=%u\n", k->reg4 + ((word)k->reg5 << 8), k->reg2 + ((word)k->reg3 << 8));
+         	break;
+      	case ISRL_RXGET:
+         	printf("RxGET:  %s\n", prt_isrlog_basic(k));
+            printf("  addr=%04X\n", k->reg4 + ((word)k->reg5 << 8));
+            break;
+      	case ISRL_TXFREE:
+         	printf("TxFREE: %s\n", prt_isrlog_basic(k));
+            printf("  addr=%04X sending=%u\n", k->reg4 + ((word)k->reg5 << 8), k->reg1);
+            break;
+      	case ISRL_RXFIN:
+         	printf("RxFIN:  %s\n", prt_isrlog_basic(k));
+            printf("  addr=%04X len=%u\n", k->reg4 + ((word)k->reg5 << 8), k->reg2 + ((word)k->reg3 << 8));
+            break;
+      	case ISRL_TXGET:
+         	printf("TxGET:  %s\n", prt_isrlog_basic(k));
+            printf("  addr=%04X len=%u sending=%u\n",
+            	k->reg4 + ((word)k->reg5 << 8), k->reg2 + ((word)k->reg3 << 8), k->reg1);
+            break;
+      	case ISRL_TOSS:    printf("TOSS:   %s\n", prt_isrlog_basic(k)); break;
+      	case ISRL_ALLOC_1: printf("ALOC_1: %s\n", prt_isrlog_basic(k)); break;
+      	case ISRL_ALLOC_2: printf("ALOC_2: %s\n", prt_isrlog_basic(k)); break;
+      	case ISRL_ALLOC_3: printf("ALOC_3: %s\n", prt_isrlog_basic(k)); break;
+      	case ISRL_ALLOC_4: printf("ALOC_4: %s\n", prt_isrlog_basic(k)); break;
+      	case ISRL_ALLOC_5: printf("ALOC_5: %s\n", prt_isrlog_basic(k)); break;
+      	case ISRL_ALLOC_6: printf("ALOC_6: %s\n", prt_isrlog_basic(k)); break;
+      	case ISRL_ERR_NOBUF:printf("ENOBUF: %s\n", prt_isrlog_basic(k)); break;
+      	case ISRL_ERR_ORUN:printf("EORUN:  %s\n", prt_isrlog_basic(k)); break;
+      	case ISRL_ERR_ALIGN:printf("EALIGN: %s\n", prt_isrlog_basic(k)); break;
+      	case ISRL_ERR_CRC: printf("ECRC:   %s\n", prt_isrlog_basic(k)); break;
+      	case ISRL_ERR_DMATO:printf("EDMATO: %s\n", prt_isrlog_basic(k)); break;
+
+         default:
+         	printf("<bad type>\n");
+         	break;
+      }
+   }
+   printf("-------------\n");
+   for (i = 0; i < ISRL_LAST; ++i)
+   	printf("L[%u]=%u%s", i, _nlog[i], (i&7)==7 ? "\n" : " "),
+   printf("\n");
+   memset(_nlog, 0, sizeof(_nlog));
+   ilog_idx = 0;
+}
+
+/*** BeginHeader */
+#endif /* __DMAETH_LIB */
+/*** EndHeader */

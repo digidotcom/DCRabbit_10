@@ -1,0 +1,1532 @@
+/*** BeginHeader  ********************************************/
+#ifndef __LZSS_LIB
+#define __LZSS_LIB
+/*** EndHeader ***********************************************/
+
+/* START LIBRARY DESCRIPTION *********************************************
+LZSS.LIB
+	Copyright (c) 2002, Rabbit Semiconductor.
+
+DESCRIPTION:
+	LZ compression library for #zimport decompression.
+
+	This module implements an LZSS style compression algorithm.  As
+	implemented here it uses a 12 bit index into the sliding window,
+	and a 4 bit length, which is adjusted to reflect phrase lengths
+	of between 2 and 17 bytes.
+
+	This library is thread-safe, and achieves a throughput of 10 KB/s
+	to 20 KB/s (number of bytes in uncompressed file/time to decompress
+	entire file using ReadCompressedFile) depending upon file size and
+	compression ratio. The average compression ratio for the LZ algorithm
+	with a 12-bit index count (see LZ_INDEX_BIT_COUNT macro, below), is
+	about 2:1, but can be as high as 5:1 in some cases.
+
+SUPPORT LIB'S: BITIO.LIB
+END DESCRIPTION **********************************************************/
+
+/*
+// Global static pools for LZ buffer memory management.
+// See the #GLOBAL_INIT sections in lz_setupTree and
+// lz_setupWindow for more information.
+
+#if (OUTPUT_COMPRESSION_BUFFERS != 0)
+_LZ_BUF lz_tree_pool[OUTPUT_COMPRESSION_BUFFERS];
+#endif
+_LZ_BUF lz_window_pool[_INPUT_COMPRESSION_BUFFERS];
+*/
+
+/*** BeginHeader */
+#define LZ_TREEMEMBER_TYPE int		// Member type for tree structure
+
+/*
+ * Various constants used to define the compression parameters.  The
+ * LZ_INDEX_BIT_COUNT tells how many bits we allocate to indices into the
+ * text window.  This directly determines the LZ_WINDOW_SIZE.  The
+ * LZ_LENGTH_BIT_COUNT tells how many bits we allocate for the length of
+ * an encode phrase. This determines the size of the look ahead buffer.
+ * The LZ_TREE_ROOT is a special node in the tree that always points to
+ * the root node of the binary phrase tree.  LZ_END_OF_STREAM is a special
+ * index used to flag the fact that the file has been completely
+ * encoded, and there is no more data.  LZ_UNUSED is the null index for
+ * the tree. LZ_MOD_WINDOW() is a macro used to perform arithmetic on tree
+ * indices.
+ *
+ */
+
+#define LZ_INDEX_BIT_COUNT      12
+#define LZ_LENGTH_BIT_COUNT     4
+#define LZ_WINDOW_SIZE          ( 1 << LZ_INDEX_BIT_COUNT )
+#define LZ_RAW_LOOK_AHEAD_SIZE  ( 1 << LZ_LENGTH_BIT_COUNT )
+#define LZ_BREAK_EVEN           ( ( 1 + LZ_INDEX_BIT_COUNT + LZ_LENGTH_BIT_COUNT ) / 9 )
+#define LZ_LOOK_AHEAD_SIZE      ( LZ_RAW_LOOK_AHEAD_SIZE + LZ_BREAK_EVEN )
+#define LZ_TREE_ROOT            LZ_WINDOW_SIZE
+#define LZ_END_OF_STREAM        0
+#define LZ_UNUSED               0
+#define LZ_MOD_WINDOW( a )      ( ( a ) & ( LZ_WINDOW_SIZE - 1 ) )
+
+//  In reality, the tree members must be all of the same type - either int or long
+//  Also, the function _lz_get_tree_value MUST be the same type as tree members
+
+typedef struct {
+    LZ_TREEMEMBER_TYPE     parent;
+    LZ_TREEMEMBER_TYPE     smaller_child;
+    LZ_TREEMEMBER_TYPE     larger_child;
+} LZ_TREE;
+
+// This is the size that the LZ tree must be.
+#define LZ_TREE_SIZE (long)(sizeof(LZ_TREE)*(LZ_WINDOW_SIZE+1))
+
+#define lz_offsetof(s,m)           (size_t)(unsigned long)&(((s *)0)->m)
+
+#define LZ_TREECHILD_ADDR(x,m,fd)     (fd->lz_tree+(sizeof(LZ_TREE)*x)+lz_offsetof(LZ_TREE,m))
+#define LZ_SET_TREE(x,m,v,fd)         _lz_set_tree_value( x, lz_offsetof(LZ_TREE,m), v, fd)
+#define LZ_GET_TREE(x,m,fd)           _lz_get_tree_value( x, lz_offsetof(LZ_TREE,m), fd)
+#define LZ_COPY_NODE(d,s,fd)          _lz_copy_node(d,s,fd)
+#define LZ_GET_WINDOW(x,fd)           _lz_get_window(x,fd)
+#define LZ_PUT_WINDOW(x,v,fd)         _lz_put_window(x,v,fd)
+
+// Compressed file descriptor structure. Support is
+// included for both filesystem (FAT) files and for #ximport
+// (or #zimport) files. All the fields are set and used internally
+// by the LZSS.LIB and BITIO.LIB functions, and should not be
+// modified by the user.
+typedef struct ZFILE
+{
+#ifdef __LZ_USE_FAT__
+	// The fs member is only necessary when using FAT
+    FILE __far *fsp;				// File stream pointer
+#endif
+    int     CurrPos;				// Current position in file
+    UBYTE	Compressed;			// Are we compressed?
+    int     matchPos;			// The following are used for LZ compression
+    int     matchLen;
+    int     matchIdx;
+    int     state;
+    int     lookAheadBytes;
+    int     repCount;
+
+	 // These are pointers to xmem structures
+	 unsigned long lz_window;
+	 unsigned long lz_tree;
+
+	 int lz_window_idx;			// Index into the lz_window_pool
+	 int lz_tree_idx;				// Index into the lz_tree_pool
+    PFI     oneCharIO;       	// either read or write 1 character routine
+    UBYTE   xmBool;          	// set to TRUE if an ximport file
+    long    fsz;             	// size of input file
+    BIT_FILE    bf;				// Bitfile structure for BITIO.LIB
+} ZFILE;
+
+
+// ==== Memory management ====
+// Create a pool of buffers for compression/decompression
+// This allows the compression library to be thread safe,
+// and does not impose memory management concerns on the
+// user.
+
+// The number of output buffers (LZ trees) needed
+#ifndef OUTPUT_COMPRESSION_BUFFERS
+	#define OUTPUT_COMPRESSION_BUFFERS 0
+#endif
+
+// The number of input buffers (LZ windows) needed. Each output buffer (LZ tree)
+// also needs an input buffer to work, so we create a macro,
+// _INPUT_COMPRESSION_BUFFERS, which should only be used in this file
+#ifndef INPUT_COMPRESSION_BUFFERS
+	#define _INPUT_COMPRESSION_BUFFERS (1+OUTPUT_COMPRESSION_BUFFERS)
+#else
+	#define _INPUT_COMPRESSION_BUFFERS (INPUT_COMPRESSION_BUFFERS+OUTPUT_COMPRESSION_BUFFERS)
+#endif
+
+// The buffer structure, holds the address, and whether the buffer is used
+// or not.
+typedef struct _lz_buf {
+	unsigned long buf_ptr;	// Pointer to the buffer
+	int used;					      // Flag to indicate used or free
+} _LZ_BUF;
+/*** EndHeader */
+
+/*** BeginHeader lz_tree_pool */
+extern _LZ_BUF lz_tree_pool[];
+/*** EndHeader */
+
+// Global static pool for LZ buffer memory management.
+// See the #GLOBAL_INIT sections in lz_setupTreefor more information.
+// only used if OUTPUT_COMPRESSION_BUFFERS is > 0
+_LZ_BUF lz_tree_pool[OUTPUT_COMPRESSION_BUFFERS];
+
+/*** BeginHeader lz_window_pool */
+extern _LZ_BUF lz_window_pool[_INPUT_COMPRESSION_BUFFERS];
+/*** EndHeader */
+
+// Global static pool for LZ buffer memory management.
+// See the #GLOBAL_INIT sections in lz_setupWindow for more information.
+
+_LZ_BUF lz_window_pool[_INPUT_COMPRESSION_BUFFERS];
+
+/*** BeginHeader OpenInputCompressedFile  */
+int OpenInputCompressedFile(ZFILE *ifp, long fn);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+OpenInputCompressedFile    <LZSS.LIB>
+
+SYNTAX: int OpenInputCompressedFile(ZFILE *ifp, long fn);
+
+PARAMETER1: ZFILE file descriptor
+
+PARAMETER2: Address of #ximport/#zimport input file
+
+KEYWORDS: compression, zimport, LZ
+
+DESCRIPTION: Open an import file for input. This function sets up the
+LZ compression algorithm window associated with the ZFILE file.
+The second parameter is the address (#ximport/#zimport) of the input
+file to be opened.
+
+RETURN VALUE:	true on success, false on failure
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int OpenInputCompressedFile(ZFILE *ifp, long fn) {
+
+	auto int ret_val;
+
+	// Open the file, this zaps the ZFILE struct so it should come first
+	ret_val = OpenInputBitFile(ifp, fn);
+
+	// Setup the LZ window
+	if(!lz_setupWindow(ifp)) {
+		ret_val = 0;
+	}
+
+	return ret_val;
+}
+
+/*** BeginHeader AttachInputCompressedFile  */
+int AttachInputCompressedFile(ZFILE *ifp, FILE __far *fs, long len);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+AttachInputCompressedFile    <LZSS.LIB>
+
+SYNTAX: int AttachInputCompressedFile(ZFILE *ifp, FILE __far *fs, long len)
+
+PARAMETER1: ZFILE file descriptor
+
+PARAMETER2: Pointer to full input file path
+
+PARAMETER3: Length of the input file
+
+KEYWORDS: compression, LZ
+
+DESCRIPTION: Attaches a file stream for input. This function sets up the
+LZ compression algorithm window associated with the ZFILE file.  The
+second parameter is the file stream to be used for input.  The stream must
+be opened in a binary readable mode and be in a readable state. The third
+parameter is the length of the input file to be processed.
+
+RETURN VALUE:	true on success, false on failure
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int AttachInputCompressedFile(ZFILE *ifp, FILE __far *fsp, long len) {
+
+	auto int ret_val;
+
+	// Open the file, this zaps the ZFILE struct so it should come first
+   ret_val = AttachInputBitFile(ifp, fsp);
+	if (ret_val && len) {
+      ifp->fsp = fsp;
+      ifp->fsz = len;
+
+	   // Setup the LZ window
+	   ret_val = lz_setupWindow(ifp);
+   }
+
+	return ret_val;
+}
+
+/*** BeginHeader AttachOutputCompressedFile  */
+int AttachOutputCompressedFile(ZFILE *ofp, FILE __far *fsp);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+AttachOutputCompressedFile   <LZSS.LIB>
+
+SYNTAX: int AttachOutputCompressedFile(ZFILE *ofp, FILE __far *fsp);
+
+PARAMETER1: ZFILE file descriptor
+
+PARAMETER2: Output file stream for compressed file
+
+KEYWORDS: compression, LZ
+
+DESCRIPTION: Open a compressed file for output. This function sets up
+the LZ compression algorithm window and tree associated with the ZFILE
+file. The second parameter is the file stream for the output stream to
+be written to. The stream must be opened in a binary write mode and be
+in a writable state.
+
+RETURN VALUE:	true on success, false on failure
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int AttachOutputCompressedFile(ZFILE *ofp, FILE __far *fsp) {
+
+	auto int ret_val;
+
+	// Attach the file stream
+   ret_val = AttachOutputBitFile(ofp, fsp);
+	if (ret_val) {
+      ofp->fsp = fsp;
+      ofp->fsz = 0;
+
+	   // Setup the LZ tree
+	   ret_val = lz_setupTree(ofp);
+
+	   // Setup the LZ window
+	   if (ret_val) {
+	      ret_val = lz_setupWindow(ofp);
+	   }
+   }
+
+   return ret_val;
+}
+
+/*** Beginheader CloseInputCompressedFile */
+void CloseInputCompressedFile( ZFILE *ifp );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+CloseInputCompressedFile   <LZSS.LIB>
+
+SYNTAX: void CloseInputCompressedFile( ZFILE *ifp );
+
+PARAMETER1: File descriptor of an input compression ZFILE.
+
+KEYWORDS: compression, zimport
+
+DESCRIPTION: Close an input compression file opened by
+OpenInputCompressionFile or attached by AttachInputCompressionFile.
+This file may be a compressed file that is being decompressed, or an
+uncompressed file that is being compressed. In either case, this function
+should be called for each open input ZFILE once it is done being used.
+
+RETURN VALUE:	None.
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void CloseInputCompressedFile( ZFILE *ifp ) {
+	// Close the bitfile, flushing buffers, etc.
+   CloseInputBitFile(ifp);
+
+   // Release the window back to the pool. This does not
+   // need to be atomic since we are done with the buffer,
+   // any other thread can go ahead and use the memory
+	lz_window_pool[ifp->lz_window_idx].used = 0;
+	ifp->lz_window = 0; // null out the window, just in case
+}
+
+/*** Beginheader CloseOutputCompressedFile */
+void CloseOutputCompressedFile( ZFILE *ifp );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+CloseOutputCompressedFile  <LZSS.LIB>
+
+SYNTAX: void CloseOutputCompressedFile( ZFILE *ifp );
+
+PARAMETER1: File descriptor of an output compression ZFILE.
+
+KEYWORDS: compression, zimport
+
+DESCRIPTION: Close a compression output file stream. This is the stream
+which was previously attached with AttachOutputCompressionFile. This function
+should always be called when done writing to a compression output ZFILE.
+
+RETURN VALUE:	None.
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void CloseOutputCompressedFile( ZFILE *ofp ) {
+	// Close the file, flush buffers, etc.
+   CloseOutputBitFile(ofp);
+
+   // Release the window back to the pool. This does not
+   // need to be atomic since we are done with the buffer,
+   // any other thread can go ahead and use the memory
+	lz_window_pool[ofp->lz_window_idx].used = 0;
+	ofp->lz_window = 0; // null out the window, just in case
+
+   // Release the tree back to the pool.
+	lz_tree_pool[ofp->lz_tree_idx].used = 0;
+	ofp->lz_tree = 0; // null out the window, just in case
+}
+
+/*** BeginHeader CompressFile  */
+void CompressFile( ZFILE *input, ZFILE *output );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+CompressFile               <LZSS.LIB>
+
+SYNTAX: void CompressFile(ZFILE *input, ZFILE *output);
+
+PARAMETER1: Input bit file.
+
+PARAMETER2: Output bit file.
+
+KEYWORDS: compression, zimport, LZ
+
+DESCRIPTION: This function compresses a file using the LZ compression
+algorithm, and puts the result into a user-specified output file.
+
+This routine has to first load up the look ahead buffer, then go into
+the main compression loop.  The main loop decides whether to output a
+single character or an index/length token that defines a phrase. Once
+the character or phrase has been sent out, another loop has to run.
+The second loop reads in new characters, deletes the strings that are
+overwritten by the new character, then adds the strings that are
+created by the new character.
+
+RETURN VALUE:	None.
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void CompressFile( ZFILE *input, ZFILE *ofp )
+{
+auto    int i;
+auto    int c;
+
+#if (OUTPUT_COMPRESSION_BUFFERS == 0)
+// Make sure we have trees for compression
+#fatal "Trying to use CompressFile without defining OUTPUT_COMPRESSION_BUFFERS."
+#endif
+
+    for ( i = 0 ; i < LZ_LOOK_AHEAD_SIZE ; i++ ) {
+        if ( ( c = (*input->oneCharIO)( input ) ) == EOF )
+            break;
+        LZ_PUT_WINDOW(ofp->CurrPos+i, c, ofp);
+    }
+    ofp->lookAheadBytes = i;
+
+    while ( ofp->lookAheadBytes > 0 ) {
+        if ( ofp->matchLen > ofp->lookAheadBytes )
+            ofp->matchLen = ofp->lookAheadBytes;
+        if ( ofp->matchLen <= LZ_BREAK_EVEN ) {
+            ofp->repCount = 1;
+            OutputBit( ofp, 1 );
+            OutputBits( ofp,
+                        (unsigned long) LZ_GET_WINDOW(ofp->CurrPos, ofp), 8 );
+        } else {
+            OutputBit( ofp, 0 );
+            OutputBits( ofp,
+                        (unsigned long) ofp->matchPos, LZ_INDEX_BIT_COUNT );
+            OutputBits( ofp,
+                        (unsigned long) ( ofp->matchLen - ( LZ_BREAK_EVEN + 1 ) ),
+                        LZ_LENGTH_BIT_COUNT );
+            ofp->repCount = ofp->matchLen;
+        }
+        for ( i = 0 ; i < ofp->repCount ; i++ ) {
+            lz_DeleteString( LZ_MOD_WINDOW( ofp->CurrPos + LZ_LOOK_AHEAD_SIZE ), ofp );
+            if ( ( c = (*input->oneCharIO)( input ) ) == EOF )
+                ofp->lookAheadBytes--;
+            else
+                LZ_PUT_WINDOW(LZ_MOD_WINDOW(ofp->CurrPos + LZ_LOOK_AHEAD_SIZE), c, ofp);
+            ofp->CurrPos = LZ_MOD_WINDOW(ofp->CurrPos + 1);
+            if ( ofp->lookAheadBytes )
+                ofp->matchLen = lz_AddString( ofp->CurrPos, &ofp->matchPos, ofp );
+        }
+    };
+    OutputBit( ofp, 0 );
+    OutputBits( ofp, (unsigned long) LZ_END_OF_STREAM, LZ_INDEX_BIT_COUNT );
+}
+
+/*** BeginHeader DecompressFile  */
+void DecompressFile( ZFILE *input, FILE __far *output );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+DecompressFile             <LZSS.LIB>
+
+SYNTAX: void DecompressFile(ZFILE *input, FILE __far *output);
+
+PARAMETER1: Input bit file.
+
+PARAMETER2: Output bit file.
+
+KEYWORDS: compression, zimport, LZ
+
+DESCRIPTION: This is the expansion routine for the LZSS algorithm.  All
+it has to do is read in flag bits, decide whether to read in a character
+or an index/length pair, and take the appropriate action.
+
+NOTE: This function can only write to a file stream.
+
+RETURN VALUE:	None.
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void DecompressFile( ZFILE *input, FILE __far *output )
+{
+auto    int i;
+auto    int c;
+
+#if (_INPUT_COMPRESSION_BUFFERS == 0)
+// Make sure we have windows for decompression
+#fatal "Trying to use decompresion with INPUT_COMPRESSION_BUFFERS equal to 0."
+#endif
+
+    while(1)
+    {
+        if ( InputBit( input ) )
+        {
+            c = InputBits( input, 8 );
+            fputc( c, output );
+            LZ_PUT_WINDOW( input->CurrPos, c, input );
+            input->CurrPos = LZ_MOD_WINDOW( input->CurrPos + 1);
+        }
+        else
+        {
+            input->matchPos = (int) InputBits( input, LZ_INDEX_BIT_COUNT );
+            if ( input->matchPos == LZ_END_OF_STREAM )
+                break;
+            input->matchLen = (int) InputBits( input, LZ_LENGTH_BIT_COUNT );
+            input->matchLen += LZ_BREAK_EVEN;
+            for ( i = 0 ; i <= input->matchLen ; i++ )
+            {
+                c = LZ_GET_WINDOW( LZ_MOD_WINDOW( input->matchPos + i ), input );
+                fputc( c, output );
+                LZ_PUT_WINDOW( input->CurrPos, c, input );
+                input->CurrPos = LZ_MOD_WINDOW( input->CurrPos + 1 );
+            }
+        }
+    }
+}
+
+/*** BeginHeader ReadCompressedFile */
+int ReadCompressedFile ( ZFILE *input, UBYTE __far *buf, int lenx );
+#define LZ_RDSTATE_0   0
+#define LZ_RDSTATE_1   1
+#define LZ_RDSTATE_EOF 2
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+ReadCompressedFile         <LZSS.LIB>
+
+SYNTAX: int ReadCompressedFile(ZFILE *input, UBYTE far *buf, int lenx);
+
+PARAMETER1: Input bit file.
+
+PARAMETER2: Output buffer.
+
+PARAMETER3: Number of bytes to read.
+
+KEYWORDS: compression, zimport, LZ
+
+DESCRIPTION: This function expands a compressed file using the LZ
+compression algorithm on-the-fly, placing a number of bytes into
+a user-specified buffer.
+
+RETURN VALUE:	Number of bytes read.
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int ReadCompressedFile ( ZFILE *input, UBYTE __far *buf, int lenx )
+{
+auto    int     c;
+auto    UBYTE  __far *obuf;
+auto    int     done_flag;
+auto    int     outct;
+auto    int     temp_idx, temp_len, temp_pos, temp_mpos;
+
+#if (_INPUT_COMPRESSION_BUFFERS == 0)
+// Make sure we have windows for compression
+#fatal "Trying to use decompresion with INPUT_COMPRESSION_BUFFERS equal to 0."
+#endif
+
+    obuf = buf;
+
+    // Use temporary values to shrink and speed up code.
+    // We can eliminate quite a few ldp pointer dereferences
+    // with this technique
+	 temp_idx = input->matchIdx;
+	 temp_len = input->matchLen;
+	 temp_pos = input->CurrPos;
+	 temp_mpos = input->matchPos;
+	 done_flag = FALSE;
+    outct = 0;
+
+    while (!done_flag && outct < lenx)
+    {
+        switch ( input->state )
+        {
+            case LZ_RDSTATE_0 :            // first state AND can be a continued state
+                if ( InputBit( input ) )
+                {
+                    c = (int) InputBits( input, 8 );
+						  obuf[outct++] = c;
+                    LZ_PUT_WINDOW( temp_pos, c, input );
+                    temp_pos = LZ_MOD_WINDOW( temp_pos + 1 );
+                }
+                else
+                {
+                    temp_mpos = (int) InputBits( input, LZ_INDEX_BIT_COUNT );
+                    if ( temp_mpos == LZ_END_OF_STREAM )
+                    {
+                        input->state = LZ_RDSTATE_EOF;
+								done_flag = TRUE;   // set to get out of the main loop
+                    }
+                    else
+                    {
+                        temp_len = (int) InputBits( input, LZ_LENGTH_BIT_COUNT );
+                        temp_len += LZ_BREAK_EVEN;
+                        temp_idx = 0;  // setup for loop control
+                        input->state = LZ_RDSTATE_1;  // set the loop state for chars
+                    }
+                }
+                break;                          // and break out of switch
+
+            case LZ_RDSTATE_1 :                    // continuous read state
+                if ( temp_idx <= temp_len )
+                {                       // come here if we need more matching
+                    while((temp_idx <= temp_len) && (outct < lenx)) {
+                        c = LZ_GET_WINDOW( LZ_MOD_WINDOW( temp_mpos + temp_idx ), input );
+						      obuf[outct++] = c;
+                        LZ_PUT_WINDOW( temp_pos, c, input );
+                        temp_pos = LZ_MOD_WINDOW( temp_pos + 1);
+                        temp_idx++;
+                    }
+                }
+                else                    // ok, we switch to getting only 1 byte
+                    input->state = LZ_RDSTATE_0;
+                break;
+
+            case LZ_RDSTATE_EOF :       // we previously got EOF - return 0 count
+					 done_flag = TRUE;       // set to get out of the main loop
+                break;                  // i.e. - do nothing
+        }
+    }
+
+    input->matchIdx = temp_idx;
+  	 input->matchLen = temp_len;
+	 input->CurrPos = temp_pos;
+	 input->matchPos = temp_mpos;
+
+	 return( outct );                        // return the number of bytes read
+}
+
+/*** BeginHeader lz_setupWindow */
+int    lz_setupWindow(ZFILE *f);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+lz_setupWindow             <LZSS.LIB>
+
+SYNTAX: int    lz_setupWindow(ZFILE *f);
+
+PARAMETER1: File descriptor.
+
+KEYWORDS: compression, zimport, LZ
+
+DESCRIPTION: Setup the sliding window for the LZ compression algorithm for
+a particular file. Should be called before compression or decompression.
+This should be called for each file to setup the associated LZ compression
+window.
+
+RETURN VALUE:	1 - success, 0 - failure
+END DESCRIPTION **********************************************************/
+__nodebug
+int    lz_setupWindow(ZFILE *f)
+{
+	static int global_i; // Used only for the #GLOBAL_INIT
+	auto int i;
+	auto int temp_ip;
+
+#GLOBAL_INIT {
+	// Initialize the window pool
+	for(global_i = 0; global_i < _INPUT_COMPRESSION_BUFFERS; global_i++) {
+   	lz_window_pool[global_i].buf_ptr = xalloc((long)LZ_WINDOW_SIZE);
+		lz_window_pool[global_i].used = 0; // Not currently used
+   }
+} // End #GLOBAL_INIT
+
+	// Get an unused window from the pool
+	for(i = 0; i < _INPUT_COMPRESSION_BUFFERS; i++) {
+		// Disable interrupts for atomic access of
+		// lz_window_pool
+		#asm
+			push ip		; Save state of interrupts
+			ld hl, (sp)
+			inc sp
+			ld (sp+@sp+temp_ip), hl
+			ipset 1		; disable interrupts
+		#endasm
+
+		// This needs to be atomic since the pool is
+		// a static global
+		if(!lz_window_pool[i].used) {
+			lz_window_pool[i].used = 1;
+
+			// Re-enable interrupts
+		   #asm
+		   	ld hl, (sp+@SP+temp_ip)
+		   	push hl
+		   	ipres		; reset interrupts
+		   	pop ip	; restore interrupt state
+		   	inc sp
+		   #endasm
+
+			// This does not need to be atomic, since we already
+			// have the buffer's index, and we will not be changing
+			// the pool anymore.
+			f->lz_window_idx = i;
+   		f->lz_window = lz_window_pool[i].buf_ptr;
+      	_lz_xmemset(f->lz_window, 0, (long)LZ_WINDOW_SIZE);
+     		return 1;
+      }
+
+      // We only want to disable interrupts briefly,
+      // so re-enable them each iteration of the loop
+	   #asm
+		   	ld hl, (sp+@SP+temp_ip)
+		   	push hl
+		   	ipres		; reset interrupts
+		   	pop ip	; restore interrupt state
+		   	inc sp
+	   #endasm
+   }
+
+#ifdef __DEBUG_LZSS__
+   // OOPS, tried to use too many buffers
+   fatal_error("Tried to allocate too many LZ windows.");
+#endif
+
+	exception(-ERR_LZINPUTBUFFERS);
+	return 0;
+}
+
+/*** BeginHeader lz_setupTree */
+int    lz_setupTree(ZFILE *f);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+lz_setupTree                  <LZSS.LIB>
+
+SYNTAX: int lz_setupTree(ZFILE *f);
+
+PARAMETER1: File descriptor.
+
+KEYWORDS: compression, zimport, LZ
+
+DESCRIPTION: Setup the tree structure for the LZ compression algorithm
+for a particular file. The tree is only used in the compression of a file,
+and should not be needed during decompression. This function should be
+called for each output file before compression.
+
+RETURN VALUE:	True on success, False on failure
+END DESCRIPTION **********************************************************/
+__nodebug
+int    lz_setupTree(ZFILE *f)
+{
+	static int global_i; // Used only for the #GLOBAL_INIT
+	auto int i;
+	auto int temp_ip;
+
+#GLOBAL_INIT {
+	// Initialize the window pool
+	for(global_i = 0; global_i < OUTPUT_COMPRESSION_BUFFERS; global_i++) {
+   	lz_tree_pool[global_i].buf_ptr = xalloc(LZ_TREE_SIZE);
+		lz_tree_pool[global_i].used = 0; // Not currently used
+   }
+} // End #GLOBAL_INIT
+
+	// Get an unused window from the pool
+	for(i = 0; i < _INPUT_COMPRESSION_BUFFERS; i++) {
+		// Disable interrupts for atomic access of
+		// lz_window_pool
+		#asm
+			push ip		; Save state of interrupts
+			ld hl, (sp)
+			inc sp
+			ld (sp+@sp+temp_ip), hl
+			ipset 1		; disable interrupts
+		#endasm
+
+		// This needs to be atomic since the pool is
+		// a static global
+		if(!lz_tree_pool[i].used) {
+			lz_tree_pool[i].used = 1;
+
+			// Re-enable interrupts
+		   #asm
+		   	ld hl, (sp+@SP+temp_ip)
+		   	push hl
+		   	ipres		; reset interrupts
+		   	pop ip	; restore interrupt state
+		   	inc sp
+		   #endasm
+
+			// This does not need to be atomic, since we already
+			// have the buffer's index, and we will not be changing
+			// the pool anymore.
+			f->lz_tree_idx = i;
+   		f->lz_tree = lz_tree_pool[i].buf_ptr;
+	      _lz_xmemset(f->lz_tree, 0, LZ_TREE_SIZE);
+         _lz_InitTree ( 1, f );
+     		return 1;
+      }
+
+      // We only want to disable interrupts briefly,
+      // so re-enable them each iteration of the loop
+	   #asm
+		   	ld hl, (sp+@SP+temp_ip)
+		   	push hl
+		   	ipres		; reset interrupts
+		   	pop ip	; restore interrupt state
+		   	inc sp
+	   #endasm
+   }
+
+#ifdef __DEBUG_LZSS__
+   // OOPS, tried to use too many buffers
+   fatal_error("Tried to allocate too many LZ trees.");
+#endif
+	exception(-ERR_LZOUTPUTBUFFERS);
+	return 0;
+}
+
+/*** BeginHeader _lz_put_window  */
+void    _lz_put_window(int x, unsigned char v, ZFILE *f);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_lz_put_window                 <LZSS.LIB>
+
+SYNTAX: void _lz_put_window(int x, unsigned char v, ZFILE *f);
+
+PARAMETER1: Index into window structure.
+
+PARAMETER2: Value to insert.
+
+PARAMETER2: File descriptor.
+
+KEYWORDS: compression, zimport, LZ
+
+DESCRIPTION: Insert a value into the sliding window (for use with Xmem
+mapping) for a particular file. This function essentially does a
+root2xmem array assignment without the function call.
+
+RETURN VALUE:	None.
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void    _lz_put_window(int x, unsigned char v, ZFILE *f)
+{
+auto    long    dest;
+    dest = f->lz_window+x;
+#asm
+    ld  jkhl,(sp+@SP+dest)
+    ld  pw,jkhl
+    ld  hl,(sp+@SP+v)
+    ld  a,l
+    ld  (pw),a
+#endasm
+}
+
+/*** BeginHeader _lz_get_window  */
+unsigned char _lz_get_window(int x, ZFILE *f);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_lz_get_window                 <LZSS.LIB>
+
+SYNTAX: unsigned char _lz_get_window(int x, ZFILE *f);
+
+PARAMETER1: Index into window structure.
+
+PARAMETER1: File descriptor
+
+KEYWORDS: compression, zimport, LZ
+
+DESCRIPTION: Get a value from the sliding window of a particular file.
+(For use when window is in Xmem). This function does a xmem2root and
+returns the value in the window at the index specified by the parameter x.
+
+RETURN VALUE:	Character value from the window.
+END DESCRIPTION **********************************************************/
+
+__nodebug
+unsigned char _lz_get_window(int x, ZFILE *f)
+{
+auto    long    src;
+    src = f->lz_window+x;
+#asm
+    ld  jkhl,(sp+@SP+src)
+    ld  pw,jkhl
+    ld  hl,(pw)
+    ld  h,0
+#endasm
+}
+
+/*** BeginHeader _lz_get_tree_value */
+LZ_TREEMEMBER_TYPE _lz_get_tree_value(int node, int nodepart, ZFILE *f );
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_lz_get_tree_value             <LZSS.LIB>
+
+SYNTAX: LZ_TREEMEMBER_TYPE _lz_get_tree_value(int node, int nodepart,
+															 ZFILE *f);
+
+PARAMETER1: Node number.
+
+PARAMETER2: Part of node to return.
+
+PARAMETER3: File descriptor.
+
+KEYWORDS: compression, zimport, LZ
+
+DESCRIPTION: Get a value from the tree of a particular file. (For use when
+tree is in Xmem). Assembly retrieves a value from a node in the tree
+structure.
+
+RETURN VALUE:	Node value.
+END DESCRIPTION **********************************************************/
+__nodebug
+LZ_TREEMEMBER_TYPE _lz_get_tree_value(int node, int nodepart, ZFILE *f)
+{
+auto    long    src;
+
+//  NOTE: This assembly code only works if LZ_TREEMEMBER_TYPE is "int"
+
+    src = f->lz_tree+((node*sizeof(LZ_TREE))+nodepart);
+#asm
+    ld      hl,(sp+@SP+src+2)
+    ld      a,l
+    ex		jk,hl                       // save high bits of phys addr to jk
+    ld      hl,(sp+@SP+src)
+    ld      iy,hl                       // save low bits of phys addr to iy
+    ld      pw,jkhl
+    ld      hl,(pw)
+    ex      de,hl                       // save result in de
+    ld      hl, iy                      // get lo-order 16 bits
+    inc     hl                          // bump up 1
+    bool    hl                          // did we overlap
+    jr      nz,.xxgtv                   // nope - all done
+    inc     a                           // yes - bump hi order 4 bits
+    clr		hl
+    ld		l,a
+    ex		jk,hl
+    inc     iy                          // bump iy also
+    ld		hl,iy
+    ld		pw,jkhl
+    ld		hl,(pw)                     // get correct hi byte
+    ld      d,l                         //   to d-reg
+.xxgtv:
+    ex      de,hl                       // result to hl
+#endasm
+}
+
+/*** BeginHeader _lz_set_tree_value */
+void _lz_set_tree_value(int node, int nodepart, LZ_TREEMEMBER_TYPE value, ZFILE *f);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_lz_set_tree_value             <LZSS.LIB>
+
+SYNTAX: void _lz_set_tree_value(int node, int nodepart,
+                            LZ_TREEMEMBER_TYPE value, ZFILE *f);
+
+PARAMETER1: Node number.
+
+PARAMETER2: Part of node to return.
+
+PARAMETER3: Value to insert.
+
+PARAMETER4: File descriptor.
+
+KEYWORDS: compression, zimport, LZ
+
+DESCRIPTION: Insert a value into the tree for a particular file. (For
+use when the tree is in Xmem). This function is used to do a root2xmem
+assignment without the function call.
+
+RETURN VALUE:	None.
+END DESCRIPTION **********************************************************/
+__nodebug
+void _lz_set_tree_value(int node, int nodepart, LZ_TREEMEMBER_TYPE value, ZFILE *f)
+{
+auto    long    dest;
+    dest = f->lz_tree+((node*sizeof(LZ_TREE))+nodepart);
+#asm
+    ld      hl,(sp+@SP+dest+2)
+    ld      hl,(sp+@SP+dest)
+    ld      iy,hl
+    inc     hl                          // bump to test for page overlap
+    bool    hl                          // test result
+    jr      z, .stvolap                 // brief page overlap
+    ld		hl,iy
+    ld		pw,jkhl
+    ld      hl, (sp+@SP+value)          // get the int
+    ld		(pw),hl
+    jr      .xxstv                      // go exit
+.stvolap:                       // ... come here if storing 1 byte at a time
+    ld      hl, (sp+@SP+value)          // get the int
+    ex      de,hl                       // save it
+    ld		hl,iy
+    ld		pw,jkhl
+    ld		hl,(pw)
+    ld      l,e                         // set correct lo value
+    ld		(pw),hl
+    inc     iy                          // IY to zero
+    ld		hl,iy
+    ex		jk,hl
+    inc		hl
+    ex		jk,hl
+    ld		pw,jkhl
+    ld		hl,(pw)
+    ld      l,d                         // place hi-byte value correctly
+    ld		(pw),hl
+.xxstv:
+#endasm
+}
+
+/*** BeginHeader _lz_copy_node  */
+void    _lz_copy_node ( int destnode, int srcnode, ZFILE *f );
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_lz_copy_node                  <LZSS.LIB>
+
+SYNTAX: void    _lz_copy_node (int destnode, int srcnode, ZFILE *f);
+
+PARAMETER1: Destination node.
+
+PARAMETER2: Node being copied.
+
+PARAMETER3: File descriptor.
+
+KEYWORDS: compression, zimport, LZ
+
+DESCRIPTION: Copy a node to another node in the tree of a particular file.
+(For use when the tree is in Xmem). The function simply does an xmem2xmem
+copy of a node to another location in the tree.
+
+RETURN VALUE:	None.
+END DESCRIPTION **********************************************************/
+__nodebug
+void    _lz_copy_node ( int destnode, int srcnode, ZFILE *f )
+{
+    xmem2xmem(f->lz_tree+(sizeof(LZ_TREE)*destnode),
+    			  f->lz_tree+(sizeof(LZ_TREE)*srcnode), sizeof(LZ_TREE));
+}
+
+/*** BeginHeader _lz_xmemset */
+void    _lz_xmemset( long addr, int ch, long lenx );
+#define	LZ_MEMBLKSIZ	8
+/*** Endheader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_lz_xmemset                 <LZSS.LIB>
+
+SYNTAX: void _lz_xmemset( long addr, int ch, long lenx );
+
+PARAMETER1: Address of buffer.
+
+PARAMETER2: Fill character.
+
+PARAMETER3: Number of characters to fill.
+
+KEYWORDS: compression, zimport, LZ
+
+DESCRIPTION: This function is memset, but modified for use with
+xmem structures. Takes an address addr, a fill character ch, and
+a count lenx, and writes the character ch the first lenx bytes
+starting at addr.
+
+RETURN VALUE:	None.
+END DESCRIPTION **********************************************************/
+__nodebug
+void    _lz_xmemset( long addr, int ch, long lenx )
+{
+    auto    UBYTE       dummy[LZ_MEMBLKSIZ];
+    auto    unsigned    sz_blks, sz_rems, i;
+
+    memset(dummy, ch, LZ_MEMBLKSIZ);
+    sz_blks = (unsigned)(lenx / LZ_MEMBLKSIZ);
+    sz_rems = (unsigned)(lenx % LZ_MEMBLKSIZ);
+
+    if ( sz_rems )
+        root2xmem(addr, dummy, sz_rems);
+    addr += sz_rems;
+
+    for ( i = 0; i < sz_blks; i++, addr += LZ_MEMBLKSIZ )
+        root2xmem(addr, dummy, LZ_MEMBLKSIZ);
+}
+
+/*** BeginHeader _lz_InitTree  */
+void _lz_InitTree( int r, ZFILE *f );
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_lz_InitTree               <LZSS.LIB>
+
+SYNTAX: void _lz_InitTree(int r, ZFILE *f);
+
+PARAMETER1: Root node number.
+
+PARAMETER2: File descriptor.
+
+KEYWORDS: compression, zimport, LZ
+
+DESCRIPTION: Initialize the LZ tree structure for a particular file by
+giving it a root node. This function is only called by lz_setupTree.
+Every node is initialized to 0, which is good, since 0 is the LZ_UNUSED
+code. However, to make the tree really usable, a single phrase has to be
+added to the tree so it has a root node.  That is done right here.
+
+RETURN VALUE:	None.
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void _lz_InitTree( int r, ZFILE *f )
+{
+    LZ_SET_TREE( LZ_TREE_ROOT, larger_child, r, f);
+    LZ_SET_TREE( r, parent, LZ_TREE_ROOT, f);
+    LZ_SET_TREE( r, larger_child, LZ_UNUSED, f);
+    LZ_SET_TREE( r, smaller_child, LZ_UNUSED, f);
+}
+
+
+/*** BeginHeader lz_ContractNode  */
+void lz_ContractNode( int old_node, int new_node, ZFILE *f );
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+lz_ContractNode            <LZSS.LIB>
+
+SYNTAX: void lz_ContractNode(int old_node, int new_node, ZFILE *f);
+
+PARAMETER1: Node being replaced.
+
+PARAMETER2: New node being inserted.
+
+PARAMETER3: File descriptor.
+
+KEYWORDS: compression, zimport, LZ
+
+DESCRIPTION: Replaces a node with an existing node in the lz_tree
+structrure for a particular file. Called by DeleteString. This routine
+is used when a node is being deleted.  The link to its descendant is
+broken by pulling the descendant in to overlay the existing link.
+
+RETURN VALUE:	None.
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void lz_ContractNode( int old_node, int new_node, ZFILE *f )
+{
+    LZ_SET_TREE(new_node, parent, LZ_GET_TREE( old_node, parent, f), f);
+
+    if(LZ_GET_TREE(LZ_GET_TREE(old_node, parent, f), larger_child, f) == old_node) {
+        LZ_SET_TREE(LZ_GET_TREE(old_node, parent, f), larger_child, new_node, f);
+    } else {
+        LZ_SET_TREE(LZ_GET_TREE(old_node, parent, f), smaller_child, new_node, f);
+    }
+
+    LZ_SET_TREE(old_node, parent, LZ_UNUSED, f);
+}
+
+/*** BeginHeader lz_ReplaceNode  */
+void lz_ReplaceNode( int old_node, int new_node, ZFILE *f );
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+lz_ReplaceNode             <LZSS.LIB>
+
+SYNTAX: void lz_ReplaceNode(int old_node, int new_node, ZFILE *f);
+
+PARAMETER1: Node being replaced.
+
+PARAMETER2: New node being inserted.
+
+PARAMETER3: File descriptor.
+
+KEYWORDS: compression, zimport, LZ
+
+DESCRIPTION: Replaces a node with new node in the lz_tree structure of
+a particular file. This routine is also used when a node is being deleted.
+However, in this case, it is being replaced by a node that was not previously
+in the tree.
+
+RETURN VALUE:	None.
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void lz_ReplaceNode( int old_node, int new_node, ZFILE *f )
+{
+auto    LZ_TREEMEMBER_TYPE parent_node;
+
+    parent_node = LZ_GET_TREE( old_node, parent, f );
+    if ( LZ_GET_TREE( parent_node, smaller_child, f ) == old_node )
+        LZ_SET_TREE( parent_node, smaller_child, new_node, f );
+    else
+        LZ_SET_TREE( parent_node, larger_child, new_node, f );
+
+    LZ_COPY_NODE( new_node, old_node, f );
+    LZ_SET_TREE( LZ_GET_TREE( new_node, smaller_child, f ), parent, new_node, f );
+    LZ_SET_TREE( LZ_GET_TREE( new_node, larger_child, f ), parent, new_node, f );
+    LZ_SET_TREE( old_node, parent, LZ_UNUSED, f );
+}
+
+/*** BeginHeader lz_FindNextNode  */
+int lz_FindNextNode( int node, ZFILE *f );
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+lz_FindNextNode            <LZSS.LIB>
+
+SYNTAX: int lz_FindNextNode(int node, ZFILE *F);
+
+PARAMETER1: Current node.
+
+PARAMETER2: File descriptor.
+
+KEYWORDS: compression, zimport, LZ
+
+DESCRIPTION: Searches for the next-smallest node in the tree of a
+particular file. This routine is used to find the next smallest node
+after the node argument.  It assumes that the node has a smaller child.
+We find the next smallest child by going to the smaller_child node, then
+going to the end of the larger_child descendant chain.
+
+RETURN VALUE:	Index of the next-smallest node.
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int lz_FindNextNode( int node, ZFILE *f )
+{
+auto    int next;
+auto    int new_next;
+
+    next = LZ_GET_TREE( node, smaller_child, f );
+
+    while ( (new_next = LZ_GET_TREE( next, larger_child, f )) != LZ_UNUSED )
+        next = new_next;
+
+    return( next );
+}
+
+/*** BeginHeader lz_DeleteString  */
+void lz_DeleteString( int p, ZFILE *f );
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+lz_DeleteString            <LZSS.LIB>
+
+SYNTAX: void lz_DeleteString(int p, ZFILE *f);
+
+PARAMETER1: Index of node.
+
+PARAMETER2: File descriptor.
+
+KEYWORDS: compression, zimport, LZ
+
+DESCRIPTION: This function performs binary tree deletion of a node from
+the lz_tree structure of a particular file. This routine performs the
+classic binary tree deletion algorithm. If the node to be deleted has a
+null link in either direction, we just pull the non-null link up one to
+replace the existing link. If both links exist, we instead delete the
+next link in order, which is guaranteed to have a null link, then replace
+the node to be deleted with the next link.
+
+RETURN VALUE:	None.
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void lz_DeleteString( int p, ZFILE *f )
+{
+auto    int  replacement;
+
+    if ( LZ_GET_TREE( p, parent, f ) != LZ_UNUSED )
+    {                                   // only execute if node is used
+        if ( LZ_GET_TREE( p, larger_child, f ) == LZ_UNUSED )
+            lz_ContractNode( p, LZ_GET_TREE( p, smaller_child, f ), f );
+        else if ( LZ_GET_TREE( p, smaller_child, f ) == LZ_UNUSED )
+            lz_ContractNode( p, LZ_GET_TREE( p, larger_child, f ), f );
+        else
+        {
+        replacement = lz_FindNextNode( p, f );
+        lz_DeleteString( replacement, f );
+        lz_ReplaceNode( p, replacement, f );
+        }
+    }
+}
+
+/*** BeginHeader lz_AddString  */
+int lz_AddString( int new_node, int *match_position, ZFILE *f );
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+lz_AddString               <LZSS.LIB>
+
+SYNTAX: int lz_AddString(int new_node, int *match_position, ZFILE *f);
+
+PARAMETER1: Index of node.
+
+PARAMETER2: Position of best match for the new node.
+
+PARAMETER3: File descriptor.
+
+KEYWORDS: compression, zimport, LZ
+
+DESCRIPTION: Add a new node to the lz_tree structure of a particular file,
+and find best existing match for the encoder. This where most of the work
+done by the encoder takes place.  This routine is responsible for adding
+the new node to the binary tree. It also has to find the best match among
+all the existing nodes in the tree, and return that to the calling routine.
+To make matters even more complicated, if the new_node has a duplicate in
+the tree, the old_node is deleted, for reasons of efficiency.
+
+RETURN VALUE:	The length of the match.
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int lz_AddString( int new_node, int *match_position, ZFILE *f )
+{
+auto    int i;
+auto    int test_node;
+auto    int delta;
+auto    int match_length;
+
+auto    long    child_addr;
+auto    int     child_value;
+
+    if ( new_node == LZ_END_OF_STREAM )
+        return( 0 );
+
+    test_node = LZ_GET_TREE( LZ_TREE_ROOT, larger_child, f );
+    match_length = 0;
+    for ( ; ; ) {
+        for ( i = 0 ; i < LZ_LOOK_AHEAD_SIZE ; i++ ) {
+
+            delta = LZ_GET_WINDOW( LZ_MOD_WINDOW( new_node + i ), f ) -
+                    LZ_GET_WINDOW( LZ_MOD_WINDOW( test_node + i ), f );
+
+            if ( delta != 0 )
+                break;
+        }
+        if ( i >= match_length ) {
+            match_length = i;
+            *match_position = test_node;
+            if ( match_length >= LZ_LOOK_AHEAD_SIZE ) {
+                lz_ReplaceNode( test_node, new_node, f );
+                return( match_length );
+            }
+        }
+        if ( delta >= 0 )
+            child_addr = LZ_TREECHILD_ADDR( test_node, larger_child, f );
+        else
+            child_addr = LZ_TREECHILD_ADDR( test_node, smaller_child, f );
+
+        xmem2root( &child_value, child_addr, sizeof(LZ_TREEMEMBER_TYPE) );
+        if ( child_value == LZ_UNUSED )
+        {
+            root2xmem( child_addr, &new_node, sizeof(LZ_TREEMEMBER_TYPE) );
+            LZ_SET_TREE( new_node, parent, test_node, f );
+            LZ_SET_TREE( new_node, larger_child, LZ_UNUSED, f );
+            LZ_SET_TREE( new_node, smaller_child, LZ_UNUSED, f );
+            return(match_length);
+        }
+        test_node = child_value;
+    }
+}
+
+/*** BeginHeader lz_ProcWindow */
+void lz_ProcWindow ( ZFILE *ofp );
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+lz_ProcWindow                 <LZSS.LIB>
+
+SYNTAX: void lz_ProcWindow ( ZFILE *ofp );
+
+PARAMETER1: Ouput bit file.
+
+KEYWORDS: compression, zimport, LZ
+
+DESCRIPTION: This function processes the sliding window for stream
+compression. The file descriptor is actually a pointer to a compresion
+stream. This is only called by the stream compression routines.
+
+RETURN VALUE:	None.
+END DESCRIPTION **********************************************************/
+__nodebug
+void lz_ProcWindow ( ZFILE *ofp )
+{
+    if ( ofp->matchLen > ofp->lookAheadBytes )
+        ofp->matchLen = ofp->lookAheadBytes;
+
+    if ( ofp->matchLen <= LZ_BREAK_EVEN )
+    {
+        ofp->repCount = 1;
+        OutputBit( ofp, 1);
+        OutputBits(ofp, (unsigned long) LZ_GET_WINDOW(ofp->CurrPos, ofp), 8 );
+    }
+    else
+    {
+        OutputBit( ofp, 0 );
+        OutputBits( ofp, (unsigned long) ofp->matchPos, LZ_INDEX_BIT_COUNT );
+        OutputBits( ofp, (unsigned long) ( ofp->matchLen - ( LZ_BREAK_EVEN + 1 ) ),
+                                                        LZ_LENGTH_BIT_COUNT );
+        ofp->repCount = ofp->matchLen;
+    }
+}
+
+/*** BeginHeader lz_CompressStream  */
+void lz_CompressStream( UBYTE *inbuf, int bufct, ZFILE *ofp );
+#define LZ_CSTATE_0            0
+#define LZ_CSTATE_TRANSITION_1 1
+#define LZ_CSTATE_PROCWINDOW   2
+#define LZ_CSTATE_GATHERBYTES  3
+#define LZ_CSTATE_GATHER_2     4
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+lz_CompressStream          <LZSS.LIB>
+
+SYNTAX: void lz_CompressStream(UBYTE *inbuf, int bufct, ZFILE *ofp);
+
+PARAMETER1: Input buffer.
+
+PARAMETER2: Number of bytes to process.
+
+PARAMETER3: Ouput bit stream.
+
+KEYWORDS: compression, zimport, LZ
+
+DESCRIPTION: This function provides on-the-fly stream compression.
+The first parameter contains the data to be compressed, and the
+second parameter is the number of bytes to process. The data is
+compressed by this function, and written to the output stream
+defined by the third parameter.
+
+RETURN VALUE:	None.
+END DESCRIPTION **********************************************************/
+__nodebug
+void lz_CompressStream( UBYTE *inbuf, int bufct, ZFILE *ofp )
+{
+auto    int         charct;
+auto    int         getAnotherChar;
+auto    UBYTE       tbuf[30];
+
+    for ( charct = 0; charct < bufct; charct++ )
+    {
+        for ( getAnotherChar = FALSE; !getAnotherChar;  )
+        {
+            switch ( ofp->state )
+            {
+                case LZ_CSTATE_0 :             // we're just starting
+                    LZ_PUT_WINDOW( ofp->CurrPos + ofp->matchIdx, *inbuf, ofp );
+                    inbuf++;
+                    ofp->matchIdx++;
+                    ofp->lookAheadBytes++;
+                    if ( ofp->matchIdx < LZ_LOOK_AHEAD_SIZE )
+                    {
+                        getAnotherChar = TRUE;  // this waits for another char to process
+                    }
+                    else
+                        ofp->state++;   // switch state
+                    break;
+
+                case LZ_CSTATE_TRANSITION_1 :  // window is full, do any initialization
+                    ofp->state++;           // switch state to processing window
+                    break;
+
+                case LZ_CSTATE_PROCWINDOW :    // process chars in window
+                    lz_ProcWindow( ofp );   // process some look ahead bytes
+                    ofp->matchIdx = 0;      // set for next state
+                    ofp->state++;           //  switch state
+                    break;
+
+                case LZ_CSTATE_GATHERBYTES :  // we need/want more databytes
+                    if ( ofp->matchIdx < ofp->repCount )
+                    {
+                        lz_DeleteString( LZ_MOD_WINDOW( ofp->CurrPos + LZ_LOOK_AHEAD_SIZE ), ofp );
+                        getAnotherChar = TRUE;  // this waits for another char to process
+                        ofp->state++;
+                    }
+                    else
+                        ofp->state = LZ_CSTATE_PROCWINDOW;
+                    break;
+
+                case LZ_CSTATE_GATHER_2 :      // we have more data
+                    LZ_PUT_WINDOW( LZ_MOD_WINDOW( ofp->CurrPos + LZ_LOOK_AHEAD_SIZE ), *inbuf, ofp );
+                    inbuf++;
+                    ofp->CurrPos = LZ_MOD_WINDOW( ofp->CurrPos + 1 );
+                    ofp->matchLen = lz_AddString( ofp->CurrPos, &ofp->matchPos, ofp );
+                    ofp->matchIdx++;
+                    ofp->state = LZ_CSTATE_GATHERBYTES;
+                    break;
+            }
+        }
+    }
+}
+
+/*** BeginHeader lz_CloseCompressStream */
+void lz_CloseCompressStream ( ZFILE *ofp );
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+lz_CloseCompressStream     <LZSS.LIB>
+
+SYNTAX: void lz_CloseCompressStream (ZFILE *ofp);
+
+PARAMETER1: Ouput bit stream.
+
+KEYWORDS: compression, zimport, LZ
+
+DESCRIPTION: Closes a compression stream defined by the input parameter.
+
+RETURN VALUE:	None.
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void lz_CloseCompressStream ( ZFILE *ofp )
+{
+auto    int         doDel;
+
+    doDel = FALSE;
+
+    while ( ofp->lookAheadBytes > 0 )
+    {
+        if ( ofp->state != LZ_CSTATE_GATHER_2 )            //  did we process anything
+        {                                               //  no, then we *must* process
+            lz_ProcWindow( ofp );                       //      the first few bytes
+            ofp->state = LZ_CSTATE_GATHER_2;
+            ofp->matchIdx = 0;
+        }
+        for ( ; ofp->matchIdx < ofp->repCount; ofp->matchIdx++ )
+        {
+            if ( doDel )
+                lz_DeleteString( LZ_MOD_WINDOW( ofp->CurrPos + LZ_LOOK_AHEAD_SIZE ), ofp );
+            doDel = TRUE;
+            ofp->lookAheadBytes--;
+            ofp->CurrPos = LZ_MOD_WINDOW( ofp->CurrPos + 1 );
+            if ( ofp->lookAheadBytes )
+                ofp->matchLen = lz_AddString( ofp->CurrPos, &ofp->matchPos, ofp );
+        }
+        if ( ofp->lookAheadBytes > 0 )
+            lz_ProcWindow( ofp );
+        ofp->matchIdx = 0;      // set for next state
+    }
+    OutputBit( ofp, 0 );
+    OutputBits( ofp, (unsigned long) LZ_END_OF_STREAM, LZ_INDEX_BIT_COUNT );
+}
+
+/*** BeginHeader  ********************************************/
+#endif
+/*** EndHeader ***********************************************/

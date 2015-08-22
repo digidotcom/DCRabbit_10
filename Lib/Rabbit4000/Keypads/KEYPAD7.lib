@@ -1,0 +1,788 @@
+/*** Beginheader */
+#ifndef __KEYPAD7_LIB
+#define __KEYPAD7_LIB
+/*** Endheader */
+
+/*** Beginheader __keyInitFlag  */
+// Function execution flag
+extern int __keyInitFlag;
+
+
+#ifndef SET_EXTBUFFER_RD
+#define SET_EXTBUFFER_RD
+#endif
+
+#ifndef SET_EXTBUFFER_WR
+#define SET_EXTBUFFER_WR
+#endif
+
+/*** Endheader */
+
+int __keyInitFlag;
+
+
+/* START LIBRARY DESCRIPTION *********************************************
+KEYPAD7.LIB
+	Copyright (c) 2006, Rabbit Semiconductor.
+
+DESCRIPTION:	Keypad driver for a 1 X 7 type keypad
+
+SUPPORT LIB'S:
+END DESCRIPTION **********************************************************/
+
+/*************************************************************************
+					Keypad Functions
+--------------------------------------------------------------------------
+					This section supports 1x7 keypad layout.
+
+					The 1 X 7 key positions are defined as:
+   				|---------------------------------------|
+					|	[ 0 ]     [ 1 ]     [ 2 ]     [ 3 ]	 |
+					|       [ 4 ]     [ 5 ]     [ 6 ]		 |
+   				|---------------------------------------|
+					User interface:
+
+
+SYNTAX:	      void keyProcess ( void );
+DESCRIPTION:   Scans and processes keypad data for key assignment,
+					debouncing, press and release and repeat.
+
+SYNTAX: 			void keyConfig	();
+DESCRIPTION:   Defines inidividual keys
+
+SYNTAX:	      char keyGet	(void);
+DESCRIPTION:   Get next keypress
+
+SYNTAX:	      void keyInit (void);
+DESCRIPTION:   Initialize keypad process
+
+SYNTAX:	      void keypadDef ();
+DESCRIPTION:   Configure keypad to default layout.
+
+
+**************************************************************************/
+
+/*** Beginheader dqInit, .dqInit, dqPop, dqPush */
+typedef struct {			//	Double Input Queue Structure
+	unsigned	wSize;		// Buffer Size
+	char *pLo;				// Low Buffer Address
+	char *pHi;				// High Buffer Address
+	char *pIn;				// In Pointer
+	char *pOut;				// Out Pointer
+	} DQueue;
+
+int dqPop ( DQueue * );								//	Remove Char from Tail
+int dqPush ( DQueue *,char );
+void dqInit ( DQueue *,void *,unsigned );
+/*** Endheader */
+
+#asm __root __nodebug
+;============================================================================
+; .dqPop : Pop Item from Queue (Remove from Tail)
+;
+; INPUT  :
+;          IY = Pointer to Queue Structure
+; OUTPUT :
+;          A  = Character Popped from Queue
+;          NZ = Character Popped OK
+;          Z  = Queue is EMPTY
+; NOTES  :
+;          Destroys HL,DE,Flags
+
+.dqPop::
+	ld    e,(iy+8)          ; DE = Out Pointer
+   ld    d,(iy+9)
+   ld    l,(iy+6)          ; HL = In Pointer
+   ld    h,(iy+7)
+   xor   a                 ; Check for Empty Queue
+   sbc   hl,de
+   ret   z                 ; Done if Empty
+   ld    a,(de)            ; Get Character
+   ld    l,(iy+4)          ; HL = Last Buffer Location
+   ld    h,(iy+5)
+   or    a                 ; Check for Wrap
+   sbc   hl,de
+   inc   de                ; DE = Next Out Pointer
+   jr    nz,.PoNoWrap1     ; Done if No Wrap
+   ld    e,(iy+2)          ; DE = First Buffer Location
+   ld    d,(iy+3)
+.PoNoWrap1:
+   ld    (iy+8),e          ; Update Out Pointer
+	ld    (iy+9),d
+   ld    e,a               ; Set NZ Flag
+   inc   e
+   cp    e
+   ret                     ; Return w/ Error
+
+;============================================================================
+; .dqPush : Push Item (Add to Tail)
+;
+; INPUT  :
+;          IY = Pointer to Queue Structure
+;          A  = Character to Add to Queue
+; OUTPUT :
+;          NZ = Pushing OK
+;          Z  = Queue is FULL
+; NOTES  :
+;          Destroys HL,DE,Flags
+
+.dqPush::
+	ld		e,(iy+8)				; DE = Out Pointer
+	ld		d,(iy+9)
+   ld    l,(iy+2)          ; HL = First Buffer Location
+   ld    h,(iy+3)
+   or    a                 ; Check for Wrap
+   sbc   hl,de
+   dec	de                ; DE = Prev (Out Pointer)
+   jr    nz,.PuNoWrap0		; Done if No Wrap
+   ld    e,(iy+4)          ; DE = Last Buffer Location
+   ld    d,(iy+5)
+.PuNoWrap0:
+	ld    l,(iy+6)          ; HL = Input Pointer
+   ld    h,(iy+7)
+   or    a                 ; Check for Overrun
+   sbc   hl,de
+   ret   z                 ; Done if Overrun
+   ld    (iy+8),e          ; Update Out Pointer
+   ld    (iy+9),d
+   ld    (de),a            ; Store Character
+   ret                     ; Done - No Error
+
+;============================================================================
+; .dqInit : Initialize Queue
+;
+; INPUT  :
+;          HL = Pointer to Queue Structure
+;          DE = Address of Buffer
+;          BC = Size of Buffer
+; OUTPUT :
+;          None
+
+.dqInit::
+	ld    (hl),c            ; Store Size of Buffer
+   inc   hl
+   ld    (hl),b
+   inc   hl
+   push  de                ; Protect Low Buffer Address
+   ld    (hl),e            ; Store Low Buffer Address
+   inc   hl
+   ld    (hl),d
+   inc   hl
+   ex    de,hl             ; Compute Last Byte of Buffer
+   add   hl,bc
+   dec	hl
+   ex    de,hl
+   ld    (hl),e            ; Store High Buffer Address
+   inc   hl
+   ld    (hl),d
+   inc   hl
+   pop   de                ; Restore Low Buffer Address
+   ld    (hl),e            ; Initialize In Pointer
+   inc   hl
+   ld    (hl),d
+   inc   hl
+   ld    (hl),e            ; Initialize Out Pointer
+   inc   hl
+   ld    (hl),d
+   inc   hl
+   ret                     ; Done
+
+;============================================================================
+; dqPop  : Pop Item from Queue
+;
+; C CALL :
+;          int dqPop ( Queue * );
+; RETURN :
+;          0 - 255 : Character Read
+;          -1      : Buffer Empty
+
+dqPop::
+	pop   hl                ; Return Address
+   pop   iy                ; IY = Queue Pointer
+   push  hl                ; Restore Stack
+   push  hl
+   call  .dqPop				; Push Character
+   ld    h,0               ; HL = Character Read
+   ld    l,a
+   ret   nz                ; Done if No Error
+   ld    hl,-1             ; HL = Queue is Empty
+   ret                     ; Done
+
+;============================================================================
+; dqPush : Push Item (Add to Head)
+;
+; C CALL :
+;          int dqPush ( Queue *,char );
+; RETURN :
+;          0  - No Error
+;          -2 - Buffer Full
+
+dqPush::
+	pop   hl                ; Return Address
+   pop   iy                ; IY = Queue Pointer
+   pop   de                ; E  = Character
+   push  de                ; Restore Stack
+   push  hl
+   push  hl
+   ld    a,e               ; A = Character
+   call  .dqPush				; Push Character
+   ld    hl,0              ; HL = No Error
+   ret   nz                ; Done if No Error
+   ld    hl,-2             ; HL = Queue is Full
+   ret                     ; Done
+
+;============================================================================
+; dqInit :  Initialize Queue
+;
+; C CALL :
+;          void dqInit ( Queue *,void *,unsigned );
+; RETURN :
+;          None
+
+dqInit::
+	call  _param3           ; Get Parameters from C
+   jp    .dqInit				; Initialize Queue
+
+
+;============================================================================
+; .dqQueue : Queue Item (Add to Head)
+;
+; INPUT  :
+;          IY = Pointer to Queue Structure
+;          A  = Character to Add to Queue
+; OUTPUT :
+;          NZ = Queueing OK
+;          Z  = Queue is FULL
+; NOTES  :
+;          Destroys HL,DE,Flags
+
+.dqQueue::
+	ld		e,(iy+6)				; DE = In Pointer
+	ld		d,(iy+7)
+   push  de                ; Protect In Pointer
+   ld    l,(iy+4)          ; HL = Last Buffer Location
+   ld    h,(iy+5)
+   or    a                 ; Check for Wrap
+   sbc   hl,de
+   inc   de                ; DE = Next In Pointer
+   jr    nz,.QuNoWrap0		; Done if No Wrap
+   ld    e,(iy+2)          ; DE = First Buffer Location
+   ld    d,(iy+3)
+.QuNoWrap0:
+	ld    l,(iy+8)          ; HL = Output Pointer
+   ld    h,(iy+9)
+   or    a                 ; Check for Overrun
+   sbc   hl,de
+   pop   hl                ; Restore Current In Pointer
+   ret   z                 ; Done if Overrun
+   ld    (iy+6),e          ; Update In Pointer
+   ld    (iy+7),d
+   ld    (hl),a            ; Store Character
+   ret                     ; Done - No Error
+
+;============================================================================
+; .dqQueueS : Queue Item w/ Minimum of Register Damage
+;
+; INPUT  :
+;          IY = Pointer to Queue Structure
+;          A  = Character to Add to Queue
+; OUTPUT :
+;          NZ = Queueing OK
+;          Z  = Queue is FULL
+; NOTES  :
+;          Destroys Flags
+
+.dqQueueS::
+	push  hl                ; Protect HL
+   push  de                ; Protect DE
+   call  .dqQueue				; Queue Item
+   pop   de                ; Restore DE
+   pop   hl                ; Restore HL
+   ret                     ; Done
+
+#endasm
+
+/*** BeginHeader keyProcess, asKey, aacKey, acKeyQ, sKeyQ */
+typedef struct Key {		 ////	Key Decode/Repeat Configuration
+								 ////	User Defined Key Configuration
+	char cRaw;					//	Raw Key Code Index
+	char cPress;				//	Key Press Code (0 = Unused)
+	char cRelease;				//	Key Release Code (0 = Unused)
+	char cCntHold;				//	Hold Ticks (0 = No Repeat)
+	char cSpdLo;				//	Low Speed Repeat Ticks
+	char cCntLo;				//	Low Speed Hold Ticks (0 = Slow Only)
+	char cSpdHi;				//	High Speed Repeat Ticks
+
+								 ////	State Info for Key Repeating
+	char cSpeed;				//	Repeat Speed
+	char cRepeat;				//	Repeat Down Counter
+	char cCount;				//	Hold Down Counter
+	char cState;				//	Key Decode State
+										//	0 = Button is Up
+										//	1 = Button is Down & Holding
+										//	2 = Button in Low Speed Repeat
+										//	3 = Button in High Speed Repeat
+}	Key;
+
+extern Key asKey[64];		//	Key Processing Structure
+extern char aacKey[3][8];	//	Raw Key Map FIFO
+extern char acKeyQ[16];		//	Key Queue Buffer
+extern DQueue sKeyQ;			//	Key Queue Structure
+
+void keyProcess ( void );	//	Scan & Process Keypad Data
+/*** EndHeader */
+
+Key asKey[64];					//	Key Processing Structure
+char aacKey[3][8];			//	Raw Key Map FIFO
+char acKeyQ[16];				//	Key Queue Buffer
+DQueue sKeyQ;					//	Key Queue Structure
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+keyProcess                     <KEYPAD7.LIB>
+
+SYNTAX:	      void keyProcess ( void );
+
+DESCRIPTION:  	Scans and processes keypad data for key assignment,
+				  	debouncing, press and release and repeat.
+				  	Note:  This function is able to process an 8x8 matrix keypad.
+
+PARAMETER1:    None
+
+RETURN VALUE:	None
+
+SEE ALSO:		keyConfig, keyGet, keypadDef
+
+END DESCRIPTION **********************************************************/
+
+#asm __root __nodebug
+keyProcess::
+	push	ix
+	ld		hl,aacKey+15			; aacKey[1..2] = aacKey[0..1]
+	ld		de,aacKey+23
+	ld		bc,16
+	lddr
+	ld		hl,aacKey				; aacKey[0] = New Key Data
+	push	hl
+	call	keyScan					; Hardware Dependent Function
+	pop	hl
+	ld		ix,asKey					; IX = asKey (Processing) Array
+	ld		iy,aacKey				; IY = aacKey (Raw Data) Arrays
+	ld		h,8						;  H = Row Counter
+.kP0:
+	ld		a,(iy+0)					;  A =  aacKey[0][wRow]
+	or		a,(iy+8)					;  A =  aacKey[0][wRow] |  aacKey[1][wRow]
+	cpl								;  A = ~aacKey[0][wRow] & ~aacKey[1][wRow]
+	and	a,(iy+16)				;  A = ~aacKey[0][wRow] & ~aacKey[1][wRow] & aacKey[2][wRow]
+	ld		d,a						;  D = Falling Edge Detectors
+	ld		a,(iy+16)				;  A = aacKey[2][wRow]
+	cpl								;  A = ~aacKey[2][wRow]
+	and	a,(iy+8)					;  A = aacKey[1][wRow] & ~aacKey[2][wRow]
+	and	a,(iy+0)					;  A = aacKey[0][wRow] &  aacKey[1][wRow] & ~aacKey[2][wRow]
+	ld		e,a						;  E = Rising Edge Detectors
+	push	iy							; Protect aacKey Pointer
+	ld		iy,sKeyQ					; IY = Processed Key Queue
+	ld		l,8						;  L = Col Counter
+.kP1:
+	rr		d							; C = Press Detected
+	jr		nc,.kP2					; Skip if No Press Detected
+	ld		a,(ix+Key+cPress)		; Code Set for Press?
+	or		a,a
+	jr		z,.kP3
+	call	.dqQueueS				; Queue Key Press
+.kP3:
+	ld		a,(ix+Key+cCntHold)	; Set Initial Hold Count
+	ld		(ix+Key+cCount),a
+	ld		a,1						; Button is Downing & Holding
+	ld		(ix+Key+cState),a
+.kP2:
+	rr		e							; C = Release Detected
+	jr		nc,.kP4
+	ld		a,(ix+Key+cRelease)	; Code Set for Release?
+	or		a,a
+	jr		z,.kP5
+	call	.dqQueueS				; Queue Key Release
+.kP5:
+	xor	a							; Button is Up
+	ld		(ix+Key+cState),a
+.kP4:
+	ld		a,(ix+Key+cState)		; A = Current Key State
+	dec	a							; cState == 1?
+	jr		nz,.kP6
+	or		a,(ix+Key+cCount)		; If Hold Count Zero, Done
+	jr		z,.kP8
+	dec	(ix+Key+cCount)		; If Count Not Reaching Zero, Done
+	jr		nz,.kP8
+	ld		a,(ix+Key+cPress)		; Queue New Keypress
+	call	.dqQueueS
+	ld		a,(ix+Key+cSpdLo)		; Setup Low Speed Repeat
+	ld		(ix+Key+cSpeed),a
+	ld		(ix+Key+cRepeat),a
+	ld		a,(ix+Key+cCntLo)		; Setup Low Speed Period
+	ld		(ix+Key+cCount),a
+	ld		a,2						; Button in Low Speed Repeat
+	ld		(ix+Key+cState),a
+	jr		.kP8						; Done
+.kP6:
+	dec	a							; cState == 2?
+	jr		nz,.kP7
+	or		a,(ix+Key+cCount)		; If Hold Count Zero, Done
+	jr		z,.kP9
+	dec	(ix+Key+cCount)		; If Count Not Reaching Zero, Done
+	jr		nz,.kP9
+	ld		a,(ix+Key+cSpdHi)		; Set High Speed Repeat
+	ld		(ix+Key+cSpeed),a
+	ld		a,3						; Button in High Speed Repeat
+	ld		(ix+Key+cState),a
+	jr		.kP9						; Finish Processing
+.kP7:
+	dec	a							; cState == 3?
+	jr		nz,.kP8
+.kP9:
+	dec	(ix+Key+cRepeat)		; If Repeat Count not Reaching Zero, Done
+	jr		nz,.kP8
+	ld		a,(ix+Key+cPress)		; Queue New Keypress
+	call	.dqQueueS
+	ld		a,(ix+Key+cSpeed)		; Reset Repeat Count
+	ld		(ix+Key+cRepeat),a
+.kP8:
+	ld		bc,11						; Bump Process Array Pointer
+	add	ix,bc
+	dec	l							; Decrement Column Counter
+	jp		nz,.kP1					; Continue til Columns Done
+	pop	iy							; Restore aacKey Pointer
+	inc	iy							; Bump aacKey Pointer
+	dec	h							; Decrement Row Counter
+	jp		nz,.kP0					; Continue til All Rows Done
+	pop	ix
+	ret								; Done
+#endasm
+
+/*** Beginheader keyConfig */
+void keyConfig	( 	char	cRaw,
+						char	cPress,
+						char	cRelease,
+						char	cCntHold,
+						char	cSpdLo,
+						char	cCntLo,
+						char	cSpdHi );
+/*** endheader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+keyConfig                     <KEYPAD7.LIB>
+
+SYNTAX: 			void keyConfig	( 	char	cRaw,
+						char	cPress,
+						char	cRelease,
+						char	cCntHold,
+						char	cSpdLo,
+						char	cCntLo,
+						char	cSpdHi );
+
+DESCRIPTION:   Assigns each key with key press and release codes,
+					hold and repeat ticks for auto repeat and debouncing.
+
+PARAMETER1:		cRaw - Raw Key Code Index.
+					1x7 keypad matrix with raw key code index assignments (in brackets):
+
+   				|---------------------------------------|
+					|	[ 0 ]     [ 1 ]     [ 2 ]     [ 3 ]	 |
+					|       [ 4 ]     [ 5 ]     [ 6 ]		 |
+   				|---------------------------------------|
+					User keypad interface:
+
+PARAMETER2:		cPress - Key Press Code
+					An 8-bit value returned when a key is pressed.  0 = Unused.
+					See keypadDef() for default press codes.
+
+PARAMETER3:		cRelease - Key Release Code
+					An 8-bit value to be returned when a key is released.  0 = Unused.
+
+PARAMETER4:		cCntHold - Hold Ticks
+					How long to hold before repeating.  0 = No Repeat.
+
+PARAMETER5:		cSpdLo - Low Speed Repeat Ticks
+					How many times to repeat.  0 = None.
+
+PARAMETER6:		cCntLo - Low Speed Hold Ticks
+					How long to hold before going to high speed repeat.  0 = Slow Only.
+
+PARAMETER7:		cSpdHi - High Speed Repeat Ticks
+					How many times to repeat after low speed repeat.  0 = None.
+
+RETURN VALUE:	None
+
+SEE ALSO:		keyProcess, keyGet, keypadDef
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void keyConfig	( 	char	cRaw,
+						char	cPress,
+						char	cRelease,
+						char	cCntHold,
+						char	cSpdLo,
+						char	cCntLo,
+						char	cSpdHi )
+{
+	static Key *pKey;
+
+	#GLOBAL_INIT {__keyInitFlag  = FALSE;}
+	if(!__keyInitFlag)
+	{
+		// the brdInit and/or the digConfig function hasn't been executed
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+	pKey = &asKey[cRaw];
+	pKey->cPress = cPress;
+	pKey->cRelease = cRelease;
+	if (!cPress)
+		cCntHold = cSpdLo = cCntLo = cSpdHi = 0;
+	pKey->cCntHold = cCntHold;
+	pKey->cSpdLo = cSpdLo;
+	pKey->cCntLo = cCntLo;
+	pKey->cSpdHi = cSpdHi;
+	pKey->cState = 0;
+}
+
+
+/*** Beginheader keyUnget */
+
+int keyUnget (char cKey);
+/*** endheader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+keyUnget                     <KEYPAD7.LIB>
+
+SYNTAX:	      int keyUnget (char cKey);
+
+DESCRIPTION:   Push keypress on top of input queue
+
+PARAMETER1:    cKey
+
+RETURN VALUE:	None
+
+SEE ALSO:		keyGet
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int keyUnget (char cKey)
+{
+	return cKey && !dqPush(&sKeyQ,cKey);
+}
+
+
+/*** Beginheader keyGet */
+
+char keyGet	(void);
+/*** endheader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+keyGet                     <KEYPAD7.LIB>
+
+SYNTAX:	      char keyGet	(void);
+
+DESCRIPTION:   Get next keypress
+
+PARAMETER1:    None
+
+RETURN VALUE:	The next keypress or 0 if none
+
+SEE ALSO:		keyConfig, keyProcess, keypadDef
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+char keyGet	(void)
+{
+	auto int nKey;
+
+	#GLOBAL_INIT {__keyInitFlag = FALSE;}
+	if(!__keyInitFlag)
+	{
+		// the brdInit and/or the digConfig function hasn't been executed
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+	return (nKey = dqPop(&sKeyQ)) == -1 ? 0 : nKey;
+}
+
+
+/*** Beginheader keyInit */
+void keyInit (void);
+extern char keypad_CS[32];
+/*** endheader */
+
+char keypad_code_buffer[32];
+
+/* START FUNCTION DESCRIPTION ********************************************
+keyInit                     <KEYPAD7.LIB>
+
+SYNTAX:	      void keyInit (void);
+
+DESCRIPTION:   Initializes keypad process
+
+PARAMETER1:    None
+
+RETURN VALUE:	None
+
+SEE ALSO:		brdInit
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void keyInit (void)
+{
+	//---------------------------------------------------------------------
+	// Initialize the keypad interface
+	//---------------------------------------------------------------------
+	// Initialize Port E bit to be a normal I/O pin
+	WrPortI(PEFR, &PEFRShadow, (PEFRShadow|KEYSTROBE));
+
+	// Initialize Port E bit to be an output pin
+	WrPortI(PEDDR, &PEDDRShadow, (PEDDRShadow|KEYSTROBE));
+
+	// Initialize Port E bit to be a chip select.
+	// Set to be a I/O Read and Write strobe with 7 wait states.
+	// and writes allowed.
+	WrPortI(KEYCSREGISTER, &KEYCSSHADOW, KEYCSCONFIG);
+
+	//---------------------------------------------------------------------
+	// Initialize keypad memory arrays
+	//---------------------------------------------------------------------
+	memset ( asKey,0x00,sizeof(asKey) );			//	Reset Key Processing
+	memset ( aacKey,0xFF,sizeof(aacKey) );			//	Idle Raw Key Map
+	dqInit ( &sKeyQ,acKeyQ,sizeof(acKeyQ) );		//	Init Key Queue
+	__keyInitFlag = TRUE;
+	keypadDef();
+}
+
+
+/*** BeginHeader keyScan */
+void keyScan ( char *pcKeys );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+keyScan                     <KEYPAD7.LIB>
+
+SYNTAX:	      void keyScan (char *pcKeys);
+
+DESCRIPTION:   Writes "1" to each row and reads the value.  Position of
+					a key press is indicated by a zero value in a bit position.
+
+PARAMETER1:    Address of the value read.
+
+RETURN VALUE:	None
+
+SEE ALSO:		keyConfig, keyGet, keypadDef, keyProcess
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void keyScan (char *pcKeys)
+{
+	#GLOBAL_INIT {__keyInitFlag   = FALSE;}
+
+	if(!__keyInitFlag)
+	{
+		// the brdInit and/or the digConfig function hasn't been executed
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+   // Macro to set control buffer to data read direction
+   SET_EXTBUFFER_RD;
+
+	//	Check if a key is being pressed on the keypad
+	*pcKeys++ = (0x80 | RdExtPort(KEYADDR));
+
+   // Macro to set control buffer to data write direction
+   SET_EXTBUFFER_WR;
+
+   //	Clear Seven Unused Rows
+	*pcKeys++ = 0xFF;
+	*pcKeys++ = 0xFF;
+	*pcKeys++ = 0xFF;
+	*pcKeys++ = 0xFF;
+	*pcKeys++ = 0xFF;
+	*pcKeys++ = 0xFF;
+	*pcKeys++ = 0xFF;
+}
+
+/*** BeginHeader keypadDef */
+void keypadDef ();
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+keypadDef                     <KEYPAD7.LIB>
+
+SYNTAX:	      void keypadDef ();
+
+DESCRIPTION:   Configure the physical layout of the keypad with
+					the desired ascii return key codes.
+
+					Keypad physical mapping 1 X 7
+
+                  0   4    1    5    2    6    3
+               ------------------------------------
+					['L']     ['U']     ['D']     ['R']
+					     ['-']     ['+']     ['E']
+
+					'E' represents the ENTER key
+				   '+' represents
+				   '-' represents
+				   'D' represents Down Scroll
+				   'U' represents Up Scroll
+				   'R' represents Right Scroll
+				   'L' represents Left Scroll
+
+
+					EXAMPLE:
+					For the above physical vs. ascii return key codes
+					do the following:
+
+					keyConfig (  3,'R',0, 0, 0,  0, 0 );
+					keyConfig (  6,'E',0, 0, 0,  0, 0 );
+					keyConfig (  2,'D',0, 0, 0,  0, 0 );
+					keyConfig (  5,'+',0, 0, 0,  0, 0 );
+					keyConfig (  1,'U',0, 0, 0,  0, 0 );
+					keyConfig (  4,'-',0, 0, 0,  0, 0 );
+					keyConfig (  0,'L',0, 0, 0,  0, 0 );
+
+					Characters are returned upon keypress with no repeat.
+
+PARAMETER1:    None
+
+RETURN VALUE:	None
+
+SEE ALSO:		keyConfig, keyGet, keyProcess
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void keypadDef( void )
+{
+	#GLOBAL_INIT {__keyInitFlag   = FALSE;}
+	if(!__keyInitFlag)
+	{
+		// the brdInit and/or the digConfig function hasn't been executed
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+	// Initialize keypad with the desired return ascii value
+	keyConfig (  3,'R',0, 0, 0,  0, 0 );
+	keyConfig (  6,'E',0, 0, 0,  0, 0 );
+	keyConfig (  2,'D',0, 0, 0,  0, 0 );
+	keyConfig (  5,'+',0, 0, 0,  0, 0 );
+	keyConfig (  1,'U',0, 0, 0,  0, 0 );
+	keyConfig (  4,'-',0, 0, 0,  0, 0 );
+	keyConfig (  0,'L',0, 0, 0,  0, 0 );
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

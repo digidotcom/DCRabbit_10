@@ -1,0 +1,416 @@
+/*** BeginHeader */
+#ifndef ZNETSUPPORT_LIB
+#define ZNETSUPPORT_LIB
+
+/* START LIBRARY DESCRIPTION *********************************************
+ZNETSUPPORT.LIB
+	Copyright (c) 2007, Rabbit Semiconductor
+
+DESCRIPTION:
+
+   This library provides network configuration save functionality in
+   support of ZCONSOLE.LIB.
+
+END DESCRIPTION *********************************************************/
+
+/*** EndHeader */
+
+/*** BeginHeader */
+/*
+ * Sub-structure (of a NetConfSave) which contains non-interface-specific
+ * configuration info.
+ */
+typedef struct {
+	word				len;				// Total length of this structure
+
+	word				nrouters;		// Number of routers in following list
+	struct {
+		longword		ipaddr;			// IP address of router (0 if entry not used)
+		longword		subnet;			// Subnet served by this router
+		longword		mask;				// Mask for above subnet
+	} router[ARP_ROUTER_TABLE_SIZE];
+
+	word				nnameservers;	// Number of name (DNS) servers on following list
+	longword			nameserver[MAX_NAMESERVERS];	// IP addresses of name servers (0 if entry not used)
+} NISNetConf;
+
+/*
+ * Sub-structure (of a NetConfSave) which contains interface-specific
+ * configuration info.  Most of the fields are the same as IFTEntry,
+ * except that fields which are purely dynamic are not included.
+ */
+typedef struct {
+	word				len;				// Total length of this structure
+	byte				iface;			// Interface number
+	byte				type;
+#define ISNC_ETH			0x00			// Ethernet
+#define ISNC_PPPOE		0x01			// PPP over ethernet
+#define ISNC_PPPSER		0x02			// PPP over serial
+} ISNetConfHead;
+
+typedef struct {
+	ISNetConfHead head;
+	word				mtu;			// Max transmission unit (IP, transport headers plus data)
+	longword			ipaddr;		// Home IP address last used (0 if entry not used)
+	longword			mask;			// Our subnetting mask (normally all 1's for PPP)
+	word				flags;		// Flags as per the IFF_* defines above.
+#define ISNC_FLAGMASK	(IFF_DHCP|IFF_ICMP_CONFIG)		// Flags which are permanently saved
+	word				 eflags;		// Broadcast ethernet-specific flags... (reserved, set zero)
+} EthNetConf;
+
+#if USING_PPPOE || USING_PPPLINK
+typedef struct {
+	ISNetConfHead head;
+	word				mtu;			// Max transmission unit (IP, transport headers plus data)
+	word				pflags;
+	longword			peeraddr;
+	PPPState 		ppp_state;   //holds all PPP config
+} PPPNetConf;
+#endif
+
+
+/*
+ * The following structure is used to save and restore network configuration.  Unlike
+ * most structures, this one is designed to be forwards and backwards compatible, so
+ * that new versions of DC (or the application program) will be able to read the
+ * configuration from older versions.  It is intended that the structure is able to
+ * be saved in the user block or filesystem.
+ */
+typedef struct {
+	word				len;				// Total length of this structure (varies depending on
+											// how many interfaces and other factors).
+	byte				version;			// Struct version number
+#define NCS_VERSION	0					// Version number incremented when incompatible change
+	byte				flags;			// Flag bits (reserved, set zero)
+	NISNetConf		nis;				// Non-interface-specific info
+	// Number of interface-specific items following
+	word				num_eth;
+	word 				num_pppser;
+	word				num_pppoe;
+// Interface-specific info.  Note that the array dimension is
+#if (USING_ETHERNET + USING_WIFI)
+	EthNetConf		eth[USING_ETHERNET+USING_WIFI];
+#endif
+#if USING_PPPLINK
+	PPPNetConf		pppser[USING_PPPLINK];
+#endif
+#if USING_PPPOE
+	PPPNetConf		pppoe[USING_PPPOE];
+#endif
+
+} NetConfSave;
+
+// The ruplNetworkPowerOnParameters struct is stored at
+// RUPL_TYPE_USERBLOCK_NW_PARAM_OFS in the user block.
+#ifndef RUPL_TYPE_USERBLOCK_NW_PARAM
+	#define RUPL_TYPE_USERBLOCK_NW_PARAM 0
+#endif
+#ifndef RUPL_TYPE_USERBLOCK_NW_PARAM_OFS
+	#define RUPL_TYPE_USERBLOCK_NW_PARAM_OFS 0
+#endif
+typedef struct
+{
+   char type;
+#ifdef DCRTCP
+   NetConfSave configuration;
+#endif
+   int checksum;
+}ruplNetworkPowerOnParameters;
+
+#ifdef DLP_DEFS_DEBUG
+	#define _dlp_defs_nodebug
+#else
+	#define _dlp_defs_nodebug __nodebug
+#endif
+
+#use "idblock_api.lib"
+/*** EndHeader */
+
+////////////////////////////////////////////////////////////////////////////////
+//		SECTION: Network configuration saving/restoring
+////////////////////////////////////////////////////////////////////////////////
+/*** BeginHeader ifs_restore*/
+int ifs_restore (NetConfSave *ncs);
+/*** EndHeader */
+_dlp_defs_nodebug
+int ifs_restore (NetConfSave *ncs)
+{
+	auto int i;
+   auto int ival;
+   auto word* wpval;
+   auto longword* lpval;
+
+   //check for match of version, size, and interfaces
+   if(ncs->version != NCS_VERSION) goto _ifc_error;
+   if(ncs->len != sizeof(NetConfSave)) goto _ifc_error;
+   if(ncs->num_eth != USING_ETHERNET + USING_WIFI) goto _ifc_error;
+   if(ncs->num_pppser != USING_PPPLINK) goto _ifc_error;
+   if(ncs->num_pppoe != USING_PPPOE) goto _ifc_error;
+
+   if (_initialized) for (i = 0; i < IF_MAX; i++)
+      ifdown(i);
+//   if (iface != IF_ANY)
+  //    wasup = ifpending(iface);
+#if (USING_ETHERNET + USING_WIFI)
+   for (i = 0; i < USING_ETHERNET + USING_WIFI; i++) {
+      ival = ncs->eth[i].head.iface;
+      _if_tab[ival].mtu = ncs->eth[i].mtu;
+      _if_tab[ival].ipaddr = ncs->eth[i].ipaddr;
+      _if_tab[ival].mask = ncs->eth[i].mask;
+      _if_tab[ival].flags = ncs->eth[i].flags & (ISNC_FLAGMASK |
+                                         ((ncs->eth[i].flags&IFF_DHCP)?IFF_DHCP_OK:0) |
+                                         ((ncs->eth[i].flags&IFF_ICMP_CONFIG)?IFF_ICMP_CFG_OK:0));
+      _if_tab[ival].u.eth.eflags = ncs->eth[i].eflags;
+   }
+#endif
+#if USING_PPPLINK
+   for (i = 0; i < USING_PPPLINK; i++) {
+      ival = ncs->pppser[i].head.iface;
+      _if_tab[ival].mtu = ncs->pppser[i].mtu;
+      _if_tab[ival].u.ppp.pflags = ncs->pppser[i].pflags;
+      _if_tab[ival].u.ppp.peeraddr = ncs->pppser[i].peeraddr;
+      memcpy(_if_tab[ival].state,
+             &(ncs->pppser[i].ppp_state),
+             sizeof(PPPState));
+   }
+#endif
+#if USING_PPPOE
+   for (i = 0; i < USING_PPPOE; i++) {
+      ival = ncs->pppoe[i].head.iface;
+      _if_tab[ival].mtu = ncs->pppoe[i].mtu;
+      _if_tab[ival].u.ppp.pflags = ncs->pppoe[i].pflags;
+      _if_tab[ival].u.ppp.peeraddr = ncs->pppoe[i].peeraddr;
+      memcpy(_if_tab[ival].state,
+             &(ncs->pppoe[i].ppp_state),
+             sizeof(PPPState));
+   }
+#endif
+   router_del_all();
+   for (i = 0; i < ncs->nis.nrouters; i++) {
+      if (!ncs->nis.router[i].ipaddr)
+         continue;
+      ival = ip_iface(ncs->nis.router[i].ipaddr, 2);
+      if (ival == IF_ANY)
+         ival = IF_DEFAULT;
+      router_add(ncs->nis.router[i].ipaddr, ival, ncs->nis.router[i].subnet, ncs->nis.router[i].mask, 0);
+   }
+#ifndef DISABLE_DNS
+   wpval = (word *)(ncs->nis.router + ncs->nis.nrouters);
+   lpval = (longword *)(wpval + 1);
+   servlist_delete(&_dns_server_table, 0, DNS_PREDEFINED);
+   for (i = 0; i < *wpval; i++, lpval++)
+      if (*lpval)
+         servlist_add(&_dns_server_table, *lpval, DNS_PREDEFINED, NULL);
+#endif
+	return 0;
+_ifc_error:
+	return -1;
+}
+
+/*** BeginHeader rupl_loadnetworkparameters */
+/* START _FUNCTION DESCRIPTION ********************************************
+rupl_loadnetworkparameters    <ZNETSUPPORT.LIB>
+
+SYNTAX:			int rupl_loadnetworkparameters(
+						 			ruplNetworkPowerOnParameters* params);
+
+DESCRIPTION:	This function reads the dlmNetworkPowerOnParameters from the
+					RUPL_TYPE_USERBLOCK_NW_PARAM_OFS offset in the user block in
+               parallel flash.
+
+PARAMETER:		A pointer to a valid ruplNetworkPowerOnParameters struct to
+					receive data from the user block.
+
+RETURN VALUE:	1 if the data in the user block is valid.
+					0 if the data in the user block is not valid.
+
+END DESCRIPTION *********************************************************/
+
+int rupl_loadnetworkparameters(ruplNetworkPowerOnParameters* params);
+/*** EndHeader */
+
+_dlp_defs_nodebug
+int rupl_loadnetworkparameters(ruplNetworkPowerOnParameters* params)
+{
+   readUserBlock(params, RUPL_TYPE_USERBLOCK_NW_PARAM_OFS,
+   				  sizeof(ruplNetworkPowerOnParameters));
+   // calculate simple summation checksum over type and NetConfSave members
+   return (params->checksum == rupl_dochecksum((void*)params,
+   		  sizeof(ruplNetworkPowerOnParameters) - sizeof(params->checksum)));
+}
+
+/*** BeginHeader repl_getCurrentNetworkConfig */
+void repl_getCurrentNetworkConfig(NetConfSave *ncs);
+/*** EndHeader */
+_dlp_defs_nodebug
+void repl_getCurrentNetworkConfig(NetConfSave *ncs)
+{
+	auto int i,j;
+	auto int ival;
+
+	ncs->len = sizeof(NetConfSave);
+	ncs->version = NCS_VERSION;
+	ncs->num_eth = USING_ETHERNET + USING_WIFI;
+	ncs->num_pppser = USING_PPPLINK;
+	ncs->num_pppoe = USING_PPPOE;
+	ncs->flags = 0;
+	ncs->nis.len = sizeof(NISNetConf);
+	ncs->nis.nrouters = ARP_ROUTER_TABLE_SIZE;
+	for (i = 0; i < ARP_ROUTER_TABLE_SIZE; i++) {
+		if (_arp_gate_data[i].ath > 0 && !_arp_gate_data[i].flags) {
+			arpcache_ipaddr(_arp_gate_data[i].ath, &ncs->nis.router[i].ipaddr);
+			ncs->nis.router[i].subnet = _arp_gate_data[i].u.preconfig.subnet;
+			ncs->nis.router[i].mask = _arp_gate_data[i].u.preconfig.mask;
+		}
+		else
+			ncs->nis.router[i].ipaddr = 0;
+	}
+	ncs->nis.nnameservers = MAX_NAMESERVERS;
+	for (i = 0; i < MAX_NAMESERVERS; i++) {
+#ifndef DISABLE_DNS
+		if (!i)
+			ncs->nis.nameserver[i] = servlist_first(&_dns_server_table, DNS_PREDEFINED, NULL);
+      else
+			ncs->nis.nameserver[i] = servlist_next(&_dns_server_table,
+               ncs->nis.nameserver[i-1], DNS_PREDEFINED, NULL);
+#else
+		ncs->nis.nameserver[i] = 0;
+#endif
+	}
+#if (USING_ETHERNET + USING_WIFI)
+	for (i = 0; i < USING_ETHERNET + USING_WIFI; i++) {
+	#if USING_ETHERNET
+		ival = IF_ETH0 + i;
+	#else
+		ival = IF_WIFI0 + i;
+   #endif
+		ncs->eth[i].head.iface = ival;
+		ncs->eth[i].mtu = _if_tab[ival].mtu;
+		ncs->eth[i].ipaddr = _if_tab[ival].ipaddr;
+		ncs->eth[i].mask = _if_tab[ival].mask;
+		ncs->eth[i].flags = _if_tab[ival].flags;
+		ncs->eth[i].eflags = _if_tab[ival].u.eth.eflags;
+	}
+#endif
+#if USING_PPPLINK
+	j = 0;
+	for (i = 0; i < MAX_PPP_SERIAL; i++) {
+		if(USE_PPP_SERIAL & (1 << i))
+		{
+		#ifdef MULTI_IF
+			ival = IF_PPP0 + i;
+		#else
+			ival = 0;  //only one PPP interface, nothing else
+		#endif
+			ncs->pppser[j].head.iface = ival;
+			ncs->pppser[j].mtu = _if_tab[ival].mtu;
+			ncs->pppser[j].pflags = _if_tab[ival].u.ppp.pflags;
+			ncs->pppser[j].peeraddr = _if_tab[ival].u.ppp.peeraddr;
+			memcpy(&(ncs->pppser[j].ppp_state),
+					 _if_tab[ival].state,
+					 sizeof(PPPState));
+			j++; //next index in save array
+		}
+	}
+#endif
+#if USING_PPPOE
+	for (i = 0; i < USING_PPPOE; i++) {
+		ival = IF_PPPOE0 + i;
+		ncs->pppoe[j].head.iface = ival;
+		ncs->pppoe[i].mtu = _if_tab[ival].mtu;
+		ncs->pppoe[i].pflags = _if_tab[ival].u.ppp.pflags;
+			ncs->pppoe[j].peeraddr = _if_tab[ival].u.ppp.peeraddr;
+		memcpy(&(ncs->pppoe[i].ppp_state),
+				 _if_tab[ival].state,
+				 sizeof(PPPState));
+	}
+#endif
+} //repl_getCurrentNetworkConfig()
+
+/*** BeginHeader rupl_savenetworkparameters */
+/* START _FUNCTION DESCRIPTION ********************************************
+rupl_savenetworkparameters    <ZNETSUPPORT.LIB>
+
+SYNTAX:			void rupl_savenetworkparameters(void);
+
+DESCRIPTION:	Saves the current network configuration to the user block
+					if the current configuration differs from the configuration
+               saved in the user block.
+
+RETURN VALUE:	None.
+
+END DESCRIPTION *********************************************************/
+
+void rupl_savenetworkparameters(void);
+/*** EndHeader */
+_dlp_defs_nodebug
+void rupl_savenetworkparameters(void)
+{
+   auto int rc;
+   auto ruplNetworkPowerOnParameters params;
+   auto ruplNetworkPowerOnParameters savedparams;
+
+	// clear out structures
+   memset((void*)&params, 0, sizeof(params));
+   memset((void*)&savedparams, 0, sizeof(savedparams));
+
+   // load NetConfSave structure
+	repl_getCurrentNetworkConfig(&params.configuration);
+   rc = rupl_loadnetworkparameters(&savedparams);
+
+	// If dlm_loadnetworkparameters failed (stored checksum of savedparams
+   // structure did not match the calculated checksum) or if the saved
+   // configuration does not match the current configuration, save the current
+   // configuration.
+	if(!rc || memcmp(&savedparams.configuration,
+   					  &params.configuration,
+                    sizeof(params.configuration)) != 0)
+   {
+      // set type field for structure
+      params.type     = RUPL_TYPE_USERBLOCK_NW_PARAM;
+	   params.checksum = rupl_dochecksum((void*)&params,
+   								sizeof(ruplNetworkPowerOnParameters) -
+                           sizeof(params.checksum));
+
+		writeUserBlock(RUPL_TYPE_USERBLOCK_NW_PARAM_OFS, &params, sizeof(params));
+   }
+}
+
+/*** BeginHeader rupl_dochecksum */
+/* START _FUNCTION DESCRIPTION ********************************************
+rupl_dochecksum               <ZNETSUPPORT.LIB>
+
+SYNTAX:			xmem unsigned int rupl_dochecksum(void* data, int length);
+
+DESCRIPTION:	Calculates a simple byte by byte checksum over the length
+					of data.
+
+PARAMETER1:		Pointer to a data buffer to checksum.
+
+PARAMETER2:		The length of the data buffer.
+
+RETURN VALUE:	The sum of all bytes in the buffer.
+
+END DESCRIPTION *********************************************************/
+
+__xmem unsigned int rupl_dochecksum(void* data, int length);
+/*** EndHeader */
+_dlp_defs_nodebug
+__xmem unsigned int rupl_dochecksum(void* data, int length)
+{
+	auto int i;
+   auto int checksum;
+   auto char* sptr;
+
+   checksum = 0;
+   sptr = (char*)data;
+   for(i = 0; i < length; i++)
+   {
+		checksum += *(sptr + i);
+   }
+	return checksum;
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

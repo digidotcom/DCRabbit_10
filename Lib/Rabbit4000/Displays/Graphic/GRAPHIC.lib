@@ -1,0 +1,5372 @@
+/*************************************************************************
+	High-Level Graphic Library for Rabbit based products
+	Copyright (c) 2001, Rabbit Semiconductor Inc.
+
+	Algorithms:
+	-----------
+	Primitive graphic drawing routines(lines, circles, polygon)	were
+	adapted from DDA and Bresenham's algorithms.
+
+
+	History:
+	--------
+	* 	This code was ported from the OP71HW.LIB library design.
+
+	  	Copyright (c) 1999, CF Controls and Copyright (c) 2000, Rabbit Semiconductor Inc.
+
+	 	Modified Jan 2000 by GVW, Woodley Associates
+ 	  	for compatibility with OP7100GE.
+
+	  	Version 1.1		3/29/2000	gvw
+		- Fixed op71FillVPolygon to handle star-shaped figures
+		  as well as normal polygons.
+
+	* 	Start of history for GRAPHIC.LIB.
+		Version 1.2 	7/15/01	EK
+		- Ported code over from OP71HW.LIB Z180 based product.
+	   - Moved the graphic buffer from Root to XMEM memory.
+	   - Implemented new design requirements from the BL2100
+	     graphic design specification.
+	   - Removed glXGetBitmap and glXGetFastmap functions as
+	     graphic engine isn't being implemented at this time.
+	   - Added escape sequence recognition for text functions
+	     TextPrintf and TextPutChar, now handles '\r' and '\n'
+	     control characters.
+	   - Added row/col TextGotoXY function that calculates
+	     the character cursor position based on font size
+	     and also uses the new TextWindowFrame function to
+	     define the text display area for keeping track of
+	     the cursor.
+	   - Added TextCursorPosition function to get the current
+	     location of the cursor.
+		- Added clipping to all graphic display functions for
+        display buffer protection.
+
+      Version 1.3 	8/15/02	EK
+      - Added TextWindowMenu function for large LCD displays
+
+      Version 1.4		12/21/04 EK
+      - Fixed the glLeft1 function to properly scroll images that cross
+        a xmem boundary in the display buffer.
+
+   	Version 1.5    07/22/05 EK
+      - Fixed Textborder function so that can be called again
+        for subsequence redrawing of the text window border.
+**************************************************************************/
+
+/*** BeginHeader */
+#ifndef __GRAPHIC_LIB
+#define __GRAPHIC_LIB
+
+
+// Used to calculate the location of the bitmapped character set
+// within the XMEM array.  (w+7/8) forces the calulation to be
+// byte aligned.
+#define FONTOFFSET(w,h) ((w+7)/8*h)
+/*** EndHeader */
+
+
+/*** BeginHeader glLock, realtime, dispaddr */
+extern char glLock;				// LCD buffer lock counter
+extern int realtime;
+extern unsigned long dispaddr;
+/*** EndHeader */
+
+// Realtime flag and pixel address pointer
+int realtime;
+unsigned long dispaddr;
+
+// Declared variable for the above header section
+char glLock;						// LCD buffer lock counter
+
+/*** BeginHeader pixBM  */
+// Buffer used to manipulate the bitmaps that aren't byte aligned
+extern char pixBM[2][PIXGROUP+2];	//	Bitmap Image/Mask Line Buffers
+
+// Structure to hold information on bitmap font characters
+typedef struct  {
+	char pixWidth, pixHeight;	// Char Height and Width
+	unsigned startChar;			// Character set start value
+	unsigned endChar;          // Character set end value
+	char flags;						//
+	unsigned charLength;			//	Length of each character in bytes
+	unsigned long xmemBuffer;  // XMEM location of Bitmap
+} fontInfo;
+
+// Structure to hold information on a given text window
+typedef struct  {
+	fontInfo *pFont;				// Font descriptor pointer
+	int startwinx;				  	// x-coord of text window frame
+	int startwiny;				  	// y-coord of text window frame
+	int winwidth;				  	// Width of window frame
+	int winheight;            	// Height of window frame
+	int curX;                 	// x-coord of cursor (pixel)
+	int curY;						// y-coord of cursor (pixel)
+	int curRow;						// Row of where the cursor is located
+	int curCol;						// Column of where the cursor is located
+	int curXmax;					// Cursor x-coord maximum pixel location
+	int curYmax;					// Cursor y-coord maximum pixel location
+	int maxChars;              // Maximum number of characters that can be displayed
+	char *title;               // Pointer to title for text border
+	int border;               	// Border type
+	int borderDisplayed;       // Flag used to control displaying the border
+} windowFrame;
+
+
+
+// Structure to combine text window and font information together
+typedef struct  {
+	fontInfo *pFont;
+	int x, y;
+	int w, h;
+	windowFrame *window;
+} glPutCharInst;
+
+
+#ifndef SINGLE_LINE
+#define NO_BORDER		0
+#endif
+
+#ifndef SINGLE_LINE
+#define SINGLE_LINE 	1
+#endif
+
+#ifndef DOUBLE_LINE
+#define DOUBLE_LINE 	2
+#endif
+
+/*** EndHeader */
+
+// Declared Array for the above header section
+char pixBM[2][PIXGROUP+2];	//	Bitmap Image/Mask Line Buffers
+
+
+/*** BeginHeader _glparams */
+__root int _glparams (int left, int top, int cols, int rows);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION *******************************************
+_glparams 			<GRAPHIC.LIB>
+
+SYNTAX:  		int _glparams (int left, int top, int cols, int rows);
+
+DESCRIPTION:	This is an assembly utility for fetching a common set
+					of parameters from the stack. This function is for
+					internal use only. This function is non-reentrant.
+
+					Note: This routine must only be called as a assembly
+					      rountine only, not as a "C" function.
+
+PARAMETER1:		X-coordinate of the upper left corner of the bitmap.
+PARAMETER2:		Y-coordinate of the left top corner of the bitmap.
+PARAMETER3:		Number of rows contained in bitmap.
+PARAMETER4:		Number columns contained in bitmap.
+
+RETURN VALUE:  HL  the address offset of the byte in the screen buffer
+               containing the pixel specified by left and top paramter.
+					The xpc_temp variable contains the XPC value for the
+					screen buffer offset.
+
+END DESCRIPTION **********************************************************/
+
+#asm __root __nodebug
+
+_glparams::
+	ld		hl,6						; HL = &left parameter
+	add	hl,sp
+
+	ld		e,(hl)					; Get left paramter
+	inc	hl
+	ld		d,(hl)					; DE = left parameter
+	inc	hl
+
+	srl	d							; Calculate column byte addr
+	rr		e							; Byte offset = column/8
+	srl	d
+	rr		e
+	srl	d
+	rr		e
+	push  de							; DE = Byte Offset of Column
+
+	ld		e,(hl)					; Get top parameter
+	inc	hl
+	ld		d,(hl)					; DE = top
+	inc	hl
+
+	push  hl							; Save-off parameter pointer
+	ld    bc,PIXGROUP				; Calculate pixel row offset
+	mul
+
+	pop	hl							; Retrieve parameter pointer
+	pop   de							; Retrieve column offset value
+	ex		de,hl						; HL = Column Byte Offset, DE = Param Ptr
+	add	hl,bc						; HL = Column + Row
+
+	; Calculate the starting x,y address in glBuf.
+	ex		de,hl'					; Save-off parameter pointer
+	ld    de,(glBuf)				; Get address of the graphic buffer
+	ld    bc,(glBuf+2)
+	add   hl,de						; Add offset to base glbuf address
+	jr    nc,.skipadd				; Check if there was a carry
+	inc   bc							; If so then increment MSB of address
+
+.skipadd:
+	ex    de,hl
+	call 	LongToXaddr				; Convert BC:DE to an xmem addr in A:DE
+	ld    (xpc_temp),a			; Save for calling routine
+	ex    de,hl
+	ret								; HL = Screen Addr
+#endasm
+
+
+
+/*** BeginHeader gl_PixMap */
+extern char gl_PixMap[];
+/*** EndHeader */
+
+//	Pixel Offset/Mask Table
+#asm const __root __nodebug
+gl_PixMap::		dw		0080h,0040h,0020h,0010h,0008h,0004h,0002h,0001h
+					dw		0180h,0140h,0120h,0110h,0108h,0104h,0102h,0101h
+					dw		0280h,0240h,0220h,0210h,0208h,0204h,0202h,0201h
+					dw		0380h,0340h,0320h,0310h,0308h,0304h,0302h,0301h
+					dw		0480h,0440h,0420h,0410h,0408h,0404h,0402h,0401h
+					dw		0580h,0540h,0520h,0510h,0508h,0504h,0502h,0501h
+					dw		0680h,0640h,0620h,0610h,0608h,0604h,0602h,0601h
+					dw		0780h,0740h,0720h,0710h,0708h,0704h,0702h,0701h
+					dw		0880h,0840h,0820h,0810h,0808h,0804h,0802h,0801h
+					dw		0980h,0940h,0920h,0910h,0908h,0904h,0902h,0901h
+					dw		0A80h,0A40h,0A20h,0A10h,0A08h,0A04h,0A02h,0A01h
+					dw		0B80h,0B40h,0B20h,0B10h,0B08h,0B04h,0B02h,0B01h
+					dw		0C80h,0C40h,0C20h,0C10h,0C08h,0C04h,0C02h,0C01h
+					dw		0D80h,0D40h,0D20h,0D10h,0D08h,0D04h,0D02h,0D01h
+					dw		0E80h,0E40h,0E20h,0E10h,0E08h,0E04h,0E02h,0E01h
+					dw		0F80h,0F40h,0F20h,0F10h,0F08h,0F04h,0F02h,0F01h
+					dw		1080h,1040h,1020h,1010h,1008h,1004h,1002h,1001h
+					dw		1180h,1140h,1120h,1110h,1108h,1104h,1102h,1101h
+					dw		1280h,1240h,1220h,1210h,1208h,1204h,1202h,1201h
+					dw		1380h,1340h,1320h,1310h,1308h,1304h,1302h,1301h
+					dw		1480h,1440h,1420h,1410h,1408h,1404h,1402h,1401h
+					dw		1580h,1540h,1520h,1510h,1508h,1504h,1502h,1501h
+					dw		1680h,1640h,1620h,1610h,1608h,1604h,1602h,1601h
+					dw		1780h,1740h,1720h,1710h,1708h,1704h,1702h,1701h
+					dw		1880h,1840h,1820h,1810h,1808h,1804h,1802h,1801h
+					dw		1980h,1940h,1920h,1910h,1908h,1904h,1902h,1901h
+					dw		1A80h,1A40h,1A20h,1A10h,1A08h,1A04h,1A02h,1A01h
+					dw		1B80h,1B40h,1B20h,1B10h,1B08h,1B04h,1B02h,1B01h
+					dw		1C80h,1C40h,1C20h,1C10h,1C08h,1C04h,1C02h,1C01h
+					dw		1D80h,1D40h,1D20h,1D10h,1D08h,1D04h,1D02h,1D01h
+					dw		1E80h,1E40h,1E20h,1E10h,1E08h,1E04h,1E02h,1E01h
+					dw		1F80h,1F40h,1F20h,1F10h,1F08h,1F04h,1F02h,1F01h
+					dw		2080h,2040h,2020h,2010h,2008h,2004h,2002h,2001h
+					dw		2180h,2140h,2120h,2110h,2108h,2104h,2102h,2101h
+					dw		2280h,2240h,2220h,2210h,2208h,2204h,2202h,2201h
+					dw		2380h,2340h,2320h,2310h,2308h,2304h,2302h,2301h
+					dw		2480h,2440h,2420h,2410h,2408h,2404h,2402h,2401h
+					dw		2580h,2540h,2520h,2510h,2508h,2504h,2502h,2501h
+					dw		2680h,2640h,2620h,2610h,2608h,2604h,2602h,2601h
+					dw		2780h,2740h,2720h,2710h,2708h,2704h,2702h,2701h
+#endasm
+
+/*** BeginHeader glBuffLock, glBuffUnlock, glSwap */
+void glBuffLock(void);
+void glBuffUnlock(void);
+void glSwap(void);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glBuffLock                  <GRAPHIC.LIB>
+
+SYNTAX:  		void glBuffLock(void);
+
+DESCRIPTION:  	Increment LCD Screen Locking Counter.  Graphics calls
+					are recorded in the LCD memory buffer and not transferred
+					to the LCD if the counter is non-zero. This function is
+					non-reentrant.
+
+					Note:
+					-----
+					Functions glBuffLock() and glBuffUnlock() can be nested
+					up to a level of 255, but be sure to balance the calls.
+					It is not a requirement to use these procedures, but a
+					set of glBuffLock() and glBuffUnlock() bracketing a set
+					of related graphics calls significantly speeds up the
+					rendering.
+
+PARAMETER1:		None.
+
+RETURN VALUE:	None.
+
+SEE ALSO:		glBuffUnlock, glSwap
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void glBuffLock ( void )
+{
+	#GLOBAL_INIT{glLock = 0;}
+#asm
+	ld		hl,glLock				; Increment Lock
+	inc	(hl)
+#endasm
+}
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+glBuffUnlock   		<GRAPHIC.LIB>
+
+SYNTAX:  		void glBuffUnlock(void);
+
+DESCRIPTION:  	Decrement the LCD Screen Locking Counter. The contents of
+					the LCD buffer are transferred to the LCD if the counter
+					goes to zero (0). This function is non-reentrant.
+
+PARAMETER1: 	None.
+
+RETURN VALUE:	None.
+
+SEE ALSO:		glBuffLock, glSwap
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void glBuffUnlock( void )
+{
+	#GLOBAL_INIT{glLock = 0;}
+#asm
+	ld		hl,glLock				; Decrement Lock
+	dec	(hl)
+	ld		a,(glLock)				; Quit if Screen Locked
+	or		a,a
+	jr    nz,.skipSwap
+	call  _glSwapData
+.skipSwap:
+#endasm
+}
+
+/* START FUNCTION DESCRIPTION ********************************************
+glSwap                <GRAPHIC.LIB>
+
+SYNTAX:  		void glSwap(void);
+
+DESCRIPTION:  	Checks the LCD Screen Locking Counter. The contents of the
+               LCD buffer are transferred to the LCD if the counter is
+					zero (0). This function is non-reentrant.
+
+PARAMETER1:		None.
+
+RETURN VALUE:	None.
+
+SEE ALSO:		glBuffUnlock, glBuffLock, _glSwapData located in the
+               library specifically for the LCD that you're using.
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void glSwap ( void )
+{
+#asm
+	ld		a,(glLock)				; Quit if Screen Locked
+	or		a,a
+	jr    nz, .skipSwap
+	call  _glSwapData
+.skipSwap:
+#endasm
+}
+
+
+/*** BeginHeader glSetBrushType, PixColor */
+//	Pixel = (Pixel AND LSB) XOR MSB
+#define	PIXBLACK		0xFF00
+#define	PIXWHITE		0x0000
+#define	PIXXOR		0xFFFF
+extern int PixColor;
+void glSetBrushType ( int type );
+/*** EndHeader */
+
+int PixColor;
+
+/* START FUNCTION DESCRIPTION ********************************************
+glSetBrushType              <GRAPHIC.LIB>
+
+SYNTAX:  		void glSetBrushType(int type);
+
+DESCRIPTION:  	Sets the drawing method (or color) of pixels drawn by
+					subsequent graphics calls. This function is non-reentrant.
+
+PARAMETER1:		The value can be one of the following MACRO's:
+  					PIXBLACK....draws black pixels.
+  					PIXWHITE....draws white pixels.
+  					PIXXOR......draws oldPixel XOR'ed with the newPixel.
+
+RETURN VALUE:	None.
+
+SEE ALSO:		glGetBrushType
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void glSetBrushType(int type)
+{
+	PixColor = type;
+}
+
+/*** BeginHeader glGetBrushType */
+int glGetBrushType(void);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glGetBrushType              <GRAPHIC.LIB>
+
+SYNTAX:  		int glGetBrushType(void);
+
+DESCRIPTION:  	Gets the current method (or color) of pixels drawn by
+					subsequent graphics calls. This function is non-reentrant.
+
+PARAMETER1:    None.
+
+RETURN VALUE:  The current brush type.
+
+SEE ALSO:		glSetBrushType
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int glGetBrushType(void)
+{
+	return (PixColor);
+}
+
+/*** BeginHeader glPlotDot */
+__root void glPlotDot ( int x, int y );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glPlotDot                   <GRAPHIC.LIB>
+
+SYNTAX:  		void glPlotDot(int x, int y);
+
+DESCRIPTION:  	Draw a single pixel in the LCD buffer, and on the LCD if
+					the buffer is unlocked. This function is non-reentrant.
+
+					If the coordinates are outside the LCD display area, the
+					dot will not be plotted.
+
+PARAMETER1:		X-coordinate of dot.
+PARAMETER2:    Y-coordinate of dot.
+
+RETURN VALUE:	None.
+
+SEE ALSO:		glPlotline, glPlotPolygon, glPlotCircle
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void glPlotDot(int x, int y)
+{
+	static long phyAddr;
+	static char pixel;
+
+	// Check if the x,y coordinates have exceeded the LCD display boundary
+	if(x < 0 || x > (LCD_XS-1))
+	{
+		// x-coordinate exceeded, return without plotting the dot
+		return;
+	}
+	if(y < 0 || y > (LCD_YS-1))
+	{
+		// y-coordinate exceeded, return without plotting the dot
+		return;
+	}
+
+#asm
+	call	_param2					; HL = X, E = Y
+	ex    de',hl      			; Save X coordinate
+	ld 	bc,PIXGROUP				; BC = Num_Cols
+	mul								; (DE = Row ) * (BC = PIXGROUP)
+   				               ; HL = Don't Care  : BC = Row offset
+	push  bc
+	ex    de',hl         		; Retrieve X-coord
+
+	add	hl,hl						; HL = Pixel Map Index (HL * 2)
+	ld		bc,gl_PixMap			; HL = Pixel Map Start Address
+
+	add	hl,bc	 					; Add Index to base pointer
+	ld		a,(hl)					; A = Bit Mask
+	inc	hl							; Increment HL to point to the pixel offset
+
+	ld		l,(hl)					; HL = Pixel offset
+	ld		h,0
+	pop 	de
+	add  	hl,de
+
+	ex		af,af'
+	ld    a,xpc          		; Save current XPC value
+	push  af
+
+	; Calculate the column and row in glBuf where the dot is going to be
+	; plotted.
+	ld    de,(glBuf)				; Load BC:DE with glBuf base address
+	ld    bc,(glBuf+2)
+	add   hl,de						; Add column and row offset to base address
+	jr    nc,.skipcarry
+	inc   bc
+
+.skipcarry:
+
+	ld    a,(realtime)
+	cp    0x00
+	jr    z,.skip_realtime1
+	ld    (phyAddr),hl
+	ld    (phyAddr+2),bc
+
+.skip_realtime1:
+	ex    de,hl
+	call 	LongToXaddr				; Convert BC:DE to an xmem addr in A:DE
+	ld    xpc,a
+	ex    de,hl
+  	ex    af,af'					; Retrieve pixel bitmask
+
+	ld		bc,(PixColor)			; B = XOR Mask, C = AND Mask
+	ld		e,a						; E = Bit Mask
+	cpl								; A = Complement of Bit Mask
+	rrc	c							; Rotate AND Mask, C = Next AND Bit
+	jr		nc,.skipAND				; AND Mask = 0xFF if Next AND Bit Set
+	or		a,e
+
+.skipAND:
+	and	a,(hl)					; A = Pixel AND Masked
+	rrc	b							; Rotate XOR Mask, C = Next XOR Bit
+	jr		nc,.skipXOR				; A = (Pixel AND Masked) XOR Masked
+	xor	a,e
+
+.skipXOR:
+	ld		(hl),a					; Update Buffer
+	ld    (pixel),a
+	ld    a,(realtime)
+	cp    0x00
+	jr    z,.skip_realtime2
+	push  ix
+	push  iy
+	c  	_glPlotRealtime(pixel, phyAddr);
+	pop   iy
+	pop   ix
+	jr    .endplotdot
+
+.skip_realtime2:
+	call	glSwap					; Update LCD
+
+.endplotdot:
+	pop   af							; Restore XPC register
+	ld    xpc,a
+#endasm
+}
+
+
+/*** BeginHeader glPlotLine */
+__root void glPlotLine ( int x0, int y0, int x1, int y1 );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glPlotLine                  <GRAPHIC.LIB>
+
+SYNTAX:  		void glPlotLine(int x0, int y0, int x1, int y1);
+
+DESCRIPTION:  	Draw a line in the LCD buffer, and on the LCD if the
+					buffer is unlocked. This function is non-reentrant.
+
+					Any portion of the line that is beyond the LCD display
+					area will be clipped.
+
+PARAMETER1:    X-coordinate of one endpoint of the line.
+PARAMETER2:    Y-coordinate of one endpoint of the line.
+PARAMETER3:		X-coordinate of the other endpoint of the line.
+PARAMETER4:    Y-coordinate of the other endpoint of the line.
+
+RETURN VALUE: 	 None.
+
+SEE ALSO: 		glPlotDot, glPlotPolygon, glPlotCircle
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void glPlotLine(int x0, int y0, int x1, int y1)
+{
+	static char* laddr;
+	static char pixel;
+
+	// Return if x-coordinates of line are not displayable on the LCD display
+	if((x0 < 0 && x1 < 0) || (x0 > (LCD_XS-1) && x1 > (LCD_XS-1)))
+	{
+		return;
+	}
+
+	// Return if y-coordinates of line are not displayable on the LCD display
+	if((y0 < 0 && y1 < 0) || (y0 > (LCD_YS-1) && y1 > (LCD_YS-1)))
+	{
+		return;
+	}
+
+	// Check if first endpoint of the line has exceeded the LCD boundary
+	if(x0 < 0 || x0 > (LCD_XS-1))
+	{
+		// Clip it, set it to either the MIN or MAX display boundary
+		x0 = (x0 > (LCD_XS-1)) ? (LCD_XS-1) : 0;
+	}
+	if(y0 < 0 || y0 > (LCD_YS-1))
+	{
+		// Clip it, set it to either the MIN or MAX display boundary
+		y0 = (y0 > (LCD_YS-1)) ? (LCD_YS-1) : 0;
+	}
+
+
+	// Check if other endpoint of the line has exceeded the LCD boundary
+	if(x1 < 0 || x1 > (LCD_XS-1))
+	{
+		// Clip it, set it to either the MIN or MAX display boundary
+		x1 = (x1 > (LCD_XS-1)) ? (LCD_XS-1) : 0;
+	}
+	if(y1 < 0 || y1 > (LCD_YS-1))
+	{
+		// Clip it, set it to either the MIN or MAX display boundary
+		y1 = (y1 > (LCD_YS-1)) ? (LCD_YS-1) : 0;
+	}
+
+#asm
+	ld    a,xpc
+	push  af
+	push  ix
+	ld		iy,6						; IY = &X0
+	add	iy,sp
+	ld		e,(iy+0)					; DE = X0
+	ld		d,(iy+1)
+	ld		c,(iy+4)					; BC = X1
+	ld		b,(iy+5)
+	ld		h,b						; HL = X1 - X0
+	ld		l,c
+	or		a,a
+	sbc	hl,de
+	jr		nc,.origin				; If X1 < X0, Swap (X0,Y0) & (X1,Y1)
+	push	de							; Protect X0
+	push	bc							; Protect X1
+	ld		e,(iy+2)					; DE = Y0
+	ld		d,(iy+3)
+	ld		c,(iy+6)					; BC = Y1
+	ld		b,(iy+7)
+	ld		(iy+6),e					; Swap Y0 & Y1
+	ld		(iy+7),d
+	ld		(iy+2),c
+	ld		(iy+3),b
+	pop	de							; Restore X1
+	pop	bc							; Restore X0
+	ld		(iy+0),e					; Swap X0 & X1
+	ld		(iy+1),d
+	ld		(iy+4),c
+	ld		(iy+5),b
+	ld		h,b						; HL = X1 - X0
+	ld		l,c
+	or		a,a
+	sbc	hl,de
+
+.origin:
+	push	hl							; Protect X1 - X0
+	ex		de,hl						; HL = X0
+	add	hl,hl						; HL = &gl_PixMap[X0]
+	ld		de,gl_PixMap
+	add	hl,de
+	ld		a,(hl)					;  A = Pixel Bitmask
+
+	inc	hl
+	ld		l,(hl)					; HL = Pixel Byte Offset
+	ld		h,0
+
+	push  hl
+	ld		c,(iy+2)					; BC = Y0
+	ld		b,(iy+3)
+	ld		de,PIXGROUP				; DE = PIXGROUP
+	mul   							; BC = (Y0*PIXGROUP )
+	pop   hl
+	add	hl,bc						; HL = LCD Buffer Offset
+	ex    af,af'					; Save-off pixel bitmask
+
+	; Calculate the starting row in glBuf where the line is going to start.
+	ld     de,(glBuf)				; Load BC:DE with glBuf base address
+	ld     bc,(glBuf+2)
+	add    hl,de					; Add row column offset to base address
+	jr     nc,.skipadd
+	inc    bc
+
+.skipadd:
+	ex     de,hl
+	call 	 LongToXaddr			; Convert BC:DE to an xmem addr in A:DE
+	ld     (xpc_temp),a
+	ld     xpc,a
+	ex     de,hl
+
+	; At this point the glbuf pointer is pointing to the first row of
+	; where the line is going to start. The worst case calculation for
+	; bumping the glBuf pointer from this point on will be the number
+	; of bytes within a given row. For example, a LCD with a resolution
+	; of 240x320 would be 40 bytes.
+
+	ex    af,af'					; Retrieve pixel bitmask
+	ex		(sp),hl					; HL = X1 - X0, (SP) = LCD Buffer Pointer
+	ld		c,l						; BC = X1 - X0
+	ld		b,h
+	ld		l,(iy+2)					; HL = Y0
+	ld		h,(iy+3)
+	ld		e,(iy+6)					; DE = Y1
+	ld		d,(iy+7)
+	or		a							; HL = Y0 - Y1
+	sbc	hl,de
+	jp		nc,.oct78				; If (Y0 - Y1) Pos, Octants 7 & 8
+
+.oct12:
+	push	hl							; Protect Y0 - Y1
+	ex		de,hl						; HL = Y1 - Y0
+	ld		hl,0
+	or		a,a
+	sbc	hl,de
+	ld		e,l						; DE = Y1 - Y0
+	ld		d,h
+	or		a,a						; !C = (Y1 - Y0) - (X1 - X0)
+   sbc	hl,bc
+	jp		nc,.oct2					; If (Y1 - Y0) > (X1 - X0), Octant 2
+
+.oct1:
+	pop	hl							; DE = Y0 - Y1 (Clean Stack)
+	push	bc							; Push X1 - X0
+	ld		hl,0						; HL = X0 - X1
+	or		a,a
+	sbc	hl,bc
+	ld		c,l						; BC = X0 - X1
+	ld		b,h
+	sra	h							; HL = (X0 - X1)/2
+	rr		l
+	exx								; Show Pixel Registers
+
+	pop	hl							; HL = Pixel Count
+	inc	hl
+	ld		d,a						; D = XOR Mask
+	cpl								; E = AND Mask
+	ld		e,a
+	pop	ix							; IX = LCD Buffer Pointer
+	ld		iy,PixColor				; (IY+0) = AND Mask, (IY+1) = XOR Mask
+
+.oct1next:
+	ld		a,(ix)					; A = LCD Buffer Containing Pixel
+	ld    b,(iy+0)
+	rlc	b
+	ld    (iy+0),b					; AND Mask Pixel
+	jr		c,.oct1or
+	and	a,e
+
+.oct1or:
+	ld    b,(iy+1)
+	rlc	b
+	ld    (iy+1),b					; XOR Mask Pixel
+	jr		nc,.oct1pix
+	xor	a,d
+
+.oct1pix:
+	ld		(ix),a					; Update LCD Buffer
+
+.skip_oct1:
+	rrc	e							; Rotate AND/XOR Masks (X += 1)
+	rrc	d
+	jr		nc,.oct1daa				; If Wrap, Inc Buffer Pointer
+	inc	ix
+
+.oct1daa:
+	exx								; Show DAA Registers
+	add	hl,de						; Acc += (Y0 - Y1)
+	jr		nc,.oct1count			; Continue if No Acc Overflow
+	add	hl,bc						; Acc += (X0 - X1)
+	exx								; Show Pixel Registers
+	ld		bc,PIXGROUP				; Load BC with (Y += 1)
+	add	ix,bc						; Bump Buffer Pointer (Y += 1)
+	push  hl							; Save HL value
+
+	; Check if glBuf pointer has crossed the 0xF000 page boundary
+	ld    hl,ix						; Load HL with glBuf pointer
+	bit   4,h
+	jr    z,.skipXPC2				; If HL in 0xE000 Page, Continue
+	res   4,h						; Force Back to 0xE000 Page
+	ld    a,xpc						; Get the current page location
+	inc   a							; Bump to next page
+	ld    xpc,a						; Update XPC with new value
+	ld    ix,hl						; Move glBuf pointer to IX register
+
+.skipXPC2:
+	pop   hl							; Retrieve HL value
+	exx								; Show DAA Registers
+
+.oct1count:
+	exx								; Show Pixel Registers
+	dec	hl							; Dec Pixel Count
+	ld		a,h						; Continue til Done
+	or		a,l
+	jr		nz,.oct1next
+	jp		.linedone					; Done
+
+.oct2:
+	pop	de							; DE = Y0 - Y1
+	ld		l,e						; HL = Y0 - Y1
+	ld		h,d
+	sra	h							; HL = (Y0 - Y1)/2
+	rr		l
+	push	de							; Push Y0 - Y1
+	exx								; Show Pixel Registers
+
+	pop	hl							; HL = Pixel Count (Negative)
+	dec	hl
+	ld		d,a						; D = XOR Mask
+	cpl								; E = AND Mask
+	ld		e,a
+	pop	ix							; IX = LCD Buffer Pointer
+	ld		iy,PixColor				; (IY+0) = AND Mask, (IY+1) = XOR Mask
+
+.oct2next:
+	ld		a,(ix)					; A = LCD Buffer Containing Pixel
+	ld    b,(iy+0)
+	rlc   b
+	ld    (iy+0),b					; AND Mask Pixel
+	jr		c,.oct2or
+	and	a,e
+
+.oct2or:
+	ld    b,(iy+1)
+	rlc	b
+	ld    (iy+1),b					; XOR Mask Pixel
+	jr		nc,.oct2pix
+	xor	a,d
+
+.oct2pix:
+	ld		(ix),a					; Update LCD Buffer
+
+.skip_oct2:
+	ld		bc,PIXGROUP				; Load BC with (Y += 1)
+	add	ix,bc						; Bump LCD Buffer Pointer (Y += 1)
+	push  hl							; Save HL value
+
+	; Check if glBuf pointer has crossed the 0xF000 page boundary
+	ld    hl,ix						; Load HL with glBuf pointer
+	bit   4,h
+	jr    z,.skipXPC3				; If HL in 0xE000 Page, Continue
+	res   4,h						; Force Back to 0xE000 Page
+	ld    a,xpc						; Get current page location
+	inc   a							; Bump to next page
+	ld    xpc,a						; Update XPC with new value
+	ld    ix,hl						; Move glBuf pointer to IX register
+
+.skipXPC3:
+	pop   hl							; Retrieve HL value
+
+.oct2daa:
+	exx								; Show DAA Registers
+	add	hl,bc						; Acc -= (X1 - X0)
+	jr		nc,.oct2count			; Continue if No Acc Overflow
+	add	hl,de						; Acc += (Y1 - Y0)
+	exx								; Show Pixel Registers
+	rrc	e							; Rotate AND/XOR Masks (X += 1)
+	rrc	d
+	exx								; Show DAA Registers
+	jr		nc,.oct2count			; If Wrap, Inc Buffer Pointer
+	inc	ix
+
+.oct2count:
+	exx								; Show Pixel Registers
+	inc	hl							; Dec Pixel Count
+	ld		a,h						; Continue til Done
+	or		a,l
+	jr		nz,.oct2next
+	jp		.linedone					; Done
+
+.oct78:
+	ld		e,l						; DE = Y0 - Y1
+	ld		d,h
+	or		a,a						; !C = (Y0 - Y1) - (X1 - X0)
+	sbc	hl,bc
+	jp		nc,.oct7					; If (Y1 - Y0) > (X1 - X0), Octant 7
+
+.oct8:
+	push	bc							; Push X1 - X0
+	ld		hl,0						; HL = X0 - X1
+	or		a
+	sbc	hl,bc
+	ld		c,l						; BC = X0 - X1
+	ld		b,h
+	sra	h							; HL = (X0 - X1)/2
+	rr		l
+	exx								; Show Pixel Registers
+
+	pop	hl							; HL = Pixel Count
+	inc	hl
+	ld		d,a						; D = XOR Mask
+	cpl								; E = AND Mask
+	ld		e,a
+	pop	ix							; IX = LCD Buffer Pointer
+	ld		iy,PixColor				; (IY+0) = AND Mask, (IY+1) = XOR Mask
+
+.oct8next:
+	ld		a,(ix)					; A = LCD Buffer Containing Pixel
+	ld    b,(iy+0)
+	rlc	b
+	ld    (iy+0),b					; AND Mask Pixel
+	jr		c,.oct8or
+	and	a,e
+
+.oct8or:
+	ld    b,(iy+1)
+	rlc	b
+	ld    (iy+1),b					; XOR Mask Pixel
+	jr		nc,.oct8pix
+	xor	a,d
+
+.oct8pix:
+	ld		(ix),a					; Update LCD Buffer
+
+.skip_oct8:
+	rrc	e							; Rotate AND/XOR Masks (X += 1)
+	rrc	d
+	jr		nc,.oct8daa				; If Wrap, Inc Buffer Pointer
+	inc	ix
+
+.oct8daa:
+	exx								; Show DAA Registers
+	add	hl,de						; Acc += (Y0 - Y1)
+	jr		nc,.oct8count			; Continue if No Acc Overflow
+	add	hl,bc						; Acc += (X0 - X1)
+	exx								; Show Pixel Registers
+	ld		bc,-PIXGROUP			; Load BC with (Y -= 1)
+	add	ix,bc						; Bump LCD Buffer Pointer (Y -= 1)
+	push  hl							; Save HL value
+
+	; Check if glBuf pointer has crossed the 0xE000 page boundary
+	ld    hl,ix						; Load HL with glBuf pointer
+	bit   5,h
+	jr    nz,.skipXPC4			; If HL in 0xE000 Page, Continue
+	res   4,h
+	set   5,h						; Force Back to 0xE000 Page
+	ld    a,xpc						; Get current page location
+	dec   a							; Bump to next page
+	ld    xpc,a						; Update XPC with new value
+	ld    ix,hl						; Move glBuf pointer to IX register
+
+.skipXPC4:
+	pop   hl							; Restore HL value
+	exx								; Show DAA Registers
+
+.oct8count:
+	exx								; Show Pixel Registers
+	dec	hl							; Dec Pixel Count
+	ld		a,h						; Continue til Done
+	or		a,l
+	jr		nz,.oct8next
+	jp		.linedone					; Done
+
+.oct7:
+	ld		hl,0						; HL = Y1 - Y0
+	or		a,a
+	sbc	hl,de
+	ld		e,l						; DE = Y1 - Y0
+	ld		d,h
+	sra	h							; HL = (Y1 - Y0)/2
+	rr		l
+	push	de							; Push Y1 - Y0
+	exx								; Show Pixel Registers
+	pop	hl							; HL = Pixel Count (Negative)
+	dec	hl
+	ld		d,a						; D = XOR Mask
+	cpl								; E = AND Mask
+	ld		e,a
+	pop	ix							; IX = LCD Buffer Pointer
+	ld		iy,PixColor				; (IY+0) = AND Mask, (IY+1) = XOR Mask
+
+.oct7next:
+	ld		a,(ix)					; A = LCD Buffer Containing Pixel
+	ld    b,(iy+0)
+	rlc   b
+	ld    (iy+0),b					; AND Mask Pixel
+	jr		c,.oct7or
+	and	a,e
+
+.oct7or:
+	ld    b,(iy+1)
+	rlc	b
+	ld    (iy+1),b					; XOR Mask Pixel
+	jr		nc,.oct7pix
+	xor	a,d
+
+.oct7pix:
+	ld		(ix),a					; Update LCD Buffer
+
+.skip_oct7:
+	ld		bc,-PIXGROUP			; Load BC with (Y -= 1)
+	add	ix,bc						; Bump LCD Buffer Pointer (Y -= 1)
+	push  hl							; Save HL value
+
+	; Check if glBuf pointer has crossed the 0xE000 page boundary
+	ld    hl,ix						; Load HL with glBuf pointer
+	bit   5,h
+	jr    nz,.skipXPC5			; If HL in 0xE000 Page, Continue
+	set   5,h						; Force Back to 0xE000 Page
+	res   4,h
+	ld    a,xpc						; Get current page location
+	dec   a							; Bump to next page
+	ld    xpc,a						; Update XPC with new value
+	ld    ix,hl						; Move glBuf pointer to IX register
+
+.skipXPC5:
+	pop   hl							; Retrieve HL value
+
+.oct7daa:
+	exx								; Show DAA Registers
+	add	hl,bc						; Acc -= (X1 - X0)
+	jr		nc,.oct7count			; Continue if No Acc Overflow
+	add	hl,de						; Acc += (Y1 - Y0)
+	exx								; Show Pixel Registers
+	rrc	e							; Rotate AND/XOR Masks (X += 1)
+	rrc	d
+	exx								; Show DAA Registers
+	jr		nc,.oct7count			; If Wrap, Inc Buffer Pointer
+	inc	ix
+
+.oct7count:
+	exx								; Show Pixel Registers
+	inc	hl							; Dec Pixel Count
+	ld		a,h						; Continue til Done
+	or		a,l
+	jr		nz,.oct7next
+
+.linedone:
+	pop	ix
+	pop   af							; Restore XPC
+	ld    xpc,a
+	call  glSwap
+#endasm
+}
+
+
+/*** BeginHeader glLeft1 */
+__root __useix void glLeft1 ( int left,int top,int cols,int rows );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glLeft1                     <GRAPHIC.LIB>
+
+SYNTAX:  		void glLeft1(int left, int top,
+                            int cols, int rows);
+
+DESCRIPTION:  	Scroll byte-aligned Window left one pixel, right column
+					filled by current pixel type (color). This function is
+					non-reentrant.
+
+PARAMETER1:		Upper left corner of bitmap, must be evenly divisible by 8.
+PARAMETER2:		Left top corner of the bitmap.
+PARAMETER3:		Number of columns in window, must be evenly divisible by 8.
+PARAMETER4:		Number of rows in window.
+
+SEE ALSO:		glHScroll, glRight1
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+__root __useix void glLeft1(int left, int top, int cols, int rows)
+{
+#asm
+	call	_glparams				; HL = Screen Addr
+	ld    a,xpc						; Save-off current XPC value
+	push	af
+	ld   	a,(xpc_temp)  		 	; xpc_temp was initialized in glparams
+	ld    xpc,a						; Map in start scrolling location
+
+	ld    e,(ix+rows+0)
+	ld    d,(ix+rows+1)
+
+	ld		c,(ix+cols+0)
+	ld		b,(ix+cols+1)
+
+	srl	b
+	rr		c
+	srl	b
+	rr		c
+	srl	b
+	rr		c
+
+	add	hl,bc						; HL = Addr of Row & Right Most Col
+	dec	hl
+
+.row:
+	push	hl							; Protect Addr Row & Col
+	ld		a,(PixColor+1)			; C = Current Pixel Color
+	rra								; color into CY
+	ld		b,c						; B = Columns
+
+.col:
+	rl		(hl)						; Rotate Left
+	dec	hl							; Point to Next Byte
+	djnz	.col						; Shift Column
+
+	pop	hl							; Restore Addr Row & Col
+	push	bc							; Protect Row Count
+	ld		c,PIXGROUP				; BC = Row Advance (Note: DJNZ Leaves B = 0)
+
+	bit   4,h						; Check if glBuf crossed the 0xF000 boundary
+	jr    z,.skipXPC				; If not then continue
+	set   5,h						; Reset ptr back to the 0xE000 page
+	res	4,h
+	ld    a,xpc						; Get current XPC value
+	inc   a							; Bump XPC to the next 4K page
+	ld    xpc,a						; Update XPC with new value
+
+
+.skipXPC:
+	add	hl,bc						; Bump Memory Pointer
+	pop	bc							; Restore Row Count
+	dec	de							; Decrement Row Counter
+	ld		a,d						; Row Counter Zero?
+	or		a,e
+	jr		nz,.row					; Shift Next Row
+
+	pop   af
+	ld    xpc,a
+	call	glSwap					; Update LCD
+#endasm
+}
+
+/*** BeginHeader glRight1 */
+__root __useix void glRight1(int left, int top, int cols, int rows);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glRight1                    <GRAPHIC.LIB>
+
+SYNTAX:  		void glRight1(int left, int top,
+                             int cols, int rows);
+
+DESCRIPTION:  	Scroll byte-aligned Window right one pixel, left column
+					filled by current pixel type (color). This function is
+					non-reentrant.
+
+PARAMETER1:		Upper left corner of bitmap, must be evenly divisible by 8.
+PARAMETER2:		Left top corner of the bitmap.
+PARAMETER3:		Number of columns in window, must be evenly divisible by 8.
+PARAMETER4:		Number of rows in window.
+
+SEE ALSO:		glHScroll, glLeft1
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+__root __useix void glRight1(int left, int top, int cols, int rows)
+{
+#asm
+	call	_glparams				; HL = Screen Addr
+	ld    a,xpc
+	push	af
+	ld    a,(xpc_temp)			; xpc_temp was initialized in glparams
+	ld    xpc,a						; Map in start scrolling location
+
+	ld    e,(ix+rows+0)
+	ld    d,(ix+rows+1)
+
+	ld		c,(ix+cols+0)
+	ld		b,(ix+cols+1)
+
+	srl	b
+	rr		c
+	srl	b
+	rr		c
+	srl	b
+	rr		c
+.row:
+	push	hl							; Protect Addr Row & Col
+	ld		a,(PixColor+1)			; A = Current Pixel Color
+	rra
+	ld		b,c						; B = Columns
+.col:
+	rr		(hl)						; Rotate Right
+	inc	hl							; Point to Next Byte
+	djnz	.col						; Shift Column
+
+	pop	hl							; Restore Addr Row & Col
+	push	bc							; Protect Row Count
+	ld		c,PIXGROUP				; BC = Row Advance (Note: DJNZ Leaves B = 0)
+	add	hl,bc						; Bump Memory Pointer
+	bit   4,h						; Check if glBuf ptr crossed 0xF000 boundary
+	jr    z,.skipXPC				; If not then continue
+	res   4,h						; Reset ptr back to the 0xE000 page
+	ld    a,xpc						; Get current XPC value
+	inc   a							; Bump XPC to the next 4K page
+	ld    xpc,a						; Update XPC with new value
+
+.skipXPC:
+	pop	bc							; Restore Row Count
+	dec	de							; Decrement Row Counter
+	ld		a,d						; Row Counter Zero?
+	or		a,e
+	jr		nz,.row					; Shift Next Row
+
+	pop   af
+	ld    xpc,a
+	call	glSwap					; Update LCD
+#endasm
+}
+
+/*** BeginHeader glUp1 */
+__root __useix void glUp1 ( int left,int top,int cols,int rows );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glUp1                       <GRAPHIC.LIB>
+
+SYNTAX:  		void glUp1(int left, int top,
+                          int cols, int rows);
+
+DESCRIPTION:  	Scroll byte-aligned Window up one pixel, bottom row
+					filled by current pixel type (color). This function is
+					non-reentrant.
+
+PARAMETER1:		Upper left corner of bitmap, must be evenly divisible by 8.
+PARAMETER2:		Left top corner of the bitmap.
+PARAMETER3:		Number of columns in window, must be evenly divisible by 8.
+PARAMETER4:		Number of rows in window.
+
+SEE ALSO:		glVScroll, glDown1
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+__root __useix void glUp1(int left, int top, int cols, int rows)
+{
+#asm
+	call	_glparams				; HL = Screen Addr
+	ld    a,xpc
+	push	af
+	ld    a, (xpc_temp)			; xpc_temp was initialized in glparams
+	ld    xpc,a						; Map in start scrolling location
+
+	ld    e,(ix+rows+0)
+	ld    d,(ix+rows+1)
+
+	ld		c,(ix+cols+0)
+	ld		b,(ix+cols+1)
+
+	srl	b
+	rr		c
+	srl	b
+	rr		c
+	srl	b
+	rr		c
+
+	ex		de,hl						; HL = rows, DE = Screen Addr
+	dec	hl							; Shift rows-1 Rows Up
+	dec	hl							; Force NC on Last Row
+
+.shift:
+	push	bc							; Protect cols
+	push	hl							; Protect rows
+
+	ld		hl,PIXGROUP				; HL = Same Col, Next Row
+	add	hl,de
+
+	bit   4,d						; Check if glBuf ptr crossed 0xF000 boundary
+	jr    z,.skipXPC				; If not then continue
+	res   4,d						; Reset ptr back to the 0xE000 page
+	res	4,h
+	ld    a,xpc						; Get current XPC value
+	inc   a							; Bump XPC to the next 4K page
+	ld    xpc,a						; Update XPC with new value
+
+.skipXPC:
+
+	push	hl							; Protect Same Col, Next Row
+	ldir								; while (BC--) (DE++) = (HL++)
+	pop	de							; Restore Same Col, Next Row
+	pop	hl							; Restore rows
+	ld		bc,-1						; Decrement rows
+	add	hl,bc
+
+	pop	bc							; Restore cols
+	jr		c,.shift					; Shift Next Row
+
+	ld		h,d						; HL = DE = Last Row
+	ld		l,e
+	inc	de							; Fill Last Row with MSB(Color)
+	dec	bc
+	ld		a,(PixColor+1)
+	ld		(hl),a
+	ldir
+
+	pop   af							; Retrieve orignal XPC
+	ld    xpc,a          		; Restore XPC
+	call	glSwap					; Update LCD
+#endasm
+}
+
+/*** BeginHeader glDown1 */
+__root __useix void glDown1 ( int left,int top,int cols,int rows );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glDown1                     <GRAPHIC.LIB>
+
+SYNTAX:  		void glDown1(int left, int top,
+                            int cols, int rows );
+
+DESCRIPTION:  	Scroll byte-aligned Window down one pixel, top column
+					filled by current pixel type (color). This function is
+					non-reentrant.
+
+PARAMETER1:		Upper left corner of bitmap, must be evenly divisible by 8.
+PARAMETER2:		Left top corner of the bitmap.
+PARAMETER3:		Number of columns in window, must be evenly divisible by 8.
+PARAMETER4:		Number of rows in window.
+
+SEE ALSO:		glVScroll, glUp1
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+__root __useix void glDown1(int left, int top, int cols, int rows )
+{
+#asm
+	ld		a,xpc						; Save-off current XPC value
+	push	af
+
+	ld		e,(ix+left+0)			; DE = left
+	ld		d,(ix+left+1)
+
+	srl	d							; DE = Byte Offset of Column
+	rr		e
+	srl	d
+	rr		e
+	srl	d
+	rr		e
+	push  de
+
+	ld		e,(ix+top+0)			; AB = top
+	ld		d,(ix+top+1)
+
+	ld    bc,PIXGROUP
+	mul
+	pop   de
+	add	hl,bc						; HL = Column + Partial Row
+	ld    iy,hl
+
+	ld		c,(ix+cols+0)			; BC = cols
+	ld		b,(ix+cols+1)
+
+	srl	b							; BC = columns in Byte Count (B Unused)
+	rr		c
+	srl	b
+	rr		c
+	srl	b
+	rr		c
+	ld		l,(ix+rows+0)					; HL = rows
+	ld		h,(ix+rows+1)
+
+	ex		de,hl						; HL = Addr Row & Col, DE = rows
+										; HL = glBuf offset, DE = rows, BC = cols
+
+	dec	de							; Shift rows-1 Rows Up
+	push	de							; Protect Rows
+	push  bc
+	push  hl
+
+	ld		bc,PIXGROUP				; DE = rows * PIXGROUP
+	mul
+
+	pop   hl
+	add	hl,bc						; HL = glBuf offset of Last Row
+	ex		de,hl
+	ld		hl,iy
+	add   hl,de
+
+	; Calculate the starting row in glBuf where the area is to be scrolled.
+	ld    de,(glBuf)				; Load BC:DE with glBuf base address
+	ld    bc,(glBuf+2)
+	add   hl,de						; Add row/column offset to the base address
+	jr    nc,.skipadd
+	inc   bc
+
+.skipadd:
+	ex      	de,hl
+	call	LongToXaddr				; Convert BC:DE to an xmem addr in A:DE
+	ld    xpc,a
+
+	pop   bc
+	pop	hl							; Restore Rows
+	dec	hl							; Force NC on Last Row
+
+.shift:
+	push	bc							; Protect cols
+	push	hl							; Protect rows
+
+	ld		hl,-PIXGROUP			; HL = Same Col, Prev Row
+	add	hl,de
+
+	bit 	5,h
+	jr    nz,.skipXPC 			; Jump if result not less than zero
+
+	res	4,h            		; Reset ptr back to the 0xE000 page
+	set   5,h
+
+	bit   5,d						; If DE in D000 XMEM page, set to E000
+	jr    nz,.sethigh
+	res	4,d            		; Set DE to the 0xE000 page
+	set   5,d
+	jr    .setXPC
+
+.sethigh:
+	set   4,d						; DE in E000 page, must set to F000
+	set   5,d
+	jr    .setXPC
+
+.setXPC:
+	ld		a,xpc          		; Get current XPC value
+	dec	a							; Bump to the next lower 4K page
+	ld		xpc,a						; Update XPC
+
+.skipXPC:
+	push	hl							; Protect Same Col, Prev Row
+	ldir								; while (BC--) (DE++) = (HL++)
+	pop	de							; Restore Same Col, Prev Row
+	pop	hl							; Restore rows
+
+	ld		bc,-1						; Decrement rows
+	add	hl,bc
+
+	pop	bc							; Restore cols
+	jr		c,.shift					; Shift Next Row
+
+
+	ld		h,d						; HL = DE = Last Row
+	ld		l,e
+	inc	de							; Fill Top Row with MSB(Color)
+	dec	bc
+	ld		a,(PixColor+1)
+	ld		(hl),a
+	ldir
+	pop   af
+	ld    xpc,a
+	call	glSwap					; Update LCD
+#endasm
+}
+
+
+/*** BeginHeader glHScroll */
+void glHScroll ( int left, int top, int cols, int rows, int nPix);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glHScroll                   <GRAPHIC.LIB>
+
+SYNTAX:  		void glHScroll(int left, int top,
+                              int cols, int rows,
+                              int nPix);
+
+DESCRIPTION:  	Scroll right or left, within the defined window by X
+               number of pixels. The opposite edge of the scrolled
+               window will be filled in with white pixels. The window
+               must be byte aligned. This function is non-reentrant.
+
+               Paramters will be verified for the following:
+               1. The LEFT and COLUMN paramters will be verified that they
+                  are evenly divisible by 8. If not, they will be changed
+                  to be a value thats a multiple of 8.
+
+					2. Parameters will be checked to verify that the scrolling
+					   area is valid. The minimum scrolling area is a width of
+					   8 pixels and a height of one row.
+
+PARAMETER1:		Upper left corner of bitmap, must be evenly divisible by 8.
+PARAMETER2:		Left top corner of the bitmap.
+PARAMETER3:		Number of columns in window, must be evenly divisible by 8.
+PARAMETER4:		Number of rows in window.
+PARAMETER5:		Number of pixels to scroll within the defined window.
+               (Make it a negative value to scroll left)
+
+SEE ALSO:		glVScroll
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void glHScroll(int left, int top, int cols, int rows, int nPix)
+{
+	auto char dir;
+	auto int brushType;
+	auto int remainder;
+
+	if (!nPix || cols < 8 || rows < 1)
+	{
+		return;
+	}
+
+	// Make adjustment for displays that where the maximum x-axis is not
+	// evenly divisible by 8.
+	//
+	// Note: MACRO's PIXEL_XS and PIXEL_YS are for internal use only and
+	//       the marco PIXEL_XS is guaranteed to be evenly divisible by 8.
+	//       The customer should be using the LCD_XS and LCD_YS macro's for
+	//       their application program.
+	//
+	if(cols == LCD_XS)
+	{
+		cols = PIXEL_XS;
+	}
+
+	// Check if x,y coordinates of the top left edge has exceeded the
+	// LCD display boundary.
+
+	if(left < 0 || left > (PIXEL_XS-8))
+	{
+		// Clip it, set it to either the MIN or MAX display boundary
+		left = (left > (PIXEL_XS-8)) ? (PIXEL_XS-8) : 0;
+	}
+
+	if(top < 0 || top > (PIXEL_YS-1))
+	{
+		// Clip it, set it to either the MIN or MAX display boundary
+		top = (top > (PIXEL_YS-1)) ? (PIXEL_YS-1) : 0;
+	}
+
+	// Force left and cols parameters to be evenly divisible by 8
+	if((remainder = left%8))
+	{
+		left -= remainder;
+		left += 8;
+	}
+	if((remainder = cols%8))
+	{
+		cols -= remainder;
+		cols += 8;
+	}
+	// Check if the number of rows or columns causes the LCD display
+	// boundary to be exceeded.
+	if((cols+left) > (PIXEL_XS))
+	{
+		// Set Column to not exceed the MAX display boundary
+		cols -= ((cols+left) - (PIXEL_XS));
+	}
+	if((rows+top) > (PIXEL_YS))
+	{
+		// Set Row to not exceed the MAX display boundary
+		rows -= ((rows+top) - (PIXEL_YS));
+	}
+
+	brushType = glGetBrushType();
+	dir = 0;		// assume right
+	if (nPix < 0)
+	{
+		dir = 1;	// no - it's left
+		nPix = -nPix;
+	}
+	glSetBrushType (PIXWHITE);
+	glBuffLock ();
+	while (nPix--)
+	{
+		if (dir)
+		{
+			glLeft1 (left, top, cols, rows);
+		}
+		else
+		{
+			glRight1(left, top, cols, rows);
+		}
+	}
+	glBuffUnlock ();
+	glSetBrushType(brushType);
+}
+
+/*** BeginHeader glVScroll */
+void glVScroll ( int left, int top, int cols, int rows, int nPix);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glVScroll                   <GRAPHIC.LIB>
+
+SYNTAX:  		void glVScroll(int left, int top,
+                              int cols, int rows,
+                              int nPix);
+
+DESCRIPTION:  	Scroll up or down, within the defined window by X
+               number of pixels. The opposite edge of the scrolled
+               window will be filled in with white pixels. The window
+               must be byte aligned. This function is non-reentrant.
+
+               Paramters will be verified for the following:
+               1. The LEFT and COLUMN paramters will be verified that they
+                  are evenly divisible by 8. If not, they will be changed
+                  to be a value that is a multiple of 8.
+
+					2. Parameters will be checked to verify that the scrolling
+					   area is valid. The minimum scrolling area is a width of
+					   8 pixels and a height of one row.
+
+PARAMETER1:		Upper left corner of bitmap, must be evenly divisible by 8.
+PARAMETER2:		Left top corner of the bitmap.
+PARAMETER3:		Number of columns in window, must be evenly divisible by 8.
+PARAMETER4: 	Number of rows in window.
+PARAMETER5:		Number of pixels to scroll within the defined window.
+               (Make it negative value to scroll up)
+
+SEE ALSO:		glHScroll
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void glVScroll(int left, int top, int cols, int rows, int nPix)
+{
+	auto char dir;
+	auto int	brushType;
+	auto int remainder;
+
+	if (!nPix || cols < 8 || rows < 1)
+	{
+		// Exiting function, due to invalid parameter
+		return;
+	}
+
+	// Make adjustment for displays that where the maximum x-axis is not
+	// evenly divisible by 8.
+	//
+	// Note: MACRO's PIXEL_XS and PIXEL_YS are for internal use only. The
+	//       customer should be using the LCD_XS and LCD_YS macro's for
+	//       their application program.
+	//
+	if(cols == LCD_XS)
+	{
+		cols = PIXEL_XS;
+	}
+
+	// Check if x,y coordinates of the top left edge has exceeded the
+	// LCD display boundary. Need to use PIXEL_XS instead of LCD_XS due
+	// to the byte alignment issue. See your low-level driver for more
+	// infor.
+	if(left < 0 || left > (PIXEL_XS-8))
+	{
+		// Clip it, set it to either the MIN or MAX display boundary
+		left = (left > (PIXEL_XS-8)) ? (PIXEL_XS-8) : 0;
+	}
+
+	if(top < 0 || top > (PIXEL_YS-1))
+	{
+		// Clip it, set it to either the MIN or MAX display boundary
+		top = (top > (PIXEL_YS-1)) ? (PIXEL_YS-1) : 0;
+	}
+
+	// Force left and cols parameters to be evenly divisible by 8
+	if((remainder = left%8))
+	{
+		left -= remainder;
+		left += 8;
+	}
+	if((remainder = cols%8))
+	{
+		cols -= remainder;
+		cols += 8;
+	}
+
+	// Check if the number of rows or columns causes the LCD display
+	// boundary to be exceeded.
+	if((cols+left) > (PIXEL_XS-1))
+	{
+		// Set Column to not exceed the MAX display boundary
+		cols -= ((cols+left) - (PIXEL_XS));
+	}
+	if((rows+top) > (PIXEL_YS-1))
+	{
+		// Set Row to not exceed the MAX display boundary
+		rows -= ((rows+top) - (PIXEL_YS));
+	}
+
+	brushType = glGetBrushType();
+	dir = 0;		// assume down
+	if (nPix < 0)
+	{
+		dir = 1;	// no - it's up
+		nPix = -nPix;
+	}
+	glSetBrushType (PIXWHITE);
+	glBuffLock ();
+	while (nPix--)
+	{
+		if (dir)
+		{
+			glUp1   (left, top, cols, rows);
+		}
+		else
+		{
+			glDown1 (left, top, cols, rows);
+		}
+	}
+	glBuffUnlock ();
+	glSetBrushType(brushType);
+}
+
+
+
+/*** BeginHeader glXPutBitmap */
+__root __useix void glXPutBitmap ( int left, int top,
+								       int width, int height,
+								       unsigned long bitmap );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glXPutBitmap                <GRAPHIC.LIB>
+
+SYNTAX:  		void glXPutBitmap(int left, int top,
+                          	      int width, int height,
+                          	      unsigned long bitmap );
+
+DESCRIPTION:  	Draw bitmap in the specified space.  The data for the
+               bitmap is stored in XMEM.  This function Automatically
+               calls glXPutFastmap if bitmap is byte-aligned (left-edge
+               and width each evenly divisible by 8). This function is
+               non-reentrant.
+
+					Any portion of a bitmap image or character that is outside
+					the LCD display area will be clipped.
+
+PARAMETER1:		Upper left corner of the bitmap.
+PARAMETER2:		Left top corner of the bitmap.
+PARAMETER3:		Width of bitmap.
+PARAMETER4:		Height of bitmap.
+PARAMETER5:		Address of bitmap in XMEM.
+
+SEE ALSO:		glXPutFastmap, glPrintf
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+__root __useix void glXPutBitmap(int left, int top, int width,
+                       		  int height, unsigned long bitmap)
+{
+	static int width_tmp, left_tmp;
+	static int mapLeftSide, mapRightSide, rowOffset, shiftR, shiftL;
+	static int origheight, origwidth, adjwidth, alignwidth, alignflag;
+
+	if(height <= 0 || width <= 0)
+   {
+    	return;
+   }
+	if((left&0x07) == 0 && (width&0x07) == 0)
+	{
+		glXPutFastmap(left, top, width, height, bitmap);
+		return;
+	}
+
+	// Set bitmap left and rightside pixel offsets
+	mapLeftSide = 0;
+	mapRightSide = 0;
+
+	// Set bitmap row (pixel) offset and aligned width value
+	rowOffset = 0;
+	adjwidth  = width;
+	if(width & 7)
+	{
+		adjwidth += (8 - (width%8));
+	}
+	alignwidth = ((adjwidth)>>3);
+
+	// Save a copy of original height and width values
+	origheight = height;
+	origwidth  = width;
+	adjwidth   = width;
+	alignflag = FALSE;
+
+	// Initialized to indicate that the bitmap is aligned
+	shiftR = 0;
+	shiftL = 0;
+
+	// Check if x-coordinate of the top-left edge has exceeded the LCD
+	// display boundary.
+	if(left < 0 || left > (LCD_XS-1))
+	{
+
+		if(left > (LCD_XS-1))
+		{
+			return;
+		}
+		else
+		{
+			// Create leftside pixel offset for bitmap image
+			mapLeftSide = abs(left);
+
+			// Check if the image is outside the display area
+			if(mapLeftSide >= width)
+			{
+				// Exiting function, bitmap width is invalid
+				return;
+			}
+
+			// Calculate new bitmap width
+			width   -= mapLeftSide;
+
+			if((origwidth & 7))
+			{
+				width_tmp = 8 - (origwidth % 8);
+				left_tmp  = 8 - (abs(left)%8);
+				if(width_tmp >= left_tmp)
+					alignflag = TRUE;
+			}
+
+			// Set bitmap alignment parameters
+			shiftL  	= mapLeftSide%8;
+			shiftR 	= 8-shiftL;
+
+			// Byte align,  the leftside bitmap parameter
+			mapLeftSide = mapLeftSide>>3;
+		}
+		// Clip bitmap, set it to either the MIN or MAX display boundary
+		left = (left > (LCD_XS-1)) ? (LCD_XS-1) : 0;
+	}
+
+	// Check if y-coordinate of the top-left edge has exceeded the LCD
+	// display boundary.
+	if(top < 0 || top > (LCD_YS-1))
+	{
+		if(top > (LCD_YS-1))
+		{
+			return;
+		}
+		else
+		{
+			// Create pixel row offset for bitmap image
+			rowOffset =  abs(top);
+
+			// Check if the image is outside the display area
+			if(rowOffset >= height)
+			{
+				// Exiting function, height is invalid
+				return;
+			}
+			height -= rowOffset;
+		}
+		// Clip bitmap, set it to either the MIN or MAX display boundary
+		top = (top > (LCD_YS-1)) ? (LCD_YS-1) : 0;
+	}
+
+	// Check if x,y coordinates of the top left edge has exceeded the
+	// LCD display boundary. Need to use PIXEL_XS instead of LCD_XS due
+	// to the byte alignment issue. See your low-level driver for more
+	// infor.
+	if((width+left) > (PIXEL_XS-1))
+	{
+		// Set Column to not exceed the MAX display boundary
+		width -= ((width+left) - (PIXEL_XS -1));
+
+		mapRightSide = (origwidth - width)>>3;
+		mapRightSide -= mapLeftSide;
+		if(((left+origwidth) >= (PIXEL_XS-1)) && (origwidth&7))
+		{
+	   	width_tmp = 8 - (origwidth % 8);
+			left_tmp  = 8 - (((left+origwidth) - (PIXEL_XS-1))%8);
+			if(width_tmp >= left_tmp)
+					mapRightSide++;
+		}
+	}
+	if((height+top) > (PIXEL_YS-1))
+	{
+		// Set Row to not exceed the MAX display boundary
+		height -= ((height+top) - (PIXEL_YS));
+	}
+
+#asm
+	ld  	a,xpc						; Get current xmem page
+	push	af
+	push	ix
+
+	; Calculate clipping offset for bitmap starting address...Offset will be
+	; greater than zero for coordinates of -X or -Y
+	ld		bc, (alignwidth)		; Calc starting row of bitmap to be accessed
+	ld		de, (rowOffset)
+	mul
+	ld		hl, (mapLeftSide)		; Calc column offset within row being accessed
+	add	hl,bc
+
+	ld		e,(ix+bitmap+0)		; BCDE = bitmap
+	ld		d,(ix+bitmap+1)
+	ld		c,(ix+bitmap+2)
+	ld		b,(ix+bitmap+3)
+
+	add   hl,de
+	; Convert physical address to logical address
+	ex		de,hl
+	call	LongToXaddr				; Convert BC:DE to a XMEM addr in A:DE
+	ld  	xpc,a						; Set XMEM Window
+	ld    l,e
+	ld    h,d
+
+	ld		c,(ix+width+0)			; BC = Bitmap Width
+	ld		b,(ix+width+1)
+	push	bc							; Save Width for Return Value
+	ld		e,(ix+height+0)		; DE = Bitmap Height
+	ld		d,(ix+height+1)
+	push	de							; Protect Bitmap Height
+
+	push	hl							; Protect Bitmap Pointer
+
+	ld		h,b						; HL = Index to gl_PixMap
+	ld		l,c
+	dec	hl
+	add	hl,hl
+	ld		bc,gl_PixMap
+	add	hl,bc
+	ld		a,(hl)					; A = Bitmask of Last Pixel
+	inc	hl
+	ld		b,(hl)					; B = Fillin Byte Count + 1
+	inc	b
+	push	bc							; Protect Mask Byte Count
+	ld		hl,pixBM+PIXGROUP+1	; HL = Bitmap Mask Buffer - 1
+
+.maskfill:
+	inc	hl							; Bump Mask Pointer
+	ld		(hl),0xFF
+	djnz	.maskfill				; Continue til Fill Done
+	dec	a							; A = Bitmask of Bitmap End
+	cpl
+	ld		(hl),a					; Complete Bitmask Buffer
+	inc	hl							; Place Zero Terminator on Mask Buffer
+	ld		(hl),0x00
+	inc	hl
+	ld		(hl),0x00
+	pop	de							; Restore Mask Byte Count
+	inc	d							; Adjust for DJNZ
+	ld		a,(ix+left+0)			; A = LSB (left)
+	and	a,0x07					; A = Bitmap Shift
+	jr		z,.maskdone				; If Shift = 0, Mask Already Done
+
+.shiftmask:
+	ld		hl,pixBM+PIXGROUP+2	; HL = Bitmap Mask Buffer
+	ld		b,d						; B = Bitmap Mask Byte Count
+	or		a,a						; Clear Carry
+
+.shiftbyte:
+	rr		(hl)						; Shift Next Byte
+	inc	hl							; Point to Next Byte
+	djnz	.shiftbyte
+	dec	a							; Decrement Shift Count
+	jr		nz,.shiftmask			; Continue til Done
+
+
+.maskdone:
+	ld		c,(ix+top+0)			; HL = LSW Partial (PIXGROUP * Top)
+	ld		b,(ix+top+1)			; DE = MSW Partial (PIXGROUP * Top)
+	ld		de,PIXGROUP
+	mul
+	add	hl,bc						; HL = PIXGROUP * Top
+
+	ld		e,(ix+left+0)			; DE = left
+	ld		d,(ix+left+1)
+	srl	d							; DE = Byte Offset of left
+	rr		e
+	srl	d
+	rr		e
+	srl	d
+	rr		e
+	add	hl,de
+
+	; Calculate the starting row in glBuf where the bitmap is going to
+	; be written.
+	ld   	de,(glBuf)				; Load BC:DE with glBuf base address
+	ld   	bc,(glBuf+2)
+	add  	hl,de						; Add the row/column offset to the base address
+	jr   	nc,.skipadd
+	inc  	bc
+.skipadd:
+	ex    de,hl
+	call 	LongToXaddr				; Convert BC:DE to a XMEM addr in A:DE
+	ld    (xpc_temp),a
+	ex    de,hl
+	; At this point the glbuf pointer is pointing to the first row of
+	; where the bitmap is going to reside. The worst case calculation
+	; for bumping the glBuf pointer from this point on will be the
+	; number of bytes within a given row. For example, a LCD with a
+	; resolution of 240x320 would be 40 bytes.
+
+.rownext:
+	ex		(sp),hl					; HL = Bitmap Pointer, (SP) = LCD Pointer
+	ld		ix,pixBM					; (IX) = Bitmap Buffer, (IX+PIXGROUP+2) = Mask Buffer
+	ld		e,(ix+PIXGROUP+2)		; E = Head Bitmask
+
+.rowcopy:
+	ld		a,(shiftL)				; Check if the bitmap needs to be byte aligned
+	or		a,a                  ; (Used for clipping negative x-coordinates only)
+	jr		nz,.bmshift
+
+	; Get data from byte aligned bitmap
+	ld		a,(hl)					; Get next bitmap byte
+	ld		(ix),a					; Copy byte to mask buffer
+	jr		.skipalign
+
+	; Convert non-aligned bitmap data to aligned bitmap data...this
+	; section of code will only be executed when the left parameter
+	; is a negative value.
+.bmshift:
+	ld		a,(shiftL)
+	ld		b,a
+	ld		a,(hl)					; Get next byte from bitmap
+
+.bmshift1:
+	sla	a							; Shift data left with zero fill
+	djnz	.bmshift1
+	ld		d,a
+	inc	hl							; Point to next byte for rest of pixel data
+
+	ld		a,(shiftR) 		      ; Load reg B with shift value
+	ld		b,a
+	ld		a,(hl)					; Get next byte to fill-in rest of the previous byte
+
+.bmshift2:
+	srl	a							; Shift data right with zero fill
+	djnz	.bmshift2
+	or		a,d						; OR'in shifted data with previous byte
+	ld		(ix),a					; Copy aligned byte to mask buffer
+	dec	hl							; Adjust bitmap pointer
+
+	; Bitmap is byte aligned at this point
+.skipalign:
+	inc	hl							; Bump Bitmap Pointer
+	inc	ix							; Bump Tmp Buffer Pointer
+	ld		a,(ix+PIXGROUP+2)		; A = Next Bitmask
+	and	a,e						; If Bitmaps Overlap, Get Next Rows of Data
+	jr		nz,.rowcopy
+
+.rowplace:
+	rl		e							; C = Left Most Mask Bit
+	jr		c,.rowready				; If Set, Data Shift Complete
+	ld		ix,pixBM					; IX = Bitmap Buffer
+
+.rowshift:
+	ld    b,(ix)
+	rr		b
+	ld    (ix),b					; Shift Bitmap
+	inc	ix							; Bump Bitmap Pointer
+	ld		a,(ix+PIXGROUP+2)		; A = Next Bitmask
+	inc	a							; Bitmask Zero? (Note: Set Z, Protect C)
+	dec	a
+	jr		nz,.rowshift			; Continue til Bitmap Shifted
+	jr		.rowplace				; Continue til Shifted Completely
+
+.rowready:
+	ex		(sp),hl					; HL = LCD Buffer Pointer, (SP) = Bitmap Pointer
+	push	hl							; Protect LCD Buffer Pointer
+	ld		ix,pixBM					; (IX) = Bitmap Buffer, (IX+PIXGROUP+2) = Mask Buffer
+
+.rowblit:
+	ld		a,(ix+PIXGROUP+2)		; A = Bitmask
+	or		a,a						; If Bitmask = 0, Done with Blit
+	jr		z,.rowdone
+	ld		c,a						; C = New Image Mask
+	cpl								; A = Current Image Mask
+
+	ex		af,af'					; Save-off current bitmap image
+	ld    a,xpc
+	push  af							; Save-off XPC for the bitmap image
+	ld    a,(xpc_temp)			; Change XPC to map-in the glBuf buffer
+	ld    xpc,a
+	ex    af,af'
+	and	a,(hl)					; HL points to somewhere in the glBuf
+
+	ld		b,a						; B = Current LCD Image Masked
+	ld		a,(ix)					; A = New bitmap Image
+	and	a,c						; A = New bitmap Image Masked
+	ld		d, a						; save in D
+
+	ld		a, (PixColor)			; FF only if XOR
+	rra								; CY set if XOR
+	ld		a, d						; restore New bitmap Image Masked
+	jr		nc, .GVW2				; jump if not XOR
+
+	ld		a, (hl)					; A = Current LCD Image
+	and	a, c						; mask Current LCD Image
+	xor	a, d						; XOR with masked bitmap image
+
+.GVW2:									; GVW end
+	or		a, b						; A = Completed Composite
+	ld		(hl),a
+	pop   af							; Restore XPC to point to the bitmap image
+	ld    xpc,a
+
+	inc	hl							; Bump dest pointer
+	inc	ix							; Bump bitmap pointer
+	jr		.rowblit					; Continue til Done
+
+.rowdone:
+	pop	hl							; Restore LCD Buffer Pointer
+	ld		de,PIXGROUP				; Bump LCD buffer PTR to Next Row
+	add	hl,de
+
+	; Check if the glBuf offset has crossed the 0xF000 page boundary
+	bit	4,h						; If HL in 0xE000 Page, Continue
+	jr		z,.skipXPC1
+	res	4,h						; Force Back to 0xE000 Page
+	ld    a,(xpc_temp)
+	inc   a
+	ld    (xpc_temp),a
+
+
+	; Get bitmap pointer
+.skipXPC1:
+	pop	de							; Restore Bitmap Pointer
+	ex		de,hl						; DE = glBuf pointer HL = bitmap pointer
+
+	; Add clipping offset...offset will be greater than zero if X > (PIXEL_XS-1)
+	ld		bc,(mapRightSide)		; Add-in pixel offset for rightside of bitmap
+	add	hl,bc
+
+	; Add clipping offset...offset will be zero or greater if X < 0
+	ld		bc, (mapLeftSide)		; Add-in pixel offset for leftside of bitmap
+	add	hl,bc
+
+	ld		a,(alignflag)
+	and   a,0xff
+	jr		z,.skipbump
+	inc	hl
+
+.skipbump:
+	; Check if bitmap pointer has crossed the 0xF000 page boundary
+	bit	4,h						; If HL in 0xE000 Page, Continue
+	jr		z,skipXPC2
+	res	4,h						; Force Back to 0xE000 Page
+	ld  	a,xpc						; get current page location
+	inc	a							; Bump to next page
+	ld  	xpc,a
+
+	; Check if done processing the bitmap, otherwise continue
+skipXPC2:
+	ex		de,hl
+	pop	bc							; Restore Bitmap Height
+	dec	bc							; Decrement Height
+	ld		a,b						; Done if Zero
+	or		a,c
+	jr		z,.bitmapdone
+	push	bc							; Protect Bitmap Height
+	push	de							; Protect Bitmap Pointer
+	jp		.rownext
+
+	; Restore registers and exit
+.bitmapdone:
+	pop	hl							; HL = Bitmap Width
+	pop	ix
+	pop	af							; Restore XMEM Window
+	ld  	xpc,a						; Restore XMEM window
+
+.fastmapdone:
+	call	glSwap					; Update LCD
+#endasm
+}
+
+
+/*** BeginHeader glXPutFastmap */
+__root __useix void glXPutFastmap ( int left, int top,
+								  		  int width, int height,
+								        unsigned long bitmap );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glXPutFastmap               <GRAPHIC.LIB>
+
+SYNTAX:  		void glXPutFastmap(int left, int top,
+                                  int width, int height,
+                                  unsigned long bitmap );
+
+DESCRIPTION:  	Draws bitmap in the specified space.  The data for the
+					bitmap is stored in Xmem. This is like glXPutBitmap,
+					except that it's faster. The restriction is that the
+					bitmap must be byte-aligned. This function is non-
+					reentrant.
+
+					Any portion of a bitmap image or character that is outside
+					the LCD display area will be clipped.
+
+PARAMETER1:		Upper left corner of bitmap, must be evenly divisible by 8.
+PARAMETER2:		Left top corner of the bitmap.
+PARAMETER3:		Width of bitmap, must be evenly divisible by 8.
+PARAMETER4:		Height of bitmap
+PARAMETER5:		Address of bitmap in XMEM.
+
+SEE ALSO:		glXPutBitmap, glPrintf
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+__useix __root void glXPutFastmap(int left, int top,
+                        		int width, int height,
+                              unsigned long bitmap)
+{
+	static int mapLeftSide, mapRightSide, rowOffset;
+	static int origheight, origwidth, alignwidth;
+
+	// Set bitmap left and rightside pixel offsets
+	mapLeftSide  = 0;
+	mapRightSide = 0;
+
+	// Save a copy of original height and width values
+	origheight = height;
+	origwidth  = width;
+
+	// Set bitmap row (pixel) offset and aligned width value
+	rowOffset = 0;
+	alignwidth = origwidth>>3;
+
+	// Check if x-coordinate of the top left edge has exceeded the
+	// LCD display boundary.
+	if(left < 0 || left > (LCD_XS-1))
+	{
+
+		if(left > (LCD_XS-1))
+		{
+			return;
+		}
+		else
+		{
+			// Create leftside pixel offset for bitmap image
+			mapLeftSide = abs(left);
+
+			// Check if the image is outside the display area
+			if(mapLeftSide >= width)
+			{
+				// Exiting function, width is invalid
+				return;
+			}
+
+			// Calculate new bitmap width
+			width -= mapLeftSide;
+
+			// Byte align,  the bitmap leftside parameter
+			mapLeftSide = mapLeftSide>>3;
+		}
+		// Clip bitmap, set it to either the MIN or MAX display boundary
+		left = (left > (LCD_XS-1)) ? (LCD_XS-1) : 0;
+	}
+
+	// Check if y-coordinate of the top-left edge has exceeded the LCD
+	// display boundary.
+	if(top < 0 || top > (LCD_YS-1))
+	{
+		if(top > (LCD_YS-1))
+		{
+			return;
+		}
+		else
+		{
+			// Create pixel row offset for bitmap image
+			rowOffset =  abs(top);
+
+			// Check if the image is outside the display area
+			if(rowOffset >= height)
+			{
+				// Exiting function, height is invalid
+				return;
+			}
+			height -= rowOffset;
+		}
+
+		//Clip bitmap, set it to either the MIN or MAX display boundary
+		top = (top > (LCD_YS-1)) ? (LCD_YS-1) : 0;
+	}
+
+	// Check if x,y coordinates of the top left edge has exceeded the
+	// LCD display boundary. Need to use PIXEL_XS instead of LCD_XS due
+	// to the byte alignment issue. See your low-level driver for more
+	// infor.
+	if((width+left) > (PIXEL_XS-1))
+	{
+		// Set Column to not exceed the MAX display boundary
+		width -= ((width+left) - (PIXEL_XS));
+		mapRightSide = (origwidth - width)>>3;
+		mapRightSide -= mapLeftSide;
+	}
+	if((height+top) > (PIXEL_YS-1))
+	{
+		// Set Row to not exceed the MAX display boundary
+		height -= ((height+top) - (PIXEL_YS));
+	}
+
+#asm
+	ld  	a,xpc						; Protect XMEM window page
+	push	af
+
+	ld		c,(ix+left+0)			; BC = left
+	ld		b,(ix+left+1)
+	srl	b							; BC = Byte Offset of left
+	rr		c
+	srl	b
+	rr		c
+	srl	b
+	rr		c
+	push	bc							; Protect Byte Offset
+
+	ld		c,(ix+top+0)			; BC = top
+	ld		b,(ix+top+1)
+	ld		de,PIXGROUP				; DE = PIXGROUP
+	mul
+
+	pop	hl							; Restore Byte Offset
+	add	hl,bc						; HL = Screen Offset of (left,top)
+
+
+	; Calculate the starting row in glBuf where the bitmap is going to
+	; written.
+	ld    de,(glBuf)				; Load BC:DE with glBuf base address
+	ld    bc,(glBuf+2)
+	add   hl,de						; Add row/column offset to the base address
+	jr    nc,.skipadd
+	inc	bc
+
+.skipadd:
+	ex      	de,hl					; Move calculation result to reg DE
+	call	LongToXaddr				; Convert BC:DE to a XMEM addr in A:DE
+	ld    (xpc_temp),a			; Save-off XPC for glBuf access
+	ex    de,hl						; Move glBuf offset to reg HL
+
+	; At this point the glbuf pointer is pointing to the first row of
+	; where the bitmap is going to reside. The worst case calculation
+	; for bumping the glBuf pointer from this point on will be the
+	; number of bytes within a given row. For example, a LCD with a
+	; resolution of 240x320 would be 40 bytes.
+
+
+	push	hl							; Protect LCD Buffer Pointer
+	ld		bc,(alignwidth)		; Calculate starting row of bitmap to be accessed
+	ld		de,(rowOffset)
+	mul
+
+	ld		hl,(mapLeftSide)		; Calculate column offset within row being accessed
+	add	hl,bc
+
+	; Load BC:DE with address of the bitmap
+	ld		e,(ix+bitmap+0)		; BCDE = bitmap
+	ld		d,(ix+bitmap+1)
+	ld		c,(ix+bitmap+2)
+	ld		b,(ix+bitmap+3)
+
+	; Add clipping offset to bitmap starting address...Offset will be greater
+	; than zero for coordinates of -X or -Y
+	add	hl,de						; Add clipping offset
+
+	ex		de,hl
+	call	LongToXaddr				; Convert BC:DE to a XMEM addr in A:DE
+	ld  	xpc,a						; Set XMEM Window
+	ld    l,e
+	ld    h,d
+
+	ld		c,(ix+width+0)			; BC = Bitmap Width (Pixels)
+	ld		b,(ix+width+1)
+	srl	b
+	rr		c
+	srl	b
+	rr		c
+	srl	b
+	rr		c							; BC = Bitmap Width (bytes)
+
+	ld		e,(ix+height+0)		; DE = Bitmap Height (pixels)
+	ld		d,(ix+height+1)
+	ex		de,hl						; HL = Bitmap Height, DE = Bitmap Pointer
+
+.rownext:
+	ex		(sp),hl					; HL = LCD Buffer Pointer, (SP) = Bitmap Height
+	ex		de,hl						; HL = Bitmap Pointer, DE = LCD Buffer Pointer
+	push	bc							; Protect Bitmap Width
+	push	de							; Protect LCD Buffer Pointer
+
+	ld		b,c						; B = Bitmap Width (bytes)
+.GVW4:
+	ld		a,(PixColor)			; FF only if XOR
+	rra								; CY set if XOR
+	ld		a,(hl)					; A = bitmap byte
+	ex		de,hl						; HL = LCD Buffer Pointer, DE = Bitmap Pointer
+
+	; Change XPC to glBuf location
+	ex    af,af'					; Save bitmap data value
+	ld    a,xpc             	; Get bitmap XPC page address
+	ld    c,a						; Save in register C
+	ld    a,(xpc_temp)			; Get glBuf XPC address
+	ld    xpc,a						; Set XPC with glBuf page address
+	ex    af,af'					; Retrieve bitmap data value
+	jr		nc,.GVW4A				; jump if not XOR
+
+	; XOR bitmap data
+	xor	a,(hl)					; A = bitmap byte XOR LCD buffer byte
+
+.GVW4A:
+	ld		(hl), a					; Change XPC   store bitmap byte in LCD buffer
+	ld    a,c
+	ld 	xpc,a
+
+	inc	hl							; Bump dest pointer
+	inc	de							; Bump source pointer
+	ex		de,hl						; HL = Bitmap Pointer, DE = LCD Buffer Pointer
+	djnz	.GVW4						; loop til done this row
+
+	; Add clipping offset...offset will be greater than zero if X > (PIXEL_XS-1)
+	ld		bc,(mapRightSide)		; Add-in pixel offset for rightside of bitmap
+	add	hl,bc
+
+	; Add clipping offset...offset will be greater than zero if X < 0
+	ld		bc, (mapLeftSide)		; Add-in pixel offset for leftside of bitmap
+	add	hl,bc
+
+	; Check if bitmap pointer has crossed the 0xF000 page boundary
+	bit	4,h
+	jr		z,.rowadv				; If HL in 0xE000 Page, Continue
+	res	4,h						; If not, force Back to 0xE000 Page
+	ld    a, xpc					; Get the current page address
+	inc   a							; Bump to the next page
+	ld    xpc,a						; Update XPC with the new value
+
+.rowadv:
+	pop	de							; Restore LCD Buffer Pointer
+	ex		de,hl						; HL = LCD Buffer Pointer, DE = Bitmap Pointer
+
+	ld		bc,PIXGROUP				; Advance to Next Row
+	add	hl,bc
+
+	; Check if the glBuf offset has crossed the 0xF000 page boundary
+	bit	4,h
+	jr    z,.skipXPC2				; If HL in 0xE000 Page, Continue
+	res	4,h						; If not, force Back to 0xE000 Page
+	ld    a,(xpc_temp)			; Get the current page address
+	inc   a							; Bump to the next page
+	ld    (xpc_temp),a			; Update XPC variable with the new value
+
+	; Check if done processing the bitmap, otherwise continue
+.skipXPC2:
+	pop	bc							; Restore Bitmap Width
+	ex		(sp),hl					; HL = Bitmap Height, (SP) = LCD Buffer Ptr
+	dec	hl							; Decrement Bitmap Height
+	ld		a,h						; Height Zero?
+	or		a,l
+	jr		nz,.rownext				; Continue til Done
+
+	; Restore registers and exit
+	pop	hl							; Clean Stack
+	pop	af							; Restore Xmem page
+	ld  	xpc,a						; Restore XMEM Window
+	call	glSwap					; Update LCD
+#endasm
+}
+
+
+/*** BeginHeader glXGetBitmap */
+
+__root __useix void glXGetBitmap(int left, int top, int width, int height,
+                  			  unsigned long bitmap);
+
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glXGetBitmap                <OP71HW.LIB>
+
+SYNTAX:  		void glXGetBitmap(int x, int y,
+                               	int bmWidth, int bmHeight,
+                                 unsigned long xBm);
+
+DESCRIPTION:  Gets a bitmap from the LCD page buffer and stores it in
+				  Xmem RAM.  Automatically calls glXGetFastmap if bitmap
+				  is byte-aligned (left-edge and width each evenly divisible
+				  by 8).
+
+// left edge (pixels)
+// top edge (pixels)
+// width (pixels)
+// height (pixels)
+// XRAM storage address
+
+RETURN VALUE: None.
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+__root __useix void glXGetBitmap(int left, int top, int width, int height,
+                  			  unsigned long xptr)
+{
+	static char shiftL, shiftR;
+
+   if(height <= 0 || width <= 0)
+   {
+    	return;
+   }
+
+	if((left&0x07) == 0 && (width&0x07) == 0)
+	{
+		glXGetFastmap(left, top, width, height, xptr);
+		return;
+	}
+
+	// Set bitmap alignment parameters
+	shiftL  	= left%8;
+	shiftR 	= 8-shiftL;
+
+#asm
+.notAligned:
+	ld		a,xpc						; Protect XMEM Window
+	push	af
+	ld		c,(ix+left+0)			; BC = left
+	ld		b,(ix+left+1)
+	srl	b							; BC = Byte Offset of left
+	rr		c
+	srl	b
+	rr		c
+	srl	b
+	rr		c
+	push	bc							; Protect Byte Offset
+
+	ld		c,(ix+top+0)			; BC = top
+	ld		b,(ix+top+1)
+	ld		de,PIXGROUP				; DE = PIXGROUP
+	mul
+
+	pop	hl							; Restore Byte Offset
+	add	hl,bc						; HL = Screen Offset of (left,top)
+
+	; Calculate the starting row in glBuf where the bitmap is going to
+	; written.
+	ld    de,(glBuf)				; Load BC:DE with glBuf base address
+	ld    bc,(glBuf+2)
+	add   hl,de						; Add row/column offset to the base address
+	jr    nc,.skipadd
+	inc	bc
+
+.skipadd:
+	ex    de,hl						; Move calculation result to reg DE
+	call	LongToXaddr				; Convert BC:DE to a XMEM addr in A:DE
+	ld    (xpc_temp),a			; Save-off XPC for glBuf access
+	ex    de,hl						; Move glBuf offset to reg HL
+
+	ld		c,(ix+width+0)			; BCDE = bitmap
+	ld		b,(ix+width+1)
+	srl	b							; Calculate column byte addr
+	rr		c							; Byte offset = column/8
+	srl	b
+	rr		c
+	srl	b
+	rr		c
+
+	ld		e,(ix+height+0)
+	ld		d,(ix+height+1)
+
+	push	hl							; save screen addr
+	push	de							; save row count
+	push	bc							; save col byte count
+
+	ld		e,(ix+xptr+0)			; BCDE = XMEM save buffer
+	ld		d,(ix+xptr+1)
+	ld		c,(ix+xptr+2)
+	ld		b,(ix+xptr+3)
+	call	LongToXaddr				; Convert BC:DE to a XMEM addr in A:DE
+	ex    de,hl                ; Move DE to HL
+	ld		xpc,a						; Set XMem Window
+
+	push	hl							; Save-off the XMEM buffer address
+	pop	iy							; IY = XMEM buffer address
+
+	pop	bc							; BC = column byte count (actually in C reg only)
+	pop	de							; DE = row count
+	pop	hl							; HL = LCD Screen addr
+	;   here for each row
+.eachRow:
+	push	hl							; protect screen addr
+	ld		b,c						; refresh column byte count
+	;   here for each column
+.eachCol:
+
+	push 	de
+	push  bc
+	ld    a,xpc
+	push  af
+	ld    a,(xpc_temp)
+	ld    xpc,a
+	ld		a,(shiftL)
+	ld		b,a
+	ld		a,(hl)					; Get next byte from LCD buffer
+
+.bmshift1:
+	sla	a							; Shift data left with zero fill
+	djnz	.bmshift1
+	ld		d,a
+	inc	hl							; Point to next byte for rest of pixel data
+
+	ld		a,(shiftR) 		      ; Load reg B with shift value
+	ld		b,a
+	ld		a,(hl)					; Get next byte to fill-in rest of the previous byte
+
+.bmshift2:
+	srl	a							; Shift data right with zero fill
+	djnz	.bmshift2
+	or		a,d						; OR'in shifted data with previous byte
+	ex    af,af'					; Save aligned byte for XMEM buffer
+
+	pop   af
+	pop   bc
+	pop   de
+	ld    xpc,a
+	ex    af,af'
+	ld		(iy+0),a					; Write data to XMEM save buffer
+	inc	iy							; Bump Xmem buffer address
+	djnz	.eachCol
+
+	push	iy							; Save Xmem address
+	ex		(sp), hl					; Save LCD addr on stack, HL = XMEM address
+	bit	4,h						; If HL in 0xE000 Page, Continue
+	jr		z,.skipXPC1
+	res 	4,h						; Force Back to 0xE000 Page
+	ld		a,xpc						; Bump XPC Page
+	inc	a
+	ld    xpc,a
+.skipXPC1:
+	ex		(sp), hl					; Put XMEM addr on stack, HL = LCD buff addr
+	pop	iy							; IY = XMEM addr
+
+	pop		hl						; Restore Addr Row & Col
+	push	bc							; Protect Column Count
+	ld		c,PIXGROUP				; BC = Row Advance (Note: DJNZ Leaves B = 0)
+	add	hl,bc						; Bump Screen Memory Pointer
+
+	; Check if the glBuf offset has crossed the 0xF000 page boundary
+	bit	4,h
+	jr    z,.skipXPC3				; If HL in 0xE000 Page, Continue
+	res	4,h						; If not, force Back to 0xE000 Page
+	ld    a,(xpc_temp)			; Get the current page address
+	inc   a							; Bump to the next page
+	ld    (xpc_temp),a			; Update XPC variable with the new value
+.skipXPC3:
+
+	pop	bc							; Restore Column Count
+	dec	de							; Decrement Row Counter
+	ld		a,d						; Row Counter Zero?
+	or		e
+	jr		nz,.eachRow				; get Next Row
+
+	;   restore regs & return
+	pop	af							; Restore XMEM Window
+	ld		xpc,a
+#endasm
+}
+
+
+/*** BeginHeader glXGetFastmap */
+__root __useix void glXGetFastmap ( int left, int top,
+								  		  int width, int height,
+								  		  unsigned long xmemptr );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glXGetFastmap               <GRAPHIC.LIB>
+
+SYNTAX:  		void glXGetFastmap(int left, int top,
+                                  int width, int height,
+                                  unsigned long xmemptr );
+
+DESCRIPTION:  	Draws bitmap in the specified space.  The data for the
+					bitmap is stored in Xmem. This is like glXPutBitmap,
+					except that it's faster. The restriction is that the
+					bitmap must be byte-aligned. This function is non-
+					reentrant.
+
+					Any portion of a bitmap image or character that is outside
+					the LCD display area will be clipped.
+
+PARAMETER1:		Upper left corner of bitmap, must be evenly divisible by 8.
+PARAMETER2:		Left top corner of the bitmap.
+PARAMETER3:		Width of bitmap, must be evenly divisible by 8.
+PARAMETER4:		Height of bitmap
+PARAMETER5:		Address of bitmap in XMEM.
+
+SEE ALSO:		glXPutBitmap, glPrintf
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+__root __useix void glXGetFastmap ( int left, int top,
+								  		  int width, int height,
+								  		  unsigned long xptr )
+{
+#asm
+	ld		a,xpc						; Protect XMEM Window
+	push	af
+	ld		c,(ix+left+0)			; BC = left
+	ld		b,(ix+left+1)
+	srl	b							; BC = Byte Offset of left
+	rr		c
+	srl	b
+	rr		c
+	srl	b
+	rr		c
+	push	bc							; Protect Byte Offset
+
+	ld		c,(ix+top+0)			; BC = top
+	ld		b,(ix+top+1)
+	ld		de,PIXGROUP				; DE = PIXGROUP
+	mul
+
+	pop	hl							; Restore Byte Offset
+	add	hl,bc						; HL = Screen Offset of (left,top)
+
+	; Calculate the starting row in glBuf where the bitmap is going to
+	; written.
+	ld    de,(glBuf)				; Load BC:DE with glBuf base address
+	ld    bc,(glBuf+2)
+	add   hl,de						; Add row/column offset to the base address
+	jr    nc,.skipadd
+	inc	bc
+
+.skipadd:
+	ex    de,hl						; Move calculation result to reg DE
+	call	LongToXaddr				; Convert BC:DE to a XMEM addr in A:DE
+	ld    (xpc_temp),a			; Save-off XPC for glBuf access
+	ex    de,hl						; Move glBuf offset to reg HL
+
+	ld		c,(ix+width+0)			; BCDE = bitmap
+	ld		b,(ix+width+1)
+	srl	b							; Calculate column byte addr
+	rr		c							; Byte offset = column/8
+	srl	b
+	rr		c
+	srl	b
+	rr		c
+
+	ld		e,(ix+height+0)
+	ld		d,(ix+height+1)
+
+	push	hl							; save screen addr
+	push	de							; save row count
+	push	bc							; save col byte count
+
+	ld		e,(ix+xptr+0)			; BCDE = XMEM save buffer
+	ld		d,(ix+xptr+1)
+	ld		c,(ix+xptr+2)
+	ld		b,(ix+xptr+3)
+	call	LongToXaddr				; Convert BC:DE to a XMEM addr in A:DE
+	ex    de,hl                ; Move DE to HL
+	ld		xpc,a						; Set XMem Window
+
+	push	hl							; Save-off the XMEM buffer address
+	pop	iy							; IY = XMEM buffer address
+
+	pop	bc							; BC = column byte count (actually in C reg only)
+	pop	de							; DE = row count
+	pop	hl							; HL = LCD Screen addr
+	;   here for each row
+.eachRow:
+	push	hl							; protect screen addr
+	ld		b,c						; refresh column byte count
+	;   here for each column
+.eachCol:
+
+	ld    a,xpc
+	push  af
+	ld    a,(xpc_temp)
+	ld    xpc,a
+	ld		a,(hl)					; A = screen byte
+	ex    af,af'
+	pop   af
+	ld    xpc,a
+	ex    af,af'
+	ld		(iy+0),a					; Write data to XMEM save buffer
+
+	inc	hl							; Bump Screen byte address
+	inc	iy							; Bump Xmem buffer address
+	djnz	.eachCol
+
+	push	iy							; Save Xmem address
+	ex		(sp), hl					; Save LCD addr on stack, HL = XMEM address
+	bit	4,h						; If HL in 0xE000 Page, Continue
+	jr		z,.skipXPC1
+	res 	4,h						; Force Back to 0xE000 Page
+	ld		a,xpc						; Bump XPC Page
+	inc	a
+	ld    xpc,a
+.skipXPC1:
+	ex		(sp), hl					; Put XMEM addr on stack, HL = LCD buff addr
+	pop	iy							; IY = XMEM addr
+
+
+	pop	hl							; Restore Addr Row & Col
+	push	bc							; Protect Column Count
+	ld		c,PIXGROUP				; BC = Row Advance (Note: DJNZ Leaves B = 0)
+	add	hl,bc						; Bump Screen Memory Pointer
+
+	; Check if the glBuf offset has crossed the 0xF000 page boundary
+	bit	4,h
+	jr    z,.skipXPC3				; If HL in 0xE000 Page, Continue
+	res	4,h						; If not, force Back to 0xE000 Page
+	ld    a,(xpc_temp)			; Get the current page address
+	inc   a							; Bump to the next page
+	ld    (xpc_temp),a			; Update XPC variable with the new value
+.skipXPC3:
+
+	pop	bc							; Restore Column Count
+	dec	de							; Decrement Row Counter
+	ld		a,d						; Row Counter Zero?
+	or		e
+	jr		nz,.eachRow				; get Next Row
+
+	;   restore regs & return
+	pop	af							; Restore XMEM Window
+	ld		xpc,a
+#endasm
+}
+
+/*** BeginHeader glInit, _glBackLight, _glSetContrast,
+                 glFillScreen, glBlankScreen, _glDispOnOff */
+void glInit(void);
+void _glBackLight(int isOn);
+void _glDispOnOff(int onOff);
+void _glSetContrast(unsigned int level);
+__useix __root void glFillScreen(int pattern);
+__root void glBlankScreen (void);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glInit                 <GRAPHIC.LIB>
+
+SYNTAX:  		void glInit(void);
+
+DESCRIPTION:   Initializes the display devices, clears the screen. This
+               function is non-reentrant.
+
+PARAMETER:     None.
+
+RETURN VALUE:  None.
+
+SEE ALSO:      glDispOnOFF, glBacklight, glSetContrast, glPlotDot,
+               glBlock, glPlotDot, glPlotPolygon, glPlotCircle,
+               glHScroll, glVScroll, glXFontInit, glPrintf, glPutChar,
+               glSetBrushType, glBuffLock, glBuffUnlock, glPlotLine
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void glInit(void)
+{
+	_glInit();
+}
+
+/* START _FUNCTION DESCRIPTION ********************************************
+glBackLight                 <GRAPHIC.LIB>
+
+SYNTAX:  		void _glBackLight(int onOff);
+
+DESCRIPTION:   Sets the intensity of the backlight, if circuitry is
+               installed. This function is non-reentrant.
+
+PARAMETER1:    Low to high values (typically 0 to 255, depending on board
+               design) will set the intensity low to high. (setting it to
+               0 will turn it off completely)
+
+RETURN VALUE:  None
+
+SEE ALSO:      glInit, _glDispOnoff, _glSetContrast
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void _glBackLight(int onOff)
+{
+	glBackLight( onOff );
+}
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_glDispOnOff            <GRAPHIC.LIB>
+
+SYNTAX:  		void _glDispOnOff(int onOff);
+
+DESCRIPTION:   Sets the LCD screen ON or OFF. Data will not be cleared
+					from the screen. This function is non-reentrant.
+
+PARAMETER1:    1 to turn the LCD screen ON
+					0 to turn the LCD screen OFF
+
+RETURN VALUE:  None
+
+SEE ALSO:      glInit, glSetContrast, glBackLight
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void _glDispOnOff(int onOff)
+{
+	glDispOnOff(onOff);
+}
+
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_glSetContrast               <GRAPHIC.LIB>
+
+SYNTAX:  	  void _glSetContrast(unsigned level);
+
+DESCRIPTION:  Sets display contrast, if circuitry is installed.  This
+              function is non-reentrant.
+
+PARAMETER1:   Low to high values (typically 0  to 255, depending on board
+              design) will give high to low contrast, respectively.
+
+RETURN VALUE: None
+
+SEE ALSO:     glInit, glBacklight, glDispOnoff
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void _glSetContrast(unsigned level)
+{
+	glSetContrast( level );
+}
+
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+glFillScreen                <GRAPHIC.LIB>
+
+SYNTAX:  		void glFillScreen(int pattern);
+
+DESCRIPTION:  	Fills the LCD display screen with a pattern. This function
+					is non-reentrant.
+
+PARAMETER1:    The screen will be set to all black if the pattern is 0xFF,
+					all white if the pattern is 0x00, and vertical stripes for
+					any other pattern.
+
+RETURN VALUE:  None.
+
+SEE ALSO:		glBlock, glBlankScreen, glBlankRegion
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+__useix __root void glFillScreen(int pattern)
+{
+	static int bufSize;
+
+	bufSize = XMEM_BUF_SIZE;
+
+#asm
+	ld    a,xpc  					; Save-off current XPC value
+	push  af
+	push	ix
+
+	ld		a,(glbuf_xpc)			; Get glBuf XPC value
+	ld    xpc,a						; Mapped in glBuf into the 0xE000 block
+
+	ld    a,(ix+pattern)			; Load Reg A with data pattern
+	ld    hl,(glbuf_offset)		; Get glBuf offset within 0xE000 block
+	ld    de,(bufSize) 			; Load size of glBuf into Reg DE
+
+.fillscreen:
+	ld    iy,0xffff				; Load iy with mask to set zero flag
+	ld    (hl),a            	; Write data to LCD glBuf
+	inc   hl							; Bump Memory Pointer
+	dec   de							; Decrement glbuf size counter
+	and   iy,de						; AND to set zero flag when done
+	jr		z,.done					; Jump if done
+
+	bit   4,h						; Test if HL exceeded 0xF000 boundary
+	jr    z,.fillscreen			; If not continue writing data to glBuf
+	res   4,h						; Set glBuf offset back to 0xE000 range
+	ex		af,af'
+	ld    a,xpc						; Get XPC value
+	inc   a							; Bump XPC to point to next 4K block
+	ld    xpc,a						; Update XPC register
+	ex		af,af'
+	jr    .fillscreen				; Continue writing char to glBuf
+
+.done:
+	pop	ix
+	pop   af							; Retrieve orignal XPC value
+	ld    xpc,a             	; Restore XPC to orignal value
+#endasm
+
+	// Update LCD buffer and the LCD display if it isn't locked
+	glSwap();
+}
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+glBlankScreen               <GRAPHIC.LIB>
+
+SYNTAX:  		void glBlankScreen(void);
+
+DESCRIPTION:  	Blanks (sets to white) the LCD display screen. This
+               function is non-reentrant.
+
+PARAMETER:     None.
+
+RETURN VALUE:  None.
+
+SEE ALSO:		glFillScreen, glBlock, glBlankRegion
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+__root void glBlankScreen(void)
+{
+	static int bufSize;
+
+	bufSize = XMEM_BUF_SIZE;
+
+#asm
+	ld    a,xpc  					; Save-off current XPC value
+	push  af
+
+	ld		a,(glbuf_xpc)			; Get glBuf XPC value
+	ld    xpc,a						; Mapped in glBuf into the 0xE000 block
+	ld    hl,(glbuf_offset)		; Get glBuf offset within 0xE000 block
+	ld    de,(bufSize) 			; Load size of glBuf into Reg DE
+
+.blankscreen:
+	ld    iy,0xffff				; Load iy with mask to set zero flag
+	xor   a							; Set A to zero to clear LCD display
+	ld    (hl),a            	; Write data byte to LCD glBuf
+	inc   hl							; Bump Memory Pointer
+	dec   de							; Decrement glbuf size counter
+	and   iy,de						; AND counter to set zero flag when done
+	jr		z,.done					; Jump if done
+
+	bit   4,h						; Test if HL exceeded 0xF000 boundary
+	jr    z,.blankscreen			; If not continue clearing glBuf
+	res   4,h						; Set glBuf offset back to 0xE000 range
+	ld    a,xpc						; Get XPC value
+	inc   a							; Bump XPC to point to next 4K block
+	ld    xpc,a						; Update XPC register
+	jr    .blankscreen				; Continue blanking the LCD display
+
+.done:
+	pop   af							; Retrieve orignal XPC value
+	ld    xpc,a            		; Restore XPC to orignal value
+#endasm
+
+	// Update LCD buffer and display if it isn't locked
+	glSwap();
+}
+
+
+/*** BeginHeader _glBlankRegion */
+__useix __root void _glBlankRegion(int left, int top, int width, int height);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_glBlankRegion               <GRAPHIC.LIB>
+
+SYNTAX:  		void _glBlankRegion(int left, int top,
+                                  int width, int height);
+
+DESCRIPTION:  	Clears a region on the LCD display. This function is
+               non-reentrant.
+
+               Important Note: This function will be changed for the next
+                               release not to have the byte align width
+                               limitation.
+
+					Any parameter that exceeds LCD display limits will be
+					adjusted to keep it within the LCD display boundary.
+
+PARAMETER1:		X-coordinate of the upper left corner of region,
+               must be evenly divisible by 8.
+PARAMETER2:		Y-coordinate of the top left corner of the region.
+PARAMETER3:		Width of region, must be evenly divisible by 8.
+PARAMETER4:		Height of the region.
+
+SEE ALSO:		glFillScreen, glBlankScreen, glBlock
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+__useix __root void _glBlankRegion(int left, int top, int width, int height)
+{
+
+   if(height <= 0 || width <= 0)
+   {
+    	return;
+   }
+#asm
+	ld  	a,xpc						; Get current xmem page
+	push	af
+	push	ix
+	ld		c,(ix+width+0)			; BC = Bitmap Width
+	ld		b,(ix+width+1)
+	ld		e,(ix+height+0)		; DE = Bitmap Height
+	ld		d,(ix+height+1)
+	push	de							; Protect Bitmap Height
+
+	ld		h,b						; HL = Index to gl_PixMap
+	ld		l,c
+	dec	hl
+	add	hl,hl
+	ld		bc,gl_PixMap
+	add	hl,bc
+	ld		a,(hl)					; A = Bitmask of Last Pixel
+	inc	hl
+	ld		b,(hl)					; B = Fillin Byte Count + 1
+	inc	b
+	push	bc							; Protect Mask Byte Count
+	ld		hl,pixBM+PIXGROUP+1	; HL = Bitmap Mask Buffer - 1
+
+.maskfill:
+	inc	hl							; Bump Mask Pointer
+	ld		(hl),0xFF
+	djnz	.maskfill				; Continue til Fill Done
+	dec	a							; A = Bitmask of Bitmap End
+	cpl
+	ld		(hl),a					; Complete Bitmask Buffer
+	inc	hl							; Place Zero Terminator on Mask Buffer
+	ld		(hl),0x00
+	inc	hl
+	ld		(hl),0x00
+	pop	de							; Restore Mask Byte Count
+	inc	d							; Adjust for DJNZ
+	ld		a,(ix+left+0)			; A = LSB (left)
+	and	a,0x07					; A = Bitmap Shift
+	jr		z,.maskdone				; If Shift = 0, Mask Already Done
+
+.shiftmask:
+	ld		hl,pixBM+PIXGROUP+2	; HL = Bitmap Mask Buffer
+	ld		b,d						; B = Bitmap Mask Byte Count
+	or		a,a						; Clear Carry
+
+.shiftbyte:
+	rr		(hl)						; Shift Next Byte
+	inc	hl							; Point to Next Byte
+	djnz	.shiftbyte
+	dec	a							; Decrement Shift Count
+	jr		nz,.shiftmask			; Continue til Done
+
+.maskdone:
+	ld		c,(ix+top+0)			; HL = LSW Partial (PIXGROUP * Top)
+	ld		b,(ix+top+1)			; DE = MSW Partial (PIXGROUP * Top)
+	ld		de,PIXGROUP
+	mul
+	add	hl,bc						; HL = PIXGROUP * Top
+
+	ld		e,(ix+left+0)			; DE = left
+	ld		d,(ix+left+1)
+	srl	d							; DE = Byte Offset of left
+	rr		e
+	srl	d
+	rr		e
+	srl	d
+	rr		e
+	add	hl,de
+
+	; Calculate the starting row in glBuf where the bitmap is going to
+	; be written.
+	ld   	de,(glBuf)				; Load BC:DE with glBuf base address
+	ld   	bc,(glBuf+2)
+	add  	hl,de						; Add the row/column offset to the base address
+	jr   	nc,.skipadd
+	inc  	bc
+.skipadd:
+	ex    de,hl
+	call 	LongToXaddr				; Convert BC:DE to a XMEM addr in A:DE
+	ld    xpc,a
+	ex    de,hl
+	; At this point the glbuf pointer is pointing to the first row of
+	; where the bitmap is going to reside. The worst case calculation
+	; for bumping the glBuf pointer from this point on will be the
+	; number of bytes within a given row. For example, a LCD with a
+	; resolution of 240x320 would be 40 bytes.
+
+.rownext:
+	ld		ix,pixBM					; (IX) = Bitmap Buffer, (IX+PIXGROUP+2) = Mask Buffer
+	ld		e,(ix+PIXGROUP+2)		; E = Head Bitmask
+	push	hl
+.rowcopy:
+	; Get data from byte aligned bitmap
+	xor	a							; Get pix control byte
+	ld		(ix),a					; Copy byte to mask buffer
+
+	; Bitmap is byte aligned at this point
+	inc	ix							; Bump Tmp Buffer Pointer
+	ld		a,(ix+PIXGROUP+2)		; A = Next Bitmask
+	and	a,e						; If Bitmaps Overlap, Get Next Rows of Data
+	jr		nz,.rowcopy
+
+.rowplace:
+	rl		e							; C = Left Most Mask Bit
+	jr		c,.rowready				; If Set, Data Shift Complete
+	ld		ix,pixBM					; IX = Bitmap Buffer
+
+.rowshift:
+	ld    b,(ix)
+	rr		b
+	ld    (ix),b					; Shift Bitmap
+	inc	ix							; Bump Bitmap Pointer
+	ld		a,(ix+PIXGROUP+2)		; A = Next Bitmask
+	inc	a							; Bitmask Zero? (Note: Set Z, Protect C)
+	dec	a
+	jr		nz,.rowshift			; Continue til Bitmap Shifted
+	jr		.rowplace				; Continue til Shifted Completely
+
+.rowready:
+	ld		ix,pixBM					; (IX) = Bitmap Buffer, (IX+PIXGROUP+2) = Mask Buffer
+
+.rowblit:
+	ld		a,(ix+PIXGROUP+2)		; A = Bitmask
+	or		a,a						; If Bitmask = 0, Done with Blit
+	jr		z,.rowdone
+	ld		c,a						; C = New Image Mask
+	cpl								; A = Current Image Mask
+
+	and	a,(hl)					; HL points to somewhere in the glBuf
+	ld		b,a						; B = Current LCD Image Masked
+	ld		a,(ix)					; A = New bitmap Image
+	and	a,c						; A = New bitmap Image Masked
+
+.GVW2:								; GVW end
+	or		a, b						; A = Completed Composite
+	ld		(hl),a
+	inc	hl							; Bump dest pointer
+	inc	ix							; Bump bitmap pointer
+	jr		.rowblit					; Continue til Done
+
+.rowdone:
+	ld		de,PIXGROUP				; Bump LCD buffer PTR to Next Row
+	pop	hl
+	add	hl,de
+
+	; Check if the glBuf offset has crossed the 0xF000 page boundary
+	bit	4,h						; If HL in 0xE000 Page, Continue
+	jr		z,.skipXPC1
+	res	4,h						; Force Back to 0xE000 Page
+	ld    a,xpc
+	inc   a
+	ld    xpc,a
+
+	; Check if done processing the bitmap, otherwise continue
+.skipXPC1:
+	pop	bc							; Restore Block Height
+	dec	bc							; Decrement Height
+	ld		a,b						; Done if Zero
+	or		a,c
+	jr		z,.bitmapdone
+	push	bc							; Protect Block Height
+	jp		.rownext
+
+	; Restore registers and exit
+.bitmapdone:
+	pop	ix
+	pop	af							; Restore XMEM Window
+	ld  	xpc,a
+	call	glSwap					; Update LCD
+#endasm
+}
+
+/*** BeginHeader glBlock */
+__useix void glBlock(int left, int top, int width, int height);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glBlock                     <GRAPHIC.LIB>
+
+SYNTAX:  		void glBlock(int left, int top, int width, int height);
+
+DESCRIPTION:  	Draw a rectangular block in the page buffer, and on
+					the LCD if the buffer is unlocked. This function is
+					non-reentrant.
+
+					Any portion of the block that is outside the LCD display
+					area will be clipped.
+
+PARAMETER1:		X-coordinate of the upper left corner of the block.
+PARAMETER2:		Y-coordinate of the left top corner of the block.
+PARAMETER3:		Width of the block.
+PARAMETER4:    Height of the block.
+
+RETURN VALUE:  None.
+
+SEE ALSO:		glFillScreen, glBlankScreen, glBlock
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+__useix __root void glBlock(int left, int top, int width, int height)
+{
+	static char pix_cntrl;
+
+   if(height <= 0 || width <= 0)
+   {
+    	return;
+   }
+	// Check if x-coordinate of the top-left edge has exceeded the LCD
+	// display boundary.
+	if(left < 0 || left > (LCD_XS-1))
+	{
+		// Clip, set it to either the MIN or MAX display boundary
+		left = (left > (LCD_XS-1)) ? (LCD_XS-1) : 0;
+	}
+
+	// Check if y-coordinate of the top-left edge has exceeded the LCD
+	// display boundary.
+	if(top < 0 || top > (LCD_YS-1))
+	{
+		// Clip, set it to either the MIN or MAX display boundary
+		top = (top > (LCD_YS-1)) ? (LCD_YS-1) : 0;
+	}
+
+	// Check if x,y coordinates of the top left edge has exceeded the
+	// LCD display boundary. Need to use PIXEL_XS instead of LCD_XS due
+	// to the byte alignment issue. See your low-level driver for more
+	// infor.
+	if((width+left) > (PIXEL_XS))
+	{
+		// Set Column to not exceed the MAX display boundary
+		width -= ((width+left) - (PIXEL_XS -1));
+	}
+	if((height+top) > (PIXEL_YS))
+	{
+		// Set Row to not exceed the MAX display boundary
+		height -= ((height+top) - (PIXEL_YS));
+	}
+
+#asm
+	ld  	a,xpc						; Get current xmem page
+	push	af
+	push	ix
+
+	ld    hl,PixColor    		; Set mode for writes to Graphic buffer
+	inc   hl
+	ld    a,(hl)
+	ld    (pix_cntrl),a
+	ld		c,(ix+width+0)			; BC = Bitmap Width
+	ld		b,(ix+width+1)
+	ld		e,(ix+height+0)		; DE = Bitmap Height
+	ld		d,(ix+height+1)
+	push	de							; Protect Bitmap Height
+
+	ld		h,b						; HL = Index to gl_PixMap
+	ld		l,c
+	dec	hl
+	add	hl,hl
+	ld		bc,gl_PixMap
+	add	hl,bc
+	ld		a,(hl)					; A = Bitmask of Last Pixel
+	inc	hl
+	ld		b,(hl)					; B = Fillin Byte Count + 1
+	inc	b
+	push	bc							; Protect Mask Byte Count
+	ld		hl,pixBM+PIXGROUP+1	; HL = Bitmap Mask Buffer - 1
+
+.maskfill:
+	inc	hl							; Bump Mask Pointer
+	ld		(hl),0xFF
+	djnz	.maskfill				; Continue til Fill Done
+	dec	a							; A = Bitmask of Bitmap End
+	cpl
+	ld		(hl),a					; Complete Bitmask Buffer
+	inc	hl							; Place Zero Terminator on Mask Buffer
+	ld		(hl),0x00
+	inc	hl
+	ld		(hl),0x00
+	pop	de							; Restore Mask Byte Count
+	inc	d							; Adjust for DJNZ
+	ld		a,(ix+left+0)			; A = LSB (left)
+	and	a,0x07					; A = Bitmap Shift
+	jr		z,.maskdone				; If Shift = 0, Mask Already Done
+
+.shiftmask:
+	ld		hl,pixBM+PIXGROUP+2	; HL = Bitmap Mask Buffer
+	ld		b,d						; B = Bitmap Mask Byte Count
+	or		a,a						; Clear Carry
+
+.shiftbyte:
+	rr		(hl)						; Shift Next Byte
+	inc	hl							; Point to Next Byte
+	djnz	.shiftbyte
+	dec	a							; Decrement Shift Count
+	jr		nz,.shiftmask			; Continue til Done
+
+.maskdone:
+	ld		c,(ix+top+0)			; HL = LSW Partial (PIXGROUP * Top)
+	ld		b,(ix+top+1)			; DE = MSW Partial (PIXGROUP * Top)
+	ld		de,PIXGROUP
+	mul
+	add	hl,bc						; HL = PIXGROUP * Top
+
+	ld		e,(ix+left+0)			; DE = left
+	ld		d,(ix+left+1)
+	srl	d							; DE = Byte Offset of left
+	rr		e
+	srl	d
+	rr		e
+	srl	d
+	rr		e
+	add	hl,de
+
+	; Calculate the starting row in glBuf where the bitmap is going to
+	; be written.
+	ld   	de,(glBuf)				; Load BC:DE with glBuf base address
+	ld   	bc,(glBuf+2)
+	add  	hl,de						; Add the row/column offset to the base address
+	jr   	nc,.skipadd
+	inc  	bc
+.skipadd:
+	ex    de,hl
+	call 	LongToXaddr				; Convert BC:DE to a XMEM addr in A:DE
+	ld    xpc,a
+	ex    de,hl
+	; At this point the glbuf pointer is pointing to the first row of
+	; where the bitmap is going to reside. The worst case calculation
+	; for bumping the glBuf pointer from this point on will be the
+	; number of bytes within a given row. For example, a LCD with a
+	; resolution of 240x320 would be 40 bytes.
+
+.rownext:
+	ld		ix,pixBM					; (IX) = Bitmap Buffer, (IX+PIXGROUP+2) = Mask Buffer
+	ld		e,(ix+PIXGROUP+2)		; E = Head Bitmask
+	push	hl
+.rowcopy:
+	; Get data from byte aligned bitmap
+	ld		a,(pix_cntrl)			; Get pix control byte
+	ld		(ix),a					; Copy byte to mask buffer
+
+	; Bitmap is byte aligned at this point
+	inc	ix							; Bump Tmp Buffer Pointer
+	ld		a,(ix+PIXGROUP+2)		; A = Next Bitmask
+	and	a,e						; If Bitmaps Overlap, Get Next Rows of Data
+	jr		nz,.rowcopy
+
+.rowplace:
+	rl		e							; C = Left Most Mask Bit
+	jr		c,.rowready				; If Set, Data Shift Complete
+	ld		ix,pixBM					; IX = Bitmap Buffer
+
+.rowshift:
+	ld    b,(ix)
+	rr		b
+	ld    (ix),b					; Shift Bitmap
+	inc	ix							; Bump Bitmap Pointer
+	ld		a,(ix+PIXGROUP+2)		; A = Next Bitmask
+	inc	a							; Bitmask Zero? (Note: Set Z, Protect C)
+	dec	a
+	jr		nz,.rowshift			; Continue til Bitmap Shifted
+	jr		.rowplace				; Continue til Shifted Completely
+
+.rowready:
+	ld		ix,pixBM					; (IX) = Bitmap Buffer, (IX+PIXGROUP+2) = Mask Buffer
+
+.rowblit:
+	ld		a,(ix+PIXGROUP+2)		; A = Bitmask
+	or		a,a						; If Bitmask = 0, Done with Blit
+	jr		z,.rowdone
+	ld		c,a						; C = New Image Mask
+	cpl								; A = Current Image Mask
+
+	and	a,(hl)					; HL points to somewhere in the glBuf
+	ld		b,a						; B = Current LCD Image Masked
+	ld		a,(ix)					; A = New bitmap Image
+	and	a,c						; A = New bitmap Image Masked
+	ld		d,a						; save in D
+
+	ld		a, (PixColor)			; FF only if XOR
+	rra								; CY set if XOR
+	ld		a,d						; restore New bitmap Image Masked
+	jr		nc, .GVW2				; jump if not XOR
+
+	ld		a, (hl)					; A = Current LCD Image
+	and	a, c						; mask Current LCD Image
+	xor	a, d						; XOR with masked bitmap image
+
+.GVW2:								; GVW end
+	or		a, b						; A = Completed Composite
+	ld		(hl),a
+	inc	hl							; Bump dest pointer
+	inc	ix							; Bump bitmap pointer
+	jr		.rowblit					; Continue til Done
+
+.rowdone:
+	ld		de,PIXGROUP				; Bump LCD buffer PTR to Next Row
+	pop	hl
+	add	hl,de
+
+	; Check if the glBuf offset has crossed the 0xF000 page boundary
+	bit	4,h						; If HL in 0xE000 Page, Continue
+	jr		z,.skipXPC1
+	res	4,h						; Force Back to 0xE000 Page
+	ld    a,xpc
+	inc   a
+	ld    xpc,a
+
+	; Check if done processing the bitmap, otherwise continue
+.skipXPC1:
+	pop	bc							; Restore Block Height
+	dec	bc							; Decrement Height
+	ld		a,b						; Done if Zero
+	or		a,c
+	jr		z,.bitmapdone
+	push	bc							; Protect Block Height
+	jp		.rownext
+
+	; Restore registers and exit
+.bitmapdone:
+	pop	ix
+	pop	af							; Restore XMEM Window
+	ld  	xpc,a
+	call	glSwap					; Update LCD
+#endasm
+}
+
+
+/*** BeginHeader glFillRegion */
+__useix __root void glFillRegion(int left, int top,
+                             int width, int height,
+                             char pattern);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glFillRegion                     <GRAPHIC.LIB>
+
+SYNTAX:  		void glFillRegion(int left, int top,
+                                 int width, int height,
+                                 char pattern)
+
+DESCRIPTION:  	Fills a rectangular block in the LCD buffer with the
+               pattern specified, This function is non-reentrant.
+
+					Any portion of the block that is outside the LCD display
+					area will be clipped.
+
+PARAMETER1:		X-coordinate of the upper left corner of the block.
+PARAMETER2:		Y-coordinate of the left top corner of the block.
+PARAMETER3:		Width of the block.
+PARAMETER4:    Height of the block.
+PARAMETER5:		Bit Pattern Value.
+
+RETURN VALUE:  None.
+
+SEE ALSO:		glFillScreen, glBlankScreen, glBlock, glBlankRegion
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+__useix __root void glFillRegion(int left, int top,
+                             int width, int height,
+                             char pattern)
+{
+	static char pix_cntrl;
+
+   if(height <= 0 || width <= 0)
+   {
+    	return;
+   }
+
+	if((left&0x07) == 0 && (width&0x07) == 0)
+	{
+		glFastFillRegion(left, top, width, height, pattern);
+		return;
+	}
+
+	// Check if x-coordinate of the top-left edge has exceeded the LCD
+	// display boundary.
+	if(left < 0 || left > (LCD_XS-1))
+	{
+		// Clip, set it to either the MIN or MAX display boundary
+		left = (left > (LCD_XS-1)) ? (LCD_XS-1) : 0;
+	}
+
+	// Check if y-coordinate of the top-left edge has exceeded the LCD
+	// display boundary.
+	if(top < 0 || top > (LCD_YS-1))
+	{
+		// Clip, set it to either the MIN or MAX display boundary
+		top = (top > (LCD_YS-1)) ? (LCD_YS-1) : 0;
+	}
+
+	// Check if x,y coordinates of the top left edge has exceeded the
+	// LCD display boundary. Need to use PIXEL_XS instead of LCD_XS due
+	// to the byte alignment issue. See your low-level driver for more
+	// infor.
+	if((width+left) > (PIXEL_XS-1))
+	{
+		// Set Column to not exceed the MAX display boundary
+		width -= ((width+left) - (PIXEL_XS -1));
+	}
+	if((height+top) > (PIXEL_YS-1))
+	{
+		// Set Row to not exceed the MAX display boundary
+		height -= ((height+top) - (PIXEL_YS));
+	}
+
+#asm
+	ld  	a,xpc						; Get current xmem page
+	push	af
+	push	ix
+
+	ld    a,(ix+pattern)			; Pattern used to fill block specified
+	ld    (pix_cntrl),a
+
+	ld		c,(ix+width+0)			; BC = Bitmap Width
+	ld		b,(ix+width+1)
+	ld		e,(ix+height+0)		; DE = Bitmap Height
+	ld		d,(ix+height+1)
+	push	de							; Protect Bitmap Height
+
+	ld		h,b						; HL = Index to gl_PixMap
+	ld		l,c
+	dec	hl
+	add	hl,hl
+	ld		bc,gl_PixMap
+	add	hl,bc
+	ld		a,(hl)					; A = Bitmask of Last Pixel
+	inc	hl
+	ld		b,(hl)					; B = Fillin Byte Count + 1
+	inc	b
+	push	bc							; Protect Mask Byte Count
+	ld		hl,pixBM+PIXGROUP+1	; HL = Bitmap Mask Buffer - 1
+
+.maskfill:
+	inc	hl							; Bump Mask Pointer
+	ld		(hl),0xFF
+	djnz	.maskfill				; Continue til Fill Done
+	dec	a							; A = Bitmask of Bitmap End
+	cpl
+	ld		(hl),a					; Complete Bitmask Buffer
+	inc	hl							; Place Zero Terminator on Mask Buffer
+	ld		(hl),0x00
+	inc	hl
+	ld		(hl),0x00
+	pop	de							; Restore Mask Byte Count
+	inc	d							; Adjust for DJNZ
+	ld		a,(ix+left+0)			; A = LSB (left)
+	and	a,0x07					; A = Bitmap Shift
+	jr		z,.maskdone				; If Shift = 0, Mask Already Done
+
+.shiftmask:
+	ld		hl,pixBM+PIXGROUP+2	; HL = Bitmap Mask Buffer
+	ld		b,d						; B = Bitmap Mask Byte Count
+	or		a,a						; Clear Carry
+
+.shiftbyte:
+	rr		(hl)						; Shift Next Byte
+	inc	hl							; Point to Next Byte
+	djnz	.shiftbyte
+	dec	a							; Decrement Shift Count
+	jr		nz,.shiftmask			; Continue til Done
+
+.maskdone:
+	ld		c,(ix+top+0)			; HL = LSW Partial (PIXGROUP * Top)
+	ld		b,(ix+top+1)			; DE = MSW Partial (PIXGROUP * Top)
+	ld		de,PIXGROUP
+	mul
+	add	hl,bc						; HL = PIXGROUP * Top
+
+	ld		e,(ix+left+0)			; DE = left
+	ld		d,(ix+left+1)
+	srl	d							; DE = Byte Offset of left
+	rr		e
+	srl	d
+	rr		e
+	srl	d
+	rr		e
+	add	hl,de
+
+	; Calculate the starting row in glBuf where the bitmap is going to
+	; be written.
+	ld   	de,(glBuf)				; Load BC:DE with glBuf base address
+	ld   	bc,(glBuf+2)
+	add  	hl,de						; Add the row/column offset to the base address
+	jr   	nc,.skipadd
+	inc  	bc
+.skipadd:
+	ex    de,hl
+	call 	LongToXaddr				; Convert BC:DE to a XMEM addr in A:DE
+	ld    xpc,a
+	ex    de,hl
+	; At this point the glbuf pointer is pointing to the first row of
+	; where the bitmap is going to reside. The worst case calculation
+	; for bumping the glBuf pointer from this point on will be the
+	; number of bytes within a given row. For example, a LCD with a
+	; resolution of 240x320 would be 40 bytes.
+
+.rownext:
+	ld		ix,pixBM					; (IX) = Bitmap Buffer, (IX+PIXGROUP+2) = Mask Buffer
+	ld		e,(ix+PIXGROUP+2)		; E = Head Bitmask
+	push	hl
+.rowcopy:
+	; Get data from byte aligned bitmap
+	ld		a,(pix_cntrl)			; Get pix control byte
+	ld		(ix),a					; Copy byte to mask buffer
+
+	; Bitmap is byte aligned at this point
+	inc	ix							; Bump Tmp Buffer Pointer
+	ld		a,(ix+PIXGROUP+2)		; A = Next Bitmask
+	and	a,e						; If Bitmaps Overlap, Get Next Rows of Data
+	jr		nz,.rowcopy
+
+.rowplace:
+	rl		e							; C = Left Most Mask Bit
+	jr		c,.rowready				; If Set, Data Shift Complete
+	ld		ix,pixBM					; IX = Bitmap Buffer
+
+.rowshift:
+	ld    b,(ix)
+	rr		b
+	ld    (ix),b					; Shift Bitmap
+	inc	ix							; Bump Bitmap Pointer
+	ld		a,(ix+PIXGROUP+2)		; A = Next Bitmask
+	inc	a							; Bitmask Zero? (Note: Set Z, Protect C)
+	dec	a
+	jr		nz,.rowshift			; Continue til Bitmap Shifted
+	jr		.rowplace				; Continue til Shifted Completely
+
+.rowready:
+	ld		ix,pixBM					; (IX) = Bitmap Buffer, (IX+PIXGROUP+2) = Mask Buffer
+
+.rowblit:
+	ld		a,(ix+PIXGROUP+2)		; A = Bitmask
+	or		a,a						; If Bitmask = 0, Done with Blit
+	jr		z,.rowdone
+	ld		c,a						; C = New Image Mask
+	cpl								; A = Current Image Mask
+
+	and	a,(hl)					; HL points to somewhere in the glBuf
+	ld		b,a						; B = Current LCD Image Masked
+	ld		a,(ix)					; A = New bitmap Image
+	and	a,c						; A = New bitmap Image Masked
+	ld		d,a						; save in D
+
+	ld		a, (PixColor)			; FF only if XOR
+	rra								; CY set if XOR
+	ld		a,d						; restore New bitmap Image Masked
+	jr		nc, .GVW2				; jump if not XOR
+
+	ld		a, (hl)					; A = Current LCD Image
+	and	a, c						; mask Current LCD Image
+	xor	a, d						; XOR with masked bitmap image
+
+.GVW2:								; GVW end
+	or		a, b						; A = Completed Composite
+	ld		(hl),a
+	inc	hl							; Bump dest pointer
+	inc	ix							; Bump bitmap pointer
+	jr		.rowblit					; Continue til Done
+
+.rowdone:
+	ld		de,PIXGROUP				; Bump LCD buffer PTR to Next Row
+	pop	hl
+	add	hl,de
+
+	; Check if the glBuf offset has crossed the 0xF000 page boundary
+	bit	4,h						; If HL in 0xE000 Page, Continue
+	jr		z,.skipXPC1
+	res	4,h						; Force Back to 0xE000 Page
+	ld    a,xpc
+	inc   a
+	ld    xpc,a
+
+	; Check if done processing the bitmap, otherwise continue
+.skipXPC1:
+	pop	bc							; Restore Block Height
+	dec	bc							; Decrement Height
+	ld		a,b						; Done if Zero
+	or		a,c
+	jr		z,.bitmapdone
+	push	bc							; Protect Block Height
+	jp		.rownext
+
+	; Restore registers and exit
+.bitmapdone:
+	pop	ix
+	pop	af							; Restore XMEM Window
+	ld  	xpc,a
+	call	glSwap					; Update LCD
+#endasm
+}
+
+
+
+
+/*** BeginHeader glFastFillRegion */
+__useix void glFastFillRegion(int left, int top,
+                            int width, int height,
+                            int pattern);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glFastFillRegion         <GRAPHIC.LIB>
+
+SYNTAX:  		void glFastFillRegion(int left, int top,
+                             			 int width, int height,
+                                     int pattern)
+
+DESCRIPTION:  	Fills a rectangular block in the LCD buffer with the
+               pattern specified, The restriction is that the block
+					left and width parameters must be byte-aligned. This
+					function is non-reentrant.
+
+					Any portion of the block that is outside the LCD display
+					area will be clipped.
+
+PARAMETER1:		X-coordinate of the upper left corner of the block.
+PARAMETER2:		Y-coordinate of the left top corner of the block.
+PARAMETER3:		Width of the block.
+PARAMETER4:    Height of the block.
+PARAMETER5:		Bit Pattern Value.
+
+RETURN VALUE:  None.
+
+SEE ALSO:		glFillScreen, glBlankScreen, glBlock, glBlankRegion
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+__useix __root void glFastFillRegion(int left, int top,
+                                 int width, int height,
+                                 int pattern)
+{
+	static char pix_cntrl;
+
+	// Check if x-coordinate of the top-left edge has exceeded the LCD
+	// display boundary.
+	if(left < 0 || left > (LCD_XS-1))
+	{
+		// Clip, set it to either the MIN or MAX display boundary
+		left = (left > (LCD_XS-1)) ? (LCD_XS-1) : 0;
+	}
+
+	// Check if y-coordinate of the top-left edge has exceeded the LCD
+	// display boundary.
+	if(top < 0 || top > (LCD_YS-1))
+	{
+		// Clip, set it to either the MIN or MAX display boundary
+		top = (top > (LCD_YS-1)) ? (LCD_YS-1) : 0;
+	}
+
+	// Check if x,y coordinates of the top left edge has exceeded the
+	// LCD display boundary. Need to use PIXEL_XS instead of LCD_XS due
+	// to the byte alignment issue. See your low-level driver for more
+	// infor.
+	if((width+left) > (PIXEL_XS-1))
+	{
+		// Set Column to not exceed the MAX display boundary
+		width -= ((width+left) - (PIXEL_XS -1));
+	}
+	if((height+top) > (PIXEL_YS-1))
+	{
+		// Set Row to not exceed the MAX display boundary
+		height -= ((height+top) - (PIXEL_YS));
+	}
+
+#asm
+	ld  	a,xpc						; Protect XMEM window page
+	push	af
+	push  ix
+
+	ld    a,(ix+pattern)			; Pattern used to fill block specified
+	ld    (pix_cntrl),a
+
+	ld		c,(ix+left+0)			; BC = left
+	ld		b,(ix+left+1)
+	srl	b							; BC = Byte Offset of left
+	rr		c
+	srl	b
+	rr		c
+	srl	b
+	rr		c
+	push	bc							; Protect Byte Offset
+
+	ld		c,(ix+top+0)			; BC = top
+	ld		b,(ix+top+1)
+	ld		de,PIXGROUP				; DE = PIXGROUP
+	mul
+
+	pop	hl							; Restore Byte Offset
+	add	hl,bc						; HL = Screen Offset of (left,top)
+
+
+	; Calculate the starting row in glBuf where the block is going to
+	; written.
+	ld    de,(glBuf)				; Load BC:DE with glBuf base address
+	ld    bc,(glBuf+2)
+	add   hl,de						; Add row/column offset to the base address
+	jr    nc,.skipadd
+	inc	bc
+
+.skipadd:
+	ex    de,hl						; Move calculation result to reg DE
+	call	LongToXaddr				; Convert BC:DE to a XMEM addr in A:DE
+	ld    xpc,a						; Save-off XPC for glBuf access
+	ex    de,hl						; Move glBuf offset to reg HL
+
+	; At this point the glbuf pointer is pointing to the first row of
+	; where the block is going to reside. The worst case calculation
+	; for bumping the glBuf pointer from this point on will be the
+	; number of bytes within a given row. For example, a LCD with a
+	; resolution of 240x320 would be 40 bytes.
+	ld		c,(ix+width+0)			; BC = Bitmap Width (Pixels)
+	ld		b,(ix+width+1)
+	srl	b
+	rr		c
+	srl	b
+	rr		c
+	srl	b
+	rr		c							; BC = Bitmap Width (bytes)
+
+	ld		e,(ix+height+0)		; DE = Bitmap Height (pixels)
+	ld		d,(ix+height+1)
+
+.rownext:
+	push	bc							; Protect Bitmap Width
+	push	hl							; Protect LCD Buffer Pointer
+	ld		b,c						; B = Bitmap Width (bytes)
+
+.GVW4:
+	ld		a,(PixColor)			; FF only if XOR
+	rra								; CY set if XOR
+	jr		nc,.GVW4A				; jump if not XOR
+
+	; XOR bitmap data
+	xor	a,(hl)					; A = bitmap byte XOR LCD buffer byte
+	jr    .wrdata
+
+.GVW4A:
+	ld    a,(pix_cntrl)
+.wrdata:
+	ld		(hl),a					; Change XPC   store bitmap byte in LCD buffer
+	inc	hl							; Bump dest pointer
+	djnz	.GVW4						; loop til done this row
+
+
+.rowadv:
+	pop	hl							; Restore LCD Buffer Pointer
+	ld		bc,PIXGROUP				; Advance to Next Row
+	add	hl,bc
+
+	; Check if the glBuf offset has crossed the 0xF000 page boundary
+	bit	4,h
+	jr    z,.skipXPC2				; If HL in 0xE000 Page, Continue
+	res	4,h						; If not, force Back to 0xE000 Page
+	ld    a,xpc						; Get the current page address
+	inc   a							; Bump to the next page
+	ld    xpc,a						; Update XPC variable with the new value
+
+	; Check if done processing the bitmap, otherwise continue
+.skipXPC2:
+	pop	bc							; Restore Bitmap Width
+	dec	de							; Decrement Bitmap Height
+	ld		a,d						; Height Zero?
+	or		a,e
+	jr		nz,.rownext				; Continue til Done
+
+	; Restore registers and exit
+	pop	ix
+	pop	af							; Restore Xmem page
+	ld  	xpc,a						; Restore XMEM Window
+	call	glSwap					; Update LCD
+#endasm
+}
+
+
+
+/*** BeginHeader glPlotVPolygon */
+void glPlotVPolygon(int n, int *pFirstCoord);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glPlotVPolygon              <GRAPHIC.LIB>
+
+SYNTAX:  		void glPlotVPolygon(int n, int *pFirstCoord);
+
+DESCRIPTION:  	Plots the outline of a polygon in the LCD page buffer,
+					and on the LCD if the buffer is unlocked. This function
+					is non-reentrant.
+
+					Any portion of the polygon that is outside the LCD display
+					area will be clipped. The function will also return, doing
+					nothing, if there are less than 3 vertices.
+
+PARAMETER1:		Number of vertices.
+PARAMETER2:    Pointer to array of vertex coordinates
+               x1,y1, x2,y2, x3,y3...
+
+RETURN VALUE:  None.
+
+SEE ALSO: 		glPlotPolygon, glFillPolygon, glFillVPolygon
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void glPlotVPolygon(int n, int *pFirstCoord)
+{
+	auto int *pCurrentCoord;
+
+	if(n < 3)
+	{
+		return;
+	}
+	glBuffLock();
+	pCurrentCoord = pFirstCoord;
+	while(--n)
+	{
+		glPlotLine( pCurrentCoord[0], pCurrentCoord[1],
+						pCurrentCoord[2], pCurrentCoord[3]);
+		glPlotDot(pCurrentCoord[0],pCurrentCoord[1]);
+		pCurrentCoord += 2;
+	}
+	glPlotLine(pCurrentCoord[0],pCurrentCoord[1],
+				  pFirstCoord[0],  pFirstCoord[1]);
+
+	glPlotDot(pCurrentCoord[0], pCurrentCoord[1]);
+	glBuffUnlock();
+}
+
+/*** BeginHeader glPlotPolygon */
+void glPlotPolygon(int n, int x1, int y1, int x2, int y2,...);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glPlotPolygon               <GRAPHIC.LIB>
+
+SYNTAX:  		void glPlotPolygon(int n,
+                                  int x1, int y1,
+                                  int x2, int y2, ...);
+
+DESCRIPTION:  	Plots the outline of a polygon in the LCD page buffer,
+					and on the LCD if the buffer is unlocked. This function
+					is non-reentrant.
+
+					Any portion of the polygon that is outside the LCD display
+					area will be clipped. The function will also return, doing
+					nothing, if there are less than 3 vertices.
+
+PARAMETER1:		Number of vertices.
+PARAMETER2:		X-coordinates of 1st vertex.
+PARAMETER3:		Y-coordinates of 1st vertex.
+PARAMETER4:		X-coordinates of 2nd vertex.
+PARAMETER5:		Y-coordinates of 2nd vertex.
+PARAMETER6:    ...coordinates of additional vertex's.
+	 :
+PARAMETERX:
+
+RETURN VALUE:  None.
+
+SEE ALSO:		glPlotVPolygon, glFillPolygon, glFillVPolygon
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void glPlotPolygon(int n, int x1, int y1, int x2, int y2,...)
+{
+	glPlotVPolygon(n,&x1);
+}
+
+
+/*** BeginHeader _glPlotPolySeg */
+void _glPlotPolySeg(int n, int *pFirstV, int x, char star);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION *******************************************
+_glPlotPolySeg               <GRAPHIC.LIB>
+
+SYNTAX:  		void _glPlotPolySeg(int n, int *pFirstV, int x, char star);
+
+DESCRIPTION:  	Procedure to Plot a polygon segment. This function is
+					non-reentrant.
+
+PARAMETER1:		Number of segments to plot.
+PARAMETER2:		Pointer to array of segment coordinates
+               x1,y1, x2,y2, x3,y3...
+PARAMETER3:    Parameter to indicate if its a star-shaped figure.
+					0 = Not star-shape figure
+ 					1 = Star-shape figure
+
+RETURN VALUE:  None.
+
+SEE ALSO: 		glPlotPolygon, glPlotVPolygon, glFillPolygon,
+               glFillVPolygon
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void _glPlotPolySeg(int n, int *pFirstV, int x, char star)
+{
+	auto char	bool;
+	auto int minY, min2Y, min3Y, swapper;
+	auto int yBound;
+	auto int c1, c2;
+	auto int y;
+	auto int i;
+	auto int *pCurrentV;
+	auto int x1, y1, x2, y2;
+
+
+	minY = 0x7fff;
+	yBound = 0;
+	c1 = c2 = 0;
+	do
+	{
+		pCurrentV = pFirstV;
+		min2Y = min3Y = 0x7fff;
+		for (i = 0; i < n; ++i)
+		{
+			x1 = pCurrentV[0];
+			y1 = pCurrentV[1];
+			if (i != n-1)
+			{
+				x2 = pCurrentV[2];
+				y2 = pCurrentV[3];
+			}
+			else
+			{
+				x2 = pFirstV[0];
+				y2 = pFirstV[1];
+			}
+			if (star)
+				bool = (((x1 < x) && (x2 > x)) || ((x2 < x) && (x1 > x)));
+			else
+				bool = (((x1 <= x) && (x2 >= x)) || ((x2 <= x) && (x1 >= x)));
+			if (bool)
+			{
+				//	not a straight line, but it intersects
+				if (x == x1)
+					y = y1;			//	check if end-points is on the v line
+				else if (x == x2)
+					y = y2;
+				else
+				{
+					y = (int)(y1 + 0.5 +
+						(float)((x-x1) * (y2 - y1)) /
+							(x2 - x1));
+				}
+				//	at this point, y indicates where the lines intersect
+				if (y >= yBound) 			//	yBound is the lower bound
+				{
+					if (y == minY)
+						++c1;
+					if (y == min2Y)
+						++c2;
+					if (y < minY) 			//	an upper vertex
+					{
+						if (min2Y != y)
+							min3Y = min2Y;
+						min2Y = minY;
+						minY = y;			//	shift minimum due to new min
+						c2 = c1;
+						c1 = 0;
+					}
+					else if (y < min2Y)
+					{
+						if (min2Y != y)
+							min3Y = min2Y;
+						min2Y = y;
+						c2 = 0;
+					}
+					else if (y < min3Y)
+					{
+						if (min2Y != y)
+							min3Y = y;
+					}
+				}
+			}
+			pCurrentV += 2;
+		}
+
+		if (min2Y != 0x7fff)
+		{
+			if (minY == min2Y)
+			{
+				if (c1 & 1)
+				{
+					if (min3Y != 0x7fff)
+					{
+						if (star)
+						{
+							minY = min3Y;			// gvw 3/28/00
+							min3Y = y1;				// gvw 3/28/00
+						}
+						glPlotLine(x,minY,x,min3Y);
+						c1 = 1;
+						if (!star)
+							minY = min3Y;
+						yBound = min3Y;
+					}
+				}
+				else
+				{
+					glPlotLine(x,minY,x,minY);
+					c1 = 0;
+					yBound = min3Y;
+					minY = 0x7fff;
+				}
+			}
+			else
+			{
+				glPlotLine(x,minY,x,min2Y);
+				minY = (c2&1)?0x7fff:min2Y;
+				yBound = (c2&1)?min3Y:min2Y;
+				c1 = !(c2&1);
+			}
+		}
+		if (min3Y != 0x7fff)
+			min3Y;			// Used for setting a breakpoint
+	} while (min3Y != 0x7fff);
+}
+
+/*** BeginHeader glFillVPolygon */
+void glFillVPolygon(int n, int *pFirstV);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glFillVPolygon              <GRAPHIC.LIB>
+
+SYNTAX:  		void glFillVPolygon(int n, int *pFirstCoord);
+
+DESCRIPTION:  	Fills a polygon in the LCD page buffer, and on the LCD
+					screen if the buffer is unlocked. This function is
+					non-reentrant.
+
+					Any portion of the polygon that is outside the LCD display
+					area will be clipped. The function will also return, doing
+					nothing, if there are less than 3 vertices.
+
+PARAMETER1:    The number of vertices.
+PARAMETER2:    Pointer to array of vertex coordinates
+               x1,y1, x2,y2, x3,y3...
+
+RETURN VALUE: 	None.
+
+SEE ALSO: 		glFillPolygon, glPlotPolygon, glPlotVPolygon
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void glFillVPolygon(int n, int *pFirstV)
+{
+	auto char	star;
+	auto int 	maxX, minX;
+	auto int 	i, x0, y0, x, m, x1st, xlast, y1st, ylast;
+	auto int 	*pCurrentV;
+	auto int    valid_segment;
+
+	// Check for a valid polygon
+	if(n < 3)
+	{
+		return;
+	}
+
+	// Clip any X and/or Y coordinates that is beyond the display area
+	valid_segment = FALSE;
+	for (x = 0, i = 0; x < n; x++)
+	{
+		x0 = pFirstV[i];
+		y0 = pFirstV[i+1];
+		// Check if first endpoint of the line has exceeded the LCD boundary
+		if(x0 < 0 || x0 > (LCD_XS-1))
+		{
+			// Clip it, set it to either the MIN or MAX display boundary
+			x0 = (x0 > (LCD_XS-1)) ? (LCD_XS-1) : 0;
+		}
+		else if(y0 < 0 || y0 > (LCD_YS-1))
+		{
+			// Clip it, set it to either the MIN or MAX display boundary
+			y0 = (y0 > (LCD_YS-1)) ? (LCD_YS-1) : 0;
+		}
+		else
+		{
+			valid_segment = TRUE;
+		}
+		pFirstV[i] = x0;
+		pFirstV[i+1] = y0;
+		i += 2;
+	}
+
+	// Return if theres no segments that are displayable on the LCD
+	if(!valid_segment)
+	{
+		return;
+	}
+
+	glBuffLock();
+	maxX = 0; minX = 0x7fff;
+	pCurrentV = pFirstV;
+	for (x = 0; x < n; ++x)
+	{
+		if (maxX < *pCurrentV)
+		{
+			maxX = *pCurrentV;
+		}
+		if (minX > *pCurrentV)
+		{
+			minX = *pCurrentV;
+		}
+		pCurrentV += 2;
+	}
+	m = (n * 2) - 2;
+	x1st = pFirstV[0];
+	y1st = pFirstV[1];
+	xlast = pFirstV[m];
+	ylast = pFirstV[m+1];
+	star = ((x1st == xlast) && (y1st == ylast));
+
+	for (x = minX; x <= maxX; ++x)
+	{
+		_glPlotPolySeg(n, pFirstV, x, star);
+	}
+	glBuffUnlock();
+}
+
+/*** BeginHeader glFillPolygon */
+void glFillPolygon(int n, int x1, int y1, int x2, int y2,...);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glFillPolygon               <GRAPHIC.LIB>
+
+SYNTAX:  		void glFillPolygon(int n,
+                                  int x1, int y1,
+                                  int x2, int y2, ...);
+
+DESCRIPTION: 	Fills a polygon in the LCD page buffer, and on the LCD if
+					the buffer is unlocked. This function is non-reentrant.
+
+					Any portion of the polygon that is outside the LCD display
+					area will be clipped. The function will also return, doing
+					nothing, if there are less than 3 vertices.
+
+PARAMETER1:		Number of vertices
+PARAMETER2:		X-coordinates of 1st vertex.
+PARAMETER3:	   Y-coordinates of 1st vertex.
+PARAMETER4:    X-coordinates of 2nd vertex.
+PARAMETER5:    Y-coordinates of 2nd vertex.
+PARAMETER6:    ...coordinates of additional vertex's.
+   :
+PARAMETERX:
+
+RETURN VALUE:  None.
+
+SEE ALSO: 		glFillVPolygon, glPlotPolygon, glPlotVPolygon
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void glFillPolygon(int n, int x1, int y1, int x2, int y2,...)
+{
+	glFillVPolygon(n,&x1);
+}
+
+/*** BeginHeader glPlotCircle */
+void glPlotCircle(int xc, int yc, int rad);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glPlotCircle                <GRAPHIC.LIB>
+
+SYNTAX:  		void glPlotCircle(int xc, int yc, int rad);
+
+DESCRIPTION:  	Draws a circle in the LCD page buffer, and on the LCD
+					if the buffer is unlocked. This function is non-reentrant.
+
+					Any portion of the circle that is outside the LCD display
+					area will be clipped.
+
+PARAMETER1:		X-coordinate of the center of the circle.
+PARAMETER2:		Y-coordinate of the center of the circle.
+PARAMETER3:    Radius of the circle (Number of pixels).
+
+RETURN VALUE:  None.
+
+SEE ALSO: 		glFillCircle, glPlotPolygon, glFillPolygon
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void glPlotCircle (int xc, int yc, int rad)
+{
+	auto int x, y, d, lastY;
+
+	glBuffLock();
+	if (rad <= 1)
+	{
+		glPlotDot(xc,yc);
+	}
+	else
+	{
+		x = 0;
+		y = rad;
+		lastY = y;
+		d = 3-2*rad;
+		while (x <= y)
+		{
+			if (x)
+			{
+				glPlotDot(xc+x, yc+y);
+				glPlotDot(xc+x, yc-y);
+				glPlotDot(xc-y, yc+x);
+				if (x != y)
+				{
+					glPlotDot(xc+y,yc+x);
+				}
+			}
+			glPlotDot(xc-x, yc-y);
+			if (x != y)
+			{
+				glPlotDot(xc-y, yc-x);
+				glPlotDot(xc-x, yc+y);
+				glPlotDot(xc+y, yc-x);
+			}
+			if (d < 0)
+			{
+				d = d + 4*x + 6;
+			}
+			else
+			{
+				d = d + 4 * (x - y) + 10;
+				y = y - 1;
+			}
+			x = x + 1;
+		}
+	}
+	glBuffUnlock();
+}
+
+/*** BeginHeader glFillCircle */
+void glFillCircle(int xc, int yc, int rad);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glFillCircle                <GRAPHIC.LIB>
+
+SYNTAX:  		void glFillCircle(int xc, int yc, int rad);
+
+DESCRIPTION:  	Draws a filled circle in the LCD page buffer, and on
+					the LCD if the buffer is unlocked. This function is
+					non-reentrant.
+
+					Any portion of the circle that is outside the LCD display
+					area will be clipped.
+
+PARAMETER1:		X-coordinate of the center of the circle.
+PARAMETER2:    Y-coordinate of the center of the circle.
+PARAMETER3:    Radius of the circle (Number of pixels).
+
+RETURN VALUE:  None.
+
+SEE ALSO:		glPlotCircle, glPlotPolygon, glFillPolygon
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void glFillCircle(int xc, int yc, int rad)
+{
+	auto int x, y, d, lastY, lastX;
+
+	glBuffLock();
+	if (rad <= 1)
+		glPlotDot(xc,yc);
+	else
+	{
+		x = 0;
+		y = rad;
+		lastY = y;
+		d = 3 - (2 * rad);
+		while (x <= y)
+		{
+			if (x)
+				glPlotLine(xc+x, yc+y, xc+x, yc-y);
+			glPlotLine(xc-x, yc+y, xc-x, yc-y);
+			if (d < 0)
+			{
+				d = d + 4*x + 6;
+			}
+			else
+			{
+				d = d + 4 * (x - y) + 10;
+				y = y - 1;
+			}
+			x = x + 1;
+			if ((y != lastY) && ((x-1) != lastY))
+			{
+				glPlotLine(xc+lastY, yc+lastX, xc+lastY, yc-lastX);
+				glPlotLine(xc-lastY, yc+lastX, xc-lastY, yc-lastX);
+				lastY = y;
+			}
+			lastX = x;
+		}
+	}
+	glBuffUnlock();
+}
+
+
+/*** BeginHeader glXFontInit */
+void glXFontInit(fontInfo *pInfo,
+					  char pixWidth,
+					  char pixHeight,
+					  unsigned startChar,
+					  unsigned endChar,
+					  unsigned long xmemBuffer);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glXFontInit                 <GRAPHIC.LIB>
+
+SYNTAX:  		void glXFontInit(fontInfo *pInfo,
+              						  char pixWidth,
+              						  char pixHeight,
+             						  unsigned startChar,
+              						  unsigned endChar,
+              						  unsigned long xmemBuffer);
+
+DESCRIPTION:  	Initialize the font descriptor structure, where the font
+					is stored in Xmem. Each font character's bitmap is column
+					major and byte aligned. This function is non-reentrant.
+
+PARAMETER1:		Pointer to the font descriptor to be initialized.
+PARAMETER2:		Width of each font item (number of pixels).
+PARAMETER3:		Height of each font item (number of pixels).
+PARAMETER4:    Value of the first printable character in the font
+					character set.
+PARAMETER5:		Value of the last printable character in the font
+					character set.
+PARAMETER6:		XMEM pointer to a linear array of font bitmaps.
+
+RETURN VALUE:  None.
+
+SEE ALSO:		glPrinf
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void glXFontInit(fontInfo *pInfo,
+					  char pixWidth,
+					  char pixHeight,
+					  unsigned startChar,
+					  unsigned endChar,
+					  unsigned long xmemBuffer)
+{
+	pInfo->pixWidth = pixWidth;
+	pInfo->pixHeight = pixHeight;
+	pInfo->startChar = startChar;
+	pInfo->endChar = endChar;
+	pInfo->xmemBuffer = xmemBuffer;
+	pInfo->flags |= 0x01;
+	pInfo->charLength = FONTOFFSET(pixWidth,pixHeight);
+}
+
+
+/*** BeginHeader glFontCharAddr */
+unsigned long glFontCharAddr (fontInfo *pInfo, char letter);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glFontCharAddr              <GRAPHIC.LIB>
+
+SYNTAX:  		unsigned long glFontCharAddr(fontInfo *pInfo, char letter);
+
+DESCRIPTION:  	Return XMEM address of character from specified font set.
+               This function is non-reentrant.
+
+PARAMETER1: 	XMEM address of the bitmap font set.
+PARAMETER2:		ASCII character.
+
+RETURN VALUE:  XMEM address of bitmap character font, column major and byte
+               aligned.
+
+SEE ALSO:		glPutFont, glPrintf
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+unsigned long glFontCharAddr (fontInfo *pInfo, char letter)
+{
+	auto unsigned long addr;
+
+	addr  = (unsigned long)((int)letter - pInfo->startChar);
+	addr *= pInfo->charLength;
+	addr += pInfo->xmemBuffer;
+	return (addr);
+}
+
+
+/*** BeginHeader glPutFont */
+void glPutFont (int x, int y,  fontInfo *pInfo, char code);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glPutFont                   <GRAPHIC.LIB>
+
+SYNTAX:  		void glPutFont(int x, int y,
+ 									   fontInfo *pInfo, char code);
+
+DESCRIPTION:  	This function puts an entry from the font table to the
+					page buffer, and on the LCD if the buffer is unlocked.
+					Each font character's bitmap is column major and byte
+					aligned. This function is non-reentrant.
+
+
+					Any portion of the bitmap character that is outside the
+					LCD display area will be clipped.
+
+PARAMETER1:		X-coordinate (column) of the upper left corner of the text.
+PARAMETER2:		Y-coordinate (row) of the left top corner of the text.
+PARAMETER3:		Pointer to font descriptor.
+PARAMETER4:		ASCII character to display.
+
+RETURN VALUE:  None.
+
+SEE ALSO:		glFontCharAddr, glPrintf
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+__root void glPutFont(int x, int y, fontInfo *pInfo, char code)
+{
+	auto unsigned long addr;
+
+	addr = glFontCharAddr (pInfo, code);
+	glXPutBitmap (x, y, pInfo->pixWidth, pInfo->pixHeight, addr);
+}
+
+
+/*** BeginHeader 	glSetPfStep, glPfStepX,   glPfStepY */
+extern int glPfStepX;
+extern int glPfStepY;
+
+void glSetPfStep(int stepX, int stepY);
+/*** EndHeader */
+
+// Variables for the above header section
+int glPfStepX;
+int glPfStepY;
+
+/* START FUNCTION DESCRIPTION ********************************************
+glSetPfStep 			<GRAPHIC.LIB>
+
+SYNTAX:  		void glSetPfStep(int stepX, int stepY);
+
+DESCRIPTION:  	Sets the glPrintf() printing step direction. The X and
+					Y step directions are independent signed values. The actual
+					step increments depend on the height and width of the font
+					being displayed, which are multiplied by the step values.
+					This function is non-reentrant.
+
+PARAMETER1:		glPrintf X step value
+PARAMETER2:		glPrintf Y step value
+
+RETURN VALUE:  None.
+
+SEE ALSO:  		Use glGetPfStep() to examine the current X and Y printing
+					step direction.
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void glSetPfStep(int stepX, int stepY)
+{
+	glPfStepX = stepX;
+	glPfStepY = stepY;
+}
+
+/*** BeginHeader 	glGetPfStep */
+int glGetPfStep( void );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glGetPfStep                 <GRAPHIC.LIB>
+
+SYNTAX:  		int glGetPfStep(void);
+
+DESCRIPTION:  	Gets the current glPrintf() printing step direction. Each
+					step direction is independent of the other, and treated as
+					an 8-bit signed value. The actual step increments depends
+					on the height and width of the font being displayed, which
+					are multiplied by the step values. This function is non-
+					reentrant.
+
+PARAMETER:     None.
+
+RETURN VALUE:  The X step is returned in the MSB, and the Y step is
+               returned in the LSB of the integer result.
+
+SEE ALSO:  		Use glSetPfStep() to control the X and Y printing step
+					direction.
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int glGetPfStep(void)
+{
+	return(((glPfStepX << 8) & 0xFF00) | (glPfStepY & 0x00FF));
+}
+
+
+/*** BeginHeader glPutChar */
+void glPutChar(char ch, char __far *ptr, int *cnt, glPutCharInst *pInst);
+/*** EndHeader */
+
+
+/* START FUNCTION DESCRIPTION *******************************************
+glPutChar   					<GRAPHIC.LIB>
+
+SYNTAX: 			void glPutChar(char ch, char far *ptr, int *cnt,
+		                        glPutCharInst *pInst)
+
+DESCRIPTION:	This function provides an interface between the STDIO
+					string handling functions and the graphic library. The
+					STDIO string formatting function will call this function,
+					one character at a time, until the entire formatted string
+					has been parsed. This function is non-reentrant.
+
+					Any portion of the bitmap character that is outside the LCD
+					display area will be clipped.
+
+PARAMETER1:		Character to be displayed on the LCD.
+PARAMETER2:	   Not used, is a place holder due to STDIO string functions.
+PARAMETER3:		Not used, is a place holder due to STDIO string functions.
+PARAMETER4:		Font descriptor pointer.
+
+RETURN VALUE:  None.
+
+SEE ALSO:  		glPrintf, glPutFont, doprnt
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void glPutChar(char ch, char __far *ptr, int *cnt, glPutCharInst *pInst)
+{
+	glPutFont(pInst->x, pInst->y, pInst->pFont, ch);
+	pInst->x += (glPfStepX * pInst->pFont->pixWidth);
+	pInst->y += (glPfStepY * pInst->pFont->pixHeight);
+}
+
+/*** BeginHeader 	glPrintf */
+void glPrintf( int x, int y, fontInfo *pInfo, char __far *fmt, ... );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+glPrintf       				<GRAPHIC.LIB>
+
+SYNTAX:  		void glPrintf( int x, int y,
+										fontInfo *pInfo, char far *fmt, ... );
+
+DESCRIPTION:  	This function prints a formatted string (much like printf)
+				  	on the LCD screen. Only the character codes that exist in
+				  	the font set are printed, all others are skipped over. For
+				  	example, '\b', '\t', '\n' and '\r' (ASCII backspace, tab,
+				  	newline and carriage return, respectively) will be printed
+				  	if they exist in the font set, but will not have any effect
+				  	as control characters. This function is non-reentrant.
+
+				  	Any portion of the bitmap character that is outside the LCD
+				  	display area will be clipped.
+
+PARAMETER1:		X-coordinate (column) of the upper left corner of the text.
+PARAMETER2:		Y-coordinate (row) of the left top corner of the text.
+PARAMETER3:		Font descriptor pointer.
+PARAMETER4:		Formatted string
+PARAMETER5:    ...Formatted string conversion parameter(s)
+    :
+PARAMETERX
+					EXAMPLE:
+					--------
+					glprintf(0,0, &fi12x16, "Test %d\n", count);
+
+RETURN VALUE:  None.
+
+SEE ALSO:		glXFontInit
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void glPrintf(int x, int y, fontInfo *pInfo, char __far *fmt, ...)
+{
+	glPutCharInst instanceParam;
+
+	instanceParam.x = x;
+	instanceParam.y = y;
+	instanceParam.pFont = pInfo;
+	glBuffLock();
+	doprnt(glPutChar, fmt, (char *) &fmt + sizeof fmt,
+	       &instanceParam, NULL, NULL);
+	glBuffUnlock();
+}
+
+
+/*** BeginHeader TextWindowFrame */
+int TextWindowFrame(windowFrame *window,
+						  fontInfo *pInfo,
+                    int x, int y,
+                    int width, int height);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION *******************************************
+TextWindowFrame		<GRAPHIC.LIB>
+
+SYNTAX: 			int TextWindowFrame(windowFrame *window,
+											  fontInfo *pFont,
+                    					  int x, int y,
+                    					  int winWidth, int winHeight)
+
+DESCRIPTION:	Defines a text only display window. This function provides
+				   a way to display caharacters within the text window with
+				   only using character row and column coordinates.
+
+					The text window feature provides end-of-line wrapping and
+					clipping after the character in the last column and row
+					is displayed.
+
+					Note:
+					-----
+					Must executed the TextWindowFrame function before using
+					using any of the Text only functions. (i.e. TextGotoXY,
+					TextPutChar, TextPrintf, TextCursorLocation)
+
+PARAMETER1:	   Window Frame descriptor pointer.
+PARAMETER2:		Font descriptor pointer.
+PARAMETER3:		X-coordinate of where the text window frame is to start.
+PARAMETER4:		Y-coordinate of where the text window frame is to start.
+PARAMETER5:		Width of the text window frame.
+PARAMETER6:		Height of the text window frame.
+
+RETURN VALUE:	 0  Window frame was successfully created.
+				   -1  X-coordinate+width has exceeded the display boundary.
+					-2  Y-coordinate+height has exceeded the display boundary.
+               -3  Invalid winHeight and/or winWidth parameter value.
+
+SEE ALSO:  		TextPutChar, TextPrintf, TextCursorLocation,
+					TextGotoXY
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int TextWindowFrame(windowFrame *window,
+						  fontInfo *pFont,
+                    int x, int y,
+                    int winWidth, int winHeight)
+{
+	auto int xmax, ymax;
+
+   if(winHeight <= 0 || winWidth <= 0)
+   {
+    	return -3;
+   }
+	memset(window, 0x00, sizeof(windowFrame));
+	// Calculate the maximum column and row for displaying characters
+	xmax = ((winWidth  / pFont->pixWidth) * pFont->pixWidth)  + x;
+	ymax = ((winHeight / pFont->pixHeight)* pFont->pixHeight) + y;
+
+	if(xmax > LCD_XS)
+	{	// Error, have exceeded the maximum x-coordinate for the display
+		return -1;
+	}
+	else if(ymax > LCD_YS)
+	{
+		// Error, have exceeded the maximum y-coordinate for the display
+		return -2;
+	}
+
+
+	window->pFont = pFont;				// Font descriptor pointer
+	window->startwinx  = x;				// Starting x-pixel for window frame
+	window->startwiny  = y;				// Starting y-pixel for window frame
+	window->winwidth   = winWidth;	// Width of window frame
+	window->winheight  = winHeight;	// Height of window frame
+	window->curX		 = x;				// Current cursor x-pixel location
+	window->curY		 = y;				// Cuurent cursor y-pixel location
+	window->curXmax    = xmax;			// Maximum window frame x-coordinate
+	window->curYmax    = ymax;			// Maximum window frame y-coordinate
+	window->curRow     = 0;				// Row of where the cursor is located
+	window->curCol     = 0;				// Column of where cursor is located
+	window->maxChars   = (winWidth  / pFont->pixWidth) *
+	                     (winHeight / pFont->pixHeight);
+	// The window frame has been successfully created
+	return 0;
+}
+
+/*** BeginHeader TextGotoXY */
+void TextGotoXY(windowFrame *window, int col, int row);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+TextGotoXY           <GRAPHIC.LIB>
+
+SYNTAX:  		void TextGotoXY(windowFrame *window, int col, int row);
+
+DESCRIPTION:  	Sets the cursor location on the display of where to display
+					the next character. Display location is based on the height
+					and width of the character to be displayed. This function
+					is non-reentrant.
+
+					Note: Must executed the TextWindowFrame function before
+					      using this function.
+
+PARAMETER1: 	Window Frame descriptor pointer.
+PARAMETER2:   	Character column location.
+PARAMETER3:  	Character row location.
+
+RETURN VALUE:  None.
+
+SEE ALSO:  		TextPutChar, TextPrintf, TextWindowFrame,
+					TextCursorLocation
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void TextGotoXY(windowFrame *window, int col,  int row)
+{
+	window->curX = (col *  window->pFont->pixWidth);
+	window->curY = (row *  window->pFont->pixHeight);
+
+	window->curX += window->startwinx;
+	window->curY += window->startwiny;
+	window->curRow = row;
+	window->curCol = col;
+}
+
+
+/*** BeginHeader TextCursorLocation */
+void TextCursorLocation(windowFrame *window, int *col, int *row);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+TextCursorLocation		<GRAPHIC.LIB>
+
+SYNTAX:  		void TextCursorLocation(windowFrame *window,
+													int *col, int *row);
+
+DESCRIPTION:  	Gets the current cursor location that was set by one of
+					Graphic Text functions
+
+					Note: Must executed the TextWindowFrame function before
+					      using this function.
+
+PARAMETER1:		Window Frame descriptor pointer.
+PARAMETER2:		Pointer to cursor column variable.
+PARAMETER3:		Pointer to cursor row variable.
+
+RETURN VALUE:  Lower word = Cursor Row location
+					Upper word = Cursor Column location
+
+SEE ALSO:  		TextGotoXY, TextPrintf, TextWindowFrame, TextPutChar
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void TextCursorLocation(windowFrame *window, int *col, int *row)
+{
+	*row = window->curRow;
+	*col = (window->curCol << 16);
+}
+
+
+/*** BeginHeader _TextPutChar */
+void _TextPutChar(char ch, char __far *ptr, int *cnt, windowFrame *pInst);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION *******************************************
+_TextPutChar   					<GRAPHIC.LIB>
+
+SYNTAX: 			void _TextPutChar(char ch, char far *ptr, int *cnt,
+		                             struct glPutCharInst *pInst);
+
+DESCRIPTION:	This function provides an interface between the STDIO
+               string handling functions and the graphic library. The
+               STDIO string formatting function will call this function,
+               one character at a time, until the entire formatted string
+               has been parsed. This function is non-reentrant.
+
+					If any portion of the bitmap character is outside the LCD
+					display area the character will not to be displayed.
+
+					Note: Must executed the TextWindowFrame function before
+					      using this function.
+
+PARAMETER1:		Character to be displayed on the LCD.
+PARAMETER2:	   Not used, is a place holder due to STDIO string functions.
+PARAMETER3:		Not used, is a place holder due to STDIO string functions.
+PARAMETER4:		Window Frame descriptor pointer.
+
+RETURN VALUE:  None.
+
+SEE ALSO:  		TextGotoXY, TextPrintf, TextWindowFrame,
+					TextCursorLocation
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void _TextPutChar(char ch, char __far *ptr, int *cnt, windowFrame *wPtr)
+{
+	if (ch == '\b')
+	{
+		return;
+	}
+	if (ch == '\n')
+	{
+		if(wPtr->curX == 0)
+		{
+   		TextGotoXY(wPtr, 0, wPtr->curRow);
+		}
+		else
+		{
+			TextGotoXY(wPtr, 0, wPtr->curRow+1);
+		}
+      return;
+   }
+   else if (ch == '\r')
+   {
+   	TextGotoXY(wPtr, 0, wPtr->curRow);
+		return;
+   }
+
+   if(!(wPtr->curY >= wPtr->curYmax))
+   {
+		glPutFont(wPtr->curX, wPtr->curY, wPtr->pFont, ch);
+	}
+	else
+	{
+		// The cursor is pointing beyond the text window area,
+		// exit without displaying anything.
+		return;
+	}
+
+	if(((wPtr->curX + wPtr->pFont->pixWidth)  <  wPtr->curXmax)  &&
+		((wPtr->curY + wPtr->pFont->pixHeight) <= wPtr->curYmax))
+	{
+		TextGotoXY(wPtr, wPtr->curCol + 1,  wPtr->curRow);
+	}
+	else
+	{
+		if((wPtr->curX + wPtr->pFont->pixWidth)  >= wPtr->curXmax)
+		{
+			TextGotoXY(wPtr, 0, wPtr->curRow + 1);
+		}
+	}
+}
+
+
+/*** BeginHeader TextPutChar */
+void TextPutChar(windowFrame *window, char ch);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION *******************************************
+TextPutChar   					<GRAPHIC.LIB>
+
+SYNTAX: 			void TextPutChar(struct windowFrame *window, char ch);
+
+DESCRIPTION:	This functions displays a character on the display where
+               the cursor is currently pointing, afterwards the cursor
+               will be incremented to the next character position.
+
+              	If any portion of the bitmap character is outside the LCD
+					display area the character will not to be displayed.
+
+					Note: Must executed the TextWindowFrame function before
+					      using this function.
+
+PARAMETER1:		Window Frame descriptor pointer.
+PARAMETER2:		Character to be displayed on the LCD.
+
+RETURN VALUE:  None.
+
+SEE ALSO:  		TextGotoXY, TextPrintf, TextWindowFrame,
+					TextCursorLocation
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void TextPutChar(windowFrame *window, char ch)
+{
+	auto char fmt[2];
+	auto int status;
+
+	status = 0;
+	// Put the character into an ASCII string format
+	fmt[0] = ch;
+	fmt[1] = '\0';
+
+	doprnt(_TextPutChar, fmt, (char *) &fmt[0] + sizeof fmt,
+	       window, NULL, NULL);
+}
+
+/*** BeginHeader TextPrintf */
+void TextPrintf(windowFrame *window, char __far *fmt, ... );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+TextPrintf       				<GRAPHIC.LIB>
+
+SYNTAX:  void TextPrintf(struct windowFrame *window, char far *fmt, ...);
+
+DESCRIPTION:  	This function prints a formatted string (much like printf)
+				  	on the LCD screen. Only printable characters in the font
+				  	set are printed, also escape sequences, '\r' and '\n' are
+				  	recognized. All other escape sequence's will be skipped
+				  	over, for example '\b' and '\t' will cause nothing to be
+				  	displayed. This function is non-reentrant.
+
+				  	The text window feature provides end-of-line wrapping and
+					clipping after the character in the last column and row
+					is displayed.
+
+					Note: Must executed the TextWindowFrame function before
+					      using this function.
+
+PARAMETER1:		Window Frame descriptor pointer.
+PARAMETER2:		Formatted string
+PARAMETER3:    ...Formatted string conversion parameter(s)
+    :
+PARAMETERX
+
+					EXAMPLE:
+					--------
+					TextPrintf(&TextWindow, "Test %d\n", count);
+
+RETURN VALUE:  None.
+
+SEE ALSO:		TextGotoXY, TextPutChar, TextWindowFrame,
+					TextCursorLocation
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void TextPrintf(windowFrame *window, char __far *fmt, ...)
+{
+	glBuffLock();
+	doprnt(_TextPutChar, fmt, (char *) &fmt + sizeof fmt,
+	        window, NULL, NULL);
+	glBuffUnlock();
+}
+
+
+/*** BeginHeader TextBorderInit */
+void TextBorderInit(windowFrame *wPtr, int border, char *title);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+TextBorderInit    			<GRAPHIC.LIB>
+
+SYNTAX:	      void TextBorderInit(windowFrame *wPtr,
+                                   int border, char *title);
+
+DESCRIPTION:   This function initializes the window frame structure
+               with the border and title information.
+
+               The TextWindowFrame function must be executed before
+               running this function. This function is non-reentrant.
+
+PARAMETER1:    Window Frame descriptor pointer.
+PARAMETER2:    Border style:
+					-------------
+					SINGLE_LINE...Function will draw a single line border
+					              around the Text Window.
+					DOUBLE_LINE...Function will draw a double line border
+					              around the Text Window.
+PARAMETER3:   	Title:
+					------
+					1. If a NULL or an empty (i.e. "") string is detected then
+					no title is written to the Text MENU.
+
+					2. If a string is detected then it will be written to the
+					top of the Text Menu Box as the title with center alignment.
+
+RETURN VALUE:	None.
+
+SEE ALSO:		TextBorder, TextGotoXY, TextPutChar, TextWindowFrame,
+					TextCursorLocation
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void TextBorderInit(windowFrame *wPtr,
+                   int border, char *title)
+{
+	wPtr->title      = title;
+	wPtr->border     = border;
+	wPtr->borderDisplayed  = FALSE;
+	wPtr->winwidth -= (wPtr->winwidth%wPtr->pFont->pixWidth);
+	wPtr->winheight-= (wPtr->winheight%wPtr->pFont->pixHeight);
+}
+
+
+/*** BeginHeader TextBorder */
+void TextBorder(windowFrame *wPtr);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+TextBorder    			<GRAPHIC.LIB>
+
+SYNTAX:	      void TextBorder(windowFrame *wPtr);
+
+DESCRIPTION:   This function displays the border for a given window
+               frame.
+
+               The TextBorderInit function must be executed before
+               running this function.
+
+               This function will automatically adjust the text window
+               parameters to accommodate the space taken by the text
+               border. This adjustment will only occur once after the
+               TextBorderInit function executes.
+
+PARAMETER:     Window Frame descriptor pointer.
+
+RETURN VALUE:	None.
+
+SEE ALSO:		TextBorderInit, TextGotoXY, TextPutChar, TextWindowFrame,
+					TextCursorLocation
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void TextBorder(windowFrame *wPtr)
+{
+
+	auto int xoffset;
+	auto int yoffset;
+	auto int offset;
+	auto int x;
+
+	// If border already has been displayed, re-calculate the text
+   // window frame coordinates for redisplaying the border.
+   if(wPtr->borderDisplayed)
+	{
+   	wPtr->startwinx -= wPtr->pFont->pixWidth;
+		wPtr->winwidth  += (2*wPtr->pFont->pixWidth);
+		wPtr->startwiny -= wPtr->pFont->pixHeight;
+   	wPtr->winheight += (2*wPtr->pFont->pixHeight);
+      wPtr->borderDisplayed = FALSE;
+   }
+	if(wPtr->border== DOUBLE_LINE || wPtr->border == SINGLE_LINE)
+	{
+		yoffset = (int)((float)wPtr->pFont->pixHeight * .2);
+		glPlotPolygon(4,
+	  					  wPtr->startwinx,
+	   				  wPtr->startwiny+yoffset,
+
+	   				  wPtr->startwinx+wPtr->winwidth-1,
+	                 wPtr->startwiny+yoffset,
+
+	                 wPtr->startwinx+wPtr->winwidth-1,
+	                 wPtr->startwiny+wPtr->winheight-1,
+
+	                 wPtr->startwinx,
+	                 wPtr->startwiny+wPtr->winheight-1);
+	}
+	if(wPtr->border == DOUBLE_LINE)
+	{
+		xoffset = (int)((float)wPtr->pFont->pixWidth  * .2);
+	   yoffset = (int)((float)wPtr->pFont->pixHeight * .2);
+
+	   if(xoffset >= yoffset)
+	     	offset = xoffset;
+	   else
+			offset = yoffset;
+
+		yoffset = (int)((float)wPtr->pFont->pixHeight*.3);
+		glPlotPolygon(4,
+	   				  wPtr->startwinx+ offset,
+	   				  wPtr->startwiny+ offset+ yoffset,
+
+	   				  wPtr->startwinx+wPtr->winwidth-1- offset,
+	                 wPtr->startwiny+ offset + yoffset,
+
+	                 wPtr->startwinx+wPtr->winwidth-1-offset,
+	                 wPtr->startwiny+wPtr->winheight-1-offset,
+
+	                 wPtr->startwinx+offset,
+	                 wPtr->startwiny+wPtr->winheight-1-offset);
+	}
+	if(wPtr->title && strlen(wPtr->title))
+	{
+		x  = (wPtr->winwidth - strlen(wPtr->title) * wPtr->pFont->pixWidth) /2;
+		x -= (wPtr->pFont->pixWidth>>1);
+		if(strlen(wPtr->title)% 2)
+			x += (wPtr->pFont->pixWidth>>1);
+		glPrintf(x+wPtr->startwinx, wPtr->startwiny, wPtr->pFont, "%s", wPtr->title);
+	}
+	if(!wPtr->borderDisplayed)
+	{
+		wPtr->startwinx += wPtr->pFont->pixWidth;
+		wPtr->winwidth  -= (2*wPtr->pFont->pixWidth);
+		wPtr->startwiny += wPtr->pFont->pixHeight;
+   	wPtr->winheight -= (2*wPtr->pFont->pixHeight);
+
+ 	  	wPtr->curXmax    = ((wPtr->winwidth / wPtr->pFont->pixWidth) *
+                           wPtr->pFont->pixWidth)  + wPtr->startwinx;
+		wPtr->curYmax    = ((wPtr->winheight/ wPtr->pFont->pixHeight)*
+	                        wPtr->pFont->pixHeight) + wPtr->startwiny;
+		wPtr->curX		  = wPtr->startwinx;
+		wPtr->curY		  = wPtr->startwiny;
+		wPtr->maxChars   = (wPtr->winwidth  / wPtr->pFont->pixWidth) *
+	                      (wPtr->winheight / wPtr->pFont->pixHeight);
+		wPtr->borderDisplayed = TRUE;
+	}
+}
+
+
+/*** BeginHeader TextWinClear */
+void TextWinClear(windowFrame *wPtr);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION *******************************************
+TextWinClear   		<GRAPHIC.LIB>
+
+SYNTAX: 			void TextWinClear(windowFrame *wPtr);
+
+DESCRIPTION:	This functions clears the entire area within the specified
+               text window. This function is non-reentrant.
+
+PARAMETER1:		Window Frame descriptor pointer.
+
+RETURN VALUE:  None.
+
+SEE ALSO:  		TextGotoXY, TextPrintf, TextWindowFrame,
+					TextCursorLocation
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void TextWinClear(windowFrame *wPtr)
+{
+	auto int brushtype;
+
+	brushtype = glGetBrushType();
+	glSetBrushType(PIXWHITE);
+	glBlock(wPtr->startwinx, wPtr->startwiny,
+	        wPtr->winwidth,
+	        wPtr->winheight);
+	glSetBrushType(brushtype);
+}
+
+/*** BeginHeader TextMaxChars */
+int TextMaxChars(windowFrame *wPtr);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION *******************************************
+TextMaxChars   					<GRAPHIC.LIB>
+
+SYNTAX: 			int TextMaxChars(windowFrame *wPtr);
+
+DESCRIPTION:	This function returns the maximum number of characters
+               that can be displayed within the text window. This function
+               is non-reentrant.
+
+					Note: Must executed the TextWindowFrame function before
+					      using this function.
+
+PARAMETER1:		Window Frame descriptor pointer.
+
+RETURN VALUE:  Maximum number of characters that can be displayed within
+               the text window.
+
+SEE ALSO:  		TextGotoXY, TextPrintf, TextWindowFrame,
+					TextCursorLocation
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int TextMaxChars(windowFrame *wPtr)
+{
+
+	return( wPtr->maxChars);
+
+}
+
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+
+

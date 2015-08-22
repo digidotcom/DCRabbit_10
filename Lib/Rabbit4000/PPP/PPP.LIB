@@ -1,0 +1,2043 @@
+/*
+* Copyright (c) 2008 Digi International Inc., All Rights Reserved
+*
+* This software contains proprietary and confidential information of Digi
+* International Inc.  By accepting transfer of this copy, Recipient agrees
+* to retain this software in confidence, to prevent disclosure to others,
+* and to make no use of this software other than that for which it was
+* delivered.  This is a published copyrighted work of Digi International
+* Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+* prohibited.
+*
+* Restricted Rights Legend
+*
+* Use, duplication, or disclosure by the Government is subject to
+* restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+* Technical Data and Computer Software clause at DFARS 252.227-7031 or
+* subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+* Restricted Rights at 48 CFR 52.227-19, as applicable.
+*
+* Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+*/
+
+/*******************
+PPP.LIB
+
+PPP bundled with Dynamic C.
+
+PPP driver for serial and PPPoE links.
+*********************/
+
+/*** BeginHeader _ppp_states, _pppoe_states */
+
+#if CC_VER < 0xA20
+#fatal "This PPP module must be used with Dynamic C version 10.21 or later."
+#endif
+
+#ifndef __PPP_LIB
+#define __PPP_LIB
+
+
+#define USING_PPP
+
+#ifdef PPP_DEBUG
+#define _ppp_nodebug
+#else
+#define _ppp_nodebug __nodebug
+#endif
+
+
+#define PPP_MAXTEMP		256	// Maximum temporary transmit buffer size, since use single static buffer
+
+#define PPP_MIN_MTU		64		// Minimum reasonable MTU
+
+// Normally, a config-request would only have to be sent 3 times (initial request, again after reject,
+// then again after NAK).  However, packets may be dropped and peers may be buggy.  So we allow twice
+// the theoretical.  PAP is restricted to 3, however.  These counters apply to our sending of the
+// config-request packet, and hopefully cut short any negotiation loops.
+#if !defined LCP_MAX_RETRY
+	#define LCP_MAX_RETRY	6
+#endif
+#if !defined PAP_MAX_RETRY
+	#define PAP_MAX_RETRY	3
+#endif
+#if !defined IPCP_MAX_RETRY
+	#define IPCP_MAX_RETRY	6
+#endif
+
+#ifndef PPP_TIMEOUT
+ #ifdef LCP_TIMEOUT
+	//backward compatibility
+	#define PPP_TIMEOUT LCP_TIMEOUT
+ #else
+	#define PPP_TIMEOUT 3000	// ms
+ #endif
+#endif
+
+#ifndef PPP_TIMEOUT_AUTHENTICATION
+	// by default, allow 1 second longer than the usual PPP time-out
+	#define PPP_TIMEOUT_AUTHENTICATION ((PPP_TIMEOUT) + 1000L)
+#endif
+
+#define PPP_SENDFREE 0
+#define PPP_SENDLOCKED 1
+#define PPP_SENDREADY 2
+#define PPP_SENDBUSY 3
+
+typedef struct
+{
+	longword	escape_map;		// Async escape map.  Bit set if char is to be escaped.
+	word		mru;				// Maximum receive unit.
+	char		protocol_comp;	// non-zero if use protocol compression.
+	char		address_comp;	// non-zero if use address compression (of the 0xFF03)
+	longword	magic_number;				// Magic number to set in next config-req or config-nak.  If we get same
+   											// number in a received LCP packet, then this is changed and the original
+                                    // request is retransmitted.
+} LCPOptions;
+
+typedef struct
+{
+	LCPOptions	local_options;			// Options we send to peer, controlling our receive side
+	LCPOptions	remote_options;		// Options we got from peer, controlling our transmit side.
+	char		current_id;
+	char		local_acked;				// Set when peer accepted all options we sent
+	char		local_config_sent;		// Number of trys
+	char		remote_acked;				// Set when we have accepted all options sent by the peer
+	char		use_magic_number;			// If use of magic numbers goes awry (broken peer) then turn this off.
+   											// It is on by default.
+	char		remote_term;				// Got LCP terminate request
+	char		term_sent;
+	char		term_acked;
+} LCPState;
+
+#ifndef PPP_MAXPAPSTRING
+#define PPP_MAXPAPSTRING 30
+#endif
+
+typedef struct
+{
+	char		current_id;
+
+	// We only send Authenticate-Request if peer requires it (LCP option)
+	char		remote_request;			// True if we should authenticate ourself to peer
+	char		have_auth;					// Set if we have credentials for peer
+	char		sent_auth;					// Number of times sent Authenticate-Request
+	char		auth_acked;					// True when received Authenticate-Ack
+	// Our credentials sent to peer
+	char		remote_username[PPP_MAXPAPSTRING];
+	char		remote_password[PPP_MAXPAPSTRING];
+
+	char		require_auth;				// True if we require the peer to authenticate itself
+	char		got_auth;					// True if Authenticate-Request was valid
+	char		auth_failed;				// True if A-R was received but invalid
+	// Peer's credentials (which must match his A-R)
+	char		local_username[PPP_MAXPAPSTRING];
+	char		local_password[PPP_MAXPAPSTRING];
+	int 		(*local_auth_callback)();	// Optional callback to handle incoming PAP
+} PAPState;
+
+typedef struct
+{
+	// Negotiating IP addresses is slightly complicated.
+   // (1) Getting the local IP address (and we don't already know it)
+   // If IFS_PPP_ACCEPTIP is TRUE, then we initially send CONF-REQ with IP=0.  This asks the peer to
+   // send CONF-NAK with a suitable local, for us, IP address.  If, instead, a broken peer responds with
+   // CONF-ACK IP=0 then we do the following (as if ACCEPTIP was FALSE):
+   // If IFS_PPP_ACCEPTIP is FALSE, we send CONF-REQ IP=xxxx where xxxx is the first non-zero value
+   // found in the following order: the local_ip field, then _if_tab[iface].ipaddr for this interface,
+   // then the .ipaddr field of any other interface.  The 'other' interfaces are searched in order of
+   // PPP interfaces, then non-DHCP ethernets.  If none of these have a non-zero value,
+   // then we give up and bring the interface down.
+   // (2) Setting or getting the peer's IP address.
+   // If IFS_PPP_REMOTEIP is yyyy = 0, then we don't want to set the peer's IP addr.  If we get CONF-REQ IP=zzzz
+   // (non-zero) from the peer, then we are happy with this whatever the setting of REMOTEIP, unless zzzz happens
+   // to conflict with one of our local addresses (or overlaps a subnet on another interface).  If such
+   // a conflict is detected, then if yyyy != 0 we send CONF-NAK IP=yyyy, else if yyyy==0 then we give up and
+   // bring the interface down.
+   // If we get CONF-REQ IP=0, or CONF-REQ without the IP option, then we do this:
+   // If yyyy==0, we give up, since we can't assign an IP address to the peer.
+   // Else if yyyy!=0, we send CONF-NAK IP=yyyy.
+   // NOTE: we do not support the obsolete IP_ADDRESSES option.
+	longword local_ip;
+	longword remote_ip;
+   word		flags;
+#define IPCP_F_IP_NEGOT		0x0001	// Local IP address is negotiable.  If not, then any address other than
+												// the one set in _if_tab[].ipaddr will not be acceptable i.e. the peer
+                                    // is not allowed to NAK our IP_ADDRESS option.  If true, then we accept
+                                    // whatever he puts in config-NAK for this option.
+                                    // This flag is set by default.
+#define IPCP_F_HAVE_HIS_IP	0x0002	// If true, suggest the address in remote_ip as the peer's IP address
+												// if he sends initial config-req with zero IP address (or no IP_ADDRESS
+                                    // option at all).
+												// We never NAK the peer's non-zero address unless it directly conflicts with
+                                    // our other interfaces.
+                                    // This flag is not set by default.
+#define IPCP_F_DNS_NEGOT   0x0004	// Local DNS addresses are negotiable.  If not, any hints are ignored.
+                                    // This flag is set by default.
+#define IPCP_F_HAVE_HIS_DNS 0x0008	// If true, suggest primary_dns/secondary_dns as the peer's DNS server
+												// addresses as per the IP address option.
+                                    // This flag is not set by default, since most apps do not have this info.
+                                    // If you #define PPP_PUSHY_DNS_ASSIGN then, even if the peer sends non-zero
+                                    // DNS addresses in his config-req, we NAK them with our own ones (if this
+                                    // flag is TRUE).  This is not normally defined, since we rarely have better
+                                    // knowledge of the DNS server addresses than the peer.
+// Following flags are only used during negotiation.  All init to zero.
+#define IPCP_F_PEER_REJ_IP	0x0100	// Peer rejected IP_ADDRESS option
+#define IPCP_F_PEER_REJ_D1	0x0200	// Peer rejected DNS 1 option
+#define IPCP_F_PEER_REJ_D2	0x0400	// Peer rejected DNS 2 option
+												// ... any of these reject flags stops us from setting the option again.
+#define IPCP_F_PEER_NO_IP	0x0800	// Peer did not send an IP_ADDRESS option.  If we get a 2nd config-req
+												// with no ip addr, and this flag is set (from the first) then we give up
+                                    // and use a dummy address for him (since he is a pure router).  The
+                                    // dummy address is 0.0.1.<iface number>.
+#define IPCP_F_LOCAL_ACKED	0x1000	// Got config-ack to our config-req.
+#define IPCP_F_REMOTE_ACKED 0x2000	// Sent config-ack to his config-req.
+	longword primary_dns;
+	longword secondary_dns;
+	char		local_config_sent;		// Number of trys
+	char		current_id;
+} IPCPState;
+
+
+// Sum of entire PPP state.  This structure is pointed to by the interface table,
+// field u.ppp.ppp_state (cast to PPPState *).
+typedef struct _PPPState
+{
+	word		iface;					// Interface number
+	char		initialized;			// Set 1 when PPPinitialize() called
+   char		connected;				// flag indicating connected state.  LCP, IPCP (and maybe PAP) completed.
+   										// This gets turned off when LCP finishes coming down.
+   char		passive;					// Whether to wait passively for a peer to connect.  If TRUE, then if initial
+   										// LCP negotiation times out then the interface just stays pending up until
+                                 // it gets an LCP ConfReq from the peer.  If FALSE, then LCP timeout causes
+                                 // the interface to fail, and the app has to explicitly bring it up later.
+   void *	state;				// Points to _PPPLINKConfig or _PPPOEConfig - these structs have pointers back to
+   										// this struct.
+   const NetControllerDevice * ncd;	// Points to controller info for this interface.
+	longword timeout;
+	char		error_type;
+#define PPP_MODEMERROR 1
+#define PPP_PPPOEERROR 2
+#define PPP_LCPERROR 3
+#define PPP_PAPERROR 4
+#define PPP_IPCPERROR 5
+#define PPP_SERIALERROR 6
+	int		error;
+#define LCP_RETRY_ERROR 	-20
+#define LCP_CODEREJECT		-21
+#define LCP_PROTOCOLREJECT -22
+#define LCP_OPTIONERROR		-23
+#define PAP_RETRY_ERROR		-30
+#define PAP_INVALIDERROR	-31
+#define PAP_CODEERROR		-32
+#define PAP_AUTHFAILED		-33
+#define IPCP_RETRY_ERROR	-40
+#define IPCP_CODEERROR		-42
+#define IPCP_OPTIONERROR	-43
+	LCPState lcp;
+	PAPState pap;
+	IPCPState ipcp;
+} PPPState;
+
+
+// Main state structures.  These are memset to zero in dcrtcp global init (dcr_initdcr()).
+#if USING_PPPLINK
+extern PPPState _ppp_states[USING_PPPLINK];
+#endif
+
+#if USING_PPPOE
+extern PPPState _pppoe_states[USING_PPPOE];
+#endif
+
+// This buffer is used to construct outgoing control packets (LCP, PAP, IPCP).
+extern char _ppp_tempbuf[PPP_MAXTEMP];
+
+#define PPPpack16(location, value) *(word *)(location) = intel16(value)
+#define PPPunpack16(location) intel16(*(word *)(location))
+#define PPPpack32(location, value) *(longword *)(location) = intel(value)
+#define PPPunpack32(location) intel(*(longword *)(location))
+
+/*---------------------------------
+
+Constants to map protocol fields
+
+----------------------------------*/
+
+// Uncompressed protocol field values
+#define LCP_PROTOCOL		0xC021
+#define PAP_PROTOCOL		0xC023
+#define IPCP_PROTOCOL	0x8021
+#define IP_PROTOCOL		0x0021
+
+
+// LCP code field values
+// Codes 1-7 also used for IPCP.
+#define LCP_VENDOR		0x00
+#define LCP_CONFIG_REQ	0x01
+#define LCP_CONFIG_ACK	0x02
+#define LCP_CONFIG_NAK	0x03
+#define LCP_CONFIG_REJ	0x04
+#define LCP_TERM_REQ		0x05
+#define LCP_TERM_ACK		0x06
+#define LCP_CODE_REJ		0x07
+#define LCP_PROTO_REJ	0x08
+#define LCP_ECHO_REQ		0x09
+#define LCP_ECHO_REP		0x0A
+#define LCP_DISC_REQ		0x0B
+#define LCP_IDENT			0x0C
+#define LCP_TIME			0x0D
+
+// LCP config options
+#define LCP_OPT_VENDOR	0x00
+#define LCP_OPT_MRU		0x01
+#define LCP_OPT_ACCM		0x02
+#define LCP_OPT_AUTH		0x03
+#define LCP_OPT_MAGIC	0x05
+#define LCP_OPT_PFC		0x07
+#define LCP_OPT_ACFC		0x08
+
+
+// PAP code field values
+#define PAP_AUTH_REQ		0x01
+#define PAP_AUTH_ACK		0x02
+#define PAP_AUTH_NAK		0x03
+
+// IPCP config options
+#define IPCP_IP_ADDRESSES	0x01	// Obsolete, not used
+#define IPCP_IP_COMPRESS	0x02	// Not currently used
+#define IPCP_IP_ADDRESS		0x03
+#define IPCP_PRIMARY_DNS	0x81
+#define IPCP_SECONDARY_DNS	0x83
+
+/*** EndHeader */
+
+#if USING_PPPLINK
+PPPState _ppp_states[USING_PPPLINK];
+#endif
+
+#if USING_PPPOE
+PPPState _pppoe_states[USING_PPPOE];
+#endif
+
+char _ppp_tempbuf[PPP_MAXTEMP];
+
+/*** BeginHeader PPPinitialize */
+int PPPinitialize(PPPState *ppp, void * state, word iface,
+                  const NetControllerDevice * ncd, const LCPOptions * local,
+                  const LCPOptions * remote);
+/*** EndHeader */
+
+_ppp_nodebug
+int PPPinitialize(PPPState *ppp, void * state, word iface,
+                  const NetControllerDevice * ncd, const LCPOptions * local,
+                  const LCPOptions * remote)
+{
+	auto LCPOptions oldlocal, oldremote;
+	auto word rnd;
+
+#ifdef PPP_VERBOSE
+	printf("PPPinitialize: i/f %d local=%s remote=%s\n",
+		iface, local ? "yes" : "no", remote ? "yes" : "no");
+#endif
+
+   // If no new local and/or remote LCP options, preserve the current settings.
+   if (!local)
+   	memcpy(&oldlocal, &ppp->lcp.local_options, sizeof(LCPOptions));
+   if (!remote)
+   	memcpy(&oldremote, &ppp->lcp.remote_options, sizeof(LCPOptions));
+
+	memset(ppp, 0, sizeof(*ppp));
+
+	ppp->iface = iface;
+   ppp->state = state;
+   ppp->ncd = ncd;
+
+  	memcpy(&ppp->lcp.local_options, local ? local : &oldlocal, sizeof(LCPOptions));
+  	memcpy(&ppp->lcp.remote_options, remote ? remote : &oldremote, sizeof(LCPOptions));
+
+	//LCP
+   // Note that MS_TIMER is not necessarily set up if we are being called pre-main.  Thus, we read
+   // the RTC to get a pseudo-random value.
+   #asm
+   ioi ld (RTC0R),a
+   ioi ld hl,(RTC0R)
+   ld	(sp+@sp+rnd),hl
+   #endasm
+	ppp->lcp.local_options.magic_number = rnd;
+	ppp->lcp.use_magic_number = 1;
+
+	//PAP - all zeros.
+
+	//IPCP
+	ppp->ipcp.flags = IPCP_F_IP_NEGOT|IPCP_F_DNS_NEGOT; // Allow negotiation of IP addresses
+
+	ppp->initialized = 1;
+	return 0;
+}
+
+
+
+/*** BeginHeader PPPLinkStatus */
+void PPPLinkStatus(int iface, int up);
+/*** EndHeader */
+
+_ppp_nodebug void PPPLinkStatus(int iface, int up)
+{
+	// This is upcalled from lower layer when physical link status changes.
+	// It is also called from this library when LCP terminate request is received, or
+	// a new config request is received when the i/f is up.
+   // If up==2, then the link is up and LCP is already done.  This is called when an
+   // IPCP term-req is received, and indicates that the interface is actually down
+   // but coming up pending renegotiation of IPCP (and maybe PAP).
+   // NOTE: up==2 not implemented - we always restart from LCP.
+	auto word mask;
+
+#ifdef PPP_VERBOSE
+	printf("PPPLinkStatus: link i/f %d is %s\n", iface, up ? "up" : "down");
+#endif
+
+	mask = 1 << iface;
+	if (!up) {
+		_if_request &= ~mask;
+		_if_prequest &= ~mask;
+		_if_actual &= ~mask;
+		_abort_socks(NETERR_IFDOWN, iface);
+		_if_tab[iface].up = 0;
+		PPPResetState((PPPState *)_if_tab[iface].u.ppp.ppp_state, 1);
+#ifdef USE_IF_CALLBACK
+		if (_if_tab[iface].ifcallback)
+			_if_tab[iface].ifcallback(iface, 0);
+#endif
+	}
+   //else if (up == 2) {
+   //}
+}
+
+/*** BeginHeader PPPResetState */
+void PPPResetState(PPPState * ppp, int lcp);
+/*** EndHeader */
+
+_ppp_nodebug void PPPResetState(PPPState * ppp, int lcp)
+{
+#ifdef PPP_VERBOSE
+	printf("PPPResetState: i/f %d lcp=%d\n", ppp->iface, lcp);
+#endif
+	if (lcp) {
+	   ppp->lcp.local_config_sent = 0;
+	   ppp->lcp.local_acked = 0;
+	   ppp->lcp.remote_acked = 0;
+	   ppp->lcp.remote_term = 0;
+	   ppp->lcp.term_sent = 0;
+	   ppp->lcp.term_acked = 0;
+   }
+
+	ppp->pap.sent_auth = 0;
+	ppp->pap.got_auth = 0;
+	ppp->pap.auth_failed = 0;
+	ppp->pap.remote_request = 0;
+	ppp->pap.auth_acked = 0;
+
+	ppp->ipcp.local_ip = 0;
+	ppp->ipcp.local_config_sent = 0;
+   ppp->ipcp.flags &= ~(IPCP_F_PEER_REJ_IP|IPCP_F_PEER_REJ_D1|IPCP_F_PEER_REJ_D2|
+   								IPCP_F_LOCAL_ACKED|IPCP_F_REMOTE_ACKED);
+
+   ppp->connected = 0;
+
+#if USING_PPPLINK
+	if(IF_PKT_SER(ppp->iface)) {
+		//use default escape map to start
+		ppp->ncd->ioctl(ppp->state, PD_PPPLINK_ASYMAP, 0xFFFFFFFFuL);
+	}
+#endif
+}
+
+
+/*** BeginHeader ifctl_ppp */
+// Common subroutine for both ppp serial and pppoe
+int ifctl_ppp(PPPState * ppp, int iface, int up, int change);
+/*** EndHeader */
+
+_ppp_nodebug int ifctl_ppp(PPPState * ppp, int iface, int up, int change)
+{
+	auto int result;
+
+	if (up) {
+		if(change)
+			//zero everything out
+			PPPResetState(ppp, 1);
+
+		if (!(result = LCPtick(ppp)))
+			return IFCTL_PEND;
+		if (result < 0) {
+			ppp->error_type = PPP_LCPERROR;
+			ppp->error = result;
+			return IFCTL_FAIL;
+		}
+
+		if (!(result = PAPtick(ppp)))
+			return IFCTL_PEND;
+		if (result < 0) {
+			ppp->error_type = PPP_PAPERROR;
+			ppp->error = result;
+			return IFCTL_FAIL;
+		}
+
+		if (!(result = IPCPtick(ppp)))
+			return IFCTL_PEND;
+		if (result < 0) {
+			ppp->error_type = PPP_IPCPERROR;
+			ppp->error = result;
+			return IFCTL_FAIL;
+		}
+
+#if USING_PPPLINK
+		if(IF_PKT_SER(iface)) {
+      	if (ppp->ncd->ioctl(ppp->state, PD_PPP_SENDINGCTL))
+         	return IFCTL_PEND; // Wait for any packets to finish
+         // Install the negotiated escape map for sending to peer.
+			ppp->ncd->ioctl(ppp->state, PD_PPPLINK_ASYMAP, ppp->lcp.remote_options.escape_map);
+      }
+#endif
+		if (ppp->ipcp.flags & IPCP_F_PEER_NO_IP)
+      	// Need to assign dummy.  Use 0.0.1.<iface>
+			_if_tab[iface].u.ppp.peeraddr = 0x00000100uL | iface;
+      else
+			_if_tab[iface].u.ppp.peeraddr = ppp->ipcp.remote_ip;
+      // Force netmask to all 1's
+      _if_tab[iface].mask = 0xFFFFFFFFuL;
+
+		if(ppp->ipcp.flags & IPCP_F_IP_NEGOT)
+         _if_tab[iface].ipaddr = ppp->ipcp.local_ip;
+
+		if (!(_if_tab[iface].u.ppp.pflags & IFF_PPP_NOROUTE))
+			ifconfig(iface, IFS_ROUTER_ADD, ppp->ipcp.remote_ip, IFS_END);
+
+		if (ppp->ipcp.flags & IPCP_F_DNS_NEGOT) {
+      	if (ppp->ipcp.primary_dns)
+				ifconfig(iface, IFS_NAMESERVER_ADD, ppp->ipcp.primary_dns, IFS_END);
+			if (ppp->ipcp.secondary_dns)
+				ifconfig(iface, IFS_NAMESERVER_ADD, ppp->ipcp.secondary_dns, IFS_END);
+      }
+#ifdef PPP_VERBOSE
+		printf("PPP: i/f %d UP\n", iface);
+#endif
+		ppp->connected = 1; //link negotiation done
+	}
+	else {
+#ifdef PPP_VERBOSE
+		if (change)
+			printf("PPP: LCP terminating %son i/f %d\n", ppp->lcp.remote_term ? "by remote " : "", iface);
+#endif
+		// Bringing down
+		if(ppp->lcp.remote_term) {
+			//Terminate request came from peer, already sent ack
+			if(ppp->ncd->ioctl(ppp->state, PD_PPP_SENDING))
+				return IFCTL_PEND; //wait for last packet to go out
+		}
+		else
+		{
+			//we want to terminate
+			if(change) {
+				ppp->lcp.term_sent = 0;
+				ppp->lcp.term_acked = 0;
+			}
+
+			if (!(result = LCPshutdown(ppp)))
+				return IFCTL_PEND;
+			if (result < 0) {
+				ppp->error_type = PPP_LCPERROR;
+				ppp->error = result;
+				// Even if error, we continue with shutdown (return IFCTL_OK)
+			}
+		}
+#ifdef PPP_VERBOSE
+      if (ppp->connected)
+			printf("PPP: LCP terminated on i/f %d (result=%d)\n", iface, result);
+#endif
+   	ppp->connected = 0; //no longer have connection
+	}
+	return IFCTL_OK;
+}
+
+
+/*** BeginHeader LCPtick */
+_ppp_nodebug int LCPtick(PPPState *ppp);
+/*** EndHeader */
+
+_ppp_nodebug int LCPtick(PPPState *ppp)
+{
+	if (ppp->lcp.local_acked && ppp->lcp.remote_acked)
+		return 1;
+
+	if (!ppp->lcp.local_config_sent ||
+		 chk_timeout(ppp->timeout)) {
+	   if (ppp->ncd->ioctl(ppp->state, PD_PPP_SENDINGCTL))
+	      return 0; // Wait for send to finish.
+
+	   if (ppp->lcp.local_config_sent > LCP_MAX_RETRY) {
+	#ifdef PPP_VERBOSE
+   		if (ppp->lcp.local_config_sent == LCP_MAX_RETRY+1)
+	      	printf("PPP: LCP too many retries i/f %d\n", ppp->iface);
+	#endif
+   		if (ppp->passive) {
+         	ppp->lcp.local_config_sent = LCP_MAX_RETRY+2;
+            ppp->timeout = _SET_TIMEOUT(3600000L);	// Come back in an hour
+				return 0;	// Wait forever, or until peer starts negotiating
+         }
+         else
+	      	return LCP_RETRY_ERROR;
+	   }
+	   if (!ppp->lcp.local_acked)
+			LCPsendConfig(ppp);
+   }
+
+	return 0;
+}
+
+/*** BeginHeader LCPshutdown */
+_ppp_nodebug int LCPshutdown(PPPState *ppp);
+/*** EndHeader */
+
+_ppp_nodebug int LCPshutdown(PPPState *ppp)
+{
+	if (ppp->lcp.term_acked)
+		return 1;	// All done
+
+	if (!ppp->lcp.term_sent ||
+		chk_timeout(ppp->timeout)) {
+	   if (ppp->lcp.term_sent > LCP_MAX_RETRY) {
+	#ifdef PPP_VERBOSE
+	      printf("PPP: LCP too many retries during shutdown i/f %d\n", ppp->iface);
+	#endif
+   		ppp->lcp.term_acked = 1;	// Pretend acked, so we don't keep doing this forever
+	      return LCP_RETRY_ERROR;
+	   }
+		LCPsendTerm(ppp);
+   }
+
+	return 0;
+}
+
+
+/*** BeginHeader _PPPsendCtl */
+#ifdef PPP_VERBOSE
+void _PPPsendCtl(PPPState *ppp, word type, word id, word len, char * msg);
+#define PPPsendCtl(a, b, c, d, e) _PPPsendCtl(a, b, c, d, e)
+#else
+void _PPPsendCtl(PPPState *ppp, word type, word id, word len);
+#define PPPsendCtl(a, b, c, d, e) _PPPsendCtl(a, b, c, d)
+#endif
+#define PPPST_LCP		0x0000
+#define PPPST_PAP		0x0100
+#define PPPST_IPCP	0x0200
+
+/*** EndHeader */
+
+#ifdef PPP_VERBOSE
+_ppp_nodebug void _PPPsendCtl(PPPState *ppp, word type, word id, word len, char * msg)
+#else
+_ppp_nodebug void _PPPsendCtl(PPPState *ppp, word type, word id, word len)
+#endif
+{
+	// Internal function to commonize header construction for PPP control packets
+	PPPpack16(_ppp_tempbuf, 0xFF03);
+	switch (type & 0xFF00) {
+		case PPPST_LCP: PPPpack16(_ppp_tempbuf+2, LCP_PROTOCOL); break;
+		case PPPST_PAP: PPPpack16(_ppp_tempbuf+2, PAP_PROTOCOL); break;
+		case PPPST_IPCP: PPPpack16(_ppp_tempbuf+2, IPCP_PROTOCOL); break;
+	}
+	_ppp_tempbuf[4] = (char)type;
+	_ppp_tempbuf[5] = (char)id;
+	// Length field (doesn't include address and protocol)
+	PPPpack16(_ppp_tempbuf + 6, len - 4);
+#ifdef PPP_VERBOSE
+	printf("PPPsendCtl: sending %s %s i/f %d\n",
+	  (type & 0xFF00) == PPPST_IPCP ? "IPCP" :
+	  (type & 0xFF00) == PPPST_PAP ? "PAP" :
+	  "LCP"
+	  , msg, ppp->iface);
+	if (ppp->ncd->ioctl(ppp->state, PD_PPP_SENDINGCTL))
+		printf("PPPsendCtl: sendctl will fail for prev msg\n");
+	if (debug_on > 4)
+		mem_dump(_ppp_tempbuf, len);
+#endif
+	ppp->ncd->ioctl(ppp->state, PD_PPP_SENDCTL, _ppp_tempbuf, len);
+}
+
+/*** BeginHeader LCPsendConfig */
+int LCPsendConfig(PPPState *ppp);
+/*** EndHeader */
+
+_ppp_nodebug int LCPsendConfig(PPPState *ppp)
+{
+	auto char temp;
+	auto int buf_pos;
+
+	buf_pos = 8; //add in header and length last
+
+	// MRU.  This is set to PPP_MTU by default, and is the largest payload we are willing to accept.
+   // Normally, PPP_MTU should equal MAX_MTU.  The only rational exception is if we are trying to
+   // enforce a link with better 'interactive' performance, in which case it may be appropriate to
+   // reduce the PPP MRU.  Note that the peer should be happy with this.  Broken peers may try to
+   // NAK our MRU: if so, then we accept whatever the peer says up to MAX_MTU (regardless of PPP_MTU).
+   // If the peer insists on > MAX_MTU, then we accept anyway but log a message that long packets may
+   // be dropped.
+   // Since 1500 is the specified default, we don't set this option if that is the current setting.
+   if (ppp->lcp.local_options.mru != 1500) {
+	   PPPpack16(_ppp_tempbuf + buf_pos, (LCP_OPT_MRU<<8) | 4);
+	   PPPpack16(_ppp_tempbuf + buf_pos + 2, ppp->lcp.local_options.mru);
+	   buf_pos += 4;
+   }
+	// ACCM
+	if (!IF_PKT_ETH(ppp->iface)) {
+   	// Only serial ports have escape maps.  On the rabbit side, we have no particular requirements
+      // (ACCM can be 0).
+		if(ppp->lcp.local_options.escape_map != 0xffffffff)
+		{
+			PPPpack16(_ppp_tempbuf + buf_pos, (LCP_OPT_ACCM<<8) | 6);
+			PPPpack32(_ppp_tempbuf + buf_pos + 2,
+						 ppp->lcp.local_options.escape_map);
+			buf_pos += 6;
+		}
+	}
+	if (ppp->pap.require_auth) {
+		// We require peer to authenticate itself using PAP
+		PPPpack16(_ppp_tempbuf + buf_pos, (LCP_OPT_AUTH<<8) | 4);
+		PPPpack16(_ppp_tempbuf + buf_pos + 2, PAP_PROTOCOL);
+		buf_pos += 4;
+	}
+	if (ppp->lcp.use_magic_number) {
+		// Magic Number
+		PPPpack16(_ppp_tempbuf + buf_pos, (LCP_OPT_MAGIC<<8) | 6);
+		PPPpack32(_ppp_tempbuf + buf_pos + 2,
+					  ppp->lcp.local_options.magic_number);
+		buf_pos += 6;
+	}
+	if (ppp->lcp.local_options.protocol_comp) {
+		// Protocol Compression Option
+		PPPpack16(_ppp_tempbuf + buf_pos, LCP_OPT_PFC<<8 | 2);
+		buf_pos += 2;
+	}
+	if (!IF_PKT_ETH(ppp->iface) && ppp->lcp.local_options.address_comp) {
+		// Address Compression Option (not for PPPoE)
+		PPPpack16(_ppp_tempbuf + buf_pos, LCP_OPT_ACFC<<8 | 2);
+		buf_pos += 2;
+	}
+	PPPsendCtl(ppp, PPPST_LCP | LCP_CONFIG_REQ, ++ppp->lcp.current_id, buf_pos, "config req");
+	++ppp->lcp.local_config_sent;
+	ppp->timeout = _SET_TIMEOUT(PPP_TIMEOUT);
+	return 1;
+}
+
+/*** BeginHeader LCPsendTerm */
+int LCPsendTerm(PPPState *ppp);
+/*** EndHeader */
+
+_ppp_nodebug int LCPsendTerm(PPPState *ppp)
+{
+	PPPsendCtl(ppp, PPPST_LCP | LCP_TERM_REQ, ++ppp->lcp.current_id, 8, "term");
+	ppp->lcp.term_sent++;
+	ppp->timeout = _SET_TIMEOUT(PPP_TIMEOUT);
+	return 1;
+}
+
+/*** BeginHeader PPP_process */
+int PPP_process(ll_prefix __far * p, byte * hdrbuf);
+/*** EndHeader */
+
+/*
+ * This is the main upcall from IP.LIB::pkt_received(), but it is also called
+ * from PPPOE.LIB::PPPOE_process().
+ *
+ * On entry, p points to a new packet.  p->net_offs is the byte offset from the end of (*p)
+ * to the PPP address/control field (if present).  Typically, the offset is 0 for serial
+ * packets, or 20 for PPPoE (which skips over the 14-byte ethernet header and 6-byte PPPoE
+ * header).
+ *
+ * This function must reset the net_offs field to point to the start of the IP header if
+ * the packet is IP.  In this case, the return value must be 0 to continue processing
+ * IP.  If the packet is not IP, it is probably an LCP, PAP or IPCP message which should
+ * be processed and a non-zero value returned.
+ *
+ * The PPP state machine is driven from this function, at least the part of it which
+ * is altered by incoming packets.
+ */
+
+_ppp_nodebug int PPP_process(ll_prefix __far * p, byte * hdrbuf)
+{
+	auto PPPState * ppp;
+	auto word pos, protocol, len;
+	auto byte *pkt;
+
+	ppp = (PPPState *)_if_tab[p->iface].u.ppp.ppp_state;
+
+	pkt = hdrbuf + p->net_offs;	// Start of PPP headers.  hdrbuf[0..net_offs-1] is already filled in.
+   // Get 4 bytes from xmem buffers.  This is enough to determine the protocol field in the worst case.
+   // For IP packets, usually only one byte is required (0x21 indicates IP).
+   _pkt_buf2root(p, pkt, 4, p->net_offs);
+
+
+	pos = (*pkt == 0xFF) << 1;	// Skip address/control byte if it is 0xFFxx
+
+	if (pkt[pos] & 1)
+		protocol = pkt[pos++];
+	else {
+		protocol = intel16(*(word *)(pkt + pos));
+		pos += 2;
+	}
+
+#ifdef PPP_VERBOSE
+	printf("PPP: got packet %04X on i/f:%d protocol:0x%x\n", p, p->iface, protocol);
+   // Don't print it here: can set IP_VERBOSE instead to print it.
+#endif
+
+	// Update net_offs to point to the first field of interest for the given protocol.
+	p->net_offs += pos;
+
+   // Remaining packet length
+   len = p->len - p->net_offs;
+
+	switch(protocol)
+	{
+		case LCP_PROTOCOL:	LCPprocessIn(ppp, p); break;
+		case PAP_PROTOCOL:	PAPprocessIn(ppp, p); break;
+		case IPCP_PROTOCOL:	IPCPprocessIn(ppp, p); break;
+		case IP_PROTOCOL:    return !ppp->connected;
+		default:
+#ifdef PPP_VERBOSE
+			printf("PPP: unknown incoming protocol %04x i/f %d\n", protocol, ppp->iface);
+         if (debug_on > 3)
+				_pkt_dump(p);
+#endif
+         LCPsendProtocolCodeReject(ppp, protocol, p, 0);
+         break;
+	}
+   // Return 1 to indicate all processing completed.
+	return 1;
+}
+
+/*** BeginHeader LCPsendProtocolCodeReject */
+_ppp_nodebug void LCPsendProtocolCodeReject(PPPState *ppp,
+													int protocol,
+													ll_prefix __far * p,
+                                       int code);
+/*** EndHeader */
+
+_ppp_nodebug void LCPsendProtocolCodeReject(PPPState *ppp,
+													int protocol,
+													ll_prefix __far * p,
+                                       int code)
+{
+	// If 'code' is true, send code reject, else return protocol reject.
+   // p->net_offs indicates the start of the code field (ppp information), which is echoed back.
+   // if not 'code' then the protocol value is also inserted in the echod info.
+   // if 'code', then the protocol parameter contains either PPPST_LCP or PPPST_IPCP (since LCP and
+   // IPCP use basically similar codes).
+	auto int length;
+   auto word hlen;
+   auto char id;
+   auto word type;
+
+   hlen = code ? 8 : 10;
+   // Get contents to echo
+   _pkt_buf2root(p, _ppp_tempbuf+hlen, sizeof(_ppp_tempbuf) - hlen, p->net_offs);
+
+	//assume format of "<code> <id> <length(2 bytes)>"
+	length = PPPunpack16(_ppp_tempbuf + (hlen+2));
+	if(length > sizeof(_ppp_tempbuf) - hlen)
+		length = 4; //something is wrong, send back 4 bytes only
+   if (!code) {
+   	id = ++ppp->lcp.current_id;
+      type = PPPST_LCP | LCP_PROTO_REJ;
+		PPPpack16(_ppp_tempbuf + 8, protocol); //send back uncompressed
+   }
+   else {
+   	if (protocol == PPPST_LCP)
+      	id = ++ppp->lcp.current_id;
+      else
+      	id = ++ppp->ipcp.current_id;
+      type = protocol | LCP_CODE_REJ;
+   }
+	PPPsendCtl(ppp, type, id, length+hlen, "proto/code rej");
+}
+
+
+
+/*** BeginHeader LCPprocessIn */
+_ppp_nodebug int LCPprocessIn(PPPState *ppp, ll_prefix __far * p);
+/*** EndHeader */
+
+_ppp_nodebug int LCPprocessIn(PPPState *ppp, ll_prefix __far * p)
+{
+	auto struct {
+		char code, id;
+   	word length;
+   } lcphdr;
+   auto word proto;
+
+   _pkt_buf2root(p, &lcphdr, 4, p->net_offs);
+	lcphdr.length = intel16(lcphdr.length);
+   if (lcphdr.length > p->len - p->net_offs) {
+   #ifdef PPP_VERBOSE
+   	printf("PPP: LCP packet length bad, is %u should be %u\n", lcphdr.length, p->len - p->net_offs);
+   #endif
+   	return 1;
+   }
+   // Force length in packet ot be correct (may be padding at end for e.g. ethernet)
+   p->len = p->net_offs + lcphdr.length;
+
+   p->net_offs += 4;
+
+#ifdef PPP_VERBOSE
+	if (debug_on > 2)
+		printf("PPP: got LCP packet code=0x%02x id=%d len=%u i/f %d\n",
+      			lcphdr.code, lcphdr.id, lcphdr.length, ppp->iface);
+#endif
+
+
+	switch(lcphdr.code)
+	{
+		case LCP_CONFIG_REQ:
+         if (ifstatus(ppp->iface)) {
+            // Interface was up, but getting a new LCP config.  The peer must have
+            // bombed out and is now reconnecting.  Bring i/f down then up so we start
+            // from scratch.
+            PPPLinkStatus(ppp->iface, 0); // Force down
+            ifup(ppp->iface);
+         }
+         // In initial attempt failed, and we are now getting negotiation from other side, reset retry counter.
+         if (ppp->passive && ppp->lcp.local_config_sent == LCP_MAX_RETRY+2)
+         	ppp->lcp.local_config_sent = 0;
+         LCPprocessRequest(ppp, p, lcphdr.id);
+         break;
+
+		case LCP_CONFIG_ACK:
+         if (lcphdr.id == ppp->lcp.current_id)
+               ppp->lcp.local_acked = 1;
+#ifdef PPP_VERBOSE
+         printf("PPP: received LCP ACK i/f %d.  local_acked = %d\n", ppp->iface, ppp->lcp.local_acked);
+#endif
+
+         break;
+
+		case LCP_CONFIG_NAK:
+         if (lcphdr.id == ppp->lcp.current_id) {
+            if(LCPhandleNak(ppp, p))
+               LCPsendConfig(ppp);
+            else
+               return LCP_OPTIONERROR;
+         }
+         break;
+
+		case LCP_CONFIG_REJ:
+         if (lcphdr.id == ppp->lcp.current_id) {
+            if(LCPhandleReject(ppp, p))
+               LCPsendConfig(ppp);
+            else
+               return LCP_OPTIONERROR;
+         }
+         break;
+
+		case LCP_TERM_REQ:	// Got term request
+         ppp->lcp.remote_term = 1;
+         LCPsendTermAck(ppp, lcphdr.id);
+         PPPLinkStatus(ppp->iface, 0);
+         break;
+
+		case LCP_TERM_ACK:
+         if (ppp->lcp.term_sent) {
+         #ifdef PPP_VERBOSE
+            printf("PPP: Got LCP term ACK, disconnecting\n");
+         #endif
+            ppp->lcp.term_acked = 1;
+         }
+      #ifdef PPP_VERBOSE
+         else
+            printf("PPP: ERROR - Got unexpected LCP Term ACK\n");
+      #endif
+         break;
+
+		case LCP_CODE_REJ:
+   		_pkt_buf2root(p, &lcphdr, 4, p->net_offs);
+      #ifdef PPP_VERBOSE
+      	printf("PPP: got LCP code reject for code 0x%02X\n", lcphdr.code);
+      #endif
+      	switch (lcphdr.code) {
+         	case LCP_CONFIG_REQ: case LCP_CONFIG_ACK: case LCP_CONFIG_NAK: case LCP_CONFIG_REJ:
+            	// These MUST be handled, so abort this link if peer rejects these codes.
+            	PPPLinkStatus(ppp->iface, 0); // Force down
+         }
+      	return LCP_CODEREJECT;
+
+		case LCP_PROTO_REJ:
+   		_pkt_buf2root(p, &proto, 2, p->net_offs);
+         proto = intel16(proto);
+      #ifdef PPP_VERBOSE
+      	printf("PPP: got LCP protocol reject for proto 0x%04X\n", proto);
+      #endif
+         if (proto == IPCP_PROTOCOL || proto == PAP_PROTOCOL && ppp->pap.require_auth)
+         	// We ignore silly rejections of LCP itself, but we require IPCP (and possibly PAP)
+            // so bring down if these are rejected.
+            PPPLinkStatus(ppp->iface, 0); // Force down
+      	return LCP_PROTOCOLREJECT;
+
+		case LCP_ECHO_REQ:
+      	LCPsendEchoReply(ppp, p, lcphdr.id);
+			break;
+
+		case LCP_ECHO_REP:
+      	break;
+
+      case LCP_VENDOR:
+		case LCP_DISC_REQ:
+		case LCP_TIME:
+		case LCP_IDENT:
+      	break; //ignore all of these
+
+		default:
+   		p->net_offs -= 4;	// Back up to code fiels
+         LCPsendProtocolCodeReject(ppp, PPPST_LCP, p, 1);
+			return LCP_CODEREJECT;
+	}
+	return 1;
+}
+
+/*** BeginHeader PPPgetOption */
+int PPPgetOption(ll_prefix __far * p, word * type, word * len);
+/*** EndHeader */
+
+_ppp_nodebug int PPPgetOption(ll_prefix __far * p, word * type, word * len)
+{
+	// Get next option indicated by p->net_offs into _ppp_tempbuf.  It is assumed that
+   // the current position is the next Type/Len/Data tuple.  The type code (0-255) is placed
+   // in *type, the data length (0-253) in *len, and the data is copied to _ppp_tempbuf.
+   // Returns 0 iff no option i.e. initial position is end of packet.
+   // Note: since the length field in the packet includes the header (2 byte) length, it is
+   // a sender error if the length byte is less than 2 (or greater than the remeaining packet length).
+   // In this case, *len is set to 0 on return, and (if the length is too long) the next position is
+   // set to EOP (or beyond).
+   auto struct {
+   	char type;
+      char len;
+   } opthdr;
+
+   //printf("p->len=%u p->net_offs=%u\n", p->len, p->net_offs);
+
+   if (p->net_offs > p->len-2)
+   	return 0;	// No more options possible.
+
+	_pkt_buf2root(p, &opthdr, 2, p->net_offs);
+   p->net_offs += 2;
+	if (opthdr.len < 2)
+   	opthdr.len = 0;
+   else
+   	opthdr.len -= 2;
+   if (opthdr.len) {
+		_pkt_buf2root(p, _ppp_tempbuf, opthdr.len, p->net_offs);
+		p->net_offs += opthdr.len;
+   }
+	*type = opthdr.type;
+   *len = opthdr.len;
+   //printf("  *type=%u *len=%u\n", *type, *len);
+   return 1;
+}
+
+/*** BeginHeader LCPhandleNak */
+int LCPhandleNak(PPPState *ppp, ll_prefix __far * p);
+/*** EndHeader */
+
+
+
+_ppp_nodebug int LCPhandleNak(PPPState *ppp, ll_prefix __far * p)
+{
+	// NAK means that the option is understood by the peer, however it would like to
+   // negotiate a different value.  We try to be as accommodating as possible, but there are limits...
+	auto word option, data_len;
+
+#ifdef PPP_VERBOSE
+	printf("PPP: LCP NAK on i/f %d\n", ppp->iface);
+#endif
+	while (PPPgetOption(p, &option, &data_len)) {
+		switch(option) {
+			case LCP_OPT_MRU:
+         	// Peer (inadvisedly) wants a different MTU.  We accept anything up to MAX_MTU.
+            ppp->lcp.local_options.mru =
+               PPPunpack16(_ppp_tempbuf);
+            #ifdef PPP_VERBOSE
+            if (ppp->lcp.local_options.mru > MAX_MTU) {
+               printf("PPP: WARNING - Peer demands MRU of %u which is >MAX_MTU (%u) - may drop packets\n",
+                  ppp->lcp.local_options.mru, MAX_MTU);
+            }
+            #endif
+            break;
+
+			case LCP_OPT_ACCM:	// OR the requested ACCM with ours
+            ppp->lcp.local_options.escape_map |=
+               PPPunpack32(_ppp_tempbuf);
+            break;
+
+			case LCP_OPT_AUTH:
+#ifdef PPP_VERBOSE
+				printf("PPP: peer wants auth protocol %04X\n", PPPunpack16(_ppp_tempbuf));
+#endif
+         	return 0; // use of authentication is not negotiable: we only support PAP, and if PAP was not
+            			// required then we would not have set that option.
+
+         case LCP_OPT_MAGIC:
+         	// If the NAK contains the last magic number we sent, then the link is probably looped back.
+            // According to RFC1661 section 6.4, we should pick a new magic number and send config request
+            // again.
+				if ((ppp->lcp.remote_options.magic_number = PPPunpack32(_ppp_tempbuf))
+            		 == ppp->lcp.local_options.magic_number) {
+	#ifdef PPP_VERBOSE
+	            printf("PPP: NAK magic, may be looped back\n");
+	#endif
+	            ppp->lcp.local_options.magic_number = MS_TIMER;
+            }
+            //else
+            	// NAK, but was not one we sent.  This means that we initially happened to pick a
+               // magic number that was the same as the peer's.  The peer has chosen a new one,
+               // so all is OK.
+               // The following is commented out, since the issue is resolved with this version.
+            	//ppp->lcp.use_magic_number = 0;   //turn off magic numbers to work around issue with Win2K
+            break;
+
+			default:
+         	// NAK of something we didn't try to negotiate in the first place
+            #ifdef PPP_VERBOSE
+            printf("PPP: got NAK of option we didn't send: %u\n", option);
+            #endif
+         	break;
+		}
+	}
+	return 1; //NAK OK, options updated
+}
+
+/*** BeginHeader LCPhandleReject */
+_ppp_nodebug int LCPhandleReject(PPPState *ppp, ll_prefix __far * p);
+/*** EndHeader */
+
+_ppp_nodebug int LCPhandleReject(PPPState *ppp, ll_prefix __far * p)
+{
+	// Reject means that the peer doesn't understand the option at all.  In this case, we
+   // revert to some default behavior.  When a default value is set, the option is not sent
+   // in the next config-request.
+	auto word option, data_len;
+
+#ifdef PPP_VERBOSE
+	printf("PPP: LCP reject on i/f %d\n", ppp->iface);
+#endif
+	while (PPPgetOption(p, &option, &data_len)) {
+		switch(option)
+		{
+      	case LCP_OPT_MRU:
+         #if MAX_MTU >= 1500
+        		ppp->lcp.local_options.mru = 1500;
+            break;
+         #else
+            #ifdef PPP_VERBOSE
+            printf("PPP: peer rejected MRU, but local MAX_MTU (%u) < 1500.\n", MAX_MTU);
+            #endif
+            return 0;
+         #endif
+
+			case LCP_OPT_ACCM:	//revert to default escape map
+            ppp->lcp.local_options.escape_map = 0xffffffff;
+            break;
+
+			case LCP_OPT_AUTH:
+#ifdef PPP_VERBOSE
+				printf("PPP: peer rejects auth protocol\n");
+#endif
+         	return 0; // use of authentication is not negotiable: we only support PAP, and if PAP was not
+            			// required then we would not have set that option.
+
+			case LCP_OPT_MAGIC:
+         	// Link is not looped back, but peer doesn't understand.  Just turn it off.
+         	ppp->lcp.use_magic_number = 0;
+            break;
+
+			case LCP_OPT_PFC:
+         	ppp->lcp.local_options.protocol_comp = 0;
+            break;
+
+			case LCP_OPT_ACFC:
+         	ppp->lcp.local_options.address_comp = 0;
+            break;
+
+			default:
+         	// Reject of something we didn't try to negotiate in the first place
+            #ifdef PPP_VERBOSE
+            printf("PPP: got reject of option we didn't send: %u\n", option);
+            #endif
+         	break;
+		}
+	}
+	return 1; //Reject OK, changed local options
+}
+
+
+
+
+
+/*** BeginHeader LCPprocessRequest, PPPprocessThisOption */
+void LCPprocessRequest(PPPState *ppp, ll_prefix __far * p, char id);
+void PPPprocessThisOption(word action, char * reply, word * len, word * bad, word option, word data_len);
+/*** EndHeader */
+
+_ppp_nodebug void PPPprocessThisOption(word action, char * reply, word * len,
+						word * bad, word option, word data_len)
+{
+	// This assumes the original (or modified) data is in _ppp_tempbuf.
+   // This is used for LCP and IPCP.
+
+   if (action < *bad)
+   	return;			// Already doing NAK or rejects
+   if (action > *bad) {
+   	// escalate to new level (ACK -> NAK -> reject)
+      *len = 0;		// Start over on reply packet
+      *bad = action;
+   }
+#ifdef PPP_VERBOSE
+   printf("PPP: %s option %u\n", action == 0 ? "accepting" : action == 1 ? "NAKing" : "rejecting", option);
+#endif
+   if (*len + data_len + 2 > PPP_MAXTEMP - 8) {
+   	#ifdef PPP_VERBOSE
+      printf("PPP: replied options do not fit!\n");
+      #endif
+   	return;	// Can't fit it!
+   }
+   reply[*len] = (char)option;
+   reply[*len + 1] = (char)data_len + 2;
+	memcpy(reply + *len + 2, _ppp_tempbuf, data_len);
+   *len += data_len + 2;
+}
+
+
+_ppp_nodebug void LCPprocessRequest(PPPState *ppp, ll_prefix __far * p, char id)
+{
+	// The peer has sent a config request.  We can respond in one of 3 ways: ack, nak or reject.
+   // If all options are acceptable, we send ACK (which basically reflects the request packet back to
+   // the peer).  Otherwise, we build a reply packet as we encounter options which we must reject,
+   // or ones which need to be modified (nak).  If there are any options to reject, we send a config reject.
+   // Else if there are any to NAK, we send updated values.  Else, we send ACK.
+   auto char reply[PPP_MAXTEMP - 8];
+	auto word option, data_len;
+   auto word bad, len, mtu;
+   auto word action;
+
+	bad = 0;		// Assume OK.  1 if NAK only, else 2 for reject
+   len = 0;
+
+#ifdef PPP_VERBOSE
+	printf("PPP: LCP config request i/f %d\n", ppp->iface);
+#endif
+
+#if USING_PPPLINK
+	if(IF_PKT_SER(ppp->iface))
+	{
+		//revert to default escape map if we get an LCP request at any point
+		ppp->ncd->ioctl(ppp->state, PD_PPPLINK_ASYMAP, 0xFFFFFFFFuL);
+	}
+#endif
+
+	while (PPPgetOption(p, &option, &data_len)) {
+   	action = 0;	// Assume OK.  1 if NAK only, else 2 for reject
+		switch(option)
+		{
+			case LCP_OPT_MRU:
+            if((mtu = PPPunpack16(_ppp_tempbuf)) >= PPP_MIN_MTU) {
+               ppp->lcp.remote_options.mru = mtu;
+               if (mtu > MAX_MTU)
+               	mtu = MAX_MTU;
+               ifconfig(ppp->iface,
+                        IFS_MTU, mtu,
+                        IFS_END);
+            }
+            else {
+            	#if MAX_MTU >= 1500
+               // If we have big enough MTU, then reject this option (and implicitly use 1500)
+               action = 2;
+               #else
+               // Our MTU is too small for PPP defaults, so try NAKing.
+            	*(word *)_ppp_tempbuf = intel16(PPP_MTU);
+            	action = 1;		// NAK this
+               #endif
+            }
+            break;
+
+			case LCP_OPT_ACCM:
+         	// We always accept this.  For PPPoE, the value is rejected.
+            ppp->lcp.remote_options.escape_map = PPPunpack32(_ppp_tempbuf);
+            if (IF_PKT_ETH(ppp->iface))
+            	action = 2;
+            break;
+
+			case LCP_OPT_AUTH:
+         	if (!ppp->pap.have_auth) {
+            #ifdef PPP_VERBOSE
+               printf("PPP: peer requesting authentication, but no credentials\n");
+            #endif
+            	action = 2;		// Reject this
+            }
+            else if (PPPunpack16(_ppp_tempbuf) != PAP_PROTOCOL) {  // We require PAP
+	           	*(word *)_ppp_tempbuf = intel16(PAP_PROTOCOL);
+            	action = 1;		// NAK this, we only do PAP.
+            }
+            else
+            	ppp->pap.remote_request = 1;
+            break;
+
+			case LCP_OPT_MAGIC:
+            if((ppp->lcp.remote_options.magic_number = PPPunpack32(_ppp_tempbuf))
+            		== ppp->lcp.local_options.magic_number) {
+            #ifdef PPP_VERBOSE
+               printf("PPP: received same magic number!\n");
+            #endif
+            	ppp->lcp.local_options.magic_number = MS_TIMER;	// Pick a new one.
+               action = 1;		// NAK the one sent by the peer (put our new one in)
+            }
+            // Otherwise, accept it.
+            break;
+
+			case LCP_OPT_PFC:
+			case LCP_OPT_ACFC:
+         	// Always OK for serial, rejected for PPPoE (even though PPPoE can use PFC, but we
+            // don't support it for simplicity in generating packets).
+            if (IF_PKT_ETH(ppp->iface))
+            	action = 2;
+         	break;
+
+			default:
+        		action = 2;		// Reject this, we don't understand it
+				break;
+		}
+      // Now we have an action, formulate the appropriate reply.
+		PPPprocessThisOption(action, reply, &len, &bad, option, data_len);
+	}
+
+	memcpy(_ppp_tempbuf+8, reply, len);
+   len += 8;
+
+	if (bad == 2)
+		PPPsendCtl(ppp, PPPST_LCP | LCP_CONFIG_REJ, id, len, "reject");
+   else if (bad)
+		PPPsendCtl(ppp, PPPST_LCP | LCP_CONFIG_NAK, id, len, "nak");
+	else {
+		PPPsendCtl(ppp, PPPST_LCP | LCP_CONFIG_ACK, id, len, "ack");
+		ppp->lcp.remote_acked = 1;
+	}
+
+}
+
+
+
+/*** BeginHeader LCPsendEchoReply */
+void LCPsendEchoReply(PPPState *ppp, ll_prefix __far * p, char id);
+/*** EndHeader */
+
+_ppp_nodebug void LCPsendEchoReply(PPPState *ppp, ll_prefix __far * p, char id)
+{
+	// Insert our magic number (or zero if not negotiated)
+	PPPpack32(_ppp_tempbuf + 8, ppp->lcp.use_magic_number ? ppp->lcp.local_options.magic_number : 0uL);
+	PPPsendCtl(ppp, PPPST_LCP | LCP_ECHO_REP, id, 12, "echo reply");
+}
+
+/*** BeginHeader LCPsendTermAck */
+void LCPsendTermAck(PPPState *ppp, char id);
+/*** EndHeader */
+
+_ppp_nodebug void LCPsendTermAck(PPPState *ppp, char id)
+{
+	auto int length;
+
+	PPPsendCtl(ppp, PPPST_LCP | LCP_TERM_ACK, id, 8, "term ack");
+}
+
+/*** BeginHeader PAPtick */
+int PAPtick(PPPState *ppp);
+/*** EndHeader */
+
+_ppp_nodebug int PAPtick(PPPState *ppp)
+{
+	if (ppp->pap.remote_request && !ppp->pap.auth_acked) {
+		// Peer wants our credentials...
+
+		if (ppp->ncd->ioctl(ppp->state, PD_PPP_SENDINGCTL))
+			return 0; // Wait for send to finish.
+
+		if (!ppp->pap.sent_auth ||
+			 chk_timeout(ppp->timeout))
+			PAPsendAuth(ppp);
+
+		if (ppp->pap.sent_auth > PAP_MAX_RETRY) {
+#ifdef PPP_VERBOSE
+			printf("PPP: PAP too many retries i/f %d\n", ppp->iface);
+#endif
+			return PAP_RETRY_ERROR;
+		}
+		else
+			return 0;
+	}
+	else if (ppp->pap.require_auth &&
+				!(ppp->pap.got_auth || ppp->pap.auth_failed)) {
+		// We want peer's credentials...
+		return 0;	// Still waiting
+	}
+
+	if (ppp->pap.auth_failed)
+		return PAP_AUTHFAILED;
+	return 1;	// Completed PAP
+}
+
+
+
+/*** BeginHeader PAPprocessIn */
+_ppp_nodebug int PAPprocessIn(PPPState *ppp, ll_prefix __far * p);
+/*** EndHeader */
+
+_ppp_nodebug int PAPprocessIn(PPPState *ppp, ll_prefix __far * p)
+{
+	auto struct {
+		char code, id;
+   	word length;
+   } paphdr;
+
+   _pkt_buf2root(p, &paphdr, 4, p->net_offs);
+	paphdr.length = intel16(paphdr.length);
+   if (paphdr.length > p->len - p->net_offs) {
+   #ifdef PPP_VERBOSE
+   	printf("PPP: PAP packet length bad, is %u should be %u\n", paphdr.length, p->len - p->net_offs);
+   #endif
+   	return 1;
+   }
+   // Force length in packet ot be correct (may be padding at end for e.g. ethernet)
+   p->len = p->net_offs + paphdr.length;
+
+   p->net_offs += 4;
+
+#ifdef PPP_VERBOSE
+	if (debug_on > 2)
+		printf("PPP: got PAP packet code=0x%02x id=%d len=%u i/f %d\n",
+      			paphdr.code, paphdr.id, paphdr.length, ppp->iface);
+#endif
+
+	if (!(ppp->lcp.local_acked && ppp->lcp.remote_acked)) {
+   #ifdef PPP_VERBOSE
+   	printf("PPP: PAP packet ignored, LCP not up\n");
+   #endif
+   	return 1;
+   }
+
+	switch(paphdr.code)
+	{
+		// Authenticate request
+		case PAP_AUTH_REQ:
+      	if (ppp->pap.require_auth)
+            PAPcheckAuth(ppp, p, paphdr.id);
+         else
+            PAPsendAck(ppp, paphdr.id);
+         break;
+
+		// Authenticate ACK
+		case PAP_AUTH_ACK:
+      	ppp->pap.auth_acked = 1;
+         break;
+
+		// Authenticate NAK
+		case PAP_AUTH_NAK:
+         return PAP_INVALIDERROR;
+
+		default:
+      	return PAP_CODEERROR;
+	}
+	return 1;
+}
+
+/*** BeginHeader PAPcheckAuth */
+_ppp_nodebug void PAPcheckAuth(PPPState *ppp, ll_prefix __far * p, char id);
+/*** EndHeader */
+
+_ppp_nodebug void PAPcheckAuth(PPPState *ppp, ll_prefix __far * p, char id)
+{
+	auto char credentials[100];
+	auto byte peerid_length, password_length;
+   auto byte * userid, * password;
+
+	//get peer-ID(username)
+   _pkt_buf2root(p, credentials, sizeof(credentials), p->net_offs);
+   peerid_length = credentials[0];
+   userid = credentials+1;
+   password = credentials + peerid_length + 2;
+   password_length = password[-1];
+   if (peerid_length + password_length > sizeof(credentials)-2)
+   	goto _auth_failed;
+#ifdef PPP_VERBOSE
+	printf("PPP: peer gives credentials %*.*s/%*.*s\n",
+   	peerid_length, peerid_length, userid,
+      password_length, password_length, password);
+#endif
+
+	if (ppp->pap.local_auth_callback) {
+		if (ppp->pap.local_auth_callback(userid,
+												  peerid_length,
+												  password,
+												  password_length)) {
+			PAPsendAck(ppp, id);
+			ppp->pap.got_auth = 1;
+		}
+		else
+      	goto _auth_failed;
+	}
+	else {
+		if (strlen(ppp->pap.local_username) != peerid_length ||
+			 memcmp(ppp->pap.local_username, userid, peerid_length) ||
+			 strlen(ppp->pap.local_password) != password_length ||
+			 memcmp(ppp->pap.local_password, password, password_length) ) {
+      _auth_failed:
+			PAPsendNak(ppp, id);
+			ppp->pap.auth_failed = 1;
+		}
+		else {
+			PAPsendAck(ppp, id);
+			ppp->pap.got_auth = 1;
+		}
+	}
+}
+
+/*** BeginHeader PAPsendAuth */
+_ppp_nodebug void PAPsendAuth(PPPState *ppp);
+/*** EndHeader */
+
+_ppp_nodebug void PAPsendAuth(PPPState *ppp)
+{
+	auto word pos;
+
+#ifdef PPP_VERBOSE
+	printf("PPP: sending our credentials %s/%s\n",
+   	ppp->pap.remote_username, ppp->pap.remote_password);
+#endif
+	_ppp_tempbuf[8] = (char)strlen(ppp->pap.remote_username);
+	memcpy(_ppp_tempbuf+9, ppp->pap.remote_username, _ppp_tempbuf[8]);
+	pos = 9+_ppp_tempbuf[8];
+	_ppp_tempbuf[pos] = (char)strlen(ppp->pap.remote_password);
+	memcpy(_ppp_tempbuf+pos+1, ppp->pap.remote_password, _ppp_tempbuf[pos]);
+	pos += 1 + _ppp_tempbuf[pos];
+	PPPsendCtl(ppp, PPPST_PAP | PAP_AUTH_REQ, ppp->pap.current_id++, pos, "auth");
+	ppp->pap.sent_auth++;
+	ppp->timeout = _SET_TIMEOUT(PPP_TIMEOUT_AUTHENTICATION);
+}
+
+/*** BeginHeader PAPsendAck */
+_ppp_nodebug void PAPsendAck(PPPState *ppp, char id);
+/*** EndHeader */
+
+_ppp_nodebug void PAPsendAck(PPPState *ppp, char id)
+{
+	_ppp_tempbuf[8] = 0; //add in zero length for message
+	PPPsendCtl(ppp, PPPST_PAP | PAP_AUTH_ACK, id, 9, "ACK");
+}
+
+/*** BeginHeader PAPsendNak */
+_ppp_nodebug void PAPsendNak(PPPState *ppp, char id);
+/*** EndHeader */
+
+_ppp_nodebug void PAPsendNak(PPPState *ppp, char id)
+{
+	_ppp_tempbuf[8] = 0; //add in zero length for message
+	PPPsendCtl(ppp, PPPST_PAP | PAP_AUTH_NAK, id, 9, "NAK");
+}
+
+/*** BeginHeader IPCPtick */
+int IPCPtick(PPPState *ppp);
+/*** EndHeader */
+
+_ppp_nodebug int IPCPtick(PPPState *ppp)
+{
+	if ((ppp->ipcp.flags & (IPCP_F_LOCAL_ACKED|IPCP_F_REMOTE_ACKED)) == (IPCP_F_LOCAL_ACKED|IPCP_F_REMOTE_ACKED))
+		return 1;
+
+	if (ppp->ncd->ioctl(ppp->state, PD_PPP_SENDINGCTL))
+		return 0; // Wait for send to finish.
+
+	if (!ppp->ipcp.local_config_sent ||
+		 chk_timeout(ppp->timeout))
+		IPCPsendConfig(ppp);
+
+	if (ppp->ipcp.local_config_sent > IPCP_MAX_RETRY) {
+#ifdef PPP_VERBOSE
+		printf("PPP: IPCP too many retries i/f %d\n", ppp->iface);
+#endif
+		return IPCP_RETRY_ERROR;
+	}
+	else
+		return 0;
+}
+
+
+
+/*** BeginHeader IPCPprocessIn */
+_ppp_nodebug int IPCPprocessIn(PPPState *ppp, ll_prefix __far * p);
+/*** EndHeader */
+
+_ppp_nodebug int IPCPprocessIn(PPPState *ppp, ll_prefix __far * p)
+{
+	auto struct {
+		char code, id;
+   	word length;
+   } ipcphdr;
+
+   _pkt_buf2root(p, &ipcphdr, 4, p->net_offs);
+	ipcphdr.length = intel16(ipcphdr.length);
+   if (ipcphdr.length > p->len - p->net_offs) {
+   #ifdef PPP_VERBOSE
+   	printf("PPP: IPCP packet length bad, is %u should be %u\n", ipcphdr.length, p->len - p->net_offs);
+   #endif
+   	return 1;
+   }
+   // Force length in packet ot be correct (may be padding at end for e.g. ethernet)
+   p->len = p->net_offs + ipcphdr.length;
+
+   p->net_offs += 4;
+
+#ifdef PPP_VERBOSE
+	if (debug_on > 2)
+		printf("PPP: got IPCP packet code=0x%02x id=%d len=%u i/f %d\n",
+      			ipcphdr.code, ipcphdr.id, ipcphdr.length, ppp->iface);
+#endif
+
+	if (ppp->pap.require_auth && !ppp->pap.got_auth) {
+   #ifdef PPP_VERBOSE
+   	printf("PPP: IPCP packet ignored, peer not auth\n");
+   #endif
+   	return 1;
+   }
+
+   // Note: the same numeric codes are used by both LCP and IPCP.
+	switch(ipcphdr.code)
+	{
+		case LCP_CONFIG_REQ:
+      	IPCPprocessRequest(ppp, p, ipcphdr.id);
+         break;
+
+		case LCP_CONFIG_ACK:
+      	if (ipcphdr.id == ppp->ipcp.current_id)
+            ppp->ipcp.flags |= IPCP_F_LOCAL_ACKED;
+         break;
+
+		case LCP_CONFIG_NAK:
+         if (ipcphdr.id == ppp->ipcp.current_id) {
+            if(IPCPprocessNak(ppp, p))
+               IPCPsendConfig(ppp);
+            else
+               return IPCP_OPTIONERROR;
+         }
+         break;
+
+		case LCP_CONFIG_REJ:
+         if (ipcphdr.id == ppp->ipcp.current_id) {
+            if(IPCPprocessReject(ppp, p))
+               IPCPsendConfig(ppp);
+            else
+               return IPCP_OPTIONERROR;
+         }
+         break;
+
+		case LCP_TERM_REQ:
+      	// If we get a term-req at the NCP layer, send term-ack and drop back into LCP-only, not auth.
+         // The peer can restart without redoing LCP, but it will need to redo PAP if we require auth.
+         // Since we are terminating IP, we bring the interface 'down', but then set it as 'coming up'.
+			PPPsendCtl(ppp, PPPST_IPCP | LCP_TERM_ACK, ipcphdr.id, 8, "term-ack");
+			// Note: don't implement reneg of IPCP.  Always restart LCP as well.  ifdown() terminates
+         // LCP cleanly, and notifies rest of application.
+         PPPResetState(ppp, 0);	// Reset all but LCP (so can send LCP term-req)
+			ifdown(ppp->iface);
+			break;
+
+		case LCP_TERM_ACK:
+		case LCP_CODE_REJ:
+      	// Ignore these.  We didn't send any bad codes or term-req's, did we?  (We always send term-req
+         // at the LCP layer).
+         #ifdef PPP_VERBOSE
+         printf("PPP: got unexpected IPCP code-rej or term-ack!\n");
+         #endif
+			break;
+
+		default:
+         #ifdef PPP_VERBOSE
+            printf("PPP: got bad IPCP code\n");
+         #endif
+   		p->net_offs -= 4;	// Back up to code field
+         LCPsendProtocolCodeReject(ppp, PPPST_IPCP, p, 1);
+         return IPCP_CODEERROR;
+	}
+	return 1;
+}
+
+/*** BeginHeader IPCPprocessRequest */
+_ppp_nodebug void IPCPprocessRequest(PPPState *ppp, ll_prefix __far * p, char id);
+/*** EndHeader */
+
+
+_ppp_nodebug void IPCPprocessRequest(PPPState *ppp, ll_prefix __far * p, char id)
+{
+	// The peer has sent a config request.  We can respond in one of 3 ways: ack, nak or reject.
+   // If all options are acceptable, we send ACK (which basically reflects the request packet back to
+   // the peer).  Otherwise, we build a reply packet as we encounter options which we must reject,
+   // or ones which need to be modified (nak).  If there are any options to reject, we send a config reject.
+   // Else if there are any to NAK, we send updated values.  Else, we send ACK.
+   auto char reply[PPP_MAXTEMP - 8];
+	auto word option, data_len;
+   auto word bad, len;
+   auto word action, appendnakip, iface, noffs, flag;
+   auto longword ip, * setaddr, dummy, * storeaddr;
+   auto word setflag;
+   #ifdef PPP_VERBOSE
+   auto char * which;
+   #endif
+
+	bad = 0;		// Assume OK.  1 if NAK only, else 2 for reject
+   len = 0;
+
+   appendnakip = 0x01;		// We always expect the IP address option, since we need to know his addr.
+#ifdef PPP_PUSHY_DNS_ASSIGN
+   // If we are setting DNS then send it, otherwise don't send this option unless solicited.
+   // If the above 'pushy' DNS macro is not defined, then we never send unsolicited DNS addrs.  It is
+   // not defined by default, since this is usually a waste of code.
+   if (ppp->ipcp.flags & IPCP_F_HAVE_HIS_DNS)
+   	appendnakip = 0x07;
+#endif
+
+#ifdef PPP_VERBOSE
+	printf("PPP: IPCP config request i/f %d\n", ppp->iface);
+#endif
+
+	noffs = p->net_offs - 4;	// Remember start of code field, in case we need to send proto reject
+
+	while (PPPgetOption(p, &option, &data_len)) {
+   	// IP address is common to all options we understand
+		ip = PPPunpack32(_ppp_tempbuf);
+   _nakip:
+   	action = 0;	// Assume OK.  1 if NAK only, else 2 for reject
+		switch(option)
+		{
+      	// All these options are handled in the same manner.  Just set some pointers so we
+         // can use generic code.
+			case IPCP_IP_ADDRESS:
+         	flag = 0x01;
+            setflag = IPCP_F_HAVE_HIS_IP;
+            setaddr = &ppp->ipcp.remote_ip;
+            //storeaddr = &_if_tab[ppp->iface].u.ppp.peeraddr;
+            storeaddr = setaddr;
+            #ifdef PPP_VERBOSE
+            which = "IP addr";
+            #endif
+            goto _common;
+			case IPCP_PRIMARY_DNS:
+         	flag = 0x02;
+            setflag = IPCP_F_HAVE_HIS_DNS;
+            setaddr = &ppp->ipcp.primary_dns;
+            storeaddr = &dummy;	// We are not really interested in his DNS addresses
+            #ifdef PPP_VERBOSE
+            which = "DNS 1 addr";
+            #endif
+            goto _common;
+			case IPCP_SECONDARY_DNS:
+         	flag = 0x04;
+            setflag = IPCP_F_HAVE_HIS_DNS;
+            setaddr = &ppp->ipcp.secondary_dns;
+            storeaddr = &dummy;	// We are not really interested in his DNS addresses
+            #ifdef PPP_VERBOSE
+            which = "DNS 2 addr";
+            #endif
+            goto _common;
+         _common:
+				appendnakip &= ~flag;	// Processing here so don't append unsolicited NAK
+            if (!ip) {
+            	// He is asking us to supply an address for him.
+               #ifdef PPP_VERBOSE
+               printf("IPCP: peer wants us to assign his %s - giving him %08lX\n", which, *setaddr);
+               #endif
+            	if (ppp->ipcp.flags & setflag && *setaddr) {
+               	PPPpack32(_ppp_tempbuf, *setaddr);
+                  action = 1;		// Nak this, and suggest an IP.
+               }
+               else {
+               	// We have nothing to suggest - send IPCP protocol reject.
+                  // Note that for DNS addresses, this path is not taken because we send an option
+                  // reject for these if we have nothing to suggest.  This works better with peers
+                  // who ask for DNS but don't really need it (such as Windows dial-up).
+                  if (option != IPCP_IP_ADDRESS) {
+                  	action = 2;		// Must be one of the DNS's.  Send option reject.
+                     break;
+                  }
+   					p->net_offs = noffs;	// Back up to code fields
+			         LCPsendProtocolCodeReject(ppp, IPCP_PROTOCOL, p, 0);
+                  return;
+               }
+            }
+            else {
+               #ifdef PPP_VERBOSE
+               printf("IPCP: peer wants %s %08lX\n", which, ip);
+               #endif
+               // Is this OK by us?  Must not conflict with our other (up) interface addresses or overlap
+               // subnets.  We only do this checking for IP ADDRESS option.  With DNS, anything goes.
+               if (option == IPCP_IP_ADDRESS) {
+	               for (iface = 0; iface < IF_MAX; ++iface) {
+	                  if (!is_valid_iface(iface) || iface == ppp->iface || !_if_tab[iface].up)
+	                     continue;
+	                  if (!((ip ^ _if_tab[iface].ipaddr) & _if_tab[iface].mask))
+	                     // Mismatch with this iface.
+	                     break;
+	               }
+	               if (iface < IF_MAX) {
+	                  #ifdef PPP_VERBOSE
+	                  printf("IPCP: peer's IP addr conflicts with our i/f %u\n", iface);
+	                  #endif
+	                  // Process as if 0 IP.
+	                  ip = 0;
+	                  goto _nakip;
+	               }
+               }
+               // Else all OK.
+					*storeaddr = ip;
+            }
+
+				break;
+
+
+			default:
+        		action = 2;		// Reject this, we don't understand it
+				break;
+		}
+      // Now we have an action, formulate the appropriate reply.
+		PPPprocessThisOption(action, reply, &len, &bad, option, data_len);
+	}
+
+   ip = 0;	// Setting this to 0 causes any unsolicited options to be in a NAK packet
+   data_len = 4;
+   if (appendnakip & 0x01) {
+   	// Didn't get IP option: we currently need to know his IP address, so nak it.  This will
+      // turn into a protocol reject if we don't have an address to suggest.
+      //devnote: in principle, we could just assign him a dummy address and just use it internally
+      // so our router table works.  This would be fine provided that the peer was a "pure router"
+      // and we never needed to talk directly to him.  Probably 0.0.1.<iface#> would work OK.
+      option = IPCP_IP_ADDRESS;
+      if (ppp->ipcp.flags & IPCP_F_PEER_NO_IP || !ppp->ipcp.remote_ip) {
+      	// We suggested an address before (or had none to suggest) but peer is not putting in
+         // an IP_ADDRESS option.  In this case, we internally use a dummy address but allow
+         // negotiation to proceed without knowing his IP address.
+      	ppp->ipcp.flags |= IPCP_F_PEER_NO_IP;
+	      #ifdef PPP_VERBOSE
+	      printf("IPCP: peer didn't provide his IP addr; using dummy\n");
+	      #endif
+      }
+      else {
+	      ppp->ipcp.flags |= IPCP_F_PEER_NO_IP;
+	      #ifdef PPP_VERBOSE
+	      printf("IPCP: peer didn't provide his IP addr; will suggest %08X\n", ppp->ipcp.remote_ip);
+	      #endif
+	      goto _nakip;
+      }
+   }
+#ifdef PPP_PUSHY_DNS_ASSIGN
+   if (appendnakip & 0x02) {
+      option = IPCP_PRIMARY_DNS;
+      #ifdef PPP_VERBOSE
+      printf("IPCP: peer didn't provide his DNS 1\n");
+      #endif
+   	goto _nakip;
+   }
+   if (appendnakip & 0x04) {
+      option = IPCP_SECONDARY_DNS;
+      #ifdef PPP_VERBOSE
+      printf("IPCP: peer didn't provide his DNS 2\n");
+      #endif
+   	goto _nakip;
+   }
+#endif
+
+	memcpy(_ppp_tempbuf+8, reply, len);
+   len += 8;
+
+	if (bad == 2)
+		PPPsendCtl(ppp, PPPST_IPCP | LCP_CONFIG_REJ, id, len, "reject");
+   else if (bad)
+		PPPsendCtl(ppp, PPPST_IPCP | LCP_CONFIG_NAK, id, len, "nak");
+	else {
+		PPPsendCtl(ppp, PPPST_IPCP | LCP_CONFIG_ACK, id, len, "ack");
+		ppp->ipcp.flags |= IPCP_F_REMOTE_ACKED;
+	}
+
+}
+
+
+
+
+/*** BeginHeader IPCPprocessNak */
+int IPCPprocessNak(PPPState *ppp, ll_prefix __far * p);
+/*** EndHeader */
+
+
+
+_ppp_nodebug int IPCPprocessNak(PPPState *ppp, ll_prefix __far * p)
+{
+	// NAK means that the option is understood by the peer, however it would like to
+   // negotiate a different value.
+	auto word option, data_len;
+   auto longword ip;
+
+#ifdef PPP_VERBOSE
+	printf("PPP: IPCP NAK on i/f %d\n", ppp->iface);
+#endif
+	while (PPPgetOption(p, &option, &data_len)) {
+   	ip = PPPunpack32(_ppp_tempbuf);
+		switch(option) {
+			case IPCP_IP_ADDRESS:
+         	if (ppp->ipcp.flags & IPCP_F_IP_NEGOT)
+	         	ppp->ipcp.local_ip = ip;
+#ifdef PPP_VERBOSE
+				else
+					printf("PPP: peer assigning IP %08lX but we want %08lX (not negot)\n", ip, ppp->ipcp.local_ip);
+#endif
+            break;
+
+			case IPCP_PRIMARY_DNS:
+         	if (ppp->ipcp.flags & IPCP_F_DNS_NEGOT)
+         		ppp->ipcp.primary_dns = ip;
+            break;
+
+			case IPCP_SECONDARY_DNS:
+         	if (ppp->ipcp.flags & IPCP_F_DNS_NEGOT)
+         		ppp->ipcp.secondary_dns = ip;
+            break;
+
+			default:
+         	// NAK of something we didn't try to negotiate in the first place.
+            // These could be unsolicited hints.  Correct peers will send them once only, so it
+            // is OK for us to ignore them.
+            #ifdef PPP_VERBOSE
+            printf("PPP: got NAK of option we didn't send: %u\n", option);
+            #endif
+         	break;
+		}
+	}
+	return 1; //NAK OK, options updated
+}
+
+/*** BeginHeader IPCPprocessReject */
+_ppp_nodebug int IPCPprocessReject(PPPState *ppp, ll_prefix __far * p);
+/*** EndHeader */
+
+_ppp_nodebug int IPCPprocessReject(PPPState *ppp, ll_prefix __far * p)
+{
+	// Reject means that the peer doesn't understand the option at all.  In this case, we
+   // revert to some default behavior.  When a default value is set, the option is not sent
+   // in the next config-request.
+   // For IPCP, if we get a reject then we drop that option from subsequent config-req's.
+   // This is OK for DNS, but if it doesn't understand IP addresses then we will proceed
+   // with whatever the default addresses are.  If his or our address is zero, then the
+   // interface will probably not work.
+	auto word option, data_len;
+
+#ifdef PPP_VERBOSE
+	printf("PPP: IPCP reject on i/f %d\n", ppp->iface);
+#endif
+	while (PPPgetOption(p, &option, &data_len)) {
+		switch(option)
+		{
+			case IPCP_IP_ADDRESS:
+            #ifdef PPP_VERBOSE
+            printf("PPP: peer rejected IP address!\n");
+            #endif
+         	ppp->ipcp.flags |= IPCP_F_PEER_REJ_IP;
+            break;
+
+			case IPCP_PRIMARY_DNS:
+         	ppp->ipcp.flags |= IPCP_F_PEER_REJ_D1;
+            break;
+			case IPCP_SECONDARY_DNS:
+         	ppp->ipcp.flags |= IPCP_F_PEER_REJ_D2;
+            break;
+
+			default:
+         	// Reject of something we didn't try to negotiate in the first place
+            #ifdef PPP_VERBOSE
+            printf("PPP: got reject of option we didn't send: %u\n", option);
+            #endif
+         	break;
+		}
+	}
+	return 1; //Reject OK, changed local options
+}
+
+
+
+
+/*** BeginHeader IPCPsendConfig */
+int IPCPsendConfig(PPPState *ppp);
+/*** EndHeader */
+
+_ppp_nodebug int IPCPsendConfig(PPPState *ppp)
+{
+	auto char temp;
+	auto int buf_pos;
+	auto longword myip;
+   auto word iface;
+
+	buf_pos = 8; //add in header and length last
+
+	// IP Address option is always set.  If local_ip is zero, we try to fill it in with an IP
+   // address stolen from one of our other active interfaces.  The order of assignment is:
+   //   (1) this interface's 'ipaddr' field i.e. the configured IFS_IPADDR value
+   //   (2) the first other interface which is currently UP and NOT configured using DHCP unless the
+   //       lease is permanent.  This will prefer ethernets first, then PPPoEs, then PPP serials.
+   //   (3) 0.0.0.0.  This requires the peer to give us an address.
+   // The peer can always NAK the address and suggest another.  Otherwise, it is perfectly OK
+   // to share local PPP interface IP addresses with any other local interface.  That is, we work
+   // in "unnumbered" mode in router terminology.
+   // If we do not have the IFS_PPP_ACCEPTIP flag set, then if the peer NAKs the suggested local address
+   // then we send protocol reject.  ACCEPTIP should be the default for best interoperability.
+   myip = ppp->ipcp.local_ip;
+   if (!myip)
+   	myip = _if_tab[ppp->iface].ipaddr;
+   if (!myip)
+   	for (iface = 0; iface < IF_MAX; ++iface)
+      	if (_if_tab[iface].up && _if_tab[iface].ipaddr
+         #ifdef USE_DHCP
+         		&& (!(_if_tab[iface].flags & IFF_DHCP_OK) || _if_tab[iface].dhcp->lease == DHCP_PERMANENT)
+         #endif
+         	) {
+         	myip = _if_tab[iface].ipaddr;
+            break;
+         }
+	ppp->ipcp.local_ip = myip;
+
+   // If myip is still 0, then we definitely require the peer to assign one for us.
+   if (!(ppp->ipcp.flags & IPCP_F_PEER_REJ_IP)) {
+	   PPPpack16(_ppp_tempbuf + buf_pos, IPCP_IP_ADDRESS<<8 | 6);
+	   PPPpack32(_ppp_tempbuf + buf_pos + 2, myip);
+	   buf_pos += 6;
+   }
+
+	if (ppp->ipcp.flags & IPCP_F_DNS_NEGOT) {
+	   if (!(ppp->ipcp.flags & IPCP_F_PEER_REJ_D1)) {
+	      PPPpack16(_ppp_tempbuf + buf_pos, IPCP_PRIMARY_DNS<<8 | 6);
+	      PPPpack32(_ppp_tempbuf + buf_pos + 2, ppp->ipcp.primary_dns);
+	      buf_pos += 6;
+      }
+	   if (!(ppp->ipcp.flags & IPCP_F_PEER_REJ_D2)) {
+	      PPPpack16(_ppp_tempbuf + buf_pos, IPCP_SECONDARY_DNS<<8 | 6);
+	      PPPpack32(_ppp_tempbuf + buf_pos + 2, ppp->ipcp.secondary_dns);
+	      buf_pos += 6;
+      }
+	}
+	PPPsendCtl(ppp, PPPST_IPCP | LCP_CONFIG_REQ, ++ppp->ipcp.current_id, buf_pos, "config");
+	ppp->ipcp.local_config_sent++;
+	ppp->timeout = _SET_TIMEOUT(PPP_TIMEOUT);
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

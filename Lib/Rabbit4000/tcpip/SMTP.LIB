@@ -1,0 +1,1746 @@
+/*
+     smtp.lib
+     Copyright (C) Rabbit Semiconductor, Inc. All rights reserved.
+
+	Change History:
+
+	2002 Dec 23  SJH
+     Revamped to take advantage of new TCP/IP functions, and
+     also allow specification of data generator function a-la
+     FTP.  Improved error handling so socket is aborted.
+     Non-blocking resolve added.
+	2009 Sep 09  SJH
+	  Added SMTP Authentication service extensions for SMTP over TLS according
+	  to RFC 3207.
+
+
+	To use SMTP over TLS, do the following:
+
+	  #define SSPEC_NO_STATIC   // <<- only if not using a static resource list
+	  									 // with e.g. HTTP.
+	  #define USE_SMTP_AUTH
+	  #define SMTP_AUTH_FAIL_IF_NO_AUTH  // <- highly recommended
+
+	  <other macros, as required>
+
+	  #use "dcrtcp.lib"
+	  #use "ssl_sock.lib"
+	  #use "smtp.lib"
+
+ */
+
+/*** BeginHeader smtp_state*/
+#ifndef SMTP_H
+#define SMTP_H
+
+/*
+ *   SMTP_VERBOSE allows you to view a complete log of
+ *   an email session in Dynamic C's STDIO window.
+ */
+//#define SMTP_VERBOSE
+
+#ifdef SMTP_DEBUG
+	#define smtp_debug __debug
+#else
+	#define smtp_debug __nodebug
+#endif
+
+/*
+ *   Number of seconds before timing out email attempt.
+ */
+
+#ifndef SMTP_TIMEOUT
+	#ifdef SMTP_DEBUG
+		#define SMTP_TIMEOUT 2000uL
+	#else
+		#define SMTP_TIMEOUT 20
+	#endif
+#endif
+
+/*
+ * Maximum length of SMTP server name
+ */
+
+#ifndef SMTP_MAX_SERVERLEN
+	#define SMTP_MAX_SERVERLEN MAX_STRING
+#endif
+
+/*
+ * Maximum length of data buffer.  This should not be set smaller than 256.
+ */
+
+#ifndef SMTP_MAX_DATALEN
+	#define SMTP_MAX_DATALEN 256
+#endif
+
+/*
+ *   SMTP_SERVER is a machine which will relay messages for us.
+ *   This is the default if smtp_setserver() not called.
+ */
+
+#ifndef SMTP_SERVER
+#define SMTP_SERVER ""
+#endif
+
+#ifndef SMTP_PORT
+	#define SMTP_PORT		25
+#endif
+
+#ifndef SMTP_IFACE
+
+#define SMTP_IFACE	IF_ANY
+
+#endif
+
+/*
+ *   SMTP_DOMAIN is used in the HELO/EHLO command.  Some email servers
+ *   require that this name match with the DNS entry for the IP
+ *   address of the sender.
+ */
+
+#ifndef SMTP_DOMAIN
+	// ip_buffer is a local var in smtp_mailtick()
+	// s is assumed to point to the socket (TCP or SSL)
+	#define SMTP_DOMAIN  inet_ntoa(ip_buffer, gethostid_iface(sock_iface(s)))
+#endif
+
+/*
+ *    If using SMTP AUTH (authentication) we'll use a username and
+ *    password to authenticate with the remote SMTP server.  These
+ *    values are stored in smtp_state and set with smtp_setauth().
+ */
+#ifdef USE_SMTP_AUTH
+	#ifndef SMTP_MAX_USERNAMELEN
+	#define SMTP_MAX_USERNAMELEN 64
+	#endif
+	#ifndef SMTP_MAX_PASSWORDLEN
+	#define SMTP_MAX_PASSWORDLEN 16
+	#endif
+
+	/* Bitfields used for auth_methods */
+	#define SMTP_AUTH_PLAIN    	0x01
+	#define SMTP_AUTH_LOGIN    	0x02
+	#define SMTP_AUTH_CRAMMD5  	0x04
+	#define SMTP_AUTH_AVAILABLE	0x80
+	/*
+		The SMTP_AUTH_ACCEPTABLE macro may be overridden at compile time in user
+		code before "#use dcrtcp.lib" as either a constant 8-bit value or a char
+		variable name. The latter (variable) method provides run-time control of
+		acceptable USE_SMTP_AUTH options. In this latter case, initialization of
+		the user supplied char variable to a suitable bit-or combination of
+		SMTP_AUTH_PLAIN, SMTP_AUTH_LOGIN, SMTP_AUTH_CRAMMD5 prior to use of SMTP
+		is also the responsibility of user code.
+	*/
+	#if !defined SMTP_AUTH_ACCEPTABLE
+		#define SMTP_AUTH_ACCEPTABLE \
+	                      (SMTP_AUTH_PLAIN | SMTP_AUTH_LOGIN | SMTP_AUTH_CRAMMD5)
+	#endif
+
+	// If SSL_SOCK.LIB has been included, allow STARTTLS
+	#ifdef _SSL_SOCK_H
+		#ifndef SMTP_AUTH_TLS
+			#define SMTP_AUTH_TLS		1
+		#endif
+	#endif
+
+	/* libraries referenced by auth code */
+	#use "BASE64.LIB"
+	#use "MD5.LIB"
+#endif
+
+#ifndef SMTP_AUTH_TLS
+	#define SMTP_AUTH_TLS		0
+#endif
+
+#ifndef SMTP_TLS_RX_BUFFER_SIZE
+	#if _BOARD_TYPE_ == RCM5700
+		// This board only has 128k RAM, so we can't afford the full
+		// amount, however 6k will work in the majority of cases
+		// and allows this small board to work with a single TLS
+		// socket at a time.
+		#define SMTP_TLS_RX_BUFFER_SIZE 6000
+	#else
+		#define SMTP_TLS_RX_BUFFER_SIZE 16420
+	#endif
+#endif
+
+#if SMTP_AUTH_TLS
+	#ifndef _SSL_SOCK_H
+		#error "SMTP_AUTH_TLS requires #use ssl_sock.lib before #use smtp.lib"
+	#endif
+#endif
+
+/*
+ * Following macros may be defined in order to specify TLS-related defaults:
+ */
+// Permit any SMTP server certificate.  This would normally be defined only
+// during testing, or where the application has other assurances that the
+// intended SMTP server is valid, or if this level of checking is not justified.
+// If *not* defined, then the application must specify a trusted authority
+// certificate list.
+// Note that this is only a default setting.  You can use the smtp_set_tls()
+// function with or without the SSL_F_PEER_CERT_OK flag to change the
+// setting dynamically.
+//#define SMTP_ALLOW_ANY_SERVER_CERT
+
+// Permit NULL encryption i.e. cleartext.  This may be permissible where the
+// message contents and headers are not sensitive, and only the ability to
+// detect tampering and authenticate the server are considered necessary.
+// Note that this is only a default setting.  You can use the smtp_set_tls()
+// function with or without the SSL_S_ALLOW_NULL flag to change the
+// setting dynamically.
+//#define SMTP_ALLOW_CLEARTEXT
+
+// Permit server certificate common name (CN) field to mismatch the expected
+// server name (e.g. smtp.gmail.com).  By default, the name in the certificate
+// must match the expected DNS domain name.
+// Note that this is only a default setting.  You can use the smtp_set_tls()
+// function with a certificate policy callback function in order to provide
+// more detailed handling of server certificates.  This macro only applies
+// if the callback is NULL.
+//#define SMTP_ALLOW_CERT_CN_MISMATCH
+
+// Use these macros consistently for dealing with TCP and/or SSL sockets
+#define _TCP_SOCK_OF_SMTP(state) (&state.s)
+#if SMTP_AUTH_TLS
+	#define _SOCK_OF_SMTP(state) (state.sock)
+	#define _SSL_SOCK_OF_SMTP(state) (state._n_ssl)
+#else
+	#define _SOCK_OF_SMTP(state) _TCP_SOCK(state.sock)
+	#define _SSL_SOCK_OF_SMTP(state) NULL	// should never be used
+#endif
+
+
+
+/*
+	This is a portion of the response chart for different situations
+	from RFC821.  For example the HELO message would get a response
+	from the server that begin with 250, 500, 501, 504, 421.  250
+	would be the only sucessful result.
+
+            CONNECTION ESTABLISHMENT
+               S: 220
+               F: 421
+            HELO
+               S: 250
+               E: 500, 501, 504, 421
+            MAIL
+               S: 250
+               F: 552, 451, 452
+               E: 500, 501, 421
+            RCPT
+               S: 250, 251
+               F: 550, 551, 552, 553, 450, 451, 452
+               E: 500, 501, 503, 421
+            DATA
+               I: 354 -> data -> S: 250
+                                 F: 552, 554, 451, 452
+               F: 451, 554
+               E: 500, 501, 503, 421
+            QUIT
+               S: 221
+               E: 500
+
+	There is a logical progression of events when sending an
+	individual email. S: = sender, R: = receiver
+
+            S: MAIL FROM:<Smith@Alpha.ARPA>
+            R: 250 OK
+
+            S: RCPT TO:<Brown@Beta.ARPA>
+            R: 250 OK
+
+            S: DATA
+            R: 354 Start mail input; end with <CRLF>.<CRLF>
+            S: Blah blah blah...
+            S: ...etc. etc. etc.
+            S: <CRLF>.<CRLF>
+            R: 250 OK
+
+            S: QUIT
+            R: 221 OK
+
+	A complete definition of the format for the commands, the responses,
+	and their behaviour can be found in RFC821 from http://www.ietf.org
+
+*/
+
+typedef struct
+{
+	int state;				// Current state.  See defines below
+	longword	server_ip;	// If non-zero, use this IP address instead of
+								//		resolving above name
+	int	buflen;			// Length of data in buffer to send.  If zero, we are
+								//		not sending.
+	word	port;				// SMTP server port number (defaults to SMTP_PORT)
+	long	offset;			// Offset of next byte to send
+	int	error;			// Overall status return code (see below)
+	const char* to;		// Recipient
+	const char* from;		// Sender
+	const char* subject;	// Subject line
+	unsigned long timeout;	// Timer
+	long  xmemmessage;	// Message, as xmem address
+	long	messagelen;		// Message length.
+	int 		(*dhnd)();	// Data handler for dynamically generated content
+								//		(smtp_data_handler called)
+	void *	dhnd_data;	// Opaque data passed to data handler
+	int		dhnd_rc;		// Final return code from data handler
+	int		dns;			// Handle for nameserver resolve
+	word		remain;		// Remaining bytes to send in subject line
+	int		abrt;			// Flag indicating need to abort socket
+	void * 	sock;			// Same as _n_ssl, or points to tcp_Socket instance ('s') below.
+#if SMTP_AUTH_TLS
+   ssl_Socket * _n_ssl;			// This is same as above.
+   SSL_Cert_t __far * cert; 		// Pointer to the certificate structure
+#endif
+	tcp_Socket s;		   // Socket
+	char buffer[SMTP_MAX_DATALEN];	// Buffer for server responses and also
+												//		our (short) requests
+	char server[SMTP_MAX_SERVERLEN];	// Server domain name (or dotted quad).
+#ifdef USE_SMTP_AUTH
+	char		auth_methods;
+	char 		username[SMTP_MAX_USERNAMELEN]; // username for SMTP AUTH
+	char		password[SMTP_MAX_PASSWORDLEN]; // password for SMTP AUTH
+#endif
+#if SMTP_AUTH_TLS
+	char		require_tls;			// If true, then we require TLS (and fail if
+											// server does not support it)
+	char		starttls_supported;	// Got STARTTLS in EHLO response
+	char		secured;					// If true, socket currently secured.
+	// Following fields set using smtp_set_tls().  See that function for details.
+	word 		tls_flags;
+	SSL_Cert_t __far * my_cert;
+	SSL_Cert_t __far * trusted;
+	int (*policy)(struct tls_connection __far * state,
+	                       int trusted,
+	                       struct x509_certificate __far * cert,
+	                       void __far * data);
+#endif
+} SMTPState;
+#define SMTP_CLEAR_DHND() smtp_state.dhnd = NULL
+#define SMTP_GET_DHND()   smtp_state.dhnd
+#define SMTP_SET_DHND(n)   smtp_state.dhnd = n
+
+/*
+ *   Internal states for the SMTP server.
+ */
+
+#define SMTP_INIT 				0
+#define SMTP_WAITFORESTAB		1
+#define SMTP_WAITFORHELO220	2
+#define SMTP_WAITFORMAIL250	3
+#define SMTP_WAITFORDATA354	4
+#define SMTP_WAITFORDATA250	5
+#define SMTP_WAITFORRCPT250	6
+#define SMTP_SENDHEAD			7
+#define SMTP_SENDBODY			8
+#define SMTP_SENDEOM				9
+#define SMTP_WAITQUIT250		10
+#define SMTP_WAITCLOSE			11
+#define SMTP_WAITDONE			12
+#define SMTP_DONE					13
+#define SMTP_ERROR				14
+#define SMTP_RESOLVING			15
+
+/*
+ *    Additional states related to SMTP AUTH
+ */
+#define SMTP_PARSE_EHLO			20
+#define SMTP_WAIT_LOGINUSER	21
+#define SMTP_WAIT_LOGINPASS	22
+#define SMTP_WAIT_CHALLENGE	23
+#define SMTP_SEND_AUTH			24
+#define SMTP_WAITFORSTARTTLS220	25
+#define SMTP_WAITFORTLSESTAB	26
+
+/*
+ *   Status of the SMTP Process
+ */
+
+#define SMTP_SUCCESS				1
+#define SMTP_PENDING				0
+#define SMTP_TIME					-NETERR_SMTP_TIME
+#define SMTP_UNEXPECTED			-NETERR_SMTP_UNEXPECTED
+#define SMTP_NOSOCK 				-NETERR_SMTP_NOSOCK
+#define SMTP_DNSERROR			-NETERR_SMTP_DNSERROR
+#define SMTP_ABORTED				-NETERR_SMTP_ABORTED
+#define SMTP_AUTH_UNAVAILABLE	-NETERR_SMTP_AUTH_UNAVAILABLE
+#define SMTP_AUTH_FAILED		-NETERR_SMTP_AUTH_FAILED
+
+/*
+ *		Return codes for smtp_setserver()
+ */
+#define SMTP_OK					0
+#define SMTP_NAMETOOLONG		-1
+/*
+ *    Additional return codes for smtp_setauth()
+ */
+#define SMTP_USERNAMETOOLONG	-2
+#define SMTP_PASSWORDTOOLONG	-3
+
+#define SMTP_RESET_TIMEOUT		smtp_state.timeout = _SET_TIMEOUT(SMTP_TIMEOUT*1000L)
+
+extern SMTPState smtp_state;
+
+/*** EndHeader */
+
+SMTPState smtp_state;
+
+/*** BeginHeader smtpauth_plain */
+void smtpauth_plain (char *username, char *password, char *response);
+/*** EndHeader */
+void smtpauth_plain (char *username, char *password, char *response)
+{
+	/* buffer holds two copies of username, one copy of password and three NULLs */
+	auto char buff[SMTP_MAX_USERNAMELEN*2+SMTP_MAX_PASSWORDLEN+3];
+	auto int encodesize;
+	encodesize = sprintf (buff, "%s%c%s%c%s", username, '\0', username, '\0',
+		password);
+	base64_encode (response, buff, encodesize);
+}
+
+/*** BeginHeader smtpauth_crammd5 */
+void smtpauth_crammd5 (char *username, char *password, char *challenge, char *response);
+/*** EndHeader */
+void smtpauth_crammd5 (char *username, char *password, char *challenge, char *response)
+{
+	auto char temp[8];
+	auto char buff[128];
+	auto int decodesize;
+	auto char digest[16];
+	auto int i, j;
+
+	/* Make sure we have enough room to decode the base64-encoded challenge. */
+	if ((strlen (challenge) * 3) / 4 >= sizeof(buff)) {
+		*response = '\0';
+		return;
+	}
+
+	decodesize = base64_decode (buff, challenge);
+	buff[decodesize] = '\0';  /* add NULL terminator */
+#ifdef SMTP_VERBOSE
+	printf ("CRAM-MD5: Decoded %x byte challenge:\n", decodesize);
+	printf ("          %s\n", buff);
+#endif
+	hmac_md5 (buff, decodesize, password, strlen(password), digest);
+
+   /***** verify lengths *****/
+	j = sprintf (buff, "%s ", username);
+
+	for (i = 0; i < 16; i++, j+=2)
+		sprintf (&buff[j], "%02x", digest[i] & 0x00FF);
+	buff[j] = '\0';
+
+	base64_encode (response, buff, strlen(buff));
+#ifdef SMTP_VERBOSE
+	printf ("CRAM-MD5 response (raw): %s\n", buff);
+	printf ("CRAM-MD5 response (base64): %s\n", response);
+#endif
+}
+
+/*** BeginHeader smtp_sendmail */
+
+/* START FUNCTION DESCRIPTION ********************************************
+smtp_sendmail                		<SMTP.LIB>
+
+SYNTAX: void smtp_sendmail(const char* to, const char* from, const char* subject,
+                           const char* message);
+
+KEYWORDS:		tcpip, smtp, mail
+
+DESCRIPTION: 	Start an e-mail being sent.  This function is intended to
+               be used for short messages which are entirely constructed
+               prior to being sent.
+
+               If you have previously installed a data handler via
+               smtp_data_handler(), then you must call smtp_data_handler()
+               with a NULL data handler, otherwise this message will not
+               get sent.
+
+               Note: the strings pointed to by the parameters must not
+               be changed until the entire process is completed.
+
+               Note: if the first character of any line of the message
+               is a period (.), then this character will be deleted as
+               part of normal mail processing.  Thus, to actually send
+               a line starting with '.', you must start the line with
+               '..' i.e. double up an initial period.
+
+PARAMETER1:	String containing the e-mail address of the destination.
+            Maximum of 192 characters.  Currently, only one recipient
+            is supported.
+PARAMETER2:	String containing the e-mail address of the source.  Max
+            192 characters for a return address.  If no return should be
+            sent by receiver, then pass an empty string ("").
+PARAMETER3:	String containing the subject of the message.  This may be
+            NULL in which case no subject line will be sent.  This string
+            may also contain embedded \r\n sequences so that additional
+            mail header lines may be inserted.  The length of this string
+            is unlimited.
+PARAMETER4:	String containing the message. (this string must NOT contain
+				the byte sequence "\r\n.\r\n" (CRLF.CRLF), as this is used to
+				mark the end of the e-mail, and will be appended to the e-mail
+				automatically.)  This message must be null terminated, and is
+				only allowed to contain 7-bit characters.  You can pass NULL
+				if a data handler is to be used to generate the message.
+
+RETURN VALUE: 	none
+
+SEE ALSO: 	smtp_mailtick, smtp_status, smtp_sendmailxmem
+
+END DESCRIPTION **********************************************************/
+
+void smtp_sendmail(const char* to, const char* from, const char* subject,
+                   const char* message);
+/*** EndHeader */
+
+smtp_debug
+void smtp_sendmail(const char* to, const char* from, const char* subject,
+	                const char* message)
+{
+	smtp_sendmailxmem(to, from, subject,
+		message ? paddr(message) : 0L,
+		message ? strlen(message) : 0);
+}
+
+/*** BeginHeader SMTP_netbuffer */
+extern long SMTP_netbuffer;
+/*** EndHeader */
+long SMTP_netbuffer;
+
+
+/*** BeginHeader smtp_sendmailxmem*/
+/* START FUNCTION DESCRIPTION ********************************************
+smtp_sendmailxmem            		<SMTP.LIB>
+
+SYNTAX: void smtp_sendmailxmem(const char* to, const char* from,
+                               const char* subject, long message, long messagelen);
+
+KEYWORDS:		tcpip, smtp, mail
+
+DESCRIPTION: 	Start an e-mail being sent.  This is intended for
+               moderately long, fixed, messages which are stored in
+               xmem (e.g. via #ximport'ed file).
+
+               See smtp_sendmail for more details.
+
+PARAMETER1:	String containing the e-mail address of the destination.
+PARAMETER2:	String containing the e-mail address of the source.
+PARAMETER3:	String containing the subject of the message.
+PARAMETER4:	String in xmem containing the message. (this string must NOT
+				contain the byte sequence "\r\n.\r\n" (CRLF.CRLF), as this is
+				used to mark the end of the e-mail, and will be appended to
+				the e-mail automatically.)  The string does not need to be
+				null terminated.  The string should only contain 7-bit
+				characters.
+PARAMETER5: Length of the message in xmem
+
+RETURN VALUE: 	none
+
+SEE ALSO: 	smtp_mailtick, smtp_status, smtp_sendmail
+
+END DESCRIPTION **********************************************************/
+
+void smtp_sendmailxmem(const char* to, const char* from, const char* subject,
+	long message, long messagelen);
+/*** EndHeader */
+
+smtp_debug
+void smtp_sendmailxmem(const char* to, const char* from, const char* subject,
+	long message, long messagelen)
+{
+	#GLOBAL_INIT {
+		memset(&smtp_state,0,sizeof(smtp_state));
+		#ifdef SMTP_ALLOW_ANY_SERVER_CERT
+		smtp_state.tls_flags |= SSL_F_PEER_CERT_OK;
+		#endif
+		#ifdef SMTP_ALLOW_CLEARTEXT
+		smtp_state.tls_flags |= SSL_S_ALLOW_NULL;
+		#endif
+	}
+
+	#ifdef SMTP_VERBOSE
+	   printf("to:%x\n",to);
+	   printf("from:%x\n",from);
+	   printf("subject:%x\n",subject);
+	   printf("message:%X\n",message);
+	#endif
+	smtp_state.sock=&smtp_state.s;
+	smtp_state.state=SMTP_INIT;
+	smtp_state.to=to;
+	smtp_state.from=from;
+	smtp_state.subject=subject;
+	smtp_state.xmemmessage=message;
+	smtp_state.messagelen=messagelen;
+	smtp_state.error=SMTP_PENDING;
+#ifdef USE_SMTP_AUTH
+	smtp_state.auth_methods = 0;
+#endif
+#if SMTP_AUTH_TLS
+	#ifdef SMTP_AUTH_FAIL_IF_NO_AUTH
+	smtp_state.require_tls = 1;
+	#else
+	smtp_state.require_tls = 0;
+	#endif
+	smtp_state.starttls_supported = 0;
+	smtp_state.secured = 0;
+#endif
+}
+
+/*** BeginHeader smtp_data_handler */
+/* START FUNCTION DESCRIPTION ********************************************
+smtp_data_handler                   <SMTP.LIB>
+
+SYNTAX:	void smtp_data_handler(int (*dhnd)(), void * dhnd_data, word opts)
+
+KEYWORDS:		tcpip, smtp, mail
+
+DESCRIPTION:	Sets a data handler for generating mail message content.
+               This function should be called after calling
+               smtp_sendmail etc.  It overrides any message parameter
+               set by the smtp_sendmail call, since the message is
+               generated dynamically by the callback function.
+
+               Note: you can use the same data handler as used for the
+               FTP library (see ftp_data_handler() description).  The
+               flags values are numerically equivalent to those of
+               the same meaning for ftp_data_handler.  The SMTP data
+               handler is only used to generate data (not receive it).
+
+               The handler is a function which must be coded according
+               the the following prototype:
+
+                 int my_handler(char * data, int len, longword offset,
+                                int flags, void * dhnd_data);
+
+               This function is called with "data" pointing to a data
+               buffer, and "len" containing the length of that buffer.
+               "offset" is the byte number relative to the first byte
+               of the entire message stream.  This is useful for data
+               handler functions which do not wish to keep track of the
+               current state of the data source.
+
+               "len" will be set to SMTP_MAX_DATALEN (256 by default).
+               You can override that macro to allow larger "chunks".
+
+               "dhnd_data" is the pointer that was passed to
+               ftp_data_handler().
+
+               "flags" contains an indicator of the current operation:
+                 SMTPDH_OUT : data is to be filled with the next data
+                   to send to the mail server.  The maximum allowable
+                   chunk of data is specified by 'len'.  The data
+                   must not contain the sequence <CRLF>.<CRLF> since
+                   that will confuse the process.
+                 SMTPDH_ABORT : end of data; error encountered during
+                   SMTP operation.  The mail was probably not delivered.
+
+               The return value from this function should
+               be the actual number of bytes placed in the data
+               buffer, or -1 to abort.  If 0 is returned, then this
+               is considered to be the end of data.  You can write
+               up to and including "len" bytes into the buffer, but at
+               least one byte must be written otherwise it is assumed
+               that no more data is following.
+
+               For SMTPDH_ABORT, the return code is ignored.
+
+PARAMETER1:	   Pointer to data handler function, or NULL to remove
+               the current data handler.
+PARAMETER2:    A pointer which is passed to the data handler function.
+               This may be used to point to any further data required by
+               the data handler such as an open file descriptor.
+PARAMETER3:    Options word (currently reserved, set to zero).
+
+SEE ALSO:      smtp_sendmail, smtp_sendmailxmem, smtp_mailtick
+
+END DESCRIPTION **********************************************************/
+
+// These are numerically the same as the equivalent FTP data handler codes
+#define SMTPDH_OUT 	2
+#define SMTPDH_ABORT	4
+
+void smtp_data_handler(int (*dhnd)(), void * dhnd_data, word opts);
+/*** EndHeader */
+
+smtp_debug
+void smtp_data_handler(int (*dhnd)(), void * dhnd_data, word opts)
+{
+	smtp_state.dhnd = dhnd;
+	smtp_state.dhnd_data = dhnd_data;
+}
+
+/*** BeginHeader smtp_status */
+
+/* START FUNCTION DESCRIPTION ********************************************
+smtp_status             		<SMTP.LIB>
+
+SYNTAX: int smtp_status();
+
+KEYWORDS:		tcpip, smtp, mail
+
+DESCRIPTION: 	return the status of the last email processed
+
+RETURN VALUE: 	SMTP_SUCCESS - email sent
+               SMTP_PENDING - email not sent yet call smtp_mailtick again
+               SMTP_TIME    - email not sent within SMTP_TIMEOUT seconds
+               SMTP_UNEXPECTED - received an invalid response from SMTP server
+
+SEE ALSO: 	smtp_sendmail
+
+END DESCRIPTION **********************************************************/
+
+int smtp_status();
+/*** EndHeader */
+
+smtp_debug
+int smtp_status()
+{
+	return smtp_state.error;
+}
+
+/*** BeginHeader smtp_setserver */
+
+/* START FUNCTION DESCRIPTION ********************************************
+smtp_setserver          		<SMTP.LIB>
+
+SYNTAX: int smtp_setserver(char* server);
+
+KEYWORDS:		tcpip, smtp, mail
+
+DESCRIPTION: 	Sets the SMTP server.  This value overrides SMTP_SERVER.
+               If you called smtp_setserver_ip() before, the IP address
+               specified by that function is forgotten.
+
+PARAMETER1:	   Server name string.  This is copied into the SMTP state
+               structure.  This name is not resolved to an IP address
+               until you start calling smtp_mailtick().
+
+RETURN VALUE: 	SMTP_OK          - server name was set successfully
+					SMTP_NAMETOOLONG - the server name was too long
+
+SEE ALSO: 	smtp_sendmail, smtp_setserver_ip, smtp_mailtick, smtp_setport
+
+END DESCRIPTION **********************************************************/
+
+int smtp_setserver(char* server);
+/*** EndHeader */
+
+smtp_debug
+int smtp_setserver(char* server)
+{
+	if (strlen(server) < SMTP_MAX_SERVERLEN) {
+		strcpy(smtp_state.server, server);
+		smtp_state.server_ip = 0;
+		return SMTP_OK;
+	} else {
+		return SMTP_NAMETOOLONG;
+	}
+}
+
+
+/*** BeginHeader smtp_getserver */
+
+/* START FUNCTION DESCRIPTION ********************************************
+smtp_getserver          		<SMTP.LIB>
+
+SYNTAX: char * smtp_getserver();
+
+KEYWORDS:		tcpip, smtp, mail
+
+DESCRIPTION: 	Get the server domain name as set by smtp_setserver() or
+               SMTP_SERVER macro.
+
+RETURN VALUE:  Server name string
+
+SEE ALSO: 	smtp_setserver
+
+END DESCRIPTION **********************************************************/
+
+char * smtp_getserver();
+/*** EndHeader */
+
+smtp_debug
+char * smtp_getserver()
+{
+	return smtp_state.server[0] ? smtp_state.server : SMTP_SERVER;
+}
+
+
+/*** BeginHeader smtp_setport */
+
+/* START FUNCTION DESCRIPTION ********************************************
+smtp_setport          		<SMTP.LIB>
+
+SYNTAX: int smtp_setport(word port);
+
+DESCRIPTION: 	Sets the SMTP server port.  This value overrides SMTP_PORT.
+               Setting a different port number is important if using
+               normal email (port 25) mixed with secure email (which generally
+               uses non-standard port numbers).
+
+PARAMETER1:	   TCP well-known port number of SMTP server.  If set to zero,
+               then the default defined by the SERVER_PORT macro will be
+               used.
+
+RETURN VALUE: 	SMTP_OK
+
+SEE ALSO: 	smtp_setserver
+
+END DESCRIPTION **********************************************************/
+
+int smtp_setport(word port);
+/*** EndHeader */
+
+smtp_debug
+int smtp_setport(word port)
+{
+	smtp_state.port = port;
+}
+
+/*** BeginHeader smtp_setserver_ip */
+
+/* START FUNCTION DESCRIPTION ********************************************
+smtp_setserver_ip          		<SMTP.LIB>
+
+SYNTAX: int smtp_setserver_ip(longword server);
+
+KEYWORDS:		tcpip, smtp, mail
+
+DESCRIPTION: 	Sets the SMTP server.  This value overrides the value set
+               by smtp_setserver, and is used when the IP address of the
+               mail server is known.
+
+PARAMETER1:	   Server IP address.
+
+RETURN VALUE: 	SMTP_OK          - server IP was set successfully
+
+SEE ALSO: 	smtp_sendmail, smtp_setserver, smtp_mailtick
+
+END DESCRIPTION **********************************************************/
+
+int smtp_setserver_ip(longword server);
+/*** EndHeader */
+
+smtp_debug
+int smtp_setserver_ip(longword server)
+{
+	smtp_state.server_ip = server;
+	return SMTP_OK;
+}
+
+/*** BeginHeader smtp_setauth */
+
+/* START FUNCTION DESCRIPTION ********************************************
+smtp_setauth          		<SMTP.LIB>
+
+SYNTAX: int smtp_setauth(char* username, char* password);
+
+KEYWORDS:		tcpip, smtp, mail
+
+DESCRIPTION: 	Sets the username and password to use for SMTP AUTH
+               (Authentication).  You must #define USE_SMTP_AUTH in your
+               program if you want to use SMTP AUTH on your outbound
+               connections.
+
+PARAMETER1:	   Username.  This is copied into the SMTP state structure.
+               Note that some SMTP servers require a full email address
+               while others just want a username.  Some servers refer
+               to this as the "account name".
+
+PARAMETER2:	   Password.  This is copied into the SMTP state structure.
+
+RETURN VALUE: 	SMTP_OK              - name and password were set successfully
+               SMTP_USERNAMETOOLONG - the username was too long
+               SMTP_PASSWORDTOOLONG - the username was too long
+
+SEE ALSO: 	smtp_sendmail, smtp_mailtick
+
+END DESCRIPTION **********************************************************/
+
+int smtp_setauth(char* username, char* password);
+/*** EndHeader */
+
+smtp_debug
+int smtp_setauth(char* username, char* password)
+{
+	if (strlen (username) > SMTP_MAX_USERNAMELEN) return SMTP_USERNAMETOOLONG;
+	if (strlen (password) > SMTP_MAX_PASSWORDLEN) return SMTP_PASSWORDTOOLONG;
+
+	strcpy(smtp_state.username, username);
+	strcpy(smtp_state.password, password);
+	return SMTP_OK;
+}
+
+
+
+/*** BeginHeader smtp_set_tls */
+
+/* START FUNCTION DESCRIPTION ********************************************
+smtp_set_tls          		<SMTP.LIB>
+
+SYNTAX: int smtp_set_tls(word flags,
+					SSL_Cert_t far * my_cert,
+	 				SSL_Cert_t far * trusted,
+	 				int (*policy)() );
+
+DESCRIPTION:	Set various options for SMTP over TLS.  See RFC 3207 for
+               details of the protocol used, plus the Dynamic C documentation
+               for the sock_secure() function.  The sample code
+               	samples/tcpip/snmp/snmp_tls.c
+               shows an example of use.
+
+               This function is only available if you first #use "ssl_sock.lib"
+               before #use this library.  It is highly advisable to
+                 #define SMTP_AUTH_FAIL_IF_NO_AUTH
+               otherwise mail will be sent in cleartext with no authentication
+               if the server does not offer TLS.
+
+               The options provided here are basically passed to sock_secure()
+               when the SMTP session performs the STARTTLS command.
+
+               NOTE: this function only copies the pointers, not the objects
+               to which they refer.  Thus, the application should be careful
+               not to modify or delete the relevant objects.  The application
+               is responsible for all certificate management.
+
+               NOTE: settings provided by this function persist over multiple
+               calls to smtp_sendmail() etc.
+
+PARAMETER 1: flags:
+				 A bitwise combination of the following flags:
+               SSL_F_REQUIRE_CERT  Require certificate from peer.
+               SSL_F_PEER_CERT_OK  Pretend all certs are valid.  This is mainly
+                         for debugging.
+               SSL_F_NO_RESUME     Set to not attempt session resumption.
+               SSL_S_ALLOW_NULL    Permit NULL bulk encryption suites.  This
+											  allows eavesdropping, but still requires
+											  strong authentication and message integrity.
+					SSL_S_FORBID_RC4    Do not permit RC4 stream cipher (force AES)
+					SSL_S_FORBID_MD5    Do not permit MD5-based hash (force SHA-1)
+PARAMETER 2:my_cert:
+				 If not NULL, is a parsed certificate including private key
+				 information.  This certificate will be presented to the server
+				 if requested.  This is not normally required, since most publicly
+				 accessible SMTP servers will use account details provided by
+				 smtp_setauth() rather than a client certificate provided by this
+				 function.
+PARAMETER 3:trusted:
+				 Pre-parsed certificate chain representing the list of trusted
+				 authorities.  This is required if server authentication is
+				 required by the application.  If the application is intended to
+				 work with a single SMTP server, then it is sufficient to provide
+				 the server's certificate only.  Otherwise, it may be necessary
+				 to provide a relatively long list of CA certificates, or allow
+				 CA certificates to be provided at run-time.
+PARAMETER 4:policy
+				 Callback function which is called by this library when a server
+				 certificate is provided.  Prototype of such a callback must be:
+					int smtp_server_policy(
+									ssl_Socket far * state,
+	                       	int trusted,
+	                       	struct x509_certificate far * cert,
+                           void __far * data
+										);
+				 Pass NULL to remove this callback.  If not NULL, this callback
+				 is called if and only if the SSL_F_REQUIRE_CERT flag is set,
+				 after a valid certificate is available.  If trusted is false, then
+				 no trusted CA list was specified. If there is a trusted CA list,
+				 but the certificate could not be validated, then this function
+				 will not be called since this always causes an error.
+             Function should return 0 to proceed (allow) or non-zero to
+             disallow. In the latter case, an access_denied alert will be sent
+             to the peer.
+             cert parameter is the peer certificate.  This has several fields
+             (see X509.lib) which indicate the subject and issuer etc.  Most
+             useful field is cert->subject which points to a struct containing
+             ascii representations of the various certificate subject name
+             fields.  Function may call x509_name_string() to get a formatted
+             subject name e.g. for messages.
+
+RETURN VALUE: 	SMTP_OK
+
+SEE ALSO: 	smtp_setauth
+
+END DESCRIPTION **********************************************************/
+
+#if SMTP_AUTH_TLS
+int smtp_set_tls(
+					word flags,
+					SSL_Cert_t __far * my_cert,
+	 				SSL_Cert_t __far * trusted,
+	 				int (*policy)( /* ssl_Socket far * state,
+	                       int trusted,
+	                       struct x509_certificate far * cert,
+                          void far * data */ )
+					);
+#endif
+/*** EndHeader */
+
+//DEVIDEA: note that Dynamic C currently does not handle function
+// pointer prototypes inside a parameter list declaration.  That
+// explains the commenting out of the policy parameters.
+smtp_debug
+int smtp_set_tls(
+					word flags,
+					SSL_Cert_t __far * my_cert,
+	 				SSL_Cert_t __far * trusted,
+	 				int (*policy)( /* ssl_Socket far * state,
+	                       int trusted,
+	                       struct x509_certificate far * cert,
+                          void far * data */ )
+					)
+{
+	smtp_state.tls_flags = flags;
+	smtp_state.my_cert = my_cert;
+	smtp_state.trusted = trusted;
+	smtp_state.policy = policy;
+	return SMTP_OK;
+}
+
+
+
+/*** BeginHeader smtp_mailtick */
+
+/* START FUNCTION DESCRIPTION ********************************************
+smtp_mailtick            		<SMTP.LIB>
+
+SYNTAX: int smtp_mailtick();
+
+KEYWORDS:		tcpip, smtp, mail
+
+DESCRIPTION: 	Repetitively call this function until email is completely
+               sent.
+
+RETURN VALUE: 	SMTP_SUCCESS - email sent
+               SMTP_PENDING - email not sent yet; call smtp_mailtick again
+               SMTP_TIME    - email not sent within SMTP_TIMEOUT seconds
+               SMTP_UNEXPECTED - received an invalid response from SMTP
+                 server
+               SMTP_NOSOCK - could not open network socket
+               SMTP_DNSERROR - cannot resolve server name
+               SMTP_ABORTED - transaction aborted (by data handler)
+
+               When using SMTP AUTH, the following errors are enabled
+               if you define SMTP_AUTH_FAIL_IF_NO_AUTH (otherwise the SMTP
+               lib will fall back on sending without authentication):
+               SMTP_AUTH_UNAVAILABLE - unable to attempt authentication
+               SMTP_AUTH_FAILED - attempts to authenticate failed
+
+SEE ALSO: 	smtp_sendmail, smtp_status
+
+END DESCRIPTION **********************************************************/
+
+int smtp_mailtick();
+/*** EndHeader */
+
+
+#if SMTP_AUTH_TLS
+int _smtp_dflt_policy(struct tls_connection __far * state,
+	                       int trusted,
+	                       struct x509_certificate __far * cert,
+	                       void __far * data)
+{
+#ifdef SMTP_ALLOW_CERT_CN_MISMATCH
+	return 0;	// All sweetness and light
+#else
+	// Default is to reject if not matching CN.
+	return strcmp(cert->subject.cn, smtp_getserver());
+#endif
+}
+#endif
+
+smtp_debug
+int smtp_mailtick()
+{
+	auto void* s;
+	auto char* buffer;
+	auto int bytes_written;
+	auto char* server;
+	auto int num_bytes;
+	auto int rc;
+	auto char ip_buffer[16];
+	auto int sureg;
+	auto long towrite;
+
+   s = _SOCK_OF_SMTP(smtp_state);
+	buffer=smtp_state.buffer;
+
+	/*
+	 *   Check if the socket prematurely closed or if
+	 *   a timeout has occurred.
+	 */
+
+	if(smtp_state.state!=SMTP_INIT)
+	{
+		if (smtp_state.state != SMTP_WAITCLOSE &&
+		    smtp_state.state != SMTP_RESOLVING &&
+		    !tcp_tick(s))
+		{
+#ifdef SMTP_VERBOSE
+			printf("SMTP: Socket unexpectedly closed!\n");
+#endif
+			smtp_state.state=SMTP_ERROR;
+			smtp_state.error=SMTP_UNEXPECTED;
+			goto _smtp_error;
+		}
+		if (chk_timeout(smtp_state.timeout))
+		{
+#ifdef SMTP_VERBOSE
+			printf("SMTP: Timed out\n");
+#endif
+			smtp_state.state=SMTP_ERROR;
+			smtp_state.error=SMTP_TIME;
+			goto _smtp_error;
+		}
+		if (smtp_state.buflen)
+		{
+			// Currently sending a request, in buffer.
+			if ((rc = sock_awrite(s, buffer, smtp_state.buflen)) < 0)
+			{
+#ifdef SMTP_VERBOSE
+				printf("SMTP: Error sending data (%x)\n", rc);
+#endif
+				smtp_state.state = SMTP_ERROR;
+				smtp_state.error = SMTP_UNEXPECTED;
+				goto _smtp_error;
+			}
+			else if (rc == smtp_state.buflen)
+			{
+#ifdef SMTP_VERBOSE
+				printf("SMTP: Wrote %s", buffer);
+#endif
+				smtp_state.buflen = 0;
+			}
+			else
+				return smtp_state.error = SMTP_PENDING;
+		}
+		if (smtp_state.abrt)
+		{
+#ifdef SMTP_VERBOSE
+			printf("SMTP: Aborting\n");
+#endif
+			smtp_state.state = SMTP_ERROR;
+			smtp_state.error = SMTP_ABORTED;
+			goto _smtp_error;
+		}
+
+	}
+
+	switch(smtp_state.state)
+	{
+		case SMTP_INIT:
+			/*
+			 *		Attempt to open a connection to the mail server
+			 */
+			SMTP_RESET_TIMEOUT;
+			smtp_state.buflen = 0;
+			smtp_state.abrt = 0;
+			if (!smtp_state.server_ip)
+			{
+				server = smtp_getserver();
+#ifdef SMTP_VERBOSE
+				printf("SMTP: Resolving %s\n", server);
+#endif
+#ifdef DISABLE_DNS
+				smtp_state.server_ip = resolve(server);
+            if (smtp_state.server_ip == 0)
+#else
+				smtp_state.dns = resolve_name_start(server);
+				if (smtp_state.dns < 0)
+#endif
+				{
+					rc = smtp_state.dns;
+				_smtp_dnserror:
+#ifdef SMTP_VERBOSE
+					printf("SMTP: Error resolving server (%x).\n", rc);
+#endif
+					smtp_state.state=SMTP_DONE;
+					smtp_state.error = SMTP_DNSERROR;
+					goto _smtp_error;
+				}
+#ifndef DISABLE_DNS
+				smtp_state.state=SMTP_RESOLVING;
+#endif
+				break;
+			}
+		_smtp_open:
+#ifdef SMTP_VERBOSE
+			printf("SMTP: Opening to %lX:%x\n",
+				smtp_state.server_ip,
+				smtp_state.port ? smtp_state.port : SMTP_PORT);
+#endif
+			if(!tcp_extopen(s, SMTP_IFACE, 0,
+								smtp_state.server_ip,
+								smtp_state.port ? smtp_state.port : SMTP_PORT,
+								NULL, 0, SMTP_AUTH_TLS ? -SMTP_TLS_RX_BUFFER_SIZE : 0))
+			{
+#ifdef SMTP_VERBOSE
+				printf("Error opening socket.\n");
+#endif
+				smtp_state.state=SMTP_ERROR;
+				smtp_state.error=SMTP_NOSOCK;
+				goto _smtp_error;
+			}
+			sock_mode(s,TCP_MODE_ASCII);
+			smtp_state.state=SMTP_WAITFORESTAB;
+			SMTP_RESET_TIMEOUT;
+			break;
+
+		case SMTP_RESOLVING:
+#ifndef DISABLE_DNS
+			tcp_tick(NULL);
+			if ((rc = resolve_name_check(smtp_state.dns, &smtp_state.server_ip)) ==
+				RESOLVE_SUCCESS)
+				goto _smtp_open;
+			if (rc != RESOLVE_AGAIN)
+				goto _smtp_dnserror;
+#endif
+			break;
+
+		case SMTP_WAITFORESTAB:
+			/*
+			 *   Wait for the connection to be acknowledged
+			 */
+
+			if(sock_established(s))
+			{
+#ifdef SMTP_VERBOSE
+				printf("SMTP: Connected\n");
+#endif
+				smtp_state.state=SMTP_WAITFORHELO220;
+				SMTP_RESET_TIMEOUT;
+			}
+			break;
+
+		case SMTP_WAITFORHELO220:
+			/*
+			 *   Wait for the initial welcome message
+			 */
+
+			if(smtp_getresponse("22"))
+			{
+#ifdef USE_SMTP_AUTH
+				/* only attempt AUTH if we have a username or password to use! */
+	         if (*smtp_state.username || *smtp_state.password)
+				{
+					sprintf(buffer,"EHLO %s\r\n",SMTP_DOMAIN);
+					smtp_state.state = SMTP_PARSE_EHLO;
+				} else
+#endif
+				/* code for non-auth */
+				{
+	            sprintf(buffer,"HELO %s\r\n",SMTP_DOMAIN);
+	            smtp_state.state = SMTP_WAITFORMAIL250;
+				}
+				smtp_state.buflen = strlen(buffer);
+				SMTP_RESET_TIMEOUT;
+			}
+			break;
+
+#ifdef USE_SMTP_AUTH
+		case SMTP_PARSE_EHLO:
+			/*
+			 *   Parse the response to our EHLO.  The AUTH methods can appear in
+			 *   a continuation line (in which case smtp_getresponse() returns 0)
+			 *   or the final line of the response.
+			 */
+			if (smtp_getresponse("25"))
+				smtp_state.state = SMTP_SEND_AUTH;
+
+			if (strncmp (smtp_state.buffer+4, "AUTH", 4) == 0)
+			{
+				smtp_state.auth_methods = SMTP_AUTH_AVAILABLE;
+				if (strstr (smtp_state.buffer, "LOGIN"))
+				{
+					smtp_state.auth_methods |=
+					                      (SMTP_AUTH_LOGIN) & (SMTP_AUTH_ACCEPTABLE);
+				}
+				if (strstr (smtp_state.buffer, "PLAIN"))
+				{
+					smtp_state.auth_methods |=
+					                      (SMTP_AUTH_PLAIN) & (SMTP_AUTH_ACCEPTABLE);
+				}
+				if (strstr (smtp_state.buffer, "CRAM-MD5"))
+				{
+					smtp_state.auth_methods |=
+					                    (SMTP_AUTH_CRAMMD5) & (SMTP_AUTH_ACCEPTABLE);
+				}
+				*smtp_state.buffer = '\0';  /* overwrite the buffer so we don't reparse it */
+			}
+		#if SMTP_AUTH_TLS
+			else if (!strncmp(smtp_state.buffer+4, "STARTTLS", 8) && !smtp_state.secured) {
+				// Server supports TLS.  This is ignored if already secured.
+				smtp_state.starttls_supported = 1;
+			}
+		#endif
+			break;
+
+		case SMTP_SEND_AUTH:
+			/*
+			 * Send authentication credentials.  We try all of the various
+			 * methods that the server advertised and that we can handle.
+			 * Once we try a method, we clear its flag in auth_methods so
+			 * we don't try it again.
+			 *
+			 * We try multiple methods just in case our (or the server's)
+			 * implementation of a method is broken.
+			 *
+			 * CRAM-MD5 is preferred as it's impossible to sniff the cleartext
+			 * password.  AUTH LOGIN is slightly better than AUTH PLAIN, since
+			 * the username and password are sent in separate packets.
+			 */
+		#if SMTP_AUTH_TLS
+			if (!smtp_state.secured) {
+	         if (smtp_state.require_tls && !smtp_state.starttls_supported) {
+	            smtp_state.state = SMTP_ERROR;
+	            smtp_state.error = SMTP_AUTH_UNAVAILABLE;
+	            goto _smtp_error;
+	         }
+	         else if (smtp_state.starttls_supported) {
+	            // OK, issue STARTTLS command to server and wait for 220.
+	            // According to RFC 3207, we must forget any info obtained from
+	            // the server before this point.
+	            smtp_state.state = SMTP_WAITFORSTARTTLS220;
+	            strcpy(buffer, "STARTTLS\r\n");
+	            smtp_state.buflen = strlen(buffer);
+         		SMTP_RESET_TIMEOUT;
+         		break;
+	         }
+			}
+		#endif
+
+			if (smtp_state.auth_methods & SMTP_AUTH_CRAMMD5)
+			{
+				smtp_state.auth_methods &= ~SMTP_AUTH_CRAMMD5;
+	         strcpy(buffer, "AUTH CRAM-MD5\r\n");
+   	      smtp_state.state = SMTP_WAIT_CHALLENGE;
+			}
+			else if (smtp_state.auth_methods & SMTP_AUTH_LOGIN)
+			{
+				smtp_state.auth_methods &= ~SMTP_AUTH_LOGIN;
+	         strcpy(buffer, "AUTH LOGIN\r\n");
+	         smtp_state.state = SMTP_WAIT_LOGINUSER;
+			} else if (smtp_state.auth_methods & SMTP_AUTH_PLAIN)
+			{
+				smtp_state.auth_methods &= ~SMTP_AUTH_PLAIN;
+	         strcpy(buffer, "AUTH PLAIN ");
+	         smtpauth_plain (smtp_state.username, smtp_state.password, buffer+11);
+	         strcat (buffer, "\r\n");
+	         smtp_state.state = SMTP_WAITFORMAIL250;
+			}
+			else
+			{
+				/* no AUTH options */
+#ifdef SMTP_AUTH_FAIL_IF_NO_AUTH
+				smtp_state.state = SMTP_ERROR;
+				smtp_state.error = ((smtp_state.auth_methods & SMTP_AUTH_AVAILABLE) ?
+					SMTP_AUTH_FAILED : SMTP_AUTH_UNAVAILABLE);
+				goto _smtp_error;
+#else
+				/* try sending without authentication */
+				sprintf(buffer,"MAIL FROM: <%s>\r\n",smtp_state.from);
+				smtp_state.state = SMTP_WAITFORRCPT250;
+#endif
+			}
+
+         smtp_state.buflen = strlen(buffer);
+         SMTP_RESET_TIMEOUT;
+
+		case SMTP_WAIT_CHALLENGE:
+			/*
+			 *   Wait for base64-encoded challenge for AUTH CRAM-MD5.
+			 */
+			if (smtp_getresponse("334"))
+			{
+				smtpauth_crammd5 (smtp_state.username, smtp_state.password,
+					smtp_state.buffer + 4, buffer);
+				strcat (buffer, "\r\n");
+				smtp_state.state = SMTP_WAITFORMAIL250;
+				smtp_state.buflen = strlen(buffer);
+				SMTP_RESET_TIMEOUT;
+			}
+			break;
+
+		case SMTP_WAIT_LOGINUSER:
+			/*
+			 *   Wait for "334 VXNlcm5hbWU6", the AUTH LOGIN prompt for username.
+			 */
+			if (smtp_getresponse("334"))
+			{
+				base64_encode (buffer, smtp_state.username,
+					strlen(smtp_state.username));
+				strcat (buffer, "\r\n");
+				smtp_state.buflen = strlen(buffer);
+				smtp_state.state = SMTP_WAIT_LOGINPASS;
+				SMTP_RESET_TIMEOUT;
+			}
+			break;
+
+		case SMTP_WAIT_LOGINPASS:
+			/*
+			 *   Wait for "334 UGFzc3dvcmQ6", the AUTH LOGIN prompt for password.
+			 */
+			if (smtp_getresponse("334"))
+			{
+				base64_encode (buffer, smtp_state.password,
+					strlen(smtp_state.password));
+				strcat (buffer, "\r\n");
+				smtp_state.buflen = strlen(buffer);
+				smtp_state.state = SMTP_WAITFORMAIL250;
+				SMTP_RESET_TIMEOUT;
+			}
+			break;
+#endif
+
+#if SMTP_AUTH_TLS
+		case SMTP_WAITFORSTARTTLS220:
+			/*
+			 *   Wait for server OK-ing the STARTTLS command
+			 */
+
+			if(smtp_getresponse("22"))
+			{
+	         // OK, secure this socket and re-jig pointers so that server struct
+	         // points to secure socket rather than direct transport.
+	         // App data buffers are sized to be the same as the transport (TCP socket)
+	         // buffer sizes, and dynamically allocated.
+	         rc = sock_secure(_TCP_SOCK_OF_SMTP(smtp_state), &smtp_state._n_ssl,
+#ifdef TLS_OLDBUF
+	                      smtp_state.s.rd.maxlen, NULL, 	// Read buffer
+	                      smtp_state.s.wr.maxlen, NULL,	// Write buffer
+#else
+	                      TCP_BUF_SIZE>>2, NULL, // Read buffer (1/4)
+	                      TCP_BUF_SIZE*3>>2, NULL, // Write buffer (3/4)
+#endif
+	                      1,   // Is a client
+	                      smtp_state.tls_flags,
+	                      0, 0, 0, 0,
+	                      smtp_state.my_cert,
+	                      smtp_state.trusted,
+	                      NULL          // No session to resume
+	                      );
+	         if (!rc) {
+	            smtp_state.sock = smtp_state._n_ssl;
+	            if (smtp_state.policy)
+						smtp_state._n_ssl->policy = smtp_state.policy;
+					else
+						smtp_state._n_ssl->policy = _smtp_dflt_policy;
+	         }
+	         else
+	            // Error securing socket, most likely because of malloc or other
+	            // resource failure.  Application is unlikely to expect, let alone
+	            // handle, this failure, so take safe path and exit.
+	            exit(rc);
+				smtp_state.state = SMTP_WAITFORTLSESTAB;
+				SMTP_RESET_TIMEOUT;
+			}
+			break;
+
+		case SMTP_WAITFORTLSESTAB:
+			/*
+			 *   Wait for the TLS connection to become established
+			 */
+
+			if (sock_established(s))
+			{
+#ifdef SMTP_VERBOSE
+				printf("SMTP: Secured with TLS\n");
+#endif
+				sprintf(buffer,"EHLO %s\r\n",SMTP_DOMAIN);
+				smtp_state.buflen = strlen(buffer);
+				smtp_state.state = SMTP_PARSE_EHLO;
+				// Indicate secured, but zero out everything else...
+				smtp_state.secured = 1;
+				smtp_state.auth_methods = 0;
+				SMTP_RESET_TIMEOUT;
+			}
+			break;
+#endif
+
+		case SMTP_WAITFORMAIL250:
+			/*
+			 *   Wait for the response to our HELO (250) or AUTH (235)
+			 */
+
+			if(smtp_getresponse("2"))
+			{
+				sprintf(buffer,"MAIL FROM: <%s>\r\n",smtp_state.from);
+				smtp_state.buflen = strlen(buffer);
+				smtp_state.state = SMTP_WAITFORRCPT250;
+				SMTP_RESET_TIMEOUT;
+			}
+#ifdef USE_SMTP_AUTH
+			if (*smtp_state.buffer == '5')
+			{
+				/* AUTH failed, try again with a different method */
+				smtp_state.state = SMTP_SEND_AUTH;
+				SMTP_RESET_TIMEOUT;
+			}
+#endif
+			break;
+
+		case SMTP_WAITFORRCPT250:
+			/*
+			 *   Wait for the response to our MAIL
+			 */
+
+			if(smtp_getresponse("25"))
+			{
+				sprintf(buffer,"RCPT TO: <%s>\r\n",smtp_state.to);
+				smtp_state.buflen = strlen(buffer);
+				smtp_state.state = SMTP_WAITFORDATA250;
+				SMTP_RESET_TIMEOUT;
+			}
+			break;
+
+		case SMTP_WAITFORDATA250:
+			/*
+			 *   Wait for the response to our RCPT
+			 */
+
+			if(smtp_getresponse("25"))
+			{
+				strcpy(buffer,"DATA\r\n");
+				smtp_state.buflen = strlen(buffer);
+				smtp_state.state = SMTP_WAITFORDATA354;
+				SMTP_RESET_TIMEOUT;
+			}
+			break;
+
+		case SMTP_WAITFORDATA354:
+			/*
+			 *   Wait for the response to our DATA
+			 */
+
+			if(smtp_getresponse("354"))
+			{
+				if (smtp_state.subject)
+					smtp_state.remain = strlen(smtp_state.subject);
+				else
+					smtp_state.remain = 0;
+				sprintf(buffer,"From: <%s>\r\nTo: <%s>\r\n%s",
+					smtp_state.from,
+					smtp_state.to,
+					smtp_state.remain ? "Subject: " : "\r\n");
+				smtp_state.buflen = strlen(buffer);
+				smtp_state.offset=0;
+				if (smtp_state.remain)
+					smtp_state.state = SMTP_SENDHEAD;
+				else
+					smtp_state.state = SMTP_SENDBODY;
+				SMTP_RESET_TIMEOUT;
+			}
+			break;
+
+		case SMTP_SENDHEAD:
+			/*
+			 *   Send the Subject: line(s)
+			 */
+
+			bytes_written = sock_fastwrite(s, smtp_state.subject+
+				(int)smtp_state.offset, smtp_state.remain);
+
+			if(bytes_written>=0)
+			{
+				smtp_state.offset += bytes_written;
+				smtp_state.remain -= bytes_written;
+				if(!smtp_state.remain)
+				{
+					smtp_state.offset=0;
+#ifdef SMTP_VERBOSE
+					printf("SMTP: Wrote subject line\n");
+#endif
+					strcpy(buffer, "\r\n\r\n");
+					smtp_state.buflen = strlen(buffer);
+					smtp_state.state=SMTP_SENDBODY;
+					SMTP_RESET_TIMEOUT;
+				}
+			}
+			else
+				smtp_state.state=SMTP_ERROR;
+			break;
+
+		case SMTP_SENDBODY:
+			/*
+			 *   Send the body of the message
+			 */
+			if (smtp_state.dhnd)
+			{
+            if (sock_tbleft(s) < sizeof(smtp_state.buffer))
+               break;
+            rc = smtp_state.dhnd(smtp_state.buffer, sizeof(smtp_state.buffer),
+                  smtp_state.offset, SMTPDH_OUT, smtp_state.dhnd_data);
+				if (!rc)
+					goto _smtp_msgdone;
+				if (rc < 0)
+				{
+					smtp_state.abrt = 1;
+				}
+				else
+				{
+               bytes_written = sock_fastwrite(s, smtp_state.buffer, rc);
+					smtp_state.offset += bytes_written;
+				}
+				break;
+			}
+			else {
+				towrite = smtp_state.messagelen - smtp_state.offset;
+				if (towrite > 32767)
+					towrite = 32767;
+				bytes_written = sock_fastwrite(s,(char __far *)(smtp_state.xmemmessage+
+					smtp_state.offset), (int)towrite);
+			}
+
+			if (bytes_written>=0)
+			{
+				smtp_state.offset += bytes_written;
+				if (smtp_state.offset == smtp_state.messagelen)
+				{
+				_smtp_msgdone:
+#ifdef SMTP_VERBOSE
+					printf("SMTP: Message finished (%X bytes)\n", smtp_state.offset);
+#endif
+					smtp_state.state=SMTP_SENDEOM;
+					SMTP_RESET_TIMEOUT;
+				}
+			}
+			else
+				smtp_state.state=SMTP_ERROR;
+			break;
+
+		case SMTP_SENDEOM:
+			/*
+			 *   Send "\r\n.\r\n" to terminate the message
+			 */
+			strcpy(buffer,"\r\n.\r\n");
+			smtp_state.buflen = strlen(buffer);
+			smtp_state.offset=0;
+			smtp_state.state=SMTP_WAITQUIT250;
+			SMTP_RESET_TIMEOUT;
+			break;
+
+		case SMTP_WAITQUIT250:
+			/*
+			 *   Wait for the response to our message
+			 */
+
+			if(smtp_getresponse("25"))
+			{
+				strcpy(buffer,"QUIT\r\n");
+				smtp_state.buflen = strlen(buffer);
+				smtp_state.state=SMTP_WAITDONE;
+			}
+			break;
+
+		case SMTP_WAITDONE:
+			/*
+			 *   Wait for the response to our QUIT message
+			 */
+
+			if(smtp_getresponse("22"))
+			{
+#if SMTP_AUTH_TLS
+				if (smtp_state.secured) {
+#ifdef SMTP_VERBOSE
+					printf("SMTP: Shutting down TLS\n");
+#endif
+   				sock_unsecure(smtp_state._n_ssl);
+   				smtp_state.secured = 0;
+   			}
+#endif
+#ifdef SMTP_VERBOSE
+				printf("SMTP: Connection Closing\n");
+#endif
+				sock_close(s);
+				smtp_state.state=SMTP_WAITCLOSE;
+				SMTP_RESET_TIMEOUT;
+			}
+			break;
+
+		case SMTP_WAITCLOSE:
+			/*
+			 *   Wait for the connection to completely close.
+			 */
+
+			if(tcp_tick(s)==0)
+			{
+#ifdef SMTP_VERBOSE
+				printf("SMTP: Connection Closed\n");
+#endif
+				smtp_state.state=SMTP_DONE;
+				return smtp_state.error=SMTP_SUCCESS;
+			}
+			break;
+
+		case SMTP_DONE:
+		case SMTP_ERROR:
+			smtp_state.error=SMTP_UNEXPECTED;
+			goto _smtp_error;
+	}
+
+	return smtp_state.error=SMTP_PENDING;
+
+_smtp_error:
+#if SMTP_AUTH_TLS
+	if (smtp_state.secured) {
+#ifdef SMTP_VERBOSE
+		printf("SMTP: Aborting TLS\n");
+#endif
+      sock_unsecure(smtp_state._n_ssl);
+      smtp_state.secured = 0;
+   }
+#endif
+	sock_abort(s);
+	if (smtp_state.dhnd)
+	{
+		SETUSERMODE;
+		smtp_state.dhnd(smtp_state.buffer, strlen(smtp_state.buffer), 0,
+			SMTPDH_ABORT, smtp_state.dhnd_data);
+		SETSYSMODE;
+	}
+	return smtp_state.error;
+
+}
+
+/*** BeginHeader smtp_getresponse */
+int smtp_getresponse(char* expected);
+/*** EndHeader */
+
+/*
+ *		Internal function waits for and checks the reponse from a server.
+ */
+
+smtp_debug int smtp_getresponse(char* expected)
+{
+	auto int rc;
+	if(sock_bytesready(&smtp_state.s) != -1) {
+		rc = sock_gets(&smtp_state.s,smtp_state.buffer,sizeof(smtp_state.buffer));
+#ifdef SMTP_VERBOSE
+		printf("SMTP: Read: %s\n",smtp_state.buffer);
+#endif
+		if (rc < 3)
+			return 0;	// Cannot be valid response
+		if (rc > 3 && smtp_state.buffer[3] == '-')
+			return 0;	// This is a continuation line
+		if (!memcmp(smtp_state.buffer, expected, strlen(expected)))
+				return 1;
+		else {
+			/*
+			 * Handle extra 220 lines if we are in the SMTP_WAITFORMAIL250
+			 * state.
+			 */
+			if (smtp_state.state == SMTP_WAITFORMAIL250 &&
+				 memcmp(smtp_state.buffer, "220", 3) == 0) {
+				return 0;
+			}
+			smtp_state.state=SMTP_ERROR;
+			smtp_state.error=SMTP_UNEXPECTED;
+		}
+	}
+	return 0;
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

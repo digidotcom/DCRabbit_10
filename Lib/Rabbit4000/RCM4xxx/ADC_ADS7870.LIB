@@ -1,0 +1,1869 @@
+/*** BeginHeader */
+#ifndef __ADC_ADS7870_LIB
+#define __ADC_ADS7870_LIB
+/*** EndHeader */
+
+/* START LIBRARY DESCRIPTION *********************************************
+ADC_ADS7870.LIB
+
+DESCRIPTION:	Code for interfacing to ADS7870 SPI ADC.
+
+
+REVISION HISTORY:
+16-Aug-2006 tbc	Extracted from RCM40xx.LIB and RCM41xx.LIB
+04-Dec-2007	MRS	Corrected Gain Code comments to range from 1-20
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader */
+// ADC defines
+//////////
+// required for A/D conversion operations
+//	make changes below to match your application
+//////////
+
+#use "idblock_api.lib"
+
+#define ADCPOLLING
+
+#define ADCSXSR SBSR // Serial port status register
+#define ADCSXCR SBCR // Serial port control register
+#define ADCSXCRSHADOW SBCRShadow
+#define ADCSXER SBER // Serial port extended register
+#define ADCSXERSHADOW SBERShadow
+#define ADCSXDR SBDR // Serial port data register
+#define ADCSXDLR SBDLR // Serial port divider low register
+#define ADCSXDHR SBDHR // Serial port divider high register
+
+#define ADCCS_LOW    ioi ld a,(GOCR) $ set 1, a $ res 0, a $ ioi ld (GOCR), a
+#define ADCCS_HIGH   ioi ld a,(GOCR) $ or 0x03 $ ioi ld (GOCR), a
+
+#ifndef ADCPOLLING
+   #define ADCBUSYBIT 0
+#if (RCM4300_SERIES)
+   #define ADCBUSYDR  NAPCR
+#else
+   #define ADCBUSYDR  PEDR
+   #define ADCBUSYDDR PEDDR
+   #define ADCBUSYDDRSHADOW PEDDRShadow
+#endif
+#endif
+
+#ifdef ADC_SCLKBAUD
+ 	// Older versions incorrectly referred to the Bps (as in Bytes per second)
+	//  as the Baud rate, make sure previous uses still compile
+   #define  ADC_SCLKBRATE ADC_SCLKBAUD
+   #warnt  " ADC_SCLKBAUD has been changed to ADC_SCLKBRATE, "
+   #warnt  "   which represents the byte rate, not the bit (baud) rate."
+#endif
+
+#ifndef ADC_SCLKBRATE
+ #define ADC_SCLKBRATE 115200ul // initial serial clock byte rate
+// #define ADC_SCLKBRATE  57600ul  // initial serial clock byte rate
+// #define ADC_SCLKBRATE  19200ul  // initial serial clock byte rate
+#endif
+
+
+// internal osc, cclk=2.5Mhz, ref powered, buf powered, vref= 2.048
+#define AD_OSC_ENABLE 0x3e
+// internal osc, cclk=2.5Mhz, ref powered, buf powered, vref= 1.15
+//#define AD_OSC_ENABLE 0x3d
+// internal osc, cclk=2.5Mhz, ref powered, vref= 2.048
+//#define AD_OSC_ENABLE 0x3a
+
+#define AD_OSC_DISABLE 0x00   // vref=cclk, OSCE, REFE, BUFE all disabled
+
+
+//////////
+// do not make any changes below
+//////////
+#define ADDIRECT  0x80			// direct mode or bit
+#define ADREADINS	0x40			// read instruction or bit
+#define ADWRITEINS 0x00			// write instruction or bit
+#define ADLEN8		0x00			// 8-bit length instruction or bit
+#define ADLEN16	0x20			// 16-bit length instruction or bit
+#define ADMODE0	0x00			// mode 0 read instruction req'd or bit
+#define ADMODE1	0x04			// mode 1 MS byte first instruction or bit
+#define ADMODE2	0x08			// mode 2 LS byte first instruction or bit
+#define ADMODE3	0x0C			// mode 3 MS byte only instruction or bit
+
+// ADC instruction byte OR macros
+#define ADLSBYTE	0x00			// LS byte register
+#define ADMSBYTE	0x01			// MS byte register
+#define ADPGAREG	0x02			// PGA valid register
+#define ADCNTLREG	0x03			// AD control register
+#define ADGAINMUXREG	0x04		// Gain Mux register
+#define ADDIOSTATEREG 0x05		// Digital I/O state register
+#define ADDIOCNTLREG	0x06		// Digital I/O control register
+#define ADREFOSCREG	0x07		// Ref Osc register
+#define ADSICREG	0x18			// Serial interface control register
+#define ADIDREG	0x1F			// Id register
+
+// ADC write command byte OR macros
+#define ADSINGLE 0x08			// Single ended or line or bit
+#define ADDIFFNL 0x00			// Differential line or bit
+
+#define GAIN_1 0					// gaincode for gain=1
+#define GAIN_2 1					// gaincode for gain=2
+#define GAIN_4 2					// gaincode for gain=4
+#define GAIN_5 3					// gaincode for gain=5
+#define GAIN_8 4					// gaincode for gain=8
+#define GAIN_10 5					// gaincode for gain=10
+#define GAIN_16 6					// gaincode for gain=16
+#define GAIN_20 7					// gaincode for gain=20
+// (Note: prototype board has 11:1 resistor network)
+
+#ifdef ZB_SERIAL_PORT
+	#if ZB_SERIAL_PORT == 'B'
+		#define _XBEE_ON_B_
+		#define _SET_B_SYNC_FLAG	_SET_ZB_SYNC_FLAG
+	   #define _B_IS_ASYNC			_ZB_IS_ASYNC
+	   #define _B_IS_NOT_ASYNC		_ZB_IS_NOT_ASYNC
+	   #define _SET_B_SYNC_FLAG	_SET_ZB_SYNC_FLAG
+	   #define _SET_B_ASYNC_FLAG	_SET_ZB_ASYNC_FLAG
+   #endif
+#endif
+
+/*** EndHeader */
+
+/*** BeginHeader _msDelay */
+void _msDelay(unsigned int delay);
+/*** EndHeader */
+
+void _msDelay(unsigned int delay)
+{
+	auto unsigned long done_time;
+
+	done_time = MS_TIMER + delay;
+   while( (long) (MS_TIMER - done_time) < 0 );
+}
+
+/*** Beginheader __adcinitflag, __ad_readbackmode, __pwminitflag, __ad_oscenable */
+
+extern int __ad_readbackmode;
+extern int __adcinitflag;
+extern int __pwminitflag;
+extern int __ad_oscenable;
+extern int __numcycles_1us;
+
+
+/*** endheader */
+
+// Function execution flags
+int __ad_readbackmode;			//ADC read back mode
+int __adcinitflag;				//ADC init flag
+int __pwminitflag;				//PWM init flag
+int __ad_oscenable;				//AD oscillator enabled
+int __numcycles_1us;				//AD busy delay
+
+/***
+//------------------------------------------------------------------------
+//	The following section is taken from ADS7870 specification
+//	It describes address and registers for operation in this library
+//------------------------------------------------------------------------
+	ADS7870		State			Controller Function/State
+	----------	----------	-------------------------------------
+	LN0			Input			AIN0
+	LN1			Input			AIN1
+	LN2			Input			AIN2
+	LN3			Input			AIN3
+	LN4			Input			AIN4
+	LN5			Input			AIN5
+	LN6			Input			AIN6
+	LN7			Input			AIN7
+	/RESET		Input			Board reset device
+	RISE/FALL	Input			Tied-up
+	I/O0			Input			Tied-down
+	I/O1			Input			Tied-down
+	I/O2			Input			Tied-down
+	I/O3			Input			Tied-down
+	CONVERT		Input			Pulled-down when not driven
+	BUSY			Output		PE0; Pulled-down 1=converter is busy
+	CCLKCNTRL	Input			Tied-down; 0 state sets CCLK as input
+	CCLK			Input			Pulled-down; external conversion clock
+	SCLK			Input			PB0; serial data transfer clock
+	SDI			Input			PC4; 3-wire mode for serial data input
+	SDO			Output		PC5; serial data output /CS driven
+	/CS			Input			BUFEN pulled-up; active-low enables serial interface
+	BUFIN			Input       Driven by Vref
+	BUFOUT		Output      Driven by Vref
+============================================================
+Start Conversion Single 8-bit Instruction Byte (Direct Mode)
+same as Gain/Mux register
+============================================================
+Bits		Value and Function
+-------	----------------------------------------------
+D7			0=idle; 1=busy, write=start conversion
+D6-D4		xxx=PGA gain (see Gain/Mux register below)
+D3-D0		Input channel select (see table below)
+
+===========================================
+Gain/Mux Register
+===========================================
+Bits		Value and Function
+-------	--------------------------------------
+D7			0=idle; 1=busy, write=start conversion
+D6-D4		000=PGA gain 1
+			001=PGA gain 2
+			010=PGA gain 4
+			011=PGA gain 5
+			100=PGA gain 8
+			101=PGA gain 10
+			110=PGA gain 16
+			111=PGA gain 20
+D3-D0		Input channel select (see tableav)
+(Note: prototype board has 11:1 resistor network)
+
+==============================================
+Input	   	Differential positive and
+channel		negative input lines
+----------	----------------------------------
+	 0			+AIN0 -AIN1
+	 1			+AIN2 -AIN3
+	 2			+AIN4 -AIN5
+	 3			+AIN6 -AIN7
+	 4			-AIN0 +AIN1
+	 5			-AIN2 +AIN3
+	 6			-AIN4 +AIN5
+	 7			-AIN6 +AIN7
+
+Input			Single-ended positive input lines
+channel   	(negative input is ground)
+----------	-------------------------------
+	 8			+AIN0
+	 9			+AIN1
+	10			+AIN2
+	11			+AIN3
+	12			+AIN4
+	13			+AIN5
+	14			+AIN6
+	15			+AIN7
+
+============================================================
+Read/Write Instruction Byte (Register Mode)
+============================================================
+Bit		Name					  Value and Function
+-------	------------------  --------------------------------------
+D7			Mode select			  0=initiates a read or write operation
+D6			Read/Write select	  0=write operation; 1=read operation
+D5			Word length			  0=8-bit word; 1=16-bit word (2 bytes) that follows
+D4-D0		Register address	  (see table below)
+
+==========================================
+Register
+Address	R/W	Control Registers (see tables below)
+--------	----	--------------------------------
+0			R		A/D Output Data, LS Byte
+1  		R		A/D Output Data, MS Byte
+2  		R		PGA Valid Register
+3  		R/W	A/D Control Register
+4  		R/W	Gain/Mux Register
+5  		R/W	Digital I/O State Register
+6  		R/W	Digital I/O Control Register
+7  		R/W	Ref/Oscillator Control Register
+24 		R/W	Serial Interface Control
+31 		R		ID Register
+
+
+============================================================
+Control Registers
+============================================================
+===========================================
+A/D Output Data, LS Byte
+===========================================
+Bits		Value and Function
+-------	--------------------------------------------
+D7-D4		Four least sig bits of A/D conversion result
+D3-D1		Always 0
+D0			0=valid conversion,
+			1=overrange error (see PGA	valid	register)
+
+===========================================
+A/D Output Data, MS Byte
+===========================================
+Bits		Value and Function
+-------	---------------------------------------------
+D7-D0		Eight most sig bits of A/D conversion result
+
+===========================================
+PGA Valid Register
+===========================================
+Bits		Value and Function
+-------	------------------------------------------
+D7-D6		Always 0
+D5			1=voltage at "-" PGA output exceeds min value
+D4			1=voltage at "-" PGA output exceeds max value
+D3			1=voltage at "-" PGA output exceeds allowed value
+D2			1=voltage at "+" PGA output exceeds min value
+D1			1=voltage at "+" PGA output exceeds max value
+D0			1=voltage at "+" PGA output exceeds allowed value
+
+===========================================
+A/D Control Register
+===========================================
+Bits		Value and Function
+-------	-------------------------------------------
+D7-D4		Always 0
+D3-D2		00=read instruction required for ADC result
+			01=MS byte returned first
+			10=LS byte returnd first
+			11=only MS byte returned
+D1-D0 	00=division factor CCLK=1 (DCLK=CCLK)
+			01=division factor CCLK=2 (DCLK=CCLK/2)
+			10=division factor CCLK=4 (DCLK=CCLK/4)
+			11=division factor CCLK=8 (DCLK=CCLK/8)
+
+=================================================
+Digital I/O State Register
+=================================================
+Bits		Value and Function
+-------	----------------------------------------
+D7			0=idle; 1=busy, write=start conversion
+D6-D4		Always 0
+D3			I/O3; 0 or 1, input or output state
+D2			I/O2; 0 or 1, input or output state
+D1			I/O1; 0 or 1, input or output state
+D0			I/O0; 0 or 1, input or output state
+
+=================================================
+Digital I/O Control Register
+=================================================
+Bits		Value and Function
+-------	----------------------------------------
+D7-D4		Always 0
+D3			I/O3; 0=digital input, 1=digital output
+D2			I/O2; 0=digital input, 1=digital output
+D1			I/O1; 0=digital input, 1=digital output
+D0			I/O0; 0=digital input, 1=digital output
+
+=================================================
+Ref/Osc Control Register
+=================================================
+Bits		Value and Function
+-------	----------------------------------------
+D7-D6		Always 0
+D5			0=internal Vref source clock is CCLK pin
+			1=internal oscillator is source clock
+D4			0=CCLK is an input
+			1=CCLK outputs a 2.5MHz signal
+D3			0=reference is powered down, no current draw
+			1=reference is powered
+D2			0=buffer is powered down, no current draw
+			1=buffer is powered
+D1			0=Vref is 2.5V
+			1=Vref is 2.048
+D0			0=bit R2V determines value of ref voltage
+			1=Vref is 1.15V
+
+=================================================
+Serial Interface Control Register
+=================================================
+Bits		Value and Function
+-------	----------------------------------------------
+D7			0=serial interface receives and transmits MSB first
+			1=serial interface receives and transmits LSB first
+D6			0=3 wire mode
+			1=2 wire mode
+D5			0=DIN high impedance next inactive edge or CS inactive
+			1=DIN high impedance on last active SCLK edge of last data byte
+D4-D3		Always 0
+D2			0=DIN high impedance next inactive edge or CS inactive
+			1=DIN high impedance on last active SCLK edge of last data byte
+D1			0=3 wire mode
+			1=2 wire mode
+D0			0=serial interface receives and transmits MSB first
+			1=serial interface receives and transmits LSB first
+
+=================================================
+ID Register
+=================================================
+Bits		Value and Function
+-------	----------------------------------------------
+D7-D0		0x01 identifies revision of ADS7870
+
+//------------------------------------------------------------------------
+//------------------------------------------------------------------------
+***/
+
+
+#asm __root __nodebug
+;;;entry data byte must be in l
+_txadcbyte::
+	ld		a,l
+   ioi	ld (ADCSXDR),a		;load instruction byte first into transmit data reg
+	ld		a,0x8C				;use pport C
+	ioi	ld (ADCSXCR),a		;transmit byte
+.txshiftdone:					;wait for empty shift reg
+	ioi	ld	a,(ADCSXSR)
+	bit	2,a
+	jp		nz,.txshiftdone
+	ret
+#endasm
+
+
+#asm __root __nodebug
+;;;exit data byte will be in l
+_rxadcbyte::
+	ld		a,0x4C				;receive byte one
+	ioi	ld (ADCSXCR),a
+.rxdatafull:
+	ioi	ld	a,(ADCSXSR)
+	bit	7,a
+	jr		z,.rxdatafull
+	ioi	ld a,(ADCSXDR)		;get byte from receive data reg
+	ld		l,a
+	ret
+#endasm
+
+
+/*** BeginHeader  _ads7870driver */
+
+__root unsigned int _ads7870driver(unsigned int instructionbyte, unsigned int
+cmd);
+
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_ads7870driver					<ADC_ADS7870.LIB >
+
+SYNTAX:	unsigned int _ads7870driver(unsigned int instructionbyte,
+												unsigned int cmd);
+
+DESCRIPTION: This driver is specifically for the ADS7870 and is designed
+to serially clock an instruction byte and serially read from or write the
+command to the designated register of the ADS7870.
+Refer to an ADS7870 specification for addressing registers.
+
+PARAMETER1:  The instruction byte will initiate a read or write operation
+at eight or sixteen bits on the designated register address.
+
+PARAMETER2:	Command data configures the registers addressed
+by the instruction byte.  Enter 0 if performing a read operation.
+
+RETURN VALUE:	0 on write operations,
+					data value on read operations.
+
+SEE ALSO:		anaInConfig, swap, _txadcbyte, _rxadcbyte, RevBitTable
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+__root unsigned int _ads7870driver(unsigned int instructionbyte, unsigned int cmd)
+{
+#asm
+	ld		hl,(sp+@sp+instructionbyte)
+	ld		iy,.write8			;assume mainly 8-bit write operations
+	bit	6,l					;check for write or read operation
+	jr		z,.start				;
+	ld		iy,.read8
+	bit	5,l					;check for 16-bit or 8-bit read
+	jr		z,.start
+	ld		iy,.read16
+
+.start:
+	ADCCS_LOW					;assert /CS low
+
+	call	_txadcbyte			;send instruction byte to ads7870
+	jp		(iy)
+
+.read8:
+	call	_rxadcbyte			;received clocked data
+	ld		h,0					;return value in hl
+	jr		.done
+.read16:
+	call	_rxadcbyte			;received clocked data
+	ld		h,l					;return value in hl
+	call	_rxadcbyte			;received clocked data
+	jr		.done
+
+.write8:
+	ld		hl,(sp+@sp+cmd)
+	call	_txadcbyte			;send command byte as designated by instruction byte
+	ld		hl,0					;return 0
+
+.done:
+	ADCCS_HIGH					;assert /CS high
+#endasm
+}
+
+/*** BeginHeader anaInConfig */
+
+__root int anaInConfig(unsigned int regaddress, unsigned int cmd,
+                          long brate);
+
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+anaInConfig					<ADC_ADS7870.LIB >
+
+SYNTAX:	int anaInConfig(unsigned int instructionbyte,
+			                  unsigned int cmd, long brate)
+
+DESCRIPTION:	Use this function to configure the ADS7870 data acquistion
+device.  This function will address the ADS7870 in Register Mode only and
+will error if you try in Direct Mode.  Please refer to ADS7870 specification
+or user manual appendix for proper addressing and commands.
+
+	ADS7870		State			Controller Function/State
+	----------	----------	-------------------------------------
+	LN0			Input			AIN0
+	LN1			Input			AIN1
+	LN2			Input			AIN2
+	LN3			Input			AIN3
+	LN4			Input			AIN4
+	LN5			Input			AIN5
+	LN6			Input			AIN6
+	LN7			Input			AIN7
+	/RESET		Input			Board reset device
+	RISE/FALL	Input			Tied-up
+	I/O0			Input			Tied-down
+	I/O1			Input			Tied-down
+	I/O2			Input			Tied-down
+	I/O3			Input			Tied-down
+	CONVERT		Input			Pulled-down when not driven
+	BUSY			Output		PE0; Pulled-down 1=converter is busy
+	CCLKCNTRL	Input			Tied-down; 0 state sets CCLK as input
+	CCLK			Input			Pulled-down; external conversion clock
+	SCLK			Input			PB0; serial data transfer clock
+	SDI			Input			PC4; 3-wire mode for serial data input
+	SDO			Output		PC5; serial data output /CS driven
+	/CS			Input			BUFEN pulled-up; active-low enables serial interface
+	BUFIN			Input       Driven by Vref
+	BUFOUT		Output      Driven by Vref
+
+PARAMETER1:  The instruction byte will initiate a read or write operation
+at eight or sixteen bits on the designated register address.
+
+	ie:  	checkid = anaInConfig(0x5F, 0, 9600);	//read ID and set byte rate
+
+PARAMETER2:	Command data configures the registers addressed
+by the instruction byte.  Enter 0 if performing a read operation.
+
+	ie:	i = anaInConfig(0x07, 0x3b, 0);	//write ref/osc reg and enable
+
+PARAMETER3: Serial clock transfer rate of 9600 to 115200 bytes per second.
+				Brate must be	set on first call to this function. Enter 0 in
+            this parameter thereafter.
+
+	ie:  anaInConfig(0x00, 0x00, 9600);   //resets device and sets byte rate
+
+RETURN VALUE:	0 on write operations,
+					data value on read operations.
+               ADSPIBUSY (-4094) if SPI port already in use (RCM4300 only).
+                                 If more than _SPI_MAXTIME milliseconds
+                                 elapsed since the last attempt to grab the
+                                 port semaphore by the ADC, a fatal run-time
+                                 error -ETIME results.
+
+SEE ALSO:		anaInDriver, anaIn, brdInit
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int anaInConfig(unsigned int instructionbyte, unsigned int cmd, long
+brate)
+{
+#if (RCM4300_SERIES)
+   auto unsigned int rc;
+#else
+	auto long tdivisor;
+#endif
+
+	#GLOBAL_INIT {__ad_readbackmode = 0x00;}		//default Mode 0
+	#GLOBAL_INIT {__adcinitflag = FALSE;}
+
+#ifdef DEVELOPMENT_BOARD
+	#GLOBAL_INIT {__brdinitflag = FALSE;}
+
+	if	(__brdinitflag == FALSE)
+	{
+		exception(ERR_BADPARAMETER);
+		exit(ERR_BADPARAMETER);
+	}
+#endif
+	#ifdef _XBEE_ON_B_
+		if ( _B_IS_ASYNC )
+		{
+			if ( !brate )
+			{
+				brate = ADC_SCLKBRATE;
+			}
+			_SET_B_SYNC_FLAG();
+		}
+	#endif
+
+	///register mode only
+	if (instructionbyte&0x80) {
+		exception(ERR_BADPARAMETER);
+		exit(ERR_BADPARAMETER);
+	}
+
+#if (RCM4300_SERIES)
+   if (_SPIgetSemaphore(SPI_ADC)) return ADSPIBUSY;
+#else
+	if (brate > 0)
+	{
+		#ifdef _XBEE_ON_B_
+	      // Turn RTS off to stop transmission from XBee,
+	      _xb_rts(0);
+
+	      //deselect Radio to stop serial data from reaching it.
+	      _xb_cs(0);
+		#endif
+		// Setup PB0 (SCLK)
+		BitWrPortI(PBDDR, &PBDDRShadow, 1, 0);
+
+      // Setup PC4/PC5 as TXB/RXB
+		BitWrPortI(PCDDR, &PCDDRShadow, 1, 4);
+      BitWrPortI(PCFR,  &PCFRShadow,  1, 4);
+		BitWrPortI(PCDDR, &PCDDRShadow, 0, 5);
+      BitWrPortI(PCFR,  &PCFRShadow,  0, 5);
+
+#ifndef ADCPOLLING
+#ifdef ADCBUSYDDR
+      // ADC Busy line set to input
+      BitWrPortI (ADCBUSYDDR, &ADCBUSYDDRSHADOW, 0, ADCBUSYBIT);
+#endif
+#endif
+
+      // Use the new 4000 serial timers
+      tdivisor = (long)(2.0 * freq_divider * 19200.0/(float)brate + 0.5) - 1L;
+      WrPortI (ADCSXDLR, NULL, (char) tdivisor);
+      WrPortI (ADCSXDHR, NULL, (char) (tdivisor >> 8) | 0x80);
+
+		// use internal clock for serial B
+		WrPortI (ADCSXCR, &ADCSXCRSHADOW, 0x0C );
+		// Set clock polarity - Rising edge
+      WrPortI (ADCSXER, &ADCSXERSHADOW, 0x00);
+
+	}
+#endif
+   //set mode once
+	if (__adcinitflag==FALSE) {
+		__ad_readbackmode = 0x00;
+   	__adcinitflag=TRUE;
+	}
+
+	//check if addressing adc control register for read back mode
+	if ((instructionbyte&0x1f) == 0x03) {
+		__ad_readbackmode = cmd&0x0c;
+	}
+
+#if (RCM4300_SERIES)
+   rc = _ads7870driver(instructionbyte, cmd);
+   _SPIfreeSemaphore(SPI_ADC);
+   return rc;
+#else
+	return (_ads7870driver(instructionbyte, cmd));
+#endif
+}
+
+
+/*** BeginHeader anaInDriver */
+
+__root int anaInDriver(unsigned int cmd);
+
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+anaInDriver					<ADC_ADS7870.LIB >
+
+SYNTAX:			int anaInDriver(unsigned int cmd)
+
+DESCRIPTION:	Reads the voltage of an analog input channel by serial
+					clocking an 8-bit command to the ADS7870 device by its
+					Direct Mode method.  anaInConfig() use Register Mode method.
+					This function assumes that Mode1	(most significant byte first)
+					and the A/D device oscillator	have been enabled.  See
+					anaInConfig() for setup.
+
+					After the last data bit is transfered, the conversion
+					begins immediately.
+
+					An exception error will occur if Direct Mode bit D7 is
+					not set.
+
+					This function is non-reentrant
+
+PARAMETER1:		The cmd parameter contains a gain code and a channel code
+					as follows:
+
+					D7		D6 - D4		D3 - D0
+					--		---------	------------
+					1	   gain_code	channel_code
+
+	Use the following calculation and tables below to determine cmd:
+
+					cmd = 0x80 | (gain_code*16) + channel_code
+
+	===========================================
+	gain_code		gain
+	---------	-----------
+		 0				  1
+		 1				  2
+		 2				  4
+		 3				  5
+		 4				  8
+		 5				 10
+		 6				 16
+		 7				 20
+	===========================================
+   (Note: prototype board has 11:1 resistor network)
+
+	===========================================
+	channel_code	Differential input lines
+	------------	----------------------------
+		 0				+AIN0 -AIN1
+		 1				+AIN2 -AIN3
+		 2				+AIN4 -AIN5
+		 3				+AIN6 -AIN7
+		 4				-AIN0 +AIN1
+		 5				-AIN2 +AIN3
+		 6				-AIN4 +AIN5
+		 7				-AIN6 +AIN7
+
+						Single-ended		milli-Amp
+						input lines			input lines
+						-------------------------------
+		 8				+AIN0					+AIN0
+		 9				+AIN1 				+AIN1
+		10				+AIN2 				+AIN2
+		11				+AIN3 				+AIN3
+		12				+AIN4 				+AIN4
+		13				+AIN5 				+AIN5
+		14				+AIN6 				+AIN6
+		15				+AIN7					+AIN7
+	==============================================
+
+RETURN VALUE:	A value corresponding to the voltage on the analog input
+					channel, which will be:
+
+			  0 to 2047 	for 11-bit single ended conversions
+       -2048 to 2047    for 12-bit differential conversions
+    ADSPIBUSY (-4094)   if SPI port already in use (RCM4300 only).
+                        If more than _SPI_MAXTIME milliseconds
+                        elapsed since the last attempt to grab the
+                        port semaphore by the ADC, a fatal run-time
+                        error -ETIME results.
+
+	 ADTIMEOUT (-4095)	conversion incomplete, busy bit timeout
+   ADOVERFLOW (-4096)   overflow or out of range
+
+SEE ALSO:		anaInConfig, anaIn, brdInit
+
+END DESCRIPTION **********************************************************/
+#ifndef ADC_ONBOARD
+	#fatal "The target does not have an ADC onboard."
+#endif
+#ifndef ADC_RESOLUTION
+	#fatal "The target does not have an ADC onboard."
+#else
+ #if ADC_RESOLUTION <= 0 || ADC_RESOLUTION > 16
+	#fatal "ADC_RESOLUTION must be in the range [1,16] inclusive."
+ #endif
+#endif
+
+__nodebug
+__root int anaInDriver(unsigned int cmd)
+{
+   auto int val;
+
+	#GLOBAL_INIT {__adcinitflag = FALSE;}
+   #GLOBAL_INIT
+	{
+   	// Number of CPU cycles required to obtain a period of 1 usec
+		__numcycles_1us = (int)(19200L*32*freq_divider/1000000L)+1;
+ 	}
+
+
+	if (__adcinitflag == FALSE) {
+		exception(ERR_BADPARAMETER);
+		exit(ERR_BADPARAMETER);
+	}
+
+	///this is a direct mode only
+	if (!(cmd&0x80)) {
+		exception(ERR_BADPARAMETER);
+		exit(ERR_BADPARAMETER);
+	}
+
+#if (RCM4300_SERIES)
+   if (_SPIgetSemaphore(SPI_ADC)) return ADSPIBUSY;
+#endif
+
+#asm
+.start:
+	ADCCS_LOW							; assert /CS low
+
+	ld		hl,(sp+@sp+cmd)
+	call	_txadcbyte					; send instruction in hl to convert channel
+
+#ifndef REMOVE_AD_DEVBOARD_DELAY
+	#ifdef	ADCPOLLING
+	// __numcycles_1us = number clocks needed for 1 usec
+	ld		de,(__numcycles_1us)
+
+   // BC = (24 loop cycles / dwjnz_clk_cycles) + 1
+   ld		bc, 4
+
+   // Total busy delay:
+   // total_clocks = BC * __numcycles_1us
+   mul
+.busydelay:
+	dwjnz	.busydelay 		; dwjnz = 7 cycles
+   #endif
+#endif
+
+#ifndef ADCPOLLING
+	ld		b,10 ; 10
+.waitstart2:
+	ioi	ld	a,(ADCBUSYDR)			; 11
+	bit	ADCBUSYBIT,a				; 4
+	jr		nz,.waitnext2				; 7 look for conversion start logic high
+	djnz	.waitstart2
+	jr		.overtime
+.waitnext2:
+
+	ld		b,50 ; 50
+.waitend2:								;
+	ioi	ld	a,(ADCBUSYDR)			; 11
+	bit	ADCBUSYBIT,a				; 4
+	jr		z,.readfull16				; 7 look for conversion end logic low
+	djnz	.waitend2
+	jr		.overtime
+.readfull16:
+	call	_rxadcbyte					; read first byte in hl, assumes mode1 (MS byte
+											; first) and MSB
+	ld		e,l							; save upper byte
+	call	_rxadcbyte					; read LS byte
+	ld		h,e
+#else
+	// Verify that the chip is not busy by polling the register
+	ld		b, 50
+.waitpoll:
+	ld		hl, 0x0045					; Read DIG I/O State register from ADC Chip
+	call	_txadcbyte
+   call	_rxadcbyte
+   xor	a
+   or		L
+   and	0x80							; MSB = CNV/BSY Signal
+   jr		z, .readfull16
+   djnz	.waitpoll
+	ld		hl,ADTIMEOUT
+	jr		.done
+.readfull16:
+	ld		hl, 0x0060					; Read Converted Data
+	call	_txadcbyte
+	call	_rxadcbyte					; read first byte in hl, assumes mode1 (MS byte
+											; first) and MSB
+	ld		e,l							; save upper byte
+	call	_rxadcbyte					; read LS byte
+   ld		h,l
+	ld		l,e
+#endif
+
+	ADCCS_HIGH							; assert /CS high
+
+.checkovr:								; check for valid or analog over-range
+	bit	0,l
+	jr		z,.done
+.overrange:
+	ld		hl,ADOVERFLOW				; over-range  -1
+	jr		.done
+.overtime:
+	ADCCS_HIGH							; assert /CS high
+
+	ld		hl,ADTIMEOUT					; over-range  -2
+.done:
+	ld 	(sp+@sp+val), hl
+#endasm
+
+#if (RCM4300_SERIES)
+   _SPIfreeSemaphore(SPI_ADC);
+#endif
+	if(val != ADOVERFLOW && val != ADTIMEOUT) {           // check for errors
+      val = ((val < 0) ? (0xFFFF << ADC_RESOLUTION) : 0) |
+					(val >> (16-ADC_RESOLUTION));
+      // If single ended reading, do not allow negative values
+      if (((cmd & 15) > 7) && (val < 0)) val = 0;
+   }
+  	return val;
+}
+
+
+/*** BeginHeader anaIn */
+
+int anaIn (unsigned int channel, int opmode, int gaincode);
+
+#define ADOVERFLOW -4096	//ADC overflow/out of range error code
+#define ADTIMEOUT  -4095
+#define ADSPIBUSY  -4094
+#define SE_DEVCHAN 0x08		//Single-ended and milli-Amp device channel
+
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+anaIn							<ADC_ADS7870.LIB >
+
+SYNTAX:	  int anaIn(unsigned int channel, int opmode, int gaincode);
+
+DESCRIPTION:	Reads the value of an analog input channel using the
+					direct method of addressing the ADS7870 A/D converter.
+
+					First time call of this function will enable the
+					A/D converter and will take approximately 1 second to
+					ensure the device capacitor is fully charged.
+
+					This function is non-reentrant.
+
+PARAMETER1:		Depending on circuitry used, a channel number 0 to 7,
+					for AIN0-AIN7.  Channels marked with an asterisk "*",
+					are not used on the prototyping board.
+
+	==========================================================
+	channel   	Single	Differential 	milli-Amp
+	----------	----------------------------------------------
+		 0			+AIN0 	+AIN0 -AIN1 	+AIN0*
+		 1			+AIN1 	+AIN1 -AIN0*	+AIN1*
+		 2			+AIN2 	+AIN2 -AIN3		+AIN2*
+		 3			+AIN3 	+AIN3 -AIN2*	+AIN3
+		 4			+AIN4 	+AIN4 -AIN5		+AIN4
+		 5			+AIN5 	+AIN5 -AIN4*	+AIN5
+		 6			+AIN6 	+AIN6 -AIN7*	+AIN6
+		 7			+AIN7 	+AIN7 -AIN6* 	+AIN7*
+	==========================================================
+	* Channels not used on prototyping board
+
+
+PARAMETER2:		Mode of operation depending on circuit design:
+
+					SINGLE  	,single-ended input line
+					DIFF		,differential input line
+					mAMP		,milli-Amp input line
+
+PARAMETER3:  gain code of 0 to 7.  See below.
+
+	========================================
+	gain_code		gain
+	---------	-----------
+		 0				  1
+		 1				  2
+		 2				  4
+		 3				  5
+		 4				  8
+		 5				 10
+		 6				 16
+		 7				 20
+	=========================================
+   (Note: prototype board has 11:1 resistor network)
+
+RETURN VALUE:	A value corresponding to the voltage on the analog input
+					channel, which will be:
+
+			  0 to 2047 	for 11-bit single ended conversions
+       -2048 to 2047    for 12-bit differential conversions
+    ADSPIBUSY (-4094)   if SPI port already in use (RCM4300 only).
+                        If more than _SPI_MAXTIME milliseconds
+                        elapsed since the last attempt to grab the
+                        port semaphore by the ADC, a fatal run-time
+                        error -ETIME results.
+	 ADTIMEOUT (-4095)	conversion incomplete, busy bit timeout
+   ADOVERFLOW (-4096)   overflow or out of range
+
+SEE ALSO:		anaIn, anaInConfig, anaInDriver
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int anaIn(unsigned int channel, int opmode, int gaincode)
+{
+	auto unsigned char adc_cmd;
+	auto int rdata;
+   auto int i;
+	auto long brate;
+
+	#GLOBAL_INIT {__adcinitflag = FALSE;}
+	#GLOBAL_INIT {__ad_readbackmode = 0x00;}
+	#GLOBAL_INIT {__ad_oscenable = FALSE;}
+
+	if	(__adcinitflag == FALSE) {
+		exception(ERR_BADPARAMETER);
+		exit(ERR_BADPARAMETER);
+	}
+
+	if (channel < 0 || channel > MAXAIN) {
+		exception(ERR_BADPARAMETER);
+		exit(ERR_BADPARAMETER);
+	}
+
+	if ((gaincode < 0) || (gaincode > 7)|| (opmode < 0) || (opmode > 2)) {
+		exception(ERR_BADPARAMETER);
+		exit(ERR_BADPARAMETER);
+	}
+
+	#ifdef _XBEE_ON_B_
+	if ( _B_IS_ASYNC )
+	{
+		_SET_B_SYNC_FLAG();
+		brate = ADC_SCLKBRATE;
+		anaSyncConfig(brate);
+	}
+	#else
+		brate = 0;
+		#if (RCM4300_SERIES)
+   		if (_SPIgetSemaphore(SPI_ADC)) return ADSPIBUSY;
+   	#endif
+	#endif
+
+#ifdef ADCPOLLING
+	if	(__ad_readbackmode != ADMODE0) {
+		//make it Mode 0, most significant byte first
+		anaInConfig(ADWRITEINS|ADLEN8|ADCNTLREG, ADMODE0, brate);
+	}
+#else
+	if	(__ad_readbackmode != ADMODE1) {
+		//make it Mode 1, most significant byte first
+		anaInConfig(ADWRITEINS|ADLEN8|ADCNTLREG, ADMODE1, brate);
+	}
+#endif
+
+	if (__ad_oscenable == FALSE) {
+		__ad_oscenable = TRUE;
+		// enable ref/osc reg  2.048Vref
+		anaInConfig(ADWRITEINS|ADLEN8|ADREFOSCREG, AD_OSC_ENABLE, brate);
+		_msDelay(1000);						//allow 1 sec once only to charge up cap
+      adc_cmd = ADDIRECT|(gaincode*16+channel);
+      // Clear Rcv Status
+   	for(i=0; i<4; i++)
+   	{
+   		#asm
+  			ioi ld	a, (ADCSXDR)		;Do dummy read to clear rcv status
+    		#endasm
+   	}
+      // Do an one time dummy read of A/D to clear the pipeline
+		anaInDriver(adc_cmd);
+	}
+
+	//set up channels for device conversion
+	if (opmode == DIFF) {
+		channel = diffchan[channel];
+	}
+	else {
+		channel |= SE_DEVCHAN;			//single-ended and milli-amp positions
+	}
+
+	adc_cmd = ADDIRECT|(gaincode*16+channel);
+	// Return the rawdata value from the given AD channel.
+
+	// Return the rawdata value from the given AD channel.
+	rdata = anaInDriver(adc_cmd);
+#if (RCM4300_SERIES)
+   _SPIfreeSemaphore(SPI_ADC);
+#endif
+	return rdata;
+}
+
+
+/*** BeginHeader _adcCalibS, _adcCalibM, _adcCalibD, diffchan, multable,
+                 muldiv */
+
+//reserve 2K bytes of space below top of flash
+#ifndef ZWORLD_RESERVED_SIZE
+#define ZWORLD_RESERVED_SIZE 0x0800
+#endif
+
+// Offset into flash userblock for the calibration constants start
+// single-ended
+#define ADC_CALIB_ADDRS	(4096*GetIDBlockSize()-ZWORLD_RESERVED_SIZE)
+// differential
+#define ADC_CALIB_ADDRD	(ADC_CALIB_ADDRS+sizeof(_adcCalibS))
+// milli-amp
+#define ADC_CALIB_ADDRM	(ADC_CALIB_ADDRD+sizeof(_adcCalibD))
+
+#define CALIB_START ADC_CALIB_ADDRS		//start of calibrations
+#define CALIB_END (ADC_CALIB_ADDRM+sizeof(_adcCalibM))  //end of calibrations
+
+#define MAXAIN 7
+#define ADCHANNELS 8	//total number of AD single-ended channels
+#define ADCHANNELD 8	//total number of AD differential channels
+#define ADCHANNELM 8	//total number of AD milli-Amp channels
+#define ADCHANNELALL ADCHANNELS+ADCHANNELD+ADCHANNELM  //total channels
+
+#define SINGLE	0
+#define DIFF	1
+#define mAMP	2
+
+//ADC calibration constant data structure
+typedef struct
+{
+	float kconst;			// kconst = (volt2-volt1)/(data2-data1)
+	float offset;				// offset = kconst*data2 - volt2
+} __adccalib;
+
+extern __adccalib _adcCalibS[ADCHANNELS][8];
+extern __adccalib _adcCalibD[ADCHANNELD][8];
+extern __adccalib _adcCalibM[ADCHANNELM];
+
+extern const char multable[8];
+extern const float muldiv;
+extern const char diffchan[8];
+
+/*** EndHeader */
+
+// Array for the gain and offset values for each A/D channel
+__adccalib _adcCalibS[ADCHANNELS][8];
+__adccalib _adcCalibD[ADCHANNELD][8];
+__adccalib _adcCalibM[ADCHANNELM];
+
+// Gain multiplier table related to gain codes
+const char multable[8] = {1,2,4,5,8,10,16,20};
+#ifndef ADCMULDIV
+const float muldiv = 1.0;
+#else
+const float muldiv = ADCMULDIV;
+#endif
+
+// Differential channel table translates to device channels
+const char diffchan[8] = {0,4,1,5,2,6,3,7};
+
+/*** BeginHeader anaInCalib */
+
+int anaInCalib(int channel, int opmode, int gaincode,
+						int value1, float volts1,int value2, float volts2);
+
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+anaInCalib					<ADC_ADS7870.LIB >
+
+SYNTAX:	int anaInCalib(int channel, int opmode, int gaincode,
+						int value1, float volts1,int value2, float volts2);
+
+DESCRIPTION:	Calibrates the response of the ADC channel desired as a
+               linear function using the two conversion points provided.
+
+               Values are calulated and placed into global tables
+               _adcCalibS, _adcCalibD and adcCalibM to be later store
+               into simulated eeprom using the function anaInEEWr().
+
+               Each channel will have the following information:
+						a linear constant,
+						a voltage offset.
+
+PARAMETER1:		Depending on circuitry used, a channel number 0 to 7,
+					for AIN0-AIN7.   Channels marked with an asterisk "*",
+					are NOT accessible on the prototyping board.
+
+	==========================================================
+	channel   	Single	Differential 	milli-Amp
+	----------	----------------------------------------------
+		 0			+AIN0 	+AIN0 -AIN1 	+AIN0*
+		 1			+AIN1 	+AIN1 -AIN0*	+AIN1*
+		 2			+AIN2 	+AIN2 -AIN3		+AIN2*
+		 3			+AIN3 	+AIN3 -AIN2*	+AIN3
+		 4			+AIN4 	+AIN4 -AIN5		+AIN4
+		 5			+AIN5 	+AIN5 -AIN4*	+AIN5
+		 6			+AIN6 	+AIN6 -AIN7*	+AIN6
+		 7			+AIN7 	+AIN7 -AIN6* 	+AIN7*
+	==========================================================
+
+
+PARAMETER2:		mode of operation:
+
+					SINGLE  	,single-ended input line
+					DIFF		,differential input line
+					mAMP		,milli-Amp input line
+
+PARAMETER3:  gain code of 0 to 7.  See below.
+
+	========================================
+	gain_code		gain
+	---------	-----------
+		 0				  1
+		 1				  2
+		 2				  4
+		 3				  5
+		 4				  8
+		 5				 10
+		 6				 16
+		 7				 20
+	=========================================
+   (Note: prototype board has 11:1 resistor network)
+
+PARAMETER4:		The first ADC value (0 - 2047).
+PARAMETER5:		The voltage corresponding to the first ADC value
+					(0 to +20v or 4 to 20 mA).
+PARAMETER6:		The second ADC value (0 - 2047).
+PARAMETER7:		The voltage corresponding to the second ADC value
+					(0 to +20v or 4 to 20 mA).
+
+RETURN VALUE:	0, if sucessful.
+					-1, if not able to make calibration constants.
+
+SEE ALSO:		anaIn, anaInVolts, anaInmAmps, anInDiff,
+					anaIncalib, brdInit
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int anaInCalib(int channel, int opmode, int gaincode,
+						int value1, float volts1,int value2, float volts2)
+{
+	auto float os, kc;
+
+	#GLOBAL_INIT {__adcinitflag = FALSE;}
+
+	if	(__adcinitflag == FALSE)
+	{
+		exception(ERR_BADPARAMETER);
+		exit(ERR_BADPARAMETER);
+	}
+
+	if (channel < 0 || channel > MAXAIN)
+	{
+		exception(ERR_BADPARAMETER);
+		exit(ERR_BADPARAMETER);
+	}
+
+	if ((gaincode < 0) || (gaincode > 7) || (opmode < 0) || (opmode > 2))
+	{
+		exception(ERR_BADPARAMETER);
+		exit(ERR_BADPARAMETER);
+	}
+
+	if( (volts1 == volts2) || (value1 == value2) ) return -1;
+
+	os = (volts2*value1 - volts1*value2)/(volts2-volts1);
+   kc = (volts2-volts1)/(value2-value1);
+
+	if (opmode == SINGLE)
+	{
+		_adcCalibS[channel][gaincode].offset = os;
+		_adcCalibS[channel][gaincode].kconst = kc;
+	}
+	else
+	{
+		if (opmode == DIFF)
+		{
+			_adcCalibD[channel][gaincode].offset = os;
+			_adcCalibD[channel][gaincode].kconst = kc;
+		}
+		else  //milli-amp operation
+		{
+			_adcCalibM[channel].offset = os;
+			_adcCalibM[channel].kconst = kc;
+		}
+	}
+	return 0;
+}
+
+
+/*** BeginHeader anaInVolts */
+
+float anaInVolts(unsigned int channel, unsigned int gaincode);
+
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+anaInVolts					<ADC_ADS7870.LIB >
+
+SYNTAX:			float anaInVolts(unsigned int channel, unsigned int gaincode)
+
+DESCRIPTION:	Reads the state of a single-ended analog input channel
+					and uses the previously set calibration constants to
+					convert it to volts.
+
+
+PARAMETER1:		Depending on circuitry used, a channel of 0 to 7, for AIN0 to
+					AIN7.  See below.
+
+	==============================================
+					Single-ended positive input lines
+	channel		(negative input is ground)
+	----------	-------------------------------
+		 0			+AIN0,
+		 1			+AIN1,
+		 2			+AIN2,
+		 3			+AIN3,
+		 4			+AIN4,
+		 5			+AIN5,
+		 6			+AIN6,
+		 7			+AIN7,
+	==============================================
+
+
+PARAMETER2:  gain code of 0 to 7.  See below.
+
+	========================================
+	gain_code		gain
+	---------	-----------
+		 0				  1
+		 1				  2
+		 2				  4
+		 3				  5
+		 4				  8
+		 5				 10
+		 6				 16
+		 7				 20
+	=========================================
+   (Note: prototype board has 11:1 resistor network)
+
+
+RETURN VALUE:	A voltage value corresponding to the voltage on the analog
+					input channel.
+               ADSPIBUSY (-4094)   if SPI port already in use (RCM4300 only).
+                                   If more than _SPI_MAXTIME milliseconds
+                                   elapsed since the last attempt to grab the
+                                   port semaphore by the ADC, a fatal run-time
+                                   error -ETIME results.
+               ADTIMEOUT (-4095)	 conversion incomplete, busy bit timeout
+               ADOVERFLOW (-4096) overflow or out of range
+
+SEE ALSO:		anaInCalib, anaIn, anaInmAmps,
+					brdInit
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+float anaInVolts(unsigned int channel, unsigned int gaincode)
+{
+	auto int rawdata;
+	auto float value;
+
+	#GLOBAL_INIT {__adcinitflag = FALSE;}
+
+	if	(__adcinitflag == FALSE)
+	{
+		exception(ERR_BADPARAMETER);
+		exit(ERR_BADPARAMETER);
+	}
+
+	if (channel < 0 || channel > MAXAIN)
+	{
+		exception(ERR_BADPARAMETER);
+		exit(ERR_BADPARAMETER);
+	}
+
+	rawdata = anaIn(channel, SINGLE, gaincode);
+	if (rawdata < -4000) {		  // check for error condition
+		return rawdata;           // if detected, return error
+   }
+
+	value = (rawdata - _adcCalibS[channel][gaincode].offset) *
+				(_adcCalibS[channel][gaincode].kconst);
+	if (value <= 0.00)
+		return (0.000);
+	else
+		return value;
+}
+
+
+
+/*** BeginHeader anaInDiff */
+
+float anaInDiff(unsigned int channel, unsigned int gaincode);
+
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+anaInDiff 					<ADC_ADS7870.LIB >
+
+SYNTAX:			float anaInDiff(unsigned int channel, unsigned int gaincode)
+
+DESCRIPTION:	Reads the state of differential analog input channels and
+					uses the	previously set calibration constants to convert
+					it to	volts.
+
+
+PARAMETER1:		Depending on circuitry used, a channel of 0 to 7, for AIN0 to
+					AIN7 as indicated by the positive input line.  See below.
+
+	==============================================
+	channel		Differential input lines
+	----------	-------------------------------
+		 0			+AIN0 & -AIN1,	+-20V*
+		 2			+AIN2 & -AIN3,	+-20V*
+		 4			+AIN4 & -AIN5,	+-20V*
+		 6			+AIN6 & -AIN7
+		 1			+AIN1 & -AIN0
+		 3			+AIN3 & -AIN2
+		 5			+AIN5 & -AIN4
+		 7			+AIN7 & -AIN6
+	==============================================
+
+
+PARAMETER2:  gain code of 0 to 7.  See below.
+
+	========================================
+	gain_code		gain
+	---------	-----------
+		 0				  1
+		 1				  2
+		 2				  4
+		 3				  5
+		 4				  8
+		 5				 10
+		 6				 16
+		 7				 20
+	=========================================
+   (Note: prototype board has 11:1 resistor network)
+
+RETURN VALUE:	A voltage value corresponding to the voltage on the analog
+					input channel.
+               ADSPIBUSY (-4094)  if SPI port already in use (RCM4300 only).
+                                  If more than _SPI_MAXTIME milliseconds
+                                  elapsed since the last attempt to grab the
+                                  port semaphore by the ADC, a fatal run-time
+                                  error -ETIME results.
+               ADTIMEOUT (-4095)	 conversion incomplete, busy bit timeout
+               ADOVERFLOW (-4096) overflow or out of range
+
+SEE ALSO:		anaInCalib, anaIn, anaInmAmps,
+					brdInit
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+float anaInDiff(unsigned int channel, unsigned int gaincode)
+{
+	auto int rawdata;
+	auto float value;
+
+	#GLOBAL_INIT {__adcinitflag = FALSE;}
+
+	if	(__adcinitflag == FALSE)
+	{
+		exception(ERR_BADPARAMETER);
+		exit(ERR_BADPARAMETER);
+	}
+
+	if (channel < 0 || channel > MAXAIN)
+	{
+		exception(ERR_BADPARAMETER);
+		exit(ERR_BADPARAMETER);
+	}
+
+	rawdata = anaIn(channel, DIFF, gaincode);
+	if (rawdata < -4000) {		  // check for error condition
+		return rawdata;           // if detected, return error
+   }
+
+	value = (rawdata - _adcCalibD[channel][gaincode].offset) *
+				(_adcCalibD[channel][gaincode].kconst);
+	return value;
+}
+
+/*** BeginHeader anaInmAmps */
+
+float anaInmAmps(unsigned int channel);
+
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION *************************************************
+anaInmAmps					<ADC_ADS7870.LIB >
+
+SYNTAX:			float anaInmAmps(unsigned int channel)
+
+DESCRIPTION:	Reads the state of an analog input channel and uses the
+					previously set calibration constants to convert it to current.
+
+PARAMETER1:		Depending on circuitry used, a channel of 0 to 7, for AIN0 to
+					AIN7 as indicated by the positive input line.  See below.
+					Channels marked with an asterisk "*" are accessible on the
+					prototyping board only.
+
+	=============================================
+	channel		4 to 20 mA input lines
+	----------	-------------------------------
+		 0			+AIN0
+		 1			+AIN1
+		 2			+AIN2
+		 3			+AIN3*
+		 4			+AIN4*
+		 5			+AIN5*
+		 6			+AIN6*
+		 7			+AIN7
+	=============================================
+
+
+RETURN VALUE:	A current value corresponding	to the current on	the analog
+					input channel of range 4.00 to 20.00 milli-Amps;
+    				ADSPIBUSY (-4094)  if SPI port already in use (RCM4300 only).
+                        			 If more than _SPI_MAXTIME milliseconds
+                        			 elapsed since the last attempt to grab the
+                        			 port semaphore by the ADC, a fatal run-time
+                        			 error -ETIME results.
+               ADTIMEOUT (-4095)	 conversion incomplete, busy bit timeout
+               ADOVERFLOW (-4096) overflow or out of range
+
+SEE ALSO:		anaInCalib, anaIn, anaInVolts
+
+
+END DESCRIPTION **************************************************************/
+
+__nodebug
+float anaInmAmps(unsigned int channel)
+{
+	auto int rawdata;
+	auto float value;
+
+	#GLOBAL_INIT {__adcinitflag = FALSE;}
+
+	if	(__adcinitflag == FALSE)
+	{
+		exception(ERR_BADPARAMETER);
+		exit(ERR_BADPARAMETER);
+	}
+
+	if (channel < 0 || channel > (MAXAIN-ADCHANNELM))
+	{
+		exception(ERR_BADPARAMETER);
+		exit(ERR_BADPARAMETER);
+	}
+
+	rawdata = anaIn(channel, mAMP, GAIN_4);
+	if (rawdata < -4000) {		  // check for error condition
+		return rawdata;           // if detected, return error
+   }
+
+	value = (rawdata - _adcCalibM[channel].offset)*(_adcCalibM[channel].kconst);
+	if (value <= 0.00)
+		return (0.000);
+	else
+		return value;
+
+}
+
+
+/*===================================================================
+	The following functions are for reading/writing the ADC
+	calibrations constants.
+===================================================================*/
+
+/*** BeginHeader anaInEERd */
+
+__root int anaInEERd(unsigned int channel, unsigned int opmode, unsigned int
+gaincode);
+#define ALLCHAN ADCHANNELALL
+
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+anaInEERd					<ADC_ADS7870.LIB >
+
+SYNTAX:			root int anaInEERd(unsigned int channel, unsigned int opmode,
+						unsigned int gaincode);
+
+DESCRIPTION:	Reads the calibration constants, gain and offset, from
+					designated positions in flash	--previously placed within
+					the top 2K reserved block of flash simulated eeprom.
+					Depending on flash size, found at the following macro
+					locations:
+
+					ADC_CALIB_ADDRS, address start of single-ended analog
+							input channels
+					ADC_CALIB_ADDRD, address start of differential analog
+							input channels
+					ADC_CALIB_ADDRM, address start of milli-amp analog
+							input channels
+
+					--and placed into global tables _adcCalibS, _adcCalibD,
+					_adcCalibM for analog inputs.
+
+               See the user manual for the size of the reserved UserBlock
+               memory area.
+
+					This function cannot be run in RAM and is non-reentrant.
+
+PARAMETER1:		Depending on circuitry used, a channel number 0 to 7,
+					for AIN0-AIN7. Use the macro ALLCHAN to read a block
+					of single-ended, differential, or milli-Amp constants.
+					Channels marked with an asterisk "*", are NOT accessible
+					on the prototyping board.
+
+	==========================================================
+	channel   	Single	Differential 	milli-Amp
+	----------	----------------------------------------------
+		 0			+AIN0 	+AIN0 -AIN1 	+AIN0*
+		 1			+AIN1 	+AIN1 -AIN0*	+AIN1*
+		 2			+AIN2 	+AIN2 -AIN3		+AIN2*
+		 3			+AIN3 	+AIN3 -AIN2*	+AIN3
+		 4			+AIN4 	+AIN4 -AIN5		+AIN4
+		 5			+AIN5 	+AIN5 -AIN4*	+AIN5
+		 6			+AIN6 	+AIN6 -AIN7*	+AIN6
+		 7			+AIN7 	+AIN7 -AIN6* 	+AIN7*
+	ALLCHAN
+	==========================================================
+
+
+PARAMETER2:		mode of operation:
+
+					SINGLE  	,single-ended input line
+					DIFF		,differential input line
+					mAMP		,milli-Amp input line
+
+PARAMETER3:  gain code of 0 to 7.  See below.  For ALLCHAN
+				 parameter, gaincode is ignored.
+
+	========================================
+	gain_code		gain
+	---------	-----------
+		 0				  1
+		 1				  2
+		 2				  4
+		 3				  5
+		 4				  8
+		 5				 10
+		 6				 16
+		 7				 20
+	=========================================
+   (Note: prototype board has 11:1 resistor network)
+
+RETURN VALUE:	 0, If successful.
+					-1, invalid address or range.
+
+SEE ALSO:		anaInEEWr, anaInCalib
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int anaInEERd(unsigned int channel, unsigned int opmode, unsigned int gaincode)
+{
+	auto int	status;
+	auto unsigned int offset;
+
+#ifdef DEVELOPMENT_BOARD
+	#GLOBAL_INIT {__brdinitflag = FALSE;}
+
+	if	(__brdinitflag == FALSE)
+	{
+		exception(ERR_BADPARAMETER);
+		exit(ERR_BADPARAMETER);
+	}
+#endif
+	if ((channel < 0 || channel > MAXAIN) && channel != ALLCHAN)
+	{
+		exception(ERR_BADPARAMETER);
+		exit(ERR_BADPARAMETER);
+	}
+
+	// Calculate the offset into the user block of where the calibration
+	// constants are stored for a given A/D channel.
+	// and read calibration constants from flash
+	switch (opmode)
+	{
+		case SINGLE:
+			if (channel == ALLCHAN)
+			{
+				memset(_adcCalibS, 0, sizeof(_adcCalibS));				//clear table
+				status=readUserBlock(&_adcCalibS, ADC_CALIB_ADDRS,
+					sizeof(_adcCalibS));	//get whole block
+			}
+			else
+			{
+				offset = ADC_CALIB_ADDRS;
+				offset += ((char*) &_adcCalibS[channel][gaincode] -
+					(char*)_adcCalibS);
+				status = readUserBlock(&_adcCalibS[channel][gaincode], offset,
+					sizeof(_adcCalibS[channel][gaincode]));
+			}
+			break;
+		case DIFF:
+			if (channel == ALLCHAN)
+			{
+				memset(_adcCalibD, 0, sizeof(_adcCalibD));				//clear table
+				status=readUserBlock(&_adcCalibD, ADC_CALIB_ADDRD,
+					sizeof(_adcCalibD));	//get whole block
+			}
+			else
+			{
+				offset = ADC_CALIB_ADDRD;
+				offset += ((char*) &_adcCalibD[channel][gaincode] -
+					(char*)_adcCalibD);
+				status = readUserBlock(&_adcCalibD[channel][gaincode], offset,
+					sizeof(_adcCalibD[channel][gaincode]));
+			}
+			break;
+		case mAMP:
+			if (channel == ALLCHAN)
+			{
+				memset(_adcCalibM, 0, sizeof(_adcCalibM));				//clear table
+				status=readUserBlock(&_adcCalibM, ADC_CALIB_ADDRM,
+					sizeof(_adcCalibM));	//get whole block
+			}
+			else
+			{
+				offset = ADC_CALIB_ADDRM;
+				offset += ((char*) &_adcCalibM[channel] - (char*)_adcCalibM);
+				status = readUserBlock(&_adcCalibM[channel], offset,
+					sizeof(_adcCalibM[channel]));
+			}
+			break;
+	}
+
+	return (status);
+}
+
+/*** BeginHeader anaInEEWr */
+int anaInEEWr(unsigned int channel, unsigned int opmode,
+                   unsigned int gaincode);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+anaInEEWr					<ADC_ADS7870.LIB>
+
+SYNTAX:			int anaInEEWr(unsigned int channel, unsigned int opmode,
+						unsigned int gaincode);
+
+DESCRIPTION:	Writes the calibration constants, gain and offset,
+					--previously placed into global tables _adcCalibS,
+					_adcCalibD,	and _adcCalibM for analog inputs, see
+					anaCalib()-- to designated positions within the top
+					2K reserved block of flash simulated eeprom.
+					Depending on flash size, to the following macro
+					locations:
+
+					ADC_CALIB_ADDRS, address start of single-ended analog
+							input channels
+					ADC_CALIB_ADDRD, address start of differential analog
+							input channels
+					ADC_CALIB_ADDRM, address start of milli-amp analog
+							input channels
+
+ 	            See the user manual for the size of the reserved UserBlock
+               memory area.
+
+					This function cannot be run in RAM and is non-reentrant.
+
+PARAMETER1:		Depending on circuitry used, a channel number 0 to 7,
+					for AIN0-AIN7. Use the macro ALLCHAN to write a block
+					of single-ended, differential, or milli-Amp constants.
+					Channels marked with an asterisk "*", are NOT accessible
+					on the prototyping board.
+
+	==========================================================
+	channel   	Single	Differential 	milli-Amp
+	----------	----------------------------------------------
+		 0			+AIN0 	+AIN0 -AIN1 	+AIN0*
+		 1			+AIN1 	+AIN1 -AIN0*	+AIN1*
+		 2			+AIN2 	+AIN2 -AIN3		+AIN2*
+		 3			+AIN3 	+AIN3 -AIN2*	+AIN3
+		 4			+AIN4 	+AIN4 -AIN5		+AIN4
+		 5			+AIN5 	+AIN5 -AIN4*	+AIN5
+		 6			+AIN6 	+AIN6 -AIN7*	+AIN6
+		 7			+AIN7 	+AIN7 -AIN6* 	+AIN7*
+	ALLCHAN
+	==========================================================
+
+PARAMETER2:		mode of operation:
+
+					SINGLE  	,single-ended input line
+					DIFF		,differential input line
+					mAMP		,milli-Amp input line
+
+PARAMETER3:  gain code of 0 to 7.  See below.  For ALLCHAN
+				 parameter, gaincode is ignored.
+
+	========================================
+	gain_code		gain
+	---------	-----------
+		 0				  1
+		 1				  2
+		 2				  4
+		 3				  5
+		 4				  8
+		 5				 10
+		 6				 16
+		 7				 20
+	=========================================
+   (Note: prototype board has 11:1 resistor network)
+
+RETURN VALUE:	 0, successful write to simulated eeprom.
+					-1, invalid address or range.
+
+SEE ALSO:		anaInEERd, anaInCalib
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int anaInEEWr(unsigned int channel, unsigned int opmode, unsigned int gaincode)
+{
+	auto int	status;
+	auto unsigned int offset;
+
+#ifdef DEVELOPMENT_BOARD
+	#GLOBAL_INIT {__brdinitflag = FALSE;}
+
+	if	(__brdinitflag == FALSE)
+	{
+		exception(ERR_BADPARAMETER);
+		exit(ERR_BADPARAMETER);
+	}
+#endif
+
+	if ((channel < 0 || channel > MAXAIN) && channel != ALLCHAN)
+	{
+		exception(ERR_BADPARAMETER);
+		exit(ERR_BADPARAMETER);
+	}
+
+	// Calculate the offset into the user block of where the calibration
+	// constants are stored for a given A/D channel.
+	// and write calibration constants to flash
+	switch (opmode)
+	{
+		case SINGLE:
+			if (channel == ALLCHAN)
+			{
+				status = writeUserBlock(ADC_CALIB_ADDRS, &_adcCalibS,
+					sizeof(_adcCalibS));  //save whole block
+			}
+			else
+			{
+				offset = ADC_CALIB_ADDRS;
+				offset += ((char*) &_adcCalibS[channel][gaincode] -
+					(char*)_adcCalibS);
+				status = writeUserBlock(offset, &_adcCalibS[channel][gaincode],
+					sizeof(_adcCalibS[channel][gaincode]));
+			}
+			break;
+		case DIFF:
+			if (channel == ALLCHAN)
+			{
+				status = writeUserBlock(ADC_CALIB_ADDRD, &_adcCalibD,
+					sizeof(_adcCalibD));  //save whole block
+			}
+			else
+			{
+				offset = ADC_CALIB_ADDRD;
+				offset += ((char*) &_adcCalibD[channel][gaincode] -
+					(char*)_adcCalibD);
+				status = writeUserBlock(offset, &_adcCalibD[channel][gaincode],
+					sizeof(_adcCalibD[channel][gaincode]));
+			}
+			break;
+		case mAMP:
+			if (channel == ALLCHAN)
+			{
+				status = writeUserBlock(ADC_CALIB_ADDRM, &_adcCalibM,
+					sizeof(_adcCalibM));  //save whole block
+			}
+			else
+			{
+				offset = ADC_CALIB_ADDRM;
+				offset += ((char*) &_adcCalibM[channel] - (char*)_adcCalibM);
+				status = writeUserBlock(offset, &_adcCalibM[channel],
+					sizeof(_adcCalibM[channel]));
+			}
+			break;
+		}
+
+	return(status);
+}
+
+
+
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

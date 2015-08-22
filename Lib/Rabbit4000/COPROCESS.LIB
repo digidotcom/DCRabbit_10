@@ -1,0 +1,248 @@
+/*
+ * coprocess.lib
+ *-----------------------------------------------------------------------------
+ * Copyright (c) 2008 Digi International Inc., All Rights Reserved
+ *
+ * This software contains proprietary and confidential information of Digi
+ * International Inc.  By accepting transfer of this copy, Recipient agrees
+ * to retain this software in confidence, to prevent disclosure to others,
+ * and to make no use of this software other than that for which it was
+ * delivered.  This is an published copyrighted work of Digi International
+ * Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+ * prohibited.
+ *
+ * Restricted Rights Legend
+ *
+ * Use, duplication, or disclosure by the Government is subject to
+ * restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+ * Technical Data and Computer Software clause at DFARS 252.227-7031 or
+ * subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+ * Restricted Rights at 48 CFR 52.227-19, as applicable.
+ *
+ * Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+ *-----------------------------------------------------------------------------
+ *
+ * Simple co-process support.  This library intended for internal library use
+ * only.
+ *
+ */
+/*** BeginHeader */
+#ifndef _COPROCESS_H
+#define _COPROCESS_H
+
+#ifdef COP_DEBUG
+	#define _cop_debug __debug
+#else
+	#define _cop_debug __nodebug
+#endif
+
+// Define amount of storage used to save "must preserve" registers.
+// Currently, this is 8 bytes for LXPC, IX and PW.
+#define COP_SAVEDREGS	8
+// Actually save and restore the context registers using these macros...
+#define COP_SAVE_CONTEXT		push ix $ push pw $ ld hl,lxpc $ push hl
+#define COP_RESTORE_CONTEXT   pop hl $ ld lxpc,hl $ pop pw $ pop ix
+
+typedef struct {
+	void (*entry)();		// Initial address for cop. - must be 1st field
+	word   retaddr;		// Dummy cop return address - should not be used since
+									// coprocess function not allowed to return.
+									// This must be 2nd field.
+	void __far * parm;		// This must be 3rd field - parameter to initial cop.
+	word   cop_sp;			// Saved stack pointer of this context (updated on
+									// cop_yield and cop_create)
+	word   cop_stackseg;	// Saved stack seg. of this context (set on cop_create)
+	word   app_sp;			// Application saved SP (updated on cop_resume)
+	word   app_stackseg;	// Application saved stack segment (set on cop_create)
+} cop_context;
+
+// Macro to perform swapping of the stacks.  Depends on whether uC/OS in use.
+#ifdef MCOS
+	#define COP_SWAP_STACK \
+		ld		ix,(OSTCBCur) $ \
+		ld		sp,hl $ \
+		ipset 3 $ \
+		ioi ld (STACKSEGL),de $ \
+		ex		de,hl $ \
+		ipres $ \
+		ld		(ix+[OS_TCB]+OSTCBStkSeg),hl
+#else
+	#define COP_SWAP_STACK \
+		ld		sp,hl $ \
+		ioi ld (STACKSEGL),de
+#endif
+
+
+/*** EndHeader */
+
+/*** BeginHeader cop_create */
+void __far * cop_create(void (*entry)(), void __far * parm);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ************************************************
+cop_create							<COPROCESS.LIB>
+
+Syntax:			void far * cop_create(void (*entry)(), void far * parm)
+
+Description:	Create a new coprocess.
+
+					The entry function must never return (as such).  Instead, it
+					must use the cop_yield() function to return to the main
+					application context.  The application then uses cop_resume()
+					to resume the coprocess.  Coprocesses always get 4096
+					bytes of stack.
+
+Parameter1:		Pointer to initial entry point function.  This function
+					should accept a single void far * parameter.  It should
+					never return.
+Parameter2:		Optional parameter passed to entry function.  Pass NULL if
+					not used.  HINT: you may pass a pointer to near data and the
+					compiler will automatically upcast to a far pointer.
+
+Return Value:	handle to coprocess, for calling cop_resume().
+
+END DESCRIPTION **************************************************************/
+
+/* static */
+_cop_debug
+__root void cop_error(void)
+{
+	// Jumps here if coprocess returns.  Can't tolerate this, so exit().
+	exception(-ERR_UNEXPECTEDRETURN);
+}
+
+_cop_debug
+void __far * cop_create(void (*entry)(), void __far * parm)
+{
+	auto long sz;
+	auto word s;
+	auto word aseg;
+	auto long addr;
+	auto cop_context __far * p;
+
+	parm = paddr_far(parm);		// Convert to true physical
+	// Must get 4096 bytes, otherwise much overhead when yielding.  Since
+	// always 1 page, we know top of stack is at 0xE000.  Hence, we always
+	// know where our context is without explicitly storing its addr anywhere.
+	sz = s = 4096;
+	addr = _xalloc(&sz, 12, XALLOC_ANY);
+	//printf("cop_create: addr = 0x%05lX\n", addr);
+	p = (cop_context __far *)(addr + (s - sizeof(*p)));
+	//printf("cop_create: p = 0x%05lX\n", p);
+	p->parm = parm;
+	#asm
+	ioi ld hl,(STACKSEGL)
+	ld		(sp+@sp+aseg),hl
+	#endasm
+	p->app_stackseg = aseg;
+	p->cop_sp = 0xE000 - (sizeof(*p) + COP_SAVEDREGS);
+	p->cop_stackseg = (word)((addr - 0xD000L) >> 12);
+	p->entry = entry;
+	p->retaddr = (word)cop_error;		// Return from coprocess will jump here!
+	return p;
+}
+
+/*** BeginHeader cop_yield */
+__root void __far * cop_yield(void __far * parm);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ************************************************
+cop_yield							<COPROCESS.LIB>
+
+Syntax:			void far * cop_yield(void far * parm)
+
+Description:	Yield from a coprocess, back to main application.
+
+Parameter1:		Optional parameter to be returned to main app.  Pass NULL if
+					not used.  HINT: you may pass a pointer to near data and the
+					compiler will automatically upcast to a far pointer.
+
+Return Value:	When main app calls cop_resume, the parameter to that function
+					will be provided as the return from this function.
+END DESCRIPTION **************************************************************/
+_cop_debug
+__root void __far * cop_yield(void __far * parm)
+{
+	// We always yield back to main app, so pick up implicit (main) context from
+	// top of cop's stack.  Logical addr will always be 0xE000 - sizeof(context)
+	#asm
+	ld		bcde,(sp+@sp+parm)
+	call	dkcLongLogicalToPhysical
+	ld		px,bcde		; Save parameter in PX
+	; Save the regs which functions expect to be preserved
+	; If this is changed, also review COP_SAVEDREGS definition.
+	COP_SAVE_CONTEXT
+
+	; Point PY to coprocess context struct
+	ldl	py,0xE000-sizeof(cop_context)
+
+	clr	hl
+	add	hl,sp						; HL = current SP
+	ld		(py+[cop_context]+cop_sp),hl
+	; Cop context saved; now swap to app stack.
+	ld		hl,(py+[cop_context]+app_stackseg)
+	ex		de,hl
+	ld		hl,(py+[cop_context]+app_sp)
+
+	COP_SWAP_STACK
+
+	COP_RESTORE_CONTEXT
+	ld		bcde,px					; return this parameter to main app.
+	#endasm
+	// Normal return; but now in main app's stack context, so returning from its
+	// previous cop_resume().
+}
+
+/*** BeginHeader cop_resume */
+__root void __far * cop_resume(void __far * handle, void __far * parm);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ************************************************
+cop_resume							<COPROCESS.LIB>
+
+Syntax:			void far * cop_resume(void far * handle, void far * parm)
+
+Description:	Resume a coprocess from main application.
+
+Parameter1:		handle returned by cop_create().
+Parameter2:		Optional parameter to be returned to coprocess.  Pass NULL if
+					not used.  HINT: you may pass a pointer to near data and the
+					compiler will automatically upcast to a far pointer.
+
+Return Value:	When coprocess calls cop_yield, the parameter to that function
+					will be provided as the return from this function.
+END DESCRIPTION **************************************************************/
+_cop_debug
+__root void __far * cop_resume(void __far * handle, void __far * parm)
+{
+	#asm
+	ld		bcde,(sp+@sp+parm)
+	call	dkcLongLogicalToPhysical
+	ld		px,bcde
+	; Save the regs which functions expect to be preserved
+	; If this is changed, also review COP_SAVEDREGS definition.
+	COP_SAVE_CONTEXT
+
+	; Point PY to coprocess context struct
+	ld		py,(sp+@sp+COP_SAVEDREGS+handle)
+
+	clr	hl
+	add	hl,sp						; HL = current SP
+	ld		(py+[cop_context]+app_sp),hl
+	; App context saved; now swap to coprocess stack.  We IPSET 3 since need
+	; consistent stackseg/SP in case of interupt
+	ld		hl,(py+[cop_context]+cop_stackseg)
+	ex		de,hl
+	ld		hl,(py+[cop_context]+cop_sp)
+
+	COP_SWAP_STACK
+
+	COP_RESTORE_CONTEXT
+	ld		bcde,px					; return this parameter to coprocess.
+	#endasm
+	// Normal return; but now in coprocess' stack context, so returning from its
+	// previous cop_yield().
+}
+
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+

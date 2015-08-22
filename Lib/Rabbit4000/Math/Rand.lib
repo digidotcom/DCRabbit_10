@@ -1,0 +1,801 @@
+/*** BeginHeader */
+#ifndef RAND_H
+#define RAND_H
+/*** EndHeader */
+
+/* START LIBRARY DESCRIPTION ***************************************************
+rand.lib
+	Copyright (c) 2006, Rabbit Semiconductor.
+
+DESCRIPTION: Advanced random number routines for the Rabbit2000/3000
+             This library maintains a random number "seed" which has from
+             zero to RAND_SEED_BYTES*8 bits of entropy.  The seed is used as
+             a starting point for pseudo-random number stream generators, which
+             require a random number sequence which is unpredictable to the
+             "outside world".  This is necessary for cryptographic operations,
+             but is also useful for non-crypto applications such as the
+             simple PRNG (Pseudo-Random Number Generator) in MATH.LIB (randf(),
+              randb() etc.).
+
+             The seed is altered by the application appending a specified
+             number of random bits.  For secure applications, the random bits
+             should be truly random i.e. derived from observations of the
+             real world, not some purely algorithmic process.
+
+             Possible observations include the time interval between key
+             presses of a human user, the arrival of network packets, readings
+             from an external temperature sensor, or other analog inputs.
+             Since clock timings are often used, the seed_clock() function can
+             automatically add between 1 and 16 bits of entropy based on the
+             Rabbit RTC interval between calls to seed_clock().  The more
+             general seed_addbits() function can be used to add an arbitrary
+             number of bits.
+
+             seed_bits() reports the current number of entropy bits which have
+             been accumulated.  seed_peekbits() reads out the specified number
+             of bits (1 to 32) into a long value, but does not delete the bits
+             that were returned i.e. the same value will be returned for
+             repeated calls.  seed_getbits() reads out and deletes the bits
+             tht were reported.  seed_getbits() should be used when independent
+             PRNG sequences are to be generated i.e. for crypto applications.
+
+             seed_init() should be used to initialize the seed at boot time.
+             This will set 16 bits of entropy from the RTC, plus 32 bits from
+             the specified (constant) source e.g. MAC addr.  The latter is not
+             random at all, but helps to generate different PRNG streams for
+             different Rabbit systems.  If the RTC is not battery backed, then
+             the initial seed will be completely predictable and effectively
+             have no true entropy.  If battery-backed, the RTC will provide
+             between 0 and 16 bits of true entropy depending on how predictable
+             the boot-up time is to an external observer (or controller).
+             In any case, seed_init() pretends to have 48 bits of entropy,
+             or 16 if no initial "salt" value is provided.
+
+             If you use more bits than are actually present, then old bits
+             will be returned (since the bit pointers will wrap around in the
+             available bit space).  This may be used to advantage if battery-
+             backed RAM is used to preserve the entropy bits over a boot
+             cycle.  Otherwise, you can specify that the MD5 hashing algorithm
+             be used to rescramble the bits whenever the remaining true entropy
+             becomes zero (or less).  seed_hash() performs a rehash whenever
+             otherwise required.  NB: hashing is only available with Dynamic C
+             releases with the TCP/IP libraries, since MD5.LIB is required.
+             To disable hashing, you can #define RAND_DISABLE_MD5 before
+             including this library, otherwise seed_hash() will automactically
+             be enabled.
+
+             This library also includes some PRNGs which are better than the
+             simple versions in MATH.LIB.  rand16 returns a 16-bit unsigned
+             number based on a fast linear congruential method.  randk
+             returns a number between 0 and 1771874 inclusive, based on
+             a slower method which gives better sequences.
+
+Change History:
+		Mar 3 2003  SJH  Added ability to hash in a 'secret' when rehashing the
+                       entropy buffer.  Thus, even if an adversary can see the
+                       entire sequence of random numbers, he cannot predict
+                       the next (even if there is no entropy added since the
+                       last observed output).  The 'secret' is XORed over the
+                       entropy buffer before rehashing.  Of course, the security
+                       of this method depends on the user selecting a truly
+                       random 'secret'.  This may be obtained from, e.g., part
+                       of an RSA private key, or from some true entropy from the
+                       buffer which is never made observable to an adversary.
+                       Note that use of private keys as a hashing secret is not
+                       advisable, since the key is then computable if the MD5
+                       hash can be inverted - this is currently thought to be
+                       impossible (other than by brute force), but things
+                       always change...
+                       This functionality is accessed via seed_hash_secret().
+
+END DESCRIPTION ***************************************************************/
+
+/*** BeginHeader _entropy, _rand16_value, _randk_value */
+
+#ifdef RAND_DEBUG
+	#define _rand_debug	__debug
+#else
+	#define _rand_debug	__nodebug
+#endif
+
+#ifndef RAND_SEED_BYTES
+	#define RAND_SEED_BYTES 32
+#endif
+
+#define RAND_SEED_BITS (RAND_SEED_BYTES<<3)
+
+#ifndef RAND_DISABLE_MD5
+	#use "md5.lib"
+#endif
+
+extern char _entropy[RAND_SEED_BYTES];		// Entropy store
+extern word _entropy_in, _entropy_out;		// Bit offsets of next input and next output
+extern unsigned long _entropy_lastclock;	// Most recently read RTC value
+extern word _entropy_xbits;					// Extra bits added by timer B (0, 3 or 6)
+extern word _rand16_value;						// Last value returned from rand16()
+extern unsigned long _randk_value;			// Last value returned from randk()
+extern char _entropy_hash[16];				// Entropy secret for rehashing
+/*** EndHeader */
+
+char _entropy[RAND_SEED_BYTES];
+word _entropy_in, _entropy_out;
+unsigned long _entropy_lastclock;
+word _entropy_xbits;
+word _rand16_value;
+unsigned long _randk_value;
+char _entropy_hash[16];
+
+/*** BeginHeader _seed_readrtc */
+void _seed_readrtc(unsigned long * val);
+/*** EndHeader */
+_rand_debug void _seed_readrtc(unsigned long * val)
+{
+	// Read RTC into *val.  RTC is combination of Rabbit 32kHz clock, plus
+	// LSBs of timer B counter if it is running.
+	auto word nbits;	// Extra bits from timer B (0, 2 or 5)
+	auto unsigned long rtc;
+
+	nbits = 0;
+	if (TBCSRShadow & 1) {
+		if ((TBCRShadow & 0x0C) == 0)
+			nbits = 5;
+		else if ((TBCRShadow & 0x0C) != 0x04)
+			nbits = 2;
+	}
+	// Adjust previous clock if conditions change
+	if (nbits > _entropy_xbits)
+		_entropy_lastclock <<= (nbits - _entropy_xbits);
+	else if (nbits < _entropy_xbits)
+		_entropy_lastclock >>= (_entropy_xbits - nbits);
+	_entropy_xbits = nbits;
+#asm xmemok
+	ld		iy,RTC0R  		; address of base register
+.read_rtc0:
+	ioi	ld (iy),a	  	; copy to holding registers
+	ioi	ld hl,(iy)		; save lowest word
+	ex		de,hl
+	ioi	ld hl,(iy+2)
+	ioi	ld (iy),a   	; copy to holding registers again
+	ioi	ld a,(iy) 		; get least again
+	cp		e 		     		; must not have changed
+	jr		nz,.read_rtc0 	; if changed do it all again
+	push	hl
+	ld		hl,(sp+@sp+nbits+2)
+	ld		b,L				; B = nbits
+	pop	hl
+	ld		a,b
+	ld		c,0
+	or		a
+	jr		z,.noshift
+.shift:
+	or		a
+	rl		de
+	adc	hl,hl
+	scf
+	rl		c
+	djnz	.shift
+	; insert bits from TBCLR (timer B count) - bit mask is in C (0x07 or 0x3F)
+	ioi ld a,(TBCLR)
+	rra						; Rotate out LSB, since this has a strong bias towards zero
+								; on the rabbit.
+	and	c
+	or		e
+	ld		e,a
+.noshift:
+	ld		(sp+@sp+rtc+2),hl
+	ex		de,hl
+	ld		(sp+@sp+rtc),hl	; rtc now contains RTC shifted up by nbits
+#endasm
+	*val = rtc;
+}
+
+/*** BeginHeader seed_addbits */
+void seed_addbits(void * val, word bits);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+seed_addbits                         <RAND.LIB>
+
+SYNTAX:			void seed_addbits(void * val, word bits)
+
+KEYWORDS:		math, random
+
+DESCRIPTION:	Add "bits" bits from the LSBs of *val to the entropy
+               buffer.
+
+               Note that if the RAND_USE_CRC symbol is defined, then
+               the data provided is first run through the
+               standard CRC32 algorithm, in order to avoid any possible
+               bias in the total number of 0 and 1 bits.  The CRC
+               algorithm will be applied to ceil(bits/16) words of the
+               data, thus it will use "extra" bits in the last word to
+               update the CRC, however only the requested number of bits
+               will be added.  The LSW of the CRC is used as the actual
+               bit stream to add, after each group of 16 bits is processed.
+
+PARAMETER1:    Pointer to first byte of value to add.
+PARAMETER2:    Number of bits from "val" to add.
+
+SEE ALSO:		seed_init, seed_clock, seed_bits, seed_peekbits,
+               seed_getbits, seed_hash
+END DESCRIPTION **********************************************************/
+
+_rand_debug void seed_addbits(void * val, word bits)
+{
+	// Insert "bits" number of bits from LSBs of *val.
+	auto word avail, b, byte, bit, i;
+	auto word w;
+#ifdef RAND_USE_CRC
+	static word crc;
+#endif
+	#GLOBAL_INIT { seed_init(NULL); }
+
+	if (!bits)
+		return;
+	avail = RAND_SEED_BITS - 1 - (_entropy_in - _entropy_out) % RAND_SEED_BITS;
+	if (bits > avail)
+		bits = avail;
+	b = _entropy_in;
+	for (i = 0; i < bits; i++) {
+		if (!(i & 0x0F)) {
+			w = *(word *)val;
+			val = (word *)val + 1;
+#ifdef RAND_USE_CRC
+			// Update CRC, and set w = CRC(w)
+			// This may be used to help remove any bias in the number of 1s and 0s.
+			w = crc = getcrc((char *)&w, 2, crc);
+#endif
+		}
+		byte = b >> 3;
+		bit = 1 << (b & 0x07);
+		if (w & 1)
+			_entropy[byte] |= bit;
+		else
+			_entropy[byte] &= ~bit;
+		w >>= 1;
+		if (++b >= RAND_SEED_BITS)
+			b = 0;
+	}
+	_entropy_in = b;
+}
+
+
+/*** BeginHeader seed_init */
+void seed_init(char * salt);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+seed_init                         <RAND.LIB>
+
+SYNTAX:			void seed_init(char * salt);
+
+KEYWORDS:		math, random
+
+DESCRIPTION:	Initialize the entropy source.  If salt is not NULL, then
+					32 bits from *salt are added first.  Then the 16 LSBs of
+					the current RTC are added.  For boards with TCP/IP, the
+					salt would typically point to the 4 LSBs of the MAC
+					address, since this is unique for all boards.  Applications
+					which require a secure random number generator should
+					not use the salt bits.
+
+PARAMETER1:    NULL: no salt value added
+               non-NULL: 4 bytes at this address are added to entropy.
+
+SEE ALSO:		seed_clock, seed_bits, seed_peekbits,
+               seed_getbits, seed_hash, seed_addbits
+END DESCRIPTION **********************************************************/
+
+_rand_debug void seed_init(char * salt)
+{
+	_entropy_out %= RAND_SEED_BITS;
+	_entropy_in = _entropy_out;
+	_entropy_xbits = 0;
+	_seed_readrtc(&_entropy_lastclock);
+	if (salt)
+		seed_addbits(salt, 32);
+	seed_addbits(&_entropy_lastclock, 16);
+}
+
+
+/*** BeginHeader seed_clock */
+void seed_clock(word bits);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+seed_clock                         <RAND.LIB>
+
+SYNTAX:			void seed_clock(word bits);
+
+KEYWORDS:		math, random
+
+DESCRIPTION:	Add specified number of bits to entropy source.  The value
+               is the difference between the current RTC clock time and
+               the previous reading made by seed_clock(), i.e. a time
+               difference in 1/32768 sec units.  bits should be between
+               1 and 16.  If zero, then the number of bits to add is
+               computed as floor(log2(diff))-11 (if less than 1, then
+               no bits are added).  For example, at least 1/8 second
+               must elapse for 1 bit to be added.  If no bits are added,
+               then the "previous reading" will not be altered.
+
+               If timer B is enabled, it is also used to increase the
+               resolution of the RTC - this is assumed to add an extra
+               5 bits of entropy for each call i.e. the 6 LSBs of timer
+               B wrap around in less than 1/32768 seconds, which is
+               true if the CPU clock is at least 8.3MHz and timer B is
+               being clocked at perclk/2 (=cpu clock/4).  If timer B is
+               clocked by perclk/16, then only 3 bits may be added.  If
+               clocked by timer A1, then no extra bits are available.
+               [Note: one theoretical bit of entropy is lost when timer
+               B is used, since the LSB of this counter has a strong bias
+               towards zero when read by the CPU.  This is why only 5
+               bits are added, not 6.]
+
+               Naturally, for this function to work properly, the time
+               intervals should depend on some random external process.
+
+               The most common use for this function is to generate a
+               random seed based on interval timings such as user
+               keystrokes.  It will be called automatically by the
+               TCP/IP library if the sumbol NET_ADD_ENTROPY is defined
+               prior to inclusion of DCRTCP.LIB.  If this is done, then
+               inter-packet timings will be used to add entropy.
+
+PARAMETER1:    Number of entropy bits to add, or zero to make a fairly
+               conservative estimate of the true entropy available.
+
+SEE ALSO:		seed_init, seed_bits, seed_peekbits,
+               seed_getbits, seed_hash, seed_addbits
+END DESCRIPTION **********************************************************/
+
+_rand_debug void seed_clock(word bits)
+{
+	auto unsigned long newrtc;
+	auto unsigned long diff;
+	if (bits > 32)
+		bits = 32;
+	_seed_readrtc(&newrtc);
+	diff = newrtc - _entropy_lastclock;
+	diff &= 0x7FFFFFFFuL;	// Zero out MSB otherwise next loop may not terminate.
+	if (!bits) {
+		while (diff >= 0x1000uL << bits)
+			bits++;
+	}
+	if (bits) {
+		seed_addbits(&diff, bits);
+		_entropy_lastclock = newrtc;
+	}
+}
+
+
+/*** BeginHeader seed_bits */
+word seed_bits(void);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+seed_bits                         <RAND.LIB>
+
+SYNTAX:			word seed_bits(void)
+
+KEYWORDS:		math, random
+
+DESCRIPTION:	Return the number of entropy bits which are available in
+               the buffer.  The return value will range between 0 and
+               RAND_SEED_BITS-1.
+
+RETURN VALUE:  Number of random bits available.
+
+SEE ALSO:		seed_init, seed_clock, seed_peekbits,
+               seed_getbits, seed_hash, seed_addbits
+END DESCRIPTION **********************************************************/
+
+_rand_debug word seed_bits(void)
+{
+	return (_entropy_in - _entropy_out) % RAND_SEED_BITS;
+}
+
+
+/*** BeginHeader seed_peekbits */
+unsigned long seed_peekbits(word bits);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+seed_peekbits                         <RAND.LIB>
+
+SYNTAX:			unsigned long seed_peekbits(word bits)
+
+KEYWORDS:		math, random
+
+DESCRIPTION:	Return between 0 and 32 bits of entropy, but do not delete
+               the returned bits from the entropy buffer.
+
+               If more bits are requested than are actually in the buffer,
+               then the additional bits are values that were returned
+               previously (possibly rehashed).
+
+PARAMETER1:    Number of bits to return (must be 0..32 inclusive).  If
+               zero, then the return value will always be zero.  If over
+               32, then only 32 bits will be returned.
+
+RETURN VALUE:  An unsigned long value with "bits" bits of randomness
+               packed into the LSBs.  The remaining MSBs are set to zero.
+
+SEE ALSO:		seed_init, seed_clock, seed_bits,
+               seed_getbits, seed_hash, seed_addbits
+END DESCRIPTION **********************************************************/
+
+_rand_debug unsigned long seed_peekbits(word bits)
+{
+	auto word b, byte, bit, i;
+	auto unsigned long rv;
+
+	if (bits > 32)
+		bits = 32;
+	b = _entropy_out;
+	rv = 0;
+	for (i = 0; i < bits; i++) {
+		byte = b >> 3;
+		bit = 1 << (b & 0x07);
+		rv <<= 1;
+		if (_entropy[byte] & bit)
+			rv |= 1;
+		if (++b >= RAND_SEED_BITS)
+			b = 0;
+	}
+	return rv;
+}
+
+
+/*** BeginHeader seed_getbits */
+unsigned long seed_getbits(word bits);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+seed_getbits                         <RAND.LIB>
+
+SYNTAX:			unsigned long seed_getbits(word bits)
+
+KEYWORDS:		math, random
+
+DESCRIPTION:	Return between 0 and 32 bits of entropy, and "delete"
+               the returned bits from the entropy buffer so that they
+               are not returned again.
+
+               If more bits are requested than are actually in the buffer,
+               the buffer is re-used (possibly hashed if RAND_DISABLE_MD5
+               is not defined).  Under these circumstances, the buffer
+               appears to be re-filled to capacity, although of course
+               the additional bits are values that were returned
+               previously (possibly rehashed).
+
+PARAMETER1:    Number of bits to return (must be 0..32 inclusive).  If
+               zero, then the return value will always be zero.  If over
+               32, then only 32 bits will be returned.
+
+RETURN VALUE:  An unsigned long value with "bits" bits of randomness
+               packed into the LSBs.  The remaining MSBs are set to zero.
+
+SEE ALSO:		seed_init, seed_clock, seed_bits, seed_peekbits,
+               seed_hash, seed_addbits
+END DESCRIPTION **********************************************************/
+
+_rand_debug unsigned long seed_getbits(word bits)
+{
+	auto unsigned long rv;
+	auto word avail;
+
+	if (bits > 32)
+		bits = 32;
+	avail = seed_bits();
+	if (avail < bits)
+		seed_hash();
+	rv = seed_peekbits(bits);
+	_entropy_out = (_entropy_out + bits) % RAND_SEED_BITS;
+
+	return rv;
+}
+
+
+
+/*** BeginHeader seed_hash */
+void seed_hash(void);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+seed_hash                         <RAND.LIB>
+
+SYNTAX:			void seed_hash(void)
+
+KEYWORDS:		math, random
+
+DESCRIPTION:	Rehash the contents of the entropy buffer using the MD5
+               secure hashing algorithm.
+
+               Note: You can disable hashing algorithm by #define
+               RAND_DISABLE_MD5 prior to inclusion of RAND.LIB.
+
+               Rehashing is useful if the entropy buffer is exhausted,
+               but still needs to provide random seeds.  Naturally, the
+               results are predictable, but the new seeds will at least
+               be different from the old ones.
+
+SEE ALSO:		seed_init, seed_clock, seed_bits, seed_peekbits,
+               seed_getbits, seed_addbits, seed_hash_secret
+END DESCRIPTION **********************************************************/
+
+_rand_debug void seed_hash(void)
+{
+#ifndef RAND_DISABLE_MD5
+	auto md5_state_t pms;
+	auto word i, j;
+	auto char d[16];
+
+	for (i = 0; i < RAND_SEED_BYTES; ++i)
+   	_entropy[i] ^= _entropy_hash[i & 15];
+
+	for (i = 0; i < RAND_SEED_BYTES; i += 16) {
+		md5_init(&pms);
+		md5_append(&pms, _entropy, RAND_SEED_BYTES);
+		md5_finish(&pms, d);
+		if (RAND_SEED_BYTES - i > 16)
+			j = 16;
+		else
+			j = RAND_SEED_BYTES - i;
+		memcpy(_entropy + i, d, j);
+	}
+#endif
+}
+
+/*** BeginHeader seed_hash_secret */
+void seed_hash_secret(char * s);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+seed_hash_secret                         <RAND.LIB>
+
+SYNTAX:			void seed_hash_secret(char * s)
+
+KEYWORDS:		math, random
+
+DESCRIPTION:	Specify a secret value to hash with the entropy buffer
+               when the entropy buffer needs to be rehashed.  This is
+               only necessary for secure applications which need to make
+               the random number stream unpredictable to an observer who
+               can read all or part of the random number stream, and
+               there is insufficient true entropy (timings etc.) to
+               keep the random number stream from being predictable.
+
+PARAMETER1:    If not NULL, points to 16 bytes of secret, random data.
+					If NULL, 16 bytes of data are extracted from the current
+               entropy buffer (using seed_getbits()) to form the secret.
+
+SEE ALSO:		seed_init, seed_clock, seed_bits, seed_peekbits,
+               seed_getbits, seed_addbits, seed_hash
+END DESCRIPTION **********************************************************/
+
+_rand_debug void seed_hash_secret(char * s)
+{
+   auto int i;
+
+	if (s)
+		memcpy(_entropy_hash, s, 16);
+   else
+   	for (i=0; i<4; ++i) ((unsigned long *)_entropy_hash)[i] = seed_getbits(32);
+}
+
+/*** BeginHeader rand16, rand16_init */
+word rand16(void);
+void rand16_init(word seed);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+rand16                         <RAND.LIB>
+
+SYNTAX:			word rand16(void)
+
+KEYWORDS:		math, random
+
+DESCRIPTION:	Return an uniform random deviate between 0 and 65535.
+               Algorithm is
+                 r[i+1] = (r[i]*30809 + 11213) mod 65536.
+               where r[0] is the seed value, and r[i] is the value
+               returned on the ith successive call.
+
+               rand16() is very fast, and does not repeat the returned
+               sequence until 65536 calls have been made, but is not
+               guaranteed to be suitable as a generator when results are
+               to be taken in groups of n (with n >= 2).  Also,
+               the m LSB's cycle with period 2^m, hence do not use the
+               LSBs to generate a random number with range smaller than
+               2**16.  Instead, use the MSBs or, preferably, use the
+               rand16_range() routine.
+
+               This is non-reentrant owing to the need to save the
+               previous value in static storage.
+
+RETURN VALUE:  Uniform random integer deviate between 0 and 65535
+               inclusive.
+
+SEE ALSO:		rand16_init, rand16_range, randk, randf, randb, randg, srandf
+END DESCRIPTION **********************************************************/
+
+_rand_debug word rand16(void)
+{
+#asm
+	ld		de,30809
+	ld		bc,(_rand16_value)
+	mul
+	ld		hl,11213
+	add	hl,bc
+	ld		(_rand16_value),hl
+#endasm
+}
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+rand16_init                         <RAND.LIB>
+
+SYNTAX:			void rand16_init(word seed)
+
+KEYWORDS:		math, random
+
+DESCRIPTION:	Initialize the random number generator for rand16().
+               The initial value may be a constant (if the same sequence
+               is desired at start-up), or may be obtained from
+               seed_getbits() if a truly random starting point is
+               required.
+
+PARAMETER1:    Initial value.
+
+SEE ALSO:		rand16, seed_getbits, randk_init
+END DESCRIPTION **********************************************************/
+
+_rand_debug void rand16_init(word seed)
+{
+	_rand16_value = seed;
+}
+
+
+/*** BeginHeader rand16_range */
+word rand16_range(word low, word range);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+rand16_range                         <RAND.LIB>
+
+SYNTAX:			word rand16_range(word low, word range)
+
+KEYWORDS:		math, random
+
+DESCRIPTION:	Return an unsigned random number between low and
+               (low + range - 1) inclusive.
+
+               This uses rand16() as a random number generator, then
+               computes the return value based on the MSBs of the result
+               from rand16().
+
+               Example, simulating toss of 6-sided die:
+
+                 roll = rand16_range(1, 6);
+                 // roll = 1, 2, 3, 4, 5 or 6 with roughly equal
+                 // probability.
+
+               Note: you can consider "low" and the return value to be
+               signed quantities and still obtain correct results by
+               casting the result to int:
+
+                 m += (int) rand16_range(-10, 21) * 0.1;
+                 // Add between -1 and 1 inclusive to float m.
+
+PARAMETER1:    Lowest value to return.
+PARAMETER2:    Range of values, starting at low.
+
+RETURN VALUE:  Uniform random integer deviate between low and
+               (low+range-1) inclusive.
+
+SEE ALSO:		rand16, randk
+END DESCRIPTION **********************************************************/
+
+_rand_debug word rand16_range(word low, word range)
+{
+	auto word r;
+
+#asm
+	call	rand16
+	ex		de,hl
+	ld		hl,(sp+@sp+range)
+	ld		b,h
+	ld		c,L
+	ld		a,b
+	push	bc
+	mul
+	pop	bc
+	rla
+	jr		nc,.skip1
+	add	hl,de
+.skip1:
+	rl		de
+	jr		nc,.skip2
+	add	hl,bc
+.skip2:
+	ex		de,hl
+	ld		hl,(sp+@sp+low)
+	add	hl,de
+#endasm
+}
+
+
+
+
+/*** BeginHeader randk, randk_init */
+unsigned long randk(void);
+void randk_init(unsigned long seed);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+randk                         <RAND.LIB>
+
+SYNTAX:			unsigned long randk(void)
+
+KEYWORDS:		math, random
+
+DESCRIPTION:	Return an unsigned random number between 0 and 1771874.
+               Algorithm is based on recommendations by D.E.Knuth:
+                 r[i+1] = (r[i]*2416 + 374441) mod 1771875.
+               where r[0] is the seed value, and r[i] is the value
+               returned on the ith successive call.
+
+               This routine is slower than rand16(), since it performs
+               long multiplication and division, however the quality
+               is superior.  Note that the LSB is always '1', but
+               apart from this the LSBs are "more random" than for
+               rand16().  Even so, the LSBs should not be used to
+               generate numbers with less range.
+
+               This is non-reentrant owing to the need to save the
+               previous value in static storage.
+
+RETURN VALUE:  Uniform random integer deviate between 0 and 1771874
+               inclusive.
+
+SEE ALSO:		randk_init, rand16
+END DESCRIPTION **********************************************************/
+
+_rand_debug unsigned long randk(void)
+{
+	_randk_value = (_randk_value * 2416uL + 374441uL) % 1771875uL;
+	return _randk_value;
+}
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+randk_init                         <RAND.LIB>
+
+SYNTAX:			void randk_init(unsigned long seed)
+
+KEYWORDS:		math, random
+
+DESCRIPTION:	Initialize the random number generator for randk().
+               The initial value may be a constant (if the same sequence
+               is desired at start-up), or may be obtained from
+               seed_getbits() if a truly random starting point is
+               required.
+
+PARAMETER1:    Initial value.  May be any unsigned long value.
+
+SEE ALSO:		randk, rand16_init, seed_getbits
+END DESCRIPTION **********************************************************/
+
+_rand_debug void randk_init(unsigned long seed)
+{
+	_randk_value = seed;
+}
+
+
+
+
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

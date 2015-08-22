@@ -1,0 +1,1626 @@
+/**************************************************************************
+hdlc_packet.lib
+Rabbit Semiconductor, 2002
+
+Library for sending and receiving HDLC packets over serial ports E and F
+
+Sending a packet:
+HDLC packets are sent using the HDLCsendX() function.
+There is no intermediate buffer stage for the sent packets. Instead, the
+buffer holding the packet being sent cannot be disturbed by the program
+until a subsequent call to HDLCsendingX() returns false.
+This indicates that the packet was completely sent, and the buffer can
+now be reused.
+
+Receiving packets:
+Received packets are stored in buffers until they are requested by the
+program using HDLCreceiveX(). These buffers must be allocated by the main
+program and passed to HDLCopenX() as a single chunk of extended memory.
+Each buffer takes up (packet_length + 4) bytes of memory.
+e.g.
+for a call: HDLCopenE(115200,
+							 HDLC_MANCHESTER,
+							 hdlc_buffers,
+							 buf_count,
+							 buf_size);
+
+hdlc_buffers must point to an extended memory chunk of:
+	buf_count*(buf_size + 4)
+
+Summary of Functions:
+HDLCopenX - initializes port, assigns buffers
+HDLCcloseX - shuts down port
+HDLCsendX - transmits a packet
+HDLCabortX - stops the current transmission ans sends an HDLC abort code
+HDLCsendingX - indicates if a packet is currently being transmitted
+HDLCreceiveX - retreives any packets that have been received
+HDLCpeekX - returns the xmem address of a buffer with the next received
+				packet.
+HDLCdropX - discards a received packet and frees up it's buffer
+HDLCerrorX - returns a set of error flags
+
+Revision History:	Rev 1.0 Initial Release
+						Rev 1.1 Clear Rcv FIFO upon initialization
+                          to properly clear interrupts.
+						Rev 1.2 Rabbit 4000 update
+
+**************************************************************************/
+
+/*** BeginHeader */
+#ifndef __HDLC_PACKET_LIB
+#define __HDLC_PACKET_LIB
+
+//HDLC encoding modes
+#define HDLC_NRZ 0
+#define HDLC_NRZI 2
+#define HDLC_MANCHESTER 4
+#define HDLC_BIPHASE_SPACE 6
+#define HDLC_BIPHASE_MARK 7
+
+//HDLC idle option mask
+#define HDLC_FLAG_IDLE 0x00
+#define HDLC_HIGH_IDLE 0x08
+
+//HDLC bit type
+#define HDLC_STANDARD_BIT 0x00
+#define HDLC_IRDA_BIT 0x10
+
+//bits for buffer flags
+#define HDLC_NOBUFFER 0x01
+#define HDLC_OVERFLOW 0x02
+#define HDLC_OVERRUN 0x04
+#define HDLC_ABORTED 0x08
+#define HDLC_BADCRC 0x10
+
+#define HDLC_BASEFREQ 614400.0
+
+// HDLC Control MACRO's
+#define HDLC_INT_LEVEL   	0x01
+#define HDLC_INTERNAL_CLK  0x0C
+/*** EndHeader */
+
+/*** BeginHeader HDLCcloseE */
+__nodebug void HDLCcloseE();
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+HDLCcloseE                   <HDLC_PACKET.LIB>
+
+SYNTAX:		   void HDLCcloseE();
+
+DESCRIPTION:   Disables the E HDLC port. This function is non-reentrant.
+
+END DESCRIPTION **********************************************************/
+
+#asm __xmem
+
+HDLCcloseE::
+    ipset HDLC_INT_LEVEL
+ 	 ;clear out interrupt vector
+    ld    a,0xc9        ; ret in first byte
+    ld    (INTVEC_BASE+SERE_OFS),a
+    ld    a,0x00        ; disable interrupts for port
+	 ld    (SECRShadow),a
+ioi ld    (SECR),a
+	 c TAT1R_SetValue( TAT1R_A2TIMER_REQ, TAT1R_RELEASE_REQ);
+    ipres
+    lret
+
+#endasm
+
+/*** BeginHeader HDLCopenE */
+__nodebug int HDLCopenE(long baud,
+				  		    char encoding,
+				  			 unsigned long buffers,
+				  			 int buffer_count,
+				  			 int buffer_size );
+__xmem void hdlc_init_e();
+void hdlc_isr_e();
+extern char *hdlc_txbuffer_e;
+extern int hdlc_txsize_e;
+extern int hdlc_txpos_e;
+extern char hdlc_transmit_e;
+extern unsigned long hdlc_rxbuffers_e;
+extern unsigned long hdlc_currentptr_e;	//start of current buffer
+extern int hdlc_rxcount_e;
+extern int hdlc_rxsize_e;
+extern int hdlc_rxcurrent_e;
+extern int hdlc_rxnext_e;
+extern int hdlc_rxpos_e;
+extern char hdlc_encoding_e;
+
+extern char hdlc_overflow_e;
+extern char hdlc_overrun_e;
+extern char hdlc_badcrc_e;
+extern char hdlc_abort_e;
+extern char hdlc_nobuffer_e;
+
+/*** EndHeader */
+
+char *hdlc_txbuffer_e;
+int hdlc_txsize_e;
+int hdlc_txpos_e;
+char hdlc_transmit_e;
+char hdlc_txdone_e;		//finished sending data
+unsigned long hdlc_rxbuffers_e;	//base of buffer array
+unsigned long hdlc_currentptr_e;
+int hdlc_rxcount_e;		//number of buffers
+int hdlc_rxsize_e;		//size of each buffer
+int hdlc_rxcurrent_e;	//current buffer being filled
+int hdlc_rxnext_e;		//next buffer to be read
+int hdlc_rxpos_e;
+char hdlc_encoding_e;
+
+char hdlc_overflow_e;
+char hdlc_overrun_e;
+char hdlc_badcrc_e;
+char hdlc_abort_e;
+char hdlc_nobuffer_e;
+
+#ifndef HDLC_E_USEPORT
+   #warnt "Define HDLC_E_USEPORT to C, D or E. Defaulting to D."
+   #define HDLC_E_USEPORT D
+#endif
+
+#define HDLC_E_FR					CONCAT(P, CONCAT(HDLC_E_USEPORT, FR))
+#define HDLC_E_FRSHADOW			CONCAT(P, CONCAT(HDLC_E_USEPORT, FRShadow))
+#define HDLC_E_DDR         CONCAT(P, CONCAT(HDLC_E_USEPORT, DDR))
+#define HDLC_E_DDRSHADOW   CONCAT(P, CONCAT(HDLC_E_USEPORT, DDRShadow))
+
+/* START FUNCTION DESCRIPTION ********************************************
+HDLCopenE                   <HDLC_PACKET.LIB>
+
+SYNTAX:		   int HDLCopenE(long baud,
+				  					  char encoding,
+				  					  unsigned long buffers,
+				  					  int buffer_count,
+				  					  int buffer_size);
+
+DESCRIPTION:   Opens serial port E in HDLC mode. Sets up buffers to
+					hold received packets.
+
+PARAMETER 1:	baud - the baud rate to run the serial port at. Due to
+						limitations in the baud generator, non-standard baud
+						rates will be approximated (see RETURN VALUE below.)
+PARAMETER 2:	encoding - the bit encoding mode to use. Macro labels for
+						the available options are:
+								HDLC_NRZ
+								HDLC_NRZI
+								HDLC_MANCHESTER
+								HDLC_BIPHASE_SPACE
+								HDLC_BIPHASE_MARK
+						See the HDLC documentation for more detail on these
+						modes.
+PARAMETER 3:	buffers - a pointer to the start of the extended momory
+						block containing the receive buffers. This block must
+						be allocated beforehand by the user. The size of the
+						block should be:
+							(# of buffers) * ((size of buffer) + 4)
+PARAMETER 4:	buffer_count - the number of buffers in the buffer
+										block(above).
+PARAMETER 5:	buffer_size - the capacity of each buffer in the
+									  block(above).
+
+RETURN VALUE:	1 if the actual baud rate is within 5% of the requested
+						baud rate
+					0 otherwise
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int HDLCopenE(long baud,
+							 char encoding,
+				  			 unsigned long buffers,
+				  			 int buffer_count,
+				  			 int buffer_size)
+{
+	auto long actual_baud;
+	auto int i;
+	auto char temp[4];
+
+	hdlc_encoding_e = encoding;
+
+	hdlc_txbuffer_e = NULL;
+	hdlc_txsize_e = 0;
+	hdlc_txpos_e = 0;
+	hdlc_transmit_e = 0;
+	hdlc_txdone_e = 0;
+
+	hdlc_overflow_e = 0;
+	hdlc_overrun_e = 0;
+	hdlc_badcrc_e = 0;
+	hdlc_abort_e = 0;
+	hdlc_nobuffer_e = 0;
+
+	//initialize buffers
+	hdlc_rxbuffers_e = buffers;
+	hdlc_currentptr_e = buffers; //points to first buffer
+	hdlc_rxcount_e = buffer_count;
+	hdlc_rxsize_e = buffer_size;
+	//zero out flag bytes
+	memset(temp, 0, 4);
+	for(i = 0;i < hdlc_rxcount_e;i++)
+	{
+ 		root2xmem(hdlc_rxbuffers_e + i*(hdlc_rxsize_e + 4), temp, 4);
+	}
+	hdlc_rxcurrent_e = 0;
+	hdlc_rxpos_e = 0;
+	hdlc_rxnext_e = 0;
+
+	if(baud < 10)
+	{
+		baud = 10; //prevents divide by zero errors
+	}
+
+	actual_baud = SetSerialTATxRValues( baud, NULL, TAT2R);
+
+	WrPortI(SEER, &SEERShadow,
+				((encoding << 5) & 0xe0) | (encoding & 0x18));
+
+   // Clear FIFO
+   for(i=0; i<4; i++)
+   {
+   	#asm
+  		ioi ld	 a, (SEDR)		;Do dummy read to clear interrupt
+    	#endasm
+   }
+	hdlc_init_e();
+
+   return (baud == actual_baud) || (baud / labs( baud - actual_baud) >= 20);
+}
+
+#asm __xmem
+
+hdlc_init_e::
+	 ;setup interrupt vector
+    push	 ip
+    ipset HDLC_INT_LEVEL
+    ld	 iy, INTVEC_BASE + SERE_OFS ;iy holds interrupt vector
+	 ld	 hl, hdlc_isr_e
+	 ld	 (iy), 0xC3		;JP command
+	 ld	 (iy+1), hl		;ISR address
+	 ld	 a, 0x0D			;HDLC mode, internal clock, IP 1
+ioi ld	 (SECR), a
+	 ld	 (SECRShadow), a
+
+	 ld	 a, (HDLC_E_FRSHADOW)
+	 set	 6, a
+	 ld	 (HDLC_E_FRSHADOW), a
+ioi ld    (HDLC_E_FR),a
+#ifdef HDLC_E_DDRSHADOW
+	 ld	 a, (HDLC_E_DDRSHADOW)
+	 set	 6, a
+	 ld	 (HDLC_E_DDRSHADOW), a
+ioi ld	 (HDLC_E_DDR),a
+#endif
+
+	 pop	 ip							; Restore IP to the previous state
+	 lret
+
+
+
+#endasm
+
+#asm __root
+
+hdlc_isr_e::
+	 push	 af
+	 push	 bc
+	 push	 de
+	 push	 jkhl
+	 push	 iy
+	 push	 pw
+
+ioi ld	 a, (SESR)
+	 ld	 c, a			;hold status register
+.isr_rxtest:
+	 and	 0x80
+	 jr	 nz, .isr_rx
+	 ld	 a, (hdlc_transmit_e)
+	 or	 a
+	 jr	 z, .isr_srwrite
+	 ld	 a, c
+	 and	 0x08
+	 jr	 z, .tx_offset		;buffer is clear
+.isr_srwrite:
+ioi ld	 (SESR), a		;clear interrupt
+	 jr	 .all_done
+
+.tx_offset:
+	 ld	 hl, (hdlc_txbuffer_e)
+	 ld	 de, (hdlc_txpos_e)
+	 add	 hl, de			;add offset
+	 ld	 a, (hl)
+	 inc	 de
+	 ld	 (hdlc_txpos_e), de
+	 ld	 hl, (hdlc_txsize_e)
+	 or	 a					;clear carry
+	 sbc	 hl, de
+	 jr	 z, .tx_last
+ioi ld	 (SEDR), a
+	 jr	 .all_done
+
+.tx_last:
+ioi ld	 (SEAR), a		;last byte in frame
+	 xor	 a
+	 ld	 (hdlc_transmit_e), a		;clear transmit flag
+	 jr	 .all_done
+
+.isr_rx:
+ioi ld	 a, (SEDR)		;get byte, clear interrupt
+	 ld	 b, a				; hold byte in b
+	 bit	 5, c				;check for overrun
+	 jr	 nz, .overrun
+	 ld	 iy, (hdlc_currentptr_e);
+	 ld	 a, (hdlc_currentptr_e + 2);
+	 clr	 hl
+	 ld	 l,a
+	 ex	 jk,hl
+	 ld	 hl,iy
+	 ld	 pw,jkhl    ; pw: a:iy
+	 ld	 hl, (pw)
+	 bit	 0, L			;test if current buffer is full
+	 jr	 z, .load_byte
+	 ld	 a, 0x01
+	 ld	 (hdlc_nobuffer_e), a
+    ld	 a, (SECRShadow)
+	 or	 0x40						;go to flag search mode
+ioi ld	 (SECR), a
+.all_done:
+	 jr	 .isr_exit
+
+.aborted:
+	 ld	 a, 0x01
+	 ld	 (hdlc_abort_e), a		;set abort flag
+	 jr	 .reset_buffer
+
+.bad_crc:
+	 ld	 a, 0x01
+	 ld	 (hdlc_badcrc_e), a
+	 jr	 .reset_buffer
+
+.overflow:
+	 ld	 a, 0x01
+	 ld	 (hdlc_overflow_e), a
+	 jr	 .reset_buffer
+
+.overrun:
+	 ld	 a, 0x01
+	 ld	 (hdlc_overrun_e), a
+	 jr	 .reset_buffer
+
+.reset_buffer:
+	 bool	 hl
+	 xor	 a
+	 ld	 L, a
+	 ld	 (hdlc_rxpos_e), hl		;reset buffer
+	 ld	 a, (SECRShadow)
+	 or	 0x40
+ioi ld	 (SECR), a					;wait for next flag byte(new packet)
+	 jr	 .isr_exit
+
+.isr_exit:
+	 pop	 pw
+	 pop	 iy
+	 pop	 jkhl
+	 pop	 de
+	 pop	 bc
+	 pop	 af
+	 ipres
+	 ret
+
+.load_byte:
+	 ld	 de, (hdlc_rxpos_e)
+	 ld	 hl, (hdlc_rxsize_e)
+	 or	 a					;clear carry
+	 sbc	 hl, de
+	 jr	 z, .overflow
+	 ld	 hl, 0x0004
+	 ex	 de, hl
+	 add	 iy, de			;start of data
+	 adc	 a, 0
+	 ex	 de, hl
+	 add	 iy, de
+	 adc	 a, 0				; a:iy is set to new byte location
+	 inc	 de
+	 ld	 (hdlc_rxpos_e), de		;load new pos
+	 clr	 hl
+	 ld	 l,a
+	 ex	 jk,hl
+	 ld	 hl,iy
+	 ld	 pw,jkhl       ; pw: a:iy
+	 ld 	 hl, (pw)
+	 ld	 L, b				;put in new byte
+	 ld	 (pw), hl
+.end_check:
+	 bit	 6, c
+	 jr	 nz, .packet_end
+	 bit	 4, c
+	 jr	 nz, .aborted
+.rx_done:
+	 jr	 .isr_exit
+
+.packet_end:
+	 bit	 4, c
+    jr	 nz, .bad_crc
+ 	 ld	 hl, (hdlc_rxpos_e)
+    ld	 de, 0x0002
+    or	 a						;clear carry
+    sbc	 hl, de
+    jr	 c, .reset_buffer		;runt packet, start over
+
+	 ld	 iy, (hdlc_currentptr_e)
+	 ld	 a, (hdlc_currentptr_e + 2)
+	 clr	 hl
+	 ld	 l,a
+	 ex	 jk,hl
+	 ld	 hl,iy
+	 ld	 pw,jkhl
+	 ld	 hl, (pw)
+	 set	 0, L				;set buffer full flag
+	 bit	 0, c
+	 jr	 z, .set_length
+	 set	 1, L				;set partial last byte flag
+.set_length:
+	 ld	 (pw), hl
+	 ld	 de, 0x0002		;offset into length field
+	 add	 iy, de
+	 adc	 a, 0				;carry add into high byte
+	 ld	 hl, (hdlc_rxpos_e)
+	 push	 hl
+	 clr	 hl
+	 ld	 l,a
+	 ex	 jk,hl
+	 ld	 hl,iy
+	 ld	 pw,jkhl
+	 pop	 hl
+	 ld	 (pw), hl		; load packet length
+	 ld	 de, (hdlc_rxcurrent_e)
+	 ld	 hl, (hdlc_rxcount_e)
+	 inc	 de
+	 or	 a					;clear carry
+	 sbc	 hl, de
+	 jr	 nz, .new_buffer
+	 ld	 de, 0x0000		;buffer count rolled over
+.new_buffer:
+	 ld	 (hdlc_rxcurrent_e), de
+	 ld	 b, d
+	 ld	 c, e						;put rxcurrent into bc
+	 ld	 de, (hdlc_rxsize_e)
+	 ld	 hl, 0x0004
+	 add	 hl, de
+	 ex	 de, hl
+	 mul
+	 ld	 e, L						;hold high byte in e
+	 ld	 hl, (hdlc_rxbuffers_e)
+	 ld	 a, (hdlc_rxbuffers_e + 2)
+	 add	 hl, bc
+	 adc	 a, e						;base + buffer_num*(size + 4)
+	 ld	 (hdlc_currentptr_e + 2), a   ;load up high byte
+	 ld	 (hdlc_currentptr_e), hl		;low bytes of buffer pointer
+	 bool	 hl
+	 ld	 L, 0
+	 ld	 (hdlc_rxpos_e), hl		;zero out buffer pos
+	 jr	 .rx_done
+
+
+#endasm
+
+/*** BeginHeader HDLCextClockE */
+void HDLCextClockE(int ext_clock);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+HDLCextClockE                   <HDLC_PACKET.LIB>
+
+SYNTAX:		   void HDLCextClockE(int ext_clock);
+
+DESCRIPTION:	Configures HDLC to be either internally(default)
+					of externally clocked. This should be called after
+               HDLCopenE().
+
+PARAMETER 1:   clock mode - 1 for externally clocked
+									 0 for internally clocked
+
+END DESCRIPTION **********************************************************/
+
+__nodebug void HDLCextClockE(int ext_clock)
+{
+	if(ext_clock)
+   {
+   	BitWrPortI(SECR, &SECRShadow, 0, 2);
+   }
+   else
+   {
+   	BitWrPortI(SECR, &SECRShadow, 1, 2);
+   }
+}
+
+/*** BeginHeader HDLCsendE */
+__nodebug int HDLCsendE(char *tx_buffer, int length);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+HDLCsendE                   <HDLC_PACKET.LIB>
+
+SYNTAX:		   int HDLCsendE(char *tx_buffer, int length);
+
+DESCRIPTION:	Transmits a packet out serial port E in HDLC mode. The
+					tx_buffer is read directly while transmitting, therefore
+					it cannot be altered until a subsequent call to
+					HDLCsendingE() returns false, indicating that the driver is
+					done with it.
+
+PARAMETER 1:	A pointer to the packet to be sent. This buffer must not
+					change while tranmitting (see above.)
+
+PARAMETER 2:	The size of the buffer (in bytes.)
+
+RETURN VALUE:	1 - sending packet
+					0 - cannot send, another packet is currently being
+					 	 transmitted
+
+END DESCRIPTION **********************************************************/
+
+__nodebug int HDLCsendE(char *tx_buffer, int length)
+{
+	if(hdlc_transmit_e == 0)
+	{
+		hdlc_txsize_e = length;
+		hdlc_txpos_e = 0;
+		hdlc_txbuffer_e = tx_buffer;
+		hdlc_transmit_e = 1;			//start transmitting
+
+#asm
+		ipset HDLC_INT_LEVEL
+#endasm
+		if((RdPortI(SESR) & 0x08) == 0)
+		{
+			hdlc_txpos_e = 1;
+         if(length == 1)
+         {
+         	WrPortI(SEAR, NULL, hdlc_txbuffer_e[0]);
+            hdlc_transmit_e = 0;
+         }
+         else
+         {
+				WrPortI(SEDR, NULL, hdlc_txbuffer_e[0]);
+         }
+		}
+#asm
+		ipres
+#endasm
+		return 1;
+	}
+	else
+	{
+		return 0; //already transmitting
+	}
+}
+
+/*** BeginHeader HDLCabortE */
+__nodebug void HDLCabortE();
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+HDLCabortE                   <HDLC_PACKET.LIB>
+
+SYNTAX:		   void HDLCabortE();
+
+DESCRIPTION:	Immediately stops any transmission. An HDLC abort code will
+					be sent if the driver was in the middle of sending a packet.
+
+END DESCRIPTION **********************************************************/
+
+
+__nodebug void HDLCabortE()
+{
+	if(hdlc_transmit_e)
+	{
+		hdlc_transmit_e = 0; //stop current transmission
+		WrPortI(SECR, NULL, 0xc0 | SECRShadow); //send abort pattern
+	}
+}
+
+/* START FUNCTION DESCRIPTION ********************************************
+HDLCsendingE                   <HDLC_PACKET.LIB>
+
+SYNTAX:		   int HDLCsendingE();
+
+DESCRIPTION:	Returns true if a packet is currently being transmitted.
+
+
+RETURN VALUE:	1 - currently sending a packet
+					0 - transmitter is idle.
+
+END DESCRIPTION **********************************************************/
+
+
+/*** BeginHeader HDLCsendingE */
+__nodebug int HDLCsendingE();
+/*** EndHeader */
+
+__nodebug int HDLCsendingE()
+{
+	return hdlc_transmit_e;
+}
+
+
+/*** BeginHeader HDLCreceiveE */
+__nodebug int HDLCreceiveE(char *rx_buffer, int length);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+HDLCreceiveE                   <HDLC_PACKET.LIB>
+
+SYNTAX:		   int HDLCreceiveE(char *rx_buffer, int length);
+
+DESCRIPTION:	Copies a received packet into rx_buffer if there is one.
+					Packets are received in the order they arrive, even if
+					multiple packets are currently stored in buffers.
+
+PARAMETER 1:	rx_buffer - pointer to the buffer to copy a received packet
+						into.
+PARAMETER 2:	length - size of rx_buffer
+
+RETURN VALUE:	 size of received packet(a 0 size packet is possible)
+					 -OR-
+					 -1 if no packets are available to receive
+					 -2 if rx_buffer is not large enough for the received packet
+					 	 (in this case, the packet remains in the receive buffer)
+END DESCRIPTION **********************************************************/
+
+__nodebug int HDLCreceiveE(char *rx_buffer, int length)
+{
+	auto int buffer_flags;
+	auto int buffer_size;
+	auto unsigned long buffer_start;
+
+	buffer_start = hdlc_rxbuffers_e + hdlc_rxnext_e*(hdlc_rxsize_e + 4);
+	xmem2root(&buffer_flags, buffer_start, 2);
+	if(buffer_flags)
+	{
+		xmem2root(&buffer_size, buffer_start + 2, 2);
+		if(buffer_size <= length)
+		{
+			xmem2root(rx_buffer, buffer_start + 4, buffer_size);
+			buffer_flags = 0;
+			root2xmem(buffer_start, &buffer_flags, 2); //free buffer
+			hdlc_rxnext_e = (hdlc_rxnext_e + 1) % hdlc_rxcount_e;
+			return buffer_size - 2; //exclude CRC
+		}
+		else
+		{
+			return -2;		//next packet is too large
+		}
+	}
+	else
+	{
+		return -1;			//no packets ready
+	}
+}
+
+/*** BeginHeader HDLCpeekE */
+__nodebug int HDLCpeekE(unsigned long *bufptr, int *lenptr);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+HDLCpeekE                   <HDLC_PACKET.LIB>
+
+SYNTAX:		   int HDLCpeekE(unsigned long *bufptr, int *lenptr);
+
+DESCRIPTION:	Reports the location and size of the next available
+					received packet if one is available. This function can
+					be used to effeciently inspect a received packet without
+					actually copying it into a root memory buffer with
+					HDLCreceiveE(). Once inspected, the buffer can be received
+					normally, or dropped(see HDLCdropE()).
+
+PARAMETER 1:	bufptr - set to location in xmem of the received packet
+PARAMETER 2:	lenprt - set to the size of the received packet
+
+RETURN VALUE:	 1 - set bufptr and lenptr for received packet
+					 0 - no received packets available
+END DESCRIPTION **********************************************************/
+
+__nodebug int HDLCpeekE(unsigned long *bufptr, int *lenptr)
+{
+	auto int buffer_flags;
+
+	*bufptr = hdlc_rxbuffers_e + hdlc_rxnext_e*(hdlc_rxsize_e + 4);
+	xmem2root(&buffer_flags, *bufptr, 2);
+	if(buffer_flags)
+	{
+		*bufptr += 2;
+		xmem2root(lenptr, *bufptr, 2);
+		*lenptr -= 2;		//exclude CRC
+		*bufptr += 2;
+		return 1;
+	}
+	else
+	{
+		return 0;	//no packets ready
+	}
+}
+
+/*** BeginHeader HDLCdropE */
+__nodebug int HDLCdropE();
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+HDLCdropE                   <HDLC_PACKET.LIB>
+
+SYNTAX:		   int HDLCdropE();
+
+DESCRIPTION:	Drops the next received packet, freeing up it's buffer.
+					This must be used if the packet has been examined with
+					HDLCpeekE (see above) and is no longer needed. A call
+					to HDLCreveiceE is the only other way to free up the
+					buffer.
+
+RETURN VALUE:	 1 - packet dropped
+					 0 - no received packets were available
+END DESCRIPTION **********************************************************/
+
+__nodebug int HDLCdropE()
+{
+	auto unsigned long buffer_start;
+	auto int buffer_flags;
+
+	buffer_start = hdlc_rxbuffers_e + hdlc_rxnext_e*(hdlc_rxsize_e + 4);
+	xmem2root(&buffer_flags, buffer_start, 2);
+	if(buffer_flags)
+	{
+		buffer_flags = 0;
+		root2xmem(buffer_start, &buffer_flags, 2); //free buffer
+		hdlc_rxnext_e = (hdlc_rxnext_e + 1) % hdlc_rxcount_e;
+		return 1;
+	}
+	else
+	{
+		return 0;
+	}
+}
+
+
+/*** Beginheader HDLCerrorE */
+__nodebug int HDLCerrorE();
+/*** Endheader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+HDLCerrorE                   <HDLC_PACKET.LIB>
+
+SYNTAX:		   int HDLCerrorE();
+
+DESCRIPTION:	Returns a set of possible error flags as an integer. Masks
+					can then be used to check which errors have occurred.
+					The masks are:
+						HDLC_NOBUFFER - driver ran out of buffers for received
+							packets
+						HDLC_OVERRUN - a byte was overwritten and lost before
+							the ISR could retreive it
+						HDLC_OVERFLOW - a received packet was too long for
+							the buffers
+						HDLC_ABORTED - a received packet was aborted by the
+							sender during tranmission
+						HDLC_BADCRC - a packet with an incorrect CRC was
+							received.
+					In each of these cases, a received packet with errors
+					is automatically dropped.
+
+RETURN VALUE:	 error flags (see above)
+
+END DESCRIPTION **********************************************************/
+
+__nodebug int HDLCerrorE()
+{
+	auto int error_flags;
+
+	error_flags = 0;
+
+	if(hdlc_nobuffer_e)
+	{
+		error_flags |= HDLC_NOBUFFER;
+		hdlc_nobuffer_e = 0;
+	}
+	if(hdlc_overrun_e)
+	{
+		error_flags |= HDLC_OVERRUN;
+		hdlc_overrun_e = 0;
+	}
+	if(hdlc_overflow_e)
+	{
+		error_flags |= HDLC_OVERFLOW;
+		hdlc_overflow_e = 0;
+	}
+	if(hdlc_abort_e)
+	{
+		error_flags |= HDLC_ABORTED;
+		hdlc_abort_e = 0;
+	}
+	if(hdlc_badcrc_e)
+	{
+		error_flags |= HDLC_BADCRC;
+		hdlc_badcrc_e = 0;
+	}
+	return error_flags;
+}
+
+
+/****************************************
+************* HDLC PORT F ***************
+****************************************/
+
+/*** BeginHeader HDLCcloseF */
+__nodebug void HDLCcloseF();
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+HDLCcloseF                   <HDLC_PACKET.LIB>
+
+SYNTAX:		   void HDLCcloseF();
+
+DESCRIPTION:   Disables the F HDLC port. This function is non-reentrant.
+
+END DESCRIPTION **********************************************************/
+
+#asm __xmem
+
+HDLCcloseF::
+    ipset HDLC_INT_LEVEL
+ 	 ;clear out interrupt vector
+    ld    a,0xc9        ; ret in first byte
+    ld    (INTVEC_BASE + SERF_OFS),a
+    ld    a,0x00        ; disable interrupts for port
+	 ld    (SFCRShadow),a
+ioi ld    (SFCR),a
+	 c TAT1R_SetValue( TAT1R_A3TIMER_REQ, TAT1R_RELEASE_REQ);
+    ipres
+    lret
+
+#endasm
+
+/*** BeginHeader HDLCopenF */
+__nodebug int HDLCopenF(long baud,
+				  		    char encoding,
+				  			 unsigned long buffers,
+				  			 int buffer_count,
+				  			 int buffer_size );
+__xmem void hdlc_init_f();
+void hdlc_isr_f();
+extern char *hdlc_txbuffer_f;
+extern int hdlc_txsize_f;
+extern int hdlc_txpos_f;
+extern char hdlc_transmit_f;
+extern unsigned long hdlc_rxbuffers_f;
+extern unsigned long hdlc_currentptr_f;	//start of current buffer
+extern int hdlc_rxcount_f;
+extern int hdlc_rxsize_f;
+extern int hdlc_rxcurrent_f;
+extern int hdlc_rxnext_f;
+extern int hdlc_rxpos_f;
+extern char hdlc_encoding_f;
+
+extern char hdlc_overflow_f;
+extern char hdlc_overrun_f;
+extern char hdlc_badcrc_f;
+extern char hdlc_abort_f;
+extern char hdlc_nobuffer_f;
+
+/*** EndHeader */
+
+char *hdlc_txbuffer_f;
+int hdlc_txsize_f;
+int hdlc_txpos_f;
+char hdlc_transmit_f;
+char hdlc_txdone_f;		//finished sending data
+unsigned long hdlc_rxbuffers_f;	//base of buffer array
+unsigned long hdlc_currentptr_f;
+int hdlc_rxcount_f;		//number of buffers
+int hdlc_rxsize_f;		//size of each buffer
+int hdlc_rxcurrent_f;	//current buffer being filled
+int hdlc_rxnext_f;		//next buffer to be read
+int hdlc_rxpos_f;
+char hdlc_encoding_f;
+
+char hdlc_overflow_f;
+char hdlc_overrun_f;
+char hdlc_badcrc_f;
+char hdlc_abort_f;
+char hdlc_nobuffer_f;
+
+#ifndef HDLC_F_USEPORT
+   #warnt "Define HDLC_F_USEPORT to C, D or E. Defaulting to D."
+   #define HDLC_F_USEPORT D
+#endif
+
+#define HDLC_F_FR					CONCAT(P, CONCAT(HDLC_F_USEPORT, FR))
+#define HDLC_F_FRSHADOW			CONCAT(P, CONCAT(HDLC_F_USEPORT, FRShadow))
+#define HDLC_F_DDR         CONCAT(P, CONCAT(HDLC_F_USEPORT, DDR))
+#define HDLC_F_DDRSHADOW   CONCAT(P, CONCAT(HDLC_F_USEPORT, DDRShadow))
+
+/* START FUNCTION DESCRIPTION ********************************************
+HDLCopenF                   <HDLC_PACKET.LIB>
+
+SYNTAX:		   int HDLCopenF(long baud,
+				  					  char encoding,
+				  					  unsigned long buffers,
+				  					  int buffer_count,
+				  					  int buffer_size);
+
+DESCRIPTION:   Opens serial port F in HDLC mode. Sets up buffers to
+					hold received packets.
+
+PARAMETER 1:	baud - the baud rate to run the serial port at. Due to
+						limitations in the baud generator, non-standard baud
+						rates will be approximated (see RETURN VALUE below.)
+PARAMETER 2:	encoding - the bit encoding mode to use. Macro labels for
+						the available options are:
+								HDLC_NRZ
+								HDLC_NRZI
+								HDLC_MANCHESTER
+								HDLC_BIPHASE_SPACE
+								HDLC_BIPHASE_MARK
+						See the HDLC documentation for more detail on these
+						modes.
+PARAMETER 3:	buffers - a pointer to the start of the extended momory
+						block containing the receive buffers. This block must
+						be allocated beforehand by the user. The size of the
+						block should be:
+							(# of buffers) * ((size of buffer) + 4)
+PARAMETER 4:	buffer_count - the number of buffers in the buffer
+										block(above).
+PARAMETER 5:	buffer_size - the capacity of each buffer in the
+									  block(above).
+
+RETURN VALUE:	1 if the actual baud rate is within 5% of the requested
+						baud rate
+					0 otherwise
+
+END DESCRIPTION **********************************************************/
+
+__nodebug int HDLCopenF(long baud,
+							 char encoding,
+				  			 unsigned long buffers,
+				  			 int buffer_count,
+				  			 int buffer_size)
+{
+	auto long actual_baud;
+	auto int i;
+	auto char temp[4];
+
+	hdlc_encoding_f = encoding;
+
+	hdlc_txbuffer_f = NULL;
+	hdlc_txsize_f = 0;
+	hdlc_txpos_f = 0;
+	hdlc_transmit_f = 0;
+	hdlc_txdone_f = 0;
+
+	hdlc_overflow_f = 0;
+	hdlc_overrun_f = 0;
+	hdlc_badcrc_f = 0;
+	hdlc_abort_f = 0;
+	hdlc_nobuffer_f = 0;
+
+	//initialize buffers
+	hdlc_rxbuffers_f = buffers;
+	hdlc_currentptr_f = buffers; //points to first buffer
+	hdlc_rxcount_f = buffer_count;
+	hdlc_rxsize_f = buffer_size;
+	//zero out flag bytes
+	memset(temp, 0, 4);
+	for(i = 0;i < hdlc_rxcount_f;i++)
+	{
+ 		root2xmem(hdlc_rxbuffers_f + i*(hdlc_rxsize_f + 4), temp, 4);
+	}
+	hdlc_rxcurrent_f = 0;
+	hdlc_rxpos_f = 0;
+	hdlc_rxnext_f = 0;
+
+	if(baud < 10)
+	{
+		baud = 10; //prevents divide by zero errors
+	}
+
+	actual_baud = SetSerialTATxRValues( baud, NULL, TAT3R);
+
+	WrPortI(SFER, &SFERShadow,
+				((encoding << 5) & 0xe0) | (encoding & 0x18));
+
+   // Clear FIFO
+   for(i=0; i<4; i++)
+   {
+   	#asm
+		ioi ld	 a, (SFDR)		;Do dummy read to clear interrupt
+      #endasm
+   }
+
+	hdlc_init_f();
+
+   return (baud == actual_baud) || (baud / labs( baud - actual_baud) >= 20);
+}
+
+#asm __xmem
+
+hdlc_init_f::
+	 ;setup interrupt vector
+    push	 ip
+    ipset HDLC_INT_LEVEL
+ 	 ld	 iy, INTVEC_BASE + SERF_OFS			;iy holds interrupt vector
+	 ld	 hl, hdlc_isr_f
+	 ld	 (iy), 0xC3		;JP command
+	 ld	 (iy+1), hl		;ISR address
+	 ld	 a, 0x0D			;HDLC mode, internal clock, IP 1
+ioi ld	 (SFCR), a
+	 ld	 (SFCRShadow), a
+
+	 ld	 a, (HDLC_F_FRSHADOW)
+	 set	 2, a
+	 ld	 (HDLC_F_FRSHADOW), a
+ioi ld	 (HDLC_F_FR),a
+#ifdef HDLC_F_DDR
+	 ld	 a, (HDLC_F_DDRSHADOW)
+	 set	 2, a
+	 ld	 (HDLC_F_DDRSHADOW), a
+ioi ld	 (HDLC_F_DDR),a
+#endif
+
+	 pop	 ip
+	 lret
+
+#endasm
+
+#asm __root
+
+hdlc_isr_f::
+	 push	 af
+	 push	 bc
+	 push	 de
+	 push	 jkhl
+	 push	 iy
+	 push	 pw
+
+ioi ld	 a, (SFSR)
+	 ld	 c, a			;hold status register
+.isr_rxtest:
+	 and	 0x80
+	 jr	 nz, .isr_rx
+	 ld	 a, (hdlc_transmit_f)
+	 or	 a
+	 jr	 z, .isr_srwrite
+	 ld	 a, c
+	 and	 0x08
+	 jr	 z, .tx_offset		;buffer is clear
+.isr_srwrite:
+ioi ld	 (SFSR), a		;clear interrupt
+	 jr	 .all_done
+
+.tx_offset:
+	 ld	 hl, (hdlc_txbuffer_f)
+	 ld	 de, (hdlc_txpos_f)
+	 add	 hl, de			;add offset
+	 ld	 a, (hl)
+	 inc	 de
+	 ld	 (hdlc_txpos_f), de
+	 ld	 hl, (hdlc_txsize_f)
+	 or	 a					;clear carry
+	 sbc	 hl, de
+	 jr	 z, .tx_last
+ioi ld	 (SFDR), a
+	 jr	 .all_done
+
+.tx_last:
+ioi ld	 (SFAR), a		;last byte in frame
+	 xor	 a
+	 ld	 (hdlc_transmit_f), a		;clear transmit flag
+	 jr	 .all_done
+
+.isr_rx:
+ioi ld	 a, (SFDR)		;get byte, clear interrupt
+	 ld	 b, a				; hold byte in b
+	 bit	 5, c				;check for overrun
+	 jr	 nz, .overrun
+	 ld	 iy, (hdlc_currentptr_f);
+	 ld	 a, (hdlc_currentptr_f + 2);
+    clr	 hl
+    ld	 l,a
+    ex	 jk,hl
+    ld	 hl,iy
+    ld	 pw,jkhl
+    ld	 hl,(pw)
+	 bit	 0, L			;test if current buffer is full
+	 jr	 z, .load_byte
+	 ld	 a, 0x01
+	 ld	 (hdlc_nobuffer_f), a
+	 ld	 a, (SFCRShadow)
+	 or	 0x40
+ioi ld	 (SFCR), a					;wait for next flag byte(new packet)
+.all_done:
+	 jr	 .isr_exit
+
+.aborted:
+	 ld	 a, 0x01
+	 ld	 (hdlc_abort_f), a		;set abort flag
+	 jr	 .reset_buffer
+
+.bad_crc:
+	 ld	 a, 0x01
+	 ld	 (hdlc_badcrc_f), a
+	 jr	 .reset_buffer
+
+.overflow:
+	 ld	 a, 0x01
+	 ld	 (hdlc_overflow_f), a
+	 jr	 .reset_buffer
+
+.overrun:
+	 ld	 a, 0x01
+	 ld	 (hdlc_overrun_f), a
+	 jr	 .reset_buffer
+
+.reset_buffer:
+	 bool	 hl
+	 xor	 a
+	 ld	 L, a
+	 ld	 (hdlc_rxpos_f), hl		;reset buffer
+	 ld	 a, (SFCRShadow)
+	 ld	 a, (SFCRShadow)
+	 or	 0x40
+ioi ld	 (SFCR), a					;wait for next flag byte(new packet)
+	 jr	 .isr_exit
+
+.isr_exit:
+	 pop	 pw
+	 pop	 iy
+	 pop	 jkhl
+	 pop	 de
+	 pop	 bc
+	 pop	 af
+	 ipres
+	 ret
+
+.load_byte:
+	 ld	 de, (hdlc_rxpos_f)
+	 ld	 hl, (hdlc_rxsize_f)
+	 or	 a					;clear carry
+	 sbc	 hl, de
+	 jr	 z, .overflow
+	 ld	 hl, 0x0004
+	 ex	 de, hl
+	 add	 iy, de			;start of data
+	 adc	 a, 0				; a:iy is set to new byte location
+	 ex	 de, hl
+	 add	 iy, de
+	 adc	 a, 0				; a:iy is set to new byte location
+	 inc	 de
+	 ld	 (hdlc_rxpos_f), de		;load new pos
+	 clr	 hl
+	 ld	 l,a
+	 ex	 jk,hl
+	 ld	 hl,iy
+	 ld	 pw,jkhl
+	 ld	 hl, (pw)
+	 ld	 L, b				;put in new byte
+    ld	 (pw),hl
+.end_check:
+	 bit	 6, c
+	 jr	 nz, .packet_end
+	 bit	 4, c
+	 jr	 nz, .aborted
+.rx_done:
+	 jr	 .isr_exit
+
+.packet_end:
+	 bit	 4, c
+    jr	 nz, .bad_crc
+ 	 ld	 hl, (hdlc_rxpos_f)
+    ld	 de, 0x0002
+    or	 a						;clear carry
+    sbc	 hl, de
+    jr	 c, .reset_buffer		;runt packet, start over
+
+	 ld	 iy, (hdlc_currentptr_f)
+	 ld	 a, (hdlc_currentptr_f + 2)
+    clr	 hl
+    ld	 l,a
+    ex	 jk,hl
+    ld	 hl,iy
+    ld	 pw,jkhl
+    ld	 hl,(pw)
+	 set	 0, L				;set buffer full flag
+	 bit	 0, c
+	 jr	 z, .set_length
+	 set	 1, L				;set partial last byte flag
+.set_length:
+    ld	 (pw),hl
+	 ld	 de, 0x0002		;offset into length field
+	 add	 iy, de
+	 adc	 a, 0				;carry add into high byte
+	 ld	 hl, (hdlc_rxpos_f)
+    push	 hl
+    clr	 hl
+    ld	 l,a
+    ex	 jk,hl
+    ld	 hl,iy
+    ld	 pw,jkhl
+    pop	 hl
+    ld	 (pw),hl
+	 ld	 de, (hdlc_rxcurrent_f)
+	 ld	 hl, (hdlc_rxcount_f)
+	 inc	 de
+	 or	 a					;clear carry
+	 sbc	 hl, de
+	 jr	 nz, .new_buffer
+	 ld	 de, 0x0000		;buffer count rolled over
+.new_buffer:
+	 ld	 (hdlc_rxcurrent_f), de
+	 ld	 b, d
+	 ld	 c, e						;put rxcurrent into bc
+	 ld	 de, (hdlc_rxsize_f)
+	 ld	 hl, 0x0004
+	 add	 hl, de
+	 ex	 de, hl
+	 mul
+	 ld	 e, L						;hold high byte in e
+	 ld	 hl, (hdlc_rxbuffers_f)
+	 ld	 a, (hdlc_rxbuffers_f + 2)
+	 add	 hl, bc
+	 adc	 a, e						;base + buffer_num*(size + 4)
+	 ld	 (hdlc_currentptr_f + 2), a   ;load up high byte
+	 ld	 (hdlc_currentptr_f), hl		;low bytes of buffer pointer
+	 bool	 hl
+	 ld	 L, 0
+	 ld	 (hdlc_rxpos_f), hl		;zero out buffer pos
+	 jr	 .rx_done
+
+
+#endasm
+
+/*** BeginHeader HDLCextClockF */
+void HDLCextClockF(int ext_clock);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+HDLCextClockF                   <HDLC_PACKET.LIB>
+
+SYNTAX:		   void HDLCextClockF(int ext_clock);
+
+DESCRIPTION:	Configures HDLC to be either internally(default)
+					of externally clocked. This should be called after
+               HDLCopenF().
+
+PARAMETER 1:   clock mode - 1 for externally clocked
+									 0 for internally clocked
+
+END DESCRIPTION **********************************************************/
+
+__nodebug void HDLCextClockF(int ext_clock)
+{
+	if(ext_clock)
+   {
+   	BitWrPortI(SFCR, &SFCRShadow, 0, 2);
+   }
+   else
+   {
+   	BitWrPortI(SFCR, &SFCRShadow, 1, 2);
+   }
+}
+
+
+
+/*** BeginHeader HDLCsendF */
+__nodebug int HDLCsendF(char *tx_buffer, int length);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+HDLCsendF                   <HDLC_PACKET.LIB>
+
+SYNTAX:		   int HDLCsendF(char *tx_buffer, int length);
+
+DESCRIPTION:	Transmits a packet out serial port F in HDLC mode. The
+					tx_buffer is read directly while transmitting, therefore
+					it cannot be altered until a subsequent call to
+					HDLCsendingF() returns false, indicating that the driver is
+					done with it.
+
+PARAMETER 1:	A pointer to the packet to be sent. This buffer must not
+					change while tranmitting (see above.)
+
+PARAMETER 2:	The size of the buffer (in bytes.)
+
+RETURN VALUE:	1 - sending packet
+					0 - cannot send, another packet is currently being
+					 	 transmitted
+
+END DESCRIPTION **********************************************************/
+
+__nodebug int HDLCsendF(char *tx_buffer, int length)
+{
+	if(hdlc_transmit_f == 0)
+	{
+		hdlc_txsize_f = length;
+		hdlc_txpos_f = 0;
+		hdlc_txbuffer_f = tx_buffer;
+		hdlc_transmit_f = 1;			//start transmitting
+
+#asm
+		ipset HDLC_INT_LEVEL
+#endasm
+		if((RdPortI(SFSR) & 0x08) == 0)
+		{
+			hdlc_txpos_f = 1;
+         if(length == 1)
+         {
+         	WrPortI(SFAR, NULL, hdlc_txbuffer_f[0]);
+            hdlc_transmit_f = 0;
+         }
+         else
+         {
+				WrPortI(SFDR, NULL, hdlc_txbuffer_f[0]);
+         }
+		}
+#asm
+		ipres
+#endasm
+		return 1;
+	}
+	else
+	{
+		return 0; //already transmitting
+	}
+}
+
+/*** BeginHeader HDLCabortF */
+__nodebug void HDLCabortF();
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+HDLCabortF                   <HDLC_PACKET.LIB>
+
+SYNTAX:		   void HDLCabortF();
+
+DESCRIPTION:	Immediately stops any transmission. An HDLC abort code will
+					be sent if the driver was in the middle of sending a packet.
+
+END DESCRIPTION **********************************************************/
+
+
+__nodebug void HDLCabortF()
+{
+	if(hdlc_transmit_f)
+	{
+		hdlc_transmit_f = 0; //stop current transmission
+		WrPortI(SFCR, NULL, 0xc0 | SFCRShadow); //send abort pattern
+	}
+}
+
+/* START FUNCTION DESCRIPTION ********************************************
+HDLCsendingF                   <HDLC_PACKET.LIB>
+
+SYNTAX:		   int HDLCsendingF();
+
+DESCRIPTION:	Returns true if a packet is currently being transmitted.
+
+
+RETURN VALUE:	1 - currently sending a packet
+					0 - transmitter is idle.
+
+END DESCRIPTION **********************************************************/
+
+
+/*** BeginHeader HDLCsendingF */
+__nodebug int HDLCsendingF();
+/*** EndHeader */
+
+__nodebug int HDLCsendingF()
+{
+	return hdlc_transmit_f;
+}
+
+
+/*** BeginHeader HDLCreceiveF */
+__nodebug int HDLCreceiveF(char *rx_buffer, int length);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+HDLCreceiveF                   <HDLC_PACKET.LIB>
+
+SYNTAX:		   int HDLCreceiveF(char *rx_buffer, int length);
+
+DESCRIPTION:	Copies a received packet into rx_buffer if there is one.
+					Packets are received in the order they arrive, even if
+					multiple packets are currently stored in buffers.
+
+PARAMETER 1:	rx_buffer - pointer to the buffer to copy a received packet
+						into.
+PARAMETER 2:	length - size of rx_buffer
+
+RETURN VALUE:	 size of received packet(a 0 size packet is possible)
+					 -OR-
+					 -1 if no packets are available to receive
+					 -2 if rx_buffer is not large enough for the received packet
+					 	 (in this case, the packet remains in the receive buffer)
+END DESCRIPTION **********************************************************/
+
+__nodebug int HDLCreceiveF(char *rx_buffer, int length)
+{
+	auto int buffer_flags;
+	auto int buffer_size;
+	auto unsigned long buffer_start;
+
+	buffer_start = hdlc_rxbuffers_f + hdlc_rxnext_f*(hdlc_rxsize_f + 4);
+	xmem2root(&buffer_flags, buffer_start, 2);
+	if(buffer_flags)
+	{
+		xmem2root(&buffer_size, buffer_start + 2, 2);
+		if(buffer_size <= length)
+		{
+			xmem2root(rx_buffer, buffer_start + 4, buffer_size);
+			buffer_flags = 0;
+			root2xmem(buffer_start, &buffer_flags, 2); //free buffer
+			hdlc_rxnext_f = (hdlc_rxnext_f + 1) % hdlc_rxcount_f;
+			return buffer_size - 2; //exclude CRC
+		}
+		else
+		{
+			return -2;		//next packet is too large
+		}
+	}
+	else
+	{
+		return -1;			//no packets ready
+	}
+}
+
+/*** BeginHeader HDLCpeekF */
+__nodebug int HDLCpeekF(unsigned long *bufptr, int *lenptr);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+HDLCpeekF                   <HDLC_PACKET.LIB>
+
+SYNTAX:		   int HDLCpeekF(unsigned long *bufptr, int *lenptr);
+
+DESCRIPTION:	Reports the location and size of the next available
+					received packet if one is available. This function can
+					be used to effeciently inspect a received packet without
+					actually copying it into a root memory buffer with
+					HDLCreceiveF(). Once inspected, the buffer can be received
+					normally, or dropped(see HDLCdropF()).
+
+PARAMETER 1:	bufptr - set to location in xmem of the received packet
+PARAMETER 2:	lenprt - set to the size of the received packet
+
+RETURN VALUE:	 1 - set bufptr and lenptr for received packet
+					 0 - no received packets available
+END DESCRIPTION **********************************************************/
+
+__nodebug int HDLCpeekF(unsigned long *bufptr, int *lenptr)
+{
+	auto int buffer_flags;
+
+	*bufptr = hdlc_rxbuffers_f + hdlc_rxnext_f*(hdlc_rxsize_f + 4);
+	xmem2root(&buffer_flags, *bufptr, 2);
+	if(buffer_flags)
+	{
+		*bufptr += 2;
+		xmem2root(lenptr, *bufptr, 2);
+		*lenptr -= 2;		//exclude CRC
+		*bufptr += 2;
+		return 1;
+	}
+	else
+	{
+		return 0;	//no packets ready
+	}
+}
+
+/*** BeginHeader HDLCdropF */
+__nodebug int HDLCdropF();
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+HDLCdropF                   <HDLC_PACKET.LIB>
+
+SYNTAX:		   int HDLCdropF();
+
+DESCRIPTION:	Drops the next received packet, freeing up it's buffer.
+					This must be used if the packet has been examined with
+					HDLCpeekF (see above) and is no longer needed. A call
+					to HDLCreceiveF is the only other way to free up the
+					buffer.
+
+RETURN VALUE:	 1 - packet dropped
+					 0 - no received packets were available
+END DESCRIPTION **********************************************************/
+
+__nodebug int HDLCdropF()
+{
+	auto unsigned long buffer_start;
+	auto int buffer_flags;
+
+	buffer_start = hdlc_rxbuffers_f + hdlc_rxnext_f*(hdlc_rxsize_f + 4);
+	xmem2root(&buffer_flags, buffer_start, 2);
+	if(buffer_flags)
+	{
+		buffer_flags = 0;
+		root2xmem(buffer_start, &buffer_flags, 2); //free buffer
+		hdlc_rxnext_f = (hdlc_rxnext_f + 1) % hdlc_rxcount_f;
+		return 1;
+	}
+	else
+	{
+		return 0;
+	}
+}
+
+
+/*** Beginheader HDLCerrorF */
+__nodebug int HDLCerrorF();
+/*** Endheader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+HDLCerrorF                   <HDLC_PACKET.LIB>
+
+SYNTAX:		   int HDLCerrorF();
+
+DESCRIPTION:	Returns a set of possible error flags as an integer. Masks
+					can then be used to check which errors have occurred.
+					The masks are:
+						HDLC_NOBUFFER - driver ran out of buffers for received
+							packets
+						HDLC_OVERRUN - a byte was overwritten and lost before
+							the ISR could retreive it
+						HDLC_OVERFLOW - a received packet was too long for
+							the buffers
+						HDLC_ABORTED - a received packet was aborted by the
+							sender during tranmission
+						HDLC_BADCRC - a packet with an incorrect CRC was
+							received.
+					In each of these cases, a received packet with errors
+					is automatically dropped.
+
+RETURN VALUE:	 error flags (see above)
+
+END DESCRIPTION **********************************************************/
+
+__nodebug int HDLCerrorF()
+{
+	auto int error_flags;
+
+	error_flags = 0;
+
+	if(hdlc_nobuffer_f)
+	{
+		error_flags |= HDLC_NOBUFFER;
+		hdlc_nobuffer_f = 0;
+	}
+	if(hdlc_overrun_f)
+	{
+		error_flags |= HDLC_OVERRUN;
+		hdlc_overrun_f = 0;
+	}
+	if(hdlc_overflow_f)
+	{
+		error_flags |= HDLC_OVERFLOW;
+		hdlc_overflow_f = 0;
+	}
+	if(hdlc_abort_f)
+	{
+		error_flags |= HDLC_ABORTED;
+		hdlc_abort_f = 0;
+	}
+	if(hdlc_badcrc_f)
+	{
+		error_flags |= HDLC_BADCRC;
+		hdlc_badcrc_f = 0;
+	}
+	return error_flags;
+}
+
+
+
+/*** Beginheader */
+#endif
+/*** Endheader */

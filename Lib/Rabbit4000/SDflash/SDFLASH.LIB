@@ -1,0 +1,2508 @@
+/************************************************************************
+SDFLASH.LIB
+
+Copyright Rabbit Semiconductor, 2006-7
+
+Library for interfacing to SD flash memory devices on an SPI bus.
+
+The functions are:
+
+sdspi_initDevice
+sdspi_read_sector
+sdspi_write_sector
+sdspi_WriteContinue
+sdspi_notbusy
+sdspi_print_dev
+sdspi_getSectorCount
+sdspi_isWriting
+sdspi_reset_card
+sdspi_sendingAP
+sdspi_get_status_reg
+sdspi_init_card
+sdspi_process_command
+sdspi_get_csd
+sdspi_get_scr
+sdspi_set_block_length
+sdspi_debounce
+sdspi_setLED
+
+Revision History:	Rev 1.0 Initial Release
+
+*************************************************************************/
+
+/*** BeginHeader */
+
+#ifndef __SDFLASH_LIB__
+#define __SDFLASH_LIB__
+
+// Number of SD sockets available, NOT the number of supported devices.
+// All standard SD memory cards are supported.
+// Every SD socket must have a static sd_dev_interface structure with
+// information on how the socket is connected to the processor.
+// Reading of the CDS from the card is used to fill in the table entry
+// values rather than a constant look-up table.
+#define SDFLASH_MAX_DEVS 1
+
+// Defined to use table based CRC calculations as every sector read or
+// written has the CRC calculated.  If code space is an issue, this can
+// be commented out at a cost to SD card throughput.
+#define CRC16_USE_TABLE
+
+#ifdef SDFLASH_DEBUG
+	#define _sdflash_nodebug __debug
+#else
+	#define _sdflash_nodebug __nodebug
+#endif
+
+#include <errno.h>
+
+#ifndef SD_CS_PORT
+	#if RCM4300_SERIES
+		// RCM4300 series boards need to define the chip select for the SD card:
+		#use "RCM43xx_BIOS.lib"
+	#else
+		#fatal "On this target, you must define SD card macros by hand."
+	#endif
+#endif
+
+/*** EndHeader */
+
+
+/*** BeginHeader sdspi_initDevice ****************************/
+
+/*
+ * SPI bus timing requirements for SD devices
+ */
+#define NCS_MIN     0
+#define NCR_MAX     8
+#define NRC_MIN     1
+#define NWR_MIN     1
+#define NEC_MIN     0
+#define NDS_MIN     0
+#define NBR_MAX     1
+#define NCX_MAX     8
+
+/*
+ * Data packet sizes and buffer offsets
+ */
+#define COMMAND_BYTE_COUNT       6
+#define R1_BYTE_COUNT            1
+#define R2_BYTE_COUNT            2
+#define R3_BYTE_COUNT            3
+/* CSD = 16 bytes data, 1 byte start block and 2 bytes for 16 bit CRC */
+#define CSD_BYTE_COUNT           19
+#define BLOCK_SIZE               512L
+/* DATA BLOCK = 512 bytes data, 1 byte start block and 2 bytes for 16 bit CRC */
+#define DATA_BLOCK_SIZE          BLOCK_SIZE + 3
+#define DATA_RESPONSE_BYTE_COUNT 1
+// COMMAND R1 = NCS_MIN + COMMAND_BYTE_COUNT + NCR_MAX + R1_BYTE_COUNT + NEC_MIN
+#define CMD_R1_BUFFER_SIZE       1
+// COMMAND R2 = NCS_MIN + COMMAND_BYTE_COUNT + NCR_MAX + R2_BYTE_COUNT + NEC_MIN
+#define CMD_R2_BUFFER_SIZE       2
+#define READ_CSD_BUFFER_SIZE     CMD_R2_BUFFER_SIZE + CSD_BYTE_COUNT
+#define READ_BLOCK_BUFFER_SIZE   CMD_R2_BUFFER_SIZE + DATA_BLOCK_SIZE
+#define READ_SCR_BUFFER_SIZE     CMD_R2_BUFFER_SIZE + SCR_BYTE_COUNT
+#define SCR_BYTE_COUNT           11
+
+/*
+ * SD commands supported
+ */
+#define CMD0        0
+#define CMD1        1
+#define CMD9        9
+#define CMD13       13
+#define CMD16       16
+#define CMD17       17
+#define CMD24       24
+#define CMD32       32
+#define CMD33       33
+#define CMD38       38
+#define CMD55       55
+#define CMD59       59
+#define ACMD51      51
+#define ACMD41      41
+#define ACMD42      42
+
+/*
+ * Command retry count
+ */
+#define CMD0_RETRIES               2000
+#define CMD1_RETRIES               5000
+#define BUSY_RETRIES               5400
+
+/*
+ * Command R1 (one byte command response) error codes
+ */
+#define R1_IDLE_STATE              0x01
+#define R1_ERASE_RESET             0x02
+#define R1_ILLEGAL_COMMAND         0x04
+#define R1_CRC_ERROR               0x08
+#define R1_ERASE_SEQUENCE_ERROR    0x10
+#define R1_ADDRESS_ERROR           0x20
+#define R1_PARAMETER_ERROR         0x40
+
+/*
+ * Command R2 (two byte command response) error code for second byte
+ */
+#define R2_CARD_LOCKED             0x01
+#define R2_WRITE_PROTECT_ERASE     0x02
+#define R2_GENERAL_ERROR           0x04
+#define R2_CC_ERROR                0x08
+#define R2_CARD_ECC_FAILED         0x10
+#define R2_WRITE_PROTECT_VIOLATION 0x20
+#define R2_ERASE_PARAM             0x40
+#define R2_OUT_OF_RANGE            0x80
+
+/*
+ * Bitmasks for command, response and data
+ */
+#define CMD_START                  0x40
+#define CMD_END                    0x01
+#define CMD_MASK_UPPER_BYTES       0xFF
+#define CMD_INDEX_OFFSET           NCS_MIN
+#define CMD_ARGUMENT_OFFSET        NCS_MIN + 1
+#define CMD_CRC_INDEX              NCS_MIN + 5
+#define CMD_NCR_OFFSET             NCS_MIN + COMMAND_BYTE_COUNT
+#define R1_MASK_LOW_BITS           0x80
+#define REPLY_TIMEOUT              0x41
+#define DATALINE_HIGH              0xFF
+#define DATALINE_LOW               0x00
+#define READ_WRITE_START_BLOCK     0xFE
+#define READ_DATA_ERROR            0x0F
+#define WRITE_RESPONSE_BITMASK     0x1F
+#define WRITE_DATA_ACCEPTED        0x05
+#define WRITE_DATA_CRC_ERROR       0x09
+#define WRITE_DATA_WRITE_ERROR     0x0D
+#define DATAOUT_LINE_HIGH          0xFFFFFFFF
+#define MASKOUT_31_LOWER_BITS      0x80000000
+
+/*
+ * CSD block byte offsets
+ */
+#define CSD_BLOCK_OFFSET_0            0
+#define CSD_BLOCK_OFFSET_1            1
+#define CSD_BLOCK_OFFSET_2            2
+#define CSD_BLOCK_OFFSET_3            3
+#define CSD_BLOCK_OFFSET_4            4
+#define CSD_BLOCK_OFFSET_5            5
+#define CSD_BLOCK_OFFSET_6            6
+#define CSD_BLOCK_OFFSET_7            7
+#define CSD_BLOCK_OFFSET_8            8
+#define CSD_BLOCK_OFFSET_9            9
+#define CSD_BLOCK_OFFSET_10           10
+#define CSD_BLOCK_OFFSET_11           11
+#define CSD_BLOCK_OFFSET_12           12
+#define CSD_BLOCK_OFFSET_13           13
+#define CSD_BLOCK_OFFSET_14           14
+#define CSD_BLOCK_OFFSET_15           15
+
+/*
+ * SCR block byte offsets
+ */
+#define SCR_BLOCK_OFFSET_0            0
+#define SCR_BLOCK_OFFSET_1            1
+
+/*
+ * Serial port status register bitmasks
+ */
+#define SERIAL_STATUS_RXFDB           0x00300000
+#define SERIAL_STATUS_RRDY            0x00000800
+#define SERIAL_STATUS_RBC             0x00000200
+#define SERIAL_STATUS_TRDY            0x00000008
+#define SERIAL_STATUS_RXFDB_OFFSET    20
+
+/*
+ * Timeout values for SPI device responses in seconds
+ */
+#define WAIT_SERIAL_READ_TIMEOUT          1
+#define WAIT_NOT_BUSY_TIMEOUT             1
+#define WAIT_CMD_REPLY_TIMEOUT            1
+#define WAIT_WRITE_DATA_REPLY_TIMEOUT     1
+
+extern char tx_buffer[READ_BLOCK_BUFFER_SIZE];
+extern char rx_buffer[READ_BLOCK_BUFFER_SIZE];
+
+// Non-zero if card in, 0 if no card
+#define SD_cardDetect(dev) (RdPortI(dev->SDintf->cdport)&(1<<dev->SDintf->cdpin))
+
+typedef struct sd_csd_type
+{
+   unsigned char init_ok;
+   unsigned char CSD_STR;
+   unsigned int  SPEC_VERS;
+   unsigned char TAAC;
+   unsigned char NSAC;
+   unsigned char TRANSPEED;
+   unsigned int  CCC;
+   unsigned char R_BL_LEN;
+   unsigned char R_BL_PART;
+   unsigned char WR_BL_MIS;
+   unsigned char RD_BL_MIS;
+   unsigned char DSR_IMP;
+   unsigned int  CSIZE;
+   unsigned char RC_MIN;
+   unsigned char RC_MAX;
+   unsigned char WC_MAX;
+   unsigned char WC_MIN;
+   unsigned char C_SIZE_M;
+   unsigned char ERASE_BLK_EN;
+   unsigned char SECTOR_SIZE;
+   unsigned char WP_G_S;
+   unsigned char WP_G_EN;
+   unsigned char DEF_ECC;
+   unsigned char R2W_FACT;
+   unsigned char WR_BL_LEN;
+   unsigned char WR_BL_PAR;
+   unsigned char F_FORMATG;
+   unsigned char COPY;
+   unsigned char P_WR_PROT;
+   unsigned char T_WR_PROT;
+   unsigned char F_FORMAT;
+   unsigned char CRC7;
+} SD_CSD_TYPE;
+
+typedef struct sd_scr_type
+{
+   char init_ok;
+   char SCR_STRUCTURE;
+   char SD_SPEC;
+   char DATA_STAT_AFTER_ERASE;
+   char SD_SECURITY;
+   char SD_BUS_WIDTHS;
+} SD_SCR_TYPE;
+
+
+typedef struct {
+   // Chip select PxDR reg, pin number, control registers
+   int  csport;    char *csportdrShadow;
+   char cspin;
+   int  csportddr; char *csportddrShadow;
+   int  csportfr;  char *csportfrShadow;
+   int  csportdcr; char *csportdcrShadow;
+   char csod;
+
+   // CLK line PxDR reg, pin number, control registers
+   int  clkport;
+   char clkpin;
+   int  clkportddr; char *clkportddrShadow;
+   int  clkportfr;  char *clkportfrShadow;
+   int  clkportdcr; char *clkportdcrShadow;
+   char clkod;
+
+   // Card Detect port PxDR reg, pin number, control registers
+   int  cdport;
+   char cdpin;
+   int  cdportddr; char *cdportddrShadow;
+   int  cdportfr;  char *cdportfrShadow;
+
+   // Write Protect port PxDR, pin number, control registers
+   int  wpport;
+   char wppin;
+   int  wpportddr; char *wpportddrShadow;
+   int  wpportfr;  char *wpportfrShadow;
+
+   // TX port PxDR, pin number, control registers
+   int  txport;
+   char txpin;
+   int  txportddr; char *txportddrShadow;
+   int  txportfr;  char *txportfrShadow;
+   int  txportdcr; char *txportdcrShadow;
+   char txod;
+
+   // RX port PxDR, pin number, control registers
+   int  rxport;
+   char rxpin;
+   int  rxportddr;   char *rxportddrShadow;
+   int  rxportfr;    char *rxportfrShadow;
+
+   // PWR port PxDR, pin number, control registers
+   int  pwrport;    char *pwrportdrShadow;
+   char pwrpin;
+   int  pwrportddr; char *pwrportddrShadow;
+   int  pwrportfr;  char *pwrportfrShadow;
+   int  pwrportdcr; char *pwrportdcrShadow;
+   char pwrod;      char pwron;
+
+   // LED port PxDR, pin number, control registers
+   int  ledport;    char *ledportdrShadow;
+   char ledpin;
+   int  ledportddr; char *ledportddrShadow;
+   int  ledportfr;  char *ledportfrShadow;
+   int  ledportdcr; char *ledportdcrShadow;
+   char ledod;      char ledon;
+
+   // Serial port SxDR, use parallel port D flag
+   char spdr;
+   char *sperShadow;
+   char sperValue;
+   char *spcrShadow;
+   char spcrValue;
+
+   char spdivreg;
+   char *spdivregShadow;
+   char divisor;
+
+   char sptcr;
+   char *sptcrShadow;
+   char sptcrValue;
+
+} sd_dev_interface;
+
+typedef struct
+{
+   int port;
+   char *shadow;
+   char pin;
+} sd_cspin;
+
+typedef struct sd_device_st
+{
+   struct sd_device_st *next;  // next element in linked list
+   long sectors;               // # of usable 512 byte sectors on the SD card
+   unsigned int pagesize;      // size (in bytes) of pages in flash device
+   int pagebitshift;           // # of 'don't care' bits following page addr.
+   int write_state;            // state for write timeout (used by FAT)
+   unsigned long write_sector; // current sector being written (used by FAT)
+   __far char *bptr;             // pointer to date buffer for writes
+	int erasebitshift;	       // "don't care" bits in an erase block address
+   unsigned int data_timeout;  // Computed data timeout value
+   sd_cspin cspin;             // Structure with Pin for Chip Select info
+   int port;                   // Base address for the SD card's SPI port
+   const sd_dev_interface *SDintf;   // Pointer to sd_dev_interface structure
+   SD_CSD_TYPE CSD;            // Structure for holding CSD parameters
+   SD_SCR_TYPE SCR;            // Structure for holding SCR parameters
+} sd_device;
+
+typedef struct sd_cmd_reply
+{
+   unsigned int cmd;
+   long argument;
+   unsigned int reply;
+   unsigned int reply_size;
+   unsigned int data_size;
+   char * tx_buffer;
+   char * rx_buffer;
+} SD_CMD_REPLY;
+
+int sdspi_initDevice(int indx, const sd_dev_interface *sd_dev);
+
+const sd_dev_interface SD_dev0 = {
+
+      // Chip select PxDR reg, pin number, control registers
+       (int)SD_CS_PORT,     SD_CS_PORT_DRSHADOW,
+      (char)SD_CS_PIN,
+       (int)SD_CS_PORT_DDR, SD_CS_PORT_DDRSHADOW,
+       (int)SD_CS_PORT_FR,  SD_CS_PORT_FRSHADOW,
+       (int)SD_CS_PORT_DCR, SD_CS_PORT_DCRSHADOW,
+      (char)SD_CS_PORT_OD,
+
+      // CLK line PxDR reg, pin number, control registers
+       (int)SD_CLK_PORT_DR,
+      (char)SD_CLK_PIN,
+       (int)SD_CLK_PORT_DDR, SD_CLK_PORT_DDRSHADOW,
+       (int)SD_CLK_PORT_FR,  SD_CLK_PORT_FRSHADOW,
+       (int)SD_CLK_PORT_DCR, SD_CLK_PORT_DCRSHADOW,
+      (char)SD_CLK_PORT_OD,
+
+      // Card Detect port PxDR reg, pin number, control registers
+       (int)SD_CD_PORT,
+      (char)SD_CD_PIN,
+       (int)SD_CD_PORT_DDR, SD_CD_PORT_DDRSHADOW,
+       (int)SD_CD_PORT_FR,  SD_CD_PORT_FRSHADOW,
+
+      // Write Protect port PxDR, pin number, control registers
+       (int)SD_WP_PORT,
+      (char)SD_WP_PIN,
+       (int)SD_WP_PORT_DDR, SD_WP_PORT_DDRSHADOW,
+       (int)SD_WP_PORT_FR,  SD_WP_PORT_FRSHADOW,
+
+      // TX port PxDR, pin number, control registers
+       (int)SD_TX_PORT_DR,
+      (char)SD_TX_PIN,
+       (int)SD_TX_PORT_DDR, SD_TX_PORT_DDRSHADOW,
+       (int)SD_TX_PORT_FR,  SD_TX_PORT_FRSHADOW,
+       (int)SD_TX_PORT_DCR, SD_TX_PORT_DCRSHADOW,
+      (char)SD_TX_PORT_OD,
+
+      // RX port PxDR, pin number, control registers
+       (int)SD_RX_PORT_DR,
+      (char)SD_RX_PIN,
+       (int)SD_RX_PORT_DDR, SD_RX_PORT_DDRSHADOW,
+       (int)SD_RX_PORT_FR,  SD_RX_PORT_FRSHADOW,
+
+      // PWR port PxDR, pin number, control registers
+       (int)SD_PWR_PORT_DR,  SD_PWR_PORT_DRSHADOW,
+      (char)SD_PWR_PIN,
+       (int)SD_PWR_PORT_DDR, SD_PWR_PORT_DDRSHADOW,
+       (int)SD_PWR_PORT_FR,  SD_PWR_PORT_FRSHADOW,
+       (int)SD_PWR_PORT_DCR, SD_PWR_PORT_DCRSHADOW,
+      (char)SD_PWR_PORT_OD,  SD_PWR_PORT_ON,
+
+      // LED port PxDR, pin number, control registers
+       (int)SD_LED_PORT_DR,  SD_LED_PORT_DRSHADOW,
+      (char)SD_LED_PIN,
+       (int)SD_LED_PORT_DDR, SD_LED_PORT_DDRSHADOW,
+       (int)SD_LED_PORT_FR,  SD_LED_PORT_FRSHADOW,
+       (int)SD_LED_PORT_DCR, SD_LED_PORT_DCRSHADOW,
+      (char)SD_LED_PORT_OD,  SD_LED_PORT_ON,
+
+      // Serial port SxDR, use parallel port D flag
+      (char)SD_SPI_SERPORT,
+
+      SD_SPI_SERSHADOW,
+      (char)SD_SPI_SERVALUE,
+
+      SD_SPI_SCRSHADOW,
+      (char)SD_SPI_SCRVALUE,
+
+      (char)SD_SPI_DIVREG,
+      SD_SPI_DIVREGSHADOW,
+      (char)SD_SPI_DIVISOR,
+
+      (char)SD_SPI_TCREG,
+      SD_SPI_TCRSHADOW,
+      (char)SD_SPI_TCRVALUE
+};
+
+// Define SPI line share semaphore functions
+//  as NULL if there is no sharing
+#ifndef _SPI_SD_LINES_SHARED_
+#define  _SPIgetSemaphore(X)  0
+#define  _SPIfreeSemaphore(X) 0
+#endif
+
+sd_device SD[SDFLASH_MAX_DEVS];
+
+/*** EndHeader */
+
+char tx_buffer[READ_BLOCK_BUFFER_SIZE];
+char rx_buffer[READ_BLOCK_BUFFER_SIZE];
+
+/* START FUNCTION DESCRIPTION ********************************************
+sdspi_initDevice               <SDFLASH.LIB>
+
+SYNTAX: int sdspi_initDevice(int indx, const sd_dev_interface *sd_dev)
+
+DESCRIPTION:	Initializes the SD card pointed to by sd_dev and adds
+               information about the cards interface to the SD device
+               array in the position pointed to by indx.  Sets up the
+               default block size of 512 bytes used by sector read/write
+               functions.  This should be called before any calls to
+               other sdspi functions.
+
+PARAMETER1:		indx   - index into the SD device array to add the card.
+PARAMETER2:		sd_dev - pointer to sd_dev_interface for the SD card.
+
+RETURN VALUE:   0                 Success
+               -EIO               I/O Error
+               -EINVAL            Invalid parameter given
+               -ENOMEDIUM         No SD card in socket
+               -ESHAREDBUSY       SPI port busy
+
+END DESCRIPTION **********************************************************/
+
+_sdflash_nodebug
+int sdspi_initDevice(int indx, const sd_dev_interface *sd_dev)
+{
+	unsigned long t;
+   int rc, status;
+#GLOBAL_INIT{
+   memset(SD,0,sizeof(SD));
+}
+   if (indx >= SDFLASH_MAX_DEVS || sd_dev == NULL || sd_dev->txport < PCDR
+        || sd_dev->txport > PEDR || (sd_dev->txport & 15) != 0) {
+     return -EINVAL;
+   }
+
+   SD[indx].SDintf = sd_dev;
+   SD[indx].port = sd_dev->spdr;
+   SD[indx].cspin.port = sd_dev->csport;
+   SD[indx].cspin.shadow = sd_dev->csportdrShadow;
+   SD[indx].cspin.pin =  sd_dev->cspin;
+
+   SD[indx].write_state = 0;      // Used by FAT, just set to zero
+   SD[indx].write_sector = 0;
+   SD[indx].data_timeout = 1000;  // Initial timeout, will be replaced
+                                  //  when CSD has been read from card
+   SD_DISABLECS(sd_dev);
+
+   // **** Set up chip select
+   if(sd_dev->csportfr)
+     BitWrPortI(sd_dev->csportfr, sd_dev->csportfrShadow,
+                0, sd_dev->cspin);
+   if(sd_dev->csportddr)
+     BitWrPortI(sd_dev->csportddr, sd_dev->csportddrShadow,
+                1, sd_dev->cspin);
+   if(sd_dev->csportdcr)
+     BitWrPortI(sd_dev->csportdcr, sd_dev->csportdcrShadow,
+                 sd_dev->csod, sd_dev->cspin );
+
+   if(sd_dev->pwrportfr)
+      BitWrPortI(sd_dev->pwrportfr, sd_dev->pwrportfrShadow,
+                1, sd_dev->pwrpin );
+   if(sd_dev->pwrportddr)
+      BitWrPortI(sd_dev->pwrportddr, sd_dev->pwrportddrShadow,
+                1, sd_dev->pwrpin );
+   if(sd_dev->pwrportdcr)
+      BitWrPortI(sd_dev->pwrportdcr, sd_dev->pwrportdcrShadow,
+                sd_dev->pwrod, sd_dev->pwrpin );
+   if(sd_dev->pwrport)
+      SD_ENABLEPOW(sd_dev);  // Turn on power if controllable by pin
+
+   // **** Set up serial CLK line
+   if(sd_dev->clkportfr)
+     BitWrPortI(sd_dev->clkportfr, sd_dev->clkportfrShadow,
+                1, sd_dev->clkpin );
+   if(sd_dev->clkportddr)
+     BitWrPortI(sd_dev->clkportddr, sd_dev->clkportddrShadow,
+                1, sd_dev->clkpin );
+   if(sd_dev->clkportdcr)
+     BitWrPortI (sd_dev->clkportdcr, sd_dev->clkportdcrShadow,
+                sd_dev->clkod, sd_dev->clkpin );
+
+   // **** Set up card detect
+   if(sd_dev->cdportfr)
+     BitWrPortI(sd_dev->cdportfr, sd_dev->cdportfrShadow,
+                 0, sd_dev->cdpin );
+   if(sd_dev->cdportddr)
+     BitWrPortI(sd_dev->cdportddr, sd_dev->cdportddrShadow,
+                 0, sd_dev->cdpin );
+
+   // **** Set up write protect
+   if(sd_dev->wpportfr)
+      BitWrPortI(sd_dev->wpportfr,  sd_dev->wpportfrShadow,
+                0, sd_dev->wppin );
+   if(sd_dev->wpportddr)
+      BitWrPortI(sd_dev->wpportddr,  sd_dev->wpportddrShadow,
+                0, sd_dev->wppin );
+
+   // *** Set up serial port
+	BitWrPortI(sd_dev->sptcr, sd_dev->sptcrShadow, 0, 5);
+   WrPortI(sd_dev->spdivreg, sd_dev->spdivregShadow, sd_dev->divisor);
+
+   WrPortI(sd_dev->spdr+SD_CR_OFFSET, sd_dev->spcrShadow, sd_dev->spcrValue);
+   WrPortI(sd_dev->spdr+SD_ER_OFFSET, sd_dev->sperShadow, sd_dev->sperValue);
+
+   if(sd_dev->txportfr)
+      BitWrPortI(sd_dev->txportfr, sd_dev->txportfrShadow,
+                1, sd_dev->txpin );
+   if(sd_dev->txportddr)
+      BitWrPortI(sd_dev->txportddr, sd_dev->txportddrShadow,
+                1, sd_dev->txpin );
+   if(sd_dev->txportdcr)
+      BitWrPortI(sd_dev->txportdcr, sd_dev->txportdcrShadow,
+                sd_dev->txod, sd_dev->txpin );
+
+   if(sd_dev->rxportfr)
+      BitWrPortI(sd_dev->rxportfr, sd_dev->rxportfrShadow,
+                0, sd_dev->rxpin );
+   if(sd_dev->rxportddr)
+      BitWrPortI(sd_dev->rxportddr, sd_dev->rxportddrShadow,
+                0, sd_dev->rxpin );
+
+   if(sd_dev->ledportfr)
+      BitWrPortI(sd_dev->ledportfr, sd_dev->ledportfrShadow,
+                1, sd_dev->ledpin );
+   if(sd_dev->ledportddr)
+      BitWrPortI(sd_dev->ledportddr, sd_dev->ledportddrShadow,
+                1, sd_dev->ledpin );
+   if(sd_dev->ledportdcr)
+      BitWrPortI(sd_dev->ledportdcr, sd_dev->ledportdcrShadow,
+                sd_dev->ledod, sd_dev->ledpin );
+   if(sd_dev->ledport)
+      BitWrPortI(sd_dev->ledport, sd_dev->ledportdrShadow,
+                sd_dev->ledon ? 0:1, sd_dev->ledpin );
+
+   t = MS_TIMER;
+   // let baud timer time out before using port
+   while (MS_TIMER - t < 10) ;
+
+   rc = 0;
+
+#ifdef SDFLASH_VERBOSE
+   printf("sdspi_initDevice: calling sdspi_reset_card()\n");
+#endif
+   if(rc = sdspi_reset_card(&SD[indx]))
+   {
+	    return rc;
+   }
+
+#ifdef SDFLASH_VERBOSE
+   printf("sdspi_initDevice: calling sdspi_init_card()\n");
+#endif
+   // All commands following the card reset have single level retry
+   // on an I/O error condition.  SD cards seem prone to these after
+   // being reset.
+   if ((rc = sdspi_init_card(&SD[indx])) == -EIO) {
+      rc = sdspi_init_card(&SD[indx]);
+   }
+   if (rc) {
+	    return rc;
+   }
+
+#ifdef SDFLASH_VERBOSE
+   printf("sdspi_initDevice: calling sdspi_get_csd()\n");
+#endif
+   if ((rc = sdspi_get_csd(&SD[indx])) == -EIO) {
+      rc = sdspi_get_csd(&SD[indx]);
+   }
+   if (rc) {
+	    return rc;
+   }
+
+#ifdef SDFLASH_VERBOSE
+   printf("sdspi_initDevice: calling sdspi_get_scr()\n");
+#endif
+   if ((rc = sdspi_get_scr(&SD[indx])) == -EIO) {
+      rc = sdspi_get_scr(&SD[indx]);
+   }
+   if (rc) {
+	    return rc;
+   }
+
+#ifdef SDFLASH_VERBOSE
+   printf("sdspi_initDevice: calling sdspi_set_block_length()\n");
+#endif
+   if ((rc = sdspi_set_block_length(&SD[indx], 512)) == -EIO) {
+      rc = sdspi_set_block_length(&SD[indx], 512);
+   }
+   if (rc) {
+	    return rc;
+   }
+
+#ifdef SDFLASH_VERBOSE
+   printf("sdspi_initDevice: calling sdspi_get_status_reg()\n");
+#endif
+   if ((rc = sdspi_get_status_reg(&SD[indx], &status)) == -EIO) {
+      rc = sdspi_get_status_reg(&SD[indx], &status);
+   }
+   if (rc) {
+	    return rc;
+   }
+   SD[indx].next = NULL;
+
+   return rc;
+}
+
+
+/*** BeginHeader sdspi_print_dev */
+void sdspi_print_dev(sd_device *dev);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+sdspi_print_dev                <SDFLASH.LIB>
+
+SYNTAX: void sdspi_print_dev(sd_device *dev)
+
+DESCRIPTION:	Prints parameters from the SD device structure.
+
+PARAMETER2:		dev - pointer to sd_device structure of the SD card.
+
+RETURN VALUE:  None
+
+END DESCRIPTION **********************************************************/
+_sdflash_nodebug
+void sdspi_print_dev(sd_device *dev)
+{
+	printf("sd_device address: 0x%x\n", (unsigned int)dev );
+   printf("\tnext: 0x%x\n", (unsigned int)(dev->next) );
+   printf("\tsectors: %ld\n", dev->sectors);
+   printf("\tpagesize: %d\n", dev->pagesize);
+   printf("\tpagebitshift: %d\n", dev->pagebitshift);
+   printf("\twrite_state: %d\n", dev->write_state);
+   printf("\twrite_sector: %lu\n", dev->write_sector);
+   printf("\tcs_pin:\n");
+   printf("\t  port: 0x%x\n", dev->cspin.port);
+   printf("\t  shadow: 0x%x\n", (unsigned int)(dev->cspin.shadow) );
+   printf("\t  pin: 0x%x\n", dev->cspin.pin);
+}
+
+/*** BeginHeader sdspi_getSectorCount */
+long sdspi_getSectorCount(sd_device *dev);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+sdspi_getSectorCount                 <SDFLASH.LIB>
+
+SYNTAX: long sdspi_getSectorCount(sd_device *dev);
+
+DESCRIPTION:	Return number of usable 512 byte sectors on an SD card.
+
+PARAMETER1:		dev - pointer to sd_device struct for initialized flash
+						device
+
+RETURN VALUE:  number of sectors
+
+END DESCRIPTION **********************************************************/
+
+_sdflash_nodebug
+long sdspi_getSectorCount(sd_device *dev)
+{
+	return dev->sectors;
+}
+
+
+/*** BeginHeader sdspi_isWriting */
+int sdspi_isWriting(sd_device *dev);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+sdspi_isWriting                 <SDFLASH.LIB>
+
+SYNTAX: int sdspi_isWriting(sd_device *dev)
+
+DESCRIPTION:   Returns 1 if the SD  card is busy writing a sector
+
+PARAMETER1:		dev - pointer to initialized sd_device structure for
+						 the flash chip
+
+RETURN VALUE:  1 busy
+					0 ready, not currently writing
+
+END DESCRIPTION **********************************************************/
+
+_sdflash_nodebug
+int sdspi_isWriting(sd_device *dev)
+{
+   return (sdspi_notbusy(dev->port) ? 0 : 1);
+}
+
+/*** BeginHeader _sdspi_print_data */
+void _sdspi_print_data(char *dataBuffer, int dataSize);
+/*** EndHeader */
+
+/***********************************************************************
+_sdspi_print_data
+
+SYNTAX: void _sdspi_print_data(char *dataBuffer, int dataSize)
+
+DESCRIPTION:   Prints a formated hex/ASCII dump of (16 bytes per line)
+               of dataSize bytes of the dataBuffer.
+
+PARAMETER1:		dataBuffer - Pointer to the buffer to be printed
+PARAMETER2:		dataSize   - Number of bytes to be printed
+
+RETURN VALUE:  None
+************************************************************************/
+_sdflash_nodebug
+void _sdspi_print_data(char *dataBuffer, int dataSize)
+{
+	auto char ascii_buffer[17];
+	auto char hex_buffer[58];
+	auto char fbyte;
+	auto int k;
+	auto int j;
+
+   ascii_buffer[sizeof(ascii_buffer) - 1] = 0;
+	for (j = 0L; j < dataSize; j += 16) {
+		sprintf(hex_buffer, "%04x ", j);
+		for (k = 0; k < 16; k++) {
+			if ((j + (long) k) < dataSize) {
+				fbyte = *(dataBuffer + k + j);
+				sprintf(hex_buffer + 5 + (3 * k), "%02x ", fbyte);
+				if (fbyte > 31 && fbyte < 127) {
+					ascii_buffer[k] = fbyte;
+				} else {
+					ascii_buffer[k] = '.';
+				}
+			} else {
+				sprintf(hex_buffer + 9 + (3 * k), "   ");
+				ascii_buffer[k] = 0;
+			}
+		}
+		printf("%s%s\n", hex_buffer, ascii_buffer);
+	}
+}
+
+/*** Beginheader sdspi_reset_card ***/
+int sdspi_reset_card(sd_device *sd);
+/*** endheader ***/
+
+/* START FUNCTION DESCRIPTION ********************************************
+sdspi_reset_card               <SDFLASH.LIB>
+
+SYNTAX: int sdspi_reset_card(sd_device *sd)
+
+DESCRIPTION:	Resets the SD card pointed to by sd.  Function executes
+               protocol command 0 to force the card to Idle mode. This
+               command is sent multiple times to reset the SD card.
+
+PARAMETER1: sd          Pointer to sd_device structure for the SD card.
+
+RETURN VALUE:    0                Success
+               -EIO               I/O Error
+               -EINVAL            Invalid parameter given
+               -ENOMEDIUM         No SD card in socket
+               -ESHAREDBUSY       Shared SPI port busy
+
+END DESCRIPTION **********************************************************/
+
+_sdflash_nodebug
+int sdspi_reset_card(sd_device *sd)
+{
+    int result, j;
+    unsigned long t;
+    SD_CMD_REPLY cmd_reply;
+
+    if (!SD_cardDetect(sd)) {
+#ifdef SDFLASH_VERBOSE
+    printf("sdspi_reset_card: no SD card to reset\n");
+#endif
+       return -ENOMEDIUM;
+    }
+#ifdef SDFLASH_VERBOSE
+    printf("sdspi_reset_card: attempting reset\n");
+#endif
+
+    memset(&cmd_reply, 0, sizeof(SD_CMD_REPLY) );
+    result = 0;
+
+
+    // Delay before sending Idle command
+    t = MS_TIMER;
+    // let baud timer time out before using port
+    while (MS_TIMER - t < 1) ;
+
+    // Send Go to Idle mode command (reset)
+    cmd_reply.cmd = CMD0;
+    cmd_reply.reply_size = CMD_R1_BUFFER_SIZE;
+    cmd_reply.data_size = 0;
+    cmd_reply.tx_buffer = tx_buffer;
+    cmd_reply.rx_buffer = rx_buffer;
+    for (j = 0; j < CMD0_RETRIES; j++)
+    {
+#ifdef SDFLASH_VERBOSE
+      printf("*");
+#endif
+      if (result = sdspi_process_command(sd, &cmd_reply, 2))
+      {
+        if (result == -ESHAREDBUSY)
+        {
+          break;
+        }
+
+        if (result != -EAGAIN)
+        {
+#ifdef SDFLASH_VERBOSE
+          printf("sdspi_reset_card: Process command failed.\n");
+#endif
+          break;
+        }
+      }
+      else
+      {
+        if (cmd_reply.reply == R1_IDLE_STATE)
+          break;
+      }
+    }
+
+    if (j >= CMD0_RETRIES)
+    {
+#ifdef SDFLASH_VERBOSE
+       printf("sdspi_reset_card: sdspi_process_command() retried %d times,"
+                , CMD0_RETRIES);
+       printf(" but could not reset SD card\n");
+#endif
+       result = -EIO;
+    }
+
+#ifdef SDFLASH_VERBOSE
+        printf("\n");
+#endif
+    return result;
+}
+
+/*** Beginheader sdspi_sendingAP ***/
+int sdspi_sendingAP(sd_device *sd);
+/*** endheader ***/
+
+/* START FUNCTION DESCRIPTION ********************************************
+sdspi_sendingAP                 <SDFLASH.LIB>
+
+SYNTAX: int sdspi_sendingAP(sd_device *sd)
+
+DESCRIPTION:	Sends AP command 55 to set Alternate Command mode on
+               the next command sent to the card.  This function does
+               not release the port sharing semaphore unless an error
+               is encountered.
+
+PARAMETER1: sd          Pointer to sd_device structure for the SD card.
+
+RETURN VALUE:    0                Success
+               -EIO               I/O Error
+               -ENOMEDIUM         No SD card in socket
+               -ESHAREDBUSY       Shared SPI port busy
+
+END DESCRIPTION **********************************************************/
+
+_sdflash_nodebug
+int sdspi_sendingAP(sd_device *sd)
+{
+
+    int result;
+    SD_CMD_REPLY cmd_reply;
+
+    memset(&cmd_reply, 0, sizeof(SD_CMD_REPLY) );
+
+    cmd_reply.cmd = CMD55;
+    cmd_reply.reply_size = CMD_R1_BUFFER_SIZE;
+    cmd_reply.data_size = 0;
+    cmd_reply.tx_buffer = tx_buffer;
+    cmd_reply.rx_buffer = rx_buffer;
+    if (result = sdspi_process_command(sd, &cmd_reply, 0))
+    {
+#ifdef SDFLASH_VERBOSE
+        printf("sdspi_sendingAP: sdspi_process_command() failed, error %d\n",
+                      result);
+#endif
+        _sdspi_end_command(sd);
+        _SPIfreeSemaphore(SPI_SD);
+    }
+
+    return result;
+}
+
+
+/*** Beginheader sdspi_get_status_reg ***/
+int sdspi_get_status_reg(sd_device *sd, int * status);
+/*** endheader ***/
+
+/* START FUNCTION DESCRIPTION ********************************************
+sdspi_get_status_reg           <SDFLASH.LIB>
+
+SYNTAX: int sdspi_get_status_reg(sd_device *sd, int * status)
+
+DESCRIPTION: This function is called to execute protocol command 13 to
+             retrieve the status register value of the SD card.
+
+PARAMETER1: sd       Pointer to the device structure for the SD card.
+PARAMETER2: status   Pointer to variable that returns the status.
+
+RETURN VALUE:     0               Success, Card status placed in status
+               -EIO               I/O Error
+               -ENOMEDIUM         No SD card in socket
+               -ESHAREDBUSY       Shared SPI port busy
+
+END DESCRIPTION **********************************************************/
+
+_sdflash_nodebug
+int sdspi_get_status_reg(sd_device *sd, int * status)
+{
+    int result;
+    SD_CMD_REPLY cmd_reply;
+
+    memset(&cmd_reply, 0, sizeof(SD_CMD_REPLY) );
+    result = 0;
+
+    cmd_reply.cmd = CMD13;
+    cmd_reply.reply_size = CMD_R2_BUFFER_SIZE;
+    cmd_reply.data_size = 0;
+    cmd_reply.tx_buffer = tx_buffer;
+    cmd_reply.rx_buffer = rx_buffer;
+
+    if (result = sdspi_process_command(sd, &cmd_reply, 1))
+    {
+#ifdef SDFLASH_VERBOSE
+       printf("sdspi_get_status_reg: process command failed, error %d(%d)\n",
+                   result, *status);
+#endif
+    }
+    else
+    {
+        *status = cmd_reply.reply;
+    }
+    return result;
+}
+
+
+/*** Beginheader sdspi_init_card ***/
+int sdspi_init_card(sd_device *sd);
+/*** endheader ***/
+
+/* START FUNCTION DESCRIPTION ********************************************
+sdspi_init_card                <SDFLASH.LIB>
+
+SYNTAX: int sdspi_init_card(sd_device *sd)
+
+DESCRIPTION:  Initializes the SD card pointed to by sd.  Function
+              executes protocol command 1 which clears HCS bit and
+              activates the cards initialization sequence.
+
+PARAMETER1: sd          Pointer to sd_device structure for the SD card.
+
+RETURN VALUE:     0               Success
+               -EIO               I/O Error
+               -EINVAL            Invalid parameter given
+               -ENOMEDIUM         No SD card in socket
+               -ESHAREDBUSY       Shared SPI port busy
+
+END DESCRIPTION **********************************************************/
+
+_sdflash_nodebug
+int sdspi_init_card(sd_device *sd)
+{
+    int result, j;
+    SD_CMD_REPLY cmd_reply;
+
+#ifdef SDFLASH_VERBOSE
+    printf("sdspi_init_card: attempting init");
+#endif
+
+    result = 0;
+    memset(&cmd_reply, 0, sizeof(SD_CMD_REPLY) );
+    cmd_reply.cmd = CMD1;
+    cmd_reply.reply_size = CMD_R1_BUFFER_SIZE;
+    cmd_reply.data_size = 0;
+    cmd_reply.tx_buffer = tx_buffer;
+    cmd_reply.rx_buffer = rx_buffer;
+
+    for (j = 0; j < CMD1_RETRIES; j++)
+    {
+#ifdef SDFLASH_VERBOSE
+        printf("*");
+#endif
+        if (result = sdspi_process_command(sd, &cmd_reply, 1))
+        {
+#ifdef SDFLASH_VERBOSE
+            printf("sdspi_init_card: sdspi_process_command failed, error %d\n",
+                        result);
+#endif
+            return result;
+        }
+        else
+        {
+            if (cmd_reply.reply)
+            {
+                if (cmd_reply.reply != R1_IDLE_STATE)
+                {
+#ifdef SDFLASH_VERBOSE
+                    printf("sdspi_init_card: command response error %d\n",
+                                cmd_reply.reply);
+#endif
+                    return -EIO;
+                }
+            }
+            else
+               break;
+        }
+    }
+
+#ifdef SDFLASH_VERBOSE
+        printf("\n");
+#endif
+
+    return result;
+}
+
+/*** Beginheader sdspi_process_command ***/
+int sdspi_process_command(sd_device *sd, SD_CMD_REPLY * cmd_reply, int mode);
+/*** endheader ***/
+
+/* START FUNCTION DESCRIPTION ********************************************
+sdspi_process_command          <SDFLASH.LIB>
+
+SYNTAX: int sdspi_process_command(sd_device *sd, SD_CMD_REPLY * cmd_reply,
+                                       int mode)
+
+DESCRIPTION: This function sends the command placed in the cmd_reply
+             structure and retreives a reply and data (optional) as
+             defined in the cmd_reply structure.  Pointers to TX and RX
+             buffers are retreived from cmd_reply structure and used
+             for command transmission and reply/data reception.  Reply
+             is parsed and place in cmd_reply.reply variable.  Errors
+             encountered will give a negative return value (below).
+
+             The SPI semaphore will be obtained before the command is
+             sent. The mode parameter controls whether the semaphore will
+             be released after command execution and reply/data reception.
+             If mode is zero, both semaphore and chip select are active
+             on a successful return.  An end command sequence and release
+             of the semaphore must be handled by caller.
+
+             If mode is not zero, the semaphore will be released before
+             returning. In addition, if mode is two then an SD card
+             reset is in progress.  This enables the distinguishing of
+             certain I/O error conditions that would normally be grouped
+             with the -EIO error code and instead returns the -EAGAIN
+             error code, indicating reset retries should continue.
+
+PARAMETER1: sd           Pointer to the device structure for the SD card.
+PARAMETER2: cmd_reply    Pointer to cmd_reply structure, which contains:
+									cmd        - command to be executed
+									argument   - arguments for the command
+									reply      - storage for command reply
+									reply_size - size in bytes of expected reply
+									data_size  - size in bytes of expected data
+									tx_buffer  - pointer to TX buffer to use
+									rx_buffer  - pointer to RX buffer to use
+PARAMETER3: mode         Zero = SPI port semaphore should be retained.
+                         One  = If SPI port to be released before return.
+                         Two  = Attempting SD card reset, otherwise same as one.
+                                 (Enables -EAGAIN return value)
+
+RETURN VALUE:     0               Success
+               -EIO               I/O Error
+               -EAGAIN            Allowable I/O error during card reset
+               -EINVAL            Invalid parameter given
+               -ENOMEDIUM         No SD card in socket
+               -ESHAREDBUSY       Shared SPI port busy
+
+END DESCRIPTION **********************************************************/
+
+_sdflash_nodebug
+int sdspi_process_command(sd_device *sd, SD_CMD_REPLY * cmd_reply, int mode)
+{
+    int result, rc, i;
+    unsigned short crc7;
+    char * cmd_buffer;
+
+    if (!sd) {
+       return -EINVAL;
+    }
+
+    if (!SD_cardDetect(sd)) {
+#ifdef SDFLASH_VERBOSE
+       printf("sdspi_process_command: No SD card to present.\n");
+#endif
+       return -ENOMEDIUM;
+    }
+    result = 0;
+    cmd_buffer = NULL;
+    crc7 = 0;
+
+    cmd_reply->tx_buffer[CMD_INDEX_OFFSET] = CMD_START | cmd_reply->cmd;
+    cmd_reply->tx_buffer[CMD_ARGUMENT_OFFSET] = (char)(cmd_reply->argument>>24L);
+    cmd_reply->tx_buffer[CMD_ARGUMENT_OFFSET+1]=(char)(cmd_reply->argument>>16L);
+    cmd_reply->tx_buffer[CMD_ARGUMENT_OFFSET+2]=(char)(cmd_reply->argument>>8L);
+    cmd_reply->tx_buffer[CMD_ARGUMENT_OFFSET+3]=(char)(cmd_reply->argument);
+
+    cmd_buffer = &cmd_reply->tx_buffer[CMD_INDEX_OFFSET];
+    for (i = 0; i < COMMAND_BYTE_COUNT - 1; i++)
+    {
+        crc7 = _sd_crc7(crc7, cmd_buffer[i]);
+    }
+
+    cmd_reply->tx_buffer[CMD_CRC_INDEX] = (crc7 << 1) | CMD_END;
+
+    rc = _SPIgetSemaphore(SPI_SD);
+    if (rc)
+    {   // Semaphore is being held by another device, SPI port is busy
+#ifdef SDFLASH_VERBOSE
+        printf("_SPIgetSemaphore returned %d in sdspi_process_command\n", rc);
+#endif
+        return -ESHAREDBUSY;   // And return error that SPI port is busy
+    }
+
+    rc = _sdspi_ReadWrite(sd, cmd_reply->tx_buffer, cmd_reply->rx_buffer,
+                        cmd_reply->reply_size, cmd_reply->data_size, mode);
+
+    if (rc)
+    {
+#ifdef SDFLASH_VERBOSE
+        printf("sdspi_process_command: Error sending command\n");
+#endif
+       _sdspi_end_command(sd);
+       _SPIfreeSemaphore(SPI_SD);
+       return (mode == 2 ? -EAGAIN : rc);
+    }
+
+    for (i = 0; i < (int)cmd_reply->reply_size; i++)
+    {
+        if (cmd_reply->rx_buffer[i] != DATALINE_HIGH)
+        {
+            if (cmd_reply->rx_buffer[i] & R1_MASK_LOW_BITS)
+            {
+#ifdef SDFLASH_VERBOSE
+               printf("sdspi_process_command: Response high bit not 0\n");
+#endif
+               if (cmd_reply->reply_size == 1) cmd_reply->reply_size = 2;
+               _sdspi_end_command(sd);
+               _SPIfreeSemaphore(SPI_SD);
+               return (mode == 2 ? -EAGAIN : -EIO);
+            }
+            else
+            {
+                if (cmd_reply->cmd == CMD13)
+                {
+                    // SD card returns 2 bytes when command 13 is issued
+                    cmd_reply->reply = cmd_reply->rx_buffer[i];
+                    cmd_reply->reply <<= 8;
+                    cmd_reply->reply |= cmd_reply->rx_buffer[i+1];
+                }
+                else
+                {
+                    cmd_reply->reply = cmd_reply->rx_buffer[i];
+                }
+                break;
+            }
+        }
+    }
+
+    if (i >= (int)cmd_reply->reply_size)
+    {
+#ifdef SDFLASH_VERBOSE
+        printf("sdspi_process_command: SD device did not respond\n");
+#endif
+        _sdspi_end_command(sd);
+        _SPIfreeSemaphore(SPI_SD);
+        result = -EIO;
+    }
+
+    return result;
+}
+
+/*** Beginheader _sd_crc7 ***/
+unsigned short _sd_crc7(unsigned short crc7, unsigned char ch);
+/*** endheader ***/
+
+/*************************************************************************
+_sd_crc7
+
+SYNTAX: unsigned short _sd_crc7(unsigned short crc, unsigned char c)
+
+DESCRIPTION:   This function computes the CRC7 value for a byte of data.
+
+PARAMETER1:    crc  The accumulator for the previous CRC calculation.
+PARAMETER2:    c    The byte of data to calculate the new CRC.
+
+RETURN VALUE:  new CRC value
+**************************************************************************/
+_sdflash_nodebug
+unsigned short _sd_crc7(unsigned short crc7, unsigned char ch)
+{
+    int i;
+
+    for (i = 0; i < 8; i++)
+
+    {
+        if (ch & 0x80)
+            crc7 ^= 0x40;
+        ch <<= 1;
+        if( crc7 & 0x40 )
+            crc7 = (crc7 << 1) ^ 0x09;
+        else
+            crc7 = crc7 << 1;
+    }
+    return crc7;
+}
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+sdspi_get_csd               <SDFLASH.LIB>
+
+SYNTAX: int sdspi_get_csd(sd_device *sd);
+
+DESCRIPTION: This function is called to execute protocol command 9 to
+             retrieve the SD card's Card Specific Data (CSD) and store
+             it in the respective SD driver configuration object.  The
+             CSD data is used to determine the SD card's physical
+             storage and timing attributes.
+
+PARAMETER1: sd           The device structure for the SD card.
+
+RETURN VALUE:    0                Success
+               -EIO               I/O Error
+               -EINVAL            Invalid parameter given
+               -ENOMEDIUM         No SD card in socket
+               -ESHAREDBUSY       Shared SPI port busy
+
+END DESCRIPTION **********************************************************/
+
+/*** Beginheader sdspi_get_csd ***/
+int sdspi_get_csd(sd_device *sd);
+/*** endheader ***/
+
+_sdflash_nodebug
+int sdspi_get_csd(sd_device *sd)
+{
+    int result, j, k;
+    char *csd_buffer;
+    SD_CSD_TYPE  *sd_csd;
+    unsigned short crc7, crc16, x;
+    SD_CMD_REPLY cmd_reply;
+    unsigned long temp, l;
+
+    sd_csd = &sd->CSD;
+
+    csd_buffer = NULL;
+    result = 0;
+
+    memset(&cmd_reply, 0x0, sizeof(SD_CMD_REPLY));
+    memset(sd_csd, 0x0, sizeof(SD_CSD_TYPE));
+
+    cmd_reply.cmd = CMD9;
+    cmd_reply.reply_size = CMD_R1_BUFFER_SIZE;
+    cmd_reply.data_size = CSD_BYTE_COUNT;
+    cmd_reply.tx_buffer = tx_buffer;
+    cmd_reply.rx_buffer = rx_buffer;
+
+#ifdef SDFLASH_VERBOSE
+    printf("sdspi_get_csd: calling sdspi_process_command().\n");
+#endif
+    j = 4;
+    do {
+    	result = sdspi_process_command(sd, &cmd_reply, 1);
+    } while (!result && cmd_reply.reply && --j);
+    if (result)
+    {
+        return result;
+    }
+    else
+    {
+       if (cmd_reply.reply)
+       {
+#ifdef SDFLASH_VERBOSE
+          printf("sdspi_get_csd: command response error %d\n", cmd_reply.reply);
+#endif
+          return -EIO;
+       }
+    }
+
+    for (j = cmd_reply.reply_size; j < READ_CSD_BUFFER_SIZE; j++)
+    {
+        if (cmd_reply.rx_buffer[j] != DATALINE_HIGH)
+        {
+            if (cmd_reply.rx_buffer[j] == READ_WRITE_START_BLOCK)
+                break;
+            else
+            {
+#ifdef SDFLASH_VERBOSE
+                printf("sdspi_get_csd: Read data error %x\n",
+                           cmd_reply.rx_buffer[j]);
+#endif
+                return -EIO;
+            }
+        }
+    }
+    if (j >= READ_CSD_BUFFER_SIZE)
+    {
+#ifdef SDFLASH_VERBOSE
+        printf("sdspi_get_csd: _sdspi_ReadWrite() returned invalid data\n");
+#endif
+        return -EIO;
+    }
+
+
+    csd_buffer = &cmd_reply.rx_buffer[j + 1];
+
+    /* Get the crc16 for CSD block and 2 byte CRC */
+    crc16 = crc16_calc( csd_buffer, CSD_BYTE_COUNT - 1, 0);
+
+    /*
+       Using the 2 CRC bytes in the crc16 calculation should result in 0;
+       if not 0 then try the crc7 calculation.
+    */
+    if (crc16)
+    {
+        /* The crc16 check failed, so compute crc7 for CSD data */
+        crc7 = 0;
+        for (k = 0; k < CSD_BYTE_COUNT - 4; ++k)
+            crc7 = _sd_crc7(crc7, csd_buffer[k]);
+
+        if (csd_buffer[CSD_BYTE_COUNT - 4] != (((crc7 << 1) | CMD_END) & 0xFF))
+        {
+#ifdef SDFLASH_VERBOSE
+            printf("sdspi_get_csd: CRC mismatch error\n");
+#endif
+            return -EIO;
+        }
+    }
+
+
+    /* extract the CSD information from the CSD block */
+    for (k = 0; k < CSD_BYTE_COUNT - 3; k++)
+    {
+        switch (k)
+        {
+            case CSD_BLOCK_OFFSET_0:
+                sd_csd->CSD_STR = csd_buffer[k] >> 6;
+                break;
+
+            case CSD_BLOCK_OFFSET_1:
+                sd_csd->TAAC = csd_buffer[k];
+                x = (sd_csd->TAAC & 0x7C) >> 3;
+                if ((x < 3) || (x == 15)) {
+                  x++;
+                }
+                else {
+                  if (x > 3) x--;
+                }
+                // Now x has value times 2
+                j = sd_csd->TAAC & 7;
+                // Create base multiplier in nanoseconds
+                for (temp = 1; j--; temp *= 10);
+                // Base multiplier times value divided by character time
+                temp = ((temp * x) / 1000) + 1;
+                break;
+
+            case CSD_BLOCK_OFFSET_2:
+                sd_csd->NSAC = csd_buffer[k];
+                // Add NSAC timeout to TAAC timeout
+                temp += (unsigned long)(sd_csd->NSAC) * 100;
+                // Save timeout in character time in data_timeout (w/ max check)
+                sd->data_timeout = (temp >= 0x10000 ? 0xFFFF : (unsigned)temp);
+                break;
+
+            case CSD_BLOCK_OFFSET_3:
+                sd_csd->TRANSPEED = csd_buffer[k];
+                break;
+
+            case CSD_BLOCK_OFFSET_4:
+                sd_csd->CCC = csd_buffer[k];
+                sd_csd->CCC <<= 4;
+                break;
+
+            case CSD_BLOCK_OFFSET_5:
+                sd_csd->CCC |= csd_buffer[k] >> 4;
+                sd_csd->R_BL_LEN = csd_buffer[k] & 0x0F;
+                break;
+
+            case CSD_BLOCK_OFFSET_6:
+                sd_csd->R_BL_PART = (csd_buffer[k] >> 7) & 0x01;
+                sd_csd->WR_BL_MIS = (csd_buffer[k] >> 6) & 0x01;
+                sd_csd->RD_BL_MIS = (csd_buffer[k] >> 5) & 0x01;
+                sd_csd->DSR_IMP = (csd_buffer[k] >> 4) & 0x01;
+                sd_csd->CSIZE = csd_buffer[k] & 0x3;
+                sd_csd->CSIZE <<= 8;
+                break;
+
+            case CSD_BLOCK_OFFSET_7:
+                sd_csd->CSIZE |= csd_buffer[k];
+                sd_csd->CSIZE <<= 2;
+                break;
+
+            case CSD_BLOCK_OFFSET_8:
+                sd_csd->CSIZE |= csd_buffer[k] >> 6;
+                sd_csd->RC_MIN = (csd_buffer[k] >> 3) & 0x07;
+                sd_csd->RC_MAX = csd_buffer[k] & 0x07;
+                break;
+
+            case CSD_BLOCK_OFFSET_9:
+                sd_csd->WC_MIN = (csd_buffer[k] >> 5) & 0x07;
+                sd_csd->WC_MAX = (csd_buffer[k] >> 2) & 0x07;
+                sd_csd->C_SIZE_M = csd_buffer[k] & 0x3;
+                sd_csd->C_SIZE_M <<= 1;
+                break;
+
+            case CSD_BLOCK_OFFSET_10:
+                sd_csd->C_SIZE_M |= (csd_buffer[k] >> 7) & 0x1;
+                sd_csd->ERASE_BLK_EN = (csd_buffer[k] >> 6) & 0x1;
+                sd_csd->SECTOR_SIZE = csd_buffer[k] & 0x3F;
+                sd_csd->SECTOR_SIZE <<= 1;
+                // Compute the number of 512 byte sectors on the SD card
+                sd->sectors = ((sd_csd->CSIZE + 1L) << (sd_csd->C_SIZE_M + 2))
+                                 << (sd_csd->R_BL_LEN - 9);
+                break;
+
+            case CSD_BLOCK_OFFSET_11:
+                sd_csd->SECTOR_SIZE += ((csd_buffer[k] & 0x80) >> 7) + 1;
+                sd_csd->WP_G_S = (csd_buffer[k] & 0x7F) + 1;
+                break;
+
+            case CSD_BLOCK_OFFSET_12:
+                sd_csd->WP_G_EN = (csd_buffer[k] >> 7) & 0x01;
+                sd_csd->R2W_FACT = (csd_buffer[k] >> 2) & 0x07;
+                sd_csd->WR_BL_LEN = csd_buffer[k] & 0x3;
+                sd_csd->WR_BL_LEN <<= 2;
+                break;
+
+            case CSD_BLOCK_OFFSET_13:
+  		          sd_csd->WR_BL_LEN |= (csd_buffer[k] >> 6) & 0x03;
+		          sd_csd->WR_BL_PAR = (csd_buffer[k] >> 5) & 0x01;
+                sd->pagebitshift = (int)(sd_csd->WR_BL_LEN);
+                sd->pagesize  = (int)(1L << sd_csd->WR_BL_LEN);
+                sd->erasebitshift = sd->pagebitshift;
+               // Calculate erasebitshift from pagebitshift and sector size
+                for (j = 1; !(sd_csd->SECTOR_SIZE & j); ++sd->erasebitshift) {
+                    j <<= 1;
+                }
+                break;
+
+            case CSD_BLOCK_OFFSET_14:
+		          sd_csd->F_FORMATG = (csd_buffer[k] >> 7) & 0x01;
+		          sd_csd->COPY = (csd_buffer[k] >> 6) & 0x01;
+		          sd_csd->P_WR_PROT = (csd_buffer[k] >> 5) & 0x01;
+		          sd_csd->T_WR_PROT = (csd_buffer[k] >> 4) & 0x01;
+		          sd_csd->F_FORMAT = (csd_buffer[k] >> 2) & 0x03;
+                break;
+
+            case CSD_BLOCK_OFFSET_15:
+                sd_csd->CRC7 = csd_buffer[k] >> 1;
+                break;
+        }
+    }
+    sd_csd->init_ok = TRUE;
+
+    return result;
+}
+
+/* START FUNCTION DESCRIPTION ********************************************
+sdspi_get_scr               <SDFLASH.LIB>
+
+SYNTAX: int sdspi_get_scr(sd_device *sd);
+
+DESCRIPTION: This function executes application specific command 51 to
+             retrieve the SD card's Configuration Register (SCR) and
+             store it in the respective SD driver configuration object.
+             The SCR data is used to identify the SD card's physical
+             interface version and security version.  It also contains
+             erase state (all 0's or 1's) and supported bus widths.
+
+PARAMETER1: sd           The device structure for the SD card.
+
+RETURN VALUE:     0               Success
+               -EIO               I/O Error
+               -EINVAL            Invalid parameter given
+               -ENOMEDIUM         No SD card in socket
+               -ESHAREDBUSY       Shared SPI port busy
+
+END DESCRIPTION **********************************************************/
+/*** Beginheader sdspi_get_scr ***/
+int sdspi_get_scr(sd_device *sd);
+/*** endheader ***/
+
+_sdflash_nodebug
+int sdspi_get_scr(sd_device *sd)
+{
+    int result, j, k;
+    char *scr_buffer;
+    SD_SCR_TYPE  *sd_scr;
+    unsigned short crc16;
+    SD_CMD_REPLY cmd_reply;
+    unsigned long temp;
+
+    if (result = sdspi_sendingAP(sd)) {
+#ifdef SDFLASH_VERBOSE
+       printf("sdspi_get_scr: APCMD51 response error %d\n", cmd_reply.reply);
+#endif
+         return result;
+    }
+
+    _sdspi_end_command(sd);
+    sd_scr = &sd->SCR;
+
+    scr_buffer = NULL;
+    result = 0;
+
+    memset(&cmd_reply, 0x0, sizeof(SD_CMD_REPLY));
+    memset(sd_scr, 0x0, sizeof(SD_SCR_TYPE));
+
+    cmd_reply.cmd = ACMD51;
+    cmd_reply.reply_size = CMD_R1_BUFFER_SIZE;
+    cmd_reply.data_size = SCR_BYTE_COUNT;
+    cmd_reply.tx_buffer = tx_buffer;
+    cmd_reply.rx_buffer = rx_buffer;
+
+    if (result = sdspi_process_command(sd, &cmd_reply, 1))
+    {
+#ifdef SDFLASH_VERBOSE
+        printf("sdspi_get_scr: sdspi_process_command() failed, error %d\n",
+                  result);
+#endif
+        return result;
+    }
+    else
+    {
+       if (cmd_reply.reply)
+       {
+#ifdef SDFLASH_VERBOSE
+          printf("sdspi_get_scr: command response error %d\n", cmd_reply.reply);
+#endif
+          return -EIO;
+       }
+    }
+
+    for (j = cmd_reply.reply_size; j < READ_SCR_BUFFER_SIZE; j++)
+    {
+        if (cmd_reply.rx_buffer[j] != DATALINE_HIGH)
+        {
+            if (cmd_reply.rx_buffer[j] == READ_WRITE_START_BLOCK)
+                break;
+            else
+            {
+#ifdef SDFLASH_VERBOSE
+                printf("sdspi_get_scr: Read data error %x\n",
+                          cmd_reply.rx_buffer[j]);
+#endif
+                return -EIO;
+            }
+        }
+    }
+    if (j >= READ_SCR_BUFFER_SIZE)
+    {
+#ifdef SDFLASH_VERBOSE
+        printf("sdspi_get_scr: _sdspi_ReadWrite() returned invalid data\n");
+#endif
+        return -EIO;
+    }
+
+
+    scr_buffer = &cmd_reply.rx_buffer[j + 1];
+
+    /* Get the CRC for SCR block and 2 byte CRC */
+    crc16 = crc16_calc( scr_buffer, SCR_BYTE_COUNT - 1, 0);
+
+    /* Using the 2 CRC bytes in the CRC calculation results in 0 */
+    if (crc16)
+    {
+#ifdef SDFLASH_VERBOSE
+        printf("sdspi_get_scr: CRC mismatch error\n");
+#endif
+        return -EIO;
+    }
+
+
+    /* extract the SCR information from the CSD block */
+    for (k = 0; k < SCR_BYTE_COUNT - 3; k++)
+    {
+        switch (k)
+        {
+            case SCR_BLOCK_OFFSET_0:
+                sd_scr->SCR_STRUCTURE = (scr_buffer[k]>>4) & 0x0f;
+                sd_scr->SD_SPEC = scr_buffer[k] & 0x0f;
+                break;
+
+            case SCR_BLOCK_OFFSET_1:
+                sd_scr->DATA_STAT_AFTER_ERASE = (scr_buffer[k] & 0x80)>>7;
+                // Fill out all bits for convenience
+                if(sd_scr->DATA_STAT_AFTER_ERASE)
+                    sd_scr->DATA_STAT_AFTER_ERASE = 0xff;
+                sd_scr->SD_SECURITY = ((scr_buffer[k]&0x70)>>4) & 0x07;
+                sd_scr->SD_BUS_WIDTHS = scr_buffer[k] & 0x0f;
+                break;
+        }
+    }
+    sd_scr->init_ok = TRUE;
+
+    return result;
+}
+
+
+/*** Beginheader sdspi_read_sector ***/
+int sdspi_read_sector(sd_device *sd, unsigned long sector_number,
+                             void * data_buffer);
+/*** endheader ***/
+
+/* START FUNCTION DESCRIPTION ********************************************
+sdspi_read_sector             <SDFLASH.LIB>
+
+SYNTAX: int sdspi_read_sector(sd_device *sd, unsigned long sector_number,
+                                    void * data_buffer)
+
+DESCRIPTION: This function is called to execute protocol command 17 to
+             read a 512 byte block of data from the SD card.
+
+PARAMETER1: sd             The device structure for the SD card.
+PARAMETER2: sector_number  The sector number to read.
+PARAMETER3: data_buffer    Pointer to a buffer for the 512 bytes read
+
+RETURN VALUE:    0                Success
+               -EIO               I/O Error
+               -EINVAL            Invalid parameter given
+               -ENOMEDIUM         No SD card in socket
+               -ESHAREDBUSY       Shared SPI port busy
+
+END DESCRIPTION **********************************************************/
+
+_sdflash_nodebug
+int sdspi_read_sector(sd_device *sd, unsigned long sector_number,
+                             void * data_buffer)
+{
+   return sdspi_xread_sector(sd, sector_number, (__far void *)data_buffer);
+}
+
+/*** Beginheader sdspi_xread_sector ***/
+int sdspi_xread_sector(sd_device *sd, unsigned long sector_number,
+                             __far void * data_buffer);
+/*** endheader ***/
+
+/* START FUNCTION DESCRIPTION ********************************************
+sdspi_xread_sector             <SDFLASH.LIB>
+
+SYNTAX: int sdspi_xread_sector(sd_device *sd, unsigned long sector_number,
+                                    far void * data_buffer)
+
+DESCRIPTION: This function is called to execute protocol command 17 to
+             read a 512 byte block of data from the SD card.
+
+PARAMETER1: sd             The device structure for the SD card.
+PARAMETER2: sector_number  The sector number to read.
+PARAMETER3: data_buffer    Far pointer to a buffer for the 512 bytes read
+
+RETURN VALUE:    0                Success
+               -EIO               I/O Error
+               -EINVAL            Invalid parameter given
+               -ENOMEDIUM         No SD card in socket
+               -ESHAREDBUSY       Shared SPI port busy
+
+END DESCRIPTION **********************************************************/
+
+_sdflash_nodebug
+int sdspi_xread_sector(sd_device *sd, unsigned long sector_number,
+                             __far void * data_buffer)
+{
+    int result, j, k;
+    char * read_data_ptr;
+    unsigned short crc16;
+    SD_CMD_REPLY cmd_reply;
+
+    result = 0;
+    read_data_ptr = NULL;
+
+    SD_DISABLECS(sd->SDintf);
+
+    memset(&cmd_reply, 0, sizeof(SD_CMD_REPLY));
+
+    cmd_reply.cmd = CMD17;
+    cmd_reply.argument = sector_number * BLOCK_SIZE;
+    cmd_reply.reply_size = CMD_R1_BUFFER_SIZE;
+    cmd_reply.data_size = DATA_BLOCK_SIZE;
+    cmd_reply.tx_buffer = tx_buffer;
+    cmd_reply.rx_buffer = rx_buffer;
+
+    if (result = sdspi_process_command(sd, &cmd_reply, 1))
+    {
+#ifdef SDFLASH_VERBOSE
+       printf("sdspi_read_sector: sdspi_process_command() failed, error %d\n",
+                 result);
+#endif
+       return result;
+    }
+    else
+    {
+        if (cmd_reply.reply)
+        {
+#ifdef SDFLASH_VERBOSE
+            printf("sdspi_read_sector: command response error, reply=%02x\n",
+                      cmd_reply.reply);
+#endif
+            return -EIO;
+        }
+    }
+
+    if (cmd_reply.rx_buffer[cmd_reply.reply_size] != READ_WRITE_START_BLOCK)
+    { // Automatic retry on bad start block reception
+      if (result = sdspi_process_command(sd, &cmd_reply, 1))
+      { // If it happens again, report it as an error
+#ifdef SDFLASH_VERBOSE
+        printf("sdspi_read_sector: command failed retry, error %d\n",
+                 result);
+#endif
+        return result;
+      }
+      else
+      {
+        if (cmd_reply.rx_buffer[cmd_reply.reply_size] != READ_WRITE_START_BLOCK)
+        {
+#ifdef SDFLASH_VERBOSE
+           printf("sdspi_read_sector: Expected start block, received %x\n",
+                          cmd_reply.rx_buffer[cmd_reply.reply_size]);
+#endif
+           return -EIO;
+        }
+      }
+    }
+
+    read_data_ptr = &cmd_reply.rx_buffer[cmd_reply.reply_size + 1];
+
+    /* Get the CRC for CSD block and 2 byte CRC */
+    crc16 = crc16_calc( read_data_ptr, DATA_BLOCK_SIZE - 1, 0);
+
+    /* Using the 2 CRC bytes in the CRC calculation results in 0 */
+    if (crc16)
+    {
+#ifdef SDFLASH_VERBOSE
+        printf("sdspi_read_sector: CRC mismatch error\n");
+#endif
+        return -EIO;
+    }
+
+    _f_memcpy(data_buffer, (__far void *)read_data_ptr, BLOCK_SIZE);
+
+    return result;
+}
+
+
+/*** Beginheader sdspi_write_sector ***/
+int sdspi_write_sector(sd_device *sd, unsigned long sector_number,
+                           char * data_buffer);
+/*** endheader ***/
+
+/* START FUNCTION DESCRIPTION ********************************************
+sdspi_write_sector            <SDFLASH.LIB>
+
+SYNTAX: int sdspi_write_sector(sd_device *sd, unsigned long sector_number,
+                                char * data_buffer)
+
+DESCRIPTION: This function is called to execute protocol command 24 to
+             write a 512 byte block of data to the SD card.
+
+PARAMETER1: sd            The device structure for the SD card.
+PARAMETER2: sector_number The sector number to write.
+PARAMETER3: data_buffer   Pointer to a buffer of 512 bytes to write.
+
+RETURN VALUE:     0             Success
+               -EIO             I/O Error
+               -EACCES          Write protected block, no write access
+               -EINVAL          Invalid parameter given
+               -ENOMEDIUM       No SD card in socket
+               -ESHAREDBUSY     Shared SPI port busy
+               -EBUSY           SD card is busy with write operation,
+                                call sdspi_WriteContinue to complete
+                                (Only when SD_NON_BLOCK is defined)
+
+END DESCRIPTION **********************************************************/
+
+_sdflash_nodebug
+int sdspi_write_sector(sd_device *sd, unsigned long  sector_number,
+                             char * data_buffer)
+{
+   return sdspi_xwrite_sector(sd, sector_number, (__far char *)data_buffer);
+}
+
+/*** Beginheader sdspi_xwrite_sector ***/
+int sdspi_xwrite_sector(sd_device *sd, unsigned long sector_number,
+                           __far char * data_buffer);
+/*** endheader ***/
+
+/* START FUNCTION DESCRIPTION ********************************************
+sdspi_xwrite_sector            <SDFLASH.LIB>
+
+SYNTAX: int sdspi_xwrite_sector(sd_device *sd, unsigned long sector_number,
+                                 far char * data_buffer)
+
+DESCRIPTION: This function is called to execute protocol command 24 to
+             write a 512 byte block of data to the SD card.
+
+PARAMETER1: sd            The device structure for the SD card.
+PARAMETER2: sector_number The sector number to write.
+PARAMETER3: data_buffer   Far pointer to a buffer of 512 bytes to write.
+
+RETURN VALUE:     0             Success
+               -EIO             I/O Error
+               -EACCES          Write protected block, no write access
+               -EINVAL          Invalid parameter given
+               -ENOMEDIUM       No SD card in socket
+               -ESHAREDBUSY     Shared SPI port busy
+               -EBUSY           SD card is busy with write operation,
+                                call sdspi_WriteContinue to complete
+                                (Only when SD_NON_BLOCK is defined)
+
+END DESCRIPTION **********************************************************/
+_sdflash_nodebug
+int sdspi_xwrite_sector(sd_device *sd, unsigned long  sector_number,
+                           __far char * data_buffer)
+{
+    int result, j, k, status;
+    char * read_data_ptr;
+    unsigned short crc16;
+    unsigned count;
+    char scount;
+    SD_CMD_REPLY cmd_reply;
+
+    result = 0;
+    read_data_ptr = NULL;
+
+    memset(&cmd_reply, 0, sizeof(SD_CMD_REPLY));
+
+    cmd_reply.cmd = CMD24;
+    cmd_reply.argument = sector_number * BLOCK_SIZE;
+    cmd_reply.reply_size = CMD_R1_BUFFER_SIZE;
+    cmd_reply.data_size = 0;
+    cmd_reply.tx_buffer = tx_buffer;
+    cmd_reply.rx_buffer = rx_buffer;
+
+    if (result = sdspi_process_command(sd, &cmd_reply,0))
+    {
+#ifdef SDFLASH_VERBOSE
+        printf("sdspi_write_sector: process command failed.\n");
+#endif
+        _sdspi_end_command(sd);
+        _SPIfreeSemaphore(SPI_SD);
+        return result;
+    }
+    else
+    {
+        if (cmd_reply.reply)
+        {
+#ifdef SDFLASH_VERBOSE
+            printf("sdspi_write_sector: command response error (%d).\n",
+                      cmd_reply.reply);
+#endif
+            _sdspi_end_command(sd);
+            _SPIfreeSemaphore(SPI_SD);
+            return -EIO;
+        }
+    }
+
+    tx_buffer[0] = 0xFE;      // Write start data token
+
+    // Copy data_buffer to tx_buffer and calculate crc
+    _f_memcpy( &tx_buffer[1], data_buffer, 512);
+    crc16 = crc16_calc( data_buffer, 512, 0);
+
+    // Last bit of CRC must be set or we get CRC error back from the card
+    tx_buffer[514] = (char)crc16 | 1 ;		// LSB | 0x01
+    tx_buffer[513] = (char)(crc16>>8);		// MSB
+
+    _sdspi_write_block(tx_buffer, 515, sd->port);
+    result = _sdspi_read_block(rx_buffer, 1, sd->port, REPLY_TIMEOUT);
+
+    if (result == 1) {
+	    rx_buffer[0] |= 0xE0;      // Set don't care bits high for comparing
+	    if(rx_buffer[0]==0xEB) {
+#ifdef SDFLASH_VERBOSE
+           printf("sdspi_write_sector: CRC mismatch error.\n");
+#endif
+   	     result = -EIO;
+       }
+	    else if(rx_buffer[0]==0xED) {
+#ifdef SDFLASH_VERBOSE
+           printf("sdspi_write_sector: Write data error.\n");
+#endif
+   	     result = -EIO;
+       }
+	    else if(rx_buffer[0]!=0xE5) {
+#ifdef SDFLASH_VERBOSE
+           printf("sdspi_write_sector: Invalid command response error.\n");
+#endif
+   	     result = -EIO;
+       }
+    }
+
+    if (result < 0) {
+       _sdspi_end_command(sd);
+       sdspi_get_status_reg(sd, &status);   // Read status to clear the card
+       _SPIfreeSemaphore(SPI_SD);
+       return result;
+    }
+
+#ifdef SD_NON_BLOCK
+	 return -EBUSY;
+#else
+    // Implement timeout for busy response from SD card
+    for (count = BUSY_RETRIES; !sdspi_notbusy(sd->port) && count; count--);
+
+    SD_DISABLECS(sd->SDintf);
+    SD_ENABLECS(sd->SDintf);
+    _sdspi_end_command(sd);
+    sd->write_state = 0;
+    _SPIfreeSemaphore(SPI_SD);
+
+    if(!count) {
+#ifdef SDFLASH_VERBOSE
+        printf("sdspi_write_sector: Busy response timeout.\n");
+#endif
+        result = -EIO;
+    }
+    else {
+       result = sdspi_get_status_reg(sd, &status);
+       if (!result && status) {
+          if (status & 0x0023) {
+#ifdef SDFLASH_VERBOSE
+             printf("sdspi_write_sector(%ld): Write protected, access denied.\n",
+                            sector_number);
+#endif
+             result = -EACCES;
+          }
+          else {
+#ifdef SDFLASH_VERBOSE
+             printf("sdspi_write_sector: Write operation failed (%04x).\n",
+                            status);
+#endif
+             result = -EIO;
+          }
+       }
+    }
+
+    return result;
+#endif
+}
+
+
+
+/*** Beginheader sdspi_WriteContinue ***/
+int sdspi_WriteContinue(sd_device *sd);
+/*** endheader ***/
+
+/* START FUNCTION DESCRIPTION ********************************************
+sdspi_WriteContinue         <SDFLASH.LIB>
+
+SYNTAX: int sdspi_WriteContinue(sd_device *sd)
+
+DESCRIPTION: This function completes the previously started write
+             command to the SD card when Non-Blocking mode is enabled.
+             It looks for the end of the busy signal from the card,
+             then strobes the chip select.  This function should be
+             called repeatedly until the -EBUSY code is not returned,
+             at which point the SPI port is freed.  There is a timeout
+             mechanism for the busy signal.  If exceeded, the port is
+             freed and the -EIO error code is returned.
+
+PARAMETER1:  sd      The device structure for the SD card.
+
+RETURN VALUE:     0             Success
+               -EIO             I/O Error or Timeout
+               -EBUSY           SD card is busy with write operation,
+                                call sdspi_WriteContinue again
+
+END DESCRIPTION **********************************************************/
+
+_sdflash_nodebug
+int sdspi_WriteContinue(sd_device *sd)
+{
+    int count, result, status;
+
+    // Wait for write operation to complete
+    if (sdspi_notbusy(sd->port)) {
+	    SD_DISABLECS(sd->SDintf);
+	    SD_ENABLECS(sd->SDintf);
+	    _sdspi_end_command(sd);
+       sd->write_state = 0;
+	    _SPIfreeSemaphore(SPI_SD);
+
+       // Check status response from SD card
+       result = sdspi_get_status_reg(sd, &status);
+       if (!result && status) {
+#ifdef SDFLASH_VERBOSE
+          printf("sdspi_writeContinue: Write operation failed (%04x).\n",
+                            status);
+#endif
+          result = -EIO;
+       }
+    }
+    else {  // SD card still busy, increment write_state as timeout
+       if (++sd->write_state > BUSY_RETRIES) {
+	    SD_DISABLECS(sd->SDintf);
+       sd->write_state = 0;
+	    _SPIfreeSemaphore(SPI_SD);
+#ifdef SDFLASH_VERBOSE
+          printf("sdspi_writeContinue: Write busy timeout.\n");
+#endif
+          result = -EIO;
+       }
+       else {
+          result = -EBUSY;
+       }
+    }
+
+    return result;
+}
+
+/*** Beginheader sdspi_set_block_length ***/
+int sdspi_set_block_length(sd_device *sd, int block_length);
+/*** endheader ***/
+
+/* START FUNCTION DESCRIPTION ********************************************
+sdspi_set_block_length         <SDFLASH.LIB>
+
+SYNTAX: int sdspi_set_block_length(sd_device *sd, int block_length)
+
+DESCRIPTION: This function executes protocol command 16 to set the block
+             length for the SD card.  The default block length for
+             SD cards is 512 bytes.  Please note that sdspi_write_sector
+             and sdspi_read_sector work on 512 byte blocks only.  If you
+             change the block size, these functions will need to be
+             modified, or you will need to execute commands directly
+             through sdspi_process_command and internal write block and
+             read block functions.
+
+PARAMETER1: sd             The device structure for the SD card.
+PARAMETER2: block_length   The block size in bytes for the SD card.
+
+RETURN VALUE:     0               Success
+               -EIO               I/O Error
+               -EINVAL            Invalid parameter given
+               -ENOMEDIUM         No SD card in socket
+               -ESHAREDBUSY       Shared SPI port busy
+
+END DESCRIPTION **********************************************************/
+
+_sdflash_nodebug
+int sdspi_set_block_length(sd_device *sd, int block_length)
+{
+    int result;
+    SD_CMD_REPLY cmd_reply;
+
+    result = 0;
+    memset(&cmd_reply, 0, sizeof(cmd_reply));
+
+    cmd_reply.cmd = CMD16;
+    cmd_reply.argument = (long)block_length;
+    cmd_reply.reply_size = CMD_R1_BUFFER_SIZE;
+    cmd_reply.data_size = 0;
+    cmd_reply.tx_buffer = tx_buffer;
+    cmd_reply.rx_buffer = rx_buffer;
+
+#ifdef SDFLASH_VERBOSE
+    printf("sdspi_set_block_length: calling sdspi_process_command\n");
+#endif
+    if (result = sdspi_process_command(sd, &cmd_reply, 1))
+    {
+       return result;
+    }
+    else
+    {
+        if (cmd_reply.reply)
+        {
+#ifdef SDFLASH_VERBOSE
+            printf("sdspi_set_block_length: command response error (%d)\n",
+                      cmd_reply.reply);
+#endif
+            result = -EIO;
+        }
+    }
+
+    return result;
+}
+
+/*** Beginheader sdspi_debounce ***/
+int sdspi_debounce(sd_device *sd);
+/*** endheader ***/
+
+/* START FUNCTION DESCRIPTION ********************************************
+sdspi_debounce                <SDFLASH.LIB>
+
+SYNTAX: int sdspi_debounce(sd_device *sd)
+
+DESCRIPTION: This function waits for and debounces the card insertion
+             switch.  When it returns True(1), then a card is fully
+             inserted.
+
+PARAMETER1:   sd       The device structure for the SD card.
+
+RETURN VALUE:    1     Success, Card Fully Inserted
+                 0     No Card Present
+
+END DESCRIPTION **********************************************************/
+_sdflash_nodebug
+int sdspi_debounce(sd_device *sd){
+  int i, j;
+
+  for (j = 0; j < 20; j++) {
+    for (i = 0; !SD_cardDetect(sd) && i<500; i++);
+    if (i == 500) return 0;
+    for(i = 0; SD_cardDetect(sd) && i<500; i++);
+    if (i == 500) return 1;
+  }
+  return 0;
+}
+
+
+/*** Beginheader sdspi_setLED ***/
+void sdspi_setLED(sd_device *sd, char state);
+/*** endheader ***/
+
+/* START FUNCTION DESCRIPTION ********************************************
+sdspi_setLED                  <SDFLASH.LIB>
+
+SYNTAX: void sdspi_setLED(sd_device *sd, char state)
+
+DESCRIPTION: This function sets the LED for the given SD card based
+             on state.  If state is 0, the LED is turned off. If state
+             is not zero, the LED is turned on.
+
+PARAMETER1: sd        The device structure for the SD card.
+PARAMETER2: state     The state to set the LED to:
+                            0 = Off & Non-zero = On
+
+RETURN VALUE:    NONE
+
+END DESCRIPTION **********************************************************/
+_sdflash_nodebug
+void sdspi_setLED(sd_device *sd, char state)
+{
+   // If LED port defined, set LED to 'state'
+   if (sd->SDintf->ledport) {
+     BitWrPortI(sd->SDintf->ledport, sd->SDintf->ledportdrShadow,
+                (state ? 1 : 0), sd->SDintf->ledpin);
+   }
+   return;
+}
+
+
+/*** Beginheader sdspi_notbusy ***/
+__root int sdspi_notbusy(int port);
+/*** endheader ***/
+/* START FUNCTION DESCRIPTION ********************************************
+sdspi_notbusy                 <SDFLASH.LIB>
+
+SYNTAX: int sdspi_notbusy(int port)
+
+DESCRIPTION: This function tests for a busy status from the SD card
+             on the port given.  It is assumed that the card is already
+             enabled.
+
+PARAMETER1: port      The base address for the SD card's SPI port
+
+RETURN VALUE:    1    The card is not busy, write/erase has ended
+                 0    The card is busy, write/erase in progress
+END DESCRIPTION **********************************************************/
+#asm
+sdspi_notbusy::
+		; set up the registers
+		ld		iy, hl
+.sdspi_nb_BusyWait:
+		; Discard any / all garbage Rx data and ensure that Tx is idle before
+		;  issuing the first receive byte command.
+ioi	ld		a, (iy)
+ioi	ld		a, (iy+SD_SR_OFFSET)
+		and	0xAC
+		jr		nz, .sdspi_nb_BusyWait
+
+		; look at up to 32 bytes for end of busy
+		ld		b, 32
+		ld		h, 0							; for return and for testing
+.BZLoop:
+		; set up RX control value
+		ld		a, _cexpr(SD_SPI_CONTROL_VALUE | SD_SPI_RXMASK)
+ioi	ld		(iy+SD_CR_OFFSET), a		; load RX control value - receive the byte
+		; wait for the receiver to complete
+.BZWait:
+ioi	bit	7, (iy+SD_SR_OFFSET)		; test receiver bit
+		jr		z, .BZWait					; jump if not done yet
+
+		; get the byte, zero if busy
+ioi	ld		L, (iy)						; get the byte
+		test	hl								; see if SD card is busy
+		jr		nz, .BZret					; if not busy, jump to exit
+
+		djnz	.BZLoop						; if busy, loop back on repeat counter
+
+.BZret:
+		ret
+#endasm
+
+/*** Beginheader _sdspi_ReadWrite ***/
+__root int _sdspi_ReadWrite(sd_device *sd, char *tx_buffer, char *rx_buffer,
+                unsigned int reply_size, unsigned int data_size, int disable);
+/*** endheader ***/
+
+/*************************************************************************
+SYNTAX: int _sdspi_ReadWrite(sd_device *sd, char *tx_buffer,
+                              char *rx_buffer, unsigned int reply_size,
+                               unsigned int data_size, int disable)
+
+DESCRIPTION:   Performs an end of command sequence - raising the chip
+					select and clocking out a high line character.  This
+					finishes the command and puts the SD out in hi-Z mode.
+               You must obtain the SPI semaphore before calling this
+               function as it raises and lowers the SD card chip select.
+               It will end the command and release the SPI semaphore if
+               disable is passed as true.
+
+PARAMETER1:		sd - Pointer to an SD device structure
+PARAMETER2:		len - number of bytes to transmit ( maximum 64K)
+PARAMETER3:		port - Base address of the SPI serial port to use
+
+RETURN VALUE:   0       Success
+                -EIO    Timeout Occured in Command Response
+**************************************************************************/
+_sdflash_nodebug
+__root int _sdspi_ReadWrite(sd_device *sd, char *tx_buffer, char *rx_buffer,
+                 unsigned int reply_size, unsigned int data_size, int disable)
+{
+   int rc;
+
+      SD_ENABLECS(sd->SDintf);
+      tx_buffer[6]=0xff;    //extra character needed to keep clk on
+      _sdspi_write_block(tx_buffer, 7, sd->port);
+      rc = _sdspi_read_block(rx_buffer, reply_size, sd->port, REPLY_TIMEOUT);
+      if (data_size) {
+         rc = _sdspi_read_block(rx_buffer + reply_size, data_size, sd->port,
+                               sd->data_timeout);
+      }
+      if(disable) {
+        _sdspi_end_command(sd);
+        _SPIfreeSemaphore(SPI_SD);
+      }
+   return (rc < 0 ? rc : 0);
+}
+
+
+/*** Beginheader _sdspi_end_command ***/
+void _sdspi_end_command(sd_device *sd);
+/*** endheader ***/
+
+/*************************************************************************
+SYNTAX: void _sdspi_end_command(sd_device *sd)
+
+DESCRIPTION:   Performs an end of command sequence - disabling the chip
+					select and clocking out a high line character.  This
+					finishes the command and puts the SD output in hi-Z mode.
+               Does not get or release the semaphore.
+
+PARAMETER1:		sd - Pointer to an SD device structure
+PARAMETER2:		len - number of bytes to transmit ( maximum 64K)
+PARAMETER3:		port - Base address of the SPI serial port to use
+**************************************************************************/
+_sdflash_nodebug
+void _sdspi_end_command(sd_device *sd)
+{
+   SD_DISABLECS(sd->SDintf);
+   tx_buffer[0] = 0xFF;
+   _sdspi_write_block(tx_buffer, 1, sd->port);
+}
+
+
+/*** Beginheader _sdspi_write_block ***/
+__root void _sdspi_write_block(char *buffer, unsigned int len, int port);
+/*** endheader ***/
+
+/*************************************************************************
+_sdspi_write_block
+
+SYNTAX: void _sdspi_write_block(char *buffer, unsigned int len, int port)
+
+DESCRIPTION:   Transmits a block of data over the SPI port. This
+					function blocks until the tranmission completes.
+               Chip select and semaphores must be handled before
+               calling this function, it only performs a card write.
+
+PARAMETER1:		buffer - An array of bytes to transmit
+PARAMETER2:		len - number of bytes to transmit ( maximum 64K)
+PARAMETER3:		port - Base address of the SPI serial port to use
+
+**************************************************************************/
+_sdflash_nodebug
+void _sdspi_write_block(char *buffer, unsigned int len, int port)
+{
+#asm
+		; set up the registers
+		ex		de, hl						; save src in de
+		ld		hl, (sp+@SP+len)			; get the number of bytes
+		ld		bc, hl
+		ld		iy, (sp+@SP+port)
+		; de = destination address
+		; bc = byte count
+		; iy =  serial port register base (SxDR)
+.sdspi_wb_BusyWait:
+		; Discard any / all garbage Rx data and ensure that Tx is idle before
+		;  issuing the first transmit byte command.
+ioi	ld		a, (iy)
+ioi	ld		a, (iy+SD_SR_OFFSET)
+		and	0xAC
+		jr		nz, .sdspi_wb_BusyWait
+
+._SPIWriteA0:
+		ld		a, (de)						; get a byte
+ioi	ld		(iy), a						; load it
+		;; The Rabbit's SPI transmitter idle status bit is actually set 1/2 bit-
+		;; time early. To compensate for this, we start a simultaneous receive
+		;; plus transmit operation and wait for the receive operation to complete.
+		;; We discard the received byte before proceeding.
+		ld		a, _cexpr(SD_SPI_CONTROL_VALUE | SD_SPI_RXMASK | SD_SPI_TXMASK)
+ioi	ld		(iy+SD_CR_OFFSET), a		; load TX control value - send the byte
+		; wait for the buffer to be available
+._Tx00:
+ioi	bit	7, (iy+SD_SR_OFFSET)		; test receiver full bit
+		jr		z, ._Tx00					; jump if not received yet
+
+ioi	ld		a, (iy)						; discard Rx byte (clear receiver bit)
+		inc	de								; point to next byte
+		dwjnz	._SPIWriteA0				; jump if not done
+#endasm
+}
+
+
+/*** Beginheader _sdspi_read_block ***/
+__root int _sdspi_read_block(char *buffer, unsigned int len, int port,
+                                   unsigned int timeout);
+/*** endheader ***/
+
+/*************************************************************************
+_sdspi_read_block
+
+SYNTAX: int _sdspi_read_block(char *buffer, unsigned int len, int port,
+                                     unsigned int timeout)
+
+DESCRIPTION:   Reads in len bytes of data (ignoring high line sequence)
+               from the SPI port into a buffer.  Timeout is based on the
+               current SPI clock rate and is given in number of bytes
+               allowed to be in high line condition before data starts.
+               Chip select and semaphores must be handled before
+               calling this function, it only performs a card read.
+
+PARAMETER1:		buffer - buffer for reply and received bytes
+PARAMETER2:		len - number of bytes to receive (after high line condition)
+PARAMETER3:		port - Base address of the SPI serial port to use
+PARAMETER4:    timeout - number of high line bytes allowed before timeout
+
+RETURN VALUE:  number of bytes received (if positive)
+               -EIO = Response Timeout occured
+
+**************************************************************************/
+_sdflash_nodebug
+__root int _sdspi_read_block(char *buffer, unsigned int len, int port,
+                                  unsigned int timeout)
+{
+#asm
+		; set up the registers
+		ex		de, hl						; save dest in de
+		ld		hl, (sp+@SP+timeout)		; get timeout count
+		ld		bc, hl
+		ld		iy, (sp+@SP+port)
+		; de = destination address
+		; bc = timeout counter
+		; iy = serial port register base (SxDR)
+.sdspi_rb_BusyWait:
+		; Discard any / all garbage Rx data and ensure that Tx is idle before
+		;  issuing the first receive byte command.
+ioi	ld		a, (iy)
+ioi	ld		a, (iy+SD_SR_OFFSET)
+		and	0xAC
+		jr		nz, .sdspi_rb_BusyWait
+
+		; High line condition loop
+._Rx0Loop:
+		; set up RX control value
+		ld		a, _cexpr(SD_SPI_CONTROL_VALUE | SD_SPI_RXMASK)
+ioi	ld		(iy+SD_CR_OFFSET), a		; load RX control value - receive the byte
+		; wait for the receiver to complete
+._Rx0Wait:
+ioi	bit	7, (iy+SD_SR_OFFSET)		; test receiver bit
+		jr		z, ._Rx0Wait				; jump if not done yet
+
+ioi	ld		a, (iy)						; get the byte
+		cp		0xFF							; Compare to high line condition
+		jr		nz, ._RxGetData			; If not, then go get reply/data
+
+		dwjnz	._Rx0Loop					; Loop back if not expired
+
+		; Timeout occurred
+		ld		(de), a						; Save 0xFF byte to indicate timeout
+		jr		._Rx0Exit					; And exit
+
+		; receive the reply/data bytes
+._RxGetData:
+		ld		hl, (sp+@SP+len)			; get the number of bytes to receive
+		ld		bc, hl
+		; de = destination address
+		; bc = timeout counter
+		; iy = serial port register base (SxDR)
+		jr		._RxSaveByte				; Save the first byte and get the rest
+
+		; Data or reply reception loop
+._Rx1Loop:
+		; set up RX control value
+		ld		a, _cexpr(SD_SPI_CONTROL_VALUE | SD_SPI_RXMASK)
+ioi	ld		(iy+SD_CR_OFFSET), a		; load RX control value - receive the byte
+
+; wait for the receiver to complete
+._Rx1Wait:
+ioi	bit	7, (iy+SD_SR_OFFSET)		; test receiver bit
+		jr		z, ._Rx1Wait				; jump if not done yet
+
+ioi	ld		a, (iy)						; get the byte
+._RxSaveByte:
+		ld		(de), a						; store the byte
+		inc	de								; point to next byte
+		dwjnz	._Rx1Loop					; jump if not done
+
+._Rx0Exit:
+#endasm
+	return *buffer == 0xFF ? -EIO : len;
+}
+
+/*** BeginHeader */
+#endif	// __SDFLASH_LIB__
+/*** EndHeader */

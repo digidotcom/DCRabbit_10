@@ -1,0 +1,2230 @@
+/*
+ *	ftp_server.lib
+ *	Copyright (C) Rabbit Semiconductor, Inc. All rights reserved.
+ * Based on RFC959 "File Transfer Protocol".
+ */
+
+/**********
+ * Changes
+ *
+ * NLST command implemented - fix for broken cli ftp on NT
+ * CWD command hacked in - always returns yes; no directory, really.
+ * We accept TYPE A commands - browser fix
+ * #define FTP_EXTENSIONS to implement the SIZE and MDTM commands.
+ * Other enhancements to (and better documentation for) custom handlers.
+ *
+ * 2010 Sep 22  SJH  Added directory creation/removal support.
+ *                   Don't need FTP_EXTENSIONS macro any more.
+ *
+ **********/
+
+/*** BeginHeader ftp_servers */
+#ifndef FTP_SERVER_H
+#define FTP_SERVER_H
+
+#ifdef FTP_DEBUG
+	#define _ftp_nodebug __debug
+#else
+	#define _ftp_nodebug __nodebug
+#endif
+
+#use "idblock_api.lib"
+#use "zserver.lib"
+
+/**
+ * 	FTP_MAXSERVERS - This is the number of simultaneous connectons the FTP
+ * 	server can support.  It is recommended that this be set to 1 (default),
+ * 	as each subsequent server requires a significant amount of RAM (1500
+ * 	bytes by default).
+ */
+#ifndef FTP_MAXSERVERS
+	#define FTP_MAXSERVERS	1
+#endif
+
+#if (FTP_MAXSERVERS > SSPEC_MAX_OPEN)
+	#warns "SSPEC_MAX_OPEN (see documentation for ZServer.lib) should be at least as large as FTP_MAXSERVERS"
+#endif
+
+/**
+ * 	FTP_MAXLINE - Size of the working buffer in each server.  Also, this
+ * 	is the maximum size of each network read/write.  It needs to a minimum
+ * 	of about 256 bytes for the server to function properly.
+ */
+#ifndef FTP_MAXLINE
+	#define FTP_MAXLINE	256
+#endif
+
+/**
+ * 	FTP_MAXNAME - Maximum length for filenames, usernames and passwords.
+ * 	It must include space for the nul character so, with its default of 20,
+ * 	filenames can be at most 19 characters.
+ */
+#ifndef FTP_MAXNAME
+	#define FTP_MAXNAME	20
+#endif
+
+/**
+ * 	FTP_TIMEOUT - The length of time, in seconds, to wait for data from
+ * 	the remote host, before terminating the connection.  If you have a
+ * 	high-latency network connection, this might need to be increased
+ * 	from its default of 16 seconds to avoid premature closures.
+ */
+#ifndef FTP_TIMEOUT
+	#define FTP_TIMEOUT	16
+#endif
+
+#ifndef FTP_DTPTIMEOUT
+	#define FTP_DTPTIMEOUT	FTP_TIMEOUT
+#endif
+
+#ifndef FTP_CMDPORT
+	#define FTP_CMDPORT		21		// Well-known port number for control connection
+#endif
+
+
+#ifdef FTP_WRITABLE_FILES
+	#warns "FTP_WRITABLE_FILES is obsolete.  If using DLM_TCP.C, use the macro ENABLE_DLM_TCP_SUPPORT"
+	#warns "and review the latest DLM_TCP.C"
+#endif
+
+#ifdef FTP_USE_FS2_HANDLERS
+	#warnt "FTP_USE_FS2_HANDLERS is deprecated.  Zserver.lib now handles all filesystems."
+   #warnt "You do not need to define this macro."
+#endif
+
+/**
+ *    FTP_INTERFACE - define default network interface for FTP server
+ */
+#ifndef FTP_INTERFACE
+	#define FTP_INTERFACE IF_DEFAULT
+#endif
+
+/**
+ *		FTP_CREATE_MASK - Defines a creation mask for when
+ *		FTP_USE_FS2_HANDLERS is enabled.  This mask is used in the
+ *		sspec_addfsfile() call.  Sample values for this are
+ *		SERVER_FTP or
+ *		SERVER_FTP | SERVER_HTTP
+ *    Use the latter if also want files to be accessible from web server.
+ */
+#ifndef FTP_CREATE_MASK
+	#define FTP_CREATE_MASK SERVER_FTP
+#endif
+
+/**
+ *		FTP_USERBLOCK_OFFSET - Gives the offset into the user block
+ *		in which the server_spec information (the structure that holds
+ *		the name and filenumber information for files stored in the
+ *		filesystem) will be saved.  This macro is only meaningful
+ *		when FTP_USE_FS2_HANDLERS is defined.
+ */
+#ifndef FTP_USERBLOCK_OFFSET
+	#define FTP_USERBLOCK_OFFSET 0
+#endif
+
+/* ------------------------------------------------------------- */
+
+/* fs options to "FTPhandlers.open()" : */
+#define O_UNUSED	0
+#define O_RDONLY	1		// Same value as O_READ in zserver.lib
+#define O_WRONLY	2		// Same value as O_WRITE in zserver.lib
+#define O_RDWR		2		// Alias for O_WRITE, since O_WRITE implies O_READ.
+
+#define FTP_ERR_NOTFOUND	(-ENOENT)
+#define FTP_ERR_NOTAUTH		(-EACCES)
+#define FTP_ERR_BADMODE		(-EINVAL)
+#define FTP_ERR_UNAVAIL		(-EAGAIN)
+#define FTP_ERR_WRITING 	(-ENOSPC)
+
+struct _FTPState;
+
+typedef struct {
+	int 			(*open)(char *name, int options, int uid, int cwd, struct _FTPState * state);
+	int 			(*read)(int fd, char *buf, long offset, int len, struct _FTPState * state);
+	int 			(*write)(int fd, char *buf, long offset, int len, struct _FTPState * state);
+	int 			(*close)(int fd, struct _FTPState * state);
+	long 			(*getfilesize)(int fd, struct _FTPState * state);
+	int 			(*dirlist)(int item, char *line, int listing, int uid, int cwd, struct _FTPState * state);
+   int			(*mkdir)(char *name, int options, int uid, int cwd, struct _FTPState * state);
+   int			(*rmdir)(char *name, int options, int uid, int cwd, struct _FTPState * state);
+	int			(*cd)(int cwd, char * dir, int uid, struct _FTPState * state);
+	int			(*pwd)(int cwd, char * buf, struct _FTPState * state);
+	long			(*mdtm)(int fd, struct _FTPState * state);
+	int			(*delete)(char * name, int uid, int cwd, struct _FTPState * state);
+} FTPhandlers;
+
+typedef struct {
+	int spec;		// File handle (e.g. from zserver)
+	long offset;	// Current offset
+	long length;	// Remaining length
+} FTP_FileDescriptor;
+
+typedef struct _FTPState {
+	/* fs stuff */
+	FTP_FileDescriptor fd;
+
+   // Server context
+   ServerContext	context;
+
+	/* state vars */
+	int 			state;
+	int			nextstate;
+
+	/* the main and DTP socket vars */
+	tcp_Socket	ftpsock;
+	tcp_Socket	dtpsock;
+	tcp_Socket * s;
+	tcp_Socket * dtp_s;
+
+	/* storage for the username and password */
+	char			username[SAUTH_MAXNAME];
+	char			password[SAUTH_MAXNAME];
+
+	/* DTP address and port (active) */
+	longword		addy;
+	word			port;
+	int			passive;			/* Whether to passively open DTP port */
+	word			lport;			/* Passive port */
+	int			dtpstatus;		/* status var for DTP sock */
+
+	/* a general purpose return capture; used primarily on sock_fast[read|write]() */
+	int 			retval;
+
+	/* msg send stuff */
+	int 			msglen;
+	int			msgcomplete;
+	char *		message;
+
+	/* readln stuff */
+	char 			line[FTP_MAXLINE];	// Current command line (or data buffer in treansfer mode)
+	char *		pline;					// Pointer to current read line position
+	char *      parms;					// Pointer to command parameters, when complete line
+	char 			readln_ready;
+
+	/* command stuff */
+	long 			recvsize;
+	int 			listitem;
+	int 			linelen;
+	int 			nlst;						// 0: full ls -l; 1: name list; -1: list completion (but DTP aborted)
+	int			cwd;						// Working "directory" (set and used by handler)
+	int			is_open;					// Count calls to hnd.open, so we can give proper number
+												// of hnd.close calls.
+
+	longword 	timeout;
+} FTPState;
+
+/**
+ *  Default functions for each server operation.  These also provide
+ *  prototypes!  If you only want to override a few operations, the
+ *  code can reference the default handlers as-needed.  Very useful
+ *  when the user's application wants to override _some_ handlers.
+ *
+ *  If you specify no FTP handlers, these routines will be called.
+ */
+int	ftp_dflt_open(char *name, int options, int uid, int cwd, FTPState * state);
+int	ftp_dflt_read(int fd, char *buf, long offset, int len, FTPState * state);
+int	ftp_dflt_write(int fd, char *buf, long offset, int len, FTPState * state);
+int	ftp_dflt_close(int fd, FTPState * state);
+long	ftp_dflt_getfilesize(int fd, FTPState * state);
+int 	ftp_dflt_list(int item, char *line, int listing, int uid, int cwd, FTPState * state);
+int	ftp_dflt_mkdir(char *name, int options, int uid, int cwd, FTPState * state);
+int	ftp_dflt_rmdir(char *name, int options, int uid, int cwd, FTPState * state);
+int	ftp_dflt_cd(int cwd, char * dir, int uid, FTPState * state);
+int	ftp_dflt_pwd(int cwd, char * buf, FTPState * state);
+long 	ftp_dflt_mdtm(int fd, FTPState * state);
+int 	ftp_dflt_delete(char * name, int uid, int cwd, FTPState * state);
+
+
+/* the state machine states */
+#define FTPSTATE_START		1		/* start state; wait for connection */
+#define FTPSTATE_MSGWAIT	2		/* waiting for a 'msg' command to complete */
+#define FTPSTATE_BAIL		3		/* killing all connections (reset) */
+#define FTPSTATE_BAIL2		4		/* waiting for connections to die */
+#define FTPSTATE_USERNAME	5		/* waiting for the username to be entered */
+#define FTPSTATE_PASSWORD	6		/* waiting for the password to be entered */
+#define FTPSTATE_STEADY		7		/* the steady state (getting the commands and exec-ing them */
+#define FTPSTATE_DTPCLOSE	8		/* killing the DTP connection */
+#define FTPSTATE_DTP2CLOSE	9		/* waiting for the DTP connection to die */
+#define FTPSTATE_RETR1B		10		/* waiting for the DTP connection to open */
+#define FTPSTATE_RETR2		11		/* second part of RETR (get) command */
+#define FTPSTATE_STOR1B		13		/* waiting for the DTP connection to open */
+#define FTPSTATE_STOR2		14		/* second part of STOR (put) command */
+#define FTPSTATE_LIST1B		15		/* waiting for the DTP connection to open */
+#define FTPSTATE_LIST2		16		/* second part of LIST (ls) command */
+#define FTPSTATE_LIST3		17		/* third part of LIST (ls) command */
+
+extern FTPState ftp_servers[FTP_MAXSERVERS];	// State machines
+extern FTPhandlers	_ftp_handlers; 			// All instances share same handlers.
+extern int _ftp_uid_anon;							// Anonymous userid (-1 if no anon user).
+extern char _ftp_user_anon[SAUTH_MAXNAME];	// Corresponding username
+
+/*** EndHeader */
+
+FTPState 		ftp_servers[FTP_MAXSERVERS];
+FTPhandlers 	_ftp_handlers;
+int 				_ftp_uid_anon;
+char  			_ftp_user_anon[SAUTH_MAXNAME];
+
+/*** BeginHeader ftp_load_filenames */
+int ftp_load_filenames(void);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+ftp_load_filenames                 		<FTP_SERVER.LIB>
+
+SYNTAX: int ftp_load_filenames(void)
+
+KEYWORDS:		sspec, ftp
+
+DESCRIPTION:	This function is used in conjunction with the
+					FTP_USE_FS2_HANDLERS macro.  This function loads the
+					data structure that keeps track of the association of
+					filenames to file locations in the filesystem.  The
+					information is loaded from the user block, from the
+					offset given in FTP_USERBLOCK_OFFSET.
+
+					It returns 0 on success, and -1 if the information
+					could not be loaded (possibly because they have never
+					yet been saved).
+
+               This function is deprecated.  ZSERVER.LIB now handles
+               the details of each filesystem, however if you made use
+               of the arbitrary name mapping to FS2 files, you may
+               still want to use this function.
+
+RETURN VALUE: 	 0: success
+					-1: failure (possibly due to the filenames having not
+					    yet been saved)
+
+SEE ALSO: 	   ftp_save_filenames
+
+END DESCRIPTION **********************************************************/
+
+_ftp_nodebug int ftp_load_filenames(void)
+{
+	auto long len;
+	auto int retval;
+	auto int spec;
+
+	readUserBlock(&len, FTP_USERBLOCK_OFFSET, sizeof(long));
+	if (len != sizeof(server_spec)) {
+		return -1;
+	}
+	retval = readUserBlock(server_spec, FTP_USERBLOCK_OFFSET + sizeof(long),
+	                       sizeof(server_spec));
+	if (retval) {
+		return -1;
+	}
+
+	/* Filter out the non-filesystem entries */
+	spec = 0;
+	while ((spec = sspec_findnextfile(spec, 0xffff)) >= 0) {
+		if (sspec_getfiletype(spec) != SSPEC_FSFILE) {
+			sspec_remove(spec);
+		}
+		spec += 1;
+	}
+	return 0;
+}
+
+/*** BeginHeader ftp_save_filenames */
+int ftp_save_filenames(void);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+ftp_save_filenames                 		<FTP_SERVER.LIB>
+
+SYNTAX: int ftp_save_filenames(void)
+
+KEYWORDS:		sspec, ftp
+
+DESCRIPTION:	This function is used in conjunction with the
+					FTP_USE_FS2_HANDLERS macro.  This function saves the
+					data structure that keeps track of the association of
+					filenames to file locations in the filesystem.  The
+					information is saved to the user block, at the offset
+					given in FTP_USERBLOCK_OFFSET.  The entire
+               sever_spec (global) structure is saved hence use
+               sizeof(server_spec) to determine the number of bytes
+               which will be saved in the user block.
+
+					It returns 0 on success, and -1 if the information
+					could not be saved (due to a write error).
+
+               This function is deprecated.  ZSERVER.LIB now handles
+               the details of each filesystem, however if you made use
+               of the arbitrary name mapping to FS2 files, you may
+               still want to use this function.
+
+RETURN VALUE: 	 0: success
+					-1: failure
+
+SEE ALSO: 	   ftp_load_filenames
+
+END DESCRIPTION **********************************************************/
+
+_ftp_nodebug int ftp_save_filenames(void)
+{
+	auto long len;
+
+	len = sizeof(server_spec);
+	writeUserBlock(FTP_USERBLOCK_OFFSET, &len, sizeof(long));
+	return writeUserBlock(FTP_USERBLOCK_OFFSET + sizeof(long), server_spec,
+	                      sizeof(server_spec));
+}
+
+/*** BeginHeader ftp_dflt_is_auth */
+int ftp_dflt_is_auth(int spec, int options, int uid);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+ftp_dflt_is_auth                   		<FTP_SERVER.LIB>
+
+SYNTAX: int ftp_dflt_is_auth(int spec, int options, int uid)
+
+KEYWORDS:		sspec, ftp
+
+DESCRIPTION: 	Determine amount of access to a file.  If the FTP anonymous
+					user has been set, then also checks that.  "options" is how
+					to access the file.  Currently, this value is ignored.  If
+					the anonymous user ID has been set, then files it owns are
+					globally accessible.
+					Returns whether the user can access it ("owner permission")
+					or if access is because there is an anonymous user ("world
+					permission").
+
+		 			NOTE: This routine only determines accessibility of a name,
+		 			not whether the user can read and/or write the contents.
+
+PARAMETER1:    Handle to SSPEC file (item).
+PARAMETER2:    How to access O_RDONLY, O_WRONLY or O_RDWR.
+PARAMETER3:    The userID to access as.
+
+RETURN VALUE: 	0: no access
+					1: uid only access
+					2: anonymous access (user "anonymous" has been set)
+
+SEE ALSO: 	   sspec_checkaccess()
+
+END DESCRIPTION **********************************************************/
+
+_ftp_nodebug int ftp_dflt_is_auth(int spec, int options, int uid)
+{
+	// Return 0: no access; 1: uid only access; 2: anonymous access
+	if (sspec_checkaccess(spec, uid) != 1) {
+		if (_ftp_uid_anon >= 0 && sspec_checkaccess(spec, _ftp_uid_anon) == 1)
+			return 2;
+		return 0;
+	}
+	return 1;
+}
+
+/*** BeginHeader ftp_dflt_open */
+int ftp_dflt_open(char *name, int options, int uid, int cwd, FTPState * state);
+/*** EndHeader */
+
+_ftp_nodebug int ftp_dflt_open(char *name, int options, int uid, int cwd, FTPState * state)
+{
+	auto int spec;
+#ifdef FTP_USE_FS2_HANDLERS
+	auto File f;
+	auto FileNumber filenum;
+	auto word type;
+#endif
+
+	if (options & O_WRITE) {
+   	options |= O_CREAT | O_TRUNC;
+	   if (!(sauth_getwriteaccess(uid) & SERVER_FTP))
+	      /*  This user can't write to storage. */
+	      return -EACCES;
+	}
+#ifndef FTP_USE_FS2_HANDLERS
+	// New way of doing it: zserver only.
+   spec = sspec_open(name, &state->context, options, 0);
+  	return spec;	// Various error codes, or >= 0 for success.
+#else
+	spec = sspec_findname(name, SERVER_FTP);
+	if (spec < 0 && options == O_RDONLY) {
+   	return -ENOENT;
+   }
+	else if (spec >= 0) {
+		/* Do we have access to the file? */
+		if (!ftp_dflt_is_auth(spec, options, uid))
+			return -EACCES;
+		if (options == O_RDONLY) {
+			return spec;
+		}
+		type = sspec_getfiletype(spec);
+		if (type == SSPEC_FSFILE) {
+			filenum = (FileNumber)sspec_getfileloc(spec);
+			fdelete(filenum);
+			sspec_remove(spec);
+		}
+	}
+	/* creating new file */
+	filenum = fcreate_unused(&f);
+	if (!filenum) {
+		return -ENOSPC;
+	}
+	spec = sspec_addfsfile(name, filenum, FTP_CREATE_MASK);
+	if (spec == -1) {
+		return -ENOSPC;
+	}
+	sspec_setuser(spec, uid);
+	ftp_save_filenames();
+	fclose(&f);
+	return spec;
+#endif
+}
+
+/*** BeginHeader ftp_dflt_getfilesize */
+long ftp_dflt_getfilesize(int fd, FTPState * state);
+/*** EndHeader */
+
+_ftp_nodebug long ftp_dflt_getfilesize(int fd, FTPState * state)
+{
+	return (sspec_getlength(fd));
+}
+
+/*** BeginHeader ftp_dflt_read */
+int ftp_dflt_read(int fd, char *buf, long offset, int len, FTPState * state);
+/*** EndHeader */
+
+_ftp_nodebug int ftp_dflt_read(int fd, char *buf, long offset, int len, FTPState * state)
+{
+#ifdef FTP_USE_FS2_HANDLERS
+	return sspec_readfile(fd, buf, offset, len);
+#else
+	return sspec_read(fd, buf, len);
+#endif
+}
+
+/*** BeginHeader ftp_dflt_write */
+int ftp_dflt_write(int fd, char *buf, long offset, int len, FTPState * state);
+/*** EndHeader */
+
+_ftp_nodebug int ftp_dflt_write(int fd, char *buf, long offset, int len, FTPState * state)
+{
+#ifdef FTP_USE_FS2_HANDLERS
+	auto File f;
+	auto FileNumber filenum;
+	auto bytes;
+
+	if ((filenum = (FileNumber)sspec_getfileloc(fd)) == -1) {
+		return -ENOENT;
+	}
+	if (fopen_wr(&f, filenum)) {
+		return -ENOENT;
+	}
+	fseek(&f, offset, SEEK_SET);
+	bytes = fwrite(&f, buf, len);
+	fclose(&f);
+	if (!bytes) {
+		return -ENOSPC;
+	}
+	return bytes;
+#else
+	return sspec_write(fd, buf, len);
+#endif
+}
+
+/*** BeginHeader ftp_dflt_close */
+int ftp_dflt_close(int fd, FTPState * state);
+/*** EndHeader */
+
+_ftp_nodebug int ftp_dflt_close(int fd, FTPState * state)
+{
+#ifdef FTP_USE_FS2_HANDLERS
+	return 0;
+#else
+	return sspec_close(fd);
+#endif
+}
+
+/*** BeginHeader ftp_dflt_cd */
+int ftp_dflt_cd(int cwd, char * dir, int uid, FTPState * state);
+/*** EndHeader */
+
+_ftp_nodebug int ftp_dflt_cd(int cwd, char * dir, int uid, FTPState * state)
+{
+#ifdef FTP_USE_FS2_HANDLERS
+	if (!strcmp(dir, "/"))
+		return 0;
+	return -1;
+#else
+	return sspec_cd(dir, &state->context, 1);
+#endif
+}
+
+/*** BeginHeader ftp_dflt_pwd */
+int ftp_dflt_pwd(int cwd, char * buf, FTPState * state);
+/*** EndHeader */
+
+_ftp_nodebug int ftp_dflt_pwd(int cwd, char * buf, FTPState * state)
+{
+#ifdef FTP_USE_FS2_HANDLERS
+	strcpy(buf, "/");
+#else
+	sspec_pwd(&state->context, buf);
+#endif
+	return 0;
+}
+
+/*** BeginHeader ftp_dflt_mdtm */
+long ftp_dflt_mdtm(int fd, FTPState * state);
+/*** EndHeader */
+
+_ftp_nodebug long ftp_dflt_mdtm(int fd, FTPState * state)
+{
+	return 0;	// Base rabbit epoch = 1980.
+}
+
+/*** BeginHeader ftp_dflt_delete */
+int ftp_dflt_delete(char * name, int uid, int cwd, FTPState * state);
+/*** EndHeader */
+
+_ftp_nodebug int ftp_dflt_delete(char * name, int uid, int cwd, FTPState * state)
+{
+#ifdef FTP_USE_FS2_HANDLERS
+	auto int rc;
+	auto int spec;
+	auto FileNumber filenum;
+	auto word type;
+
+	spec = sspec_findname(name, SERVER_FTP);
+	if (spec == -1) {
+		return -ENOENT;
+	}
+	if (!(rc = ftp_dflt_is_auth(spec, 0, uid))) {
+		return -EACCES;
+	}
+	/* delete it */
+	type = sspec_getfiletype(spec);
+	if (type != SSPEC_FSFILE) {
+		return -EACCES;
+	}
+	filenum = (FileNumber)sspec_getfileloc(spec);
+	fdelete(filenum);
+	sspec_remove(spec);
+#else
+	return sspec_delete(name, &state->context);
+#endif
+}
+
+/*** BeginHeader ftp_ls_date */
+char * ftp_ls_date(long t, char * buf);
+/*** EndHeader */
+#include "lc_time.h"
+_ftp_nodebug char * ftp_ls_date(long t, char * buf)
+{
+	// Do ls -l format timestamp.  buf should be at least 13 bytes.
+	// Returns buf.  t is a SEC_TIMER value.
+	auto struct tm y;
+	auto int dfmt;		// Whether "distant" format (Mon dd  yyyy), else "near"
+							// format (Mon dd hh:mm).
+	dfmt = t > SEC_TIMER || t < SEC_TIMER - 28000000;	// future or older than about 11 months
+	mktm(&y, t);
+	if (dfmt)
+		_strftime( buf, 40, "%b %e  %Y", &y, &_lc_time_C);
+	else
+		_strftime( buf, 40, "%b %e %H:%M", &y, &_lc_time_C);
+	return buf;
+}
+
+/*** BeginHeader ftp_dflt_list */
+int ftp_dflt_list(int item, char *line, int listing, int uid, int cwd, FTPState * state);
+/*** EndHeader */
+
+_ftp_nodebug int ftp_dflt_list(int item, char *line, int listing, int uid, int cwd, FTPState * state)
+{
+#ifndef FTP_USE_FS2_HANDLERS
+	auto int rc;
+	rc = sspec_dirlist(item, line, FTP_MAXLINE, &state->context, listing ? 0 : SSPEC_LIST_LONG);
+   if (rc < 0)
+   	return -1;
+   return rc;
+#else
+	auto int spec;
+	auto int rc, tempspec;
+	auto char *username;
+	auto char *filename;
+	auto char *permstr;
+	auto long length;
+
+	spec = item;
+_ftp_srv_next_entry:
+	/*  Pick out the next file visible to the FTP server. */
+	spec = sspec_findnextfile(spec, SERVER_FTP);
+	if (spec != -1) {
+		if (!(rc = ftp_dflt_is_auth(spec, 0, uid))) {
+			spec++;
+			goto _ftp_srv_next_entry;
+		}
+		username = sspec_getusername(spec);
+		filename = sspec_getname(spec);
+		length = _ftp_handlers.getfilesize(spec, state);
+		if(listing) {
+			sprintf(line, "%s\r\n", filename);
+		} else {
+			/*
+			 *  Search again to see if this SAME name is writable..  Make a
+			 *  default permission string for the anonymous user.
+			 */
+			permstr = "-r--r--r--" ;
+			if( uid != _ftp_uid_anon ) {
+				tempspec = sspec_findname(filename, SERVER_ANY);
+				if( tempspec == spec && sauth_getwriteaccess(uid) ) {
+					permstr = (2 == rc) ? "-rw-rw-rw-" : "-rw-------";
+				} else
+				if( 2 != rc ) {
+					permstr = "-r--------";
+				}
+			}   /* if not anonymous user.. */
+			sprintf(line, "%s   1 %-10s %-10s %10lu Jan  1  1980 %s\r\n",
+				permstr, username, username,
+				length,
+				filename);
+		}
+		return spec;
+	} else {
+		return -1;
+	}
+#endif
+}
+
+
+
+/*** BeginHeader ftp_dflt_mkdir */
+int ftp_dflt_mkdir(char *name, int options, int uid, int cwd, FTPState * state);
+/*** EndHeader */
+int ftp_dflt_mkdir(char *name, int options, int uid, int cwd, FTPState * state)
+{
+	auto int spec;
+
+	if (options & O_WRITE) {
+   	options |= O_CREAT | O_TRUNC;
+	   if (!(sauth_getwriteaccess(uid) & SERVER_FTP))
+	      /*  This user can't write to storage. */
+	      return -EACCES;
+	}
+   spec = sspec_mkdir(name, &state->context);
+  	return spec;	// Various error codes, or >= 0 for success.
+}
+
+/*** BeginHeader ftp_dflt_rmdir */
+int ftp_dflt_rmdir(char *name, int options, int uid, int cwd, FTPState * state);
+/*** EndHeader */
+int ftp_dflt_rmdir(char *name, int options, int uid, int cwd, FTPState * state)
+{
+	auto int spec;
+
+	if (options & O_WRITE) {
+   	options |= O_CREAT | O_TRUNC;
+	   if (!(sauth_getwriteaccess(uid) & SERVER_FTP))
+	      /*  This user can't write to storage. */
+	      return -EACCES;
+	}
+   spec = sspec_rmdir(name, &state->context);
+  	return spec;	// Various error codes, or >= 0 for success.
+}
+
+
+
+/**********************************************************************/
+
+/*** BeginHeader ftp_auth_user */
+int ftp_auth_user(FTPState *state);
+/*** EndHeader */
+
+/* authenticate the user; return 0 on success, 1 on failure */
+_ftp_nodebug int ftp_auth_user(FTPState *state)
+{
+	auto int uid;
+
+	if (_ftp_uid_anon >= 0 && !strncmp(state->username, _ftp_user_anon, SAUTH_MAXNAME)) {
+		uid = sauth_authenticate(state->username, "", SERVER_FTP);
+	} else {
+		uid = sauth_authenticate(state->username, state->password, SERVER_FTP);
+	}
+	if (uid != -1) {
+   	state->context.userid = uid;
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+/*** BeginHeader ftp_msg */
+void ftp_msg(FTPState *state, char *str, int nextstate);
+/*** EndHeader */
+
+/*
+ * Send a message over the command socket to the FTP client
+ */
+_ftp_nodebug void ftp_msg(FTPState *state, char *str, int nextstate)
+//                                              ^^^^ must point to constant or storage in the "state" struct.
+{
+	state->message = str;
+	state->msglen = strlen(state->message);
+	state->msgcomplete = sock_fastwrite(state->s, state->message, state->msglen);
+#ifdef FTP_VERBOSE
+	printf("FTP: replying: %s", str);
+#endif
+	if (state->msgcomplete < 0) {
+		state->state = FTPSTATE_BAIL;
+		return;
+	}
+	if(state->msgcomplete < state->msglen) {
+		state->nextstate = nextstate;
+		state->state = FTPSTATE_MSGWAIT;
+		return;
+	}
+	sock_flush(state->s);
+	state->state = nextstate;
+}
+
+/*** BeginHeader ftp_finish_msg */
+void ftp_finish_msg(FTPState *state);
+/*** EndHeader */
+
+/* finish sending the message, if sock_fastwrite didn't finish the first time */
+_ftp_nodebug void ftp_finish_msg(FTPState *state)
+{
+	auto int rc;
+	rc = sock_fastwrite(state->s, state->message + state->msgcomplete,
+							  state->msglen - state->msgcomplete);
+	if (rc < 0) {
+		state->state = FTPSTATE_BAIL;
+		return;
+	}
+	state->msgcomplete += rc;
+	if(state->msgcomplete < state->msglen)
+		return;
+	sock_flush(state->s);
+	state->state = state->nextstate;
+}
+
+/*** BeginHeader ftp_dtp_open */
+int ftp_dtp_open(FTPState *state);
+/*** EndHeader */
+
+/*
+ * Open the DTP socket.
+ */
+_ftp_nodebug int ftp_dtp_open(FTPState *state)
+{
+	/* open the DTP connection */
+	if (state->passive)
+		return 0;	// Already listening (from ftp_cmd_pasv)
+	else
+		state->retval = tcp_extopen(&state->dtpsock, FTP_INTERFACE, 0, state->addy, state->port, NULL, 0, 0);
+	if (!state->retval) {
+		/* open failed */
+		ftp_msg(state, "425 Can't open data connection.\r\n", FTPSTATE_STEADY);
+		return 1;
+	}
+	else
+		sock_set_tos(&state->dtpsock, IPTOS_CAPACIOUS);
+
+	return 0;
+}
+
+/*****************************************************************
+ * The readln interface:                                         *
+ *                                                               *
+ * ftp_readln_init() must be called first, to start the process. *
+ * ftp_readln_tick() is called to keep checking.                 *
+ * ftp_readln()	will return the line itself (char *)           *
+ *****************************************************************/
+/*** BeginHeader ftp_readln_init */
+void ftp_readln_init(FTPState *state);
+/*** EndHeader */
+
+_ftp_nodebug void ftp_readln_init(FTPState *state)
+{
+	state->readln_ready = 0;
+
+	state->pline = state->line;
+}
+
+/*** BeginHeader ftp_readln_tick */
+void ftp_readln_tick(FTPState *state);
+/*** EndHeader */
+
+_ftp_nodebug void ftp_readln_tick(FTPState *state)
+{
+	static int retval;
+   static char buf[3];
+   static char * p;
+
+   if(state->readln_ready)
+   	return;				/* old line hasn't been used yet */
+
+   tcp_tick(NULL);
+
+   while(1) {
+		retval = sock_fastread(state->s, buf, 1);
+		if (retval < 0)
+			// Command socket expired: reset state.
+			state->state = FTPSTATE_BAIL;
+
+		if(retval < 1)
+			return;	/* no data; wait till next tick */
+
+		/* strip off all telnet control codes */
+		if (buf[0] == 255) {
+			retval = sock_fastread(state->s, buf, 2);
+			if(2 == retval) {
+				switch (buf[0]) {
+				case 251:
+				case 252:
+					sprintf(buf, "%c%c%c", 255, 254, buf[1]);
+					sock_fastwrite(state->s, buf, 3);
+					continue;
+				case 253:
+				case 254:
+					sprintf(buf, "%c%c%c", 255, 252, buf[1]);
+					sock_fastwrite(state->s, buf, 3);
+					continue;
+				case 255:
+					break;
+				default:
+					continue;   /* ignore command */
+				}
+			}
+		}
+
+		/* data byte is good; add it to the list */
+		*state->pline = buf[0];
+		state->pline++;
+		if (buf[0] == '\n')
+			break;
+	}
+
+	/* clean it up */
+
+	/* strip off EOLN */
+	state->pline--;
+	*state->pline = '\0';
+	state->pline--;
+	if (*state->pline == '\r')
+		*state->pline = '\0';
+
+	/* Make pline point to command parameters (after null terminating the command itself) */
+	p = state->line;
+	while (isalpha(*p)) {
+		*p = toupper(*p);
+		p++;
+	}
+	if (isspace(*p)) {
+		*p++ = 0;
+		while (isspace(*p)) p++;
+	}
+	state->parms = p;
+
+#ifdef FTP_VERBOSE
+	printf("FTP: Line read-> %s %s\n",state->line,state->parms);
+#endif
+	state->readln_ready = 1;
+}
+
+
+/*** BeginHeader ftp_readln */
+char *ftp_readln(FTPState *state);
+/*** EndHeader */
+
+_ftp_nodebug char *ftp_readln(FTPState *state)
+{
+	ftp_readln_init(state);	/* reset readln */
+
+	return state->line;
+}
+
+/* End of readln interface */
+/******************************************************/
+
+/*** BeginHeader ftp_init, ftp_tick */
+void ftp_init(FTPhandlers *handlers);
+void ftp_tick(void);
+/*** EndHeader */
+
+/*
+ * NOOP ftp command: does nothing, and sends success
+ */
+_ftp_nodebug void ftp_cmd_noop(FTPState *state)
+{
+	ftp_msg(state, "200 OK\r\n", FTPSTATE_STEADY);
+}
+
+/*
+ * QUIT ftp connand: kills all connections and resets
+ */
+_ftp_nodebug void ftp_cmd_quit(FTPState *state)
+{
+	ftp_msg(state, "221 Service closing connection.\r\n", FTPSTATE_BAIL);
+}
+
+/*
+ * TYPE ftp command: Sets the transfer type.
+ * We only support binary(IMAGE) type, really, so this only
+ * gives the correct responses to the client
+ */
+_ftp_nodebug void ftp_cmd_type(FTPState *state)
+{
+	auto char *str;
+
+	switch (toupper(state->parms[0])) {
+		case 'I':
+			str = "200 IMAGE mode set\r\n";
+			break;
+		case 'A':
+			str = "200 ASCII mode set\r\n";
+			break;
+		case 'L':
+			if(state->parms[2] == '8') {
+				str = "200 Local-8 mode set\r\n";
+				break;
+			}
+			// fall thru;
+		case 'E':
+		default:
+			str = "504 Don't understand that TYPE\r\n";
+			break;
+	}
+
+	ftp_msg(state, str, FTPSTATE_STEADY);
+}
+
+/*
+ * MODE ftp command: sets the transfer mode.
+ * we only support STREAM mode (most clients only support it as well...),
+ * so again it mostly gives the correct responses
+ */
+_ftp_nodebug void ftp_cmd_mode(FTPState *state)
+{
+	auto char *str;
+
+	if(state->parms[0] == 'S')
+		str = "200 Mode set to STREAM\r\n";
+	else
+		str = "504 Only STREAM mode supported\r\n";
+
+	ftp_msg(state, str, FTPSTATE_STEADY);
+}
+
+/*
+ * STRU ftp command: Sets the transfer structure.
+ * We only support a FILE mode, so again it only gives
+ * proper responses
+ */
+_ftp_nodebug void ftp_cmd_stru(FTPState *state)
+{
+	auto char *str;
+
+	if(state->parms[0] == 'F')
+		str = "200 Structure set to FILE\r\n";
+	else
+		str = "504 Only FILE structure supported\r\n";
+
+	ftp_msg(state, str, FTPSTATE_STEADY);
+}
+
+/*
+ * PORT ftp command: sets the DTP port
+ */
+_ftp_nodebug void ftp_cmd_port(FTPState *state)
+{
+	static int i;
+	static char *p;
+
+	/* parse the PORT command for the remote IP/port */
+
+	/* set all ',' to '\0' */
+	for(p = state->parms; *p; p++)
+		if(*p == ',')
+			*p = '\0';
+
+	p = state->parms;
+
+	state->addy = 0;
+	for(i = 0; i < 4; i++) {
+		state->addy <<= 8;
+		state->addy += atoi(p);
+		p += strlen(p) + 1;
+	}
+
+	state->port = 0;
+	for(i = 0; i < 2; i++) {
+		state->port <<= 8;
+		state->port += atoi(p);
+		p += strlen(p) + 1;
+	}
+
+#ifdef FTP_VERBOSE
+	printf("FTP: PORT [0x%lx]:%d\n", state->addy, state->port);
+#endif
+	state->passive = 0;
+	ftp_msg(state, "200 PORT command successful\r\n", FTPSTATE_STEADY);
+}
+
+/*
+ * PASV ftp command: sets the DTP port in listen mode
+ */
+_ftp_nodebug void ftp_cmd_pasv(FTPState *state)
+{
+	auto byte iface;
+	auto longword ipaddr;
+
+	state->passive = 1;
+	state->lport = findfreeport(0, 1);
+	iface = sock_iface(state->s);
+	ipaddr = _if_tab[iface].ipaddr;
+#ifdef FTP_VERBOSE
+	printf("FTP: PASV i/f %d [0x%lx]:%d\n", (int)iface, ipaddr, state->lport);
+#endif
+   if (!tcp_extlisten(&state->dtpsock, iface, state->lport, 0L, 0, NULL, 0, 0, 0))
+   	strcpy(state->line, "452 Requested action not taken.");
+	else {
+		sprintf(state->line, "227 Entering Passive Mode (%u,%u,%u,%u,%u,%u).\r\n",
+			(unsigned)(ipaddr >> 24),
+			(unsigned)(ipaddr >> 16) & 0xFF,
+			(unsigned)(ipaddr >> 8) & 0xFF,
+			(unsigned)ipaddr & 0xFF,
+			state->lport >> 8,
+			state->lport & 0xFF
+			);
+		sock_set_tos(&state->dtpsock, IPTOS_CAPACIOUS);
+	}
+	ftp_msg(state, state->line, FTPSTATE_STEADY);
+}
+
+_ftp_nodebug void ftp_open_error(FTPState *state, int rc)
+{
+	switch (rc) {
+		case 0:
+			// Actually, no error.  Give default OK message.
+			ftp_msg(state, "250 OK\r\n", FTPSTATE_STEADY); break;
+		default:
+			ftp_msg(state, "550 File not found\r\n", FTPSTATE_STEADY); break;
+		case -EACCES:
+			ftp_msg(state, "550 Not authorized\r\n", FTPSTATE_STEADY); break;
+		case -EINVAL:
+      	// This error comes up when trying to upload a non-8.3 filename on
+         // a fat partition.  It would be better to have a separate error code
+         // message for that case, but we don't so it shares the BADMODE
+         // case.
+			ftp_msg(state, "550 Invalid file name or file not accessible\r\n", FTPSTATE_STEADY); break;
+		case -EAGAIN:
+			ftp_msg(state, "450 File in use\r\n", FTPSTATE_STEADY); break;
+		case -ENOSPC:
+		case -EFBIG:
+			ftp_msg(state, "452 Insufficient storage space in system.\r\n", FTPSTATE_STEADY); break;
+		case -ENOTDIR:
+			ftp_msg(state, "550 Not a directory\r\n", FTPSTATE_STEADY); break;
+		case -EISDIR:
+			ftp_msg(state, "550 Is a directory\r\n", FTPSTATE_STEADY); break;
+		case -ENOTEMPTY:
+			ftp_msg(state, "550 Directory not empty\r\n", FTPSTATE_STEADY); break;
+	}
+}
+/*
+ * RETR ftp command: sends a file over the DTP port
+ */
+_ftp_nodebug void ftp_cmd_retr(FTPState *state)
+{
+	static int fd;
+	static long len;
+	static int which;
+	static char *n;
+	static char *fname;
+
+	fname = state->parms;
+
+	/* find the file */
+	fd = _ftp_handlers.open(fname, (int)O_RDONLY, state->context.userid, state->cwd, state);
+	if(fd < 0) {
+		/* file was not found; error out */
+		ftp_open_error(state, fd);
+		return;
+	}
+	state->fd.spec = fd;
+	state->is_open = 1;
+	/* get the file size */
+	len = _ftp_handlers.getfilesize(state->fd.spec, state);
+	state->fd.length = len;
+	state->fd.offset = 0;
+
+	/* open the DTP connection */
+	if(ftp_dtp_open(state))
+		return;
+
+	state->timeout = _SET_TIMEOUT(FTP_DTPTIMEOUT*1000L);
+
+	state->state = FTPSTATE_RETR1B;
+}
+
+_ftp_nodebug void ftp_hnd_close(FTPState *state)
+{
+	if (state->is_open) {
+		_ftp_handlers.close(state->fd.spec, state);
+		state->is_open = 0;
+	}
+}
+
+_ftp_nodebug void ftp_cmd_retr1b(FTPState *state)
+{
+	tcp_tick(state->dtp_s);
+
+	if(chk_timeout(state->timeout)) {
+		ftp_hnd_close(state);
+		ftp_msg(state, "425 Can't open data connection.\r\n", FTPSTATE_DTPCLOSE);
+		return;
+	}
+
+	if(sock_established(state->dtp_s)) {
+		sprintf(state->line, "150 Opening BINARY mode data connection (%ld bytes)\r\n",
+				state->fd.length);
+		ftp_msg(state, state->line, FTPSTATE_RETR2);
+	}
+}
+
+_ftp_nodebug void ftp_cmd_retr2(FTPState *state)
+{
+	static int i, len;
+
+	if (!tcp_tick(state->dtp_s)) {
+		state->state = FTPSTATE_BAIL;
+		return;
+	}
+	// Remaining length.  May be -ve if "indefinite" size, in which case we wait for the
+	// read handler to return a zero (EOF) indication.
+	if (state->fd.length) {
+		len = sock_tbleft(state->dtp_s);
+		if (!len) {
+			if (sock_established(state->dtp_s))
+				return;
+			state->state = FTPSTATE_BAIL;
+			return;
+		}
+		if (len > FTP_MAXLINE)
+			len = FTP_MAXLINE;
+		if (state->fd.length > 0 && state->fd.length < len)
+			len = (int)state->fd.length;
+
+		i = _ftp_handlers.read(state->fd.spec, state->line, state->fd.offset, len, state);
+		if (i > len) {
+			// Handler is waiting for bigger buffer
+			if ((state->fd.length >= 0) && (i > state->fd.length)) {
+				// Don't get hung up because of file size conflict, but only if the
+				// file size is not indeterminate (fd.length >= 0)
+				state->fd.length = i;
+			}
+			//if (i <= FTP_MAXLINE && i <= state->dtp_s->wr.maxlen)
+			//This change for RabbitSys is equivalent to the original, but slower.
+			if (i <= FTP_MAXLINE && i <= sock_tbsize(state->dtp_s) )
+				return;	// Wait for more buffer to become available
+			else
+				i = -1;	// Bad: we can never give that much buffer
+		}
+		if (i < 0) {
+			// Handler wants out
+			state->state = FTPSTATE_BAIL;
+			return;
+		}
+		if (!i)
+			// EOF reached.
+			goto _ftp_srv_finished;
+
+		// Following guaranteed to succeed fully, or not at all.
+		state->retval = sock_fastwrite(state->dtp_s, state->line, i);
+		if(state->retval < 0)
+			state->state = FTPSTATE_BAIL;
+		state->fd.length -= i;
+		state->fd.offset += i;
+		return;
+	}
+
+
+_ftp_srv_finished:
+	/* dtp connection is finished - send complete msg */
+	ftp_hnd_close(state);
+	ftp_msg(state, "226 Transfer complete.\r\n", FTPSTATE_DTPCLOSE);
+}
+
+
+_ftp_nodebug void ftp_cmd_mkd(FTPState *state)
+{
+   static int retval;
+	static char *fname;
+
+   fname = state->parms;
+	if('/' == fname[0])
+		fname++;
+
+   retval = _ftp_handlers.mkdir(fname, (int)O_WRONLY, state->context.userid,
+   										state->cwd, state);
+   ftp_open_error(state, retval);
+}
+
+_ftp_nodebug void ftp_cmd_rmd(FTPState *state)
+{
+   static int retval;
+	static char *fname;
+
+   fname = state->parms;
+	if('/' == fname[0])
+		fname++;
+
+   retval = _ftp_handlers.rmdir(fname, (int)O_WRONLY, state->context.userid,
+   										state->cwd, state);
+   ftp_open_error(state, retval);
+}
+
+/*
+ * STOR ftp command: gets a file from the DTP port
+ */
+_ftp_nodebug void ftp_cmd_stor(FTPState *state)
+{
+	static int retval;
+	static char *fname;
+
+	fname = state->parms;
+	if('/' == fname[0])
+		fname++;
+
+	/* determine if it can be stored */
+	retval = _ftp_handlers.open(fname, (int)O_WRONLY, state->context.userid, state->cwd, state);
+	if (retval < 0) {
+		ftp_open_error(state, retval);
+		return;
+	}
+	state->is_open = 1;
+	state->fd.spec = retval;
+	state->recvsize = 0;
+	/* open the DTP connection */
+	if(ftp_dtp_open(state))
+		return;
+
+	state->timeout = _SET_TIMEOUT(FTP_DTPTIMEOUT*1000L);
+
+	state->state = FTPSTATE_STOR1B;
+}
+
+_ftp_nodebug void ftp_cmd_stor1b(FTPState *state)
+{
+	tcp_tick(state->dtp_s);
+
+	if(chk_timeout(state->timeout)) {
+		ftp_hnd_close(state);
+		ftp_msg(state, "425 Can't open data connection.\r\n", FTPSTATE_DTPCLOSE);
+		return;
+	}
+
+	if(sock_established(state->dtp_s))
+		ftp_msg(state, "150 Opening BINARY mode data connection.\r\n", FTPSTATE_STOR2);
+}
+
+_ftp_nodebug void ftp_cmd_stor2(FTPState *state)
+{
+	auto int rc;
+
+	tcp_tick(state->dtp_s);
+
+	if(sock_bytesready(state->dtp_s) != -1) {
+
+		state->retval = sock_fastread(state->dtp_s, state->line, FTP_MAXLINE);
+		if(state->retval == 0) {
+			/* done; fall through */
+		} else {
+			/* deal with the received buffer */
+			rc = _ftp_handlers.write(state->fd.spec, state->line, state->recvsize, state->retval, state);
+			if (rc < state->retval)
+				goto _ftp_srv_bad_write;
+			state->recvsize += state->retval;
+			return;
+		}
+	} else {
+		if (sock_established(state->dtp_s))
+			return;	// More data coming
+		/* socket has closed with no more data; fall through.. */
+	}
+
+	/* have the file */
+#ifdef FTP_VERBOSE
+	printf("FTP: Received %lu byte file.\n", state->recvsize);
+#endif
+
+	ftp_hnd_close(state);
+	sprintf(state->line, "226 Transfer OK.  Got %lu bytes\r\n", state->recvsize);
+	ftp_msg(state, state->line, FTPSTATE_DTPCLOSE);
+	return;
+
+	/*  Sorry, capt'n but she canna write no more!  Abort socket, "incomplete" to client. */
+_ftp_srv_bad_write:
+	sock_abort(state->dtp_s);
+	ftp_hnd_close(state);
+	sprintf(state->line, "452 Transfer incomplete.  Got %lu bytes\r\n", state->recvsize);
+	ftp_msg(state, state->line, FTPSTATE_DTPCLOSE);
+}
+
+_ftp_nodebug void ftp_startdirlist(FTPState *state)
+{
+	if (state->parms[0]) {
+   	// Note: we do not support "ls <directory>" commands.  The user has to CD to the
+      // required directory first.  This restriction is so that we can avoid temporarily
+      // storing the current directory name (which would otherwise require 256 bytes for each server).
+   	ftp_msg(state, "504 Command not implemented for that parameter.\r\n", FTPSTATE_STEADY);
+      return;
+   }
+
+	state->listitem = 0;
+
+	if(ftp_dtp_open(state))
+		return;
+
+	state->timeout = _SET_TIMEOUT(FTP_DTPTIMEOUT*1000L);
+
+	/* jump back to normal LIST handler */
+	state->state = FTPSTATE_LIST1B;
+
+   if (!state->nlst)
+   	// Make look more like Unix.  This is guaranteed to work, since socket
+      // just opened.
+   	sock_fastwrite(state->dtp_s, "total 1\r\n", 9);
+}
+
+/*
+ * NLST command: same as list, but without the extended information.
+ */
+_ftp_nodebug void ftp_cmd_nlst(FTPState *state)
+{
+	state->nlst = 1; /* set to basic list */
+	ftp_startdirlist(state);
+}
+
+_ftp_nodebug void ftp_cmd_list(FTPState *state)
+{
+	state->nlst = 0;	/* set to full ls -l */
+	ftp_startdirlist(state);
+}
+
+_ftp_nodebug void ftp_cmd_list1b(FTPState *state)
+{
+	tcp_tick(NULL);
+   if (!sock_waiting(state->dtp_s)) {
+   	// Something happened...
+		if (sock_established(state->dtp_s))
+			ftp_msg(state, "150 Opening ASCII mode data connection for /bin/ls\r\n", FTPSTATE_LIST2);
+      else
+			ftp_msg(state, "426 Transfer aborted.\r\n", FTPSTATE_DTPCLOSE);
+   }
+	else if (chk_timeout(state->timeout))
+      ftp_msg(state, "425 Can't open data connection.\r\n", FTPSTATE_DTPCLOSE);
+}
+
+_ftp_nodebug void ftp_cmd_list2(FTPState *state)
+{
+	// Because of the way the zserver sspec_dirlist function works, we are compelled to complete a
+   // listing even if the socket is lost.  This is because no "abort" flag is specified for the
+   // handler API, so the handler does not know about early listing termination and cannot set
+   // the early termination flag for sspec_dirlist.  Thus, if LIST3 detects an error, it just sets
+   // a flag to bypass any future sock_fastwrite's.
+	auto int i;
+_ftp_srv_listtop:
+	i = _ftp_handlers.dirlist(state->listitem, state->line, state->nlst, state->context.userid, state->cwd, state);
+	state->listitem = i;
+	if(state->listitem >= 0) {
+		state->linelen = strlen(state->line);
+      if (state->nlst >= 0) {
+			state->retval = sock_fastwrite(state->dtp_s, state->line, state->linelen);
+         if (state->retval < 0) {
+         	state->retval = state->linelen;
+            state->nlst = -1;	// Continue to go through the motions
+         }
+      }
+      else
+      	state->retval = state->linelen;
+
+		if(state->retval == state->linelen) {
+			state->listitem++;		/* increment to next line */
+			goto _ftp_srv_listtop;	/* procede immediatly; don't wait for next tick */
+		} else {
+			/*  Socket buffer is full.  Won't send for now; let "list3" try to xmit. */
+			state->state = FTPSTATE_LIST3;
+			return;
+		}
+	}
+	ftp_msg(state,
+   	state->nlst >= 0 ? "226 Transfer complete.\r\n" : "426 Transfer aborted.\r\n",
+      FTPSTATE_DTPCLOSE);
+}
+
+_ftp_nodebug void ftp_cmd_list3(FTPState *state)
+{
+	if (!tcp_tick(state->dtp_s)) {
+   	// Data transfer socket aborted,
+		state->nlst = -1;
+      return;
+   }
+	state->retval += sock_fastwrite(state->dtp_s, state->line + state->retval, state->linelen - state->retval);
+	if(state->retval == state->linelen) {
+		state->listitem++;
+		state->state = FTPSTATE_LIST2;
+	}
+}
+
+_ftp_nodebug void ftp_cmd_pwd(FTPState *state)
+{
+	strcpy(state->line, "257 \"");
+	_ftp_handlers.pwd(state->cwd, state->line + 5, state);
+	strcat(state->line, "\"\r\n");
+	ftp_msg(state, state->line, FTPSTATE_STEADY);
+}
+
+_ftp_nodebug void ftp_cmd_cwd(FTPState *state)
+{
+	auto int rc;
+
+	// Remove trailing slash, if any, unless only slash.
+	rc = strlen(state->parms);
+	if (rc > 1 && state->parms[rc-1] == '/')
+		state->parms[rc-1] = 0;
+	rc = _ftp_handlers.cd(state->cwd, state->parms, state->context.userid, state);
+	if (rc >= 0) {
+		ftp_msg(state, "250 OK\r\n", FTPSTATE_STEADY);
+		state->cwd = rc;
+	}
+	else
+		ftp_msg(state, "431 No such directory\r\n", FTPSTATE_STEADY);
+}
+
+_ftp_nodebug void ftp_cmd_cdup(FTPState *state)
+{
+	state->parms = "..";
+	ftp_cmd_cwd(state);
+}
+
+_ftp_nodebug void ftp_cmd_syst(FTPState *state)
+{
+	ftp_msg(state, "215 UNIX\r\n", FTPSTATE_STEADY);
+}
+
+_ftp_nodebug void ftp_cmd_acct(FTPState *state)
+{
+	ftp_msg(state, "202 Superfluous\r\n", FTPSTATE_STEADY);
+}
+
+_ftp_nodebug void ftp_cmd_help(FTPState *state)
+{
+	// Not a complete list...
+	ftp_msg(state,
+		"214 Commands: PORT,PASV,RETR,STOR,LIST,NLST,QUIT,SYST,STAT,ABOR," \
+		"MKD,RMD,PWD,CWD,CDUP,SIZE,MDTM,DELE\r\n", FTPSTATE_STEADY);
+}
+
+_ftp_nodebug void ftp_cmd_stat(FTPState *state)
+{
+	ftp_msg(state, "211 OK\r\n", FTPSTATE_STEADY);
+}
+
+_ftp_nodebug void ftp_cmd_size(FTPState *state)
+{
+	// Return file size
+	auto int fd;
+
+	fd = _ftp_handlers.open(state->parms, O_RDONLY, state->context.userid, state->cwd, state);
+	if (fd < 0)
+		ftp_open_error(state, fd);
+	else {
+		sprintf(state->line, "213 %lu\r\n", _ftp_handlers.getfilesize(fd, state));
+		_ftp_handlers.close(fd, state);
+		ftp_msg(state, state->line, FTPSTATE_STEADY);
+	}
+}
+
+_ftp_nodebug void ftp_cmd_mdtm(FTPState *state)
+{
+	// Return modification date/time, as yyyymmddhhmmss (UTC).  Default handler
+	// returns 19800101000000.  We assume that SEC_TIMER is set to UTC, not local
+	// time.
+	auto int fd;
+	auto struct tm y;
+
+	fd = _ftp_handlers.open(state->parms, O_RDONLY, state->context.userid, state->cwd, state);
+	if (fd < 0)
+		ftp_open_error(state, fd);
+	else {
+		mktm(&y, _ftp_handlers.mdtm(fd, state));
+		strftime( state->line, 80, "213 %Y%m%d%H%M%S\r\n", &y);
+		_ftp_handlers.close(fd, state);
+		ftp_msg(state, state->line, FTPSTATE_STEADY);
+	}
+}
+
+_ftp_nodebug void ftp_cmd_dele(FTPState *state)
+{
+	// Delete specified file.
+	auto int fd;
+
+	fd = _ftp_handlers.delete(state->parms, state->context.userid, state->cwd, state);
+	ftp_open_error(state, fd);
+}
+
+
+_ftp_nodebug void ftp_cmd_abor(FTPState *state)
+{
+	// We don't really handle abort, since we can't read this command until the
+	// current data transfer has completed.  Pretend to work.
+	ftp_msg(state, "226 Abort successful\r\n", FTPSTATE_STEADY);
+}
+
+/*
+ * FTP commands are listed here, with their name and a
+ * function pointer to their handler.
+ */
+typedef struct {
+	char *string;
+	void (*func)();
+} FtpCommand;
+
+const FtpCommand Commands[] = {
+	"NOOP",	ftp_cmd_noop,
+	"QUIT",	ftp_cmd_quit,
+	"TYPE",	ftp_cmd_type,
+	"MODE",	ftp_cmd_mode,
+	"STRU",	ftp_cmd_stru,
+	"RETR",	ftp_cmd_retr,
+	"STOR",	ftp_cmd_stor,
+   "MKD",	ftp_cmd_mkd,
+   "XMKD",	ftp_cmd_mkd,
+   "RMD",	ftp_cmd_rmd,
+   "XRMD",	ftp_cmd_rmd,
+	"PORT",	ftp_cmd_port,
+	"LIST",	ftp_cmd_list,
+	"NLST", ftp_cmd_nlst,
+	"PWD", ftp_cmd_pwd,
+	"CWD", ftp_cmd_cwd,
+	"CDUP", ftp_cmd_cdup,
+	"PASV", ftp_cmd_pasv,
+	"SYST", ftp_cmd_syst,
+	"ACCT", ftp_cmd_acct,
+	"STAT", ftp_cmd_stat,
+	"HELP", ftp_cmd_help,
+	"SIZE", ftp_cmd_size,
+	"MDTM", ftp_cmd_mdtm,
+	"DELE", ftp_cmd_dele,
+	"ABOR", ftp_cmd_abor
+};
+
+/*
+ * loops through the above list, and calls the appropriate handler.
+ */
+_ftp_nodebug void parsecommand(FTPState *state)
+{
+	static int x;
+
+	for(x=0; x < sizeof(Commands)/sizeof(FtpCommand); x++) {
+		if (!strcmp(state->line, Commands[x].string)) {
+			Commands[x].func(state);
+			return;
+	   }
+	}
+
+	ftp_msg(state, "502 Command not implemented\r\n", FTPSTATE_STEADY);
+}
+
+_ftp_nodebug void ftp_reset(FTPState *state)
+{
+	state->state = FTPSTATE_START;
+	state->cwd = 0;
+   strcpy(state->context.cwd, state->context.rootdir);
+	/* listen to the main socket */
+	tcp_extlisten(state->s,FTP_INTERFACE,FTP_CMDPORT,0,0,NULL,0,0,0);
+   sock_set_tos(state->s, IPTOS_FAST);
+
+	ftp_readln_init(state);
+}
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+ftp_init                   		<FTP_SERVER.LIB>
+
+SYNTAX: void ftp_init(FTPhandlers *handlers);
+
+KEYWORDS:		tcpip, ftp
+
+DESCRIPTION: 	Initilize the ftp server.  You can optionally specify
+               a set of handlers for controlling what the server presents
+               to the client.  All FTP server instances share the same
+               list of handlers.
+
+               The FTPhandlers structure is defined as:
+                 typedef struct {
+                 	int   (*open)(char *name, int options,
+                 	                 int uid, int cwd);
+                 	int   (*read)(int fd, char *buf, long offset, int len);
+                 	int   (*write)(int fd, char *buf, long offset, int len);
+                 	int   (*close)(int fd);
+                 	long  (*getfilesize)(int fd);
+                 	int   (*dirlist)(int item, char *line,
+                 	                 int listing, int uid, int cwd);
+                 	int   (*cd)(int cwd, char * dir, int uid);
+                 	int   (*pwd)(int cwd, char * buf);
+                 	[long (*mdtm)(int fd);]
+                 	[int  (*delete)(char * name, int uid, int cwd);]
+                 } FTPhandlers;
+               If you pass a NULL handlers pointer, then the all default
+               handlers will be used.  The defaults access the server spec
+               list which is set up using sspec_addxmemfile(),
+               sauth_adduser() etc.
+               If you always provide all your own handlers, then you can
+               define FTP_NODEFAULTHANDLER to eliminate the code for the
+               default handlers.  The handlers must be written to the
+               following specification.  To use a default handler,
+               leave the field NULL.
+
+                 NOTE: all of the following handlers are also passed the
+                 current FTP state information as an additional parameter
+                 of type FTPState*.  This parameter is not documented
+                 below; it is mainly for use by the default function
+                 implementations.
+
+               int   (*open)(char *name, int options, int uid, int cwd)
+                 Open a file with the given name.  options is one of
+                 the following values:
+                   O_RDONLY - read-only access
+                   O_WRONLY - read + write access (misnomer for historical
+                              reasons).
+                   O_RDWR   - alias for O_WRONLY
+                 uid is the userid of the logged-in user.
+                 The return value should be one of
+                   -ENOENT - file or resource not found
+                   -EACCES  - user denied access
+                   -EINVAL  - specified access mode not supported
+                   -EAGAIN  - resource temporarily unavailable
+                   a non-negative integer - success.
+                 In the last case, the returned value is passed to
+                 subsequent handler routines to identify the particular
+                 file or resource, as the 'fd' parameter.  If necessary,
+                 you can use this number to index an array of any other
+                 state information needed to communicate with the other
+                 handlers.  The number returned should be unique with
+                 respect to all other open resource instances, so that
+                 your handler does not get confused if multiple FTP
+                 data transfers are active simultaneously.
+                 Note that the given file name may be an absolute or
+                 relative path: if the handler supports the concept of
+                 directories, then it should handle the path name as
+                 appropriate and not just assume that the file is in
+                 the current directory.  If the filename is "relative",
+                 then the cwd parameter indicates the current dir.
+
+               int   (*read)(int fd, char *buf, long offset, int len)
+                 Read file identified by fd.  The file contents at the
+                 specified offset should be stored into buf, up to
+                 a maximum length of len.  The return value should be
+                 the actual number of bytes transferred, which may be
+                 less than "len".  If the return value is zero, this
+                 indicates normal end-of-file.  If the return value is
+                 negative, then the transfer is aborted.  Each successive
+                 call to this handler will have an increasing offset.
+                 If the getfilesize() handler returns a non-negative
+                 length, then the read handler will only be called for
+                 data up to that length -- there is no need for such
+                 read handlers to check for EOF since the server will
+                 assume that only the specified amount of data is
+                 available.
+                 The return value can also be greater than len.  This
+                 is interpreted as "I have not put anything in buf.
+                 Call me back when you (the server) can accept at
+                 least len bytes of data".  This is useful for read
+                 handlers which find it inconvenient to retrieve data
+                 from arbitrary offsets, for example a log reader which
+                 can only access whole log records.  If the returned
+                 value is greater than the server can ever offer, then
+                 the server aborts the data transfer.  The handler
+                 should never ask for more than FTP_MAXLINE bytes.
+
+               int   (*write)(int fd, char *buf, long offset, int len)
+                 Write file identified by fd.  buf contains data of length
+                 len, which is to be written to the file at the given
+                 offset.  The return value must be equal to len, or a
+                 negative number if an error occurs (such as out of
+                 space).  The FTP server does not handle partial writes:
+                 the given data must be completely written or not at
+                 all.  If the return code is less than len, an error
+                 is assumed to have occurred.   Note that it is up to
+                 the handler to ensure that another FTP server is not
+                 accessing a file which is opened for write.  The open
+                 call for the other server should return -EAGAIN
+                 if the current server is writing to a file.
+
+               int   (*close)(int fd)
+                 Close the specified file.  This allows the handler to
+                 free up any temporary resources associated with the
+                 transfer.
+
+               long  (*getfilesize)(int fd)
+                 Return the length of the given file.  This is called
+                 immediately after open for a read file.  If the file
+                 is of a known constant length, the correct length
+                 should be returned.  If the resource length is not
+                 known (perhaps it is generated on-the-fly) then
+                 return -1.  For write operations, the maximum
+                 permissible length should be returned, or -1 if not
+                 known.
+
+               int   (*dirlist)(int item, char *line,
+                 	                 int listing, int uid, int cwd)
+                 Return a line of a "directory listing".  item is the
+                 current item number (assumed to be in the current
+                 dir "cwd").  This starts at zero.  line points to
+                 a buffer which may be assumed to be of a length of
+                 at least (FTP_MAXLINE-6).  This buffer is filled with
+                 the directory entry information for the given item.
+                 This is either in unix "ls -l" format or just the
+                 file name, depending on whether the listing parameter
+                 is 0 or 1 respectively.  uid is the logged in user.
+                 If an item is listed successfully, return "item".
+                 If there are no more items to list, return -1.  You
+                 can also change the order of listing: the FTP server
+                 repeatedly calls this handler with the pervious return
+                 value plus 1.  Thus it is possible to change the
+                 listing order (or even duplicate entries) by creative
+                 use of the return value.
+
+   				int	(*mkdir)(char *name, int options, int uid,
+   									int cwd, FTPState * state);
+   				int	(*rmdir)(char *name, int options, int uid,
+   									int cwd, FTPState * state);
+   				  Respectively create and remove a directory called 'name'.
+  					  options is one of the following values:
+                   O_RDONLY - read-only access
+                   O_WRONLY - read + write access (misnomer for historical
+                              reasons).
+                   O_RDWR   - alias for O_WRONLY
+                 uid is the userid of the logged-in user, and cwd
+                 indicates the current working directory (identifier).
+
+               int   (*cd)(int cwd, char * dir, int uid)
+                 Change to new "directory".  This is called when the
+                 client issues a CWD command.  The "current directory"
+                 is stored as an integer, which is passed as the first
+                 parameter (cwd - current working dir).  dir is a
+                 string indicating the new directory, whose interpre-
+                 tation is entirely up to the handler.  The return
+                 value should be -1 if no such directory exists, 0
+                 for the "root" directory, or any other positive
+                 number which is meaningful to the handler.  Note that
+                 for a cwd "up one level", the dir string will be passed
+                 as "..".  The FTP server itself has no concept of
+                 what a directory is - this is meaningful only to the
+                 handler.
+
+               int   (*pwd)(int cwd, char * buf)
+                 Print the current directory, passed as cwd, as a
+                 string.  The result is placed in buf, whose length
+                 may be assumed to be at least (FTP_MAXLINE-6).  The
+                 return value is ignored.
+
+               long  (*mdtm)(int fd)
+                 This should return the modification date and time of the
+                 specified open file, as a SEC_TIMER value.  The FTP
+                 server assumes that this value is in UTC.  If SEC_TIMER
+                 is running in local time, the handler should make the
+                 necessary timezone adjustment so that the return value
+                 is expressed in UTC.
+
+               int  (*delete)(char * name, int uid, int cwd)
+                 This is called when the DELE command is issued by the client.
+                 The given file name (possibly relative to cwd) is to be
+                 deleted.  uid is the logged-in user.  This is expected
+                 to return 0 if OK, or one of the error codes documented
+                 above under "open".
+
+PARAMETER1:	   NULL == use default internal file handlers
+               Otherwise, you must supply a struct of pointers
+               to the various file handlers (open, read, write,
+               close, getfilesize, list).  To not override a particular
+               handler, leave it NULL in the structure.
+
+RETURN VALUE: 	none
+
+SEE ALSO: 	ftp_tick
+
+END DESCRIPTION **********************************************************/
+
+_ftp_nodebug void ftp_init(FTPhandlers *handlers)
+{
+	auto FTPState *state;
+	auto int i;
+
+	#GLOBAL_INIT { _ftp_uid_anon = -1; }
+
+	memset( & _ftp_handlers, 0, sizeof(_ftp_handlers) );
+	if (handlers)
+			// user supplied handlers
+			memcpy(&_ftp_handlers, handlers, sizeof(_ftp_handlers));
+
+#ifndef FTP_NODEFAULTHANDLER
+	/* For each handler, if user didn't override, then supply default. */
+	if( !_ftp_handlers.open ) _ftp_handlers.open = ftp_dflt_open;
+	if( !_ftp_handlers.read ) _ftp_handlers.read = ftp_dflt_read;
+	if( !_ftp_handlers.write )_ftp_handlers.write = ftp_dflt_write;
+	if( !_ftp_handlers.close ) _ftp_handlers.close = ftp_dflt_close;
+	if( !_ftp_handlers.getfilesize ) _ftp_handlers.getfilesize = ftp_dflt_getfilesize;
+	if( !_ftp_handlers.dirlist ) _ftp_handlers.dirlist = ftp_dflt_list;
+   if( !_ftp_handlers.mkdir ) _ftp_handlers.mkdir = ftp_dflt_mkdir;
+   if( !_ftp_handlers.rmdir ) _ftp_handlers.rmdir = ftp_dflt_rmdir;
+	if( !_ftp_handlers.cd ) _ftp_handlers.cd = ftp_dflt_cd;
+	if( !_ftp_handlers.pwd ) _ftp_handlers.pwd = ftp_dflt_pwd;
+	if( !_ftp_handlers.mdtm ) _ftp_handlers.mdtm = ftp_dflt_mdtm;
+	if( !_ftp_handlers.delete ) _ftp_handlers.delete = ftp_dflt_delete;
+#endif   /* ifndef FTP_NODEFAULTHANDLER */
+
+	for(i=0; i<FTP_MAXSERVERS; i++) {
+		state = &ftp_servers[i];
+		state->is_open = 0;
+		state->s = &state->ftpsock;
+		state->dtp_s = &state->dtpsock;
+      state->context.userid = -1;
+      state->context.server = SERVER_FTP;
+      state->context.rootdir = "/";
+      state->context.dfltname = NULL;
+		ftp_reset(state);
+	}
+}
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+ftp_tick                   		<FTP_SERVER.LIB>
+
+SYNTAX: void ftp_tick(void);
+
+KEYWORDS:		tcpip, ftp
+
+DESCRIPTION: 	Tick function to run the daemon. Needs to be
+               called periodically.
+
+RETURN VALUE: 	none
+
+SEE ALSO: 	   ftp_init
+
+END DESCRIPTION **********************************************************/
+_ftp_nodebug void ftp_tick(void)
+{
+	static int status, x, i;
+	static char *l, *p;
+	static FTPState *state;
+
+	for(i=0; i<FTP_MAXSERVERS; i++) {
+		state = &ftp_servers[i];
+
+		switch(state->state) {
+		case FTPSTATE_START:
+			tcp_tick(state->s);
+
+			if(sock_established(state->s)) {
+#ifdef FTP_VERBOSE
+				printf("FTP: Receiving incoming connection\n");
+#endif
+				sock_mode(state->s,TCP_MODE_ASCII);
+
+				ftp_msg(state, "220 Hello! Welcome to Rabbit Semiconductor TinyFTP!\r\n", FTPSTATE_USERNAME);
+			}
+			break;
+
+		case FTPSTATE_MSGWAIT: {
+			ftp_finish_msg(state);
+			break;
+		}
+
+		case FTPSTATE_USERNAME:
+			ftp_readln_tick(state);
+			if(state->readln_ready) {
+				l = ftp_readln(state);
+
+				if (!strcmp("QUIT", l)) {
+					ftp_cmd_quit(state);
+					break;
+				}
+
+				if(strcmp("USER", l)) {
+	   			ftp_msg(state, "530 Not logged in\r\n", FTPSTATE_USERNAME);
+	   			break;
+		   	}
+
+				/* get the username */
+				strncpy(state->username, state->parms, SAUTH_MAXNAME-1);
+	   		state->username[SAUTH_MAXNAME-1] = '\0';
+
+				if(_ftp_uid_anon < 0 || strncmp(state->username, _ftp_user_anon, SAUTH_MAXNAME))
+					ftp_msg(state, "331 Password required\r\n", FTPSTATE_PASSWORD);
+				else
+					ftp_msg(state, "331 Anonymous login - send e-mail address as password.\r\n", FTPSTATE_PASSWORD);
+			}
+			break;
+
+		case FTPSTATE_PASSWORD:
+			ftp_readln_tick(state);
+			if(state->readln_ready) {
+				l = ftp_readln(state);
+
+				if (!strcmp("QUIT", l)) {
+					ftp_cmd_quit(state);
+					break;
+				}
+
+				if(strcmp("PASS", l))
+			   	ftp_msg(state, "530 Expecting password\r\n", FTPSTATE_PASSWORD);
+
+				/* get the password */
+				strncpy(state->password, state->parms, SAUTH_MAXNAME-1);
+				state->password[SAUTH_MAXNAME-1] = '\0';
+
+				/* authenticate the user; bail if necessary */
+			   if(0 == ftp_auth_user(state)) {
+			   		/*
+			   		 *  If username/password is bad, then allow client to try again.
+			   		 *  The connection will remain open.
+			   		 */
+		   			ftp_msg(state, "530 Bad Username/Password\r\n", FTPSTATE_USERNAME);
+			   		break;
+				}
+
+			   ftp_msg(state, "230 User logged in.\r\n", FTPSTATE_STEADY);
+			}
+			break;
+
+		case FTPSTATE_BAIL:
+			state->timeout = _SET_TIMEOUT(FTP_TIMEOUT*1000L);
+			if(sock_established(state->s)) {
+				tcp_close(state->s);
+				state->state = FTPSTATE_BAIL2;
+			} else {
+				ftp_reset(state);
+			}
+			break;
+
+		case FTPSTATE_BAIL2:
+			if(chk_timeout(state->timeout)) {
+				tcp_abort(state->s);
+				ftp_reset(state);
+				break;
+			}
+			if( !tcp_tick(state->s) ) {
+				ftp_reset(state);
+			}
+			break;
+
+		case FTPSTATE_STEADY:
+			/* at this point, the user is logged in; deal with it... */
+			if(!sock_established(state->s)) {
+			   	/* sock died */
+		   		state->state = FTPSTATE_BAIL;
+		   		break;
+			}
+			ftp_readln_tick(state);
+			if(state->readln_ready) {
+	   		l = ftp_readln(state);
+				parsecommand(state);
+			}
+		 	break;
+
+		case FTPSTATE_DTPCLOSE:
+			state->timeout = _SET_TIMEOUT(FTP_TIMEOUT*1000L);
+			tcp_close(&state->dtpsock);
+			state->state = FTPSTATE_DTP2CLOSE;
+			break;
+
+		case FTPSTATE_DTP2CLOSE:
+			if(chk_timeout(state->timeout)) {
+				tcp_abort(&state->dtpsock);
+				state->state = FTPSTATE_STEADY;
+				break;
+			}
+			if(!tcp_tick(state->dtp_s))
+				state->state = FTPSTATE_STEADY;
+			break;
+
+		case FTPSTATE_RETR1B:
+			ftp_cmd_retr1b(state);
+			break;
+
+		case FTPSTATE_RETR2:
+			ftp_cmd_retr2(state);
+			break;
+
+		case FTPSTATE_STOR1B:
+			ftp_cmd_stor1b(state);
+			break;
+
+		case FTPSTATE_STOR2:
+			ftp_cmd_stor2(state);
+			break;
+
+		case FTPSTATE_LIST1B:
+			ftp_cmd_list1b(state);
+			break;
+
+		case FTPSTATE_LIST2:
+			ftp_cmd_list2(state);
+			break;
+
+		case FTPSTATE_LIST3:
+			ftp_cmd_list3(state);
+			break;
+
+		default :
+			/* unknown state; error */
+			break;
+		}
+	}
+}
+
+/*** BeginHeader ftp_shutdown */
+void ftp_shutdown(int bGraceful);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+ftp_shutdown                   		<FTP_SERVER.LIB>
+
+SYNTAX: void ftp_shutdown(int bGraceful);
+
+KEYWORDS:		tcpip, ftp
+
+DESCRIPTION: 	Close and cancel all FTP connections.  If connected, forces
+               the QUIT state.  If application has done tcp_reserveport(port),
+               then it must call tcp_clearreserve(port).  For a graceful
+               shutdown, appl must call tcp_tick() a few more times.
+               After the FTP sockets close, application must call ftp_init()
+               to again start the server running.
+
+PARAMETER1:	   (boolean) zero to immediately abort all open connections, or
+					non-zero to simulate the QUIT command.
+
+RETURN VALUE: 	none
+
+SEE ALSO: 	   ftp_init, tcp_abort
+
+END DESCRIPTION **********************************************************/
+_ftp_nodebug void ftp_shutdown(int bGraceful)
+{
+	auto int i;
+	auto FTPState *state;
+
+	for(i=0; i<FTP_MAXSERVERS; i++) {
+		state = &ftp_servers[i];
+
+		if( bGraceful) {
+			/* If connected, perform QUIT processing. */
+			if( sock_established(state->s)) {
+				ftp_cmd_quit( state );
+			} else {
+				tcp_abort(state->s);
+			}
+		} else {
+			/*  Abort all connections immediately */
+			state->is_open = 0;
+			sock_flushnext( state->s );
+			if(sock_established(state->s)) {
+				tcp_close(state->s);
+			} else {
+				tcp_abort(state->s);
+			}
+		}
+
+		/* can't do ftp_reset() since that sets up another listen. */
+		/* Always abort any data transfer: */
+		tcp_abort(state->dtp_s);
+	}
+
+}   /* end ftp_shutdown() */
+
+
+
+/*** BeginHeader ftp_set_anonymous */
+int ftp_set_anonymous(int uid);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+ftp_set_anonymous                   		<FTP_SERVER.LIB>
+
+SYNTAX: int ftp_set_anonymous(int uid)
+
+KEYWORDS:		tcpip, ftp
+
+DESCRIPTION: 	Set the "anonymous" user ID.  Resources belonging to this
+               userID may be accessed by any user.  A typical use of this
+               function would be
+                 ftp_set_anonymous(
+                   sauth_adduser("anonymous", "", SERVER_FTP)
+                   );
+               which defines an "anonymous" login for the FTP server.
+               This only applies to the FTP server.  The username
+               "anonymous" is recommended, since most FTP clients use
+               this for hosts which have no account for the user.
+
+PARAMETER1:    The userID to use as the anonymous user.  This should have
+               been defined using sauth_adduser().  Pass -1 to set
+               no anonymous user.
+
+RETURN VALUE: 	Same as the uid parameter, except -1 if uid invalid.
+
+SEE ALSO: 	   sauth_adduser
+
+END DESCRIPTION **********************************************************/
+_ftp_nodebug int ftp_set_anonymous(int uid)
+{
+	_ftp_uid_anon = uid;
+	if (uid >= SAUTH_MAXUSERS)
+		uid = -1;
+	if (uid >= 0)
+		strncpy(_ftp_user_anon, server_auth[uid].username, SAUTH_MAXNAME);
+	return uid;
+}
+
+/*** BeginHeader ftp_set_rootdir */
+int ftp_set_rootdir(char * path);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+ftp_set_rootdir                   		<FTP_SERVER.LIB>
+
+SYNTAX: int ftp_set_rootdir(char * path)
+
+KEYWORDS:		tcpip, ftp
+
+DESCRIPTION: 	Set the root directory for the FTP server.  All server
+               instances get set to the same root directory path.
+               This should be called before calling ftp_tick() for
+               the first time, and after ftp_init().
+
+               Note that this does not check the validity of the given
+               directory path.
+
+PARAMETER1:    The path name of the root directory.  This should
+               start and end with a '/' character.  Default is just
+               "/" i.e. all of the resource hierarchy is visible to
+               the FTP server.  The path should be limited to
+               SSPEC_MAXNAME characters.
+
+               NOTE: this parameter must be in global memory or be
+               a constant string, since the pointer is stored.
+
+RETURN VALUE: 	0: OK.
+					<0: error (e.g. path too long)
+
+SEE ALSO: 	   sspec_cd
+
+END DESCRIPTION **********************************************************/
+_ftp_nodebug int ftp_set_rootdir(char * path)
+{
+	auto int i, rc;
+
+   for (i = 0; i < FTP_MAXSERVERS; i++) {
+   	ftp_servers[i].context.rootdir = path;
+      if ((rc = sspec_cd("/", &ftp_servers[i].context, 0)) < 0)
+      	return rc;
+   }
+   return 0;
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

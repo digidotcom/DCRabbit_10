@@ -1,0 +1,604 @@
+/*** BeginHeader */
+#ifndef __TC_SYSTEMAPP_LIB
+#define __TC_SYSTEMAPP_LIB
+/*** EndHeader */
+
+/*** BeginHeader dkcSystemWriteHeader, dkcWriteBufXPC, dkcWriteBufOFFSET */
+__root void dkcSystemWriteHeader(void);
+extern uint16 dkcWriteBufXPC;
+extern uint16 dkcWriteBufOFFSET;
+extern unsigned int dkcDebugTag;
+/*** EndHeader */
+
+/* The write header, for incoming write requests */
+_TCHeader      dkcWriteBufHeader;   // header structure, so a callback can
+                                    // be queued properly
+long           dkcWriteBufHeaderPool; // the pool it came from...
+uint16         dkcWriteBufXPC;
+uint16         dkcWriteBufOFFSET;
+uint16   dkcSystemWriteFlushLength; // if the write was too big, this is
+                                    // the remaining lengh
+unsigned int dkcDebugTag;
+
+#asm
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; A write request header has been received - redirect the packet
+; data portion.
+;
+dkcSystemWriteHeader::
+   ld    hl,TC_SYSTEM_WRITE_HEADERSIZE
+   TC_STOR(RXLength,hl)
+   ld    hl,dkcWriteHeader
+   TC_STOR(RXPtr,hl)
+   ld    hl,dkcRXHeader      ; run the header state again, so the XPC is not set
+   TC_STOR(RXState,hl)
+   ld    hl,.dkcSystemWriteData
+   TC_STOR(RXSubState,hl)
+
+   ld    hl,dkcWriteBufHeader
+   xor   a                          ; zero A to look in the data space
+   call  dkcLogicalToPhysical       ; bchl=physical address
+
+   ex    de,hl
+   TC_STOR(RXCurrentBuffer,hl)
+   ld    hl,bc
+   TC_STOR(RXCurrentBuffer+2,hl)    ; mark the current buffer as our temp header
+
+   ld    hl,dkcWriteBufHeaderPool
+   TC_STOR(RXCurrentBufferPool,hl)    ; mark the current buf-pool
+   clr   hl
+   ld    (dkcWriteBufHeaderPool),hl   ; make sure the pool is 0
+   ld    (dkcWriteBufHeaderPool+2),hl
+   ret
+
+;
+; We have the write header. Redirect the incomming data to
+; the flash buffer now.
+;
+.dkcSystemWriteData:
+   ld    hl,(dkcWriteHeader+[dkcWriteHeader]+length) ;the requested write size
+   ex    de,hl
+   ld    hl,TC_WRITEBLOCK_SIZE  ; the size of the write buffer
+   or    a                      ; clear the flags
+   sbc   hl,de                  ; is the requested length bigger than writebuf?
+   jr    c,.dkcSystemNotEnoughRoom
+
+   ex    de,hl                  ; get the length again
+   TC_STOR(RXLength,hl)
+   ld    hl,dkcRXFinishBody     ; when we are done, treat it as a normal packet
+   TC_STOR(RXSubState,hl)
+
+   ld    hl,(dkcWriteBufXPC)
+   TC_STOR(RXBufferXPC,hl)
+   ld    hl,(dkcWriteBufOFFSET)
+   TC_STOR(RXPtr,hl)
+   ld    hl,dkcRXBody
+   TC_STOR(RXState,hl)
+   ret
+
+; The requested length was bigger than the flash buffer.
+.dkcSystemNotEnoughRoom:
+   ex    de,hl                      ; hl == length of the requested write
+   TC_STOR(HeaderRX+length,hl)      ; set the length of the remaining bytes
+   clr   hl
+   TC_STOR(RXCurrentBufferPool,hl)  ; mark that no buffer is currently in use
+   jp    dkcRXFlushPacket;
+
+#endasm
+
+
+/*** BeginHeader dkcSystemCallback, dkcSystemINIT, dkcWriteHeader */
+__root int dkcSystemCallback();
+__root void dkcSystemINIT(void);
+extern _tc_state TCState;
+extern faraddr_t dkcWriteBufPhysical;
+typedef void (*tcfcnptr)();
+extern char systemprobed;
+extern _TCSystemWRITE   dkcWriteHeader;
+/*** EndHeader */
+
+void  dkcSystemNAK();
+void  dkcSystemNOOP();
+void  dkcSystemREAD();
+void  dkcSystemWRITE();
+void  dkcSystemRabbitSys();
+void  dkcSystemRSStartUser();
+void  dkcSystemGetDebugTag();
+void  dkcSystemSetDebugTag();
+
+uint16 dkcReadCopyLoopPtr;
+_TCSystemWRITE dkcWriteHeader;
+
+#asm
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; The TC_TYPE_SYSTEM internal type  ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;
+; The init function
+;
+dkcSystemINIT::
+   ; find the Write Buffer
+   ld    bcde,(dkcWriteBufPhysical)
+   call  dkcPhysicalToLogical
+   ld    (dkcWriteBufOFFSET),hl        ; save the buffer's logical address
+   ex    jk,hl
+   ld    (dkcWriteBufXPC),hl
+
+   ; register the callback
+   TC_LOAD(hl,CallbackList)
+   ld    ix,hl
+   ld    hl,dkcSystemCallback
+   ld    (ix),hl                       ; register the callback
+
+   ret
+
+;
+; queues a packet, specified by bc-de, to the outgoing packet queue, and
+; tries to start the transmitter if necessary
+;
+dkcSystemSendPacket::
+   ld    hl,TCState+[TCState]+NextPacket
+   call  dkcQueueBuffer
+
+   push  ip
+   ipset 1
+   ld    a,(TCState+[TCState]+TXBusy)
+   or    a
+   jp    nz,.dkcSystemNOStart
+
+   ld    iy,TCState
+   call  dkcTXStart
+.dkcSystemNOStart:
+   pop   ip
+   ret
+#endasm
+
+
+// a jump table of our subtypes - they must be in
+// numerical order, starting w/ subtype 0x00!
+const tcfcnptr dkcSystemJumpTable[] = {
+   dkcSystemNAK,        // 0x00
+   dkcSystemNOOP,       // 0x01
+   dkcSystemREAD,       // 0x02
+   dkcSystemWRITE,      // 0x03
+   (void*) 0x0,         // 0x04
+   (void*) 0x0,         // 0x05
+   (void*) 0x0,         // 0x06
+   (void*) 0x0,         // 0x07
+   (void*) 0x0,         // 0x08
+   (void*) 0x0,         // 0x09
+   (void*) 0x0,         // 0x0a
+   dkcSystemRabbitSys,  // 0x0b
+   dkcSystemRSStartUser,// 0x0c
+   dkcSystemSetDebugTag,// 0x0d
+   dkcSystemGetDebugTag // 0x0e
+};
+
+
+#asm
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; The main SYSTEM-type callback - most download/debug messages
+; will be handled here
+;
+dkcSystemCallback::
+   ld    hl,(sp+2)               ; get the flags
+   bit   0,l                        ; is TC_RECEIVE set?
+   jr    nz,.dkcSystemRXCallback
+   bit   1,l                        ; is TC_TXDONE set?
+   jr    nz,.dkcSystemTXCallback
+   ; error - shouldn't ever get here!!
+   jp    .dkcSystemCallbackDone
+
+.dkcSystemTXCallback:
+   ; nothing has to be done for a TX callback - the buffer
+   ; is allready returned
+
+   jp    .dkcSystemCallbackDone
+
+.dkcSystemRXCallback:
+   ld    hl,(sp+6)                  ; get the subtype
+   ld    a,L
+   bool  hl                         ; clear h
+   ld    L,a                        ; hl == offset into the jump table
+   ld    e,a
+   ld    d,h
+   add   hl,de                      ; double a, as the jump table entries are
+                                    ; two bytes each
+   ex    de,hl
+   ld    hl,dkcSystemJumpTable
+   add   hl,de                      ; hl now has the jump address
+
+   ex    de,hl
+   ld    hl,dkcSystemJumpTable + sizeof(dkcSystemJumpTable)
+   or    a                          ; clear the carry flag
+   sbc   hl,de                      ; did we run past the end of the table?
+   jr    c,.dkcSystemCallbackDone      ; if so, just return
+
+   ex    de,hl
+   ld    hl,(hl)                    ; get the jump address
+   push  hl                         ; save the jump address
+
+   ld    bcde,(sp+12)               ; bc,de has the system-buffer's address
+
+   call  dkcPhysicalToLogical
+   ld    ix,hl                      ; ix points to the buffer
+   ex    jk,hl
+   ld    lxpc,hl                       ; move the window to the buffer
+
+   pop   hl                         ; restore the jump address
+   jp    (hl)                       ; and jump to the handler
+
+.dkcSystemCallbackDone:
+   clr   hl                      ; return (int)0
+   ret
+
+;
+; In all of these handlers, ix points to the buffer, which is already in the
+; window. BCDE contains the physical address of the buffer.
+;
+dkcSystemNAK:: ; this should never be called - the NAKs are handled earlier
+   jr    .dkcSystemCallbackDone
+
+dkcSystemREAD::
+   ld    de, TC_HEADER_RESERVE
+   add   ix, de
+
+   ld    a, (ix)                 ; get the READ type
+   bit   0, a
+   jr    z, .dkcSystemREADPhysical
+
+   ld    hl,lxpc                 ; Save the xpc
+   push  hl
+
+   ld    a, (ix)                 ; get the READ type to compare after lxpc setup
+   ld    hl, (ix+3)              ; read the logical address
+   ex    jk, hl
+   ld    hl, (ix+5)
+   ld    lxpc, hl
+   ex    jk, hl
+   and   TC_SYSREAD_LOGICAL_CODE ; A = Non-Zero (for Code) or Zero (for Data)
+   call  dkcLogicalToPhysical
+   ld    px, bcde
+
+   pop   hl
+   ld    lxpc,hl                      ; Restore the xpc
+
+   jr    .dkcSystemREADContinue
+.dkcSystemREADPhysical:
+   ld    bcde, (ix+3)
+   ld    px, bcde                   ; physical address
+
+.dkcSystemREADContinue:             ; continue with the READ...
+   ld    hl,(ix+1)                  ; get the length from the packet
+   push  hl
+   call  dkcGetSystemBuffer         ; get a buffer for the reply
+   pop   hl
+   ld    py, bcde                   ; py points to the system buffer
+   jp    nz,.dkcSystemCallbackDone  ; return if we don't get one
+   exx
+   ; hl' has the length, bcde' has the system buffer address
+
+   ; build the header
+   ld    jkhl, 0
+   ld    (py + TC_HEADER_FLAGS), hl
+   ld    (py + TC_HEADER_USERDATA), jkhl
+   ld    a, TC_TYPE_SYSTEM
+   ld    (py + TC_HEADER_TYPE), a
+   ld    a, TC_SYSTEM_READ|TC_ACK
+   ld    (py + TC_HEADER_SUBTYPE), a
+
+   ex    de, hl'                    ; get the length of the READ
+   ld    hl, de
+   ex    de, hl'                    ; put the length back
+   ld    (py + TC_HEADER_RESERVE), hl  ; store the length
+
+   ld    bcde, 6
+   add   hl, de
+   ld    (py + TC_HEADER_LENGTH), hl
+   ; the header of the packet (in the data portion)
+
+   ld    bcde, px
+   ld    (py + TC_HEADER_RESERVE + 2), bcde
+
+   ld    py, py + TC_HEADER_RESERVE + 6 ; move the target pointer to the
+                                        ; beginning of the data area
+   ; py points to the destination
+
+   ex    bc, hl'                    ; restore the length
+   copy
+
+.dkcSystemREADFinish:
+   exx                              ; restore the physical address of the sysbuf
+   call  dkcSystemSendPacket
+   jp    .dkcSystemCallbackDone
+
+dkcSystemWRITE::
+   ld    hl,lxpc
+   push  hl                         ; save the XPC incase it is changed
+
+   ld    a,(dkcWriteHeader+[dkcWriteHeader]+type)
+   bit   0,a
+   jr    z,.dkcSystemWRITEPhysical
+
+   ; this is a logical address
+   bit   1,a
+   jr    nz,.dkcSystemWRITENoXPC
+
+   ; we need to set the XPC for this write
+   ld    hl,(dkcWriteHeader+[dkcWriteHeader]+address+logical+xpc)
+   ld    lxpc,hl                 ; set the window
+
+.dkcSystemWRITENoXPC:
+   ; get the logical address
+   ld    hl,(dkcWriteHeader+[dkcWriteHeader]+address+logical+offset)
+   call  dkcLogicalToPhysical
+   ; now that the physical address is in bc:de, continue with normal operations
+   jr    .dkcSystemWRITEDoPhys
+
+.dkcSystemWRITEPhysical:
+   ; write to a physical address
+   ld    bcde,(dkcWriteHeader+[dkcWriteHeader]+address+physical)
+   ; the physical address of where to write to is in bc:de
+
+.dkcSystemWRITEDoPhys:
+#if !FLASH_COMPILE  && !_SERIAL_BOOT_FLASH_
+   jr    .dkcSystemWRITERam
+#else
+   ld    a,c      ; get A[23:16]
+
+   #if  (_SERIAL_BOOT_FLASH_==1)
+   jp    .dkcSystemWRITERam
+   #else
+   and   a, _cexpr(0x00FF >> (8-(MSB_ID_MASK_BIT+1)))
+   cp    _cexpr(RAM_START*1L >> 4)
+   #endif
+
+   jp    nc,.dkcSystemWRITERam      ; is it over 0x80000? if so, it's in ram
+.dkcSystemWRITEflash:
+   ; First flash
+;; copy data to flash buffer
+
+   push  bcde     ; save destination address
+   ; get source address
+   ld    bcde, (dkcWriteBufPhysical)
+   call  dkcPhysicalToLogical
+   ex    jk',hl
+   ex    jk,hl
+   ld    lxpc,hl
+   ex    jk',hl
+
+   ; get size from header
+   ld    bc, (dkcWriteHeader+[dkcWriteHeader]+length)
+
+   ; copy destination is old comm buffer
+   ld    de, commBuffer
+    ldir
+
+   pop   bcde     ; restore destination address
+
+   #if _SERIAL_BOOT_FLASH_ == 0
+
+   ; destination is in BC:DE
+   call  dkcPhysicalToLogical
+   ex    jk,hl
+   ld    hl,(dkcWriteHeader+[dkcWriteHeader]+length)
+
+   #else  // It's serial boot flash
+   ex    jkhl,bcde
+   ld    bc,(dkcWriteHeader+[dkcWriteHeader]+length)
+   ld    de, commBuffer
+   push  jkhl
+
+   #if !SUPPRESS_FAST_RAM_COPY  ; Just do the RAM write if compiling to RAM
+   ld    a,(_BIOSdownloading2serial)
+   and   1
+   jr    z,.noFlashWrAllowed
+   call  _sbf_BIOSwritef
+   call  _sbf_BusyWaitRDY
+.noFlashWrAllowed:
+   #endif
+
+   pop   bcde
+   // Mirror to RAM while we're here
+   ld    a,c
+   ex    de,hl
+   _LIN2SEG    // Send linear address in a:hl, get segmented addr in XPC:HL
+   ex    jk,hl
+   ld    lxpc,hl
+   ex    jk,hl
+   ex    de,hl    // DE now has 16 bit part of destination
+   ld    bc,(dkcWriteHeader+[dkcWriteHeader]+length)
+   ld    hl, commBuffer
+   ldir
+   clr   hl
+   #endif
+   bool hl
+   jp z, .dkcSystemWRITEAck
+   jp .dkcSystemWRITENak
+#endif
+
+.dkcSystemWRITERam:
+   ; Main RAM
+   call  dkcPhysicalToLogical
+   ld    iy,hl
+   ex    jk,hl
+   ld    lxpc,hl
+   ; XPC:iy points to the destination
+
+   ld    jkhl, (dkcWriteBufPhysical)
+   ld    pw, jkhl
+
+   ld    hl,(dkcWriteHeader+[dkcWriteHeader]+length)
+   ld    bc,hl    ; bc has the length
+
+   push  ip
+   ipset 1     ; copy the data atomically
+
+.dkcSystemWRITERamLoop:
+   ld    a, (pw)
+   ld    (iy), a
+   ld    pw, pw+1
+   inc   iy
+   dwjnz .dkcSystemWRITERamLoop
+
+.dkcSystemWRITERamDone:
+   pop   ip    ; restore interrupts
+   jr    .dkcSystemWRITEAck
+
+.dkcSystemWRITESecondFlash:
+   ; The 2nd Flash
+   jr    .dkcSystemWRITENak
+
+.dkcSystemWRITEAck:                 ; queue an ACK
+   ld    a,TC_SYSTEM_WRITE|TC_ACK
+   jr    .dkcSystemWRITERespond
+
+.dkcSystemWRITENak:                 ; queue a NAK
+   ld    a,TC_SYSTEM_WRITE|TC_NAK
+   ; fall through
+
+.dkcSystemWRITERespond:            ; build the response packet - subtype is in A
+   push  af
+   call  dkcGetSystemBuffer
+   jr    z,.dkcSystemWRITEGotBuffer ; did we get a sysbuf?
+   pop   af
+   jr    .dkcSystemWRITEDone
+
+.dkcSystemWRITEGotBuffer:
+   call  dkcPhysicalToLogical
+   ld    ix,hl                      ; xpc:ix points to the buffer
+   ex    jk,hl
+   ld    lxpc,hl
+   exx                              ; save the physical address in the alt-regs
+
+   pop   af                         ; a has the subtype again
+   ld    (ix+TC_HEADER_SUBTYPE),a
+   ld    a,TC_TYPE_SYSTEM
+   ld    (ix+TC_HEADER_TYPE),a
+   clr   hl
+   ld    (ix+TC_HEADER_LENGTH),hl   ; no data portion of the packet
+   ld    (ix+TC_HEADER_USERDATA),hl
+   ld    (ix+TC_HEADER_USERDATA+2),hl
+   ld    (ix+TC_HEADER_FLAGS),hl
+
+   exx                              ; bring back the physical address
+   call  dkcSystemSendPacket        ; and send the packet
+   ; fall through
+
+.dkcSystemWRITEDone:
+   pop   af                         ; restore the XPC, if it changed
+   jp    .dkcSystemCallbackDone
+
+////////////////////////////////////////////////////////////////////////////////
+// -------------------------------------------------------------------------- //
+////////////////////////////////////////////////////////////////////////////////
+dkcRequestSystemBuffer::
+   call  dkcGetSystemBuffer
+   ret   z
+   jp    .dkcSystemCallbackDone
+
+dkcSystemPrepareZeroLengthHeader::
+   clr   hl
+dkcSystemPrepareHeader::
+   ex    af,af'
+   push  hl
+
+   call  dkcPhysicalToLogical
+   ld    iy,hl                     ; xpc:iy points to the new buffer
+   ex    jk,hl
+   ld    lxpc,hl
+   exx                             ; save the new buffer phys-address in bc':de'
+
+   pop   bc                        ; bc has the length of the packet
+
+   ld    hl,bc
+   ld    (iy+TC_HEADER_LENGTH),hl   ; store the length
+   clr   hl
+   ld    (iy+TC_HEADER_FLAGS),hl
+   ld    (iy+TC_HEADER_USERDATA),hl
+   ld    (iy+TC_HEADER_USERDATA+2),hl
+   ld    a,TC_TYPE_SYSTEM
+   ld    (iy+TC_HEADER_TYPE),a      ; set the type to SYSTEM
+   ex    af,af'
+   ld    (iy+TC_HEADER_SUBTYPE),a   ; set the subtype
+
+   ld    de,TC_HEADER_RESERVE
+   add   iy,de                      ; move iy past the header
+   ret
+////////////////////////////////////////////////////////////////////////////////
+// -------------------------------------------------------------------------- //
+////////////////////////////////////////////////////////////////////////////////
+
+dkcSystemNOOP::
+   call  dkcRequestSystemBuffer
+
+   ; bc and de must be protected between calls to
+   ; dkcSystemGetBuffer and dkcSystemSendBuffer
+   ld    a,TC_SYSTEM_NOOP|TC_ACK
+
+   call  dkcSystemPrepareZeroLengthHeader
+   exx                              ; bring back the physical address
+   call  dkcSystemSendPacket        ; and send the packet
+
+   jp    .dkcSystemCallbackDone
+////////////////////////////////////////////////////////////////////////////////
+
+dkcSystemRabbitSys::
+   call  dkcRequestSystemBuffer
+   ; bc and de must be protected between calls to
+   ; dkcSystemGetBuffer and dkcSystemSendBuffer
+   ; shutdown the user program at the end of the next system tick
+   ld    a,TC_SYSTEM_RABBITSYS|TC_NAK
+
+   ld    hl,sizeof(_TCSystemRSVersionProbe)
+   call  dkcSystemPrepareHeader
+
+   exx                              ; bring back the physical address
+   call  dkcSystemSendPacket        ; and send the packet
+
+   jp    .dkcSystemCallbackDone
+////////////////////////////////////////////////////////////////////////////////
+
+dkcSystemRSStartUser::
+   call  dkcRequestSystemBuffer
+   ; bc and de must be protected between calls to
+   ; dkcSystemGetBuffer and dkcSystemSendBuffer
+   ld    a,1
+   ld    (dkcstartuserprog),a
+   ld    a,TC_SYSTEM_RSSTARTUSER|TC_ACK
+
+   call  dkcSystemPrepareZeroLengthHeader
+   exx                              ; bring back the physical address
+   call  dkcSystemSendPacket        ; and send the packet
+
+   jp    .dkcSystemCallbackDone
+////////////////////////////////////////////////////////////////////////////////
+
+dkcSystemGetDebugTag::
+   call  dkcRequestSystemBuffer
+   ld    a,TC_SYSTEM_GETDEBUGTAG|TC_ACK
+   ld    hl,sizeof(dkcDebugTag)
+   call  dkcSystemPrepareHeader
+   ld    hl,(dkcDebugTag)
+   ld    (iy),hl
+   exx                              ; bring back the physical address
+   call  dkcSystemSendPacket        ; and send the packet
+   jp    .dkcSystemCallbackDone
+
+dkcSystemSetDebugTag::
+   ld    de,TC_HEADER_RESERVE
+   add   ix,de
+   ld    hl,(ix)
+   ld    (dkcDebugTag),hl
+   call  dkcRequestSystemBuffer
+   ld    a,TC_SYSTEM_SETDEBUGTAG|TC_ACK
+   call  dkcSystemPrepareZeroLengthHeader
+   exx                              ; bring back the physical address
+   call  dkcSystemSendPacket        ; and send the packet
+   jp    .dkcSystemCallbackDone
+#endasm
+
+/*** BeginHeader */
+#endif /*__TC_SYSTEMAPP_LIB*/
+/*** EndHeader */

@@ -1,0 +1,1090 @@
+/*** Beginheader */
+#ifndef __RNET_KEYIF_LIB
+#define __RNET_KEYIF_LIB
+
+//#define KEYIF_DEBUG
+
+#ifdef KEYIF_DEBUG
+#define _keyif_nodebug
+#else
+#define _keyif_nodebug __nodebug
+#endif
+
+/*** Endheader */
+
+
+/* START LIBRARY DESCRIPTION *********************************************
+RNET_KEYIF.LIB
+* Copyright (c) 2008 Digi International Inc., All Rights Reserved
+*
+* This software contains proprietary and confidential information of Digi
+* International Inc.  By accepting transfer of this copy, Recipient agrees
+* to retain this software in confidence, to prevent disclosure to others,
+* and to make no use of this software other than that for which it was
+* delivered.  This is a published copyrighted work of Digi International
+* Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+* prohibited.
+*
+* Restricted Rights Legend
+*
+* Use, duplication, or disclosure by the Government is subject to
+* restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+* Technical Data and Computer Software clause at DFARS 252.227-7031 or
+* subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+* Restricted Rights at 48 CFR 52.227-19, as applicable.
+*
+* Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+
+DESCRIPTION:	Keypad support for RabbitNet RN1600 Display/Keypad
+					Interface card.  Supports a maximum of number of 64
+               keys organized as an 8x8 matrix.
+
+SUPPORT LIBS:
+
+REVISION HISTORY:
+02/05/04	pel	Initial creation.  This version supports one RN1600
+               per system.
+
+END DESCRIPTION **********************************************************/
+
+/*** Beginheader */
+//to use with rnet_lcdif.lib for buzzer functions
+#ifndef USE_KEYIF
+#define USE_KEYIF
+#endif
+
+// macro that user can identify with in applications
+#ifndef RN1600
+#define RN1600 RN1600A
+#endif
+
+// this macro overrides default microcode timing
+#ifndef _RN1600TIME
+#define _RN1600TIME {tCS=2; tCD=34; tDD=18; tDS=21; tMC=6;}
+#endif
+
+///// Command Set
+/// regnum is octal
+/// datalen is byte count
+/////
+
+/// write registers
+#define KEYIFW13	{regnum=0013; datalen=1;}	//Turn uP LED ON/OFF
+#define KEYIFW15	{regnum=0015; datalen=1;}	//Turn buzzer ON/OFF
+#define KEYIFW16	{regnum=0016; datalen=2;}	//Activate buzzer, w/period
+
+/// read registers
+#define KEYIFR17	{regnum=0115; datalen=1;}	//Buzzer shadow
+
+#define KEYIFR40	{regnum=0140; datalen=2;}	//Strobe 0 & read keypad rawdata
+#define KEYIFR41	{regnum=0141; datalen=2;}	//Strobe 1 & read keypad rawdata
+#define KEYIFR42	{regnum=0142; datalen=2;}	//Strobe 2 & read keypad rawdata
+#define KEYIFR43	{regnum=0143; datalen=2;}	//Strobe 3 & read keypad rawdata
+#define KEYIFR44	{regnum=0144; datalen=2;}	//Strobe 4 & read keypad rawdata
+#define KEYIFR45	{regnum=0145; datalen=2;}	//Strobe 5 & read keypad rawdata
+#define KEYIFR46	{regnum=0146; datalen=2;}	//Strobe 6 & read keypad rawdata
+#define KEYIFR47	{regnum=0147; datalen=2;}	//Strobe 7 & read keypad rawdata
+#define KEYIFR50	{regnum=0150; datalen=2;}	//Strobe 8 & read keypad rawdata
+#define KEYIFR51	{regnum=0151; datalen=2;}	//Strobe 9 & read keypad rawdata
+#define KEYIFR52	{regnum=0152; datalen=2;}	//Strobe 10 & read keypad rawdata
+#define KEYIFR53	{regnum=0153; datalen=2;}	//Strobe 11 & read keypad rawdata
+#define KEYIFR54	{regnum=0154; datalen=2;}	//Strobe 12 & read keypad rawdata
+#define KEYIFR55	{regnum=0155; datalen=2;}	//Strobe 13 & read keypad rawdata
+#define KEYIFR56	{regnum=0156; datalen=2;}	//Strobe 14 & read keypad rawdata
+#define KEYIFR57	{regnum=0157; datalen=2;}	//Strobe 15 & read keypad rawdata
+
+/*** Endheader */
+
+/*** Beginheader */
+typedef struct
+{
+	int strobits;
+   int buzzperiod;
+   int retkey;
+} rnkdifinfo;
+
+/*** Endheader */
+
+
+/*** Beginheader _rn_dqInit, _rn_dqPop, _rn_dqPush */
+typedef struct {			//	Double Input Queue Structure
+	unsigned	wSize;		// Buffer Size
+	char *pLo;				// Low Buffer Address
+	char *pHi;				// High Buffer Address
+	char *pIn;				// In Pointer
+	char *pOut;				// Out Pointer
+	} rnDQueue;
+
+int _rn_dqPop ( rnDQueue * );								//	Remove Char from Tail
+int _rn_dqPush ( rnDQueue *,char );
+void _rn_dqInit ( rnDQueue *,void *,unsigned );
+/*** Endheader */
+
+#asm __root __nodebug
+;==========================================================================
+; _rn__dqPop : Pop Item from Queue (Remove from Tail)
+;
+; INPUT  :
+;          IY = Pointer to Queue Structure
+; OUTPUT :
+;          A  = Character Popped from Queue
+;          NZ = Character Popped OK
+;          Z  = Queue is EMPTY
+; NOTES  :
+;          Destroys HL,DE,Flags
+
+_rn__dqPop::
+	ld    e,(iy+8)          ; DE = Out Pointer
+   ld    d,(iy+9)
+   ld    l,(iy+6)          ; HL = In Pointer
+   ld    h,(iy+7)
+   xor   a                 ; Check for Empty Queue
+   sbc   hl,de
+   ret   z                 ; Done if Empty
+   ld    a,(de)            ; Get Character
+   ld    l,(iy+4)          ; HL = Last Buffer Location
+   ld    h,(iy+5)
+   or    a                 ; Check for Wrap
+   sbc   hl,de
+   inc   de                ; DE = Next Out Pointer
+   jr    nz,.PoNoWrap1     ; Done if No Wrap
+   ld    e,(iy+2)          ; DE = First Buffer Location
+   ld    d,(iy+3)
+.PoNoWrap1:
+   ld    (iy+8),e          ; Update Out Pointer
+	ld    (iy+9),d
+   ld    e,a               ; Set NZ Flag
+   inc   e
+   cp    e
+   ret                     ; Return w/ Error
+
+;==========================================================================
+; _rn__dqPush : Push Item (Add to Tail)
+;
+; INPUT  :
+;          IY = Pointer to Queue Structure
+;          A  = Character to Add to Queue
+; OUTPUT :
+;          NZ = Pushing OK
+;          Z  = Queue is FULL
+; NOTES  :
+;          Destroys HL,DE,Flags
+
+_rn__dqPush::
+	ld		e,(iy+8)				; DE = Out Pointer
+	ld		d,(iy+9)
+   ld    l,(iy+2)          ; HL = First Buffer Location
+   ld    h,(iy+3)
+   or    a                 ; Check for Wrap
+   sbc   hl,de
+   dec	de                ; DE = Prev (Out Pointer)
+   jr    nz,.PuNoWrap0		; Done if No Wrap
+   ld    e,(iy+4)          ; DE = Last Buffer Location
+   ld    d,(iy+5)
+.PuNoWrap0:
+	ld    l,(iy+6)          ; HL = Input Pointer
+   ld    h,(iy+7)
+   or    a                 ; Check for Overrun
+   sbc   hl,de
+   ret   z                 ; Done if Overrun
+   ld    (iy+8),e          ; Update Out Pointer
+   ld    (iy+9),d
+   ld    (de),a            ; Store Character
+   ret                     ; Done - No Error
+
+;==========================================================================
+; _rn__dqInit : Initialize Queue
+;
+; INPUT  :
+;          HL = Pointer to Queue Structure
+;          DE = Address of Buffer
+;          BC = Size of Buffer
+; OUTPUT :
+;          None
+
+_rn__dqInit::
+	ld    (hl),c            ; Store Size of Buffer
+   inc   hl
+   ld    (hl),b
+   inc   hl
+   push  de                ; Protect Low Buffer Address
+   ld    (hl),e            ; Store Low Buffer Address
+   inc   hl
+   ld    (hl),d
+   inc   hl
+   ex    de,hl             ; Compute Last Byte of Buffer
+   add   hl,bc
+   dec	hl
+   ex    de,hl
+   ld    (hl),e            ; Store High Buffer Address
+   inc   hl
+   ld    (hl),d
+   inc   hl
+   pop   de                ; Restore Low Buffer Address
+   ld    (hl),e            ; Initialize In Pointer
+   inc   hl
+   ld    (hl),d
+   inc   hl
+   ld    (hl),e            ; Initialize Out Pointer
+   inc   hl
+   ld    (hl),d
+   inc   hl
+   ret                     ; Done
+
+;==========================================================================
+; _rn_dqPop  : Pop Item from Queue
+;
+; C CALL :
+;          int _dqPop ( Queue * );
+; RETURN :
+;          0 - 255 : Character Read
+;          -1      : Buffer Empty
+
+_rn_dqPop::
+	pop   hl                ; Return Address
+   pop   iy                ; IY = Queue Pointer
+   push  hl                ; Restore Stack
+   push  hl
+   call  _rn__dqPop				; Push Character
+   ld    h,0               ; HL = Character Read
+   ld    l,a
+   ret   nz                ; Done if No Error
+   ld    hl,-1             ; HL = Queue is Empty
+   ret                     ; Done
+
+;==========================================================================
+; _rn_dqPush : Push Item (Add to Head)
+;
+; C CALL :
+;          int _dqPush ( Queue *,char );
+; RETURN :
+;          0  - No Error
+;          -2 - Buffer Full
+
+_rn_dqPush::
+	pop   hl                ; Return Address
+   pop   iy                ; IY = Queue Pointer
+   pop   de                ; E  = Character
+   push  de                ; Restore Stack
+   push  hl
+   push  hl
+   ld    a,e               ; A = Character
+   call  _rn__dqPush				; Push Character
+   ld    hl,0              ; HL = No Error
+   ret   nz                ; Done if No Error
+   ld    hl,-2             ; HL = Queue is Full
+   ret                     ; Done
+
+;==========================================================================
+; _rn_dqInit :  Initialize Queue
+;
+; C CALL :
+;          void _rn_dqInit ( Queue *,void *,unsigned );
+; RETURN :
+;          None
+
+_rn_dqInit::
+	call  _param3           ; Get Parameters from C
+   jp    _rn__dqInit				; Initialize Queue
+
+
+;==========================================================================
+; _rn_dqQueue : Queue Item (Add to Head)
+;
+; INPUT  :
+;          IY = Pointer to Queue Structure
+;          A  = Character to Add to Queue
+; OUTPUT :
+;          NZ = Queueing OK
+;          Z  = Queue is FULL
+; NOTES  :
+;          Destroys HL,DE,Flags
+
+_rn_dqQueue::
+	ld		e,(iy+6)				; DE = In Pointer
+	ld		d,(iy+7)
+   push  de                ; Protect In Pointer
+   ld    l,(iy+4)          ; HL = Last Buffer Location
+   ld    h,(iy+5)
+   or    a                 ; Check for Wrap
+   sbc   hl,de
+   inc   de                ; DE = Next In Pointer
+   jr    nz,.QuNoWrap0		; Done if No Wrap
+   ld    e,(iy+2)          ; DE = First Buffer Location
+   ld    d,(iy+3)
+.QuNoWrap0:
+	ld    l,(iy+8)          ; HL = Output Pointer
+   ld    h,(iy+9)
+   or    a                 ; Check for Overrun
+   sbc   hl,de
+   pop   hl                ; Restore Current In Pointer
+   ret   z                 ; Done if Overrun
+   ld    (iy+6),e          ; Update In Pointer
+   ld    (iy+7),d
+   ld    (hl),a            ; Store Character
+   ret                     ; Done - No Error
+
+;==========================================================================
+; _rn_dqQueueS : Queue Item w/ Minimum of Register Damage
+;
+; INPUT  :
+;          IY = Pointer to Queue Structure
+;          A  = Character to Add to Queue
+; OUTPUT :
+;          NZ = Queueing OK
+;          Z  = Queue is FULL
+; NOTES  :
+;          Destroys Flags
+
+_rn_dqQueueS::
+	push  hl                ; Protect HL
+   push  de                ; Protect DE
+   call  _rn_dqQueue				; Queue Item
+   pop   de                ; Restore DE
+   pop   hl                ; Restore HL
+   ret                     ; Done
+
+#endasm
+
+
+/*** BeginHeader rn_asKey, rn_aacKey, rn_acKeyQ, rn_sKeyQ */
+typedef struct rnKey {		 ////	Key Decode/Repeat Configuration
+								 ////	User Defined Key Configuration
+	char cRaw;					//	Raw Key Code Index
+	char cPress;				//	Key Press Code (0 = Unused)
+	char cRelease;				//	Key Release Code (0 = Unused)
+	char cCntHold;				//	Hold Ticks (0 = No Repeat)
+	char cSpdLo;				//	Low Speed Repeat Ticks
+	char cCntLo;				//	Low Speed Hold Ticks (0 = Slow Only)
+	char cSpdHi;				//	High Speed Repeat Ticks
+
+								 ////	State Info for Key Repeating
+	char cSpeed;				//	Repeat Speed
+	char cRepeat;				//	Repeat Down Counter
+	char cCount;				//	Hold Down Counter
+	char cState;				//	Key Decode State
+										//	0 = Button is Up
+										//	1 = Button is Down & Holding
+										//	2 = Button in Low Speed Repeat
+										//	3 = Button in High Speed Repeat
+}	rnKey;
+
+
+typedef struct rnkeystruct
+{
+  	int strobits;
+  	int buzzperiod;
+} rnkeystruct;
+
+extern rnkeystruct rnkeyinfo[RN_MAX_PORT];
+extern rnKey rn_asKey[64];		//	Key Processing Structure
+extern char rn_aacKey[3][8];	//	Raw Key Map FIFO
+extern char rn_acKeyQ[16];		//	Key Queue Buffer
+extern rnDQueue rn_sKeyQ;		//	Key Queue Structure
+
+/*** EndHeader */
+
+rnkeystruct rnkeyinfo[RN_MAX_PORT];
+rnKey rn_asKey[64];				//	Key Processing Structure
+char rn_aacKey[3][8];			//	Raw Key Map FIFO
+char rn_acKeyQ[16];				//	Key Queue Buffer
+rnDQueue rn_sKeyQ;				//	Key Queue Structure
+
+
+/*** BeginHeader _rn_keyScan */
+int _rn_keyScan (int handle, char *pcKeys, int reserved);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_rn_keyScan                     <RNET_KEYIF.LIB>
+
+SYNTAX:        int _rn_keyScan (int handle, char *pcKeys, int reserved);
+
+DESCRIPTION:   Internal function.
+					Strobes each output line and reads the value.
+					Position of	a strobe line is indicated by a zero value in
+               the associated bit position.  Called by rn_keyProcess().
+
+               <<< NOTE >>>
+               To ensure keypad driver compatibility, the keypad
+               must be installed so that a strobe line or data line starts
+               on J6 pin 1.
+
+PARAMETER1:		Address index to device information passed in by calling
+					function. Use rn_device() or rn_find to establish handle.
+PARAMETER2:    Address of the value read.
+PARAMETER3:    Reserved. Set as 0.
+
+RETURN VALUE:	Status byte from previous command.
+
+SEE ALSO:		rn_keyProcess
+
+END DESCRIPTION **********************************************************/
+
+_keyif_nodebug
+int _rn_keyScan (int handle, char *pcKeys, int reserved)
+{
+  	auto int regnum, datalen, i, j, k;
+   auto rnDataSend ds;
+   auto rnDataRec dr;
+   auto unsigned int rowcount, strobebits, tmp;
+   auto rn_devstruct *devaddr;
+
+   devaddr = (rn_devstruct *)handle;
+	strobebits = rnkeyinfo[devaddr->portnum].strobits;
+
+	KEYIFR40;
+	ds.cmd = regnum;
+   // hard-code max 16 lines to check
+	for (i=0, rowcount = 0; i<16; i++)
+   {
+   	if (strobebits&1)
+      {
+         rowcount++;
+
+      	//strobe and read
+#ifdef RN_ACCESS_PROTECTION
+         if (RN_ACCESS_FN(devaddr->portnum)) return RN_SPIBUSY;
+#endif
+	  		_rn_sp_fastenable(devaddr->portnum);
+	  		_mosi_driver(3, &ds, &dr, &devaddr->cmdtiming, &rn_spi[devaddr->portnum]);
+	  		_rn_sp_fastdisable(devaddr->portnum);
+#ifdef RN_ACCESS_PROTECTION
+         RN_RELEASE_FN(devaddr->portnum);
+#endif
+
+	   	if ((dr.statusbyte & RNDEVSTATE) == RNREADY)
+	   	{
+            //	Set variable to current keypad values
+            tmp = (dr.miso[1]<<8) | dr.miso[0];
+            tmp = tmp|rnkeyinfo[devaddr->portnum].strobits;
+            if ( ((char)(tmp) ^ 0xff) > 0)
+            	*pcKeys++ = dr.miso[0];
+            else
+	            if ( ((tmp>>8) ^ 0xff) > 0)
+   	         	*pcKeys++ = dr.miso[1];
+      	      else
+         	   	*pcKeys++ = 0xff;
+	   	}
+         else
+         {
+         	rowcount--;
+         	break;
+         }
+      }
+     	strobebits = strobebits>>1;
+      ds.cmd++;
+   }
+
+	//	Clear rest of unused rows; hard-code max 8 strobe lines
+	for (i=0; i<(8-rowcount); i++)
+   {
+		*pcKeys++ = 0xFF;
+   }
+
+   return (dr.statusbyte);
+}
+
+/*** BeginHeader rn_keyProcess */
+
+int rn_keyProcess (int handle, int reserved);
+
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+rn_keyProcess                     <RNET_KEYIF.LIB>
+
+SYNTAX:	      int rn_keyProcess (int handle, int reserved);
+
+DESCRIPTION:  	Scans and processes keypad data for key assignment,
+				  	debouncing, press and release and repeat.
+
+               This function is able to process a maximum of 64 keys
+               organized as an 8x8 matrix.
+
+               <<< NOTE >>>
+               To ensure keypad driver compatibility, the keypad
+               must be installed so that a strobe line or data line starts
+               on J6 pin 1.
+
+               If a busy or -1 status byte is detected, key
+               processing will abort.
+
+PARAMETER1:		Address index to device information. Use rn_device()
+					or rn_find to establish handle.
+PARAMETER2:    Reserved. Set as 0.
+
+RETURN VALUE:	-1, device information indicates no connection
+               or status byte from previous command.
+
+SEE ALSO:		rn_keyConfig, rn_keyGet
+
+END DESCRIPTION **********************************************************/
+
+_keyif_nodebug
+__root int rn_keyProcess (int handle, int reserved)
+{
+   auto rn_devstruct *devaddr;
+   auto int statusbyte;
+
+   devaddr = (rn_devstruct *)handle;
+   if (devaddr->dtype == NOCONNECT)
+   	return NOCONNECT;
+
+#asm
+//rn_keyProcess::
+	push	ix
+	ld		hl,rn_aacKey+15		; aacKey[1..2] = aacKey[0..1]
+	ld		de,rn_aacKey+23
+	ld		bc,16
+	lddr
+	ld		hl,rn_aacKey			; aacKey[0] = New Key Data
+	push	hl
+   ld		hl,(sp+@sp+handle+4)
+   push	hl
+	call	_rn_keyScan				; Hardware Dependent Function
+	ld		(sp+@sp+statusbyte+6),hl
+	ld		a,h                  ; check for a no connect status
+   cp		0ffh
+	jp		z,.endprocess        ; end process if no connect
+   pop	hl
+   pop	hl
+	ld		ix,rn_asKey				; IX = asKey (Processing) Array
+	ld		iy,rn_aacKey			; IY = aacKey (Raw Data) Arrays
+	ld		h,8						;  H = Row Counter
+.kP0:
+	ld		a,(iy+0)					;  A =  aacKey[0][wRow]
+	or		a,(iy+8)					;  A =  aacKey[0][wRow] |  aacKey[1][wRow]
+	cpl								;  A = ~aacKey[0][wRow] & ~aacKey[1][wRow]
+	and	a,(iy+16)				;  A = ~aacKey[0][wRow] & ~aacKey[1][wRow] & aacKey[2][wRow]
+	ld		d,a						;  D = Falling Edge Detectors
+	ld		a,(iy+16)				;  A = aacKey[2][wRow]
+	cpl								;  A = ~aacKey[2][wRow]
+	and	a,(iy+8)					;  A = aacKey[1][wRow] & ~aacKey[2][wRow]
+	and	a,(iy+0)					;  A = aacKey[0][wRow] &  aacKey[1][wRow] & ~aacKey[2][wRow]
+	ld		e,a						;  E = Rising Edge Detectors
+	push	iy							; Protect aacKey Pointer
+	ld		iy,rn_sKeyQ				; IY = Processed Key Queue
+	ld		l,8						;  L = Col Counter
+.kP1:
+	rr		d								; C = Press Detected
+	jr		nc,.kP2						; Skip if No Press Detected
+	ld		a,(ix+[rnKey]+cPress)		; Code Set for Press?
+	or		a,a
+	jr		z,.kP3
+	call	_rn_dqQueueS				; Queue Key Press
+.kP3:
+	ld		a,(ix+[rnKey]+cCntHold)	; Set Initial Hold Count
+	ld		(ix+[rnKey]+cCount),a
+	ld		a,1							; Button is Downing & Holding
+	ld		(ix+[rnKey]+cState),a
+.kP2:
+	rr		e								; C = Release Detected
+	jr		nc,.kP4
+	ld		a,(ix+[rnKey]+cRelease)	; Code Set for Release?
+	or		a,a
+	jr		z,.kP5
+	call	_rn_dqQueueS				; Queue Key Release
+.kP5:
+	xor	a								; Button is Up
+	ld		(ix+[rnKey]+cState),a
+.kP4:
+	ld		a,(ix+[rnKey]+cState)		; A = Current Key State
+	dec	a								; cState == 1?
+	jr		nz,.kP6
+	or		a,(ix+[rnKey]+cCount)		; If Hold Count Zero, Done
+	jr		z,.kP8
+	dec	(ix+[rnKey]+cCount)			; If Count Not Reaching Zero, Done
+	jr		nz,.kP8
+	ld		a,(ix+[rnKey]+cPress)		; Queue New Keypress
+	call	_rn_dqQueueS
+	ld		a,(ix+[rnKey]+cSpdLo)		; Setup Low Speed Repeat
+	ld		(ix+[rnKey]+cSpeed),a
+	ld		(ix+[rnKey]+cRepeat),a
+	ld		a,(ix+[rnKey]+cCntLo)		; Setup Low Speed Period
+	ld		(ix+[rnKey]+cCount),a
+	ld		a,2							; Button in Low Speed Repeat
+	ld		(ix+[rnKey]+cState),a
+	jr		.kP8							; Done
+.kP6:
+	dec	a								; cState == 2?
+	jr		nz,.kP7
+	or		a,(ix+[rnKey]+cCount)		; If Hold Count Zero, Done
+	jr		z,.kP9
+	dec	(ix+[rnKey]+cCount)			; If Count Not Reaching Zero, Done
+	jr		nz,.kP9
+	ld		a,(ix+[rnKey]+cSpdHi)		; Set High Speed Repeat
+	ld		(ix+[rnKey]+cSpeed),a
+	ld		a,3							; Button in High Speed Repeat
+	ld		(ix+[rnKey]+cState),a
+	jr		.kP9							; Finish Processing
+.kP7:
+	dec	a								; cState == 3?
+	jr		nz,.kP8
+.kP9:
+	dec	(ix+[rnKey]+cRepeat)		; If Repeat Count not Reaching Zero, Done
+	jr		nz,.kP8
+	ld		a,(ix+[rnKey]+cPress)		; Queue New Keypress
+	call	_rn_dqQueueS
+	ld		a,(ix+[rnKey]+cSpeed)		; Reset Repeat Count
+	ld		(ix+[rnKey]+cRepeat),a
+.kP8:
+	ld		bc,11						; Bump Process Array Pointer
+	add	ix,bc
+	dec	l							; Decrement Column Counter
+	jp		nz,.kP1					; Continue til Columns Done
+	pop	iy							; Restore aacKey Pointer
+	inc	iy							; Bump aacKey Pointer
+	dec	h							; Decrement Row Counter
+	jp		nz,.kP0					; Continue til All Rows Done
+   jp		.finish
+.endprocess:
+	pop	hl
+   pop	hl
+.finish:
+	pop	ix
+   ld		hl,(sp+@sp+statusbyte)
+//	ret								; Done
+#endasm
+}
+
+/*** Beginheader rn_keyConfig */
+void rn_keyConfig	(int handle,
+						char	cRaw,
+						char	cPress,
+						char	cRelease,
+						char	cCntHold,
+						char	cSpdLo,
+						char	cCntLo,
+						char	cSpdHi );
+/*** endheader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+rn_keyConfig                     <RNET_KEYIF.LIB>
+
+SYNTAX: 			void rn_keyConfig	(int handle,
+						char	cRaw,
+						char	cPress,
+						char	cRelease,
+						char	cCntHold,
+						char	cSpdLo,
+						char	cCntLo,
+						char	cSpdHi );
+
+DESCRIPTION:   Assigns each key with key press and release codes,
+					hold and repeat ticks for auto repeat and debouncing.
+
+               <<< NOTE >>>
+               To ensure keypad driver compatibility, the keypad
+               must be installed so that a strobe line or data line starts
+               on J6 pin 1.
+
+PARAMETER1:		Address index to device information. Use rn_device()
+					or rn_find to establish handle.
+
+Parameter2:		Raw Key Code Index 0 to 63 for 1-key to 64-keys .
+               Keypad configurations will differ. Assign the raw code indexes
+               accordingly your keypad configuration. For example:
+
+A 2x6 keypad matrix with raw key code index assignments [in brackets]:
+
+   [ 13  ] [ 12  ] [ 11  ] [ 10  ] [  9  ] [  8  ]
+	[  5  ] [  4  ] [  3  ] [  2  ] [  1  ] [  0  ]
+
+A 4x10 keypad matrix with raw key code index assignments [in brackets]:
+
+[ 32 ][ 33 ][ 24 ][ 25 ][ 16 ][ 17 ][  8 ][  9 ][  0 ][  1 ]
+[ 34 ][ 35 ][ 26 ][ 27 ][ 18 ][ 19 ][ 10 ][ 11 ][  2 ][  3 ]
+[ 36 ][ 39 ][ 28 ][ 31 ][ 20 ][ 23 ][ 12 ][ 15 ][  4 ][  7 ]
+[ 38 ][ 37 ][ 30 ][ 29 ][ 22 ][ 21 ][ 14 ][ 13 ][  6 ][  5 ]
+
+Parameter3:		Key Press Code, an 8-bit value or character returned when a key
+					is pressed or 0 when unused. For example:
+
+	[  1  ] [  2  ] [  3  ] [  4  ] [  5  ] [     ]
+	[  6  ] [  7  ] [  8  ] [  9  ] [  0  ] [  E  ]
+
+Or
+
+[  1 ][  2 ][  3 ][  4 ][  5 ][  6 ][  7 ][  8 ][  9 ][  0 ]
+[  A ][  B ][  C ][  D ][  E ][  F ][  G ][  H ][  I ][  J ]
+[  K ][  L ][  M ][  N ][  O ][  P ][  Q ][  R ][  S ][  T ]
+[  U ][  V ][  W ][  X ][  Y ][  Z ][  * ][  # ][  < ][  > ]
+
+Parameter4:		Key Release Code, an 8-bit value or character (does not have to
+					be the same as Parameter 3) to be returned when a key is released
+               or 0 when unused.
+
+PARAMETER5:		cCntHold - Hold Ticks, how long to hold before repeating,
+               zero equals No Repeat.
+
+PARAMETER6:		cSpdLo - Low Speed Repeat Ticks, how many times to repeat,
+               zero equals None.
+
+PARAMETER7:		cCntLo - Low Speed Hold Ticks, how long to hold before going
+               to high speed repeat, zero equals Slow Only.
+
+PARAMETER8:		cSpdHi - High Speed Repeat Ticks, how many times to repeat
+               after low speed repeat, zero equals None.
+
+RETURN VALUE:	None
+
+SEE ALSO:		rn_keyProcess
+
+END DESCRIPTION **********************************************************/
+
+_keyif_nodebug
+void rn_keyConfig	(int handle,
+					 	char	cRaw,
+						char	cPress,
+						char	cRelease,
+						char	cCntHold,
+						char	cSpdLo,
+						char	cCntLo,
+						char	cSpdHi )
+{
+	auto rnKey *pKey;
+   auto rn_devstruct *devaddr;
+
+   devaddr = (rn_devstruct *)handle;
+
+	pKey = &rn_asKey[cRaw];
+	pKey->cPress = cPress;
+	pKey->cRelease = cRelease;
+	if (!cPress)
+		cCntHold = cSpdLo = cCntLo = cSpdHi = 0;
+	pKey->cCntHold = cCntHold;
+	pKey->cSpdLo = cSpdLo;
+	pKey->cCntLo = cCntLo;
+	pKey->cSpdHi = cSpdHi;
+	pKey->cState = 0;
+}
+
+
+/*** Beginheader rn_keyUnget */
+
+void rn_keyUnget (int handle, char cKey, int reserved);
+/*** endheader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+rn_keyUnget                     <RNET_KEYIF.LIB>
+
+SYNTAX:	      void rn_keyUnget (int handle, char cKey, int reserved);
+
+DESCRIPTION:   Push ckey value onto the top of input queue. The queue
+               is 16 bytes deep.
+
+PARAMETER1:		Address index to device information. Use rn_device()
+					or rn_find to establish handle.
+PARAMETER2:    Value to be pushed.
+PARAMETER3:    Reserved. Set as 0.
+
+RETURN VALUE:	None
+
+SEE ALSO:		rn_keyProcess, rn_keyGet
+
+END DESCRIPTION **********************************************************/
+
+_keyif_nodebug
+void rn_keyUnget (int handle, char cKey, int reserved)
+{
+	if (cKey) {
+		// unget only non-zero key values
+		_rn_dqPush(&rn_sKeyQ, cKey);
+	}
+}
+
+
+/*** Beginheader rn_keyGet */
+char rn_keyGet	(int handle, int reserved);
+
+/*** endheader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+rn_keyGet                     <RNET_KEYIF.LIB>
+
+SYNTAX:	      char rn_keyGet	(int handle, int reserved);
+
+DESCRIPTION:   Get next keypress
+
+PARAMETER1:		Address index to device information. Use rn_device()
+					or rn_find to establish handle.
+PARAMETER2:    Reserved. Set as 0.
+
+RETURN VALUE:	The next keypress or 0 if none
+
+SEE ALSO:		rn_keyProcess, rn_keyUnget
+
+END DESCRIPTION **********************************************************/
+
+_keyif_nodebug
+char rn_keyGet	(int handle, int reserved)
+{
+ 	auto int regnum, datalen;
+   auto rnDataSend ds;
+   auto rnDataRec dr;
+   auto rn_devstruct *devaddr;
+  	auto int nKey;
+
+   devaddr = (rn_devstruct *)handle;
+
+	if ((nKey = _rn_dqPop(&rn_sKeyQ)) == -1)
+   	return 0;
+
+   if (rnkeyinfo[devaddr->portnum].buzzperiod > 0)
+   {
+	  	KEYIFW16;
+  		ds.cmd = regnum;
+	   ds.mosi[0] = (char) (rnkeyinfo[devaddr->portnum].buzzperiod >> 8);
+   	ds.mosi[1] = (char) rnkeyinfo[devaddr->portnum].buzzperiod;
+
+#ifdef RN_ACCESS_PROTECTION
+      if (RN_ACCESS_FN(devaddr->portnum)) return RN_SPIBUSY;
+#endif
+		_rn_sp_fastenable(devaddr->portnum);
+		_mosi_driver(3, &ds, &dr, &devaddr->cmdtiming, &rn_spi[devaddr->portnum]);
+		_rn_sp_fastdisable(devaddr->portnum);
+#ifdef RN_ACCESS_PROTECTION
+      RN_RELEASE_FN(devaddr->portnum);
+#endif
+   }
+
+	return nKey;
+}
+
+
+/*** BeginHeader rn_keyBuzzerAct */
+int rn_keyBuzzerAct(int handle, unsigned int period, int reserved);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION **************************************************
+rn_keyBuzzerAct			<RNET_KEYIF.LIB>
+
+SYNTAX:			int rn_keyBuzzerAct(int handle, unsigned int period, int reserved)
+
+DESCRIPTION:	Activates the Buzzer for a specified interval of time.
+					rn_buzzer will override this function.  Does not affect
+               key press buzzer setting.
+
+PARAMETER1:		Address index to device information. Use rn_device()
+					or rn_find to establish handle.
+PARAMETER2:    Sets the length of time for the buzzer to be activated.
+					Range = 1 - 65535 ms
+PARAMETER3:    Reserved. Set as 0.
+
+RETURN VALUE:	-1, device information indicates no connection
+               or status byte from previous command.
+
+SEE ALSO:  		rn_keyBuzzer
+
+END DESCRIPTION ***************************************************************/
+
+_keyif_nodebug
+int rn_keyBuzzerAct(int handle, unsigned int period, int reserved)
+{
+ 	auto int regnum, datalen;
+   auto rnDataSend ds;
+   auto rnDataRec dr;
+   auto rn_devstruct *devaddr;
+
+   devaddr = (rn_devstruct *)handle;
+   if (devaddr->dtype == NOCONNECT)
+   	return NOCONNECT;
+
+	KEYIFW16;
+  	ds.cmd = regnum;
+   ds.mosi[0] = (char )((period & 0xFF00) >> 8);
+   ds.mosi[1] = (char ) (period & 0x00FF);
+
+#ifdef RN_ACCESS_PROTECTION
+	if (RN_ACCESS_FN(devaddr->portnum)) return RN_SPIBUSY;
+#endif
+  	_rn_sp_fastenable(devaddr->portnum);
+  	_mosi_driver(3, &ds, &dr, &devaddr->cmdtiming, &rn_spi[devaddr->portnum]);
+  	_rn_sp_fastdisable(devaddr->portnum);
+#ifdef RN_ACCESS_PROTECTION
+	RN_RELEASE_FN(devaddr->portnum);
+#endif
+
+   return (dr.statusbyte);
+}
+
+/*** BeginHeader rn_keyBuzzer */
+int rn_keyBuzzer (int handle, int onOff, int reserved);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION **************************************************
+rn_keyBuzzer					<RNET_KEYIF.LIB>
+
+SYNTAX:			int rn_keyBuzzer(int handle, int onOff, int reserved);
+
+DESCRIPTION:	Buzzer control, will set the buzzer to the specified state until
+               called again.	This function will override any setting by
+               rn_keyBuzzerAct.  Does not affect key press buzzer setting.
+
+PARAMETER1:		Address index to device information. Use rn_device()
+					or rn_find to establish handle.
+PARAMETER2:		Buzzer ON/OFF control.
+		  			0  = Buzzer OFF
+					1  = Buzzer ON
+PARAMETER3:    Reserved. Set as 0.
+
+
+RETURN VALUE:	-1, device information indicates no connection
+               or status byte from previous command.
+
+SEE ALSO:		rn_keyBuzzerAct
+
+END DESCRIPTION ***************************************************************/
+
+_keyif_nodebug
+int rn_keyBuzzer (int handle, int onOff, int reserved)
+{
+ 	auto int regnum, datalen;
+   auto rnDataSend ds;
+   auto rnDataRec dr;
+   auto rn_devstruct *devaddr;
+
+   devaddr = (rn_devstruct *)handle;
+   if (devaddr->dtype == NOCONNECT)
+   	return NOCONNECT;
+
+	KEYIFW15;
+  	ds.cmd = regnum;
+   ds.mosi[0] = onOff;
+
+#ifdef RN_ACCESS_PROTECTION
+	if (RN_ACCESS_FN(devaddr->portnum)) return RN_SPIBUSY;
+#endif
+  	_rn_sp_fastenable(devaddr->portnum);
+  	_mosi_driver(2, &ds, &dr, &devaddr->cmdtiming, &rn_spi[devaddr->portnum]);
+  	_rn_sp_fastdisable(devaddr->portnum);
+#ifdef RN_ACCESS_PROTECTION
+	RN_RELEASE_FN(devaddr->portnum);
+#endif
+
+   return (dr.statusbyte);
+}
+
+/*** BeginHeader rn_keyLedOut */
+int rn_keyLedOut (int handle, int led, int onOff, int reserved);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION **************************************************
+rn_keyLedOut				<RNET_KEYIF.LIB>
+
+SYNTAX:			int rn_keyLedOut(int handle, int led, int onOff, int reserved);
+
+DESCRIPTION:	The "uP Bad" LED is user controllable and can be set to
+					a specified state until called again.
+
+PARAMETER1:		Address index to device information. Use rn_device()
+					or rn_find to establish handle.
+PARAMETER2:		LED to control.
+					0 = for "uP Bad" LED.
+PARAMETER3:		LED On/Off control.
+		  			0  = LED Off
+					1  = LED On
+PARAMETER3:    Reserved. Set as 0.
+
+
+RETURN VALUE:	-1, device information indicates no connection
+               or status byte from previous command.
+
+SEE ALSO:		rn_keyBuzzer
+
+END DESCRIPTION ***************************************************************/
+
+_keyif_nodebug
+int rn_keyLedOut (int handle, int led, int onOff, int reserved)
+{
+ 	auto int regnum, datalen;
+   auto rnDataSend ds;
+   auto rnDataRec dr;
+   auto rn_devstruct *devaddr;
+
+   devaddr = (rn_devstruct *)handle;
+   if (devaddr->dtype == NOCONNECT)
+   	return NOCONNECT;
+
+	KEYIFW13;
+  	ds.cmd = regnum;
+   ds.mosi[0] = onOff;
+
+#ifdef RN_ACCESS_PROTECTION
+	if (RN_ACCESS_FN(devaddr->portnum)) return RN_SPIBUSY;
+#endif
+  	_rn_sp_fastenable(devaddr->portnum);
+  	_mosi_driver(2, &ds, &dr, &devaddr->cmdtiming, &rn_spi[devaddr->portnum]);
+  	_rn_sp_fastdisable(devaddr->portnum);
+#ifdef RN_ACCESS_PROTECTION
+	RN_RELEASE_FN(devaddr->portnum);
+#endif
+
+   return (dr.statusbyte);
+}
+
+/*** Beginheader rn_keyInit */
+
+int rn_keyInit (int handle, unsigned int iobits, char buzzerperiod);
+
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+rn_keyInit                     <RNET_KEYIF.LIB>
+
+SYNTAX:	      int rn_keyInit (int handle, unsigned int iobits, int buzzerperiod);
+
+DESCRIPTION:   Initializes keypad process and buzzer control for when
+               a key is pressed.  Call this function prior to any keypad
+               operations.  Calling this function more than once will
+               reinitialize key processing queues.
+
+               <<< NOTE >>>
+               To ensure keypad driver compatibility, the keypad
+               must be installed so that a strobe line or data line starts
+               on J6 pin 1.
+
+PARAMETER1:		Address index to device information. Use rn_device()
+					or rn_find to establish handle.
+
+PARAMETER2:		A sixteen-bit number, of 1’s for outputs and 0’s for inputs.
+				  	Each bit represents 16 lines available for keypad interface.
+               For example, a value of 0x1F00 assigns strobe lines 13,12,11,
+               10 and 9, on J6 of the card interface as the output strobe lines.
+               The other bit lines are inputs or unused lines.
+
+PARAMETER3:		The buzzer may be activated whenever a key is pressed. Select
+               0 = No buzzer when a key is pressed,
+               1 - 255 ms = Enables the buzzer for the period specified for
+               each key press detected.
+
+
+RETURN VALUE:	-1, device information indicates no connection
+
+
+END DESCRIPTION **********************************************************/
+
+
+_keyif_nodebug
+int rn_keyInit (int handle, unsigned int iobits, char buzzerperiod)
+{
+   auto rn_devstruct *devaddr;
+
+   devaddr = (rn_devstruct *)handle;
+   if (devaddr->dtype == NOCONNECT)
+   	return NOCONNECT;
+
+   rnkeyinfo[devaddr->portnum].strobits = iobits;
+   rnkeyinfo[devaddr->portnum].buzzperiod = buzzerperiod;
+
+	// Initialize keypad memory arrays
+	memset(rn_asKey, 0x00, sizeof(rn_asKey));					//	Reset Key Processing
+	memset(rn_aacKey, 0xFF, sizeof(rn_aacKey));				//	Idle Raw Key Map
+	_rn_dqInit(&rn_sKeyQ, rn_acKeyQ, sizeof(rn_acKeyQ));	//	Init Key Queue
+
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

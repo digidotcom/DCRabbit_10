@@ -1,0 +1,404 @@
+/*
+	ftp2fat.lib
+	Copyright (c) 2008 Digi International Inc., All Rights Reserved
+
+	This software contains proprietary and confidential information of Digi
+	International Inc.  By accepting transfer of this copy, Recipient agrees
+	to retain this software in confidence, to prevent disclosure to others,
+	and to make no use of this software other than that for which it was
+	delivered.  This is a published copyrighted work of Digi International
+	Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+	prohibited.
+
+	Restricted Rights Legend
+
+	Use, duplication, or disclosure by the Government is subject to
+	restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+	Technical Data and Computer Software clause at DFARS 252.227-7031 or
+	subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+	Restricted Rights at 48 CFR 52.227-19, as applicable.
+
+	Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+*/
+/* START LIBRARY DESCRIPTION ************************************************
+
+	Download a file from an FTP server and store it in the FAT filesystem.
+
+	Requires FAT16.LIB and FTP_CLIENT.LIB to be #used first.
+
+	Macros:
+
+	FTP2FAT_VERBOSE - If defined, library will print status messages to STDOUT.
+
+	FTP2FAT_DEBUG - If defined, functions will be debuggable (i.e., you can set
+				breakpoints and single-step into them).
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader ftp2fat_init, ftp2fat_tick */
+#if((!(defined __FAT16_LIB) && !(defined __FAT_LIB)) || !(defined FTP_CLIENT_H))
+	#warns "When using ftp2fat.lib, you must #use ftp_client.lib and either"
+	#fatal "fat16.lib or fat.lib libraries before you #use ftp2fat.lib library."
+#endif
+
+#ifdef FTP2FAT_DEBUG
+	#define _ftp2fat_debug __debug
+#else
+	#define _ftp2fat_debug __nodebug
+#endif
+
+#use "url.lib"
+
+/* START FUNCTION DESCRIPTION ********************************************
+ftp2fat_t																	<ftp2fat.lib>
+
+	Structure used to store state information for ftp2fat_tick.  Initialized
+	by ftp2fat_init.  Useful elements the caller of ftp2fat_tick can use:
+
+	char *localfn					Full path (without partition) of destination file.
+
+	unsigned long filesize		Set to 0 if size isn't known, or the size of the
+										file being downloaded.
+
+	unsigned long bytesread		Number of bytes read so far.
+
+SEE ALSO:		ftp2fat_init, ftp2fat_tick
+
+END DESCRIPTION **********************************************************/
+
+// Note that since that FAT library requires FATfile to be in near memory, the
+// API for this library requires the ftp2fat_t object to be in near as well.
+typedef struct {
+	FATfile			fatfile;
+	char				localfn[128];	// FAT file
+	unsigned long	filesize;		// size of FTP file, or 0 if unknown
+	unsigned long	bytesread;		// bytes of the file read and saved to FAT
+} ftp2fat_t;
+
+int ftp2fat_init (ftp2fat_t *f2f, const char *url, const char *localfile);
+int ftp2fat_tick( ftp2fat_t *f2f);
+/*** EndHeader */
+// Datahandler registerd with ftp_client.lib to receive file and store
+// in FAT filesystem.
+_ftp2fat_debug
+int _ftp2fat_dh (char * data, int readlen, longword readoffset,
+                   int flags, ftp2fat_t *f2f)
+{
+	auto int	writebytes;
+	auto int	offset;
+	auto int	error;
+
+	switch (flags)
+	{
+		case FTPDH_IN:
+			if (! f2f)
+			{
+#ifdef FTP2FAT_VERBOSE
+				printf("_ftp2fat_dh: error fatfile not set\n");
+#endif
+				return -1;
+			}
+
+         // write it to the FAT file
+         writebytes = readlen;
+         offset = 0;
+         error = 0;
+         while (!error && (writebytes > 0))
+         {
+            do {
+               error = fat_Write (&f2f->fatfile, &data[offset], writebytes);
+            } while (error == -EBUSY);
+            if (error < 0)
+            {
+#ifdef FTP2FAT_VERBOSE
+	            printf ("%s: error %d calling %s\n", "_ftp2fat_dh", error,
+	            	"fat_Write");
+#endif
+               return -1;
+            }
+            else if (error > 0)
+            {
+            	// error is # of bytes written
+               writebytes -= error;
+               offset += error;
+               error = 0;
+            }
+         }
+			f2f->filesize = ftp.filesize;
+			f2f->bytesread += readlen;
+			return readlen;
+
+		case FTPDH_OUT:
+#ifdef FTP2FAT_VERBOSE
+			printf ("_ftp2fat_dh: ERROR!  Should only get data in\n");
+#endif
+			break;
+
+		case FTPDH_END:
+#ifdef FTP2FAT_VERBOSE
+			printf("_ftp2fat_dh: END OK\n");
+#endif
+			return 0;
+
+		case FTPDH_ABORT:
+#ifdef FTP2FAT_VERBOSE
+			printf("_ftp2fat_dh: ABORTED\n");
+#endif
+			return 0;
+	}
+	return -1;
+}
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_ftp2fat_cleanup															<fttp2fat.lib>
+
+SYNTAX:			void _ftp2fat_cleanup( ftp2fat_t *f2f, int delete)
+
+DESCRIPTION: 	Close network socket and optionally delete FAT file (if open).
+
+PARAMETER 1:   Pointer to status structure.
+
+PARAMETER 2:	Flag set to 1 if the FAT file should be deleted (incomplete
+					download) or 0 to ignore it.
+
+END DESCRIPTION **********************************************************/
+_ftp2fat_debug
+void _ftp2fat_cleanup( ftp2fat_t *f2f, int delete)
+{
+   auto fat_part *part;
+
+   // remove data handler
+   ftp_data_handler (NULL, NULL, 0);
+
+   // if fatfile is not closed, the download failed and we need to clean up
+   if (delete)
+   {
+#ifdef FTP2FAT_VERBOSE
+   	printf( "%s: download failed, deleting %s\n", "ftp2fat", f2f->localfn);
+#endif
+		if (fat_IsOpen( &f2f->fatfile))
+		{
+      	part = f2f->fatfile.part;
+	      while (fat_Close( &f2f->fatfile) == -EBUSY);
+	      while (fat_Delete( part, FAT_FILE, f2f->localfn) == -EBUSY);
+	   }
+   }
+}
+
+/* START FUNCTION DESCRIPTION ********************************************
+ftp2fat_init																	<ftp2fat.lib>
+
+SYNTAX:			int ftp2fat_init (ftp2fat_t *f2f, const char *url,
+						const char *localfile)
+
+DESCRIPTION: 	Open FAT file, initiate FTP connection and initialize status
+					structure to pass to ftp2fat_tick, in order to download a file
+					from an FTP server and save it to a FAT file.
+
+PARAMETER 1:   Pointer to status structure.
+
+PARAMETER 2:   FTP URL of file to download, in the following format (items in
+					[] are optional): [ftp://][user:pass@]hostname[:port]/filename
+
+PARAMETER 3:	FAT pathname to store downloaded file.  In the format of
+					"a:filename.ext" or "/a/filename.ext".
+
+					IMPORTANT, the last parameter to ftp2fat_init() cannot change
+					until the calls to ftp2fat_tick() have completed.  If the
+					download fails, ftp2fat_tick() will delete the partially
+					received FAT file.  To do so, it keeps a pointer to this
+					parameter so it has the name of the file.
+
+RETURN VALUE:  Integer code as follows:
+						 0: Success, connection established.  Can pass <f2f> to
+						 		ftp2fat_tick to continue download.
+					   -EINVAL: Error parsing <url> or <localfile>.
+					   -E2BIG: FAT pathname is too long, must be < 128 characters.
+					   -NETERR_DNSERROR: Unable to resolve hostname from <url>.
+					   -NETERR_HOST_REFUSED: Unable to connect to FTP server.
+						<0: See fat_Open for additional error codes.
+
+SEE ALSO:		ftp2fat_t, ftp2fat_tick, fat_Open
+
+END DESCRIPTION **********************************************************/
+_ftp2fat_debug
+int ftp2fat_init (ftp2fat_t *f2f, const char *url, const char *localfile)
+{
+	// shared variables
+	auto byte	buffer[512];
+	auto int	error;				// return code
+	auto int	i;
+
+	// variables for FAT
+	auto fat_part *part;
+	auto char *filepath;
+	auto long filelen;
+
+	if (! f2f)
+	{
+		return -EINVAL;
+	}
+
+	memset (f2f, 0, sizeof(*f2f));
+
+#ifdef FTP2FAT_VERBOSE
+	printf ("%s: downloading %s\n", "ftp2fat", url);
+	printf ("\t to %s\n", localfile);
+#endif
+
+	error = fat_GetPartition (&part, (const char **)&filepath, localfile);
+	if (error)
+	{
+#ifdef FTP2FAT_VERBOSE
+		printf ("%s: error %d calling %s\n", "ftp2fat", error,
+			"fat_GetPartition");
+#endif
+		return error;
+	}
+
+	// copy filepath to f2f (if there's enough room)
+	i = strlen( filepath);
+	if (i > (sizeof(f2f->localfn) - 1))
+	{
+#ifdef FTP2FAT_VERBOSE
+	   printf ("%s: file path too big (%u characters)\n", "ftp2fat", i);
+#endif
+		return -E2BIG;
+	}
+	// add 1 to include null terminator (not included in strlen return)
+	memcpy( f2f->localfn, filepath, i + 1);
+
+	error = ftp_client_setup_url( url, FTP_MODE_DOWNLOAD | PASSIVE_FLAG,
+		NULL, 0);
+   if (error)
+   {
+#ifdef FTP2FAT_VERBOSE
+      printf ("%s: error %d calling %s\n", "ftp2fat", error,
+      	"ftp_client_setup_url");
+#endif
+      return error;
+   }
+
+	if (!error)
+	{
+		// we won't know filesize until after a few calls to ftp_tick
+		filelen = 0;
+#ifdef FTP2FAT_VERBOSE
+      printf ("%s: Downloading file of unknown size...\n", "ftp2fat");
+	   printf ("%s: creating file on FAT filesystem\n", "ftp2fat");
+#endif
+	   do {
+	      // !!! do we need to add a timeout of some sort, to break out of loop?
+	      error = fat_Open (part, f2f->localfn, FAT_FILE,
+	      	FAT_CREATE | FAT_SEQUENTIAL, &f2f->fatfile, &filelen);
+	   } while (error == -EBUSY);
+
+#ifdef FTP2FAT_VERBOSE
+	   if (error)
+	   {
+	      printf ("%s: error %d calling fat_Open on [%s]\n", "ftp2fat", error,
+	      	f2f->localfn);
+	   }
+#endif
+	}
+
+	if (error)
+	{
+		// Clean up on error.  Note that we couldn't successfully open the
+		// file, so we don't have to try deleting it during cleanup.
+		_ftp2fat_cleanup( f2f, 0);
+	}
+	else
+	{
+		// register data handler, and pass f2f to it
+		ftp_data_handler (_ftp2fat_dh, f2f, 0);
+	}
+
+	return error;
+}
+
+/* START FUNCTION DESCRIPTION ********************************************
+ftp2fat_tick																	<ftp2fat.lib>
+
+SYNTAX:			int ftp2fat_tick( ftp2fat_t *f2f);
+
+DESCRIPTION: 	Read more data from FTP server, and write it out to FAT file.
+
+PARAMETER 1:   Pointer to status structure, set up by ftp2fat_init.
+
+RETURN VALUE:  Integer code as follows:
+						 0: Success, file download complete.
+						>0: FTP error (see ftp_client_tick for list of return values)
+					   -EBUSY:	Download in progress.
+					   -EINVAL: Invalid structure passed as parameter 1.
+						Any other negative value: I/O error when updating the
+							directory entry.
+
+						For errors other than -EBUSY and -EINVAL, the incomplete
+						FAT file is deleted.
+
+NOTES:			You can monitor download progress via the f2f->filesize and
+					f2f->bytesread elements (both unsigned long) from ftp2fat_t.
+
+SEE ALSO:		ftp2fat_t, ftp2fat_init, ftp_client_tick
+
+END DESCRIPTION **********************************************************/
+_ftp2fat_debug
+int ftp2fat_tick( ftp2fat_t *f2f)
+{
+	auto int error;
+
+	// if f2f isn't valid (or completed), return immediately
+	if (!f2f || fat_IsClosed( &f2f->fatfile))
+	{
+		return -EINVAL;
+	}
+
+   error = ftp_client_tick();
+
+	if (error == FTPC_AGAIN)
+	{
+		// download still in progress
+		return -EBUSY;
+	}
+
+   // download complete, remove data handler
+   ftp_data_handler (NULL, NULL, 0);
+
+   if (error == FTPC_OK)
+   {
+      // success, clear error flag
+      error = 0;
+   }
+#ifdef FTP2FAT_VERBOSE
+   else
+   {
+      printf("%s: download failed, status=%d, last code=%d\n", "ftp2fat",
+      	error, ftp_last_code());
+   }
+#endif
+
+	if (!error)
+	{
+#ifdef FTP2FAT_VERBOSE
+		printf ("\n%s: downloaded %lu bytes\n", "ftp2fat", f2f->bytesread);
+#endif
+	   do {
+	      error = fat_Close(&f2f->fatfile);
+	   } while (error == -EBUSY);
+
+#ifdef FTP2FAT_VERBOSE
+	   if (error)
+	   {
+	      printf("%s: error %d calling %s\n", "ftp2fat", error, "fat_Close");
+	   }
+#endif
+	}
+
+	// Either done or exiting due to an error.  Cleanup and possibly delete file.
+   _ftp2fat_cleanup( f2f, error ? 1 : 0);
+
+	return error;
+}
+
+

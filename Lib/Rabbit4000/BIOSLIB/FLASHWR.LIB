@@ -1,0 +1,1068 @@
+/******************************************************************************
+FLASHWR.LIB
+
+   Copyright (c) 2010 Digi International Inc., All Rights Reserved
+
+   This software contains proprietary and confidential information of Digi
+   International Inc.  By accepting transfer of this copy, Recipient agrees
+   to retain this software in confidence, to prevent disclosure to others,
+   and to make no use of this software other than that for which it was
+   delivered.  This is a published copyrighted work of Digi International
+   Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+   prohibited.
+
+   Restricted Rights Legend
+
+   Use, duplication, or disclosure by the Government is subject to
+   restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+   Technical Data and Computer Software clause at DFARS 252.227-7031 or
+   subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+   Restricted Rights at 48 CFR 52.227-19, as applicable.
+
+   Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+*******************************************************************************/
+
+/*** BeginHeader */
+#ifndef __FLASHWR2_LIB
+#define __FLASHWR2_LIB
+#include <stddef.h>
+/*** EndHeader */
+
+// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!  WARNING  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+//    Do not modify this driver without observing the following:
+// The flash driver, in order to support core modules running from flash, uses
+// a ram buffer from the RAM segment to run critical flash routines. Dynamic C
+// cannot express a code difference as a constant, and so the buffer must be
+// sized manually by looking at RabbitBios.map. Since the buffer has conditional
+// directives one must compile for the worst case to determine the proper size,
+// which currently is any Rabbit 4000 core module with 16-bit enabled.
+//    Also be advised that any changes one makes to this driver will not be
+// immediately apparent without rebuilding the pilot bioses, which depend on
+// this driver. Here is a full check list of things to do after modifying this
+// driver:
+// 1. Change RAM_FUNCTIONS_SIZE to the correct value as described above.
+// 2. Recompile the pilot bioses and test that representative boards.
+// 3. Check that C breakpoints work.
+// 4. Check that userblock functionality is still intact.
+// 5. Check that WriteIdBlock.lib still works by writing ID blocks to various
+//    core modules.
+// 6. Make sure that cloning still works.
+
+// In short, you should have a reason to modify this driver that justifies the
+// time to go through the laundry list above.
+
+
+/*** BeginHeader */
+// -----------------------------------------------------------------------------
+// |                           Macro definitions                               |
+// -----------------------------------------------------------------------------
+#ifdef PILOT_BIOS
+	#define PILOT_DEFINED 1
+#else
+	#define PILOT_DEFINED 0
+#endif
+
+#ifndef USE_RAM_FUNCTIONS
+	#define USE_RAM_FUNCTIONS (!PILOT_DEFINED && FLASH_COMPILE)
+#endif
+
+#define FLASH_FORMAT_ENTRIES 4
+#define FLASH_ID_ENTRIES 8
+
+// -----------------------------------------------------------------------------
+// |                           Data Structures                                 |
+// -----------------------------------------------------------------------------
+
+// Uniquely specifies a JEDEC sequence method. This driver assumes that all
+// flash parts will use identical sequences under minor transformations. This
+// structure captures those transformations.
+// WARNING: The assembly code in the critical sections depends on the field
+// layout of this structure, so don't change it unless you can fix the critical
+// routines!
+struct _FlashFormatEntry
+{
+   char is_16_bit;			// 1 if 16-bit access only, 0 otherwise
+   char use_shift;         // 1 if shifted command addresses, 0 otherwise
+   unsigned int addr_mask; // High bits signify significant command address bits
+};
+
+// Structure to capture additional aspects of the flash device, intended to be
+// keyed on the 'id' field.
+struct _FlashIdEntry
+{
+	unsigned int id; 			// MSB:Manufacturer LSB:Part
+	char num_extensions; 	// For any future products that use a continuation
+                        	// code. See JEDEC publication JEP106W.
+#ifdef PILOT_BIOS
+   const char * sectors;	// Sector layout in 4k blocks, NULL otherwise.
+#else
+   char * sectors;   		// Sector layout in 4k blocks, NULL otherwise.
+#endif
+
+   unsigned int size_4k;   // Size of flash in 4k blocks.
+};
+/*** EndHeader */
+
+
+// -----------------------------------------------------------------------------
+// |                            Constants                                      |
+// -----------------------------------------------------------------------------
+/*** BeginHeader _flash_format_entries */
+#ifdef PILOT_BIOS
+ extern const struct _FlashFormatEntry _flash_format_entries[];
+#else
+ __root void  _flash_format_entries();
+#endif
+/*** EndHeader */
+
+#ifdef PILOT_BIOS
+ // See comments on the data structure.
+ const struct _FlashFormatEntry _flash_format_entries[FLASH_FORMAT_ENTRIES] =
+ {
+	{0, 1, 0xFFF},
+   {1, 1, 0xFFE},
+   {0, 0, 0x7FFF},
+   {1, 1, 0xFFFE},
+ };
+#else
+ // We must use code space for this table to keep const data below 16K
+ //  when cloning!
+ #asm __root
+ _flash_format_entries::
+   db 0, 1, 0xFF, 0x0F
+   db 1, 1, 0xFE, 0x0F
+   db 0, 0, 0xFF, 0x7F
+   db 1, 1, 0xFE, 0xFF
+   db 0, 0, 0x00, 0x00
+ #endasm
+
+#endif
+
+ /*** BeginHeader _flash_sectors */
+ extern const char _flash_sectors[];
+ /*** EndHeader */
+
+#ifdef PILOT_BIOS
+ // Flash sector layouts are listed in 4k blocks from bottom to top.
+ // Zero signals the end of the flash. By listing them all we can accomodate odd
+ // variations in the future.
+ const char _flash_sectors[] =
+ {
+	// ATMEL layout... index 0
+	16, 16, 16, 16, 16, 16, 16, 16,
+   16, 16, 16, 16, 16, 16, 16, 2, 2, 2, 2, 2, 2, 2, 2, 0,
+
+   // Spansion, ST micro layouts, index 24
+   16, 16, 16, 16, 16, 16, 16, 16,
+   16, 16, 16, 16, 16, 16, 16, 8, 2, 2, 4, 0,
+
+   // Room for one more sector layout, in case of binary patching.
+   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+ };
+#else
+ const char _flash_sectors[]="";
+#endif
+
+
+ // We must use code space for this table to keep const data below 16K
+ //  when cloning!
+ /*** BeginHeader _flash_sectors01, _flash_sectors02, _flash_sectors03 */
+ __root void _flash_sectors01();
+ __root void _flash_sectors02();
+ __root void _flash_sectors03();
+ /*** EndHeader */
+ #asm __root
+#ifndef PILOT_BIOS
+ _flash_sectors01::
+	// ATMEL layout... index 0
+	db 16, 16, 16, 16, 16, 16, 16, 16
+   db 16, 16, 16, 16, 16, 16, 16, 2, 2, 2, 2, 2, 2, 2, 2, 0
+
+ _flash_sectors02::
+   // Spansion, ST micro layouts
+   db 16, 16, 16, 16, 16, 16, 16, 16
+   db 16, 16, 16, 16, 16, 16, 16, 8, 2, 2, 4, 0
+
+ _flash_sectors03::
+   // Room for one more sector layout, in case of binary patching.
+   db 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+   db 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+ #endasm
+#else
+ _flash_sectors01::
+ _flash_sectors02::
+ _flash_sectors03::
+#endif
+
+ /*** BeginHeader _flash_id_entries */
+#ifdef PILOT_BIOS
+ extern const struct _FlashIdEntry _flash_id_entries[];
+#else
+ __root void _flash_id_entries();
+#endif
+ /*** EndHeader */
+
+#ifdef PILOT_BIOS
+ const struct _FlashIdEntry _flash_id_entries[FLASH_ID_ENTRIES] =
+ {
+	// SST39LF040, SST39VFO4O
+	{0xBFD7, 0, NULL, 128},
+
+	// SST39LF080, SST39VFO8O
+	{0xBFD8, 0, NULL, 256},
+
+   // SST39VF400A
+	{0xBF80, 0, NULL, 128},
+
+   // SST39VF800A
+   {0xBF81, 0, NULL, 256},
+
+   // AT49BV802DT
+   {0x1FC3, 0, &_flash_sectors[0], 256},
+
+   // S29AL008D (top boot block)
+   {0x01DA, 0, &_flash_sectors[24], 256},
+
+   // M29W800DT
+   {0x20D7, 0, &_flash_sectors[24], 256},
+
+   // Binary patch entry with fake id
+	{0x5A5A, 0, NULL, 0},
+ };
+#else
+ // We must use code space for this table to keep const data below 16K
+ //  when cloning!
+ #asm __root
+
+ _flash_id_entries::
+	// SST39LF040, SST39VFO4O
+	// {0xBFD7, 0, NULL, 128},
+	db 0xD7, 0xBF, 0x00, 0x00, 0x00, 0x80, 0x00
+
+	// SST39LF080, SST39VFO8O
+	// {0xBFD8, 0, NULL, 256},
+	db 0xD8, 0xBF, 0x00, 0x00, 0x00, 0x00, 0x01
+
+   // SST39VF400A
+	// {0xBF80, 0, NULL, 128},
+	db 0x80, 0xBF, 0x00, 0x00, 0x00, 0x80, 0x00
+
+   // SST39VF800A
+   // {0xBF81, 0, NULL, 256},
+	db 0x81, 0xBF, 0x00, 0x00, 0x00, 0x00, 0x01
+
+   // AT49BV802DT
+   // {0x1FC3, 0, &_flash_sectors[0], 256},
+	db 0xC3, 0x1F, 0x00, _flash_sectors01, _flash_sectors01>>8, 0x00, 0x01
+
+   // S29AL008D (top boot block)
+   // {0x01DA, 0, &_flash_sectors[24], 256},
+	db 0xDA, 0x01, 0x00, _flash_sectors02, _flash_sectors02>>8, 0x00, 0x01
+
+   // M29W800DT
+   // {0x20D7, 0, &_flash_sectors[24], 256},
+	db 0xD7, 0x20, 0x00, _flash_sectors02, _flash_sectors02>>8, 0x00, 0x01
+
+   // Binary patch entry with fake id
+	// {0x5A5A, 0, NULL, 0},
+	db 0x5A, 0x5a, 0x00, 0x00, 0x00, 0x00, 0x00
+ #endasm
+
+#endif
+
+// -----------------------------------------------------------------------------
+// |                            Global Variables                               |
+// -----------------------------------------------------------------------------
+/*** BeginHeader _flash_format */
+extern struct _FlashFormatEntry _flash_format;
+/*** EndHeader */
+// The format of the flash device, invalid until _GetFlashId is called either
+// directly or through _InitFlashDriver
+struct _FlashFormatEntry _flash_format;
+
+/*** BeginHeader _flash_info */
+extern struct _FlashIdEntry _flash_info;
+/*** EndHeader */
+// The additional information about the connected flash device, invalid until
+// _InitFlashDriver is called.
+struct _FlashIdEntry _flash_info;
+
+/*** BeginHeader _flash_command_base */
+extern unsigned long _flash_command_base;
+/*** EndHeader */
+// The Rabbit 4000 instruction set allows use of the ld (pd+hl), r instructions.
+// These are signed sixteen bit, however, so to avoid issuing commands to the
+// wrong locations, this driver precalculates a location near the beginning of
+// flash where all signed 16-bit offsets will still be within the flash address
+// range. This value is invalid until _InitFlashDriver is called.
+unsigned long _flash_command_base;
+
+/*** BeginHeader _flash_base */
+extern unsigned long _flash_base;
+/*** EndHeader */
+// Since the flash is not necessarily entirely mapped, storing the flash base
+// address is critical to the correct functionality of _SectorToLong and
+// _LongToSector.
+unsigned long _flash_base;
+
+/*** BeginHeader _flash_is_large_sector */
+extern unsigned int  _flash_is_large_sector;
+/*** EndHeader */
+// Used to determine whether to reference a sector layout. Currently, this
+// driver assumes that if the flash isn't large sector then it is small sector
+// flash with 4k uniform sectors. This value is invalid until _InitFlashDriver
+// is called.
+unsigned int  _flash_is_large_sector;
+
+// Valid only for large sector flashes.
+/*** BeginHeader _flash_number_of_sectors */
+extern unsigned int  _flash_number_of_sectors;
+/*** EndHeader */
+// Number of flash sectors. Invalid until _InitFlashDriver is called.
+unsigned int  _flash_number_of_sectors;
+
+// Entries are in 4k. Last entry is flash size.
+/*** BeginHeader _flash_sector_addresses */
+extern unsigned int  _flash_sector_addresses[];
+/*** EndHeader */
+
+#define FLASH_MAX_SECTORS 23
+// This is specifically to make the implementation of _LongToSector and
+// _SectorToLong functions easy to implement by listing the start addresses of
+// each sector for a large sector flash in increasing order.
+// WARNING: Update the FLASH_MAX_SECTORS if you add a new large sector flash
+// part that has more sectors than the current FLASH_MAX_SECTORS value.
+unsigned int  _flash_sector_addresses[FLASH_MAX_SECTORS+1];
+
+/*** BeginHeader _InitFlashDriverOK */
+extern int _InitFlashDriverOK;
+/*** EndHeader */
+int _InitFlashDriverOK;
+
+/*** BeginHeader _InitFlashDriver */
+__nodebug __root
+int _InitFlashDriver(unsigned long flash_base_address,
+                     unsigned long true_base_address);
+/*** EndHeader */
+
+// Because _InitFlashDriver is responsible for copying the critical functions to
+// the ram buffer, the ram buffer and core functions are listed here, so that
+// using the _InitFlashDriver symbol entails compilation of these objects. Note
+// that the functions abut in a single assembly block. This is to simplify the
+// ram buffer and copy logic so that _InitFlashDriver only need copy one block
+// and maintainers of the driver only need update one value.
+
+// See top of file for information on this buffer.
+// Additionally, this ram size relies on the run_in_ram origin being large
+// enough to hold the array.
+
+#if USE_RAM_FUNCTIONS
+ #define RAM_FUNCTIONS_SIZE 0x1F3
+ #orgact run_in_ram resume
+ char _RamFunctions[RAM_FUNCTIONS_SIZE];
+ #orgact rootdata resume
+#endif
+
+// These functions should not be called from C.
+void _GetFlashId(void);
+void _EraseFlashSector(void);
+void _ProgramFlashUnit(void);
+
+// WARNING:
+// Ram functions will not work if they contain absolute jumps. Always remember
+// that they should be fully relocatable without implementing a loader.
+
+// -----------------------------------------------------------------------------
+// |                      Core Function: _GetFlashId                           |
+// -----------------------------------------------------------------------------
+#asm __root
+// Parameters
+// px = flash command base. Not _flash_command_base because it could be invalid.
+// py = flash base address.
+_GetFlashId::
+	// For each entry, preread the memory contents, try the method, then
+   // compare. If they're different, return the value, otherwise continue.
+   // If all fails to produce a different value, then return the pre-read
+   // value.
+   // Pseudo-code:
+   // s = readFlash(0);
+   // for (i = 0; i < FLASH_FORMAT_ENTRIES; ++i) {
+   //    t = getId(_flash_format_entries[i]);
+   //    if (s != t) return t;
+   // }
+   // return s;
+#if USE_RAM_FUNCTIONS
+		ipset	3
+#pragma nowarn // We need to jump to a non label, so supress the warning here
+      jp	_RamFunctions              ; Depends on _InitFlashDriver copy to ram.
+_RamFunctions_Begin::               ; But should arrive at this label.
+#endif
+      clr	hl
+   	push	hl                      ; Index value = 0
+
+.loop:
+		; hl should be loaded with the index
+#ifdef PILOT_BIOS
+   	ldl	pz, _flash_format_entries
+#else
+   	ld	   pz, _flash_format_entries
+#endif
+   	ld		bcde, (pz+hl)
+      ld		(_flash_format), bcde   ; Preload _flash_format variable in case
+                                    ; this run is it.
+   	ld		pz, bcde                ; Load pz with format entry.
+
+      ld		hl, bc                  ; MBW of format entry is bit mask.
+      ld		de, hl                  ; Full mask in bcde, e.g. 0x0FFF0FFF
+
+      ld		jk, 0xAAAA
+      ld		hl, 0x5555					; Loaded the command address.
+      and	jkhl, bcde					; Applied the bit mask.
+
+      ld		bcde, pz                ; Reload the format entry.
+      ld		a, d                    ; Load the shift flag
+      or		a                       ; Carry flag zero after this executes.
+      jr		z, .dontshift1
+      ex		jk, hl                  ; Swap the addresses.
+.dontshift1:
+
+      ld		a, e                    ; Load the 16-bit memory flag.
+      or    a
+      jr		z, .noMACRchange
+      ld		b, ~0x06                ; Rabbit 4000 bitmask.
+ioi	ld		a, (GCPU)					; Check for >= Rabbit 5000
+      cp		3								; Carry flag = cpu < Rabbit 5000
+      jr		c, .r4000
+      rrc	b                       ; Adjust for Rabbit 5000 and above
+.r4000:
+ioi 	ld 	a, (MACR)
+		ld		d, a
+      and 	a, b							; Mask CS0
+ioi 	ld 	(MACR), a               ; Put MACR in 8-bit mode.
+		nop $ nop		; *always* follow any MACR update with two NOPs
+ioi	ld		a, (PDDDR)
+		ld		e, a
+      ld		a, 0xFF
+ioi	ld		(PDDDR), a
+		push	de
+.noMACRchange:
+		; Preparation done: Core ID retrieval algorithm...
+
+		ld		a, 0xAA                 ; Command address offset in hl
+      ld		(px+hl), a
+
+      ex		jk, hl                  ; Swap command offsets
+      ld		a, 0x55
+      ld		(px+hl), a
+
+      ex		jk, hl                  ; Swap command offsets
+      ld		a, 0x90
+      ld		(px+hl), a
+
+      ld		bcde, (py)              ; Just read 4 bytes and sort out later.
+
+      ld		a, 0xF0                 ; Exit mode
+      ld		(px+hl), a
+
+      ld		jkhl, (py)					; Re-read the same location.
+      cp		jkhl, bcde
+      flag	z, hl
+      ex		jk', hl						; Save the flag in jk'
+
+      ld		jkhl, pz						; Reload the format entry.
+      ld		a, L							; Load the 16-bit memory flag.
+      ex		jk, hl						; Save format flags in jk
+      or		a
+      jr		z, .noMACRchange2
+      pop   hl
+      ld		a, h
+ioi	ld		(MACR), a               ; Restore MACR and PDDDR settings
+		nop $ nop		; *always* follow any MACR update with two NOPs
+		ld		a, L
+ioi	ld		(PDDDR), a
+.noMACRchange2:
+
+		; Prepare the return value (even if it's wrong)
+      ex		jk, hl						; Recall format flags
+      ld		a, h                    ; Load the shift flag
+      or		a
+      jr    nz, .doshift
+      ld		c, d							; If no shift, product ID is in 'd'
+.doshift:
+      ld		b, e                    ; In either case, manufacturer is in 'e'
+
+		ex		jk', hl						; Remember success of ID check
+      bool	hl
+      jr		nz, .notFoundID
+
+      ; Found a product ID...
+      jr		.return
+
+.notFoundID:
+      pop	hl
+      inc	hl                      ; Increment index by four bytes
+      inc	hl                      ; (format entry size)
+      inc	hl
+      inc	hl
+      cp		hl, FLASH_FORMAT_ENTRIES*4   ; ASSERT(sizeof entry == 4)
+      push	hl
+      jre	c, .loop
+
+.return:
+		pop	hl								; Clean up loop index.
+      ld		hl, bc						; Load return value
+#if USE_RAM_FUNCTIONS
+		ipres
+      ret
+#else
+      ret
+#endif
+
+// -----------------------------------------------------------------------------
+// |                      Core Function: _EraseFlashSector                     |
+// -----------------------------------------------------------------------------
+
+// Parameters:
+// py = destination flash address
+_EraseFlashSector::
+#if USE_RAM_FUNCTIONS
+		ipset	3
+
+      ; Slightly tricky, but should execute at the start of the function in ram
+#pragma nowarn // We need to jump to a non label, so supress the warning here
+      jp   _RamFunctions + _EraseFlashSector_RamStart - _RamFunctions_Begin
+_EraseFlashSector_RamStart::
+#endif
+      ld		bcde, (_flash_command_base)
+      ld		px, bcde                ; Flash command base address in px
+
+      ld		bcde, (_flash_format)
+   	ld		pz, bcde                ; Load pz with format entry.
+
+      ld		hl, bc
+      ld		de, hl                  ; Full mask in bcde
+
+      ld		jk, 0xAAAA
+      ld		hl, 0x5555					; Loaded the address commands
+      and	jkhl, bcde					; Applied the bit mask.
+
+      ld		bcde, pz                ; Reload the format entry.
+      ld		a, d                    ; Load the shift flag
+      or		a                       ; Carry flag zero after this executes.
+      jr		z, .dontshift2
+      ex		jk, hl                  ; Swap the addresses.
+.dontshift2:
+
+      ld		a, e                    ; Load the 16-bit memory flag.
+      or    a
+      jr		z, .noMACRchange3
+      ld		c, ~0x06                ; Rabbit 4000 bitmask.
+ioi	ld		a, (GCPU)					; Check for >= Rabbit 5000
+      cp		3								; Carry flag = cpu < Rabbit 5000
+      jr		c, .r4000_2
+      rrc	c                       ; Adjust for Rabbit 5000 and above
+.r4000_2:
+ioi 	ld 	a, (MACR)
+		ld		b, a
+      and 	a, c							; Mask CS0
+ioi 	ld 	(MACR), a
+		nop $ nop		; *always* follow any MACR update with two NOPs
+ioi	ld		a, (PDDDR)
+		ld		c, a
+      ld		a, 0xFF
+ioi	ld		(PDDDR), a
+.noMACRchange3:
+
+		; Issue commands
+      ld		a, 0xAA                 ; Command offset in hl
+      ld		(px+hl), a
+
+      ex		jk, hl                  ; Swap command offsets
+      cpl                           ; a = ~a (0x55)
+      ld		(px+hl), a
+
+      ex		jk, hl                  ; Swap command offsets
+      ld		a, 0x80
+      ld		(px+hl), a
+
+      ld		a, 0xAA                 ; The next two command are like the first.
+      ld		(px+hl), a
+
+      ex		jk, hl                  ; Swap command offsets
+      cpl                           ; a = 0x55
+      ld		(px+hl), a
+
+      ld		a, 0x30                 ; Final erase command
+      ld		(py), a
+
+      ld		a, e							; Reload the 16-bit memory flag.
+      or		a
+      jr		z, .noMACRchange4
+      ld		a, b
+ioi	ld		(MACR), a               ; Restore MACR and PDDDR
+		nop $ nop		; *always* follow any MACR update with two NOPs
+		ld		a, c
+ioi	ld		(PDDDR), a
+.noMACRchange4:
+
+		//	Wait for erase to finish!
+	   clr	hl
+		ld		a, (py+hl)
+.wloop2:
+	   ld		d, a
+		ld		a, (py+hl)
+	   cp		a, d
+	   jr		neq, .wloop2
+		ld		a, (py+hl)
+	   cp		a, d
+	   jr		neq, .wloop2
+#if USE_RAM_FUNCTIONS
+		ipres
+      ret
+#else
+      ret
+#endif
+// -----------------------------------------------------------------------------
+// |                      Core Function: _ProgramFlashUnit                     |
+// -----------------------------------------------------------------------------
+
+// WARNING:
+// The functions in this logical block assume that it need not erase any flash
+// before issuing write commands.
+
+// Could be byte or word, you need to know which.
+// Parameters:
+// py = destination device offset
+// hl = value (h ignored for 8-bit devices)
+_ProgramFlashUnit::
+#if USE_RAM_FUNCTIONS
+		ipset	3
+#ifdef _ENABLE_16BIT_FLASH_
+ #ifndef __ALLOW_16BIT_AUXIO_DEFECT
+ 		ld		a, 0x32					; set both /CS0 flash and /CS1 SRAM advanced
+ioi	ld 	(MACR), a	  			;  16-bit memory mode with SRAM-only byte write
+											;  and disabled page mode for both
+											;  required for this 16-bit flash command
+		nop $ nop		; *always* follow any MACR update with two NOPs
+ #endif
+#endif
+      ; Slightly tricky, but should execute at the start of the function in ram
+#pragma nowarn // We need to jump to a non label, so supress the warning here
+      jp   _RamFunctions + _ProgramFlashUnit_RamStart - _RamFunctions_Begin
+_ProgramFlashUnit_RamStart::
+#endif
+		ex		jk', hl						; Store the value to write in jk'
+      ld		bcde, (_flash_command_base)
+      ld		px, bcde                ; Flash command base address in px
+
+      ld		bcde, (_flash_format)
+   	ld		pz, bcde                ; Load pz with format entry.
+
+      ld		hl, bc
+      ld		de, hl                  ; Full mask in bcde
+
+      ld		jk, 0xAAAA
+      ld		hl, 0x5555					; Loaded the address commands
+      and	jkhl, bcde					; Applied the bit mask.
+
+      ld		bcde, pz                ; Reload the format entry.
+      ld		a, d                    ; Load the shift flag
+      or		a                       ; Carry flag zero after this executes.
+      jr		z, .dontshift3
+      ex		jk, hl                  ; Swap the addresses.
+.dontshift3:
+#ifdef PILOT_BIOS
+; The pilot bios download performance relies on a wait first strategy for this
+; function so that the pilot can continue buffering input while the flash is
+; writing.
+		ld		a, (py)
+.wloop:
+	   ld		d, a
+		ld		a, (py)
+	   cp		a, d
+	   jr		neq, .wloop
+		ld		a, (py)
+	   cp		a, d
+	   jr		neq, .wloop
+#endif
+      ld		a, e                    ; Load the 16-bit memory flag.
+      or    a
+      ex		jk', hl
+      ld		bc, hl                  ; Value to write in bc.
+      ex		jk', hl
+      jr		z, ._8bit
+
+      // 16-bit mode
+      ld		de, 0x00AA              ; Command offset in hl
+      ld		(px+hl), de
+
+      ex		jk, hl                  ; Swap command offsets
+      ld		e, 0x55
+      ld		(px+hl), de
+
+      ex		jk, hl                  ; Swap command offsets
+      ld		e, 0xA0
+      ld		(px+hl), de
+
+      ld		(py), bc                ; Write data
+      jr		.write_commands_done
+
+._8bit:
+		// Issue commands
+      ld		a, 0xAA                 ; Command offset in hl
+      ld		(px+hl), a
+
+      ex		jk, hl                  ; Swap command offsets
+      cpl                           ; a = 0x55
+      ld		(px+hl), a
+
+      ex		jk, hl                  ; Swap command offsets
+      ld		a, 0xA0
+      ld		(px+hl), a
+
+      ld		a, c
+      ld		(py), a                 ; Write data
+.write_commands_done:
+
+		//	Wait for write to finish!
+#ifndef PILOT_BIOS
+; Normal wait after write semantics for bios and program.
+		ld		a, (py)
+.wloop:
+	   ld		d, a
+		ld		a, (py)
+	   cp		a, d
+	   jr		neq, .wloop
+		ld		a, (py)
+	   cp		a, d
+	   jr		neq, .wloop
+#endif
+
+#if USE_RAM_FUNCTIONS
+		ipres
+ #ifdef _ENABLE_16BIT_FLASH_
+  #ifndef __ALLOW_16BIT_AUXIO_DEFECT
+		ld		a, 0x24					; set both /CS0 flash and /CS1 SRAM basic 16-bit
+ioi	ld 	(MACR), a	  				;  memory mode with disabled page mode
+											;  (I.E. resume normal operation)
+		nop $ nop		; *always* follow any MACR update with two NOPs
+  #endif
+ #endif
+      ret
+_RamFunctions_End::
+ #else
+      ret
+#endif
+#endasm
+
+// -----------------------------------------------------------------------------
+// |                      Entry Function: _InitFlashDriver                     |
+// -----------------------------------------------------------------------------
+// Note: Do not call any other flash driver functions before calling this.
+// Return codes:
+// 0 = No errors.
+// 1 = ID not found.
+__nodebug __root
+int _InitFlashDriver(unsigned long flash_base_address,
+                     unsigned long true_base_address)
+{
+#ifdef PILOT_BIOS
+   auto const char * layout;
+#else
+   // Need far pointer to address root code space tables when using
+   // separate I&D.
+   static struct _FlashIdEntry __far *__flash_id_entries;
+   static char __far * layout;
+#endif
+
+   auto unsigned int * sector_addr_ptr;
+   auto unsigned int sector_addr4k;
+
+	auto unsigned int index, id;
+   auto int found;
+
+   _flash_command_base = flash_base_address + 0x10000;
+   _flash_base = true_base_address;
+
+   #asm
+   	; First, perform the RAM functions copy if needed
+#if USE_RAM_FUNCTIONS
+		ldl	py, _RamFunctions
+      ld		px, _RamFunctions_Begin				; _RamFunctions_Begin must be root
+      ld		bc, RAM_FUNCTIONS_SIZE
+      copy
+#endif
+   	ld		bcde, (sp+@sp+flash_base_address)
+      ld		py, bcde
+      ld		jkhl, (_flash_command_base)
+      ld		px, jkhl
+      call  _GetFlashId
+      ld		(sp+@sp+id), hl
+   #endasm
+
+   found = 0;
+
+#ifdef PILOT_BIOS
+   // Find the flash id in the table and fill in information.
+   for (index = 0; index < FLASH_ID_ENTRIES; ++index) {
+      if (id == _flash_id_entries[index].id) {
+         _flash_info = _flash_id_entries[index];
+         _flash_is_large_sector = _flash_info.sectors != NULL;
+         found = 1;
+         break;
+      }
+   }
+#else
+
+   // Need far pointer to address root code space tables when using
+   // separate I&D.
+	__flash_id_entries = (struct _FlashIdEntry __far *)
+             (0x0000fffful & (unsigned long)_flash_id_entries);
+
+   // Find the flash id in the table and fill in information.
+   for (index = 0; index < FLASH_ID_ENTRIES; ++index)
+   {
+      if (id == *(unsigned int __far*)(__flash_id_entries + index))
+      {
+			 #asm
+            ld   	px, _flash_id_entries      ; Not local copy!
+            ld    hl, (sp+@sp+index)
+            ex    bc, hl
+            ld    de, sizeof(struct _FlashIdEntry)
+            mulu
+            ex    bc, hl
+            ld    b,e                        ; E still has sizeof(...)
+            ld    de,_flash_info
+          __copyFar2NearLoop:
+            ld    a,(px+hl)
+            ld    (de),a
+            inc   hl
+            inc   de
+            djnz  __copyFar2NearLoop
+			 #endasm
+
+         _flash_is_large_sector = _flash_info.sectors != NULL;
+
+         found = 1;
+         break;
+      }
+   }
+
+#endif
+
+   _flash_number_of_sectors = _flash_info.size_4k; // Default value.
+   // If the flash is large sector, fill in the _flash_sector_addresses array
+   // now.
+   if (found && _flash_is_large_sector) {
+      _flash_number_of_sectors = 0;
+#ifdef PILOT_BIOS
+      layout = _flash_info.sectors;
+#else
+      // Point to constant in code space
+      layout = (char __far *)(0x0000fffful & (unsigned long)_flash_info.sectors);
+#endif
+      sector_addr_ptr = _flash_sector_addresses;
+      sector_addr4k = (unsigned int)(true_base_address >> 12);  // Divide by 4k
+      for (index = 0; *layout; ++index, ++sector_addr_ptr, ++layout) {
+         *sector_addr_ptr = sector_addr4k;
+         sector_addr4k += *layout;
+      }
+      *sector_addr_ptr =
+      	(unsigned int)(true_base_address >> 12) + _flash_info.size_4k;
+      _flash_number_of_sectors = index;
+   }
+
+   _InitFlashDriverOK = found;
+
+   return !found;
+}
+
+// *** Utility Function _LongToSector ***
+/*** BeginHeader _LongToSector */
+__nodebug __root
+unsigned int _LongToSector(unsigned long offset);
+/*** EndHeader */
+
+// Returns the sector number for the physical address passed.
+// This function will return _flash_number_of_sectors if the input is
+// out of range.
+__nodebug __root
+unsigned int _LongToSector(unsigned long address)
+{
+	auto unsigned int retval;
+   auto unsigned int addr_4k;
+   auto const unsigned int * sector_address;
+
+   addr_4k = (unsigned int)(address >> 12);
+
+	if (_flash_is_large_sector) {
+      for (retval = 0, sector_address = _flash_sector_addresses;
+           retval < _flash_number_of_sectors;
+           ++retval)
+      {
+         if (addr_4k >= *sector_address && addr_4k < *(++sector_address)) {
+            break;
+         }
+      }
+   }
+   else {
+      // Assume 4k sectors.
+      retval = addr_4k - (unsigned int)(_flash_base >> 12);
+   }
+
+   return retval;
+}
+
+// *** Utility Function _SectorToLong ***
+/*** BeginHeader _SectorToLong */
+__nodebug __root
+unsigned long _SectorToLong(unsigned int sector_number);
+/*** EndHeader */
+
+// Returns the physical address for the sector number passed.
+// This function does not do range checking.
+__nodebug __root
+unsigned long _SectorToLong(unsigned int sector_number)
+{
+	auto unsigned long retval;
+
+   if (_flash_is_large_sector) {
+      retval = (unsigned long)_flash_sector_addresses[sector_number] << 12;
+   }
+   else {
+      retval =
+      	_flash_base + ((unsigned long)sector_number << 12);
+   }
+
+   return retval;
+}
+
+// *** Utility Function _EraseFlashRange ***
+/*** BeginHeader _EraseFlashRange */
+__nodebug __root
+void _EraseFlashRange(unsigned long lower, unsigned long upper);
+/*** EndHeader */
+
+// This function erases all flash sectors that contain the address range given.
+// The range specified is an inclusive range, so that one may specify
+// lower and upper as the same address, for example.
+__nodebug __root
+void _EraseFlashRange(unsigned long lower, unsigned long upper)
+{
+	auto unsigned int sector, stop_sector;
+   auto unsigned long sector_address;
+
+   stop_sector = _LongToSector(upper) + 1;
+
+   for (sector = _LongToSector(lower); sector < stop_sector; ++sector) {
+      sector_address = _SectorToLong(sector);
+      #asm
+      	ld		jkhl, (sp+@sp+sector_address)
+         ld		py, jkhl
+         call _EraseFlashSector
+      #endasm
+   }
+}
+
+// *** Utility Function _ProgramFlashBlock ***
+/*** BeginHeader _ProgramFlashBlock */
+__nodebug __root
+int _ProgramFlashBlock(
+	unsigned long address, const char __far * buffer, unsigned int buf_size);
+/*** EndHeader */
+
+// This function programs a block of data to flash assuming that no erase is
+// necessary.
+__nodebug __root
+int _ProgramFlashBlock(
+	unsigned long address, const char __far * buffer, unsigned int buf_size)
+{
+   auto unsigned int increment;
+
+   if (_flash_format.is_16_bit) {
+      if (address & 1) {
+      	return 1; // 16-bit memories require even aligned addresses.
+      }
+      if (buf_size & 1) {
+      	return 2; // 16-bit memories can only write words at a time.
+      }
+      increment = 2;
+   }
+   else {
+   	increment = 1;
+   }
+
+   for (; buf_size > 0;
+      address += increment, buffer += increment, buf_size -= increment)
+   {
+      #asm
+      	ld		jkhl, (sp+@sp+address)
+         ld		py, jkhl
+         ld		jkhl, (sp+@sp+buffer)
+         ld		px, jkhl
+         ld		hl, (px)
+         call _ProgramFlashUnit
+      #endasm
+   }
+
+   return 0;
+}
+
+// The functions below are intentded as accessors for other libraries like
+// idblock.lib.
+
+/*** BeginHeader getFlashId */
+__nodebug __xmem
+unsigned int getFlashId(void);
+/*** EndHeader */
+__nodebug __xmem
+unsigned int getFlashId()
+{
+	return _flash_info.id;
+}
+
+/*** BeginHeader getFlashWriteMode */
+__nodebug __xmem
+unsigned int getFlashWriteMode(void);
+/*** EndHeader */
+__nodebug __xmem
+unsigned int getFlashWriteMode()
+{
+   return _flash_is_large_sector ? 0x10 : 1;
+}
+
+/*** BeginHeader getFlashSize */
+__nodebug __xmem
+unsigned int getFlashSize(void);
+/*** EndHeader */
+__nodebug __xmem
+unsigned int getFlashSize()
+{
+	return _flash_info.size_4k;
+}
+
+/*** BeginHeader getSectorSize */
+__nodebug __xmem
+unsigned int getSectorSize(void);
+/*** EndHeader */
+__nodebug __xmem
+unsigned int getSectorSize()
+{
+   return _flash_is_large_sector ? 128 : 0x1000;
+}
+
+/*** BeginHeader getNumSectors */
+__nodebug __xmem
+unsigned int getNumSectors(void);
+/*** EndHeader */
+__nodebug __xmem
+unsigned int getNumSectors()
+{
+	return _flash_number_of_sectors;
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+

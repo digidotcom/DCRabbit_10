@@ -1,0 +1,2115 @@
+/*
+ *    ip.lib
+ *    Copyright (C) Rabbit Semiconductor, Inc. All rights reserved.
+ *    Portions used with permission of Erick Engelke.
+ *
+ * Internet Protocol.  This library handles the network layer (just above the
+ * link layer and device driver), plus some of the link layer stuff.
+ * DCRTCP actually handles some of the IP layer at the transport layer level,
+ * so the organisation could not strictly be called "layered".
+ */
+/*** BeginHeader */
+#ifndef IP_H
+#define IP_H
+
+#ifdef IP_DEBUG
+	#define _ip_nodebug __debug
+#else
+	#define _ip_nodebug __nodebug
+#endif
+
+#ifndef NET_H
+	#use "net.lib"
+#endif
+
+// Flags for return if information from custom packet handlers
+#define CUSTOM_PKT_FLAG_PROCESS	0x0001
+
+/* The Internet Header: */
+typedef struct {
+   byte     ver_hdrlen;
+   byte     tos;
+   word     length;
+   word     identification;
+   word     frags;
+   byte     ttl;
+   byte     proto;
+   word     checksum;
+   longword source;
+   longword destination;
+} in_Header;
+
+typedef struct in_addr {
+   longword    s_addr;
+} in_addr_t;
+
+// Following flags in network order (in the frags field)
+#define IP_DF			0x0040	// Don't fragment
+#define IP_MF			0x0020	// Not the last fragment
+#define IP_OFFSET_N	0xFF1F	// Mask for the offset bits
+
+
+#define in_GetVersion(ip) ((ip)->ver_hdrlen>>4)
+#define in_GetHdrlen(ip)  ((ip)->ver_hdrlen&0x0f)  /* 32 bit word size */
+
+#define in_GetHdrlenBytes(ip)  (in_GetHdrlen(ip) << 2) /* 8 bit byte size */
+#define in_GetTos(ip)      ((ip)->tos)
+
+#define in_GetTTL(ip)      ((ip)->ttl)
+#define in_GetProtocol(ip) ((ip)->proto)
+
+/*
+ * Type-of-Service (TOS) definitions (see RFC1349).  You should set _one_ of
+ * these values in any one packet (not OR them together).  The precedence field (3 MSBs)
+ * and MBZ field (LSB) must be zero.
+ */
+#define IPTOS_DEFAULT	0x00
+#define IPTOS_CHEAP		0x02	// Minimize monetary cost
+#define IPTOS_RELIABLE	0x04	// Maximize reliability
+#define IPTOS_CAPACIOUS	0x08	// Maximize throughput
+#define IPTOS_FAST		0x10	// Minimize delay
+#define IPTOS_SECURE		0x1E	// Maximize security
+
+#ifndef ICMP_TOS
+	#define ICMP_TOS IPTOS_DEFAULT
+#endif
+
+
+extern int ip_id;        /* packet number */
+
+
+typedef struct {
+   // This also used for wifi
+   byte dest[6];        // Destination ethernet address
+   byte src[6];         // Source ethernet address
+   word type;           // Network protocol number
+} ether_ll_hdr;
+
+
+
+#define ETH_MIN	60              /* Minimum Ethernet packet size */
+
+// Link layer protocol numbers (used only by DHCP)
+#define PD_ETHER        1
+
+/*
+ * This is the global root packet receive buffer pool.
+ * This is a linked pool, and is used to manage the ll_prefix structs.  This struct points
+ * to one or more buffers in the xmem pool (which is not linked)
+ */
+extern Pool_t _pbuf_pool;
+
+
+
+#define IP_HEADER_SIZE  20
+
+// Lengths of IP options
+#define IP_OPT_ROUTERALERT_LEN	4
+
+#define IP_MAX_LL_HDR	 (MAX_OVERHEAD+1)			// Largest supported link-layer header size, plus 1.
+
+#define IP_MAX_PKT_HDR  (IP_MAX_LL_HDR + IP_HEADER_SIZE + 24)
+#define IP_MAX_TCP_HDR  (IP_MAX_LL_HDR + IP_HEADER_SIZE + 24)	// 24 is TCP header plus MSS oftion for SYN
+																					//  -- this is the largest we send currently.
+#define IP_MAX_UDP_HDR  (IP_MAX_LL_HDR + IP_HEADER_SIZE + 8)	// UDP always has 8-byte header
+#define IP_MAX_IP_HDR   (IP_MAX_LL_HDR + IP_HEADER_SIZE)
+
+// FRAGSUPPORT enables support for packet reassembly of fragmented packets
+//#define FRAGSUPPORT	// <- no, don't do it!
+#ifdef FRAGSUPPORT
+#fatal "Fragmentation support defeatured"
+//#define structure(S,m,p) ((S *)( (byte *)(p) - (byte *) &((S *)0)->m ))
+//#define MAXFRAGS        (ETH_MAXBUFS-1)
+//#define FRAGHOLDTIME    15       /* 15 secs to hold before discarding */
+//#define FRAGLONGTIME    30000
+
+typedef struct {
+   longword    source;
+   byte        proto;
+   word        identification;
+} fragkey;
+
+typedef struct hd {
+   struct hd   * next;
+   int           start;
+   int           end;
+} hole_descr;
+
+typedef struct {
+   byte         used;           // this position in table in use
+   fragkey      key;
+   hole_descr  *hole_first;
+   longword     timer;
+   in_Header   *ip;
+   byte        *data_offset;
+} fraghdr;
+
+
+extern fraghdr fraglist[MAXFRAGS];
+extern int active_frags/* = 0*/;
+#endif
+
+/*** EndHeader */
+
+/*** BeginHeader is_my_addr */
+int is_my_addr(longword ipaddr, int iface);
+/*** EndHeader */
+_ip_nodebug
+int is_my_addr(longword ipaddr, int iface)
+{
+	if (!ipaddr)
+   	return 0;
+#if USING_LOOPBACK
+	if (iface == IF_LOOPBACK && IS_LOOPBACK_ADDR(ipaddr))
+   	return 1;
+#endif
+	return ipaddr == MY_ADDR(iface);
+}
+/*** BeginHeader is_valid_source */
+int is_valid_source(longword ipaddr, int iface, int local_only);
+/*** EndHeader */
+_ip_nodebug
+int is_valid_source(longword ipaddr, int iface, int local_only)
+{
+	// To be a valid source IP address (for our purposes), the address must not be a
+	// network, broadcast, or multicast address on the specified interface (or any
+	// interface if IF_ANY).  In addition, the address is not allowed to be the 127.
+	// (loopback) address.  If local_only, then the address must also be on a local
+	// subnet i.e. not accessible only via a router.
+	if (local_only && IS_SUBNET_BCAST_ADDR(ipaddr, iface))
+		return 0;
+	if (local_only && IS_SUBNET_NET_ADDR(ipaddr, iface))
+		return 0;
+#if !USING_LOOPBACK
+   // Loopback device works now
+	if (IS_LOOPBACK_ADDR(ipaddr))
+		return 0;	// Local loopback
+#endif
+	if (IS_MULTICAST_ADDR(ipaddr))
+		return 0;
+	if (local_only && (iface == IF_ANY ? IS_ALL_NONLOCAL_SUBNET(ipaddr)
+												  : IS_NONLOCAL_SUBNET(ipaddr, iface)))
+		return 0;
+	return 1;
+}
+
+/*** BeginHeader is_nonlocal_subnet */
+int is_nonlocal_subnet(longword ipaddr, byte iface);
+/*** EndHeader */
+_ip_nodebug
+int is_nonlocal_subnet(longword ipaddr, byte iface)
+{
+	// Return true if ipaddr is not an IP address on the local subnet of
+	// interface iface.
+	// Special case: if ipaddr is currently zero (i.e. unknown during DHCP etc.)
+	// then everything is considered to be 'local' since nothing can come to us
+	// via a router.  This forestalls some chicken-and-egg problems in ARP etc.
+	auto longword x, iip, im;
+
+	iip = _if_tab[iface].ipaddr;
+	if (!iip)
+	{
+		return 0;
+	}
+
+	//for a P2P interface, the peer's address is local.
+	if ((IF_P2P(iface)) && ipaddr == _if_tab[iface].u.ppp.peeraddr)
+	{
+		return 0;
+	}
+	im = _if_tab[iface].mask;
+	x = (ipaddr ^ iip) & im;
+
+	return x != 0L;
+}
+
+
+
+/*** BeginHeader is_subnet_bcast_addr */
+int is_subnet_bcast_addr(longword ipaddr, byte iface);
+/*** EndHeader */
+_ip_nodebug int is_subnet_bcast_addr(longword ipaddr, byte iface)
+{
+	// If the trailing bits of the address are all 1's (i.e. the bits NOT in the subnet mask),
+	// then consider this a broadcast address.  In particular, 0xFFFFFFFF is always considered
+	// a subnet broadcast by this function.  If the interface is IF_ANY, then the address is
+	// considered broadcast if any of the interface would consider it so.
+	// Exception: if mask for a particular interface is all 1's (e.g. p2p interface), then
+	// never consider to be a broadcast address for that interface.
+	auto word i, j;
+	auto longword m;
+
+   if(ipaddr == 0xFFFFFFFF)
+   	return 1;
+
+	if (iface == IF_ANY) {
+		for (i = 0; i < IF_MAX+VIRTUAL_ETH; i++)
+			if (is_subnet_bcast_addr(ipaddr, i))
+				return 1;
+		return 0;
+	}
+	m = ~_if_tab[iface].mask;
+	i = m  && !(m & ~ipaddr);
+	j = is_nonlocal_subnet(ipaddr, iface);
+	return i && !j;
+}
+
+/*** BeginHeader is_subnet_net_addr */
+int is_subnet_net_addr(longword ipaddr, byte iface);
+/*** EndHeader */
+_ip_nodebug int is_subnet_net_addr(longword ipaddr, byte iface)
+{
+	// If the trailing bits of the address are all 0's (i.e. the bits NOT in the subnet mask),
+	// then consider this a network address.  If the interface is IF_ANY, then the address is
+	// considered 'network' if any of the interface would consider it so.
+	// Exception: if mask for a particular interface is all 1's (e.g. p2p interface), then
+	// never consider to be a network address for that interface.
+	auto word i;
+	if (iface == IF_ANY) {
+		for (i = 0; i < IF_MAX+VIRTUAL_ETH; i++)
+			if (is_subnet_net_addr(ipaddr, i))
+				return 1;
+		return 0;
+	}
+	return ~_if_tab[iface].mask && !(~_if_tab[iface].mask & ipaddr) && !is_nonlocal_subnet(ipaddr, iface);
+}
+
+/*** BeginHeader is_any_my_addr */
+int is_any_my_addr(longword ipaddr);
+/*** EndHeader */
+_ip_nodebug int is_any_my_addr(longword ipaddr)
+{
+	auto word i;
+	for (i = 0; i < IF_MAX+VIRTUAL_ETH; i++)
+		if (_if_tab[i].ipaddr == ipaddr)
+			return 1;
+	return 0;
+}
+
+/*** BeginHeader is_all_nonlocal_subnet */
+int is_all_nonlocal_subnet(longword ipaddr);
+/*** EndHeader */
+_ip_nodebug int is_all_nonlocal_subnet(longword ipaddr)
+{
+	auto word i;
+	for (i = 0; i < IF_MAX+VIRTUAL_ETH; i++)
+		if (ifpending(i) == IF_UP && IS_LOCAL_SUBNET(ipaddr, i))
+			return 0;
+	return 1;
+}
+
+/*** BeginHeader inet_ntoa */
+
+/* START FUNCTION DESCRIPTION ********************************************
+inet_ntoa                              <IP.LIB>
+
+SYNTAX: char* inet_ntoa(char* s, longword ip);
+
+KEYWORDS:		tcpip, ip address
+
+DESCRIPTION: 	Convert a binary ip address to its dotted decimal format.
+               This is 4 decimal numbers, each with value ranging from
+               0 to 255 inclusive, separated by '.'.
+
+PARAMETER1: 	location to place the dotted decimal string.  This must
+               be an array of at least 16 bytes.
+PARAMETER2: 	ip address to convert.
+
+RETURN VALUE:  returns 's' parameter.
+
+SEE ALSO:      inet_addr, inet_ethtoa, aton2
+
+END DESCRIPTION **********************************************************/
+
+char *inet_ntoa( char *s, longword x );
+/*** EndHeader */
+
+_ip_nodebug
+char *inet_ntoa( char *s, longword x )
+{
+	auto char *p;
+
+	p = utoa( ((char *) &x)[3], s);
+	*p++ = '.';
+	p = utoa( ((char *) &x)[2], p);
+	*p++ = '.';
+	p = utoa( ((char *) &x)[1], p);
+	*p++ = '.';
+	p = utoa( ((char *) &x)[0], p);
+	*p = '\0';
+
+   return( s );
+}
+
+/*** BeginHeader inet_ethtoa */
+
+/* START FUNCTION DESCRIPTION ********************************************
+inet_ethtoa                              <IP.LIB>
+
+SYNTAX: char * inet_ethtoa(char * s, const byte * hwa);
+
+KEYWORDS:		tcpip, ethernet address
+
+DESCRIPTION: 	Convert a binary ethernet MAC address to printable format.
+               The 6 bytes pointed to by hwa are converted to a sequence
+               of 12 hexadecimal digits, with digit pairs separated
+               by a colon.
+
+PARAMETER1: 	location to place the formatted string.  This must point
+               to an array of at least 18 characters.
+PARAMETER2: 	pointer to 1st byte of ethernet address to convert.
+
+RETURN VALUE:  returns 's' parameter.
+
+SEE ALSO:      inet_ntoa
+
+END DESCRIPTION **********************************************************/
+
+char * inet_ethtoa(char * s, const byte * hwa);
+/*** EndHeader */
+
+_ip_nodebug
+char * inet_ethtoa(char * s, const byte * hwa)
+{
+	auto int i, b;
+	auto char *d;
+
+	for (d = s, i = 6; i; --i)
+	{
+		b = *hwa++;
+		*d++ = _hexits_upper[b >> 4];
+		*d++ = _hexits_upper[b & 0x0F];
+		*d++ = ':';
+	}
+	*--d = '\0';		// null-terminate by replacing last ':' will null
+
+	return s;
+}
+
+/*
+ * aton()
+ *	- converts [a.b.c.d] or a.b.c.d to 32 bit long
+ *	- returns 0 on error (safer than -1)
+ */
+
+/*** BeginHeader aton2, isaddr, _f_aton2, _aton2 */
+#define aton inet_addr		// Macro alias for historical reasons
+longword aton2(char **textp, int * bad, word * port);
+longword _f_aton2(char __far * __far *textp, int __far * bad, word __far * port);
+longword _aton2(int __far *offset, const char __far *text, int __far *bad,
+																					word __far *port);
+int isaddr(const char __far *text);
+
+/* START FUNCTION DESCRIPTION ********************************************
+aton2                              <IP.LIB>
+
+SYNTAX: longword aton2(char **textp, int * bad, word * port)
+
+KEYWORDS:		tcpip, ip address
+
+DESCRIPTION: 	Convert an ip address string in dotted decimal format to
+               its binary representation.
+
+               The address of a pointer to the string is required, and
+               the pointer is advanced to the end of the parsed string.
+               If the string cannot be parsed as a dotted decimal IP
+               address, then *bad is set to a non-zero error indicator.
+
+               The acceptable syntax for the string (if port is NULL) is
+
+                 <optional leading space> d.d.d.d <opt trailing space>
+
+               where each 'd' represents a decimal number with a value
+               between 0 and 255 inclusive.  In addition, the following
+               special syntax is accepted:
+
+                 /n
+
+               where n is a number between 0 and 32 inclusive.  This is
+               translatedinto a 32-bit number with 'n' leading 1's.  E.g.
+               /24 becomes 0xFFFFFF00.  This is useful for specifying
+               netmasks.
+
+               Leading and trailing space is accepted, however there must
+               not be any spaces within the address e.g.
+               '  10.10.6.40  ' is OK, but not '10 . 10. 6 . 40'
+
+               The delimiter between decimals may be either '.' or ','.
+               For historical reasons, the dotted decimal may be
+               surrounded by single '[' and ']' characters.
+
+PARAMETER1: 	Pointer to a pointer to the string.  This is an input and
+               output parameter.  On return, *textp is advanced to the
+               end of the parsed string, plus any trailing whitespace.
+               If there was an error, *textp points to the character which
+               could not be parsed.
+PARAMETER2:    This is an output parameter.  *bad is set to 0 if there
+               was no error.  Otherwise, it is set to one of the following
+               error codes:
+                 NETERR_NOTDIGIT: decimal digit expected but not found
+                 NETERR_TOOBIG: one of the decimals was out of range (>255)
+                 NETERR_BADDELIM: invalid delimiter character
+                 NETERR_BADPORT: port number was outside range (0..65535)
+                 NETERR_UNBALANCED: '[' was not balanced by ']'.
+PARAMETER3:    If not NULL, this parameter points to a word
+               which will be set to a TCP or UDP port number if the IP
+               address string is suffixed with a colon (:) followed by
+               a decimal number between 0 and 65535 inclusive.  If
+               port is not NULL, but the string did not contain a port
+               number, then *port is set to zero.
+
+RETURN VALUE:  Binary representation of dotted_ip_string.  Returns zero
+               if it has problems parsing the string.
+
+SEE ALSO:      inet_ntoa, inet_addr, isaddr
+
+END DESCRIPTION **********************************************************/
+
+/* START FUNCTION DESCRIPTION ********************************************
+isaddr                              <IP.LIB>
+
+SYNTAX: int isaddr(const char *text)
+
+KEYWORDS:		tcpip, ip address
+
+DESCRIPTION: 	Test whether the given string is a valid dotted decimal
+               IP address, as would be accepted by aton2().
+
+               In addition to the aton2() test, the string is checked
+               for any trailing characters.  If there are trailing chars
+               which are not whitespace, then this function returns '0'
+               i.e. NOT a valid address.  Use aton2() directly if the
+               IP address string may contain more information after the
+               IP address.
+
+PARAMETER1: 	Pointer to the string.
+
+RETURN VALUE:  Non-zero: the string is a valid IP address.
+               Zero: the string is not an IP address.
+
+SEE ALSO:      inet_ntoa, inet_addr, aton2
+
+END DESCRIPTION **********************************************************/
+
+
+/*** Endheader */
+
+_ip_nodebug
+longword _f_aton2(char __far * __far *textp, int __far * bad, word __far * port)
+{
+   int offset = 0;
+   long retval;
+
+   retval = _aton2( &offset, *textp, bad, port);
+   *textp += offset;
+
+   return retval;
+}
+
+_ip_nodebug
+longword aton2(char **textp, int * bad, word * port)
+{
+   int offset = 0;
+   long retval;
+
+   retval = _aton2( &offset, *textp, (int __far *) bad,
+   																			(word __far *) port);
+   *textp += offset;
+
+   return retval;
+}
+
+
+_ip_nodebug
+longword _aton2(int __far *offset, const char __far *text, int __far *bad,
+																					word __far *port)
+{
+   auto int i, wasbrkt;
+   auto long cur;
+   auto longword ip;
+   auto const char __far * texto = text;
+
+   ip = 0;
+	*bad = 0;
+   while (isspace(*text)) ++text;
+   wasbrkt = *text == '[';
+   if (wasbrkt)
+      ++text;
+   if (*text == '/') {
+   	++text;
+   	// cast away const on text so strtol can set it
+      cur = _f_strtol(text, (char __far * __far *)&text, 10);
+		ip = 0xFFFFFFFFuL << (32 - cur);
+   }
+   else for( i = 24; i >= 0; i -= 8 ) {
+   	if (!isdigit(*text)) {
+      	*bad = NETERR_NOTDIGIT;
+      	goto _retz;
+      }
+   	// cast away const on text so strtol can set it
+   	cur = _f_strtol(text, (char __far * __far *)&text, 10);
+      if (cur < 0 || cur >= 256) {
+      	*bad = NETERR_TOOBIG;
+      	goto _retz;
+      }
+      ip |= cur << i;
+      if (!i) break;
+
+      if (*text != '.' && *text != ',') {
+      	*bad = NETERR_BADDELIM;
+      	goto _retz;
+      }
+      ++text;
+   }
+   if (port) {
+   	*port = 0;
+      if (*text == ':') {
+      	++text;
+	   	// cast away const on text so strtol can set it
+         cur = _f_strtol(text, (char __far * __far *)&text, 10);
+         if (cur < 0 || cur >= 65536) {
+         	*bad = NETERR_BADPORT;
+      		goto _retz;
+         }
+         *port = (word)cur;
+      }
+   }
+   if (wasbrkt)
+   	if (*text != ']') {
+      	*bad = NETERR_UNBALANCED;
+      	goto _retz;
+      }
+      else
+      	++text;
+   while (isspace(*text)) ++text;
+_ret:
+	*offset = (int)(text - texto);
+   return ip;
+_retz:
+	ip = 0;
+	goto _ret;
+}
+
+_ip_nodebug int isaddr(const char __far *text)
+{
+	auto int bad;
+   int offset = 0;
+   _aton2(&offset, text, &bad, NULL);
+   return !bad && !*(text + offset);
+}
+
+/*** BeginHeader inet_addr */
+
+/* START FUNCTION DESCRIPTION ********************************************
+inet_addr                              <IP.LIB>
+
+SYNTAX: longword inet_addr(const char* dotted_ip_string);
+
+KEYWORDS:		tcpip, ip address
+
+DESCRIPTION: 	Convert an ip address string in dotted decimal format to
+               its binary representation.
+
+               Note that aton2() is recommended for new applications,
+               since it allows the program to distinguish between an
+               address of 0.0.0.0 and an invalid address, as well as
+               allowing enhanced syntax.
+
+               Note: aton is a macro which is aliased to inet_addr
+               for historical reasons.
+
+PARAMETER1: 	dotted decimal ip string e.g. "10.10.6.100".  See
+               documentation for aton2() for acceptable syntax details.
+
+RETURN VALUE:  binary representation of dotted_ip_string. returns zero
+               if it has problems parsing the string.
+
+SEE ALSO:      inet_ntoa, aton2, isaddr
+
+END DESCRIPTION **********************************************************/
+
+longword inet_addr(const char __far *s);
+/*** EndHeader */
+
+_ip_nodebug longword inet_addr(const char __far *s)
+{
+	// This doesn't distinguish between a valid address and '0.0.0.0'.
+   auto int bad;
+   int offset = 0;
+   return _aton2(&offset, s, &bad, NULL);
+}
+
+
+/*** BeginHeader gethostid_iface */
+/* START FUNCTION DESCRIPTION ********************************************
+gethostid                              <IP.LIB>
+
+SYNTAX: longword gethostid();
+
+KEYWORDS:		tcpip, host, ip address
+
+DESCRIPTION: 	Get our ip address on the default interface (IF_DEFAULT).
+               Use gethostid_iface() to get IP address for specified
+               interface.  This is a macro which calls gethostid_iface.
+
+RETURN VALUE:  Current ip address, or zero if not assigned.
+
+END DESCRIPTION **********************************************************/
+/* START FUNCTION DESCRIPTION ********************************************
+gethostid_iface                              <IP.LIB>
+
+SYNTAX: longword gethostid_iface(word iface);
+
+KEYWORDS:		tcpip, host, ip address
+
+DESCRIPTION: 	Get our ip address on the specified interface.
+
+RETURN VALUE:  Current ip address, or zero if not assigned.
+
+END DESCRIPTION **********************************************************/
+longword gethostid_iface(word iface);
+#define gethostid() gethostid_iface(IF_DEFAULT)
+/*** EndHeader */
+
+
+_ip_nodebug longword gethostid_iface(word iface)
+{
+   return _if_tab[iface].ipaddr;
+}
+
+
+/*** BeginHeader ip_iface */
+/* START FUNCTION DESCRIPTION ********************************************
+ip_iface                              <IP.LIB>
+
+SYNTAX: word ip_iface(longword ipaddr, int local_only);
+
+KEYWORDS:		tcpip, host, ip address
+
+DESCRIPTION: 	Given an IP address, return the interface number for that
+               address.  If ipaddr is an address on one of the local
+               subnets, then the interface to that subnet is returned.
+               Only interfaces which are currently up are considered,
+               unless local_only == 2.
+
+               If the address is not local, then the local_only parameter
+               determines the result:
+
+               If local_only is 1, then IF_ANY will be returned
+               for a non-local address.  Only interface which are currently
+               up are considered.
+
+               If local_only is 2, then this is the same as above except
+               that all interfaces (up and down) are considered.
+
+               Otherwise, the router_for_iface() function is invoked to find
+               the correct router -- the interface for the router is
+               returned.
+
+PARAMETER1:    IP address of an external host.
+PARAMETER2:    0: allow non-local addresses (returns interface for router)
+               1: return IF_ANY for non-local addresses.
+               2: return IF_ANY for non-local addresses, but consider all
+                  interface whether currently up or down.
+
+RETURN VALUE:  Interface number (0..IF_MAX-1), of possibly IF_ANY (0xFF).
+
+SEE ALSO:      router_for_iface
+
+END DESCRIPTION **********************************************************/
+
+
+word ip_iface(longword ipaddr, int local_only);
+/*** EndHeader */
+
+
+_ip_nodebug word ip_iface(longword ipaddr, int local_only)
+{
+	auto word i;
+
+	for (i = 0; i < IF_MAX+VIRTUAL_ETH; i++)
+		if (local_only == 2 || ifstatus(i)) {
+      	if (IF_P2P(i)) {
+         	if (ipaddr == _if_tab[i].u.ppp.peeraddr)
+         		return i;
+         }
+      	else if (!((_if_tab[i].ipaddr ^ ipaddr) & _if_tab[i].mask))
+				return i;
+      }
+
+	if (!local_only && router_for_iface(ipaddr, NULL, &i, IF_ANY) > 0)
+		return i;
+   return IF_ANY;
+}
+
+/*** BeginHeader ip_print_ifs */
+void ip_print_ifs(void);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+ip_print_ifs									<IP.LIB>
+
+SYNTAX: void ip_print_ifs(void)
+
+KEYWORDS:      tcpip, interface
+
+DESCRIPTION:   Print all interface table entries.  This is for debugging
+               only, since the results are printed to the Dynamic C stdio
+               window.
+
+               There are 8 fields for each interface entry:
+                 #:
+                   the interface number
+                 IP addr:
+                   The local ("home") IP address of this interface.  May
+                   be 0.0.0.0 if interface is not currently active.
+                 Mask:
+                   Local subnet mask.
+                 Up:
+                   Indicates status; one of
+                     Yes: interface currently active
+                     No:  currently inactive
+                     NYU: Not Yet Up i.e. coming up
+                     NYD: Not Yet Down i.e. coming down
+                 Type:
+                   Interface type; one of
+                     eth: normal ethernet
+                     ppp: PPP over serial port
+                     pppoe: PPP over ethernet
+                 MTU:
+                   Maximum transmission unit.
+                 Flags:
+                   A list of the following characters:
+                     * = this is the default interface (IF_DEFAULT)
+                     D = Use DHCP
+                     DD= Currently configured via DHCP
+                     S = allow IP address configuration via directed
+                         ping (ICMP echo).
+                     SS= IP address currently set via directed ping
+                     1 = IGMP version 1 router present on this interface
+                     ->nn = Virtual interface on specified real i/f
+                 Peer/router:
+                   IP address of peer node (for PPP or PPPOE), or address
+                   of default router on this interface (for ethernet
+                   type).  May be blank or 0.0.0.0 if no peer or router
+                   is available.
+
+END DESCRIPTION **********************************************************/
+
+_ip_nodebug void ip_print_ifs(void)
+{
+	auto char buffer[16], peer[16];
+	auto byte i, ru;
+	auto word f;
+	auto ATHandle ath;
+	auto longword router;
+
+	printf("\nInterface table:\n\n");
+#ifdef _IP_PRINT_POWER
+	printf("#  IP addr.        Mask            Up  Lnk Pwr Type MTU  Flags  Peer/router\n");
+	printf("-- --------------- --------------- --- --- --- ---- ---- ------ ---------------\n");
+#else
+	printf("#  IP addr.        Mask            Up  Lnk Type MTU  Flags  Peer/router\n");
+	printf("-- --------------- --------------- --- --- ---- ---- ------ ---------------\n");
+#endif
+	for (i = 0; i < IF_MAX+VIRTUAL_ETH; i++) {
+		if (i < IF_MAX && !(1u<<i & IF_SET) ||
+          i >= IF_MAX && !(_if_tab[i].u.eth.eflags & EFLAG_VIRT))
+			continue;
+		if (IF_P2P(i))
+			inet_ntoa(peer, _if_tab[i].u.ppp.peeraddr);
+		else if ((ath = router_for_iface(0, NULL, NULL, i)) > 0) {
+			arpcache_ipaddr(ath, &router);
+			inet_ntoa(peer, router);
+		}
+		else
+			strcpy(peer, "");
+
+		printf("%2d %-15.15s ",
+				i,
+				inet_ntoa(buffer, _if_tab[i].ipaddr));
+#ifdef _IP_PRINT_POWER
+		printf("%-15.15s %-3.3s %-3.3s %-3.3s ",
+				inet_ntoa(buffer, _if_tab[i].mask),
+				"no NYUyesNYD"+ifpending(i)*3,
+				"no NYUyesNYD"+linkpending(i)*3,
+				"no NYUyesNYD"+pd_powerstatus(i)*3
+				);
+#else
+		printf("%-15.15s %-3.3s %-3.3s ",
+				inet_ntoa(buffer, _if_tab[i].mask),
+				"no NYUyesNYD"+ifpending(i)*3,
+				"no NYUyesNYD"+linkpending(i)*3
+				);
+#endif
+		printf("%-4s %4u ",
+				IF_P2P(i) ? (IF_PKT_ETH(i) ? "ppoe" : "ppp") :
+				IF_PKT_REAL_WIFI(i) ? "wifi" : "eth",
+				ifmtu(i,0));
+		f = _if_tab[i].flags;
+      if (i >= IF_MAX)
+        printf("->%-2d   ", _if_tab[i].u.eth.riface);
+      else
+		  printf("%c%c%c%c%c%c "
+				, i == IF_DEFAULT ? '*' : ' '
+				, f & IFF_DHCP ? 'D' : ' '
+				, f & IFF_DHCP_OK ? 'D' : ' '
+				, f & IFF_ICMP_CONFIG ? 'S' : ' '
+				, f & IFF_ICMP_CFG_OK ? 'S' : ' '
+				, f & IFF_IGMP_V1_ROUTER ? '1' : ' '
+				);
+		printf("%-15.15s\n", peer);
+	}
+}
+
+
+/*** BeginHeader pkt_init */
+int pkt_init( void );
+/*** EndHeader */
+
+Pool_t _pbuf_pool;
+__far struct {
+	void __far * link_fields[2];	// Overhead for pool allocation linkage
+	ll_prefix p;				// The header prefix struct
+	char buf[NET_BUFSIZE];	// Data buffer (about 1 MTU, 1536 bytes)
+} _pbuf_data[ETH_MAXBUFS];
+
+
+
+_ip_nodebug int pkt_init( void )
+{
+	auto word i, nn;
+   auto IFTEntry * ifte;
+   auto char __far * xx;
+
+   #GLOBAL_INIT {
+   	_done_pkt_init = 0;
+   }
+
+   if (_done_pkt_init)
+   	return 0;
+   _done_pkt_init = 1;
+
+   // Initialize the packet buffer pools
+   pool_xinit(&_pbuf_pool, (long)_pbuf_data, ETH_MAXBUFS, sizeof(_pbuf_data[0]));
+   pool_link(&_pbuf_pool, 1);
+
+	#ifdef IP_VERBOSE
+	printf("IP: pkt_init reserved %u buffers at %08lX\n",
+   	ETH_MAXBUFS, _pbuf_data);
+	#endif
+
+	#ifdef FRAGSUPPORT
+		active_frags=0;
+		memset(fraglist,0,sizeof(fraglist));
+	#endif
+
+	// Initialise the ethernet address mapping table
+	for (i = 0; i < IF_MAX; i++) {
+		if (!(1u<<i & IF_SET))
+			continue;
+   	ifte = _if_tab + i;
+   	ifte->ncd->ioctl(ifte->state, PD_INITIALIZE, ifte->instance, i);	// Reset interface and tell it the i/f number
+      my_eth_addr[i] = NULL;	// In case no hwa applicable...
+   	ifte->ncd->ioctl(ifte->state, PD_GETHWA, my_eth_addr + i);	// Get HWA (if applicable)
+	#ifdef IP_VERBOSE
+   	if (my_eth_addr[i]) {
+	      printf("IP: i/f %d using hwa ", i);
+	      for (nn = 0; nn < 6; nn++)
+	         printf(":%02X", my_eth_addr[i]->eaddr[nn]);
+	      printf("\n");
+      }
+	#endif
+
+	}//for
+
+   return 0;
+}
+
+
+
+/*** BeginHeader pkt_gather */
+int pkt_gather(ll_Gather * g);
+/*** EndHeader */
+
+_ip_nodebug int pkt_gather(ll_Gather * g)
+{
+	auto int send_status;
+   auto IFTEntry * ifte;
+
+   ifte = _if_tab + g->iface;
+#ifdef IP_VERBOSE
+	if (debug_on >= 5)
+		printf("IP: pkt_gather on i/f %u\n", g->iface);
+#endif
+
+#ifdef CUSTOM_SEND_HANDLER
+/* START FUNCTION DESCRIPTION *********************************************
+CUSTOM_SEND_HANDLER                      							<IP.LIB>
+
+SYNTAX: #define CUSTOM_SEND_HANDLER my_send_handler
+
+DESCRIPTION:   If defined, use a custom outgoing packet intercept routine
+               with the following prototype:
+
+                  int my_send_handler(ll_Gather * g);
+
+               It is up to the application to provide the handler function.
+               Typically, such a function could be used for statistical
+               or monitoring purposes.  It is also possible for the
+               packet to be modified, however this requires an in-
+               depth knowledge of the protocol in use, and the library
+               implementation.
+
+               *** NOTE ***
+
+               This intercept is provided for convenience.  Since it
+               depends on some library internal implementation
+               details, it is subject to change from release to
+               release.  If your application requires a stable,
+               documented method, please contact Rabbit technical
+               support.
+
+PARAMETER1:    The current outgoing packet.  The ll_Gather structure
+               is defined in TBUF.LIB.  In general, this structure
+               divides the outgoing data into non-contiguous header
+               and payload sections.  The first data byte is the
+               start of the link layer header.  Since different
+               interface types have different link-layer headers,
+               a general send handler needs to understand all the
+               possible types of header.  At present, Ethernet and
+               Wifi interfaces both use a 14-byte Ethernet header,
+               PPP uses a PPP header (starting with address/control
+               field), and PPPoE uses an ethernet header followed by
+               PPPoE control fields.
+
+               Note that the link layer header is not always fully
+               initialized, since this function is sometimes performed
+               by the specific network interface driver.  All other
+               header and payload information is fully constructed.
+
+RETURN VALUE:  The custom handler should return 0 if it has completely
+               handled the outgoing packet, and it should not be
+               forwarded to the network device driver.  Otherwise, it
+               should return 1 to have the packet sent in the usual
+               manner.
+
+SEE ALSO:      CUSTOM_ARP_HANDLER, CUSTOM_ETHERNET_HANDLER,
+               CUSTOM_IP_HANDLER.
+
+END DESCRIPTION **********************************************************/
+   if (CUSTOM_SEND_HANDLER(g))
+   // Only call sendpacket() when CUSTOM_SEND_HANDLER returns non-zero
+#endif
+	send_status = ifte->ncd->sendpacket(ifte->state, g);
+
+	if (!send_status)
+			return 0;
+
+#ifdef IP_VERBOSE
+	// Note that it is quite normal for send to fail for PPP over serial,
+	// since the previous buffer may still be transmitting.  TCP generally handles this
+	// by retrying in a short time.  UDP applications should avoid sending too many
+	// datagrams in too short an interval, or transmit buffering for UDP can be
+	// enabled.
+	if (debug_on >= 2)
+		printf("IP: pkt_gather failed on i/f %u\n", g->iface);
+#endif
+
+   return 1;
+}
+
+
+
+/*** BeginHeader pkt_buf_release */
+void pkt_buf_release(ll_prefix __far * LL);
+/*** EndHeader */
+
+/* return a buffer to the pool. */
+_ip_nodebug void pkt_buf_release(ll_prefix __far * LL)
+{
+#ifdef IP_VERBOSE
+	if (debug_on > 5)
+   	printf("IP: freeing buf %08lX\n", LL);
+#endif
+	#asm
+#ifdef DMAETH_SUPERDEBUG
+	ld		jkhl,(sp+@sp+LL)
+	ex		de,hl
+	ld		bc,__LINE__
+	ld		hl,ISRL_F
+	call	write_ilog
+#endif
+   push	ix
+   ld		py,(sp+@sp+LL+2)
+   lcall	_pb_free
+   pop	ix
+   #endasm
+}
+
+/*** BeginHeader _pkt_dump */
+void _pkt_dump(ll_prefix __far * p);
+/*** EndHeader */
+
+__nodebug void _pkt_dump(ll_prefix __far * p) {
+   printf("--- pkt flags=x%02X i/f=%d tstamp=%u len=%u ---\n",
+   	p->ll_flags, p->iface, p->seq, p->len);
+   if (p->len1) {
+   	printf("  sect 1, len=%u addr=x%08lX rlen=%u\n", p->len1, p->data1, p->rlen1);
+      xmem_dump(p->data1, p->len1 < 1537 ? p->len1 : 1536);
+   }
+   else if (p->len) {
+   	printf("  sect 0, len=%u addr=x%08lX rlen=%u\n", p->len, p->data1, p->rlen1);
+      xmem_dump(p->data1, p->len < 1537 ? p->len : 1536);
+   }
+}
+
+/*** BeginHeader pkt_received */
+ll_prefix __far * pkt_received(void);
+/*** EndHeader */
+
+#define IP_MAX_SNAP	2		// Max number of packets to snapshot
+
+_ip_nodebug int _pkt_snapshot(ll_prefix __far ** pset)
+{
+	// Disable interrupts and take snapshot of packet queue.  The addresses of ready packets
+   // are stored in the parameter array, and the number stored therein is returned (max IP_MAX_SNAP).
+   // Only packets which are not ready, fragments, or output buffers are ignored.
+
+   #asm
+   ld		iy,(sp+@sp+pset)
+   push	ix
+   ld		ix,_pbuf_pool
+   ld		bc,IP_MAX_SNAP
+   ld		px,0
+   ipset	PKT_POOL_IPSET
+.next:
+	push	bc
+	ld		bcde,px
+   lcall	pxnext_fast
+   ld		px,bcde
+   ld		(iy),bcde
+   pop	bc
+   jr		c,.end
+   ld		a,(px)		; Get flags
+   or		a
+   jr		z,.next
+   and	LL_OUTBUF|LL_FRAGMENT
+   jr		nz,.next
+   ld		de,4
+   add	iy,de
+   dwjnz	.next
+.end:
+	ipres
+	pop	ix
+   ld		hl,(sp+@sp+pset)
+   ex		de,hl
+   ld		hl,iy
+   or		a
+   sbc	hl,de		; Will not be any carry
+   rr		hl			; Compute number of elements stored (return value)
+   rr		hl
+   #endasm
+}
+
+#ifdef WIFI_USE_WPA
+#ifndef WPA_USE_EAP
+// Need temp root buffer since non-EAP version of WPA supplicant does not
+// support far pointers.
+char eapol_buf[512];
+#endif
+#endif
+
+/*
+   This is the base-level routine for checking for incoming packets, and processing them.
+   The return value is the ll_prefix if a packet was processed, NULL if there were no new packets ready.
+   The caller is responsible for returning the ll_prefix to the pool (via _pb_free()).
+   On any call, only the oldest ready packet is processed, thus packets are processed in order of
+   arrival completion.
+
+   This is called from tcp_tick_internal().
+
+   pkt_received() scans for the oldest completed packet - this is easy, since they are in this
+   order in the ll_prefix pool.  Only incomplete or outgoing packets need to be skipped.
+
+   If found, the link-layer header is extracted to an auto buffer (which is big enough to contain
+   _all_ the headers, but only the ll header is extracted in this routine).  The header is examined
+   to determine the next layer protocol, and an upcall to that (net) protocol handler is made.  If the
+   handler completes processing the packet, then it returns the same ll_prefix as it was passed.
+   Otherwise, if the handler needs to hang on to the packet for longer, then it returns NULL (but it
+   must remember to free the packet later otherwise it will starve the buffer).
+ */
+_ip_nodebug ll_prefix __far * pkt_received(void)
+{
+	// This buffer is used to contain a root copy of the headers, as they are parsed by higher layers.
+   // It is sized to contain the maximum possible header length (120 is for 60 byte IP plus 60 byte TCP).
+	auto byte	hdrbuf[IP_MAX_LL_HDR + 120];
+   auto ll_prefix	__far * pset[IP_MAX_SNAP];	// snapshot of ready packets
+   auto int npset;								// Number of ready packets in the above table
+   auto ll_prefix __far * p;			// The packet we are looking at
+   auto ll_prefix __far * next;		// The packet after p
+   auto eth_Header * temp_e;		// Header, mapped as ethernet
+
+   auto int	receive_result;
+   auto word iface;
+   auto word is_ip;
+   auto word i;
+   auto word llh_size;
+   auto byte * t_buf;
+   auto word pflags;					// Flags for returning info from custom handlers
+
+   auto IFTEntry * ifte;
+
+   /*
+    * Run all interface receive drivers to move any data to the receive buffer.
+    * PPP over serial does not need this processing, since it is interrupt driven
+    * by the serial port hardware.
+    */
+
+	do {
+   	receive_result = 1;
+	   for (i = 0; i < IF_MAX; ++i) {
+	      ifte = _if_tab + i;
+      	if (!(IF_SET & 1<<i) || !ifte->ncd)
+         	continue;
+	      if (ifte->ncd->flags & NCD_POLL) {
+	         receive_result &= ifte->ncd->receive(ifte->state);	//combine results
+         #ifdef IP_VERBOSE
+				if (!receive_result && debug_on >= 5) printf("IP: incoming on i/f %d, t=%lu\n", i, MS_TIMER);
+         #endif
+         }
+	   }
+	} while (!receive_result);
+
+#ifdef FRAGSUPPORT
+   // Do fragment timeouts
+   if (active_frags)
+   	___timeout_frags();
+#endif // FRAGSUPPORT
+
+	npset = _pkt_snapshot(pset);
+
+   p = NULL;
+   for (i = 0; i < npset; ++i) {
+   	p = pset[i];
+      // Verification of IP header performed here instead of in IP layer itself.
+
+      iface = p->iface;
+
+      // New packet.  Determine the offset in the packet of the IP (or ARP) header.  If the
+      // interface is ethernet, we also check for PPPoE frames.  If so, then we call PPPoE
+      // processing to unencapsulate the packet into an IP datagram.  The interface number
+      // is incremented by 2 to signal that it has come from the PPPoE interface rather than
+      // the normal ethernet.
+#ifdef IP_VERBOSE
+      if (debug_on > 4) printf("IP: New pkt i/f %d  ll_flags=%02X  stamp=%u  len=%u  net_offs=%u\n",
+      								iface, p->ll_flags, p->seq, p->len, p->net_offs);
+      if (debug_on > 5) _pkt_dump(p);
+#endif
+		//FIXME
+		//goto _drop_it;
+
+		// Process in-band data by passing directly to the ioctl handler.  This is data
+      // which is received outside of the normal TCP/IP/link encapsulation e.g. ASCII data when a PPPLINK
+      // interface is talking to the local modem.
+      if (p->ll_flags & LL_INBAND) {
+      	_if_tab[iface].ncd->ioctl(_if_tab[iface].state, PD_INBAND, p);
+         goto _drop_it;
+      }
+
+		// Extract the link-layer header to root buffer
+      _pkt_buf2root(p, hdrbuf, llh_size = p->net_offs, 0);
+
+
+#ifndef MULTI_IF
+		// Single interface: simplified processing.
+	#if USING_ETHERNET
+      temp_e = (eth_Header *)hdrbuf;
+   #elif USING_WIFIG
+   	// Copy the ethernet header to first position.  This allows higher layers to
+   	// access the ethernet header uniformly at offset 0.  The original wifi header data is
+   	// still in the network buffer, of course, since hdrbuf is only a root copy.
+   	memcpy(hdrbuf, hdrbuf+24, 14);	// ++24 is offset to macHdr.addr1 field
+      temp_e = (eth_Header *)hdrbuf;
+	   #ifdef WIFI_USE_WPA
+      if (temp_e->type == _WIFI_EP_8021X) {
+        #ifdef WPA_USE_EAP
+			#ifndef WPA_EAP_BLOCKING
+      		p = _eapol_proc_cop(p);
+			#else
+	         wpa_supplicant_rx_eapol(hdrbuf+6, p->data1 + p->net_offs, p->len - p->net_offs);
+	      #endif
+	     #else
+     			_pkt_buf2root(p, eapol_buf, p->len - p->net_offs, p->net_offs);
+				wpa_supplicant_rx_eapol(hdrbuf+6, eapol_buf, p->len - p->net_offs);
+	     #endif
+			goto _drop_it;
+		}
+	   #endif
+   #elif USING_PPPOE
+      temp_e = (eth_Header *)hdrbuf;
+   	if (!IS_PPPOE_TYPE(temp_e->type))
+      	goto _drop_it;			// Not a PPPoE encapsulation
+      if (PPPOE_process(p, hdrbuf))
+         // Drop it, badly formed or wrong interface, or was PPPoE LCP, IPCP, etc.
+         goto _drop_it;
+
+   #elif USING_PPP_SERIAL
+      if (PPP_process(p, hdrbuf))
+         // Drop it, badly formed or wrong interface, or was PPP LCP, IPCP, etc.
+         goto _drop_it;
+   #endif
+
+#else
+		// Multiple interfaces supported.
+
+	#if USING_WIFIG
+		if (iface == IF_WIFI0 || iface == IF_WIFI1)
+	   	memcpy(hdrbuf, hdrbuf+24, 14);	// ++24 is offset to macHdr.addr1 field
+	#endif
+
+		temp_e = (eth_Header *)hdrbuf;
+
+	#if USING_WIFIG
+	   #ifdef WIFI_USE_WPA
+      if (p->net_offs >= sizeof(ether_ll_hdr) && temp_e->type == _WIFI_EP_8021X) {
+        #ifdef WPA_USE_EAP
+			#ifndef WPA_EAP_BLOCKING
+      		p = _eapol_proc_cop(p);
+			#else
+	         wpa_supplicant_rx_eapol(hdrbuf+6, p->data1 + p->net_offs, p->len - p->net_offs);
+	      #endif
+	     #else
+     			_pkt_buf2root(p, eapol_buf, p->len - p->net_offs, p->net_offs);
+				wpa_supplicant_rx_eapol(hdrbuf+6, eapol_buf, p->len - p->net_offs);
+	     #endif
+			goto _drop_it;
+		}
+	   #endif
+	#endif
+
+	#if USING_PPPOE
+      if (!IF_P2P(iface) && IS_PPPOE_TYPE(temp_e->type)) {
+         iface += (IF_PPPOE0 - IF_ETH0);  // Change to PPPoE interface
+         p->iface = iface;
+         if (PPPOE_process(p, hdrbuf))
+            // Drop it, badly formed or wrong interface, or was PPPoE LCP, IPCP, etc.
+            goto _drop_it;
+
+         // Otherwise, p->net_offs has been correctly set for this IP packet.  Read in the
+         // extra header
+         //_pkt_buf2root(p, hdrbuf+llh_size, p->net_offs-llh_size, llh_size);
+      }
+      else
+	#endif
+      {
+	#ifdef USING_PPP
+         if (IF_P2P(iface) && PPP_process(p, hdrbuf))
+            // Drop it, badly formed or wrong interface, or was PPP LCP, IPCP, etc.
+            goto _drop_it;
+	#endif
+      }
+#endif
+
+      if (ifpending(iface) == IF_DOWN) {
+         // Drop this; interface is supposed to be down.
+#ifdef IP_VERBOSE
+         if (debug_on > 4) printf("IP: dropped, i/f is not pending\n");
+#endif
+         goto _drop_it;
+      }
+
+      if (!IF_P2P(iface) && p->net_offs >= sizeof(ether_ll_hdr)) {
+         // Check for broadcast destination
+         t_buf = (byte *)temp_e; // point to dest addr
+         if (!memcmp(t_buf, "\xFF\xFF\xFF\xFF\xFF\xFF", 6))
+            p->ll_flags |= LL_BROADCAST;
+         else if (!memcmp(t_buf, "\x01\x00\x5E", 3) && !(t_buf[3] & 0x80))
+            p->ll_flags |= LL_MULTICAST;
+         // For non-point-to-point (i.e. ethernet), TYPE field is IP or ARP
+         pflags = 0;
+         switch (temp_e->type) {
+         case IP_TYPE:
+#ifdef CUSTOM_IP_HANDLER
+/* START FUNCTION DESCRIPTION *********************************************
+CUSTOM_IP_HANDLER                      <IP.LIB>
+
+SYNTAX: #define CUSTOM_IP_HANDLER my_ip_handler
+
+KEYWORDS:		tcpip, ip address
+
+DESCRIPTION:   If defined, use a custom IP handler with the following
+               prototype:
+
+                  far ll_prefix *my_ip_handler(far ll_prefix *LL,
+                                    byte *hdrbuf, word *pflags);
+
+               It is up to the user to provide the handler.
+
+               See CUSTOM_IP4_HANDLER for a handler which is invoked
+               after more IPv4 header validation has been performed.
+
+PARAMETER1:    The current IP packet.
+
+PARAMETER2:    A pointer to the header of the current IP packet.
+
+PARAMETER3:    The flags for the packet.  The handler must set the
+               CUSTOM_PKT_FLAG_PROCESS if it wants the IP driver to handle
+               the IP packet as usual.  Otherwise it must clear the bit.
+
+RETURN VALUE:  The custom handler should return NULL if it wants to keep
+               the packet for further use, or else return the packet
+               pointer unchanged.
+
+SEE ALSO:      CUSTOM_ARP_HANDLER, CUSTOM_ETHERNET_HANDLER,
+					CUSTOM_SEND_HANDLER, CUSTOM_IP4_HANDLER
+
+END DESCRIPTION **********************************************************/
+
+				p = CUSTOM_IP_HANDLER(p,hdrbuf,&pflags);
+            if (p && pflags & CUSTOM_PKT_FLAG_PROCESS)
+	            p = ip_handler(p, hdrbuf);
+
+#else
+            p = ip_handler(p, hdrbuf);
+#endif
+            break;
+         case ARP_TYPE:
+#ifdef CUSTOM_ARP_HANDLER
+/* START FUNCTION DESCRIPTION *********************************************
+CUSTOM_ARP_HANDLER                     <IP.LIB>
+
+SYNTAX: #define CUSTOM_ARP_HANDLER my_arp_handler
+
+KEYWORDS:		tcpip, ip address
+
+DESCRIPTION:   If defined, use custom ARP handler with the following
+               prototype:
+
+                  far ll_prefix *my_arp_handler(far ll_prefix *LL,
+                                    byte *hdrbuf, word *pflags);
+
+               It is up to the user to provide the handler.
+
+PARAMETER1:    The current ARP packet.
+
+PARAMETER2:    A pointer to the header of the current ARP packet.
+
+PARAMETER3:    The flags for the packet.  The handler must set the
+               CUSTOM_PKT_FLAG_PROCESS if it wants the ARP driver to handle
+               the packet as usual.  Otherwise it must clear the bit.
+
+RETURN VALUE:  The custom handler should return NULL if it wants to keep
+               the packet for further use, or else return the packet
+               pointer unchanged.
+
+SEE ALSO:      CUSTOM_IP_HANDLER, CUSTOM_ETHERNET_HANDLER,
+					CUSTOM_SEND_HANDLER
+
+END DESCRIPTION **********************************************************/
+
+				p = CUSTOM_ARP_HANDLER(p,hdrbuf,&pflags);
+            if (p && pflags & CUSTOM_PKT_FLAG_PROCESS)
+	            p = _arp_handler(p, hdrbuf);
+
+#else
+            p = _arp_handler(p, hdrbuf);
+#endif
+            break;
+         default:
+#ifdef CUSTOM_ETHERNET_HANDLER
+/* START FUNCTION DESCRIPTION *********************************************
+CUSTOM_ETHERNET_HANDLER                								<IP.LIB>
+
+SYNTAX: #define CUSTOM_ETHERNET_HANDLER my_ethernet_handler
+
+KEYWORDS:		tcpip, ip address
+
+DESCRIPTION:   If defined, use custom handler for non-IP/non-ARP packets
+               with the following prototype:
+
+                  far ll_prefix *my_ethernet_handler(far ll_prefix *LL,
+                                    byte *hdrbuf, word *pflags);
+
+               It is up to the user to provide the handler.
+
+PARAMETER1:    The current ethernet packet.
+
+PARAMETER2:    A pointer to the header of the current ethernet packet.
+
+PARAMETER3:    The flags for the packet.  The handler must set the
+               CUSTOM_PKT_FLAG_PROCESS if it wants the IP driver to handle
+               the ethernet packet as usual.  Otherwise it must clear the
+               bit.
+
+RETURN VALUE:  The custom handler should return NULL if it wants to keep
+               the packet for further use, or else return the packet
+               pointer unchanged.
+
+SEE ALSO:      CUSTOM_IP_HANDLER, CUSTOM_ARP_HANDLER,
+					CUSTOM_SEND_HANDLER
+
+END DESCRIPTION **********************************************************/
+
+				p = CUSTOM_ETHERNET_HANDLER(p,hdrbuf,&pflags);
+#endif
+#ifdef IP_VERBOSE
+            if (
+	#ifdef CUSTOM_ETHERNET_HANDLER
+            	p && pflags & CUSTOM_PKT_FLAG_PROCESS &&
+	#endif
+               debug_on > 4) {
+            	printf("IP: dropped, not IP or ARP\n");
+               #ifdef DMAETH_SUPERDEBUG
+               dmaeth_prt_nicreg(NULL);
+               #endif
+            }
+#endif
+            break;
+         }
+      }
+      else {
+         // Assume IP encapsulation for pt-pt drivers
+#ifdef CUSTOM_IP_HANDLER
+			// Use custom IP handler, if it exists.  The custom handler will
+			// return NULL if it wants to keep the packet for further processing.
+			// Otherwise, it must return p unchanged.  It may set *pflags to
+			// CUSTOM_PKT_FLAG_PROCESS if it wants us to handle the IP packet as
+			// usual.
+         p = CUSTOM_IP_HANDLER(p,hdrbuf,&pflags);
+         if (p && pflags & CUSTOM_PKT_FLAG_PROCESS)
+            p = ip_handler(p, hdrbuf);
+
+#else
+         p = ip_handler(p, hdrbuf);
+#endif
+      }
+_drop_it:
+		if (p)
+      	pkt_buf_release(p);
+   }
+	#ifdef NET_ADD_ENTROPY
+   	if (npset)	seed_clock(0);
+   #endif
+
+   return NULL;
+}
+
+/*** BeginHeader ip_handler */
+ll_prefix __far * ip_handler(ll_prefix __far * LL, byte * hdrbuf);
+/*** EndHeader */
+_ip_nodebug ll_prefix __far * ip_handler(ll_prefix __far * LL, byte * hdrbuf)
+{
+	// hdrbuf has the link-layer header already copied (LL->net_offs bytes)
+   // The next data is an IP header.  Get the first 20 bytes, then any extra
+   // if there are IP options.
+   auto byte padbuf[20];
+   auto in_Header * ip;
+   auto word iface;
+   auto longword myip;
+   auto word iplen, pktlen, ck[2], trail, trail_offs;
+   auto word pflags = 0;
+
+   if (LL->len < LL->net_offs + sizeof(in_Header))
+   	return LL;	// Discard it, too short to contain IP header
+
+   _pkt_buf2root(LL, ip = (in_Header *)(hdrbuf+LL->net_offs), sizeof(in_Header), LL->net_offs);
+   iplen = in_GetHdrlenBytes(ip);
+   LL->tport_offs = LL->net_offs + iplen;
+   if (iplen > sizeof(in_Header))
+	   _pkt_buf2root(LL, (byte *)(ip + 1),
+      		iplen-sizeof(in_Header), LL->net_offs + sizeof(in_Header));
+
+	// Not yet verified IP header.  Check it and either discard or set verified indicator.
+	// Must have correct IP checksum, version=4 and reasonable length.
+	if (LL->chksum_flags != CHKSUM_IGNORE) {
+	   if (fchecksum(ip, iplen) != 0xffff) {
+
+
+	      // Invalid packet - discard it before it does any damage!
+	#ifdef IP_VERBOSE
+	      if (debug_on > 4) printf("IP: dropped, invalid IP checksum\n");
+	#endif
+	      return LL;
+	   }
+	}
+   if (in_GetVersion(ip) != 4
+       || (pktlen = (word)intel16(ip->length)) > LL->len - (word)LL->net_offs) {
+      // Invalid packet - discard it before it does any damage!
+#ifdef IP_VERBOSE
+      if (debug_on > 4) printf("IP: dropped, not V4 or bad length\n");
+#endif
+      return LL;
+   }
+
+   // If packet driver provided checksum, correct it to compensate for extraneous data
+   // like LL header, or stuff past the IP payload.
+   if (LL->chksum_flags && LL->chksum_flags != CHKSUM_IGNORE) {
+	   if (LL->net_offs > 8) {
+      	if (LL->chksum_flags == CHKSUM_FRAME) {
+	         // Subtract out irrelevant LL header part
+	         ck[0] = ~fchecksum(hdrbuf + 6, LL->net_offs - 6);
+	         ck[1] = LL->chksum;
+	         ck[1] = fchecksum((byte *)ck, sizeof(ck));
+	      #ifdef IP_VERBOSE
+	         if (debug_on > 4) {
+	            printf("IP: frame checksum=%04X; hdr correction=%04X (len %u); result=%04X\n",
+	               LL->chksum, ck[0], LL->net_offs - 6, ck[1]);
+	         }
+	      #endif
+         } else	// must be CHKSUM_ETHPL, so don't need any header correction
+      		ck[1] = LL->chksum;
+         // Subtract stuff past IP payload.  If this is at odd offset, need to byteswap
+         trail_offs = pktlen + LL->net_offs;
+         trail = LL->len - trail_offs;	// Number of trailing bytes
+         if (trail > 0) {
+	         if (trail > sizeof(padbuf) || trail < 2)
+	            // Forget about it.  Tport will recompute checksums.
+               // This should never be required.
+	            LL->chksum_flags = 0;
+	         else {
+	            _pkt_buf2root(LL, padbuf, trail, trail_offs);
+	            ck[0] = ~fchecksum(padbuf, trail);
+               if (trail_offs & 1) {
+               #asm
+               	ld hl,(sp+@sp+ck)
+                  ld	a,h
+                  ld h,L
+                  ld l,a
+                  ld (sp+@sp+ck),hl
+               #endasm
+               }
+         		ck[1] = fchecksum((byte *)ck, sizeof(ck));
+	         #ifdef IP_VERBOSE
+	            if (debug_on > 4) {
+	               printf("IP:   trailer correction=%04X (len %u); result=%04X\n",
+	                  ck[0], trail, ck[1]);
+	            }
+	         #endif
+            }
+         }
+         LL->chksum = ck[1];
+         if (LL->chksum_flags) {
+         	// Didn't get turned off.  Indicate corrected.
+         	LL->chksum_flags = CHKSUM_TPORT;
+         #ifdef IP_VERBOSE
+            if (debug_on > 4) {
+               printf("IP: checksum corrected to transport level\n",
+                  ck[0], trail, ck[1]);
+            }
+         #endif
+         }
+      }
+      else
+         LL->chksum_flags = 0;
+   }
+
+#ifdef FRAGSUPPORT
+   if (temp->frags & (IP_MF | IP_OFFSET_N)) {
+      if (!(fragstart = fragment(temp, LL)))
+         continue;
+      else {
+         *type = IP_TYPE;
+         oldest = fragstart;
+         break;
+      }
+   }
+#endif // FRAGSUPPORT
+
+  	LL->net_proto = NET_PROTO_IP;	// Got valid IP packet
+   LL->tport_proto = ip->proto;	// Save the next higher layer protocol
+
+#ifdef CUSTOM_IP4_HANDLER
+/* START FUNCTION DESCRIPTION *********************************************
+CUSTOM_IP4_HANDLER                      <IP.LIB>
+
+SYNTAX: #define CUSTOM_IP4_HANDLER my_ip4_handler
+
+KEYWORDS:		tcpip, ip address
+
+DESCRIPTION:   If defined, use a custom IPv4 handler with the following
+               prototype:
+
+                  far ll_prefix *my_ip4_handler(
+                                    far ll_prefix *LL,
+                                    byte *hdrbuf,
+                                    word *pflags,
+                                    in_Header * ip);
+
+               It is up to the user to provide the handler.
+
+               **NOTE**
+               This handler is invoked after basic IPv4 packet validation
+               has been applied, unlike CUSTOM_IP_HANDLER.  In particular,
+               the packet has been confirmed to be version 4, have correct
+               length, and have a correct header checksum.
+               LL->tport_proto is set up with the next layer protocol.
+               LL->tport_offs is the offset in hdrbuf of the end of the
+               IP header (and start of the transport header, although
+               that needs to be read from the LL structure using
+               _pkt_buf2root()).
+
+PARAMETER1:    The current IP packet.
+
+PARAMETER2:    A pointer to the start of the current IP packet. The
+					link layer header is at offset 0, the IP header
+					starts at offset LL->net_offs, which is also
+					directly pointed to by the 4th parameter.
+
+PARAMETER3:    The flags for the packet.  The handler must set the
+               CUSTOM_PKT_FLAG_PROCESS if it wants the IP driver to handle
+               the IP packet as usual.  Otherwise it must clear the bit.
+
+PARAMETER4:    Pointer to IP header (in hdrbuf at offset LL->net_offs)
+
+RETURN VALUE:  The custom handler should return NULL if it wants to keep
+               the packet for further use, or else return the packet
+               pointer unchanged.
+
+SEE ALSO:      CUSTOM_ARP_HANDLER, CUSTOM_ETHERNET_HANDLER,
+					CUSTOM_SEND_HANDLER, CUSTOM_IP_HANDLER
+
+END DESCRIPTION **********************************************************/
+
+   LL = CUSTOM_IP4_HANDLER(LL, hdrbuf, &pflags, ip);
+   if (!LL || !(pflags & CUSTOM_PKT_FLAG_PROCESS))
+      return LL;
+#endif
+
+
+#if VIRTUAL_ETH
+   // If we support virtual ethernet interfaces i.e. multihoming, then
+   // check the IP address and demux to the appropriate interface.
+   if (LL->iface < USING_ETHERNET) {
+      myip = intel(ip->destination);
+      for (iface = IF_MAX; iface < IF_MAX+VIRTUAL_ETH; iface++)
+         if (!(_if_tab[iface].u.eth.eflags & EFLAG_VIRT))
+            break;   // end of virtual entries
+         else if (myip == _if_tab[iface].ipaddr) {
+            LL->iface = iface;
+            break;
+         }
+   }
+#endif
+
+   switch( ip->proto ) {
+#ifndef DISABLE_TCP
+      case TCP_PROTO :
+         LL = tcp_handler(LL, hdrbuf);
+         break;
+#endif
+#ifndef DISABLE_UDP
+      case UDP_PROTO :
+         LL = udp_handler(LL, hdrbuf);
+         break;
+#endif
+      case ICMP_PROTO :
+         LL = icmp_handler(LL, hdrbuf);
+         break;
+#ifdef USE_IGMP
+      case IGMP_PROTO :
+         LL = _igmp_handler(LL, hdrbuf);
+         break;
+#endif
+      default:
+         // Send protocol unreachable if unicast to me only
+         if (intel(ip->destination) == _if_tab[LL->iface].ipaddr)
+         icmp_Unreach(LL, hdrbuf, ICMP_UNREACH_PROTO);
+         break;
+   }
+
+   return LL;
+
+}
+
+/*
+ * Link-Layer Driver Routines.
+ *
+ */
+
+/*** BeginHeader _pkt_buf2xmem */
+// These are wrappers for the corresponding routines in pktdrv.lib
+#define _pkt_buf2root(LL, dest, len, offset) _pkt_buf2xmem(LL, (void __far *)(dest), len, offset)
+void _pkt_buf2xmem(ll_prefix __far * LL, void __far * dest, word len, word offset);
+/*** EndHeader */
+
+_ip_nodebug void _pkt_buf2xmem(ll_prefix __far * LL, void __far * dest, word len, word offset)
+{
+#asm
+	ld		pz,px
+   ld		hl,(sp+@sp+len)
+   ld		b,h
+   ld		c,L
+   bool	hl
+   jr		z,.bye
+   ld		py,(sp+@sp+dest)
+   ld		hl,(sp+@sp+offset)
+   lcall	_pb_buf2xmem
+.bye:
+#endasm
+}
+
+/*** BeginHeader pkt_reply_ip */
+in_Header * pkt_reply_ip(int iface, void * base,
+								 ll_Gather * g, eth_address __far * e);
+/*** EndHeader */
+
+/*
+ * Construct a link-layer header at the specified base address, and return
+ * a pointer to where to put the IP header (which will be an offset from base).
+ * Note that base does not have to point to a complete packet area; only
+ * the link-layer header is accessed (e.g. ethernet header) - the caller
+ * will usually add space for the IP header (20 bytes) and a transport header
+ * (currently max 24 bytes for TCP, 8 for UDP).  Rather than using these
+ * constants, use the macro IP_MAX_PKT_HDR which includes enough space for
+ * the biggest link-layer header, an IP header with no options, and a TCP
+ * header with 4 bytes of options.
+ *
+ * This function constructs a reply (link-level only) to the packet in the
+ * arrival buffer indicated by LL.  This function is used when there is no
+ * ARP table entry for the destination address.
+ *
+ * If g is not null, *g is zeroed then the following fields are initialized:
+ *  g->iface = interface number
+ *  g->data1 = pointer to link-layer header start in returned area (typically
+ *    14 bytes less than the return value for ethernet).
+ *
+ * If e is not null, it is used as an ethernet destination address (if applicable)
+ * rather than using the LL pointer.  This can be used to force broadcast address,
+ * or bypass ARP processing.  Note: e must not be NULL for ethernet interfaces!
+ */
+
+_ip_nodebug in_Header * pkt_reply_ip(int iface, void * base,
+												 ll_Gather * g, eth_address __far * e)
+{
+   auto int ll_hdr_len;
+   auto IFTEntry * ifte;
+   auto ether_ll_hdr * eth;
+
+   ifte = _if_tab + iface;
+   if (ifte->ncd->set_hdr)
+   	ll_hdr_len = ifte->ncd->set_hdr(ifte->state, base, e);
+   else {
+   	// Default to assuming IP over ethernet header (since this is so common).
+   	ll_hdr_len = sizeof(ether_ll_hdr);
+      eth = (ether_ll_hdr *)base;
+      _f_memcpy(eth->dest, e, sizeof(eth->dest));
+      memcpy(eth->src, my_eth_addr[iface], sizeof(eth->src));
+      eth->type = IP_TYPE;
+   }
+
+   if (g) {
+   	memset(g, 0, sizeof(ll_Gather));
+   	g->iface = (byte)iface;
+   	g->data1 = (char __far *)paddr(base);
+   }
+   return (in_Header *)((char *)base + ll_hdr_len);
+}
+
+/*** BeginHeader pkt_make_ip */
+in_Header * pkt_make_ip(ATHandle ath, void * base, ll_Gather * g);
+/*** EndHeader */
+
+/*
+ * Similar to pkt_reply_ip, except that the ARP table handle is used
+ * to derive the appropriate information.  This is used when an ATH is
+ * available.
+ */
+
+_ip_nodebug in_Header * pkt_make_ip(ATHandle ath, void * base, ll_Gather * g)
+{
+   auto word biface;
+   auto int ll_hdr_len;
+   auto IFTEntry * ifte;
+   auto ether_ll_hdr * eth;
+
+#ifdef MULTI_IF
+	arpcache_iface(ath, &biface);
+	if (biface >= IF_MAX+VIRTUAL_ETH)
+		// This can arise for broadcast destinations.  This function does not
+		// allow sending to more than one interface, so select the default.
+		// If this is not satisfactory, the caller should call _eth_formatpacket()
+		// instead, to make the interface explicit.
+      // (fall thru to next stmt afeter #endif)
+#endif
+	biface = IF_DEFAULT;
+   ifte = _if_tab + biface;
+   if (ifte->ncd->set_hdr)
+   	ll_hdr_len = ifte->ncd->set_hdr(ifte->state, base, NULL);
+   else {
+   	// Default to assuming IP over ethernet header (since this is so common).
+   	ll_hdr_len = sizeof(ether_ll_hdr);
+      eth = (ether_ll_hdr *)base;
+      arpcache_hwa(ath, eth->dest);
+      memcpy(eth->src, my_eth_addr[biface], sizeof(eth->src));
+      eth->type = IP_TYPE;
+   }
+
+   if (g) {
+   	memset(g, 0, sizeof(ll_Gather));
+   	g->iface = biface;
+   	g->data1 = (char __far *)paddr(base);
+   }
+   return (in_Header *)((char *)base + ll_hdr_len);
+}
+
+
+
+/*** BeginHeader pkt_make_bcast_ip */
+in_Header * pkt_make_bcast_ip(longword dest, word biface,
+										void * base, ll_Gather * g);
+/*** EndHeader */
+
+/*
+ * Similar to pkt_make_ip, except that the destination IP address (dest)
+ * is a broadcast or multicast address.  No ARP table entry is applicable in
+ * this case, so the interface must be specified.  Returns NULL if
+ * cannot construct packet.
+ */
+
+_ip_nodebug
+in_Header * pkt_make_bcast_ip(longword dest, word biface,
+										void * base, ll_Gather * g)
+{
+   auto int ll_hdr_len;
+   auto IFTEntry * ifte;
+   auto ether_ll_hdr * eth;
+
+	if (biface >= IF_MAX)
+		return NULL;
+   ifte = _if_tab + biface;
+   if (ifte->flags & NCD_P2P)
+   	return NULL;	// No bcast for P2P links
+	eth = base;
+   if (dest == 0xffffffffuL)
+		arpcache_hwa(ATH_BROADCAST, eth->dest);
+  	else if (IS_MULTICAST_ADDR(dest))
+		multicast_iptohw(eth->dest, dest);
+	else
+		return NULL;
+   memcpy(eth->src, my_eth_addr[biface], sizeof(eth->src));
+   eth->type = IP_TYPE;
+   if (g) {
+   	memset(g, 0, sizeof(ll_Gather));
+   	g->iface = biface;
+   	g->data1 = (char __far *)paddr(base);
+   }
+   return (in_Header *)(eth + 1);
+}
+
+
+
+/*** BeginHeader fchecksum */
+word fchecksum(void * data, word len);
+/*** EndHeader */
+
+/*
+ * Fast checksum of >= 2 bytes.  Internet checksums are always calculated over
+ * a minimum of 8 bytes, since headers are always included.  Thus the restriction
+ * is not a problem in practice.
+ */
+__nodebug word fchecksum(void * data, word len)
+{
+#asm
+		push	ix
+		ld		ix,hl
+		ld		hl,(sp+@sp+len+2)
+		or		a
+		rr		hl					; number of words
+		ex		af,af'			; remember whether odd in alt carry
+		ld		b,l				; count (1..256 words (0=256))
+		ld		c,h
+		ld		de,0
+		ld		a,b
+		or		a					; also clears carry for initial add
+		jr		z,fc_hloop
+		inc	c
+fc_hloop:
+		ld		hl,(ix)
+		inc	ix
+		inc	ix
+		adc	hl,de
+		ex		de,hl
+		djnz	fc_hloop
+		dec	c
+		jr		nz,fc_hloop
+		ld		h,c
+		ld		l,c				; HL = 0 without changing carry
+		ex		af,af'
+		jr		nc,fc_was_even
+		ld		l,(ix)
+fc_was_even:
+		ex		af,af'
+		adc	hl,de
+		adc	hl,bc					; add in final carry (BC was zero)
+		pop	ix
+#endasm
+}
+
+
+/*** BeginHeader gchecksum, lchecksum, _f_checksum */
+word gchecksum(ll_Gather * g, word rxpc);
+word lchecksum(ll_prefix __far * LL, word offs, word len);
+word _f_checksum(char __far * buf, word len, word initial, int * odd);
+/*** EndHeader */
+
+#asm __xmem
+; This is a wrapper for xmem_chksum.
+; On entry:
+;  PX is address of data area.
+;  BC is length of area
+;  DE is accumulated checksum (init to zero for first area)
+;  Alt Cy flag set if the length of preceding sections is odd (init to 0)
+; On return:
+;  DE is updated checksum
+;  Alt Cy flag set if total length is now odd
+update_chksum::
+   or		a
+	rr		bc			; BC is now word count
+	; If previous section(s) were odd length, byte swap initial checksum.  It is reversed again at the end
+   ex		af,af'
+   jr		nc,.noswap
+   ld		a,d
+   ld		d,e
+   ld		e,a
+.noswap:
+	ex		af,af'
+   push	af			; Save Cy flag (for current odd byte count)
+	; Do it in-line on the R4k
+   ld    a,c
+   or    b                 ; also init carry for first iter.
+   jr    z,.xmchk_zlen
+.xmchk_loop:
+   ld    hl,(px)
+   ld		px,px+2
+   adc   hl,de
+   ex    de,hl
+   dwjnz  .xmchk_loop
+   jr    nc,.xmchk_zlen
+   inc   de                ; Add in final carry
+.xmchk_zlen:
+   ld    hl,(px)
+   ld		h,0
+   pop	af
+   jr		nc,.waseven				; Skip next if this section was even
+   add   hl,de          ; HL contains trailing odd byte (H=0)
+   ex    de,hl
+   jr    nc,.noinc
+   inc   de
+.noinc:
+	ex		af,af'
+   jr		nc,.noswap2
+   ld		a,d
+   ld		d,e
+   ld		e,a
+.noswap2:
+   ccf						; Keep track of odd or even total - this was odd, so complement oddness
+	ex		af,af'
+   lret
+.waseven:
+	ex		af,af'
+   jr		nc,.noswap3
+   ld		a,d
+   ld		d,e
+   ld		e,a
+.noswap3:
+	ex		af,af'
+   lret
+
+#endasm
+
+_ip_nodebug
+word _f_checksum(char __far * buf, word len, word initial, int * odd)
+{
+	// Simple wrapper for asm routine.
+	#asm
+	ld		hl,(sp+@sp+odd)
+	test	hl
+	jr		z,.waseven	; assume even state for null ptr
+	ld		hl,(hl)
+	test	hl			; clears cy flag, sets or clears Z
+	jr		z,.waseven
+	scf
+.waseven:
+	ex		af,af'	; Set alt Cy to oddness state
+	ld		hl,(sp+@sp+len)
+	ld		bc,hl
+	ld		hl,(sp+@sp+initial)
+	ld		de,hl
+	ld		px,(sp+@sp+buf)
+	lcall update_chksum
+	ld		hl,(sp+@sp+odd)
+	test	hl
+	jr		z,.nostoreodd
+	ldl	px,hl
+	ex		af,af'
+	sbc	hl,hl		; Set HL according to Cy flag
+	ld		(px),hl	; Save oddness state
+.nostoreodd:
+	ld		hl,de		; Return accumulated checksum
+	#endasm
+}
+
+_ip_nodebug word lchecksum(ll_prefix __far * LL, word offs, word len)
+{
+	// Compute internet checksum of packet in LL, starting at offset offs, and
+   // going for len bytes.
+   auto word t;
+   auto word x;
+   auto ll_Gather g;
+   auto long y;
+
+	// Set up g to point to the appropriate data area(s)
+   memset(&g, 0, sizeof(g));
+   g.len1 = LL->len1 - offs;
+
+	g.data1 = LL->data1 + offs;
+
+   if (len <= g.len1)
+   	g.len1 = len;
+   else {
+   	len -= g.len1;
+   	g.len2 = LL->len2;
+      g.data2 = LL->data2;
+		if (len <= g.len2)
+      	g.len2 = len;
+      else {
+      	len -= g.len2;
+         g.len3 = len;
+			g.data3 = LL->data3;
+      }
+   }
+	return gchecksum(&g, 0);
+}
+
+/* Compute an internet checksum of the data area(s) defined by the ll_Gather struct, which
+   consistes of a header, plus 0, 1 or 2 payload address areas.
+   If the total length is odd, then a final '0' byte is logically appended.
+   rxpc is a reserved parameter, and is set 0.
+   */
+__nodebug word gchecksum(ll_Gather * g, word rxpc)
+{
+#asm
+   ldl	py,hl			; point to ll_Gather
+   ld		px,(py+[_llg_]+data1)
+   ld		de,0			; Initial checksum
+   altd or	a				; Clear cy' flag (even starting length)
+   ld		hl,(py+[_llg_]+len1)
+   ld		bc,hl			; Byte count
+   lcall	update_chksum
+   ld		hl,(py+[_llg_]+len2)
+   ld		bc,hl			; Byte count
+   ld		px,(py+[_llg_]+data2)
+   lcall	update_chksum
+   ld		hl,(py+[_llg_]+len3)
+   ld		bc,hl			; Byte count
+   ld		px,(py+[_llg_]+data3)
+   lcall	update_chksum
+   ex		de,hl			; Set return value
+#endasm
+}
+
+
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

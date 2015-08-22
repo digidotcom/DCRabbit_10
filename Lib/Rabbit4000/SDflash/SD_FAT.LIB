@@ -1,0 +1,513 @@
+/*** BeginHeader */
+#ifndef __SD_FAT_LIB
+#define __SD_FAT_LIB
+
+/*** EndHeader */
+
+/************************************************************************
+sd_fat.lib
+Copyright Rabbit Semconductor 2006
+
+Filesystem specific functions for SD card devices. Used as a device
+driver with the FAT filesystem module.
+
+The only function that will need to be called directly is sd_InitDriver()
+
+*************************************************************************/
+
+/*** BeginHeader */
+
+#ifndef FAT_BLOCK
+ #define SD_NON_BLOCK
+#endif
+
+#use "sdflash.lib"
+#use "part_defs.lib"
+
+#ifdef SDFAT_DEBUG
+#define _sdfat_debug
+#else
+#define _sdfat_debug __nodebug
+#endif
+
+#ifndef MBR_DRIVER_INIT
+#define MBR_DRIVER_INIT sd_InitDriver(root_driver, NULL)
+#define MBR_SIG "SDFLASH-1"
+#endif
+
+extern sd_device SD[SDFLASH_MAX_DEVS];
+
+/*** EndHeader */
+
+/*** BeginHeader sd_getDevice */
+sd_device *sd_getDevice(sd_device *head, int index);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+sd_getDevice                 <SD_FAT.LIB>
+
+SYNTAX: int sd_getDevice(sd_device *head, int index);
+
+DESCRIPTION:   Helper function. Walks a linked list of sd_device structures,
+					to retreive the one at position 'index'
+
+PARAMETER1:		head - first sd_device structure in linked list
+PARAMETER2:    devnum - device number (index) of the desired
+                         sd_device structure
+
+RETURN VALUE:  address of sd_device struct in list or NULL if
+					end of list is reached.
+
+END DESCRIPTION **********************************************************/
+
+_sdfat_debug
+sd_device *sd_getDevice(sd_device *head, int devnum)
+{
+	auto int i;
+   auto sd_device *element;
+
+   element = head;
+   for(i = 0;i < devnum;i++)
+   {
+   	if(element->next)
+      {
+      	element = element->next;
+      }
+      else
+      {
+      	return NULL;
+      }
+   }
+   return element;
+}
+
+/*** BeginHeader sd_EnumDevice */
+int sd_EnumDevice(mbr_drvr *driver, mbr_dev *dev, int devnum);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+sd_EnumDevice                <SD_FAT.LIB>
+
+SYNTAX: int sd_EnumDevice(mbr_drvr *driver, mbr_dev *dev, int devnum);
+
+DESCRIPTION:   Callback used by FAT filesystem code to initialize the
+					storage device
+
+PARAMETER1:		driver - pointer to the device controller handle
+PARAMETER2:    dev - pointer to a device structure that will be filled in
+PARAMETER3:		the number of the device that is being initialized
+
+
+RETURN VALUE:  returns 0 on success,
+                 -EIO          I/O Error
+                 -ENODEV if device doesn't exist or not initialized
+                 -ENOMEDIUM if the SD card has been removed
+                 -ESHAREDBUSY  SPI port busy
+
+END DESCRIPTION **********************************************************/
+
+_sdfat_debug
+int sd_EnumDevice(mbr_drvr *driver, mbr_dev *device,int devnum)
+{
+	auto unsigned long sectors, sectors_per_track;
+   auto unsigned int tracks, base_size, sector_size;
+   auto int rc, status;
+   sd_device *dev;
+
+   dev = sd_getDevice( (sd_device *)(driver->dev_struct), devnum);
+
+   if(!dev)
+   {
+   	return -ENODEV;     // Device doesn't exist or not initialized
+   }
+   if (!SD_cardDetect(dev)) {
+      return -ENOMEDIUM;      // Device has been removed
+   }
+   sdspi_setLED(dev, 1);  // Turn on LED if SD card in socket
+
+   if (!dev->sectors) {   // Re-initialize the card if it has been unmounted
+	   if(rc = sdspi_reset_card(dev))
+	   {
+	       return rc;
+	   }
+
+	   // All commands following the card reset have single level retry
+	   // on an I/O error condition.  SD cards seem prone to these after
+	   // being reset.
+	   if ((rc = sdspi_init_card(dev)) == -EIO) {
+	      rc = sdspi_init_card(dev);
+	   }
+	   if (rc) {
+	       return rc;
+	   }
+
+	   if ((rc = sdspi_get_csd(dev)) == -EIO) {
+	      rc = sdspi_get_csd(dev);
+	   }
+	   if (rc) {
+	       return rc;
+	   }
+
+	   if ((rc = sdspi_get_scr(dev)) == -EIO) {
+	      rc = sdspi_get_scr(dev);
+	   }
+	   if (rc) {
+	       return rc;
+	   }
+
+	   if ((rc = sdspi_set_block_length(dev, 512)) == -EIO) {
+	      rc = sdspi_set_block_length(dev, 512);
+	   }
+	   if (rc) {
+	       return rc;
+	   }
+
+	   if ((rc = sdspi_get_status_reg(dev, &status)) == -EIO) {
+	      rc = sdspi_get_status_reg(dev, &status);
+	   }
+	   if (rc) {
+	       return rc;
+	   }
+   }
+
+   sectors_per_track = dev->sectors;   // Start with 1 track
+   tracks = 1;
+   while(sectors_per_track > 0xFFFF)
+   {
+   	sectors_per_track /= 2;          // And adjust till balance found
+      tracks *= 2;
+   }
+
+   //fill in device structure
+	device->cylinder = tracks;               // Save computed track & SPT
+   device->sec_track = (unsigned int)sectors_per_track;
+   device->seccount = dev->sectors;         // Number of usable sectors
+   device->heads = 1;
+   device->byte_sec = 512;                  // Sectors are always 512 bytes
+   device->byte_page = dev->pagesize & 0xff00; // Size on 256 byte boundary
+   device->sec_block = device->byte_page >> 9;
+   device->driver = driver;
+   device->dev_num = devnum;
+
+#ifdef SDFLASH_VERBOSE
+   printf("Device %d Enumerated\n", devnum);
+   sdspi_print_dev(dev);
+#endif
+
+   return 0;
+}
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+sd_InitDriver               <SD_FAT.LIB>
+
+SYNTAX: int sd_InitDriver(mbr_drvr *driver, void *device_list);
+
+DESCRIPTION:   Initializes the serial flash controller.
+
+PARAMETER1:		driver - empty mbr_drvr structure. It must be initialized
+						with this function before it can be used with the FAT
+                  filesystem.
+PARAMETER2:    device_list - if this argument is NULL, then a single device
+						will be initialized using sd_init(). Otherwise it must point
+                  to a linked list of sd_device structures for flash devices
+                  that have already been initialized.
+
+RETURN VALUE:  returns 0 on succesful initialization,
+                 -EIO if a device I/O error occured
+                 -EINVAL if an invalid parameter was given
+                 -ENODEV if device doesn't exist or not initialized
+                 -ENOMEDIUM if the SD card has been removed
+                 -ESHAREDBUSY if the shared SPI port is in use
+                 -EBUSY if a write is in progress
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader sd_InitDriver */
+int sd_InitDriver(mbr_drvr *driver, void *device_list);
+extern char scratch[512];
+
+/*** EndHeader */
+
+char scratch[512];
+
+_sdfat_debug
+int sd_InitDriver(mbr_drvr *driver, void *device_list)
+{
+   int rc;
+
+   /* pointer to function able to identify the devices */
+	driver->xxx_EnumDevice = sd_EnumDevice;
+	/* pointer to function able to read a sector */
+	driver->xxx_ReadSector = sd_ReadSector;
+	/* pointer to function able to write a sector */
+	driver->xxx_WriteSector = sd_WriteSector;
+	/* pointer to function able to physically format a cylinder */
+	driver->xxx_FormatCylinder = NULL;
+	/* pointer to function for returning status of a device */
+	driver->xxx_InformStatus = sd_InformStatus;
+
+   //setup other parameters in driver struct
+ 	driver->ndev = 0;
+   driver->maxdev = 1;
+   driver->dlist = NULL;
+   driver->next = NULL;
+   driver->type[0] = MBRTYPE_FLASH | MBRTYPE_SECTOR_FTL;
+   if(device_list == NULL)
+   {
+      rc = sdspi_initDevice(0, &SD_dev0);  //use compile-time default device
+   	driver->dev_struct = &SD[0];
+      if (rc) {
+#ifdef SDFLASH_VERBOSE
+      	printf("ERROR: sd_InitDriver: (%d)\n", rc);
+#endif
+      }
+
+      return rc;
+   }
+   else
+   {
+   	driver->dev_struct = device_list;
+      return 0; // must be initialized beforehand
+   }
+}
+
+/*** BeginHeader sd_ReadSector */
+int sd_ReadSector(unsigned long sector,
+					   __far char *buffer,
+                  __far char *spare,
+    					mbr_dev *device);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+sd_ReadSector                <SD_FAT.LIB>
+
+SYNTAX: int sd_ReadSector(unsigned long sector,
+							     far char *buffer,
+                          far char *spare,
+                          mbr_dev *device);
+
+DESCRIPTION:   Callback used by FAT filesystem code.
+					Reads out a sector from the device.
+
+PARAMETER1:		sector - the sector to read.  (512 bytes)
+PARAMETER2:    buffer - far pointer to a buffer in memory to read data into
+PARAMETER3:    spare  - dummy far pointer for API consistency (not used)
+PARAMETER4:		device - mbr_dev structure for the device being read
+
+
+RETURN VALUE:  returns 0 on success, or a FAT filesystem error code
+
+                 -EIO if a device I/O error occured
+                 -ENODEV if device doesn't exist or not initialized
+                 -ENOMEDIUM if the SD card has been removed
+                 -ESHAREDBUSY if the shared SPI port is in use
+                 -EBUSY if a write is in progress
+END DESCRIPTION **********************************************************/
+
+_sdfat_debug
+int sd_ReadSector(unsigned long sector,
+         				__far char *buffer,
+                     __far char *spare,
+    					   mbr_dev *device)
+{
+   auto sd_device *dev;
+   int rc;
+
+   dev = sd_getDevice( (sd_device *)(device->driver->dev_struct),
+   						 	device->dev_num );
+   if(!dev) {
+   	return -ENODEV;     // Device doesn't exist or not initialized
+   }
+   if (!SD_cardDetect(dev)) {
+      return -ENOMEDIUM;      // Device has been removed
+   }
+
+	//block if previous write operation has not completed
+   if(dev->write_state)
+   {
+   	rc = sdspi_WriteContinue(dev);
+      if (rc) {
+#ifdef SDFLASH_VERBOSE
+         if (rc != -EBUSY) {
+          	printf("ERROR: sdspi_writeContinue: (%d)\n", rc);
+         }
+#endif
+         return rc;
+      }
+   }
+
+   // Auto retry read calls once if an I/O error is received
+   if ((rc = sdspi_xread_sector(dev, sector, buffer)) == -EIO) {
+      rc = sdspi_xread_sector(dev, sector, buffer);
+   }
+
+#ifdef SDFLASH_VERBOSE
+   printf("Read Sector %08lx\n", sector);
+#endif
+
+   if (rc) {
+#ifdef SDFLASH_VERBOSE
+   	printf("ERROR: sd_readSector (%d)\n", rc);
+#endif
+   }
+
+	return rc;
+}
+
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+sd_WriteSector                <SD_FAT.LIB>
+
+SYNTAX: int sd_WriteSector(unsigned long page,
+							     far char *buffer,
+                          far char *spare,
+                          mbr_dev *device)
+
+DESCRIPTION:   Callback used by FAT filesystem code.
+					Writes to a sector on the specified device
+
+PARAMETER1:		sector - the sector to write to.  (512 bytes)
+PARAMETER2:    buffer - far pointer to a buffer to write the data from.
+PARAMETER3:    spare  - dummy far pointer for API consistency (not used)
+PARAMETER4:		device - mbr_dev structure for the device being written to
+
+RETURN VALUE:  returns 0 on success, or a FAT filesystem error code
+
+                 -EIO if a device I/O error occured
+                 -EINVAL if an invalid parameter was given
+                 -ENODEV if device doesn't exist or not initialized
+                 -ENOMEDIUM if the SD card has been removed
+                 -ESHAREDBUSY if the shared SPI port is in use
+                 -EACCES if the card is locked/write protected
+                 -EBUSY if a write is in progress
+END DESCRIPTION **********************************************************/
+/*** BeginHeader sd_WriteSector */
+int sd_WriteSector(unsigned long sector,
+						__far char *buffer,
+                  __far char *spare,
+                  mbr_dev *device);
+/*** EndHeader */
+
+_sdfat_debug
+int sd_WriteSector( unsigned long sector,
+ 						     __far char *buffer,
+                       __far char *spare,
+                  	  mbr_dev *device )
+{
+   static sd_device *dev;
+   static int rc;
+
+   dev = sd_getDevice( (sd_device *)(device->driver->dev_struct),
+   							device->dev_num);
+   if(!dev) {
+   	return -ENODEV;     // Device doesn't exist or not initialized
+   }
+   if (!SD_cardDetect(dev)) {
+      return -ENOMEDIUM;    // Device has been removed
+   }
+
+#ifdef SD_NON_BLOCK
+	//Finish previous write operation if it has not completed
+   if(dev->write_state)
+   {
+      if (buffer != dev->bptr) {
+         return -EBUSY;
+      }
+   	rc = sdspi_WriteContinue(dev);
+   }
+   else {  // Otherwise, start new write to SD card
+#endif
+	   rc = 0;
+	   dev->write_sector  = sector;
+	   dev->write_state = 1;
+      dev->bptr = buffer;
+
+#ifdef SDFLASH_VERBOSE
+   	printf("Write sector %08lx\n", sector);
+#endif
+	   rc = sdspi_xwrite_sector(dev, dev->write_sector, buffer);
+#ifdef SD_NON_BLOCK
+	}
+   if (rc == -EBUSY) return -EBUSY;
+#endif
+
+   if (rc) {
+#ifdef SDFLASH_VERBOSE
+   	printf("ERROR: sd_writeSector (%d)\n", rc);
+#endif
+   }
+
+   dev->write_state = 0;  // reset the write state
+   return rc;
+}
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+sd_InformStatus                <SD_FAT.LIB>
+
+SYNTAX: int sd_InformStatus(mbr_dev *device, int status)
+
+DESCRIPTION:   Callback used by FAT filesystem code
+
+PARAMETER1:		device - mbr_dev structure for the device
+PARAMETER2:		status - device status passed to driver from filesystem.
+							    0 = No change in status
+                         1 = Unmounted - device has been unmounted
+
+RETURN VALUE:  returns 0 if there is no pending write activity,
+
+                 -EIO if a device I/O error occured
+                 -ENODEV if device doesn't exist or not initialized
+                 -ENOMEDIUM if the SD card has been removed
+                 -EBUSY if a write is in progress
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader sd_InformStatus */
+int sd_InformStatus(mbr_dev *device, int status);
+/*** EndHeader */
+
+_sdfat_debug
+int sd_InformStatus(mbr_dev *device, int status)
+{
+	auto sd_device *dev;
+   auto int rc;
+
+   dev = sd_getDevice( (sd_device *)(device->driver->dev_struct),
+   							device->dev_num);
+   if(!dev)
+   {
+   	return -ENODEV;
+   }
+
+   // Turn off the LED if filesystem has unmounted the card
+   if (status & 1) {
+      sdspi_setLED(dev, 0);
+      dev->sectors = 0L;     // Set sectors to zero to show unmount
+   }
+
+   // Check if SD card has been removed
+   if (!SD_cardDetect(dev)) {
+      sdspi_setLED(dev, 0);  // Turn off LED if no card in socket
+      return -ENOMEDIUM;     // Return SD card not present error
+   }
+
+	if(dev->write_state)
+   {
+      rc = sdspi_WriteContinue(dev);
+     	return rc;
+   }
+   else
+   {
+		return 0;
+   }
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+
+
+

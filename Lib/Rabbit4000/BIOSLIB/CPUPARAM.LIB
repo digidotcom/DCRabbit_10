@@ -1,0 +1,278 @@
+/*** BeginHeader  ********************************************/
+#ifndef __CPUPARAM_LIB
+#define __CPUPARAM_LIB
+/*** EndHeader ***********************************************/
+
+/* START LIBRARY DESCRIPTION *********************************
+CPUPARAM.LIB
+	Copyright (c) 2006, Rabbit Semiconductor
+
+DESCRIPTION:
+	Handles CPU-specific setup for the BIOS.
+
+SUPPORT LIB'S:
+END DESCRIPTION **********************************************/
+
+
+/*** BeginHeader	_getDoublerSetting */
+__xmem int _getDoublerSetting();
+/*** EndHeader */
+
+// Setting the ALWAYS_DOUBLE macro to 1 will override the default
+// cutoff frequency in the BIOS of 12.9MHz for Rabbit 2000-based
+// boards.  Note that the upper-limit cutoffs of 31.3344MHz for
+// R2000 and 52.8384MHz for R3000 will still apply (those are the
+// upper limits of the possible clock doubler settings).
+#ifndef ALWAYS_DOUBLE
+#define	ALWAYS_DOUBLE		0
+#endif
+
+char clkdblr_setting;
+
+/* START _FUNCTION DESCRIPTION **************************************************
+_getDoublerSetting						<CPUPARAMS.LIB>
+
+SYNTAX:			int _getDoublerSetting();
+
+DESCRIPTION:	This function is called by the Rabbit BIOS to
+determine the proper clock doubler setting, which is dependent
+on both the CPU and the oscillator frequency.
+
+RETURN VALUE:	returns value to be loaded into GCDR for the current
+CPU and oscillator frequency.
+
+END DESCRIPTION ***************************************************************/
+
+#asm __xmem __nodebug
+_getDoublerSetting::
+
+#if (CLOCK_DOUBLED == 0)
+	clr	hl             ; clear return value
+	lret
+#else
+
+	ld 	a,(bios_divider19200+1)
+   or    a              ; disable if high byte non-zero
+   jr    nz,.cdDisable
+	ld 	a,(bios_divider19200)
+
+	ld		h, 0
+	ld		L, 0x0F
+	cp		13					; Xtal 7.3728 MHz and below
+	jr		c, .done
+	ld		L, 0x0D
+	cp		19					; Xtal 11.0592 MHz and below
+	jr		c, .done
+	ld		L, 0x09
+	cp		28					; Xtal 16.5888 MHz and below
+	jr		c, .done
+	ld		L, 0x06
+	cp		34					; Xtal 20.2752 MHz and below
+	jr		c, .done
+   ld		L, 0x03
+	cp		52					; Xtal 29.4912 MHz and below
+	jr		c, .done
+	ld		L, 0x01
+	cp		87					; Xtal 52.8384 MHz and below
+	jr		c, .done
+	ld		L, 0x12
+	cp		115				; Xtal 70.0416 MHz and below
+	jr		c, .done
+.cdDisable:
+	ld		L, 0x00       ; disable doubler if Xtal above 70.0416 MHz
+.done:
+	lret
+
+#endif // End of clock doubler != 0
+#endasm
+
+
+/*** BeginHeader	_enableClockModulation */
+__xmem int _enableClockModulation();
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION **************************************************
+_enableClockModulation						<CPUPARAMS.LIB>
+
+SYNTAX:			int _enableClockModulation();
+
+DESCRIPTION:	This function is called by the Rabbit BIOS to
+enable clock modulation if set by the macros in the BIOS.  It
+mainly consists to provide warnings if a possibly incompatible
+combination of spreader and oscillator frequency is selected.
+
+RETURN VALUE:	1 if enabled, 0 if not enabled.
+
+END DESCRIPTION ***************************************************************/
+
+#asm __xmem __nodebug
+_enableClockModulation::
+	bool	hl
+#if ENABLE_SPREADER == 0	// spreader disabled
+	xor	a
+	ld		(MTCRShadow), a
+	ioi	ld (MTCR), a		// normal /OE0 and /OE1 timing
+	ld		(GCM0RShadow), a
+	ioi	ld (GCM0R), a
+	ld		(GCM1RShadow), a
+	ioi	ld (GCM1R), a
+	ld		l, h
+	lret
+#else
+	// Disable clock modulator
+	ld		a, 0x00
+	ld		(GCM1RShadow), a
+	ioi	ld (GCM1R), a
+
+   // Must wait for min of 500 clk cycles before writing new modulator value
+   ld		bc, 80
+.waitDisable:
+   dwjnz .waitDisable
+
+
+	// set flash (/OE0) and RAM (/OE1) to toggle 1/2 clock early
+	ld		a, 0x0C
+	ld		(MTCRShadow), a
+	ioi	ld (MTCR), a
+
+// Rabbit 4000: setting depends on clock freq.  Over 50MHz, use weaker settings.
+//           Strong    Normal
+// <50MHz     0x80      0x00
+// >=50MHz    0x00      0x40
+
+	ld 	a, (bios_divider19200+1)
+   cp 	0
+   jr 	z, .notUsingPLL
+
+   // if high byte of bios_divider19200 is non-zero,
+   //  clock is >= 157MHz and we can't be using the doubler
+   xor   a
+	ioi	ld (GCM0R), a
+	ioi	ld (GCM1R), a
+	ld		(GCM0RShadow), a
+	ld		(GCM1RShadow), a
+   clr   hl
+   lret
+
+.notUsingPLL:
+	ld 	a, (bios_divider19200)
+
+   #if CLOCK_DOUBLED
+   sla	a
+   #endif
+
+	cp		80
+	jr		c,.lt50MHz
+	; fast clock
+	#if (ENABLE_SPREADER == 1)
+	ld		a,0x40					// normal spreading
+	#else
+	xor	a							// strong spreading
+	#endif
+	jr		.setgcm0r
+.lt50MHz:
+// pre-4000
+	#if (ENABLE_SPREADER == 1)
+	xor	a							// normal spreading
+	#else
+	ld		a, 0x80					// strong spreading
+	#endif
+.setgcm0r:
+
+	ld		(GCM0RShadow), a
+	ioi	ld (GCM0R), a		// set modulator type
+
+	ld		a, 0x80
+	ld		(GCM1RShadow), a
+	ioi	ld (GCM1R), a		// enable clock modulator
+
+	ld		l, 0x01
+	lret
+#endif
+#endasm
+
+/*** BeginHeader	_checkCPUid */
+__xmem int _checkCPUid();
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION **************************************************
+_checkCPUid						<CPUPARAMS.LIB>
+
+SYNTAX:			int _checkCPUid();
+
+DESCRIPTION:	This function is called by the Rabbit BIOS to
+determine the current BIOS was compiled for the CPU it is
+running on.
+
+RETURN VALUE:	0 if CPU matched compiled version, 1 if not.
+
+END DESCRIPTION ***************************************************************/
+
+#asm __xmem __nodebug
+_checkCPUid::
+	ioi	ld a, (GCPU)
+	and	0x1F
+	cp		_CPU_ID_>>8
+	clr	hl
+	jr		nz, .mismatch
+.match:
+	lret
+.mismatch:
+	inc	hl
+	lret
+#endasm
+
+
+/* START _FUNCTION DESCRIPTION **************************************************
+setEXPCanonical						<CPUPARAM.LIB>
+
+SYNTAX:			void setEXPCanonical(void);
+
+DESCRIPTION:	Work around following bug in Rabbit 6000:
+
+	"The complex pointer instructions (RLxREG, RRxREG, SLxREG, SRxREG, AESMC,
+	AESIMC, AESSR, AESISR, SHAFx and MD5Fx) use all of the pointer registers
+	(PW, PX, PY, PZ, PW', PX' PY' and PZ') to hold data for the operation.
+	Normally the EXP instruction can be used to swap the identity of the main
+	and alternate banks of these registers. But for these instructions, the
+	banks must be in their original state for the instructions to work as
+	specified."
+
+					This function sets the pointer register swap state so that
+					the abovementioned instructions work as expected.
+
+					This function only does anything on a Rabbit 6000.
+
+
+END DESCRIPTION ***************************************************************/
+/*** BeginHeader setEXPCanonical */
+
+
+void setEXPCanonical(void);
+/*** EndHeader */
+
+__nodebug void setEXPCanonical(void)
+{
+#if _RAB6K
+	#asm
+	; Test if proper state using RL1REG which effectively should swap jkhl and pw.
+	push	pw		; always preserver caller's view of PW
+	ld		bcde,0
+	ld		pw',bcde		; should be preserved at 0
+	ld		jkhl,1
+	rl1reg
+	alts ld bcde,pw
+	ld		jkhl,0
+	cp		jkhl,bcde
+	jr		z,.skip
+	exp
+.skip:
+	pop	pw
+	#endasm
+#endif
+}
+
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

@@ -1,0 +1,5654 @@
+/*
+ *    tcp.lib
+ *    Copyright (C) Rabbit Semiconductor, Inc. All rights reserved.
+ *    Portions used with permission of Erick Engelke.
+ *
+ * Transmission Control Protocol.
+ *
+ *	Defines:
+ *		TCP_VERBOSE - Print messages depending on runtime value of debug_on variable
+ *                  Also, where a socket is involved, check for the individual
+ *                  socket's debug_on field.
+ *		TCP_DEBUG - turn off any "nodebugs" so one can step into TCP functions
+ */
+/*** BeginHeader */
+#ifndef TCP_H
+#define TCP_H
+
+#ifdef TCP_DEBUG
+	#define _tcp_nodebug __debug
+#else
+	#define _tcp_nodebug __nodebug
+#endif
+
+#ifndef IP_H
+	#use "ip.lib"
+#endif
+#ifndef ARP_H
+	#use "arp.lib"
+#endif
+
+// Only needed here for tcp_tick(), which handles all packets
+#ifndef UDP_H
+	#use "udp.lib"
+#endif
+
+typedef struct {
+   word            srcPort;
+   word            dstPort;
+   longword        seqnum;
+   longword        acknum;
+   word            flags;
+   word            window;
+   word            checksum;
+   word            urgentPointer;
+} tcp_Header;
+
+#define tcp_FlagFIN     0x0001
+#define tcp_FlagSYN     0x0002
+#define tcp_FlagRST     0x0004
+#define tcp_FlagPUSH    0x0008
+#define tcp_FlagACK     0x0010
+#define tcp_FlagURG     0x0020
+#define tcp_FlagTRUNC   0x0040	// See note below
+#define tcp_FlagDO      0xF000
+#define tcp_GetDataOffset(tp) (intel16((tp)->flags) >> 12)
+
+/* Note:
+tcp_FlagTRUNC is not an official (RFC793) flag, and will normally be zero.
+It may be set non-zero by certain loopback interfaces for traffic which is
+not routed over IP.  If set, it indicates that the sequence and ack numbers
+are truncated to their 16 LSBs.  The high 16 bits must be reconstructed
+by comparing with the expected seq and ack numbers in the socket state.
+*/
+
+/* combination of headers and options */
+typedef struct {
+	in_Header in;
+	tcp_Header tcp;
+	word maxsegopt[2];
+} tcp_pkt;
+
+
+// TCP socket states.
+#define tcp_StateLISTEN   0x0001      /* listening for connection */
+#define tcp_StateARP      0x0002      /* waiting for ARP resolution */
+#define tcp_StateSYNSENT  0x0004      /* syn sent, active open */
+#define tcp_StateSYNREC   0x0008      /* syn received, synack+syn sent. */
+#define tcp_StateESTAB    0x0010      /* established */
+#define tcp_StateFINWT1   0x0020      /* sent FIN */
+#define tcp_StateFINWT2   0x0040      /* sent FIN, received ACK of FIN */
+#define tcp_StateCLOSWT   0x0080      /* received FIN waiting for close */
+#define tcp_StateCLOSING  0x0100      /* sent FIN, received FIN (waiting for FINACK) */
+#define tcp_StateLASTACK  0x0200      /* fin received, finack+fin sent */
+#define tcp_StateTIMEWT   0x0400      /* dally after sending final FINACK */
+#define tcp_StateCLOSED   0x8000      /* finack received */
+
+
+/*
+ * TCP data handler event type codes.  Note that TCP data handler functions
+ * are only performed if TCP_DATAHANDLER is defined.
+ */
+
+#define TCP_DH_LISTEN		0				// Started passive open (listen)
+#define TCP_DH_OPEN			1				// Started active open (sent SYN)
+#define TCP_DH_ESTAB			2				// Connection established
+#define TCP_DH_INDATA		3				// New incoming data
+#define TCP_DH_OUTBUF		4				// Outgoing data acknowledged by peer, new buffer space available for tx.
+#define TCP_DH_INCLOSE		5				// Received FIN, no more incoming data
+#define TCP_DH_OUTCLOSE		6				// Sent FIN, no more outgoing data
+#define TCP_DH_CLOSED		7				// Socket fully closed
+#define TCP_DH_ABORT			8				// Socket aborted by application
+#define TCP_DH_RESET			9				// Socket reset by peer
+#define TCP_DH_ICMPMSG		10				// Incoming ICMP message
+
+#ifndef RETRAN_STRAT_TIME
+	// This is used for several purposes.  It is the minimum time granularity of
+	// the retransmit process.  No timeout is set less than this value (ms).
+	#define RETRAN_STRAT_TIME  10
+#endif
+
+#define TCP_LOCAL 0x4000
+#define TCP_SAWCR 0x2000
+
+// Timeouts (in milliseconds) for various phases of open and close processing:
+#ifndef TCP_OPENTIMEOUT
+	#define TCP_OPENTIMEOUT 31000L   // timeout for active opens
+#endif
+#ifndef TCP_CONNTIMEOUT
+	#define TCP_CONNTIMEOUT 13000L   // timeout during open or close negotiation
+#endif
+#ifndef TCP_SYNQTIMEOUT
+	#define TCP_SYNQTIMEOUT 90000L   // timeout for pending connection
+#endif
+
+// If defined, call the TCP socket data handler function for various socket events.
+//#define TCP_DATAHANDLER
+
+// This macro, if defined, sets the default socket mode to half-close.  See
+// function description in sock_mode() for details.
+// This option is settable for individual sockets using tcp_set_fullclose/
+// tcp_set_halfclose.
+//#define TCP_NO_CLOSE_ON_LAST_READ
+
+// If defined, we can send a FIN with other data in the last segment.
+// The default (not defined) means that we send FIN in its own segment.
+// This has the advantage that it works with broken peers.
+//#define TCP_FIN_WITH_DATA
+
+// Define time to linger in TIMEWAIT state (milliseconds).
+// It should be from .5 to 4 minutes (2MSL) but it's
+// not really practical for us.  2 secs will hopefully handle the
+// case where ACK must be retransmitted, but can't (in theory) protect future
+// connections on the same port from old packets.  We make a practical attempt
+// to reduce the chances of this: the initial sequence number is chosen as the
+// byte-reversed value of MS_TIMER.  Since this is effectively random, we are
+// very unlikely to pick an initial seq num which overlaps the end of the previous
+// sequence space.
+//
+#ifndef TCP_TWTIMEOUT
+   #define TCP_TWTIMEOUT 2000L
+#endif
+
+// Number of times to retry the TCP keepalive
+#ifndef KEEPALIVE_NUMRETRYS
+	#define KEEPALIVE_NUMRETRYS 4
+#endif
+
+// Time, in seconds, to wait for the response to a TCP keepalive.
+#ifndef KEEPALIVE_WAITTIME
+	#define KEEPALIVE_WAITTIME	60
+#endif
+
+
+// Default time-to-live of TCP segments.  This value from Internet STD0002
+#ifndef TCP_TTL
+	#define TCP_TTL 64
+#endif
+// Default type-of-service
+#ifndef TCP_TOS
+	#define TCP_TOS IPTOS_DEFAULT
+#endif
+
+// Van jacobson RTT estimation parameters.  These are used to limit
+// the values, and hence limit the overall timeout interval.
+#define MAXVJSA         80000L /* 10 s (units of 1/8ms) */
+#define MAXVJSD         80000L /* 10 s (units of 1/8ms) */
+#define INITVJSA			0L 	 /* Zero initial value */
+#define INITVJSD			24000L /* 3 s initial value */
+
+// Set an overall upper bound for the retransmit timeout.  This is
+// in units of milliseconds.  Default is set to sa+4sd.
+#ifndef TCP_MAXRTO
+	#define TCP_MAXRTO (MAXVJSA+(MAXVJSD<<2)>>3)
+#endif
+
+// Set a lower bound for the retransmit timeout.  This is
+// in units of milliseconds.  Default is 10ms.  Beware of reducing
+// this, since modern hosts try to ack only every second segment.  If our
+// RTO is too small, we will unnecessarily retransmit if we don't get the
+// ack for the first of the two segments (especially on a fast LAN, where
+// the RTT measurement will want to make us set a small timeout).
+#ifndef TCP_MINRTO
+	#define TCP_MINRTO 10
+#endif
+
+// Set a delay time for "lazy update" (ms).  This is used to slightly delay
+// window updates and empty acknowledgments to the peer, in the hope of
+// being able to tag extra data along with otherwise empty segments.  This
+// improves performance by allowing better interleaving of application
+// processing with TCP activity, and sending fewer empty segments.  This
+// delay interval is also used when we need to retransmit owing to a temporary
+// shortage of ethernet transmit buffers.
+#ifndef TCP_LAZYUPD
+	#define TCP_LAZYUPD	5
+#endif
+
+#ifdef TCP_VERBOSE
+	#define tcp_send(x, y) _tcp_send(x, y)
+	#define tcp_sendsoon(x, y, z) _tcp_sendsoon(x, y, z)
+#else
+	#define tcp_send(x, y) _tcp_send(x)
+	#define tcp_sendsoon(x, y, z) _tcp_sendsoon(x, y)
+#endif
+
+/*** EndHeader */
+
+/*** BeginHeader tcp_setstate */
+void tcp_setstate(tcp_Socket * s, word newstate);
+/*** EndHeader */
+_tcp_nodebug void tcp_setstate(tcp_Socket * s, word newstate)
+{
+#ifdef TCP_VERBOSE
+	auto const char * oldstate;
+	if (newstate == s->state)
+		return;
+	oldstate  = sockstate(s);
+	s->state = newstate;
+	if (TCP_D(2,s))
+		printf("%s %s -> %s\n", printsock(s), oldstate, sockstate(s));
+#else
+	s->state = newstate;
+#endif
+   if (newstate == tcp_StateTIMEWT) {
+   #if TCP_FASTSOCKETS
+      if (s->reservedport_flag)
+      #if TCP_FASTSOCKETS == 1
+         s->timeout = MS_TIMER;		// This is the old style (no timeout at all)
+      #else
+      	s->timeout = _SET_TIMEOUT(s->rto);	// New style, not so aggressive: linger only for current RTO.
+      #endif
+      else
+   #endif
+         s->timeout = _SET_TIMEOUT(TCP_TWTIMEOUT);
+   }
+}
+
+
+/*** BeginHeader tcp_sock_init */
+void tcp_sock_init(void);
+/*** EndHeader */
+
+_tcp_nodebug void tcp_sock_init(void)
+{
+	auto int i;
+
+#ifdef USE_RESERVEDPORTS
+	// Initialize reserved ports array
+	tcp_initreserve();
+#endif
+   //set up circ buffer for available tcp_Pending objects
+   for(i=0;i < TCP_MAXPENDING;i++)
+   	tcp_pendingbuffer[i] = &tcp_pendingpool[i];
+
+  	tcp_pendingbuffer_head = 0;
+  	tcp_pendingbuffer_tail = TCP_MAXPENDING;
+#ifdef TCP_STATS
+	pkt_processed = 0;
+#endif
+   tcp_pendingcount = 0;
+   tcp_pendingestab = 0;
+   tcp_allpending = tcp_pendingtail = NULL;
+#if (MAX_TCP_SOCKET_BUFFERS > 0)
+	memset(_tcp_buffers, 0, (MAX_TCP_SOCKET_BUFFERS)*sizeof(void*));
+#endif
+	retran_strat = _SET_SHORT_TIMEOUT(RETRAN_STRAT_TIME);
+   if(_initialized) return;
+#if (MAX_TCP_SOCKET_BUFFERS > 0)
+	_tcp_buf_area = xalloc((MAX_TCP_SOCKET_BUFFERS) * (long)TCP_BUF_SIZE);
+#endif
+
+}
+
+/*** BeginHeader tcp_alloc_buffer */
+char __far * tcp_alloc_buffer(void* sockaddr);
+/*** EndHeader */
+
+_tcp_nodebug char __far * tcp_alloc_buffer(void* sockaddr)
+{
+#if (MAX_TCP_SOCKET_BUFFERS == 0)
+	return NULL;
+#else
+	auto int i,max,bsize;
+
+	max = MAX_TCP_SOCKET_BUFFERS;
+	bsize = TCP_BUF_SIZE;
+
+	i = 0;
+	while ((i < max) &&
+	       (_tcp_buffers[i] != NULL) &&
+	       (_tcp_buffers[i] != sockaddr)) {
+		i++;
+	}
+	if (i >= max) {
+		return NULL;
+	} else if (_tcp_buffers[i] == NULL) {
+		_tcp_buffers[i] = sockaddr;
+	}
+	return (char __far *)(_tcp_buf_area + (long)i * (long)bsize);
+#endif
+}
+
+
+
+
+/*** BeginHeader sock_preread */
+/* START FUNCTION DESCRIPTION ********************************************
+sock_preread                           <TCP.LIB>
+
+SYNTAX: int sock_preread( void *s, byte *dp, int len );
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	This function reads upto len bytes from the socket into
+               the buffer dp.  The bytes are not removed from the socket's
+               buffer.  This function is only valid for TCP sockets.
+
+PARAMETER1: 	socket
+PARAMETER2: 	buffer to preread into
+PARAMETER3: 	maximum number of bytes to preread
+
+RETURN VALUE:  -1 if there is an error, 0 if no data is waiting;
+					otherwise the number of bytes that were preread
+
+SEE ALSO:      sock_fastread, sock_fastwrite, sock_read, sock_write
+
+END DESCRIPTION **********************************************************/
+
+int sock_preread( void *_s, byte *dp, int len );
+/*** EndHeader */
+
+_tcp_nodebug
+int sock_preread( void *_s, byte *dp, int len )
+{
+   auto word count;
+   auto tcp_Socket *s;
+
+   if (len < 0)
+   	return -1;
+#ifdef USING_SSL
+   if (_IS_SSL_SOCK(_s))
+   	s = _TCP_SOCK_OF_SSL(_s);
+   else
+#endif
+   	s = _TCP_SOCK(_s);
+	if (_IS_TCP_SOCK(s)) {
+   	LOCK_SOCK(s);
+   	count = s->app_rd->len;
+		if (count) {
+		if (count > len) count = len;
+			_tbuf_xread((char __far *)dp, s->app_rd, 0, count);
+		}
+		UNLOCK_SOCK(s);
+		return count;
+	}
+	return -1;
+}
+
+
+
+/*** BeginHeader _tcp_open */
+int _tcp_open(tcp_Socket* s, int iface, word lport, longword ina,
+                        word port, dataHandler_t datahandler, long buffer,
+                        int buflen);
+/*** EndHeader */
+
+_tcp_nodebug int _tcp_open(tcp_Socket* s, int iface, word lport, longword ina,
+                        word port, dataHandler_t datahandler, long buffer,
+                        int buflen)
+{
+#ifdef TCP_DATAHANDLER
+	auto	void *	udata;
+#endif
+	// Common initialization for active and passive socket open
+#ifdef MCOS_LOCKS
+	static OS_EVENT *lock_backup;
+
+   if(InitSocketLock((sock_type *)s))
+   	return 0;
+   lock_backup = s->lock;
+#endif
+
+	s->dataHandler = NULL;						// Make sure unthread does not try to
+														//		call data handler.
+   tcp_unthread(s);								// Just in case not totally closed
+   // Zero out everything (except user_data if using a data handler)
+   // or userSocket flag if using RabbitSys.
+#ifdef TCP_DATAHANDLER
+   udata = s->user_data;
+#endif
+   memset( s, 0, sizeof( tcp_Socket));
+#ifdef TCP_DATAHANDLER
+   s->user_data = udata;
+#endif
+
+#ifdef TCP_NO_CLOSE_ON_LAST_READ
+	s->sock_mode |= TCP_MODE_HALFCLOSE;
+#endif
+
+   if (ina && iface != IF_ANY &&
+   		(ifpending(iface) != IF_UP)) {
+#ifdef TCP_VERBOSE
+		printf("TCP: interface number %u is not up\n", iface);
+#endif
+		sock_msg(s, NETERR_IFDOWN);
+   	return 0;
+   }
+
+
+#ifdef MCOS_LOCKS
+	s->lock = lock_backup;
+	//s->lock_count = 0;
+#endif
+
+#ifdef MCOS
+	if(s>=((tcp_Socket*)STACKORG)) {
+		exception(-ERR_TCPSOCKETISAUTO);
+	}
+#endif
+
+   s->ip_type = TCP_PROTO;
+   s->app_rd = &s->rd;
+   s->app_wr = &s->wr;
+	if (buffer == 0) {
+	#ifdef MALLOC_H_Incl
+		if (buflen) {
+			// Want dynamic allocation
+			if (buflen > 0) {
+				s->rd.buf = (char __far *)_sys_malloc(buflen);
+				if (!s->rd.buf) {
+	   #ifdef TCP_VERBOSE
+	            printf("TCP: could not allocate buffer dynamically (req=%d)\n", buflen);
+	   #endif
+	            sock_msg(s, NETERR_OUT_OF_MEMORY);
+	            return 0;
+				}
+				s->rd.maxlen = buflen >> 1;
+				s->buffer_flags |= TCP_BF_DYNALLOC;
+			}
+			else {
+				// Negative, which pecifies rdbuf size only.  Write buffer
+				// takes full TCP_BUF_SIZE (which should normally be about 2 MTUs)
+				s->rd.buf = (char __far *)_sys_malloc(-buflen + TCP_BUF_SIZE);
+				if (!s->rd.buf) {
+	   #ifdef TCP_VERBOSE
+	            printf("TCP: could not allocate buffer dynamically (req=%d)\n",
+	            				-buflen + TCP_BUF_SIZE);
+	   #endif
+	            sock_msg(s, NETERR_OUT_OF_MEMORY);
+	            return 0;
+				}
+				s->rd.maxlen = -buflen;
+				s->buffer_flags |= TCP_BF_DYNALLOC;
+  				s->wr.buf = s->rd.buf - buflen;
+  				s->wr.maxlen = TCP_BUF_SIZE;
+				goto _reset_buffers;
+			}
+		}
+		else {
+	#endif
+
+		// Use a buffer from the pool
+		if (!(s->rd.buf = tcp_alloc_buffer((void *)s))) {
+#ifdef TCP_VERBOSE
+			printf("TCP: could not allocate buffer from pool\n");
+#endif
+			sock_msg(s, NETERR_OUT_OF_MEMORY);
+			return 0;
+		}
+   	s->rd.maxlen =	TCP_BUF_SIZE / 2;
+	#ifdef MALLOC_H_Incl
+		}
+	#endif
+   }
+   else {
+   	// Use the user-supplied buffer
+   	s->rd.buf = (char __far *)buffer;
+   	s->rd.maxlen = buflen >> 1;
+   }
+   // By default, read/write buffers are init to equal sizes (with write buffer
+   // following read buffer in contiguous far memory).  This can be altered
+   // using sock_bufctl() provided the socket connection is not yet established.
+  	s->wr.buf = s->rd.buf + s->rd.maxlen;
+  	s->wr.maxlen = s->rd.maxlen;
+_reset_buffers:
+  	_tbuf_reset(&s->rd);
+  	_tbuf_reset(&s->wr);
+
+   s->iface = iface;
+   s->tos = TCP_TOS;
+   s->ttl = TCP_TTL;
+   // Set TCP MSS here.  If passive open on any interface, set minimum MSS.  This is conservative -
+   // we could set the mss when actually opened.
+  	s->mss = ifmtu(iface,ina) - (sizeof(in_Header) + sizeof(tcp_Header));
+   s->ssthresh = 32767;
+   s->cwnd = s->mss;
+   s->vj_sa = INITVJSA;
+   s->vj_sd = INITVJSD;
+   s->rto = (INITVJSA + 2*INITVJSD) >> 3; /* initial RTO is A+2D - 6 sec if defaults */
+   lport = findfreeport(lport, 1);  /* get a nonzero port val */
+   s->myport = lport;
+   s->hisaddr = ina;
+   s->hisport = port;
+#ifndef TCP_DEBUG
+	// In debug mode, initial seqnum set to zero, otherwise is set to clock value
+   s->seqnum = intel(MS_TIMER);
+#endif
+	s->advwindow = s->rd.maxlen;
+   s->dataHandler = datahandler;
+   s->usr_yield = system_yield;
+	LOCK_QUICK();
+   s->next = tcp_allsocs;
+   tcp_allsocs = s;
+   UNLOCK_QUICK();
+	return 1;
+}
+
+
+/*** BeginHeader sock_bufctl */
+typedef enum {
+	// Note that setting a read buffer to less than 1 MSS is not permitted, since
+	// it can cause very poor performance.
+	BCA_READSIZE,		// Set read buffer size (bytes), remainder for write
+	BCA_WRITESIZE,		// Set write buffer size (bytes), remainder for read
+	BCA_PROPORTION,	// Set read:write ratio as 1..255/256.  '1' gives 1 part read
+							//  to 255 parts write; '128' gives equal read and write;
+							//  '255' gives 255 parts read and 1 part write, etc.
+	BCA_REASSIGN		// Reassign buffer to a new buffer address, maintaining
+							//  current proportions.  Application is responsible for
+							//  management of buffer memory!
+} BufCtlAction;
+
+int sock_bufctl(void * s, BufCtlAction a, size_t amt, long addr);
+/*** EndHeader */
+_tcp_nodebug
+int sock_bufctl(void * s, BufCtlAction a, size_t amt, long addr)
+{
+
+	auto int     retval;
+	auto size_t  mss, rd, wr, tot, new_rd;
+	auto unsigned long g;
+
+#ifdef USING_SSL
+	// For SSL sockets, this function operates on the underlying transport.
+	// The application has full control of the application-side buffer sizes
+	// via the sock_secure() function, so this function concentrates on the
+	// tranport layer side.
+	if (_SOCK_TYPE(s) == SSL_PROTO)
+		s = _TCP_SOCK_OF_SSL(s);
+#endif
+
+	LOCK_SOCK(s);
+   switch (_SOCK_TYPE(s)) {
+#ifndef DISABLE_TCP
+   case TCP_PROTO:
+   	// Must be in listen or synsent state.  Note that in the latter case we may have already
+   	// advertised a larger window, which strictly means we should not now change to a smaller
+   	// window, however there is currently no other opportunity for changing the buffer
+   	// size of actively opened sockets, so we rely on retransmission if this is a problem.
+   	if (!(_TCP_FIELD(s, state) & (tcp_StateLISTEN | tcp_StateARP | tcp_StateSYNSENT))) {
+   		retval = -EBUSY;
+   		break;
+   	}
+   	rd = _TCP_FIELD(s, rd.maxlen);
+   	wr = _TCP_FIELD(s, wr.maxlen);
+   	tot = rd + wr;
+   	mss = _TCP_FIELD(s, mss);
+		retval = 0;
+   	if (a == BCA_REASSIGN) {
+	      if (mss >= amt) {
+	         // Cannot change size when buffer smaller than mss.
+	         retval = -EINVAL;
+	         break;
+	      }
+   		g = amt * 65536uL / tot;	// Growth factor scaled up 65536
+			new_rd = (size_t)(rd * g >> 16u);
+			if (new_rd < mss)
+				new_rd = mss;
+			if (new_rd >= amt) {
+	         retval = -EINVAL;
+	         break;
+			}
+			tot = amt;
+			_TCP_FIELD(s, rd.buf) = (char __far *)addr;
+			_TCP_FIELD(s, wr.buf) = _TCP_FIELD(s, rd.buf) + new_rd;
+   	}
+   	else {
+	      if (mss >= tot) {
+	         // Cannot change size when buffer smaller than mss.
+	         retval = -EINVAL;
+	         break;
+	      }
+	      switch (a) {
+	      case BCA_PROPORTION:
+	      	amt = (size_t)(tot * (unsigned long)amt >> 8);
+	      	goto _rsize;
+	      case BCA_WRITESIZE:
+	      	if (amt >= tot)
+	      		amt = tot - 1;
+	      	else
+            	amt = tot - amt;
+            // fall through
+	      case BCA_READSIZE:
+	      _rsize:
+	         new_rd = amt;
+	         if (new_rd < mss)
+	            new_rd = mss;
+	         if (new_rd >= tot)
+	            new_rd = tot - 1;
+	         break;
+	      }
+		}
+		if (!retval) {
+			_TCP_FIELD(s, rd.maxlen) = new_rd;
+			_TCP_FIELD(s, wr.maxlen) = tot - new_rd;
+			_tbuf_reset(&_TCP_FIELD(s, rd));
+			_tbuf_reset(&_TCP_FIELD(s, wr));
+		}
+      break;
+#endif
+   default:
+   	// Don't implement for UDP or other types
+   	retval = -EINVAL;
+   }
+   UNLOCK_SOCK(s);
+   return retval;
+}
+
+
+/*** BeginHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+tcp_open                               <TCP.LIB>
+
+SYNTAX: int tcp_open(tcp_Socket* s, word lport, longword ina, word port,
+                     dataHandler_t datahandler);
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	Actively create a session with another machine. Implemented
+					as a MACRO.
+
+PARAMETER1: 	socket
+PARAMETER2:    our port, zero for the next available 1025-65536
+PARAMETER3: 	ip address to connect to
+PARAMETER4: 	port to connect to
+PARAMETER5:    function to call when data is received, NULL for placing
+               data in the sockets receive buffer.
+
+RETURN VALUE:  0 if open was not able resolve the remote computer's
+               hardware address, !0 otherwise.
+
+SEE ALSO:      tcp_extopen
+
+END DESCRIPTION **********************************************************/
+
+#define tcp_open(s, lport, ina, port, datahandler) \
+	(tcp_extopen(s, IF_DEFAULT, lport, ina, port, datahandler, 0, 0))
+/*** EndHeader */
+
+
+/*** BeginHeader tcp_find_vspd */
+int tcp_find_vspd(word * ifacep, word * portp);
+/*** EndHeader */
+_tcp_nodebug int tcp_find_vspd(word * ifacep, word * portp)
+{
+	word iface, port;
+
+   if (*ifacep == IF_ANY) switch (*portp) {
+#if USE_VSPD & 0x01
+   case SADR: iface = IF_PPP0; break;
+#endif
+#if USE_VSPD & 0x02
+   case SBDR: iface = IF_PPP1; break;
+#endif
+#if USE_VSPD & 0x04
+   case SCDR: iface = IF_PPP2; break;
+#endif
+#if USE_VSPD & 0x08
+   case SDDR: iface = IF_PPP3; break;
+#endif
+#if USE_VSPD & 0x10
+   case SEDR: iface = IF_PPP4; break;
+#endif
+#if USE_VSPD & 0x20
+   case SFDR: iface = IF_PPP5; break;
+#endif
+   default: iface = IF_ANY;
+   }
+   else {
+   	iface = *ifacep;
+      *portp = 0;		// Specific interface overrides port.
+   }
+   if (!*portp) switch (*ifacep) {
+#if USE_VSPD & 0x01
+   case IF_PPP0: port = SADR; break;
+#endif
+#if USE_VSPD & 0x02
+   case IF_PPP1: port = SBDR; break;
+#endif
+#if USE_VSPD & 0x04
+   case IF_PPP2: port = SCDR; break;
+#endif
+#if USE_VSPD & 0x08
+   case IF_PPP3: port = SDDR; break;
+#endif
+#if USE_VSPD & 0x10
+   case IF_PPP4: port = SEDR; break;
+#endif
+#if USE_VSPD & 0x20
+   case IF_PPP5: port = SFDR; break;
+#endif
+   default: port = 0;
+   }
+   else
+   	port = *portp;
+   if (*ifacep != IF_ANY && iface != *ifacep)
+   	return 1;	// Error, cannot determine interface.
+   if (*portp && port != *portp)
+   	return 1;	// Error, cannot determine port
+	*portp = port;
+   *ifacep = iface;
+	return !(port && iface != IF_ANY);
+}
+
+
+/*** BeginHeader tcp_extopen */
+
+/* START FUNCTION DESCRIPTION ********************************************
+tcp_extopen                            <TCP.LIB>
+
+SYNTAX: int tcp_extopen(tcp_Socket* s, int iface, word lport, longword ina,
+                        word port, dataHandler_t datahandler, long buffer,
+                        int buflen);
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	Actively create a session with another machine.  This
+					is an extended version of tcp_open.
+
+PARAMETER1: 	socket
+PARAMETER2:		local interface on which to open the socket.  Use IF_ANY
+               if interface is to be selected automatically based on the
+               destination IP address.
+PARAMETER3:    local port, zero for the next available 1025-65535
+PARAMETER4: 	ip address to connect to
+PARAMETER5: 	port to connect to
+PARAMETER6:    function to call when data is received, NULL for placing
+               data in the socket's receive buffer.
+PARAMETER7:		address of user-supplied socket buffer in xmem, 0 to use
+					a buffer from the socket buffer pool (if next parameter
+					is zero) or dynamically allocated (if next parameter is
+					non-zero).
+PARAMETER8:		length of user-supplied socket buffer.  If buffer address
+					(above parameter) is zero, then if this parameter is greater
+					than zero then a suitable buffer will be dynamically
+					allocated using _sys_malloc(), and that buffer will be
+					split equally between transmit and receive.  If this
+					parameter is negative then its absolute value is used to
+					allocate a buffer of that size for receive, and a fixed
+					transmit buffer of 2 MTU is added.  This is useful for
+					sockets which are intended to be secured using sock_secure()
+					since they need asymmetric buffers with at least 16k for
+					receive.
+
+RETURN VALUE:  0 if open was not able resolve the remote computer's
+               hardware address, !0 otherwise.
+
+SEE ALSO:      tcp_open
+
+END DESCRIPTION **********************************************************/
+int tcp_extopen(tcp_Socket* s, int iface, word lport, longword ina,
+                word port, dataHandler_t datahandler, long buffer,
+                int buflen);
+/*** EndHeader */
+
+/*
+ * Actively open a TCP connection to a particular destination.
+ *	- 0 on error
+ */
+_tcp_nodebug
+int tcp_extopen(tcp_Socket* s, int iface, word lport,
+	longword ina,word port, dataHandler_t datahandler, long buffer,int buflen)
+{
+#if USING_VSPD
+	if (ina == VSPD_LOCALHOST) {
+   	// If iface is not IF_ANY, override 'port' to correct value.
+      if (tcp_find_vspd((word *)&iface, &port))
+      	return 0;
+	   if (!_tcp_open(s, iface, lport, ina, port, datahandler, buffer, buflen))
+	      return 0;
+      s->iface = iface;		// Always bind to interface
+      tcp_setstate(s, tcp_StateESTAB);
+      goto _callDH;
+   }
+#endif
+	// Don't allow loopback
+	if (iface == IF_ANY) {
+		iface = ip_iface(ina, 0);
+		if (iface == IF_ANY)
+			return 0;
+	}
+
+	if (!_tcp_open(s, iface, lport, ina, port, datahandler, buffer, buflen))
+		return 0;
+
+   tcp_setstate(s, tcp_StateSYNSENT);
+   s->timeout = _SET_TIMEOUT( TCP_OPENTIMEOUT );
+
+   s->sath = arpresolve_start_iface(ina, iface);
+   if (s->sath < 0)
+   	return 0;
+
+	arpcache_iface(s->sath, (word *)&iface);
+   if (iface == IF_ANY)
+   	iface = IF_DEFAULT;
+   s->myaddr = _if_tab[iface].ipaddr;
+
+   s->kflags = TCP_KF_SYN;
+
+   LOCK_GLOBAL(TCPGlobalLock);
+   tcp_send(s, 0);
+   UNLOCK_GLOBAL(TCPGlobalLock);
+_callDH:
+   #ifdef TCP_DATAHANDLER
+   if (s->dataHandler)
+   	s->dataHandler(TCP_DH_OPEN, s, NULL, NULL);
+   #endif
+   return 1;
+}
+
+/*** BeginHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+tcp_listen                             <TCP.LIB>
+
+SYNTAX: int tcp_listen( tcp_Socket *s, word lport, longword ina,
+            word port, dataHandler_t datahandler, word reserved );
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	This function tells DCRTCP that an incoming session for a
+               particular port will be accepted.
+
+PARAMETER1: 	socket
+PARAMETER2: 	port to listen on
+PARAMETER3: 	ip address to accept connections from or 0 for all.
+PARAMETER4: 	port to accept connections from or 0 for all.
+PARAMETER5:    function to call when data is received, NULL for placing
+               data in the sockets receive buffer.
+PARAMETER6: 	this parameter is here for compatibility and possible future
+					use (use 0 for this parameter)
+
+RETURN VALUE:  1 for success; 0 for error
+
+SEE ALSO:      tcp_extlisten
+
+END DESCRIPTION **********************************************************/
+
+#define tcp_listen( s, lport, ina, port, datahandler, reserved ) \
+	(tcp_extlisten(s, IF_DEFAULT, lport, ina, port, datahandler, reserved, 0, 0))
+/*** EndHeader */
+
+/*** BeginHeader tcp_extlisten */
+/* START FUNCTION DESCRIPTION ********************************************
+tcp_extlisten                          <TCP.LIB>
+
+SYNTAX: int tcp_extlisten( tcp_Socket *s, int iface, word lport,
+                           longword ina, word port,
+                           dataHandler_t datahandler, word reserved,
+                           long buffer, int buflen );
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	This function tells DCRTCP that an incoming session for a
+               particular port will be accepted.  This is an extended
+               version of tcp_listen.
+
+PARAMETER1: 	socket
+PARAMETER2:		local interface on which to open the socket.  Use IF_ANY
+               if the socket is to accept connections from any interface.
+               Otherwise, connections will be accepted only from the
+               specified interface.
+PARAMETER3: 	port to listen on - the "well known port".
+					From DC10.68, this can be zero, in which case the socket
+               will listen on port 0 (which is more useful than the old
+               behavior of picking a random listen port!)
+PARAMETER4: 	ip address to accept connections from or 0 for all.
+PARAMETER5: 	port to accept connections from or 0 for all.
+PARAMETER6:    function to call when data is received, NULL for placing
+               data in the socket's receive buffer.
+PARAMETER7: 	this parameter is here for compatibility and possible future
+					use (use 0 for this parameter)
+PARAMETER8:		address of user-supplied socket buffer in xmem, 0 to use
+					a buffer from the socket buffer pool (if next parameter
+					is zero) or dynamically allocated (if next parameter is
+					non-zero).
+PARAMETER9:		length of user-supplied socket buffer.  If buffer address
+					(above parameter) is zero, then if this parameter is greater
+					than zero then a suitable buffer will be dynamically
+					allocated using _sys_malloc(), and that buffer will be
+					split equally between transmit and receive.  If this
+					parameter is negative then its absolute value is used to
+					allocate a buffer of that size for receive, and a fixed
+					transmit buffer of 2 MTU is added.  This is useful for
+					sockets which are intended to be secured using sock_secure()
+					since they need asymmetric buffers with at least 16k for
+					receive.
+
+RETURN VALUE:  1 for success; 0 for error
+
+SEE ALSO:      tcp_listen
+
+END DESCRIPTION **********************************************************/
+int tcp_extlisten( tcp_Socket *s, int iface, word lport, longword ina,
+                   word port, dataHandler_t datahandler, word reserved,
+                   long buffer, int buflen );
+/*** EndHeader */
+
+/*
+ * Passive open: listen for a connection on a particular port
+ */
+_tcp_nodebug
+int tcp_extlisten( tcp_Socket *s, int iface, word lport, longword ina,
+                           word port, dataHandler_t datahandler, word reserved,
+                           long buffer, int buflen )
+{
+#if USING_VSPD
+	if (ina == VSPD_LOCALHOST) {
+      #ifdef TCP_VERBOSE
+      printf("TCP: Cannot 'listen' for a stream connection.  Must use active open.\n");
+      #endif
+   	return 0;
+   }
+#endif
+	if (!_tcp_open(s, iface, lport, ina, port, datahandler, buffer, buflen))
+		return 0;
+  	s->myport = lport;// override the random port assigned in _tcp_open().
+      					// It is not useful to listen on a random port, whereas
+                     // it *is* useful to listen on port 0!
+	if (_tcp_pendcheck(s))
+		return 1;
+   tcp_setstate(s, tcp_StateLISTEN);
+   #ifdef TCP_DATAHANDLER
+   if (s->dataHandler)
+   	s->dataHandler(TCP_DH_LISTEN, s, NULL, NULL);
+   #endif
+   return 1;
+}
+
+/*** BeginHeader _tcp_pendcheck */
+int _tcp_pendcheck( tcp_Socket *s );
+/*** EndHeader */
+_tcp_nodebug
+int _tcp_pendcheck( tcp_Socket *s )
+{
+	auto tcp_Pending __far *p;
+	auto int rc;
+	auto word iface;
+
+   LOCK_GLOBAL(TCPGlobalLock);
+	rc = 0;
+	for(p = tcp_allpending; p;p = p->next)
+	{
+		// Ignore incompletely opened pending connections in favor
+		// of fully opened ones.  Pending connections in SYNREC might be
+		// idle probes from an attacker.  Let them die a natural death if
+		// not progressed to ESTAB.
+		// Note: pending connections on an interface which is never listened on
+		// will time out.
+		if (!p->open)
+			continue;
+#ifdef MULTI_IF
+		arpcache_iface(p->ppath, &iface);
+#endif
+		if(	s->myport == p->myport &&
+				(!s->hisport || s->hisport == p->hisport) &&
+				(!s->hisaddr || s->hisaddr == p->hisaddr)
+#ifdef MULTI_IF
+				&& (s->iface == IF_ANY || s->iface == iface)
+#endif
+				)
+		{
+			//assign the pending connection to this new socket
+#ifdef TCP_VERBOSE_PENDING
+			printf("%s  -> picked up\n", printpend(p));
+#endif
+			s->hisport = p->hisport;
+			s->hisaddr = p->hisaddr;
+         s->myaddr = p->myaddr;
+			s->sath = p->ppath;
+			s->seqnum = p->seqnum;
+			s->acknum = p->acknum;
+			s->mss = p->mss;
+			s->window = p->mss;	// We don't remember his window, but this gives us a start.
+			tcp_setstate(s, tcp_StateESTAB);
+
+			s->reservedport_flag = 1; // only reserved ports have pending connections
+			//remove pending connection from the list
+			tcp_removepending(p);
+			// Empty write for new window.
+			tcp_pendingpkt(p, tcp_FlagACK, s->rd.maxlen);
+   	#ifdef TCP_DATAHANDLER
+   		if (s->dataHandler)
+   			s->dataHandler(TCP_DH_ESTAB, s, NULL, NULL);
+   	#endif
+			rc = 1;
+			break;
+		}
+	}
+#ifdef TCP_VERBOSE_PENDING
+	if (tcp_allpending && !rc)
+		printf("TCP: pending, but none established in tcp_listen (pendings=%d)\n", tcp_pendingcount);
+#endif
+
+   UNLOCK_GLOBAL(TCPGlobalLock);
+   return rc;
+}
+
+/*** BeginHeader tcp_close */
+void tcp_close( tcp_Socket *s );
+/*** EndHeader */
+
+/*
+ * Send a FIN on a particular port -- only works if it is open
+ *   Must still allow receives
+ */
+_tcp_nodebug void tcp_close( tcp_Socket *s )
+{
+   if( s->ip_type != TCP_PROTO )
+      return;
+#ifdef TCP_DATAHANDLER
+  	if (s->dataHandler)
+  		s->dataHandler(TCP_DH_OUTCLOSE, s, NULL, NULL);
+#endif
+   LOCK_GLOBAL(TCPGlobalLock);
+   LOCK_SOCK(s);
+
+#if USING_VSPD
+	if (s->hisaddr == VSPD_LOCALHOST) {
+   	// Close goes straight to CLOSED (non-existent) state, without any fuss.
+      UNLOCK_SOCK(s);
+	   UNLOCK_GLOBAL(TCPGlobalLock);
+      tcp_unthread (s);    /* unlink */
+      return;
+   }
+#endif
+
+   // Mark that we want to add a FIN, but only in appropriate states
+
+   if (s->state & (tcp_StateESTAB | tcp_StateSYNREC)) {
+      tcp_setstate(s, tcp_StateFINWT1);
+	   s->kflags |= TCP_KF_WANTFIN;
+		if (!(s->sock_mode & TCP_MODE_HALFCLOSE))
+      	s->timeout = _SET_TIMEOUT( TCP_CONNTIMEOUT );
+      tcp_send( s, 90 );
+   } else if (s->state & tcp_StateCLOSWT ) {
+      tcp_setstate(s, tcp_StateLASTACK);
+	   s->kflags |= TCP_KF_WANTFIN;
+      tcp_send( s, 91 );
+   } else if (s->state & (tcp_StateSYNSENT | tcp_StateLISTEN)) {
+      UNLOCK_SOCK(s);
+	   UNLOCK_GLOBAL(TCPGlobalLock);
+      tcp_unthread (s);    /* unlink failed connect */
+      return;
+   }
+   // Any other states; the close is already in progress so don't do anything.
+   UNLOCK_SOCK(s);
+   UNLOCK_GLOBAL(TCPGlobalLock);
+}
+
+/*** BeginHeader tcp_abort */
+void tcp_abort( tcp_Socket *s );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ******************************
+tcp_abort														<tcp.LIB>
+
+Description:	Abort a tcp connection
+
+Parameter:		pointer to open socket
+
+Return Value:	none
+
+See Also:		tcp_close
+END DESCRIPTION *******************************************/
+_tcp_nodebug void tcp_abort( tcp_Socket *s )
+{
+#if USING_VSPD
+	if (s->hisaddr == VSPD_LOCALHOST) {
+   	s->ip_type = 0;
+   	goto _callDH;
+   }
+#endif
+   LOCK_GLOBAL(TCPGlobalLock);
+	LOCK_SOCK(s);
+  	sock_msg(s, NETERR_ABORT);
+   if (!(s->state & (tcp_StateLISTEN | tcp_StateCLOSED)) &&
+		!(s->kflags & TCP_KF_NOARP))
+	{
+      s->kflags |= TCP_KF_SENDRST;
+      tcp_send(s, 95);
+   }
+   _tbuf_reset(&s->wr);
+   s->ip_type = 0;
+	UNLOCK_SOCK(s);
+   UNLOCK_GLOBAL(TCPGlobalLock);
+_callDH:
+#ifdef TCP_DATAHANDLER
+	if (s->dataHandler)
+		s->dataHandler(TCP_DH_ABORT, s, NULL, NULL);
+#endif
+   tcp_unthread(s);
+}
+
+/*** BeginHeader tcp_abortpending */
+void tcp_abortpending( tcp_Pending __far *p );
+/*** EndHeader */
+
+/*
+ * Abort a pending tcp connection
+ */
+_tcp_nodebug void tcp_abortpending( tcp_Pending __far *p )
+{
+	tcp_pendingpkt(p, tcp_FlagRST | tcp_FlagACK, 0);
+	tcp_removepending(p);
+}
+
+/*** BeginHeader tcp_removepending */
+void tcp_removepending( tcp_Pending __far *p );
+/*** EndHeader */
+
+/*
+ * Remove pending connection from active list
+ */
+_tcp_nodebug void tcp_removepending( tcp_Pending __far *p )
+{
+	if(p->prev)
+		p->prev->next = p->next;
+	else
+		//first one
+		tcp_allpending = p->next;
+
+	if(p->next)
+		p->next->prev = p->prev;
+	else
+		//last one
+		tcp_pendingtail = p->prev;
+
+	tcp_pendingpoolreturn(p);
+	tcp_pendingcount--;
+	if (p->open)
+		tcp_pendingestab--;
+}
+
+
+/*** BeginHeader _tcp_sendsoon */
+#ifdef TCP_VERBOSE
+	void _tcp_sendsoon( tcp_Socket *s, word delayms, int line );
+#else
+	void _tcp_sendsoon( tcp_Socket *s, word delayms );
+#endif
+/*** EndHeader */
+
+/*
+ * tcp_sendsoon - schedule a transmission pretty soon
+ */
+#ifdef TCP_VERBOSE
+_tcp_nodebug void _tcp_sendsoon( tcp_Socket *s, word delayms, int line )
+#else
+_tcp_nodebug void _tcp_sendsoon( tcp_Socket *s, word delayms )
+#endif
+{
+#ifdef TCP_VERBOSE
+	static int lastline;
+
+	if (line) lastline = line;
+#endif
+   LOCK_GLOBAL(TCPGlobalLock);
+  	LOCK_SOCK(s);
+   if (s->ip_type == TCP_PROTO  && !(s->kflags & TCP_KF_SENDSOON)) {
+#ifdef TCP_VERBOSE
+		if (TCP_D(3, s))
+      	printf("%s sendsoon scheduled in %ums\n", printsock(s), delayms);
+#endif
+     	s->rtt_time = _SET_TIMEOUT(delayms);
+      s->kflags |= TCP_KF_SENDSOON;
+   }
+#ifdef TCP_VERBOSE
+	else if (TCP_D(3, s) && s->ip_type == TCP_PROTO)
+   	printf("%s sendsoon already scheduled\n", printsock(s));
+#endif
+   UNLOCK_SOCK(s);
+   UNLOCK_GLOBAL(TCPGlobalLock);
+}
+
+
+/*** BeginHeader tcp_Retransmitter */
+void tcp_Retransmitter( void );
+
+/*** EndHeader */
+
+/*
+ * Retransmitter - called periodically to perform tcp retransmissions.
+ * Global lock must be obtained by caller!
+ */
+_tcp_nodebug void tcp_Retransmitter( void )
+{
+   auto tcp_Socket *s;
+   auto ATHandle ath;
+
+   /* only do this once per RETRAN_STRAT_TIME milliseconds */
+   if (
+#ifndef ARP_MINIMAL
+   	!_arp_resolved &&
+#endif
+   	!_CHK_SHORT_TIMEOUT(retran_strat))
+      return;
+   retran_strat = _SET_SHORT_TIMEOUT(RETRAN_STRAT_TIME);
+
+   for( s = tcp_allsocs; s; s = s->next ) {
+
+   	LOCK_SOCK(s);
+      // possible to be closed but still queued
+      if( s->state & tcp_StateCLOSED ) {
+         UNLOCK_SOCK(s);
+         continue;
+      }
+
+#ifndef ARP_MINIMAL
+      if (s->kflags & TCP_KF_NOARP) {
+      	// This socket waiting for ARP resolve.
+      	ath = arpresolve_check(s->sath, s->hisaddr);
+      	if (ath > 0) {
+      		// Resolved OK.
+      		s->kflags &= ~TCP_KF_NOARP;
+      		tcp_send(s, 105);
+         	UNLOCK_SOCK(s);
+         	continue;
+         }
+			// Not yet resolved.
+			if (ath != ATH_AGAIN) {
+				// Got an error.
+				sock_msg(s, NETERR_NOHOST_ARP);
+				tcp_abort(s);
+			}
+        	UNLOCK_SOCK(s);
+        	continue;
+      }
+#endif
+
+      if (s->kflags & TCP_KF_SEGCHAIN) {
+      	s->kflags &= ~TCP_KF_SEGCHAIN;
+      	tcp_send(s, 105);
+         UNLOCK_SOCK(s);
+         continue;
+      }
+
+      if (s->kflags & (TCP_KF_SENDSOON|TCP_KF_UNHAPPY) ) {
+         /* retransmission strategy */
+
+         if (chk_timeout(s->rtt_time)) {
+#ifdef TCP_VERBOSE
+       		if(TCP_D(3, s) && s->kflags & TCP_KF_SENDSOON)
+               printf("%s sendsoon timeout with unack=%u datalen=%u win=%u\n",
+                  printsock(s), s->unacked, s->wr.len, s->window);
+#endif
+            if (!(s->kflags & TCP_KF_SENDSOON) && s->unacked) {
+               /* if really did timeout */
+#ifdef TCP_VERBOSE
+            	if(TCP_D(2, s))
+            		printf("%s Timeout with unack=%u datalen=%u win=%u\n", printsock(s), s->unacked, s->wr.len, s->window);
+#endif
+            	/* strategy handles closed windows */
+            	if(!s->window) {
+               	s->window = 1;
+               	s->kflags |= TCP_KF_PROBING;
+               }
+
+               s->kflags |= TCP_KF_RETRANSMIT;
+
+               s->rto <<= 1;
+#ifdef TCP_DEBUG
+					// Limit to 3 seconds if debugging
+					if (s->rto > 3000)
+						s->rto = 3000;
+#else
+					// Limit to 50 seconds (if default values)
+					if (s->rto > TCP_MAXRTO)
+						s->rto = TCP_MAXRTO;
+#endif
+              	// Slow start threshold set to 1/2 * min(cwnd, window)
+              	if (s->cwnd < s->window)
+              		s->ssthresh = s->cwnd >> 1;
+              	else
+              		s->ssthresh = s->window >> 1;
+              	// But not less than 2 mss
+              	if (s->ssthresh < s->mss << 1)
+              		s->ssthresh = s->mss << 1;
+              	// Do slow start
+              	s->cwnd = s->mss;
+              	s->startpt = 0;
+
+#ifdef TCP_STATS
+					s->timeouts++;
+#endif
+            }
+#ifdef TCP_STATS
+				else if (s->kflags & TCP_KF_SENDSOON)
+					s->sendsoons++;
+#endif
+				if (s->kflags & TCP_KF_DUPACK_SS) {
+#ifdef TCP_VERBOSE_DUPACK
+					printf("TCP: sendsoon dupack triggered\n");
+#endif
+					s->kflags &= ~TCP_KF_DUPACK_SS;
+					s->kflags |= TCP_KF_DUPACK;
+				}
+            tcp_send(s, 20);
+         }
+
+         if( s->datatimer && chk_timeout( s->datatimer ))
+            tcp_abort(s);
+      }
+
+#ifndef ARP_MINIMAL
+      // We have processed this, if set.
+      _arp_resolved = 0;
+#endif
+
+      /* handle inactive tcp timeouts */
+      if( sock_inactive && s->inactive_to && chk_timeout( s->inactive_to)) {
+         /* this baby has timed out */
+			sock_msg(s, NETERR_INACTIVE_TIMEOUT);
+         tcp_close(s);
+      }
+
+      if( s->timeout && chk_timeout( s->timeout)) {
+         if( s->state & tcp_StateTIMEWT ) {
+            tcp_setstate(s, tcp_StateCLOSED);
+            UNLOCK_SOCK(s);
+            break;
+         } else if (s->state & (tcp_StateCLOSING|tcp_StateLASTACK|
+         								tcp_StateSYNSENT|tcp_StateSYNREC)) {
+				sock_msg(s, NETERR_CONN_TIMEOUT);
+            tcp_abort(s);
+            UNLOCK_SOCK(s);
+            break;
+         }
+      }
+
+      /* handle keepalives */
+      if(s->kflags & TCP_KF_KEEPALIVE && chk_timeout(s->rtt_time)) {
+#ifdef TCP_VERBOSE
+			printf("%s no keepalive response (%d)\n", printsock(s), s->keepalive_state);
+#endif
+      	if(s->keepalive_state) {
+      		/* a keepalive is pending - did we get a response yet? */
+      		if(s->keepalive_state == 1) {
+     				/* no response was received - kill the connection */
+     				tcp_reset_keepalive(s);
+     				tcp_abort(s);
+      		} else {
+      			/* no respose yet - reset the keepalive */
+      			tcp_send_keepalive(s);
+      			s->keepalive_state--;
+      			s->rtt_time = _SET_TIMEOUT(KEEPALIVE_WAITTIME*1000L);
+      		}
+      	} else {
+      		/* send a keepalive */
+      		tcp_send_keepalive(s);
+      		s->keepalive_state = KEEPALIVE_NUMRETRYS; /* queue our pending keepalive */
+      		s->rtt_time = _SET_TIMEOUT(KEEPALIVE_WAITTIME*1000L);
+      	}
+      }
+      UNLOCK_SOCK(s);
+   }
+   /* do our various daemons */
+   if( dcrtcpd ) (*dcrtcpd)();
+}
+
+
+/*** BeginHeader tcp_unthread */
+void tcp_unthread( tcp_Socket *ds );
+/*** EndHeader */
+
+/*
+ * Unthread a socket from the tcp socket list, if it's there
+ */
+_tcp_nodebug void tcp_unthread( tcp_Socket *ds )
+{
+   auto tcp_Socket *s, **sp;
+
+	// NOTE: this routine may be called several times for a given socket,
+	// so make sure it is idempotent!
+
+   LOCK_GLOBAL(TCPGlobalLock);
+   LOCK_SOCK(ds);
+   sp = &tcp_allsocs;
+   for(;;) {
+      s = *sp;
+      if( s == ds )
+      {
+      	// Put these manipulations in here, because tcp_unthread() may be
+      	// called for an uninitialized socket (i.e. all random).  At this
+      	// point, we know ds was legitimate.
+         tcp_setstate(ds, tcp_StateCLOSED);   /* tcp_tick needs this */
+      #ifdef TCP_DATAHANDLER
+         if (ds->dataHandler) {
+            ds->dataHandler(TCP_DH_CLOSED, ds, NULL, NULL);
+            ds->dataHandler = NULL;    // Prevent further close calls if
+                                       // tcp_unthread() re-called.
+         }
+      #endif
+	   #ifdef MALLOC_H_Incl
+	      if (ds->buffer_flags & TCP_BF_DYNALLOC) {
+	         ds->buffer_flags &= ~TCP_BF_DYNALLOC;
+	         // Because we free here, it is important that unthread is
+	         // not called if there is any remaining read data which
+	         // has not been transferred to the application (or TLS
+	         // decryptor)
+	         _sys_free(ds->rd.buf);
+	      }
+	   #endif
+         ds->ip_type = 0;		// Prevent API abuse after unthreading
+         *sp = s->next;
+         continue;           /* unthread multiple copies if necessary */
+      }
+      if( !s ) break;
+      sp = &s->next;
+   }
+   UNLOCK_SOCK(ds);
+   UNLOCK_GLOBAL(TCPGlobalLock);
+}
+
+
+/*** BeginHeader tcp_tick */
+/* START FUNCTION DESCRIPTION ********************************************
+tcp_tick                               <TCP.LIB>
+
+SYNTAX: word tcp_tick(void* s);
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	The TCP/IP stack is constantly doing little jobs like
+               checking for new packets, processing those packets, and
+               retransmitting lost packets.  The stack uses this basic
+               routine to do all of these services instead of a separate
+               task.  When tcp_tick is called on a specific socket it
+               does processing on all of the sockets and returns the
+               connection state of s.
+
+               See the documentation for sock_alive() for details of the
+               return value when a non-NULL socket pointer is passed.
+
+PARAMETER1: 	TCP or UDP socket pointer, or NULL.  If NULL, then no test
+               is done on the status of that socket.  If not NULL, then
+               the socket status is returned (as per sock_alive()).
+
+RETURN VALUE:  If parameter is not NULL:
+					  0: socket connection reset or fully closed.  Socket ready
+                   for re-use in another connection after calling an
+                   open function.
+                 non-zero: connection is opening, established, listening,
+                   or in the process of closing.
+               If parameter is NULL, always returns non-zero.
+
+SEE ALSO:      tcp_open, sock_close, sock_abort, sock_alive
+
+END DESCRIPTION **********************************************************/
+
+int tcp_tick(void* s);
+/*** EndHeader */
+
+#ifdef LEAN_N_MEAN
+_tcp_nodebug
+int tcp_tick( void* s )
+{
+	auto int retval;
+
+   return retval;
+}
+#else
+#use "dns.lib"
+
+
+_tcp_nodebug
+int tcp_tick( void* s )
+{
+	auto int retval;
+
+   LOCK_GLOBAL(TCPGlobalLock);
+	retval = _tcp_tick_internal(s);
+   UNLOCK_GLOBAL(TCPGlobalLock);
+
+	return retval;
+}
+#endif
+
+
+
+/*** BeginHeader _tcp_tick_internal */
+int _tcp_tick_internal(void * _s);
+/*** EndHeader */
+
+#ifdef NET_USE_COP
+
+_tcp_nodebug
+void _tcp_cop(void __far * parm)
+{
+	// This is the top-level coprocess.  Thus, it must not return.  It simply
+	// loops in order to drive the TCP stack.
+	for (;;) {
+		_tcp_tick_internal2();
+		cop_yield(NULL);			// Always yield after 1 iter
+	}
+}
+#endif
+
+_tcp_nodebug
+int _tcp_tick_internal(void * _s)
+{
+	// Caller must hold global lock.  (Only called from tcp_tick(), ssl_tick())
+#ifdef NET_USE_COP
+	static void __far * cop_handle;
+	static int done_init;
+	#GLOBAL_INIT {
+		done_init = 0;
+	}
+	if (!done_init) {
+		cop_handle = cop_create(_tcp_cop, NULL);
+		done_init = 1;
+	}
+
+	cop_resume(cop_handle, NULL);
+#else
+	_tcp_tick_internal2();
+#endif
+   // Generate return value from sock_alive.  This works for all socket types
+   // including SSL.
+   if (_s)
+   	return sock_alive((sock_type*)_s);
+   else
+   	return 1;
+
+}
+
+/*** BeginHeader _tcp_tick_internal2 */
+void _tcp_tick_internal2(void);
+/*** EndHeader */
+
+// This drives everything in TCP which is independent of any particular
+// socket - it handles all sockets.
+_tcp_nodebug
+void _tcp_tick_internal2(void)
+{
+#ifdef TCP_VERBOSE
+	static longword lasttime;
+   auto longword thistime;
+#endif
+   auto in_Header *ip;
+   auto word packettype;
+   auto word iface_mask;
+   auto word iface;
+   auto word up;
+   auto ll_prefix __far * LL;
+   auto int i, j;
+#if defined USE_DHCP || defined USE_LINKLOCAL
+   auto IFTEntry *ifte;
+	#if defined USE_DHCP
+   auto DHCPInfo *di;
+	#endif
+	#if defined USE_LINKLOCAL
+   auto ZC_LL_INFO *zi;
+	#endif
+#endif
+#ifdef PPP_PARALLEL
+	auto PPPState * ppp;
+#endif
+#if VIRTUAL_ETH
+   auto longword myip;
+#endif
+#ifdef USING_SSL
+	auto ssl_ResourcePool_t __far * rp, * rpn;
+	auto ssl_Socket __far * ssl_sock;
+	auto tcp_Socket * tcp_sock;
+#endif
+	static word back_divider;	// Used for dividing up background tasks so we don't
+   									// do all background tasks at once.
+   #GLOBAL_INIT { back_divider = 0; }
+
+#ifdef TCP_VERBOSE
+	thistime = MS_TIMER;
+   if (thistime - lasttime > 100)
+   	printf("TCP: %ldms since last call to tcp_tick!\n", thistime - lasttime);
+   lasttime = thistime;
+#endif
+
+#ifdef PPP_PARALLEL
+	#ifdef IF_PPP0
+   	if (IF_DOWN != ifpending(IF_PPP0)) {
+      	ppp = (PPPState *)_if_tab[IF_PPP0].u.ppp.ppp_state;
+         if (ppp)
+	      	PPPSerialTick(&ppp->link.serial);
+      }
+   #endif
+#endif
+
+	// If any interface is not in the desired state, call the interface tick
+	// function.
+	if (iface_mask = _if_request ^ _if_actual)
+		for (iface = 0; iface_mask; ++iface, iface_mask >>= 1)
+			if (iface_mask & 1)
+				ifctl_tick(iface);
+
+#if defined USE_DHCP || defined USE_LINKLOCAL
+	// If any interface is up, is using either DHCP or link-local addressing and
+	// is actively acquiring, probing or claiming an IP address then call the
+	// protocol tick function(s).
+	if ((iface_mask = _if_actual) != 0)
+	{
+		for (iface = 0; iface_mask; ++iface, iface_mask >>= 1)
+		{
+			if (iface_mask & 1)
+			{
+				// this interface is up
+				ifte = _if_tab + iface;
+	#if defined USE_DHCP
+				di = ifte->dhcp;
+				if (di && ifte->flags & IFF_DHCP && di->state != DHCP_ST_BOUND
+				    && di->state != DHCP_ST_RENEW && di->state != DHCP_ST_REBIND
+				    && di->state != DHCP_ST_WRETRY)
+				{	// not necessary to tick here if in above-listed states
+					dhcp_tick(iface);
+				}
+	#endif
+	#if defined USE_LINKLOCAL
+				zi = ifte->linklocal;
+				if (zi && zi->state != ZC_LL_STATE_DISABLED
+				    && zi->state != ZC_LL_STATE_DEFEND)
+				{	// not necessary to tick here if in above-listed states
+					linklocal_tick(iface);
+				}
+	#endif
+			}
+		}
+	}
+#endif
+
+   if (_CHK_SHORT_TIMEOUT(_arp_tick_strat)) {
+   	_arp_tick_strat = _SET_SHORT_TIMEOUT(207);
+      back_divider = back_divider + 1 & 31; 	// 32 sub-divisions (total about 6 second cycle)
+      switch (back_divider) {
+#ifndef ARP_MINIMAL
+		case 0:
+      	// Check for expiration of cached entries, or automatic refresh
+	   	_arp_tick();
+         break;
+#endif
+#ifdef USE_IGMP
+	#if (USE_IGMP >= 2)
+   	case 8:
+      	// Check for multicast group expiration
+			_igmp_tick();
+         break;
+	#endif
+#endif
+#ifdef USE_DHCP
+		case 16:
+			// Check DHCP lease renewal, rebind, expiration, retry
+			dhcp_check_lease();
+			break;
+#endif
+		default:
+      	break;
+		}
+
+#ifndef ARP_MINIMAL
+		// Call arp tick faster (every 414ms) if outstanding retransmit.
+		if (_arp_towait && back_divider & 1)
+      	_arp_tick();
+#endif
+   }
+
+
+   /* Get new packets and process them. */
+   pkt_received();
+
+#ifndef DISABLE_TCP
+	// Always call TCP retransmitter, for best performance
+  	tcp_Retransmitter();
+#endif
+
+#ifndef DISABLE_UDP
+	// Call UDP retransmitter
+  	udp_Retransmitter();
+#endif
+
+#ifndef DISABLE_DNS
+	// Drive the DNS subsystem
+	_dns_tick();
+#endif
+
+#ifdef USE_SNMP
+	_snmp_tick();
+#endif
+
+#ifdef USING_SSL
+	for (rp = pffirst(&_ssl_globals.pool); rp; rp = rpn) {
+		// Grab next element here, since following call can delete current element.
+		rpn = pfnext(&_ssl_globals.pool, rp);
+		ssl_sock = rp->ssl_sock;
+		tcp_sock = ssl_sock->sock;
+		if (!tcp_sock)
+			// No transport layer
+			continue;
+		if (!_IS_TCP_SOCK(tcp_sock))
+			// Not a TCP socket transport
+			continue;
+		if (!sock_readable(tcp_sock) &&
+			 !(ssl_sock->flags & SSL_F_CLOSE_NOTIFY) &&
+			 !(tcp_sock->state & tcp_StateCLOSWT) &&
+			 ssl_sock->cur_state != SSL_STATE_ERROR)
+			// Transport gone (not readable, not in CloseWait, yet no CN received, and
+			// we haven't sent a fatal alert).  Tell TLS...
+			tls_shutdown(ssl_sock, SHUTDOWN_TPORT_FAIL, &tcp_sock->wr);
+		// Run state machine against this transport
+		i = tcp_sock->wr.len;
+		j = tcp_sock->rd.len;
+		tls_sm(ssl_sock, &tcp_sock->rd, &tcp_sock->wr, &ssl_sock->hs, tcp_sock->app_rd, tcp_sock->app_wr);
+		// If there was any write data added, it is a handshake or alert message, so send it immediately
+		// (bypassing any nagle or local buffering requests).
+		if ((int)tcp_sock->wr.len != i)
+			tcp_send(tcp_sock, 400 );
+		else if (tcp_sock->wr.len)
+			tcp_sendsoon(tcp_sock, TCP_MINRTO, 420);
+
+		// If any read data was extracted from the transport, update advertised window to peer.
+		if ((int)tcp_sock->rd.len != j)
+			sock_update(tcp_sock);
+		if (ssl_sock->cur_state == SSL_STATE_ERROR && tcp_sock->state > tcp_StateESTAB) {
+			tcp_sock->rd.len = 0;	// Discard pending read data in error+close condition
+			tcp_sock->app_rd->len = 0;
+		}
+
+	}
+#endif
+
+}
+
+
+/*** BeginHeader tcp_established */
+int tcp_established( tcp_Socket *s );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+tcp_established                                                  <TCP.LIB>
+
+SYNTAX:      	int tcp_established( tcp_Socket *s )
+
+DESCRIPTION:	examines the state of the socket to determine if a
+connection to a remote device has been established.
+
+PARAMETER:		socket structure pointer
+
+RETURN VALUE:	1		connected
+					0		not
+
+END DESCRIPTION **********************************************************/
+/* returns 1 if connection is established */
+_tcp_nodebug int tcp_established( tcp_Socket *s )
+{
+   return( s->state >= tcp_StateESTAB );
+}
+
+/*** BeginHeader _tcp_notify */
+void _tcp_notify(icmp_ip_t * icmp, byte msg, ll_prefix __far * LL);
+/*** EndHeader */
+
+_tcp_nodebug void _tcp_notify(icmp_ip_t * icmp, byte msg, ll_prefix __far * LL)
+{
+	// This is upcalled from ICMP when we get a message relating to the TCP protocol.
+	auto in_Header * ip;
+   auto int len;
+   auto tcp_Socket *s;
+   auto tcp_Header *tp;
+   auto word myport, hisport;
+   auto longword hisip;
+   auto int code;
+#ifdef TCP_DATAHANDLER
+	auto ll_Gather g;
+#endif
+
+   ip = &icmp->ip;		// Reflected IP header
+   code = icmp->type;
+
+	LOCK_GLOBAL(TCPGlobalLock);
+
+   len = in_GetHdrlenBytes(ip);
+
+   tp = (tcp_Header *)((byte *)ip + len);   // Reflected TCP header (1st 8 bytes)
+   myport = intel16(tp->srcPort);
+   hisport = intel16(tp->dstPort);
+   hisip = intel(ip->destination);
+
+   // Find the socket with matching parameters.
+	/*  dev note: this needs to be tightened up for multiple interfaces.  Currently no harm
+	   done, but ICMP message hits all interfaces talking to that IP address.   These messages
+      should be rare, so not much point in adding a lot of code for this case. */
+   for( s = tcp_allsocs; s; s = s->next ) {
+
+      if (myport == s->myport &&
+          hisport == s->hisport &&
+          hisip == s->hisaddr ) {
+
+			LOCK_SOCK(s);
+			sock_msg(s, msg ? msg : NETERR_ICMP);
+
+         switch(code) {
+         case ICMPTYPE_PARAM_PROBLEM:
+         case ICMPTYPE_UNREACHABLE:
+         case ICMPTYPE_TIMEEXCEEDED:
+         case ICMPTYPE_SOURCE_QUENCH :
+          	// Just do slow start.  All the above errors may be temporary, so we rely on
+          	// the normal established state timeout to kill the socket if the error is
+          	// persistent.
+         	s->cwnd = s->mss;
+            break;
+
+         }
+	      UNLOCK_SOCK(s);
+	   #ifdef TCP_DATAHANDLER
+   		if (s->dataHandler) {
+   			g.iface = s->iface;
+			   g.len1 = 0;
+  				g.data1 = (char __far *)paddr(ip);
+			   g.len2 = 0;
+			   g.len3 = 0;
+			   s->dataHandler(TCP_DH_ICMPMSG, s, &g, NULL);
+			}
+		#endif
+	      break;	// We found it
+      }
+
+   }
+   UNLOCK_GLOBAL(TCPGlobalLock);
+}
+
+/*** BeginHeader tcp_read */
+int tcp_read( void *_s, void __far * datap, word maxlen );
+/*** EndHeader */
+
+_tcp_nodebug int tcp_read( void *_s, void __far * datap, word maxlen )
+{
+   auto word x;
+   auto tcp_Socket *s;
+   auto int is_tcp;
+
+   LOCK_GLOBAL(TCPGlobalLock);
+	LOCK_SOCK(s);
+
+	is_tcp = _IS_TCP_SOCK(_s);
+#ifdef USING_SSL
+	if (!is_tcp)
+		s = _TCP_SOCK_OF_SSL(_s);
+	else
+#endif
+	s = _TCP_SOCK(_s);
+
+   x = s->app_rd->len;
+   if (x) {
+      if (x > maxlen)
+      	x = maxlen;
+      if (x) {
+         if (datap)
+         	_tbuf_xread((char __far *)datap, s->app_rd, 0, x);
+         _tbuf_delete(s->app_rd, x);
+         if (is_tcp)
+         	sock_update(s);
+      }
+   }
+   else {
+   	// There was no data to read.  If the socket is currently readable, return 0.
+   	if (sock_readable(_s))
+   		x = 0;
+   	else {
+	      x = -1;
+   		// Socket not readable (no buffered data, and peer sent FIN or socket is completely closed)
+			if (!(s->sock_mode & TCP_MODE_HALFCLOSE) && sock_writable(s)) {
+	#ifdef USING_SSL
+	         if (_IS_SSL_SOCK(_s))
+	               tls_shutdown(_SSL_SOCK(_s), SHUTDOWN_FULL, &s->wr);
+	         else
+	#endif
+	         tcp_close(s);
+	      }
+      }
+	}
+
+   UNLOCK_SOCK(s);
+   UNLOCK_GLOBAL(TCPGlobalLock);
+   return x;
+}
+
+/*** BeginHeader tcp_write */
+int tcp_write( void *_s, const void __far * dp, int len );
+/*** EndHeader */
+
+/*
+ * Write data to a connection.
+ * Returns number of bytes written, == -1 when connection is not in
+ * established state.
+ * Assumes caller holds global and socket lock!
+ */
+_tcp_nodebug int tcp_write( void *_s, const void __far * dp, int len )
+{
+   auto int x;
+   auto tcp_Socket *s;
+
+	if (!sock_writable(_s))
+   	return -1;
+
+   if (len < 0)
+   	return 0;
+
+#ifdef USING_SSL
+	if (_IS_SSL_SOCK(_s)) {
+		s = _TCP_SOCK_OF_SSL(_s);
+		// Set app data, drive SSL state machine, then proceed for TCP
+	   if (len > (x = _tbuf_remain(s->app_wr)))
+	      len = x;
+	   if (!len)
+	   	return 0;
+   	_tbuf_append(s->app_wr, (char __far *)dp, len);
+      if (s->sock_mode & TCP_LOCAL) {
+         s->sock_mode &= ~TCP_LOCAL;
+			return len;
+		}
+		tls_sm(_SSL_SOCK(_s), &s->rd, &s->wr, &_SSL_FIELD(_s, hs), s->app_rd, s->app_wr);
+		goto _proc_tcp;
+	}
+	else
+#endif
+	s = _TCP_SOCK(_s);
+
+   if (len > (x = _tbuf_remain(&s->wr)))
+   	len = x;
+
+   if (len)
+   	_tbuf_append(&s->wr, (char __far *)dp, len);
+
+	{
+	_proc_tcp:
+      s->datatimer = _SET_TIMEOUT(sock_data_timeout);
+
+      if (s->sock_mode & TCP_LOCAL) {
+         #ifdef TCP_VERBOSE
+         	if (TCP_D(3, s))
+            	printf("%s tcp_write: +%u bytes, unlocking local mode (got %u)\n", printsock(s), len, s->wr.len);
+         #endif
+         s->sock_mode &= ~TCP_LOCAL;
+      }
+      else if (!(s->kflags & TCP_KF_SYN)) {
+      	// Only transmit if not waiting for handshake completion
+         if (s->sock_mode & TCP_MODE_NONAGLE) {
+         #ifdef TCP_VERBOSE
+         	if (TCP_D(3, s))
+            	printf("%s tcp_write: +%u bytes, no Nagle (got %u, unacked %u)\n", printsock(s), len, s->wr.len, s->unacked);
+         #endif
+            tcp_send( s, 40 );
+         }
+         else {
+            /* transmit if no unacked data or got complete MTU worth */
+            if (!s->unacked ||
+                s->wr.len >= s->mss + s->unacked &&
+                s->window >= s->mss + s->unacked) {
+         #ifdef TCP_VERBOSE
+	            if (TCP_D(3, s))
+	               printf("%s tcp_write: +%u bytes, sending (got %u, unacked %u)\n", printsock(s), len, s->wr.len, s->unacked);
+         #endif
+               tcp_send( s, 41 );
+            }
+            else {
+            	// Otherwise, we have unack'd data and less than one MTU to send.  Normally,
+               // an ACK for the unacknowledged data we sent will arrive before this, which
+               // will keep things moving.  Otherwise, we rely on timeout.
+               //devnote: this timeout should be adaptive to the current RTO and measured bandwidth.
+               //devnote: strictly speaking, we should be 'pure Nagle', but the timeout improves
+               // responsiveness for hosts which don't ACK every received segment (including Windows).
+               //devnote: another thing we could do is keep track of the number of outstanding segments
+               // and always allow at least 2.
+					tcp_sendsoon(s, TCP_MINRTO, 42);
+         #ifdef TCP_VERBOSE
+         		if (TCP_D(3, s))
+            		printf("%s tcp_write: +%u bytes, delayed by Nagle (got %u, unacked %u)\n",
+               			printsock(s), len, s->wr.len, s->unacked);
+         #endif
+				}
+         }
+      }
+   }
+
+   return len;
+}
+
+/*** BeginHeader tcp_Flush */
+void tcp_Flush( tcp_Socket *s );
+/*** EndHeader */
+
+/*
+ * Send pending data
+ */
+_tcp_nodebug void tcp_Flush( tcp_Socket *s )
+{
+   LOCK_GLOBAL(TCPGlobalLock);
+	LOCK_SOCK(s);
+   if (s->wr.len > s->unacked)
+      // only if new data has been added
+      tcp_send(s, 50);
+   UNLOCK_SOCK(s);
+   UNLOCK_GLOBAL(TCPGlobalLock);
+}
+
+
+/*** BeginHeader clamp16k */
+int clamp16k(long x);
+/*** EndHeader */
+/*
+ * Clamp a long value to +/- 16k and return it.  This avoids problems
+ * with int arithmetic overflow.
+ */
+_tcp_nodebug int clamp16k(long x)
+{
+  if (x < -16384) return -16384;
+  if (x > 16384) return 16384;
+  return (int)x;
+}
+
+
+/*** BeginHeader tcp_reserveport */
+void tcp_reserveport(word port);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+tcp_reserveport                               <TCP.LIB>
+
+SYNTAX: void tcp_reserveport(word port);
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	This function is used by servers to give special treatment to
+					remote sockets that connect to the specified port. If a
+					connection is made to a reserved port and there is currently
+					not a listening socket to handle it, the system will try to
+					hold the connection open until a listening socket is
+					available. This allows a server to handle multiple requests
+					smoothly even if only a few sockets are allocated.
+
+PARAMETER1: 	port number
+
+SEE ALSO:      tcp_open, tcp_listen, tcp_clearreserve
+
+END DESCRIPTION **********************************************************/
+
+
+#ifdef USE_RESERVEDPORTS
+
+_tcp_nodebug void tcp_reserveport(word port)
+{
+   auto int x;
+
+   if(!port) return;
+
+  	LOCK_GLOBAL(TCPGlobalLock);
+   for(x=0;x<MAX_RESERVEPORTS;x++)
+      if(tcp_reserveports[x]==intel16(port)) {
+      	UNLOCK_GLOBAL(TCPGlobalLock);
+         return;
+      }
+
+   for(x=0;x<MAX_RESERVEPORTS;x++)
+      if(tcp_reserveports[x]==0) {
+         tcp_reserveports[x]=intel16(port);
+         UNLOCK_GLOBAL(TCPGlobalLock);
+         return;
+      }
+   UNLOCK_GLOBAL(TCPGlobalLock);
+}
+
+#else
+/*
+ *  Don't execute reserve port operations if
+ *  USE_RESERVEPORTS isn't defined.
+ *
+ */
+
+_tcp_nodebug void tcp_reserveport(word port)
+{
+}
+#endif
+
+/*** BeginHeader tcp_initreserve */
+void tcp_initreserve(void);
+/*** EndHeader */
+
+_tcp_nodebug
+void tcp_initreserve(void)
+{
+	memset(tcp_reserveports, 0, sizeof(tcp_reserveports));
+}
+
+/*** BeginHeader tcp_clearreserve */
+void tcp_clearreserve(word port);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+tcp_clearreserve                               <TCP.LIB>
+
+SYNTAX: word tcp_clearreserve(word port);
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	Removes a port from the reserved ports list.
+
+PARAMETER1: 	port number
+
+SEE ALSO:      tcp_open, tcp_listen, tcp_reserveport
+
+END DESCRIPTION **********************************************************/
+
+#ifdef USE_RESERVEDPORTS
+_tcp_nodebug void tcp_clearreserve(word port)
+{
+   auto int x;
+   if(!port) return;
+
+   LOCK_GLOBAL(TCPGlobalLock);
+   for(x=0;x<MAX_RESERVEPORTS;x++)
+      if(tcp_reserveports[x]==intel16(port))
+         tcp_reserveports[x]=0;
+   UNLOCK_GLOBAL(TCPGlobalLock);
+}
+#else
+_tcp_nodebug void tcp_clearreserve(word port)
+{
+}
+#endif
+
+/*** BeginHeader tcp_stream_handler */
+int tcp_stream_handler(ll_prefix __far * LL, word hisport);
+/*** EndHeader */
+_tcp_nodebug int tcp_stream_handler(ll_prefix __far * LL, word hisport)
+{
+	/*
+      This handler is upcalled from vspd_ioctl() (ppplink.lib) for inbound packets from
+      'stream' interfaces i.e. VSPD packet driver.  There are no IP or TCP headers,
+      just data.  This data goes straight into a socket, if one is opened to
+      a localhost IP address/port of 127.0.0.1 : <hisport>.  The reason we support this is so
+      that application can talk to network sockets as easily as local serial ports,
+      using the same socket API.  For serial ports, <hisport> is set to the hardware I/O
+      register address of the serial port.
+
+      Needless to say, the TCP socket state machine is vastly simplified.  There are only
+      two states: CLOSED and ESTABLISHED.  The socket is established as soon as the application
+      does an active open (passive open is not currently supported).
+
+      In the CLOSED state (i.e the socket does not exist), any incoming data is ignored.
+
+      In the ESTABLISHED state, incoming data is appended into the socket receive buffer,
+      and any data written to the socket is sent out ASAP.
+
+      There is no retransmission, pending queue, RTT estimation, keepalives or any other
+      fancy TCP stuff.  ACKs for transmitted data are generated internally, and processed
+      by tcp_stream_ack().
+   */
+   auto tcp_Socket * s;
+   auto word len;
+   auto word bufspace;
+   auto ll_Gather g;
+
+   LOCK_GLOBAL(TCPGlobalLock);
+   for ( s = tcp_allsocs; s; s = s->next )
+      if( s->hisport == hisport &&
+          VSPD_LOCALHOST == s->hisaddr ) break;
+
+   if (s) {
+   	// If the socket exists, it is in established state.  Jam the data in the read buffer.
+		LOCK_SOCK(s);
+
+	   len = LL->len;
+	   // Amount of space in buffer.
+	   bufspace = s->rd.maxlen - s->rd.len;
+
+	   if (len > bufspace)
+	      len = bufspace;
+
+#ifdef TCP_VERBOSE
+		if (TCP_D(3, s))
+      	printf("%s (VSPD) received %d bytes\n", printsock(s), len);
+#endif
+	   _tbuf_bappend(&s->rd, LL, 0, len);
+
+
+
+	#ifdef TCP_DATAHANDLER
+	   // If there is a TCP data handler, call it with the new data
+	   if (s->dataHandler) {
+	      _tbuf_ref(&s->rd, &g, s->rd.len - len, len);
+	      g.iface = LL->iface;
+	      g.len1 = 0;
+	      g.data1 = NULL;      // No IP or TCP headers
+	      s->dataHandler(TCP_DH_INDATA, s, &g, NULL);
+	      // Currently, we ignore the return code from the handler for TCP sockets.
+	      // For future compatibility, it should always return zero.
+	   }
+	#endif
+		UNLOCK_SOCK(s);
+   }
+   UNLOCK_GLOBAL(TCPGlobalLock);
+   return 0;
+}
+
+/*** BeginHeader tcp_stream_ack */
+int tcp_stream_ack(word diff, word hisport);
+/*** EndHeader */
+_tcp_nodebug int tcp_stream_ack(word diff, word hisport)
+{
+	// This function is responsible for handling the pseudo-ACK for data which was queued to the
+   // VSPD port.  Once the data is transmitted, it is assumed to be ACKed (since there is no explicit ACK).
+   // The caller sets 'diff' to equal the number of chars transmitted in the last packet.
+   // Note: the caller is assumed to hold the global lock.
+
+   auto tcp_Socket * s;
+
+   for ( s = tcp_allsocs; s; s = s->next )
+      if( s->hisport == hisport &&
+          VSPD_LOCALHOST == s->hisaddr ) break;
+
+   if (s) {
+   	// If the socket exists, it is in established state.  Delete data we sent from the wr buffer.
+		LOCK_SOCK(s);
+#ifdef TCP_VERBOSE
+		if (TCP_D(3, s))
+      	printf("%s (VSPD) acked next %u bytes\n", printsock(s), diff);
+#endif
+      _tbuf_delete(&s->wr, diff);
+      s->unacked -= diff;
+      s->startpt -= diff;
+	#ifdef TCP_DATAHANDLER
+	   // If there is a TCP data handler, call it to indicate more tx space available
+	   if (s->dataHandler)
+   		s->dataHandler(TCP_DH_OUTBUF, s, NULL, NULL);
+	#endif
+		UNLOCK_SOCK(s);
+   }
+   return 0;
+
+}
+
+
+/*** BeginHeader tcp_handler, _tcp_handler */
+ll_prefix __far * tcp_handler(ll_prefix __far * LL, byte * hdrbuf);
+int _tcp_handler(ll_Gather __far * g, eth_address * eth);
+/*** EndHeader */
+
+_tcp_nodebug int _tcp_process_ack(tcp_Socket * s, int diff)
+{
+   if (s->kflags & TCP_KF_SYN && diff > 0) {
+   	s->kflags &= ~TCP_KF_SYN;
+      --diff;
+		s->seqnum++;	// Account for the acked syn
+   }
+	// Cannot have acked more than we sent (except +1 for FIN if we sent it)
+	if (diff == s->unacked + 1 && s->kflags & TCP_KF_FIN) {
+		diff--;
+		s->seqnum++;	// Account for the acked fin
+		s->kflags &= ~TCP_KF_FIN;
+#ifdef TCP_VERBOSE
+		if (TCP_D(3, s))
+      	printf("%s acked our FIN\n", printsock(s));
+#endif
+	}
+   if( diff > 0 && (word)diff <= s->unacked ) {
+      _tbuf_delete(&s->wr, diff);
+      s->unacked -= diff;
+#ifdef TCP_VERBOSE
+		if (TCP_D(3, s))
+      	printf("%s acked next %d bytes, unacked now %d\n",
+         	printsock(s), diff, s->unacked);
+#endif
+      s->startpt -= diff;
+      if ((int)s->startpt < 0)
+      	s->startpt = 0;
+      s->window -= diff;
+      s->seqnum += diff;
+   	if (s->kflags & TCP_KF_UNHAPPY) {
+   		//v24366 - this test added to suppress some unnecessary ACKs
+   		// being generated...
+   		// If everything now ack'd, turn off unhappy provided we are not
+   		// unhappy for a different reason
+			if (!s->unacked &&
+			    !(s->kflags & (TCP_KF_SYN | TCP_KF_FIN) ||
+   	         /*!s->window &&*/ s->wr.len))
+				s->kflags &= ~TCP_KF_UNHAPPY;
+			else {
+	         // Any advance extends the timeout timer.
+	         s->rtt_time = _SET_TIMEOUT(s->rto);
+         	if (!s->unacked && s->wr.len) {
+            	// End of a nagle delay, since nothing unacked yet more data
+               // to send, so sendsoon.
+					tcp_sendsoon(s, TCP_MINRTO, 99);
+            }
+         }
+   	}
+   #ifdef TCP_DATAHANDLER
+   	if (s->dataHandler)
+   		s->dataHandler(TCP_DH_OUTBUF, s, NULL, NULL);
+   #endif
+   }
+   else if (diff > 0) {
+#ifdef TCP_VERBOSE
+      if (TCP_D(1, s))
+      	printf("%s Peer ack'd more (%u) than we sent!\n",
+         	printsock(s), (word)diff - s->unacked);
+#endif
+		sock_msg(s, NETERR_PROTOCOL);
+	   tcp_abort(s);
+		return 1;
+   }
+   return 0;
+}
+
+
+void _tcp_extend_seq(longword * n, longword e)
+{
+	/* Set high half of *n (if zero) so it is as close as possible to e.
+   */
+	longword m = *n;
+   long d;
+
+	if (m & 0xFFFF0000uL)
+   	return;
+	m |= e&0xFFFF0000uL;
+   d = (long)(m - e);
+   if (d >= 32768L)
+   	m -= 65536uL;
+   else if (d <= -32768L)
+   	m += 65536uL;
+   *n = m;
+}
+
+
+
+_tcp_nodebug
+ll_prefix __far * tcp_handler(ll_prefix __far * LL, byte * hdrbuf)
+{
+	auto eth_address * eth;
+	auto in_Header *ip;
+   auto tcp_Header *tp;
+   auto word tplen;
+   auto tcp_PseudoHeader ph;
+   auto longword myip, hisip;
+   auto word iface;
+   auto word len;
+   auto ll_Gather g;
+
+#ifdef _DROP_TCP_IN
+	static word dti = 0;
+#endif
+	// If this is an ethernet-type interface, point to source address
+   // in case we need to send RST (because we wouldn't have an ATH).
+	eth = &((eth_Header *)hdrbuf)->source;
+
+   ip = (in_Header *)(hdrbuf + LL->net_offs);
+
+	// Precompute values in native order.
+	myip = intel(ip->destination);
+	hisip = intel(ip->source);
+	iface = LL->iface;
+   if (!IS_MY_ADDR(myip, iface) || !IS_VALID_SOURCE(hisip, iface)) {
+#ifdef TCP_VERBOSE
+		if (IS_MY_ADDR(myip, iface))
+			printf("TCP: dropping because invalid source addr (%08lX)\n", hisip);
+		else
+			printf("TCP: dropping seg from %08lX because destined for %08lX\n", hisip, myip);
+#endif
+		return LL;
+	}
+
+   len = intel16(ip->length) - in_GetHdrlenBytes(ip);    /* len of tcp data + header */
+
+   if (LL->len < LL->tport_offs + sizeof(tcp_Header))
+   	return LL;	// Discard it, too short to contain TCP header
+
+	if (LL->chksum_flags != CHKSUM_IGNORE) {
+	   // Do the TCP checksum thing
+	   ph.src = ip->source;
+	   ph.dst = ip->destination;
+	   ph.mbz = 0;
+	   ph.protocol = TCP_PROTO;
+	   ph.length = intel16(len);
+
+	   if ((LL->chksum_flags == CHKSUM_TPORT) && (USING_PPPOE == 0))
+	      ph.checksum = LL->chksum;
+	   else
+	      ph.checksum = lchecksum(LL, LL->tport_offs, len);
+	   if (fchecksum(&ph, sizeof(ph)) != 0xffff) {
+	#ifdef TCP_VERBOSE
+	      if (debug_on)
+	         printf("TCP: Bad Checksum: is %04X\n", fchecksum(&ph, sizeof(ph)));
+	#endif
+	      return LL;
+	   }
+	}
+   // Copy the TCP header to hdrbuf
+   _pkt_buf2root(LL, tp = (tcp_Header *)(hdrbuf+LL->tport_offs), sizeof(tcp_Header), LL->tport_offs);
+   tplen = tcp_GetDataOffset(tp) << 2;
+   LL->payload = LL->tport_offs + tplen;
+   if (tplen > sizeof(tcp_Header))
+	   _pkt_buf2root(LL, (byte *)(tp + 1),
+      		tplen-sizeof(in_Header), LL->tport_offs + sizeof(tcp_Header));
+
+#ifdef _DROP_TCP_IN
+	if (len > 1000) {
+	   ++dti;
+	   if (dti == _DROP_TCP_IN) {
+	      dti = 0;
+	      printf("####### tcp segment (data len=%u) dropped for test! ######\n", len-tplen);
+	      return LL;  // drop this segment
+	   }
+	}
+#endif
+
+	g.iface = LL->iface;
+   g.flags = 0;
+	g.data1 = (char __far *)ip;
+   g.len1 = LL->payload - LL->net_offs;
+   g.data2 = LL->data1 + LL->payload;
+   g.len2 = len - tplen;
+   g.len3 = 0;
+
+   _tcp_handler(&g, eth);
+
+   return LL;
+}
+
+	/*-----------------------------------------------------------------------*/
+_tcp_nodebug
+int _tcp_handler(ll_Gather __far * g, eth_address * eth)
+{
+	auto in_Header __far *ip;
+   auto tcp_Header __far *tp;
+   auto longword myip, hisip, hisack, hisseq;
+   auto word myport, hisport, iface, winadv;
+   auto ATHandle ath;
+   auto longword winright;
+   auto int newconn;
+   auto word len;
+   auto int diff;
+   auto int send_ack;		// 1 if send ack immediately, 2 if delayed ack
+   auto tcp_Socket *s;
+	auto tcp_Pending __far *p;
+   auto word flags;
+   auto long diffticks, ldiff;  /* must be signed */
+   auto long scheduleto;
+   auto word next_state;
+   auto int x;
+
+   ip = (in_Header __far *)g->data1;
+	myip = intel(ip->destination);
+	hisip = intel(ip->source);
+	iface = g->iface;
+   len = intel16(ip->length) - in_GetHdrlenBytes(ip);    /* len of tcp data + header */
+	tp = (tcp_Header __far *)((char __far *)ip + in_GetHdrlenBytes(ip));
+	myport = intel16(tp->dstPort);
+	hisport = intel16(tp->srcPort);
+	hisack = intel(tp->acknum);
+	hisseq = intel(tp->seqnum);
+   flags = intel16(tp->flags);
+
+   newconn = (flags & (tcp_FlagSYN|tcp_FlagACK|tcp_FlagRST)) == tcp_FlagSYN;
+
+   LOCK_GLOBAL(TCPGlobalLock);
+   /* demux to active sockets */
+   for ( s = tcp_allsocs; s; s = s->next )
+      if( !(s->state & tcp_StateLISTEN) &&
+          myport == s->myport &&
+          hisport == s->hisport &&
+          (s->iface == IF_ANY || s->iface == iface) &&
+          hisip == s->hisaddr ) break;
+
+   if (!s && newconn)
+      /* demux to passive sockets, must be a new session */
+      for( s = tcp_allsocs; s; s = s->next )
+			if ((myport == s->myport) &&
+          	 (s->iface == IF_ANY || s->iface == iface) &&
+			    (s->hisaddr == 0 || hisip == s->hisaddr) &&
+			    (s->hisport == 0 || hisport == s->hisport)) {
+            break;
+         }
+
+   if (!s)
+   {
+   	//check pending sockets
+		for( p = tcp_allpending; p; p = p->next )
+		{
+			if(chk_timeout(p->persist_timeout)) {
+				//too long since last window probe
+			#ifdef TCP_VERBOSE_PENDING
+				printf("%s no probe, aborting\n", printpend(p));
+			#endif
+				tcp_abortpending(p);
+				continue; //look at next pending connection
+			}
+
+			if(	hisip == p->hisaddr &&
+					hisport == p->hisport &&
+					myport == p->myport ) {
+
+				if(flags & tcp_FlagRST)
+					tcp_removepending(p);
+				else if (flags & tcp_FlagACK && hisack == p->seqnum &&
+							// Check for valid seq num.  Some hosts use keepalives instead of window probes - support either.
+							(hisseq == p->acknum || hisseq == p->acknum-1)) {
+					if (!p->open) {
+						// 3-way handshake being completed.  Check if socket is in listen state and, if so,
+						// move to estab state with this pending connection.
+						tcp_pendingestab++;
+						p->open = 1;
+  						for (s = tcp_allsocs; s; s = s->next)
+							if (s->state & tcp_StateLISTEN && _tcp_pendcheck(s)) {
+			#ifdef TCP_VERBOSE_PENDING
+								printf("%s picked up listen socket from pending queue\n", printsock(s));
+			#endif
+			   				UNLOCK_GLOBAL(TCPGlobalLock);
+								return 0;
+							}
+					}
+					//these are window probes from the client
+			#ifdef TCP_VERBOSE_PENDING
+					printf("%s got window probe\n", printpend(p));
+			#endif
+					tcp_pendingpkt(p, tcp_FlagACK, 0);
+					p->persist_timeout = _SET_TIMEOUT(TCP_SYNQTIMEOUT);
+				}
+				else if (newconn) {
+					// Retransmitted initial SYN
+			#ifdef TCP_VERBOSE_PENDING
+					printf("%s got retrans SYN\n", printpend(p));
+			#endif
+					p->seqnum--;				// back up to start
+					p->acknum = hisseq + 1; // redo this (should be the same as before)
+					tcp_pendingpkt(p, tcp_FlagSYN | tcp_FlagACK, 0);
+					p->seqnum++;
+					p->persist_timeout = _SET_TIMEOUT(TCP_SYNQTIMEOUT);
+				}
+
+			   UNLOCK_GLOBAL(TCPGlobalLock);
+				return 0;
+			}
+		}
+#ifdef USE_RESERVEDPORTS
+		if(!p && (tcp_pendingcount < TCP_MAXPENDING) && newconn && tp->dstPort)
+		{
+		   for(x = 0;x < MAX_RESERVEPORTS;x++)
+		   {
+				//pending connections are only for reserved ports
+				if(tcp_reserveports[x] == tp->dstPort)
+				{
+	            //Vantive 23956: now use ARP lookup instead of sending back to source's MAC address.
+	            //ath = arpcache_new(hisip, &((eth_Header *)hdrbuf)->source, iface);
+	            ath = arpresolve_start_iface(hisip, iface);
+					if (ath < 0 || (ath = arpresolve_check(ath, hisip)) <= 0) {
+			#ifdef TCP_VERBOSE_PENDING
+						printf("TCP: could not create ARP cache entry for pending %08lX:%u\n", hisip, hisport);
+			#endif
+			   		UNLOCK_GLOBAL(TCPGlobalLock);
+						return 0;
+					}
+
+					//add to beginning of list
+					p = tcp_pendingpoolget();
+					if (p)
+					{
+						tcp_pendingcount++;
+						p->hisaddr = hisip;
+						p->hisport = hisport;
+						p->myaddr = myip;
+						p->myport = myport;
+						p->acknum = hisseq + 1; //received SYN, increment
+#ifdef TCP_DEBUG
+						p->seqnum = 0;
+#else
+						p->seqnum = intel(MS_TIMER);
+#endif
+						p->open = 0;	//must wait for ACK from client
+						p->ppath = ath;
+			         p->mss = _tcp_process_options(NULL, tp, iface);
+			#ifdef TCP_VERBOSE_PENDING
+						printf("%s new\n", printpend(p));
+			#endif
+						tcp_pendingpkt(p, tcp_FlagSYN | tcp_FlagACK, 0);
+						p->seqnum++;	//sent SYN byte
+						p->persist_timeout = _SET_TIMEOUT(TCP_SYNQTIMEOUT);
+						p->next = NULL;
+						p->prev = NULL;
+						if(tcp_pendingtail) {
+							tcp_pendingtail->next = p;
+							p->prev = tcp_pendingtail;
+						}
+						if(!tcp_allpending)
+							tcp_allpending = p; //first one
+						tcp_pendingtail = p;
+					}
+			   	UNLOCK_GLOBAL(TCPGlobalLock);
+					return 0;
+				}
+			}
+		}
+#endif
+	}
+	else
+		p = NULL;
+
+   if(!s) {
+#ifdef USE_RESERVEDPORTS
+      /*
+       *  changed to allow for ignoring SYN requests for a
+       *  port that is busy... Causes browser to retry later.
+       *
+       */
+		if (flags & tcp_FlagSYN && !(flags & tcp_FlagACK) && tp->dstPort)
+	      for(x=0;x<MAX_RESERVEPORTS;x++)
+	         if(tcp_reserveports[x]==tp->dstPort) {
+			#ifdef TCP_VERBOSE
+					printf("TCP: cannot service SYN from %08lX:%u - ignoring\n", hisip, hisport);
+			#endif
+	            UNLOCK_GLOBAL(TCPGlobalLock);
+	            return 0;
+	         }
+#endif
+
+      if(!(flags & tcp_FlagRST))
+      	tcp_rst(iface, eth, ip, tp);
+
+	   UNLOCK_GLOBAL(TCPGlobalLock);
+      return 0;
+	}
+
+   LOCK_SOCK(s);
+
+   if (flags & tcp_FlagTRUNC) {
+   	// Non-RFC793 flag.  If set, reconstruct high half of hisseq+hisack based on
+      // our (full length) s->acknum and s->seqnum respectively.
+      _tcp_extend_seq(&hisseq, s->acknum);
+      _tcp_extend_seq(&hisack, s->seqnum);
+   }
+
+#ifdef TCP_VERBOSE
+	if (TCP_D(3, s))
+      printf("%s incoming segment: flags=%c%c%c%c%c seq=%lu ack=%lu len=%u\n",
+      	printsock(s),
+         flags & tcp_FlagSYN ? 'S' : '.',
+         flags & tcp_FlagACK ? 'A' : '.',
+         flags & tcp_FlagFIN ? 'F' : '.',
+         flags & tcp_FlagRST ? 'R' : '.',
+         flags & tcp_FlagTRUNC ? 'T' : '.',
+         hisseq,
+         hisack,
+			g->len2 + g->len3
+         );
+#endif
+
+
+   /* got something from the remote host - reset the keepalive timer */
+   if (s->keepalive_time)
+   	tcp_reset_keepalive(s);
+
+	/* reset code */
+   if( flags & tcp_FlagRST ) {
+   	// Resets ignored in listen or time_wait states, or if no ACK provided.
+  		// Also, check that reset is "believable" i.e. should have no ACK or
+  		// have an ACK somewhere between s->seqnum and s->seqnum+s->unacked.
+  		// If no ACK, then his sequence number must be at the right place.
+  		// Otherwise, we ignore it.
+      // Note: we allow his seq number to be one more than unacked, to account
+      // for cases where we just sent a SYN or FIN.  This is not strictly
+      // correct, but is near enough for practical cases.
+   	if (!(s->state & (tcp_StateLISTEN|tcp_StateTIMEWT)) &&
+   	    (flags & tcp_FlagACK
+   	       && (long)(hisack - s->seqnum) >= 0L
+   	       && (long)(hisack - (s->seqnum+s->unacked)) <= 1L
+   	     || !(flags & tcp_FlagACK) && hisseq == s->acknum)) {
+#ifdef TCP_VERBOSE
+      	if (TCP_D(1, s)) printf("%s Connection Reset\n", printsock(s));
+#endif
+      	s->wr.len = 0;
+      	if(!(s->state & (tcp_StateCLOSED | tcp_StateLASTACK)))
+         	s->rd.len = 0;
+         if (s->state & tcp_StateSYNSENT)
+         	sock_msg(s, NETERR_HOST_REFUSED);
+         else
+				sock_msg(s, NETERR_REMOTE_RESET);
+   	#ifdef TCP_DATAHANDLER
+   		if (s->dataHandler)
+   			s->dataHandler(TCP_DH_RESET, s, NULL, NULL);
+   	#endif
+     		tcp_setstate(s, tcp_StateCLOSED);
+      }
+      goto _th_finish;
+   }
+
+   if( sock_inactive )
+      s->inactive_to = _SET_TIMEOUT( sock_inactive*1000L );
+
+   // Assume not going to send any response.
+   send_ack = 0;
+
+   if (flags & tcp_FlagACK) {
+   	ldiff = hisack - s->seqnum;
+   	diff = clamp16k(ldiff);
+   	if (diff < 0) {
+   		// If his ack number is less than the highest ack we have seen,
+   		// must be segment which got reordered in the network.
+   		// We completely ignore the ack in such segments, but they may
+   		// nevertheless contain data that we haven't seen.
+#ifdef TCP_VERBOSE
+			if (TCP_D(3, s))
+				printf("%s back-level ACK (%lu, %d)\n", printsock(s), hisack, diff);
+#endif
+   		diff = 0;
+   		goto _th_done_ack;
+   	}
+
+	   /* Update peer's receive window.  We only update when the right
+   	   edge is advanced, which prevents confusion if we get segments
+      	out of order. */
+     	winadv = 0;
+ 		winright = hisack + intel16(tp->window);
+   	if ((long)(winright - (s->seqnum + s->window)) > 0) {
+   		winadv = 1;
+   		winright -= s->seqnum;
+   		//v24366 - 32k test removed, since it causes error when peer has
+   		//  >32k window.  s->window is unsigned so code must be careful.
+   		//v25834 - test put back, except with 64k-1 limit, since peers with
+   		//  window size of 65535 can cause problems with arithmetic overflow.
+   		//  This may occur at start-up, since "previous window size" is not
+   		//  meaningful.
+   		if (winright > 65535uL)
+   			s->window = 65535u;	// the most we are interested in
+   		else
+   		s->window = (unsigned)winright;
+	   	// The window has been advanced.  If there is at least one MSS worth
+	   	// of window available, and data to send, mark for transmit.
+#ifdef TCP_VERBOSE
+	      if (TCP_D(4, s))
+	         printf("%s his window now %d\n", printsock(s), s->window);
+#endif
+	   	if (s->window >= s->mss + s->unacked &&
+	   		 s->wr.len > s->unacked)
+   			send_ack = 1;
+   		if (s->kflags & TCP_KF_PROBING) {
+#ifdef TCP_VERBOSE
+	         if (TCP_D(4, s))
+	            printf("%s ...we were probing\n", printsock(s));
+#endif
+   			s->kflags &= ~TCP_KF_PROBING;
+   			// Always restart from beginning, since peer probably did not
+   			// accept the probe byte.
+   			s->startpt = 0;
+   		}
+   	}
+
+   	if (s->unacked) {
+   		// If no advance (but not probing or just a window advance) do duplicate ack processing
+   		if (!diff && s->window > 1 && !winadv) {
+   			s->ackdupct++;
+#ifdef TCP_VERBOSE_DUPACK
+		 		printf("TCP: dupack count now %d\n", s->ackdupct);
+#endif
+   			s->kflags |= TCP_KF_DUPACK_SS;
+   			tcp_sendsoon(s, 1000 /*TCP_MINRTO*/, 42);
+				// v24366 - this used to be a simple equality test, however it needs to be
+				// a modular comparison since it is possible for the peer to also miss our initial
+				// fast retransmit.  Thus, do the retransmit every N times the dupack count.
+   			if (!(s->ackdupct % TCP_DUPACKS)) {
+#ifdef TCP_VERBOSE_DUPACK
+					printf("TCP: - dupack count mod %d == 0\n", TCP_DUPACKS);
+#endif
+#ifdef TCP_VERBOSE
+	         	if (TCP_D(4, s))
+	            	printf("%s duplicate ack %d\n", printsock(s), s->ackdupct);
+#endif
+   				// Got too many duplicate ACKs i.e. it seems that the
+   				// peer missed one of our segments and he is trying to
+   				// tell us!  Set a special retransmit flag
+   				s->kflags |= TCP_KF_DUPACK;
+   				s->frunack = s->unacked;
+   				send_ack = 1;	// Signal to retransmit the missing segment
+#ifdef TCP_VERBOSE
+      			if (TCP_D(3, s))
+      				printf("%s Got duplicate ACK #%d\n", printsock(s), TCP_DUPACKS);
+#endif
+					// Reset slow-start threshold
+					if (s->cwnd < s->window)
+						s->ssthresh = s->cwnd >> 1;
+					else
+						s->ssthresh = s->window >> 1;
+					if (s->ssthresh < s->mss << 1)
+						s->ssthresh = s->mss << 1;
+					s->cwnd = s->ssthresh + TCP_DUPACKS*s->mss;
+   			}
+   			else if (s->ackdupct > TCP_DUPACKS) {
+   				if (s->cwnd < s->wr.maxlen)
+   					s->cwnd += s->mss;
+   				// This flag is only set for the 3rd duplicate (not more or less)
+   				s->kflags &= ~TCP_KF_DUPACK;
+   			}
+   		}
+   		else if (diff > 0) {
+   			// Got advance, turn off pending dup ack processing
+   			if (s->kflags & TCP_KF_DUPACK_SS) {
+#ifdef TCP_VERBOSE_DUPACK
+					printf("TCP: sendsoon dupack cancelled, advanced %d\n", diff);
+#endif
+   				s->kflags &= ~(TCP_KF_DUPACK_SS | TCP_KF_SENDSOON);
+				}
+   			// Perform VJ slow start/congestion avoidance (sender flow control)
+   			if (s->ackdupct >= TCP_DUPACKS) {
+#ifdef TCP_VERBOSE
+					if (TCP_D(3, s))
+      				printf("%s Fast retransmit catchup diff=%u frunack=%u unacked=%u\n", printsock(s), diff, s->frunack, s->unacked);
+#endif
+					s->frunack -= diff;
+  					s->cwnd = s->ssthresh - s->frunack;
+  					if ((int)s->cwnd < (int)s->mss)
+  						s->cwnd = s->mss;
+#ifdef TCP_VERBOSE_DUPACK
+					printf("TCP: dupack cancelled, advanced %d, ackdupct %d\n", diff, s->ackdupct);
+#endif
+   				s->kflags &= ~TCP_KF_DUPACK;
+   				s->ackdupct = 0;
+	   		}
+   			else {
+   				if (s->cwnd < s->wr.maxlen)
+   					if (s->cwnd < s->ssthresh)
+   						s->cwnd += s->mss;
+   					else
+   						s->cwnd += (word)((longword)s->mss*s->mss / s->cwnd);
+   				s->ackdupct = 0;
+   			}
+   		}
+   	}
+   }
+   else {
+   	diff = 0;
+   	// Must have an ACK in any state other than LISTEN or maybe SYNSENT
+   	// (for simultaneous open) or SYNREC (if he missed our SYN,ACK).
+   	// If not, ignore the packet.
+   	if (!(s->state & (tcp_StateLISTEN|tcp_StateSYNSENT|tcp_StateSYNREC))) {
+#ifdef TCP_VERBOSE
+	      if (TCP_D(1, s))
+	         printf("%s no ack when expected\n", printsock(s));
+#endif
+      	UNLOCK_SOCK(s);
+	   	UNLOCK_GLOBAL(TCPGlobalLock);
+      	return 0;
+   	}
+   }
+
+   /* update our retransmission stuff */
+   if( s->kflags & TCP_KF_TIMERTT && (long)(hisack - s->vj_seq) > 0) {
+	  	// We got response to data we transmitted (without retransmit).
+      diffticks = MS_TIMER - s->vj_last;
+      if (s->kflags & TCP_KF_UPDRTT) {
+      	diffticks -= s->vj_sa >> 3;		// Compute error (ms)
+	     	s->vj_sa += diffticks;				// Add 1/8 error to sa (sa in units of 1/8ms)
+      	if(diffticks < 0)
+         	diffticks = - diffticks;		// Abs value of error
+      	diffticks -= s->vj_sd >> 3;		// Compute |err| - sd
+      	s->vj_sd += diffticks << 1;		// Add 1/4 of above to sd (units 1/8ms)
+		}
+		else {
+			// Initial response
+			s->vj_sa = diffticks << 3;
+			s->vj_sd = diffticks << 2;
+			s->kflags |= TCP_KF_UPDRTT;
+		}
+     	if (s->vj_sa > MAXVJSA)
+     		s->vj_sa = MAXVJSA;	// Clamp to maximum values
+     	if (s->vj_sd > MAXVJSD)
+     		s->vj_sd = MAXVJSD;
+      // RTO = sa + 4*sd
+     	s->rto = s->vj_sa + (s->vj_sd << 2) >> 3;
+#ifdef TCP_VERBOSE
+      if (TCP_D(4, s))
+         	printf("%s RTO update: rto=%ums sa=%ums sd=%ums kf=%04X cwnd=%u sst=%u unack=%u\n", printsock(s),
+            		(unsigned)s->rto, (unsigned)(s->vj_sa>>3), (unsigned)(s->vj_sd>>3),
+            		s->kflags, s->cwnd, s->ssthresh, s->unacked );
+#endif /* TCP_VERBOSE */
+      s->kflags &= ~TCP_KF_TIMERTT;
+      if (s->rto < TCP_MINRTO)
+      	s->rto = TCP_MINRTO;
+   }
+
+_th_done_ack:
+   s->datatimer = 0;
+
+   /*
+    * Now do the core TCP processing.  Rather than using a switch statement,
+    * we use a series of if/else, which is more efficient on the rabbit if
+    * we put the most common case first.
+    */
+
+   if (s->state & (tcp_StateESTAB | tcp_StateCLOSWT)) {
+_th_SYNDATA_JUMP:
+      /* handle lost SYN */
+      if (flags & tcp_FlagSYN) {
+#ifdef TCP_VERBOSE
+	      if (TCP_D(3, s))
+	         printf("%s he retrans SYN/ACK\n", printsock(s));
+#endif
+         tcp_send( s, 65 );
+	      goto _th_finish;
+      }
+
+      s->timeout = 0; /* we do not timeout at this point */
+
+      /* process ack value in packet */
+		if (_tcp_process_ack(s, diff))
+	      goto _th_finish;
+
+	   send_ack |= tcp_ProcessData(s, g, tp, &flags);
+
+      if (flags & tcp_FlagFIN && !(s->state & tcp_StateCLOSWT)) {
+         s->acknum ++;
+         tcp_setstate(s, tcp_StateCLOSWT);
+			if (!(s->sock_mode & TCP_MODE_HALFCLOSE) && !s->rd.len) {
+				// Gone to close wait with no pending data to read.  Do full close.
+				// This is old behavior which does not support TCP half close.
+	         #ifdef TCP_DATAHANDLER
+	            if (s->dataHandler)
+	               s->dataHandler(TCP_DH_INCLOSE, s, NULL, NULL);
+	         #endif
+				tcp_close(s);
+				goto _th_finish;
+			}
+   	#ifdef TCP_DATAHANDLER
+   		if (s->dataHandler)
+   			s->dataHandler(TCP_DH_INCLOSE, s, NULL, NULL);
+   	#endif
+         send_ack = 1;
+      }
+	}
+   else if (s->state & tcp_StateLISTEN) {   /* accepting SYNs */
+   	// Ignore if not binding interface
+   	if (s->iface == IF_ANY)
+   		s->iface = iface;
+   	else if (iface != s->iface)
+   		goto _th_finish;
+      if (!s->sath) {
+   		//Vantive 23956: now use ARP lookup instead of sending back to source's MAC address.
+      	//ath = arpcache_new(hisip, &((eth_Header *)hdrbuf)->source, iface);
+   		ath = arpresolve_start_iface(hisip, iface);
+      	if (ath <= 0) {
+      		tcp_rst(iface, eth, ip, tp);
+      		goto _th_finish;
+      	}
+      	s->sath = ath;
+	      if ((ath = arpresolve_check(ath, hisip)) > 0) {
+	   #ifdef TCP_VERBOSE
+	         if (TCP_D(1, s)) printf("TCP: ...passive open using ARP table entry\n");
+	   #endif
+	      }
+	      else {
+	   #ifdef TCP_VERBOSE
+	         if (TCP_D(1, s)) printf("TCP: ...passive open deferred ARP resolution\n");
+	   #endif
+	      	s->kflags |= TCP_KF_NOARP;
+	      }
+      }
+      if( flags & tcp_FlagSYN && !(flags & tcp_FlagACK)) {
+			//check if this is a connection to a reserved port
+			s->reservedport_flag = 0;
+#ifdef USE_RESERVEDPORTS
+      	for(x=0;x<MAX_RESERVEPORTS;x++)
+         	if(tcp_reserveports[x]==tp->dstPort)
+         	{
+			   	s->reservedport_flag = 1;
+			   	break;
+         	}
+#endif
+         s->acknum = hisseq + 1;
+         s->hisport = hisport;
+         s->hisaddr = hisip;
+         s->myaddr = myip;
+         s->mss = _tcp_process_options(s, tp, iface);
+         tcp_setstate(s, tcp_StateSYNREC);
+         s->kflags |= TCP_KF_SYN;
+         send_ack = 1;
+         s->timeout = _SET_TIMEOUT( TCP_CONNTIMEOUT );
+
+         // Non-standard processing: if get SYN+FIN, then skip straight
+         // to close-wait.  Store any data as well.  This is the first
+         // segment of a 3-way TCP "transaction".  Can also handle
+         // just SYN with data but no FIN.
+        	tcp_ProcessData(s, g, tp, &flags);
+         if (flags & tcp_FlagFIN) {
+#ifdef TCP_VERBOSE
+	         if (TCP_D(1, s))
+	            printf("%s transaction segment #1\n", printsock(s));
+#endif
+	      	#ifdef TCP_DATAHANDLER
+         	//DEVIDEA: data handler not invoked for transaction,
+            // since it really needs a different sort of callback.
+	         //if (s->dataHandler)
+	         //   s->dataHandler(TCP_DH_ESTAB, s, NULL, NULL);
+	      	#endif
+	         s->timeout = 0;     /* never timeout */
+	         s->acknum++;
+	         tcp_setstate(s, tcp_StateCLOSWT);
+	         #ifdef TCP_DATAHANDLER
+            //if (s->dataHandler)
+            //   s->dataHandler(TCP_DH_INCLOSE, s, NULL, NULL);
+	         #endif
+			}
+      }
+      else
+         tcp_rst(iface, eth, ip, tp);  /* send a reset */
+
+   }
+	else if (s->state & tcp_StateSYNSENT) {
+      if( flags & tcp_FlagSYN ) {
+         s->timeout = _SET_TIMEOUT( TCP_CONNTIMEOUT );
+
+         /* FlagACK means connection established, else SYNREC */
+         if( flags & tcp_FlagACK) {
+            /* but is it for the correct session ? */
+            if(diff == 1) {
+               tcp_setstate(s, tcp_StateESTAB);
+               s->kflags &= ~TCP_KF_SYN;	// Our SYN has been acked
+               s->seqnum++;
+               s->acknum = hisseq + 1;
+         		s->mss = _tcp_process_options(s, tp, iface);
+   			#ifdef TCP_DATAHANDLER
+   				if (s->dataHandler)
+   					s->dataHandler(TCP_DH_ESTAB, s, NULL, NULL);
+   			#endif
+               tcp_ProcessData(s, g, tp, &flags);
+               send_ack = 1;
+            } else {
+               /* wrong ack, force a RST and resend SYN soon*/
+               tcp_rst(iface, eth, ip, tp);
+               tcp_sendsoon( s, TCP_MINRTO, 63 );
+            }
+         } else {
+         	// Simultaneous open.  Send SYN,ACK as if we were in listen state
+            s->acknum = hisseq + 1;
+	         s->mss = _tcp_process_options(s, tp, iface);
+            tcp_setstate(s, tcp_StateSYNREC);
+            send_ack = 1;
+         }
+      } else
+         tcp_rst(iface, eth, ip, tp);
+   }
+	else if (s->state & tcp_StateSYNREC) {   /* recSYNSENT, sentACK, waiting  EST */
+	   send_ack |= tcp_ProcessData(s, g, tp, &flags);
+
+      if( flags & tcp_FlagSYN && !(flags & tcp_FlagACK)) {
+      	// He retransmitted SYN
+         send_ack = 1;
+         s->timeout = _SET_TIMEOUT( TCP_CONNTIMEOUT );
+      }
+      else if (diff >= 1) {	// Must have got ACK of our SYN
+         tcp_setstate(s, tcp_StateESTAB);
+         s->seqnum++;
+         s->timeout = 0;     /* never timeout */
+         s->kflags &= ~TCP_KF_SYN;
+
+         /* hack to process remaining data after we got our ACK */
+         diff--; // consume SYN flag
+   	#ifdef TCP_DATAHANDLER
+   		if (s->dataHandler)
+   			s->dataHandler(TCP_DH_ESTAB, s, NULL, NULL);
+   	#endif
+        	goto _th_SYNDATA_JUMP;
+      }
+	}
+	else if (s->state & tcp_StateFINWT1) {
+      /* Process the ACK.  If KF_FIN is turned off after this, it means
+         our FIN was acked. */
+		if (_tcp_process_ack(s, diff))
+	      goto _th_finish;
+
+      // Peer may still be transmitting data, we must read it.  The incoming
+      // FIN flag, if any, may be turned off if data not completely read.
+      send_ack |= tcp_ProcessData(s, g, tp, &flags);
+
+      if (!(s->kflags & (TCP_KF_FIN|TCP_KF_WANTFIN))) {
+         // Peer has acked our fin
+         tcp_setstate(s, tcp_StateFINWT2);
+			if (!(s->sock_mode & TCP_MODE_HALFCLOSE))
+         	s->timeout = _SET_TIMEOUT( TCP_CONNTIMEOUT );
+      }
+      if (flags & tcp_FlagFIN) {
+      	// Peer's FIN flag survived: process it.
+         s->acknum++;     // we must ACK their FIN!
+
+         if (s->kflags & TCP_KF_FIN)
+            // Simultaneous close (haven't ACKed our FIN yet)
+            // We need to ACK their FIN and move to CLOSING
+            next_state = tcp_StateCLOSING;
+         else
+            // Not simultaneous close (they've ACKed our FIN)
+            // We need to ACK their FIN and move to TIME_WAIT
+            next_state = tcp_StateTIMEWT;
+
+         tcp_send( s, 69 );
+         send_ack = 0;
+         tcp_setstate(s, next_state);
+         if(next_state != tcp_StateTIMEWT)
+            s->timeout = _SET_TIMEOUT( TCP_CONNTIMEOUT );
+   	#ifdef TCP_DATAHANDLER
+   		if (s->dataHandler)
+   			s->dataHandler(TCP_DH_INCLOSE, s, NULL, NULL);
+   	#endif
+      }
+   }
+	else if (s->state & tcp_StateFINWT2) {
+      /* they may still be transmitting data, we must read it */
+      send_ack |= tcp_ProcessData(s, g, tp, &flags);
+
+      if (flags & tcp_FlagFIN) {
+         s->acknum++;
+         tcp_send( s, 70 );
+         tcp_setstate(s, tcp_StateTIMEWT);
+   	#ifdef TCP_DATAHANDLER
+   		if (s->dataHandler)
+   			s->dataHandler(TCP_DH_INCLOSE, s, NULL, NULL);
+   	#endif
+      }
+  }
+  else if (s->state & tcp_StateCLOSING) {
+		if (!_tcp_process_ack(s, diff)) {
+	      if(!(s->kflags & TCP_KF_FIN)) {
+   	   	// Our FIN was acked
+      	   s->seqnum++;
+         	tcp_setstate(s, tcp_StateTIMEWT);
+      	}
+      }
+   }
+   else if (s->state & tcp_StateLASTACK) {
+		if (!_tcp_process_ack(s, diff)) {
+	      if (s->kflags & TCP_KF_FIN)
+   	      send_ack = 1;
+      	else
+         	tcp_setstate(s, tcp_StateCLOSED);     /* no 2msl necessary */
+      }
+   }
+   else if (s->state & tcp_StateTIMEWT) {
+      if (!diff)
+         send_ack = 1;
+   }
+
+   if (send_ack & 1)
+   	tcp_send(s, 100);
+   else if (send_ack)
+   	tcp_sendsoon(s, TCP_LAZYUPD, 200);
+	else if (!s->unacked
+	    && !s->wr.len
+	    && s->keepalive_time
+	    && s->state & (tcp_StateESTAB | tcp_StateCLOSWT | tcp_StateFINWT2)) {
+		// No ack required; check if keepalive timeout required (see also end of tcp_send()).
+#ifdef TCP_VERBOSE
+		if (TCP_D(3, s))
+			printf("%s starting keepalive (%lu ms)\n", printsock(s), s->keepalive_time);
+#endif
+		s->kflags |= TCP_KF_KEEPALIVE;
+		s->rtt_time = _SET_TIMEOUT(s->keepalive_time);
+	}
+
+_th_finish:
+   UNLOCK_SOCK(s);
+   UNLOCK_GLOBAL(TCPGlobalLock);
+   return 0;
+}
+
+/*** BeginHeader _tcp_process_options */
+word _tcp_process_options(tcp_Socket *s, tcp_Header __far *tp, word iface);
+/*** EndHeader */
+_tcp_nodebug word _tcp_process_options(tcp_Socket *s, tcp_Header __far *tp, word iface)
+{
+	// s param may be NULL.
+
+	auto int hdrlen;
+   auto word gotmss, numoptions;
+   auto byte __far *options;
+   auto word maxmss;
+
+   if (s)
+   	maxmss = s->mss;
+   else
+   	maxmss = ifmtu(iface,s?s->hisaddr:0xFFFFFFFFuL) -
+      					(sizeof(in_Header) + sizeof(tcp_Header));
+   /* find the data portion */
+   hdrlen = tcp_GetDataOffset(tp) << 2; /* quadword to byte format */
+
+   /* process those options */
+   numoptions = hdrlen - sizeof(tcp_Header);
+   gotmss = 0;
+   if (numoptions) {
+      options = (byte __far *)tp + sizeof(tcp_Header);
+      while (numoptions--) {
+         switch( *options++ ) {
+         case  0 : numoptions = 0;  /* end of options */
+            break;
+         case  1 : break;     /* nop */
+
+         case  2 :
+            if (*options == 4) {
+               gotmss = intel16( *(word __far *)(&options[1]));
+               if (gotmss > maxmss)
+               	gotmss = maxmss;
+            }
+            // fallthrough (case 2),
+            // also skips unknown options (thanks GV)
+         default:    // handle 2 and others
+            numoptions -= (*options - 1);
+            options += (*options - 1);
+            break;
+         }
+      }
+   }
+
+   // If there was no MSS option, return the default of 536 (RFC1122)
+   if (!gotmss) {
+   	gotmss = 536;
+   	if (536 > maxmss)
+   		gotmss = maxmss;
+   }
+   return gotmss;
+}
+
+
+/*** BeginHeader tcp_ProcessData */
+/*int tcp_ProcessData(tcp_Socket *s, tcp_Header *tp, int len,
+                     ll_prefix __far * LL, word *flagsp, byte * hdrbuf);*/
+int tcp_ProcessData(tcp_Socket *s, ll_Gather __far * g,
+								tcp_Header __far *tp, word *flagsp);
+/*** EndHeader */
+
+/*
+ * Process the data in an incoming packet.
+ * Called from all states where incoming data can be received: established,
+ * fin-wait-1, fin-wait-2
+ * added flagsp so we can disable FIN with segment(s) missing.
+ * Returns 0 if nothing more to ack, non-zero if need to ack.
+ * NB:
+ */
+_tcp_nodebug
+int tcp_ProcessData(tcp_Socket *s, ll_Gather __far * g,
+								tcp_Header __far *tp, word *flagsp)
+{
+   auto int diff, tmpdiff, bufspace;
+   auto longword hisseq;
+   auto word flags, origlen;
+   auto word dp;		// Offset into packet buffers
+   auto int src, dst;
+	auto ll_Gather dhg;	// For data handler
+   int len = g->len2 + g->len3;	// len must be signed, since it may be
+   										// reset l.t. zero.
+
+   if( s->stress ) s->stress--;
+
+   flags = intel16( tp->flags );
+   hisseq = intel(tp->seqnum);
+   if (flags & tcp_FlagTRUNC) {
+   	// Non-RFC793 flag.  If set, reconstruct high half of hisseq based on
+      // our (full length) s->acknum.
+      _tcp_extend_seq(&hisseq, s->acknum);
+   }
+
+   /* Offset of data (w.r.t. g->data2), may be increased if already have
+      some of the data. */
+   dp = 0;
+
+   origlen = len;
+
+   diff = clamp16k(s->acknum - hisseq);
+   if (flags & tcp_FlagSYN)
+   	// Account for sequence number used by SYN flag.
+   	diff--;
+
+
+   // Amount of space in buffer.
+	bufspace = _tbuf_remain(&s->rd);
+
+   if (diff >= 0) {  /* skip already received bytes */
+      dp += diff;
+      len -= diff;
+
+      if (len > bufspace) {
+         len = bufspace;
+#ifdef TCP_VERBOSE
+	      if (TCP_D(3, s))
+	         printf("%s ignoring his FIN\n", printsock(s));
+#endif
+			*flagsp &= ~tcp_FlagFIN;
+      }
+
+      if (len <= 0) {
+      	// We have already seen this data, or can't fit any more in.
+#ifdef TCP_VERBOSE
+	      if (origlen && TCP_D(4, s))
+	         printf("%s already got this data\n", printsock(s));
+#endif
+      	goto finish_pd;
+      }
+
+#ifdef TCP_VERBOSE
+	   if (TCP_D(4, s))
+	         printf("%s data advanced by %d\n", printsock(s), len);
+#endif
+      s->acknum += len;   /* our new ack begins at end of data */
+      s->advwindow -= len;
+
+      _tbuf_gappend(&s->rd, g, dp, len);
+
+
+      // See if we reached out-of-order segment.  The new segment may
+      // touch or overlap the old segment; new data replaces old.
+      if (s->kflags & TCP_KF_GAP && (int)(s->acknum - s->ooosstart) >= 0) {
+         tmpdiff = (int)(s->ooosend - s->acknum);
+         if (tmpdiff > 0) {
+         	len += tmpdiff;
+#ifdef TCP_VERBOSE
+	         if (TCP_D(4, s))
+	            printf("%s filling gap, now advancing %d\n", printsock(s), tmpdiff);
+#endif
+         	s->rd.len += tmpdiff;
+         	s->acknum = s->ooosend;
+         	s->advwindow -= tmpdiff;
+         }
+#ifdef TCP_VERBOSE
+	      else if (TCP_D(4, s))
+	         printf("%s overfilled gap\n", printsock(s));
+#endif
+         s->kflags &= ~TCP_KF_GAP;	// Filled in the gap.
+      }
+
+   #ifdef TCP_DATAHANDLER
+      // If there is a TCP data handler, call it with the new data
+      if (s->dataHandler) {
+      	_tbuf_ref(&s->rd, &dhg, s->rd.len - len, len);
+      	dhg.iface = g->iface;
+      	dhg.len1 = g->len1;
+      	dhg.data1 = g->data1;		// IP and TCP headers
+      	s->dataHandler(TCP_DH_INDATA, s, &dhg, NULL);
+      	// Currently, we ignore the return code from the handler for TCP sockets.
+      	// For future compatibility, it should always return zero.
+      }
+   #endif
+
+   }
+   else {
+   	// diff < 0 - received later segment (at least one missed).
+      // No out-of-sequence processing of FIN flag.
+#ifdef TCP_VERBOSE
+	   if (TCP_D(4, s))
+	      printf("%s out-of-sequence segment\n", printsock(s));
+#endif
+      *flagsp &= ~tcp_FlagFIN;
+      // Handle one dropped segment.
+      if (!(s->kflags & TCP_KF_GAP)) {
+      	// Create gap.
+#ifdef TCP_VERBOSE
+	      if (TCP_D(4, s))
+	         printf("%s making gap of %d\n", printsock(s), -diff);
+#endif
+      	bufspace += diff;	// Account for gap; reduce bufspace
+         len = i_min(bufspace, len);
+         if (len > 0) {
+            _tbuf_gwrite_noadj(&s->rd, s->rd.len - diff, g, dp, len);
+
+            s->ooosstart = hisseq;
+            s->ooosend = hisseq + len;
+            s->kflags |= TCP_KF_GAP;
+         }
+      } else {
+      	// Gap already exists.  Try to merge incoming segment.  If tmpdiff
+      	// if g.t. zero, then new segment starts before previous seg.
+         tmpdiff = clamp16k(s->ooosstart - hisseq);
+         if (tmpdiff>0 && len>=tmpdiff) { // prepend bytes touching old seg.
+#ifdef TCP_VERBOSE
+	         if (TCP_D(4, s))
+	            printf("%s prepending %d to gap\n", printsock(s), tmpdiff);
+#endif
+            _tbuf_gwrite_noadj(&s->rd, s->rd.len - diff, g, dp, tmpdiff);
+            s->ooosstart -= tmpdiff;
+         }
+         // Now set tmpdiff to the amount extended beyond end of old seg.
+         tmpdiff = clamp16k(hisseq + len - s->ooosend);
+         if (tmpdiff > 0) {    // append bytes touching old seg
+         	// Set src to starting offset in new seg.
+            src = clamp16k(s->ooosend - hisseq);
+            if (src>=0) {
+               // Set dst to buffer destination offset
+               dst = clamp16k(s->ooosend - s->acknum);
+               bufspace -= dst;
+               tmpdiff = i_min(bufspace, tmpdiff); // length to move
+               if (tmpdiff > 0) {
+#ifdef TCP_VERBOSE
+	               if (TCP_D(4, s))
+	                  printf("%s appending %d to gap\n", printsock(s), tmpdiff);
+#endif
+                  _tbuf_gwrite_noadj(&s->rd, s->rd.len + dst, g, dp + src, tmpdiff);
+                  s->ooosend += tmpdiff;
+               }
+            }
+         }
+      }
+   }
+finish_pd:
+   if (origlen)
+   	if (s->kflags & (TCP_KF_SENDSOON|TCP_KF_GAP)) {
+#ifdef TCP_VERBOSE
+	      if (TCP_D(4, s))
+	         printf("%s send ack immediately\n", printsock(s), s->window);
+#endif
+   		return 1;
+      }
+   	else {
+#ifdef TCP_VERBOSE
+	      if (TCP_D(4, s))
+	         printf("%s send ack soon\n", printsock(s));
+#endif
+   		return 2;
+      }
+
+   // Do not send ack in response to just an ack.  Exception if diff == 1 and no unacked
+   // data: this is a keepalive from the peer.  We return 1 (not 2) to avoid our own
+   // keepalive timer from interfering.
+   if (diff == 1 && !s->unacked) {
+#ifdef TCP_VERBOSE
+	   if (TCP_D(4, s))
+	         printf("%s send ack, got keepalive\n", printsock(s));
+#endif
+   	return 1;
+   }
+   return 0;
+}
+
+/*** BeginHeader _tcp_send */
+#ifdef TCP_VERBOSE
+void _tcp_send( tcp_Socket *s, int line );
+#else
+void _tcp_send( tcp_Socket *s );
+#endif
+/*** EndHeader */
+
+/*
+ * Format and send an outgoing segment
+ */
+
+#ifdef TCP_VERBOSE
+_tcp_nodebug void _tcp_send( tcp_Socket *s, int line )
+#else
+_tcp_nodebug void _tcp_send( tcp_Socket *s )
+#endif
+{
+	auto byte pkt_hdr[IP_MAX_TCP_HDR];	// LL, IP and TCP headers
+   auto tcp_PseudoHeader ph;
+   auto tcp_pkt *pkt;
+   auto byte * dp;
+   auto char __far * lhdr;
+   auto ATHandle ath;
+   auto in_Header *inp;
+   auto tcp_Header *tcpp;
+   auto word senddatalen, sendpktlen, startdata, thlen;
+#ifdef TCP_STATS
+	auto word rtdatalen;
+#endif
+	auto ll_Gather g;
+   auto word more;
+   auto word outFlags;
+   auto word realwindow;
+   auto longword stamp;			// Timestamp of 1st segment transmission
+   auto longword stamp_seq;	// Seq number of 1st segment sent
+
+   // Don't do anything yet if we are currently in a segment chain (but haven't come here from retransmitter),
+   // or if currently suspended pending ARP refresh.
+   if (s->kflags & (TCP_KF_SEGCHAIN | TCP_KF_NOARP))
+   	return;
+
+   LOCK_GLOBAL(TCPGlobalLock);
+   LOCK_SOCK(s);
+
+#if USING_VSPD
+	if (s->hisaddr == VSPD_LOCALHOST) {
+   	// Special handling for VSPD (stream).  No headers are added.
+   	s->kflags &= ~TCP_KF_SENDSOON;
+   	startdata = s->startpt;
+      senddatalen = s->wr.len - startdata;	// There is no limit to transmit 'MSS' for streams.
+	   if (senddatalen) {
+	      _tbuf_ref(&s->wr, &g, startdata, senddatalen);
+         g.iface = s->iface;
+         g.flags = LLG_STAT_DATA2 | LLG_STAT_DATA3;
+         g.len1 = 0;
+	   #ifdef TCP_VERBOSE
+	      if (TCP_D(5, s))
+	         printf("%s (VSPD) SEND: len=%u\n",
+	            printsock(s),
+	            senddatalen);
+      #endif
+	      if (pkt_gather(&g)) {
+	         // Transmit error.  Short sendsoon.
+	   #ifdef TCP_VERBOSE
+	         if (TCP_D(5, s))
+	            printf("  ...failed, driver busy\n");
+	   #endif
+	         tcp_sendsoon( s, TCP_LAZYUPD, 109 );
+	      }
+         else {
+				s->startpt += senddatalen;
+            s->unacked += senddatalen;
+         }
+		}
+      goto _ts_finish;
+   }
+#endif
+
+#ifndef ARP_MINIMAL
+   // Check if ARP cache entry is up to date.  If not, just return.  The packet handler
+   // will call tcp_send() again for all TCP sockets which have the KF_NOARP flag set.
+   ath = arpresolve_check(s->sath, s->hisaddr);
+   if (ath < 0) {
+   	s->kflags |= TCP_KF_NOARP;	// A cry for help
+   	if (ath != ATH_AGAIN)
+   		s->sath = arpresolve_start_iface(s->hisaddr, s->iface);
+   	goto _ts_finish;
+   }
+#else
+	ath = s->sath;
+#endif
+
+   inp = pkt_make_ip(ath, pkt_hdr, &g);
+   lhdr = g.data1;	// Save because trashed below
+   pkt = (tcp_pkt *)inp;
+   dp = (byte *) &pkt->maxsegopt;  /* dp constant for multi-packet sends */
+   tcpp = &pkt->tcp;
+   thlen = sizeof(tcp_Header);
+
+   g.data1 = (char __far *)paddr(&ph);		// Initial, for checksum computation
+   g.len1 = sizeof(ph);
+
+   if (s->kflags & TCP_KF_DUPACK) {
+   	// Duplicate ACK processing; restart from beginning, but only send one segment.
+#ifdef TCP_VERBOSE_DUPACK
+		printf("TCP: dupack retransmit!\n");
+#endif
+   	startdata = 0;
+	}
+   else
+   	// Otherwise continue from where left off -- may be retransmission if startpt < unacked.
+   	startdata = s->startpt;
+
+   s->kflags &= ~TCP_KF_SENDSOON;
+   // This is our total possible send amount -- the minimum of the
+   // peer's receive window, our congestion window (rounded up to mss multiple), and the actual amount of data.
+   more = 0;
+   senddatalen = u_min(s->wr.len, s->window) - startdata;
+   if (!(s->kflags & TCP_KF_SENDRST) && (s->cwnd <= startdata && senddatalen)) {
+  		// Cannot send, reached congestion avoidance limit
+#ifdef TCP_VERBOSE
+		if (TCP_D(5, s)) {
+			printf("%s ca limit: cwnd=%u datalen=%u senddatalen=%u startdata=%u window=%u\n", printsock(s),
+			  s->cwnd, s->wr.len, senddatalen, startdata, s->window);
+			printf("  ...ssthr=%u, seqnum=%lu\n",
+			  s->ssthresh, s->seqnum);
+		}
+#endif
+  		goto _ts_finish;
+   }
+
+   // Finally, reduce to a maximum of one segment (and set "more" flag if can send more)
+   if (senddatalen > s->mss) {
+   	senddatalen = s->mss;
+   	more = 1;
+   }
+
+   /* internet header */
+   inp->ver_hdrlen=0x45;
+   inp->tos = s->tos;
+   inp->frags = 0;
+   inp->ttl = s->ttl;
+   inp->proto = TCP_PROTO;
+   inp->source = intel(s->myaddr);
+   inp->destination = intel(s->hisaddr);
+
+   /* tcp header */
+   tcpp->srcPort = intel16(s->myport);
+   tcpp->dstPort = intel16(s->hisport);
+   tcpp->urgentPointer = 0;
+   tcpp->acknum = intel(s->acknum);
+
+   // Decide on the window size to advertise.  We don't increase it
+   // until at least one MSS is available, to avoid "silly window syndrome"
+   // i.e. the peer trying to pump small segments into a narrow opening.
+   realwindow = _tbuf_remain(&s->rd);
+   if (realwindow >= s->mss || s->advwindow < 0 || realwindow >= (s->rd.maxlen >> 1))
+   	s->advwindow = realwindow;
+   tcpp->window = intel16(s->advwindow);
+
+  	outFlags = 0x5000;	// Set to standard header length (5*4=20)
+   // Always need to set ACK unless active opening
+   if (s->state != tcp_StateSYNSENT)
+   	outFlags |= tcp_FlagACK;
+
+
+	stamp = MS_TIMER;
+	stamp_seq = s->seqnum + startdata;
+
+   tcpp->seqnum = intel(s->seqnum + startdata);
+   tcpp->checksum = 0;
+
+   if (s->kflags & TCP_KF_SENDRST) {
+     	outFlags |= tcp_FlagRST;
+     	s->kflags &= ~(TCP_KF_SYN | TCP_KF_FIN | TCP_KF_WANTFIN);
+      // Don't send any data with our RST, since the host requirements RFC
+      // only states that stacks SHOULD accept data with RST
+		sendpktlen = sizeof( tcp_Header ) + sizeof( in_Header );
+      senddatalen = 0;
+      more = 0;
+   }
+   else if (s->kflags & TCP_KF_SYN) {
+		// If this is our SYN segment, do not send any data, but add
+	   // MSS option field.
+      sendpktlen = sizeof( tcp_Header ) + sizeof( in_Header ) + 4;
+      senddatalen = 0;
+      more = 0;
+      outFlags += 0x1000;	// Add 4 to header length
+      outFlags |= tcp_FlagSYN;
+      pkt->maxsegopt[0] = 0x0402;
+      pkt->maxsegopt[1] = intel16( s->mss );
+      thlen += 4;
+   }
+   else {
+      sendpktlen = senddatalen + sizeof( tcp_Header ) + sizeof( in_Header );
+      if (senddatalen)
+			outFlags |= tcp_FlagPUSH;
+   }
+   if (senddatalen)
+   	_tbuf_ref(&s->wr, &g, startdata, senddatalen);
+
+   // If we want out, and sending last segment, set FIN flag.
+   if (s->kflags & (TCP_KF_FIN|TCP_KF_WANTFIN) &&
+       startdata + senddatalen == s->wr.len
+       ) {
+#ifndef TCP_FIN_WITH_DATA
+		if (senddatalen)
+      	// Defer setting the FIN flag until we send the very last segment with no data, just FIN
+         more = 1;
+      else {
+#endif
+     	outFlags |= tcp_FlagFIN;
+      // Change flags to indicate unacknowledged FIN in transmit sequence
+      s->kflags &= ~TCP_KF_WANTFIN;
+      s->kflags |= TCP_KF_FIN;
+     	// FIN implies push
+     	outFlags &= ~tcp_FlagPUSH;
+#ifndef TCP_FIN_WITH_DATA
+		}
+#endif
+   }
+
+   inp->identification = intel16( ++ip_id );
+   inp->length = intel16( sendpktlen );
+
+   tcpp->flags = intel16(outFlags);
+
+   if (!IF_CHKSUM_OFFLOAD(g.iface)) {
+	   /* compute tcp and IP  header checksums.
+	      TCP pseudo-header for proper checksum calculation. */
+	   ph.src = inp->source;   /* already in network byte order */
+	   ph.dst = inp->destination;
+	   ph.mbz = 0;
+	   ph.protocol = TCP_PROTO;
+
+	   inp->checksum = 0;
+	   inp->checksum = ~fchecksum( inp, sizeof(in_Header));
+	   ph.length = intel16( sendpktlen - sizeof(in_Header));
+	   ph.checksum = fchecksum(tcpp, thlen);
+	   tcpp->checksum = ~gchecksum(&g, 0);
+   }
+   g.len1 = sendpktlen - senddatalen + (word)((char __far *)paddr(inp) - lhdr);
+   g.data1 = lhdr;
+
+#ifdef TCP_VERBOSE
+	if (TCP_D(5, s))
+	   printf("%s SEND: flags=%c%c%c%c ack=%lu seq=%lu len=%u win=%u\n",
+      	printsock(s),
+         outFlags & tcp_FlagSYN ? 'S' : '.',
+         outFlags & tcp_FlagACK ? 'A' : '.',
+         outFlags & tcp_FlagFIN ? 'F' : '.',
+         outFlags & tcp_FlagRST ? 'R' : '.',
+         s->acknum,
+         s->seqnum + startdata,
+         senddatalen,
+         s->advwindow);
+   if (debug_on > 5)
+   	printf("  ...line[%d] startdata=%u win=%u cwnd=%u unack=%u\n",
+   				line, startdata, s->window, s->cwnd, s->unacked);
+   if (debug_on > 1 && startdata < s->unacked)
+   	printf("%s retransmitting back %u from unack\n", printsock(s), s->unacked - startdata);
+#endif
+
+#ifdef TCP_VERBOSE_DUPACK
+	printf(".\n");
+	if (senddatalen == 1460)
+		printf("big!\n");
+#endif
+   if (pkt_gather(&g)) {
+     	// Transmit error.  Short sendsoon.
+#ifdef TCP_VERBOSE
+		if (TCP_D(5, s))
+      	printf("  ...failed, driver busy\n");
+#endif
+      tcp_sendsoon( s, TCP_LAZYUPD, 102 );
+#ifdef TCP_STATS
+		s->txetherr++;
+#endif
+		goto _ts_finish;
+   }
+
+
+#ifdef TCP_STATS
+	if (startdata < s->unacked) {
+		if (s->unacked > senddatalen + startdata)
+			rtdatalen = senddatalen;
+		else
+			rtdatalen = s->unacked - startdata;
+		s->rtbytes += rtdatalen;
+		s->rtsegments++;
+	}
+	s->txbytes += senddatalen;
+	s->txsegments++;
+#endif
+
+	// startdata is now the start of the _next_ segment to transmit
+   startdata += senddatalen;
+
+   if (more) {
+#ifdef TCP_VERBOSE
+	   if (TCP_D(5, s))
+	      printf("%s more to follow\n", printsock(s));
+#endif
+      // No extra timeout required if more segments to send.
+  	   retran_strat = _SET_SHORT_TIMEOUT(1);
+     	// Indicate more to send (will come back here from tcp_Retransmitter()).
+     	s->kflags |= TCP_KF_SEGCHAIN;
+   }
+
+   if (senddatalen) {
+	   if (s->unacked < startdata) {
+#ifdef TCP_VERBOSE
+	      if (TCP_D(5, s))
+	         printf("%s first tx of new data\n", printsock(s));
+#endif
+	   	s->unacked = startdata;
+   	   if (!(s->kflags & TCP_KF_TIMERTT)) {
+      		// Start a new RTT collection interval
+         	s->vj_last = stamp;		// Outbound timestamp
+         	s->vj_seq = stamp_seq;	// Sequence for which expecting a response
+         	s->kflags |= TCP_KF_TIMERTT;
+      	}
+   	}
+   	else
+      	// Retransmission, do not do RTT estimates (Karn's algo).
+	   	s->kflags &= ~TCP_KF_TIMERTT;
+	   if (s->startpt < startdata)
+	   	s->startpt = startdata;
+	}
+
+	// Retransmission done (if any)
+   s->kflags &= ~(TCP_KF_RETRANSMIT | TCP_KF_DUPACK);
+
+   // Now determine whether we need to set a timeout.  This is only done if
+   // we are expecting some acknowledgment i.e. we have unacked data or SYN/FIN.
+   // Also set timeout when window is zero but we have data to send.  This
+   // starts window probing.
+   if (s->unacked ||
+   	 s->kflags & (TCP_KF_SYN | TCP_KF_FIN) ||
+   	 !s->window && s->wr.len) {
+   	s->kflags |= TCP_KF_UNHAPPY;
+   	s->rtt_time = _SET_TIMEOUT(s->rto);
+   }
+   else {
+   	s->kflags &= ~TCP_KF_UNHAPPY;
+		if (!s->unacked
+		    && !s->wr.len
+		    && s->keepalive_time
+		    && s->state & (tcp_StateESTAB | tcp_StateCLOSWT | tcp_StateFINWT2)) {
+			// Set a keepalive initial timeout if nothing is unacked, we have no data to
+			// transmit, there is a keepalive timeout, and we are in an established state.
+#ifdef TCP_VERBOSE
+			if (TCP_D(3, s))
+				printf("%s starting keepalive in tcp_send (%lu ms)\n", printsock(s), s->keepalive_time);
+#endif
+			s->kflags |= TCP_KF_KEEPALIVE;
+			s->rtt_time = _SET_TIMEOUT(s->keepalive_time);
+		}
+
+	}
+
+_ts_finish:
+   UNLOCK_SOCK(s);
+   UNLOCK_GLOBAL(TCPGlobalLock);
+}
+
+/*** BeginHeader tcp_rst */
+void tcp_rst(int iface, eth_address * eth,
+					in_Header __far * his_ip, tcp_Header __far *oldtcpp);
+/*** EndHeader */
+
+/*
+ * Format and send a reset tcp packet
+ */
+_tcp_nodebug
+void tcp_rst(int iface, eth_address * eth,
+					in_Header __far * his_ip, tcp_Header __far *oldtcpp)
+{
+	auto byte pkt_hdr[IP_MAX_TCP_HDR];	// LL, IP and TCP headers
+   auto tcp_PseudoHeader ph;
+   auto tcp_pkt *pkt;
+	auto longword acknum;
+   auto word oldflags;
+   auto in_Header *inp;
+   auto tcp_Header *tcpp;
+   auto int sendtotlen;   /* length of packet */
+   auto int temp;
+   //auto in_Header *his_ip;
+   auto ll_Gather g;
+
+   /* see RFC 793 page 65 for details */
+	//his_ip = (in_Header *)(hdrbuf + LL->net_offs);
+   oldflags = intel16( oldtcpp->flags );
+   if (oldflags & tcp_FlagRST ) return;
+
+   inp = pkt_reply_ip(iface, pkt_hdr, &g, eth);
+   pkt = (tcp_pkt *)inp;
+   tcpp = &pkt->tcp;
+
+   sendtotlen = sizeof( tcp_Header ) + sizeof( in_Header );
+   memset(inp, 0, sendtotlen);
+   inp->length = intel16(sendtotlen);
+
+   /* tcp header */
+   tcpp->srcPort = oldtcpp->dstPort;
+   tcpp->dstPort = oldtcpp->srcPort;
+   tcpp->flags = intel16( tcp_FlagRST | tcp_FlagACK | 0x5000 );
+
+   // Compute believable seq and ack numbers
+   if (oldflags & tcp_FlagACK)
+   	tcpp->seqnum = oldtcpp->acknum;
+   acknum = intel(oldtcpp->seqnum);
+   if (oldflags & tcp_FlagSYN)
+   	acknum++;
+   if (oldflags & tcp_FlagFIN)
+   	acknum++;
+   acknum += intel16(his_ip->length)
+   			 - in_GetHdrlenBytes(his_ip)
+   			 - (tcp_GetDataOffset(oldtcpp) << 2);
+   tcpp->acknum = intel(acknum);
+
+
+   /* internet header */
+   inp->ver_hdrlen=0x45;
+   inp->tos = TCP_TOS;
+   inp->identification = intel16( ++ip_id );
+   inp->ttl = TCP_TTL;
+   inp->proto = TCP_PROTO;
+   inp->source = his_ip->destination;
+   inp->destination = his_ip->source;
+
+   inp->checksum = ~fchecksum( inp, sizeof(in_Header));
+
+   /* compute tcp checksum */
+   ph.src = inp->source;  /* already INTELled */
+   ph.dst = inp->destination;
+   ph.mbz = 0;
+   ph.protocol = TCP_PROTO;
+   ph.length = intel16( sendtotlen - sizeof(in_Header));
+
+   // Safe to use fchecksum
+   ph.checksum = fchecksum(&pkt->tcp, sizeof(tcp_Header));
+   tcpp->checksum =  ~fchecksum(&ph, sizeof(ph));
+
+   g.len1 = sendtotlen + (word)((char __far *)paddr(inp) - g.data1);
+#ifdef TCP_VERBOSE
+	if (debug_on >= 5)
+	   printf("TCP: sending RST ack=%lu from %u to %08lX:%u\n",
+      	acknum, intel16(tcpp->srcPort), intel(inp->destination), intel16(tcpp->dstPort));
+#endif
+#ifdef TCP_VERBOSE_DUPACK
+	printf(".r\n");
+#endif
+   pkt_gather(&g);
+}
+
+
+/*** BeginHeader tcp_pendingpkt */
+void tcp_pendingpkt(tcp_Pending __far *p, word flags, int windowsize );
+/*** EndHeader */
+
+/*
+ * Send an ACK (without advancing acknum) with a set window size (usually 0)
+ * for pending connection
+ */
+_tcp_nodebug void tcp_pendingpkt(tcp_Pending __far *p, word flags, int windowsize)
+{
+	auto byte pkt_hdr[IP_MAX_TCP_HDR];	// LL, IP and TCP headers
+   auto tcp_PseudoHeader ph;
+   auto tcp_pkt *pkt;
+	auto ATHandle ath;
+   auto in_Header *inp;
+   auto tcp_Header *tcpp;
+   auto eth_Header *eth;
+   auto int sendtotlen;   /* length of packet */
+   auto int temp;
+   auto ll_Gather g;
+
+   ath = arpresolve_check(p->ppath, p->hisaddr);
+   if (ath < 0) {
+   	// Cache must be being heavily thrashed.  Just forget about this guy.
+#ifdef TCP_VERBOSE_PENDING
+		printf("TCP: pending socket dropped, no ARP cache\n");
+#endif
+   	p->ppath = 0;
+   	return;
+   }
+   inp = pkt_make_ip(ath, pkt_hdr, &g);
+   pkt = (tcp_pkt *)inp;
+   tcpp = &pkt->tcp;
+
+   sendtotlen = sizeof( tcp_Header ) + sizeof( in_Header ) + 4;
+   memset( inp, 0, sendtotlen);
+
+   /* tcp header */
+   tcpp->srcPort = intel16(p->myport);
+   tcpp->dstPort = intel16(p->hisport);
+   tcpp->seqnum = intel(p->seqnum);
+   tcpp->acknum = intel(p->acknum);
+   tcpp->window = intel16(windowsize);
+   tcpp->flags = intel16(0x6000 | flags);	//includes option field
+
+   /* internet header */
+   inp->ver_hdrlen=0x45;
+   inp->tos = TCP_TOS;
+   inp->identification = intel16( ++ip_id );
+   inp->ttl = TCP_TTL;
+   inp->proto = TCP_PROTO;
+   inp->source = intel(p->myaddr);
+   inp->destination = intel(p->hisaddr);
+   inp->length = intel16(sendtotlen);
+
+   inp->checksum = ~fchecksum( inp, sizeof(in_Header));
+
+   pkt->maxsegopt[0] = 0x0402;
+   pkt->maxsegopt[1] = intel16(p->mss);
+
+
+   /* compute tcp checksum */
+   ph.src = inp->source;  /* already INTELled */
+   ph.dst = inp->destination;
+   ph.mbz = 0;
+   ph.protocol = TCP_PROTO;
+   ph.length = intel16( sendtotlen - sizeof(in_Header));
+
+   // Can use fchecksum because even number of bytes
+   ph.checksum = fchecksum(&pkt->tcp, sendtotlen - sizeof(in_Header));
+   tcpp->checksum =  ~fchecksum(&ph, sizeof(ph));
+
+#ifdef TCP_VERBOSE_DUPACK
+	printf(".p\n");
+#endif
+   g.len1 = sendtotlen + (word)((char __far *)paddr(inp) - g.data1);
+#ifdef TCP_VERBOSE_PENDING
+	if (debug_on > 4)
+	   printf("%s send flags=%c%c%c%c ack=%lu seq=%lu win=%u\n",
+   	   printpend(p),
+         flags & tcp_FlagSYN ? 'S' : '.',
+         flags & tcp_FlagACK ? 'A' : '.',
+         flags & tcp_FlagFIN ? 'F' : '.',
+         flags & tcp_FlagRST ? 'R' : '.',
+         p->acknum,
+         p->seqnum,
+         windowsize);
+   if (pkt_gather(&g)) {
+   	printf("  ...failed, driver busy\n");
+   }
+#else
+   pkt_gather(&g);
+#endif
+}
+
+/*** BeginHeader printsock */
+char * printsock(tcp_Socket * s);
+/*** EndHeader */
+__nodebug char * printsock(tcp_Socket * s)
+{
+	static char buf[60];
+	// Only invoked if TCP_VERBOSE defined for debugging
+   if (!s)
+   	return "TCP:";
+	sprintf(buf, "TCP [%u] %u-%u.%u:%u:",
+   	(word)(MS_TIMER % 10000), s->myport,
+      	(word)s->hisaddr>>8 & 0xFF, (word)s->hisaddr & 0xFF,
+         s->hisport);
+   return buf;
+}
+
+/*** BeginHeader printpend */
+char * printpend(tcp_Pending __far * s);
+/*** EndHeader */
+__nodebug char * printpend(tcp_Pending __far * s)
+{
+	static char buf[60];
+	// Only invoked if TCP_VERBOSE defined for debugging
+   if (!s)
+   	return "TCP:";
+	sprintf(buf, "TCP [%u] %u-%u.%u:%u (PENDING):",
+   	(word)(MS_TIMER % 10000), s->myport,
+      	(word)s->hisaddr>>8 & 0xFF, (word)s->hisaddr & 0xFF,
+         s->hisport);
+   return buf;
+}
+
+/*** BeginHeader tcp_send_keepalive */
+/*
+ *  Force the peer to send us a segment by sending a keep-alive packet:
+ *    <SEQ=SND.UNA-1><ACK=RCV.NXT><CTL=ACK>
+ *  We only do this if there is no unacknowledged data, and we have none
+ *  to send.  If there was, then
+ *  the normal retransmission scheme will keep things going.
+ */
+int tcp_send_keepalive(tcp_Socket * s);
+/*** EndHeader */
+
+_tcp_nodebug int tcp_send_keepalive(tcp_Socket * s)
+{
+	if (s->unacked || s->wr.len)
+		return 0;
+	s->seqnum--;
+#ifdef TCP_VERBOSE
+	if (TCP_D(1, s))
+		printf("%s sending keepalive, seq = %lu\n", printsock(s), s->seqnum);
+#endif
+	tcp_send(s, 80);
+	s->seqnum++;
+	return 1;
+}
+
+/*** BeginHeader tcp_reset_keepalive */
+
+/*
+ * helper function to reset the keepalive timer
+ * This should be called whenever we receive anything from
+ * the remote host, as we then know the host is alive
+ */
+void tcp_reset_keepalive(tcp_Socket *s);
+
+/*** EndHeader */
+
+_tcp_nodebug void tcp_reset_keepalive(tcp_Socket *s)
+{
+#ifdef TCP_VERBOSE
+	if (TCP_D(1, s))
+		printf("%s reset keepalive\n", printsock(s));
+#endif
+  s->keepalive_state = 0;
+  s->kflags &= ~TCP_KF_KEEPALIVE;
+}
+
+/*** BeginHeader tcp_keepalive */
+int tcp_keepalive(tcp_Socket *s, long timeout);
+
+/* START FUNCTION DESCRIPTION ********************************************
+tcp_keepalive                              <TCP.LIB>
+
+SYNTAX: int tcp_keepalive(tcp_Socket *s, long timeout);
+
+KEYWORDS:		tcpip, keepalive
+
+DESCRIPTION: 	Enable or disable TCP keepalives on a specified socket.
+					This socket must already be listening/open. Keepalives
+					will then be sent after "timeout" seconds of inactivity.
+					Keepalives are most useful for server sockets, if it is
+					necessary to ensure that a sever socket does not get
+					tied up with one client if the client crashes.  Set to
+					a reasonable timeout for inactivity on a socket.  The
+					RFC recommends 2 hours, however for small hosts with
+					limited socket resources, a few minutes may be more
+					appropriate.
+
+					After the keepalive is sent, and KEEPALIVE_WAITTIME seconds
+					pass, another keepalive will be sent, in case the first was
+					lost. This will be retried KEEPALIVE_NUMRETRYS times. Both
+					of these macros can be #defined at the top of your program,
+					overriding the defaults of 60 seconds, and 4 retries. Ie:
+
+					#define KEEPALIVE_WAITTIME	75		// 75 second wait
+					#define KEEPALIVE_NUMRETRYS	8	// retry 8 times
+
+PARAMETER1: 	socket
+PARAMETER2: 	period of inactivity, in seconds, before sending a
+					keepalive, or 0 to turn off keepalives.
+
+RETURN VALUE:  0 on success, 1 on error
+
+SEE ALSO:
+
+END DESCRIPTION **********************************************************/
+
+/*** EndHeader */
+
+_tcp_nodebug
+int tcp_keepalive(tcp_Socket *s, long timeout)
+{
+	if (s->ip_type != TCP_PROTO)
+		return 1;
+
+	/* set the keepalive time, in milliseconds */
+	s->keepalive_time = timeout * 1000;
+	if (!timeout)
+		tcp_reset_keepalive(s);
+	return 0;
+}
+
+/**********************************************************************
+ * socket functions
+ **********************************************************************/
+
+/* socket based stuff */
+
+/*** BeginHeader sock_read */
+/* START FUNCTION DESCRIPTION ********************************************
+sock_read                              <TCP.LIB>
+
+SYNTAX: int sock_read( void *s, void far *dp, int len );
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	Read up to len bytes from dp on socket s.  This function
+               will busy wait until either len bytes are read or there
+               is an error condition.  This function is only valid for
+               TCP sockets.  For UDP sockets, use udp_recv or
+               udp_recvfrom.
+
+PARAMETER1: 	socket
+PARAMETER2: 	buffer to store byte that are read or NULL to discard
+PARAMETER3: 	maximum number of bytes to read from the socket
+
+RETURN VALUE:  number of bytes read or -1 if there was an error
+
+SEE ALSO:      sock_fastread, sock_fastwrite, sock_write, sockerr,
+               udp_recv, udp_recvfrom
+
+END DESCRIPTION **********************************************************/
+
+int sock_read( void *_s, void __far *dp, int len );
+/*** EndHeader */
+
+/*
+ * sock_read - read a socket with maximum n bytes
+ *	     - busywaits until buffer is full but calls s->usr_yield
+ *	     - returns count also when connection gets closed
+ */
+_tcp_nodebug
+int sock_read( void *_s, void __far *dp, int len )
+{
+   auto int templen, count;
+	auto tcp_Socket *s;
+
+   count = 0;
+
+#ifdef USING_SSL
+   if (_IS_SSL_SOCK(_s))
+   	s = _TCP_SOCK_OF_SSL(_s);
+   else
+#endif
+   	s = _TCP_SOCK(_s);
+   LOCK_GLOBAL(TCPGlobalLock);
+   LOCK_SOCK(s);
+
+	if (_IS_TCP_SOCK(s)) {
+	   do {
+	      templen = tcp_read(_s, dp, len);
+
+	      if(s->usr_yield)
+	      	s->usr_yield();
+
+	      if(templen < 1 ) {
+	      	UNLOCK_SOCK(s);
+	      	UNLOCK_GLOBAL(TCPGlobalLock);
+	         if(!tcp_tick(s))
+	         	return count;
+	         LOCK_GLOBAL(TCPGlobalLock);
+	         LOCK_SOCK(s);
+	      } else {
+	         count += templen;
+	         if (dp) dp = (char __far *)dp + templen;
+	         len -= templen;
+	      }
+	   } while( len );
+	} else
+		count = -1;
+   UNLOCK_SOCK(s);
+   UNLOCK_GLOBAL(TCPGlobalLock);
+   return count;
+}
+
+/*** BeginHeader sock_fastread */
+/* START FUNCTION DESCRIPTION ********************************************
+sock_fastread                          <TCP.LIB>
+
+SYNTAX: int sock_fastread( void *s, void far *dp, int len );
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	read up to len bytes into dp on socket s.  If possible this
+               function fills the buffer, otherwise only the number of
+               bytes immediately available if any are returned.  This
+					function is only valid for TCP sockets.  For UDP sockets,
+					use udp_recv or udp_recvfrom.
+
+PARAMETER1: 	socket
+PARAMETER2: 	buffer to place byte that are read or NULL to discard
+PARAMETER3: 	maximum number of bytes to write to the buffer
+
+RETURN VALUE:  number of bytes read or -1 if there was an error
+
+SEE ALSO:      sock_read, sock_fastwrite, sock_write, sockerr,
+               udp_recv, udp_recvfrom, sock_aread
+
+END DESCRIPTION **********************************************************/
+int sock_fastread( void *s, void __far *dp, int len );
+/*** EndHeader */
+
+/*
+ * sock_fastread - read a socket with maximum n bytes
+ *	     - does not busywait until buffer is full
+ */
+_tcp_nodebug
+int sock_fastread( void *s, void __far *dp, int len )
+{
+	if (len <= 0)
+		return 0;
+   if (_IS_TCP_SOCK(s)
+#ifdef USING_SSL
+			|| _IS_SSL_SOCK(s)
+#endif
+      )
+      return tcp_read(s, dp, len);
+   else
+   	return -1;
+}
+
+/*** BeginHeader sock_aread */
+/* START FUNCTION DESCRIPTION ********************************************
+sock_aread                          <TCP.LIB>
+
+SYNTAX: int sock_aread( tcp_Socket *s, void far *dp, int len );
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION:   Read exactly len bytes from the socket or, if that amount
+               of data is not yet available, do not read anything.
+               Unlike sock_fastread(), this function will never return
+               less than the requested amount of data.  This can be useful
+               when the application knows that it will be receiving a
+               fixed amount of data, but does not wish to handle the
+               arrival of only part of the data, as it would have to
+               do if sock_fastread() was used.
+
+               len must be less than or equal to the socket receive
+               buffer size, otherwise sock_fastread() must be used.
+
+               This function is only valid for TCP sockets.
+
+PARAMETER1: 	socket
+PARAMETER2: 	buffer to place byte that are read or NULL to discard
+PARAMETER3: 	number of bytes to copy to the buffer
+
+RETURN VALUE:  -1: len is greater than the total socket receive buffer
+                   size, hence this request could never be satisfied in
+                   one call.
+               -2: the socket is closed or closing, but insufficient data
+                   is in the buffer to satisfy the request.
+               -3: len < 0 or the socket parameter was invalid.
+               0:  insufficient data is in the buffer to satisfy the
+                   request, or the len parameter was zero.  Try again
+                   later since the socket is still able to receive data
+                   from the peer.
+               len: the len parameter is returned if there was sufficient
+                   data in the socket buffer to satisfy the request.
+
+SEE ALSO:      sock_fastread, sock_fastwrite,
+               sock_awrite
+
+END DESCRIPTION **********************************************************/
+int sock_aread( void *_s, void __far *dp, int len );
+/*** EndHeader */
+
+_tcp_nodebug int sock_aread( void *_s, void __far *dp, int len )
+{
+	auto tcp_Socket *s;
+
+#ifdef USING_SSL
+   if (_IS_SSL_SOCK(_s))
+   	s = _TCP_SOCK_OF_SSL(_s);
+   else
+#endif
+   	s = _TCP_SOCK(_s);
+   if (!_IS_TCP_SOCK(s) || len < 0)
+   	return -3;
+   if (len > s->app_rd->maxlen)
+   	return -1;
+   if (!len)
+   	return 0;
+   LOCK_GLOBAL(TCPGlobalLock);
+   LOCK_SOCK(s);
+	if (s->app_rd->len >= len)
+		tcp_read(_s, dp, len);
+	else if (s->state & (tcp_StateCLOSWT|tcp_StateCLOSING|
+	                     tcp_StateLASTACK|tcp_StateTIMEWT|tcp_StateCLOSED))
+	   len = -2;
+	else
+		len = 0;
+   UNLOCK_SOCK(s);
+   UNLOCK_GLOBAL(TCPGlobalLock);
+   return len;
+}
+
+/*** BeginHeader sock_xfastread */
+/* START FUNCTION DESCRIPTION ********************************************
+sock_xfastread                          <TCP.LIB>
+
+SYNTAX: int sock_xfastread( void *s, long dp, int len );
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	read up to len bytes from dp on socket s.  If possible this
+               function fills the buffer, otherwise only the number of
+               bytes immediately available if any are returned.  This
+					function is only valid for TCP sockets.  For UDP sockets,
+					use udp_recv or udp_recvfrom.
+
+					This function is identical to sock_fastread(), except
+					that it reads into an extended memory buffer.
+
+					As of DC10.62, this function is deprecated.  Use
+					sock_fastread() with the second parameter cast to
+					void far *.
+
+PARAMETER1: 	socket
+PARAMETER2: 	buffer to place byte that are read, as an xmem address
+               obtained from, for example, xalloc().
+PARAMETER3: 	maximum number of bytes to write to the buffer
+
+RETURN VALUE:  number of bytes read or -1 if there was an error
+
+SEE ALSO:      sock_read, sock_fastwrite, sock_write, sockerr,
+               udp_recv, udp_recvfrom, sock_fastread
+
+END DESCRIPTION **********************************************************/
+int sock_xfastread( void *s, long dp, int len );
+/*** EndHeader */
+
+#warnt "sock_xfastread deprecated: use sock_fastread(s,(void far *)dp,len)"
+
+_tcp_nodebug
+int sock_xfastread( void *s, long dp, int len )
+{
+	if (len <= 0)
+		return 0;
+   if (_IS_TCP_SOCK(s)
+#ifdef USING_SSL
+			|| _IS_SSL_SOCK(s)
+#endif
+      )
+      return tcp_read(s, (void __far *)dp, (word)len);
+   else
+   	return -1;
+}
+
+/*** BeginHeader sock_axread */
+/* START FUNCTION DESCRIPTION ********************************************
+sock_axread                          <TCP.LIB>
+
+SYNTAX: int sock_axread( void *s, long dp, int len );
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION:   Read exactly len bytes from the socket or, if that amount
+               of data is not yet available, do not read anything.
+               This function is identical to sock_aread() except that
+               the destination buffer is in xmem.
+
+					As of DC10.62, this function is deprecated.  Use
+					sock_aread() with the second parameter cast to
+					void far *.
+
+PARAMETER1: 	socket
+PARAMETER2: 	buffer to place byte that are read
+PARAMETER3: 	number of bytes to copy to the buffer
+
+RETURN VALUE:  -1: len is greater than the total socket receive buffer
+                   size, hence this request could never be satisfied in
+                   one call.
+               -2: the socket is closed or closing, but insufficient data
+                   is in the buffer to satisfy the request.
+               -3: len < 0 or the socket parameter was invalid.
+               0:  insufficient data is in the buffer to satisfy the
+                   request, or the len parameter was zero.  Try again
+                   later since the socket is still able to receive data
+                   from the peer.
+               len: the len parameter is returned if there was sufficient
+                   data in the socket buffer to satisfy the request.
+
+SEE ALSO:      sock_fastread, sock_fastwrite,
+               sock_aread, sock_awrite
+
+END DESCRIPTION **********************************************************/
+
+int sock_axread( void *_s, long dp, int len );
+/*** EndHeader */
+
+#warnt "sock_axread deprecated: use sock_aread(s,(void far *)dp,len)"
+
+_tcp_nodebug
+int sock_axread( void *_s, long dp, int len )
+{
+	return sock_aread(_s, (void __far *)dp, len);
+}
+
+/*** BeginHeader sock_chr */
+/* START FUNCTION DESCRIPTION ********************************************
+sock_chr                          <TCP.LIB>
+
+SYNTAX: int sock_chr(void *s, word pos, int range, int chr);
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION:   Scan the data in the socket read buffer, looking for an
+               occurrence of character 'chr'.
+
+PARAMETER1: 	TCP socket
+PARAMETER2: 	Initial position to start searching from.  0 means the first
+               unread character in the socket buffer.
+PARAMETER3: 	Range of positions to search:
+                 -1: search all available data, and set the return code
+                     specially (see below).
+                 0:  search all available data, but do not perform the
+                     data availability test.
+                 positive: search from 'pos' up to but not including
+                     'pos'+'range'.
+PARAMETER4:		Character to search for (LSB only).
+
+RETURN VALUE:  0: character not found in specified range.
+               positive: number of characters to read (using e.g.
+                  sock_fastread) so that the specified character would
+                  be the last character read.
+               -1: this is only set if 'range' parameter is -1.  It means
+                  that the character was not found, and the character could
+                  never be found because the peer has closed the socket
+                  and no more data will be forthcoming.
+
+SEE ALSO:      sock_fastread, sock_aread, sock_cmp
+
+END DESCRIPTION **********************************************************/
+
+int sock_chr(void *_s, word pos, int range, int chr);
+/*** EndHeader */
+
+_tcp_nodebug
+int sock_chr(void *_s, word pos, int range, int chr)
+{
+   auto int p, r;
+   auto tcp_Socket *s;
+
+#ifdef USING_SSL
+	if (_IS_SSL_SOCK(_s))
+		_s = _TCP_SOCK_OF_SSL(_s);
+#endif
+	s = _TCP_SOCK(_s);
+   if (!_IS_TCP_SOCK(s))
+   	return -(range < 0);
+   LOCK_GLOBAL(TCPGlobalLock);
+   LOCK_SOCK(s);
+   if (range <= 0 || range >= s->app_rd->len)
+   	r = s->app_rd->len;
+   else
+   	r = range;
+   p = _tbuf_findchar(s->app_rd, chr, r, pos);
+   if (p < 0 && range < 0 &&
+   	 s->state & (tcp_StateCLOSWT|tcp_StateCLOSING|tcp_StateLASTACK|
+		 tcp_StateTIMEWT|tcp_StateCLOSED))
+   	p = -2;
+   UNLOCK_SOCK(s);
+   UNLOCK_GLOBAL(TCPGlobalLock);
+   return p+1;
+}
+
+/*** BeginHeader sock_cmp */
+/* START FUNCTION DESCRIPTION ********************************************
+sock_cmp                          <TCP.LIB>
+
+SYNTAX: int sock_cmp(void *s, word pos, int range,
+                     void far * mem, int far * len);
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION:   Scan the data in the socket read buffer, looking for a
+               binary character string.
+
+               A partial match at the end of the available socket data
+               may be returned if the socket is still able to accept
+               data from the peer.
+
+               To determine a full match, make sure that *len on return
+               is equal to the desired search string length.
+
+PARAMETER1: 	TCP socket
+PARAMETER2: 	Initial position to start searching from.  0 means the first
+               unread character in the socket buffer.
+PARAMETER3: 	Range of positions to search:
+                 -1: search all available data, and set the return code
+                     specially (see below).
+                 0:  search all available data, but do not perform the
+                     data availability test.
+                 positive: search from 'pos' up to but not including
+                     'pos'+'range'.  This refers to the first char of the
+                     search string.
+PARAMETER4:		Pointer to first character of string to search for.
+PARAMETER5:		On entry to function: *len = length of string to search for.
+               On return from function: *len will be set to the length
+                  of the search string which was matched.  This may be less
+                  than the entry value only if a partial match of the string
+                  was found at the end of the available socket data, and
+                  the socket is still able to receive more data.
+
+
+RETURN VALUE:  0: string not found in specified range.
+               positive: number of characters to read (using e.g.
+                  sock_fastread) so that the FIRST character of the search
+                  string which matched would be the last character read.
+               -1: this is only set if 'range' parameter is -1.  It means
+                  that the string was not found, and the string could
+                  never be found because the peer has closed the socket
+                  and no more data will be forthcoming, or the search
+                  string is larger than the socket receive buffer.
+               other negative: this is only set if 'range' parameter is -1.
+                  It means that the string was not found, however the
+                  application must read at least some data from the read
+                  buffer before the string could be found, since the peer is
+                  currently unable to send data to this socket buffer owing
+                  to window restriction.  The actual return value, negated,
+                  is the amount of data which should be read before
+                  searching again.  If there was a partial match, this will
+                  place the first character of the matching string at the
+                  start of the buffer.  Otherwise, it will equal the total
+                  amount of data in the buffer.
+
+SEE ALSO:      sock_fastread, sock_aread, sock_chr
+
+END DESCRIPTION **********************************************************/
+int sock_cmp(void *_s, word pos, int range,
+                     void __far * mem, int __far * len);
+/*** EndHeader */
+
+_tcp_nodebug
+int sock_cmp(void *_s, word pos, int range,
+	void __far * mem, int __far * len)
+{
+	auto int rc, r, ilen, window;
+	auto tcp_Socket *s;
+
+	ilen = *len;
+#ifdef USING_SSL
+	if (_IS_SSL_SOCK(_s))
+		_s = _TCP_SOCK_OF_SSL(_s);
+#endif
+	s = _TCP_SOCK(_s);
+   if (!_IS_TCP_SOCK(s))
+   	return -(range < 0);
+   LOCK_GLOBAL(TCPGlobalLock);
+   LOCK_SOCK(s);
+   if (range <= 0 || range >= s->app_rd->len)
+   	r = s->app_rd->len;
+   else
+   	r = range;
+   window = s->app_rd->maxlen - s->app_rd->len;
+	rc = _tbuf_findmem(s->app_rd, (char __far *)mem, (word __far *)len, r, pos);
+   if (rc < 0 && range < 0 &&
+   	 s->state & (tcp_StateCLOSWT|tcp_StateCLOSING|tcp_StateLASTACK|tcp_StateTIMEWT|tcp_StateCLOSED))
+   	rc = -1;
+   else if (rc < 0) {
+   	if (range < 0 && window < ilen)
+   		// Data needs to be be read to open window.
+   		rc = -s->app_rd->len;
+   	else
+   		rc = 0;
+   }
+   else {
+   	if (range < 0 && *len < ilen && window < ilen - *len) {
+   		rc = -rc;
+   		if (rc > -1)
+   			// match in 1st or 2nd char!  Cannot open window, so give up.
+   			rc = -1;
+   	}
+   	else
+   		// increment to actually include first char of match (and distinguish from 0 return)
+   		++rc;
+   }
+   UNLOCK_SOCK(s);
+   UNLOCK_GLOBAL(TCPGlobalLock);
+   return rc;
+}
+
+/*** BeginHeader sock_write */
+/* START FUNCTION DESCRIPTION ********************************************
+sock_write                             <TCP.LIB>
+
+SYNTAX: int sock_write( void *s, const void far *dp, int len );
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	Write up to len bytes from dp on socket s.  This function
+               busy waits until either the buffer is completely written or
+               a socket error occurs.  This function is only valid for TCP
+               sockets.  For UDP sockets, use udp_send or udp_sendto.
+
+PARAMETER1: 	socket
+PARAMETER2: 	buffer containing bytes to send
+PARAMETER3: 	maximum number of bytes to write to the socket
+
+RETURN VALUE:  number of bytes written or -1 if there was an error
+
+SEE ALSO:      sock_read, sock_fastwrite, sock_fastread, sockerr,
+               sock_flush, sock_flushnext, udp_send,
+               udp_sendto
+
+END DESCRIPTION **********************************************************/
+
+int sock_write( void *_s, const void __far *dp, int len );
+/*** EndHeader */
+
+/*
+ * sock_write - writes data and returns length written
+ *	      - does not perform flush
+ *	      - repeatedly calls s->usr_yield
+ */
+
+_tcp_nodebug
+int sock_write( void *_s, const void __far *dp, int len )
+{
+   auto int offset, oldlen, rc;
+   auto tcp_Socket *s;
+
+   oldlen = len;
+   offset = 0;
+
+#ifdef USING_SSL
+	if (_IS_SSL_SOCK(_s))
+		s = _TCP_SOCK_OF_SSL(_s);
+	else
+#endif
+	s = _TCP_SOCK(_s);
+   if(!_IS_TCP_SOCK(s) || len < 0)
+   	return -1;
+
+   LOCK_GLOBAL(TCPGlobalLock);
+   LOCK_SOCK(s);
+
+   while (len > 0) {
+      offset += (rc = tcp_write(_s, (char __far *)dp + offset, len));
+      len = oldlen - offset;
+      if (len > 0)
+         if (s->usr_yield)
+         	s->usr_yield();
+
+      UNLOCK_SOCK(s);
+      UNLOCK_GLOBAL(TCPGlobalLock);
+      if (!tcp_tick(s) || rc < 0)
+      	return -1;
+      LOCK_GLOBAL(TCPGlobalLock);
+      LOCK_SOCK(s);
+   }
+   UNLOCK_SOCK(s);
+   UNLOCK_GLOBAL(TCPGlobalLock);
+   return oldlen;
+}
+
+/*** BeginHeader sock_fastwrite */
+/* START FUNCTION DESCRIPTION ********************************************
+sock_fastwrite                         <TCP.LIB>
+
+SYNTAX: int sock_fastwrite( void *s, const void far *dp, int len );
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	write up to len bytes from dp on socket s.  This function
+               writes as many bytes as possible to the socket and returns
+               that number.  This function is only valid for TCP sockets.
+               For UDP sockets, use udp_send or udp_sendto.
+
+PARAMETER1: 	socket
+PARAMETER2: 	buffer containing data to be written
+PARAMETER3: 	maximum number of bytes to write to the socket
+
+RETURN VALUE:  number of bytes written or -1 if there was an error
+
+SEE ALSO:      sock_write, sock_fastread, sock_read, sockerr,
+               sock_flush, sock_flushnext, udp_send,
+               udp_sendto
+
+END DESCRIPTION **********************************************************/
+
+int sock_fastwrite( void *s, const void __far *dp, int len );
+/*** EndHeader */
+
+_tcp_nodebug
+int sock_fastwrite( void *s, const void __far *dp, int len )
+{
+	auto int rc;
+
+   if (_IS_TCP_SOCK(s)
+#ifdef USING_SSL
+			|| _IS_SSL_SOCK(s)
+#endif
+       ) {
+	   LOCK_GLOBAL(TCPGlobalLock);
+   	LOCK_SOCK(s);
+   	rc = tcp_write(s, dp, len);
+   	UNLOCK_SOCK(s);
+	   UNLOCK_GLOBAL(TCPGlobalLock);
+   	return rc;
+  	}
+   else
+   	return -1;
+}
+
+/*** BeginHeader sock_awrite */
+/* START FUNCTION DESCRIPTION ********************************************
+sock_awrite                          <TCP.LIB>
+
+SYNTAX: int sock_awrite( void *s, const void far *dp, int len );
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION:   Write exactly len bytes to the socket or, if that amount
+               of data can not be written, do not write anything.
+               Unlike sock_fastwrite(), this function will never return
+               less than the requested amount of data.  This can be useful
+               when the application needs to write a fixed amount of
+               data, but does not wish to handle the transmission of only
+               part of the data, as it would have to do if sock_fastwrite()
+               was used.
+
+               len must be less than or equal to the socket transmit
+               buffer size, otherwise sock_fastwrite() must be used.
+
+               This function is only valid for TCP sockets.
+
+PARAMETER1: 	socket
+PARAMETER2: 	buffer containing data to write
+PARAMETER3: 	number of bytes to write to the socket buffer
+
+RETURN VALUE:  -1: len is greater than the total socket transmit buffer
+                   size, hence this request could never be satisfied in
+                   one call.
+               -2: the socket has been closed for further transmissions
+                   e.g. because sock_close() has already been called.
+               -3: len < 0 or the socket parameter was invalid.
+               0:  there is insufficient free space in the transmit buffer
+                   to satisfy the request, or the len parameter was zero.
+                   Try again later since the peer will eventually
+                   acknowledge the receipt of previous data, freeing up
+                   transmit buffer space.
+               len: the len parameter is returned if there was sufficient
+                   space in the socket transmit buffer to satisfy the
+                   request.
+
+SEE ALSO:      sock_fastread, sock_fastwrite,
+               sock_aread
+
+END DESCRIPTION **********************************************************/
+
+int sock_awrite( void *_s, const void __far *dp, int len );
+/*** EndHeader */
+
+_tcp_nodebug int sock_awrite( void *_s, const void __far *dp, int len )
+{
+	auto tcp_Socket *s;
+
+   if (len < 0)
+   	return -3;
+#ifdef USING_SSL
+	if (_IS_SSL_SOCK(_s))
+		s = _TCP_SOCK_OF_SSL(_s);
+	else
+#endif
+	s = _TCP_SOCK(_s);
+   LOCK_GLOBAL(TCPGlobalLock);
+   LOCK_SOCK(s);
+   if (_IS_TCP_SOCK(s)) {
+	   if (len > s->app_wr->maxlen)
+   		len = -1;
+	   else if (!sock_writable(_s))
+	   len = -2;
+	   else if (s->app_wr->maxlen - s->app_wr->len >= len)
+	      tcp_write(_s, dp, len);
+	else
+		len = 0;
+	}
+	else
+		len = -3;
+   UNLOCK_SOCK(s);
+   UNLOCK_GLOBAL(TCPGlobalLock);
+   return len;
+}
+
+/*** BeginHeader sock_xfastwrite */
+/* START FUNCTION DESCRIPTION ********************************************
+sock_xfastwrite                         <TCP.LIB>
+
+SYNTAX: int sock_xfastwrite( void *s, long dp, int len );
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	write up to len bytes from dp on socket s.  This function
+               writes as many bytes possible to the socket and returns
+               that number of bytes.  This function is only valid for TCP
+               sockets.  For UDP sockets, use udp_send or udp_sendto.
+
+               This function is identical to sock_fastwrite(), except
+               that an extended memory data source is used.
+
+					As of DC10.62, this function is deprecated.  Use
+					sock_fastwrite() with the second parameter cast to
+					void far *.
+
+PARAMETER1: 	socket
+PARAMETER2: 	buffer containing data to be written, as an xmem address
+               obtained from, for example, xalloc().
+PARAMETER3: 	maximum number of bytes to write to the socket
+
+RETURN VALUE:  number of bytes written or -1 if there was an error
+
+SEE ALSO:      sock_write, sock_fastread, sock_read, sockerr,
+               sock_flush, sock_flushnext, udp_send,
+               udp_sendto, sock_fastwrite.
+
+END DESCRIPTION **********************************************************/
+
+int sock_xfastwrite( void *s, long dp, int len );
+/*** EndHeader */
+
+#warnt "sock_xfastwrite deprecated: use sock_fastwrite(s,(void far *)dp,len)"
+
+_tcp_nodebug
+int sock_xfastwrite( void *s, long dp, int len )
+{
+	auto int rc;
+
+	if (len <= 0)
+		return 0;
+   if (_IS_TCP_SOCK(s)
+#ifdef USING_SSL
+			|| _IS_SSL_SOCK(s)
+#endif
+       ) {
+	   LOCK_GLOBAL(TCPGlobalLock);
+   	LOCK_SOCK(s);
+   	rc = tcp_write(s, (void __far *)dp, (int)len);
+   	UNLOCK_SOCK(s);
+	   UNLOCK_GLOBAL(TCPGlobalLock);
+		return rc;
+	}
+   else
+   	return -1;
+}
+
+/*** BeginHeader sock_axwrite */
+/* START FUNCTION DESCRIPTION ********************************************
+sock_axwrite                          <TCP.LIB>
+
+SYNTAX: int sock_axwrite( void *s, long dp, int len );
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION:   Write exactly len bytes to the socket or, if that amount
+               of data can not be written, do not write anything.
+               This function is identical to sock_awrite() except that
+               the source buffer is in xmem.
+
+					As of DC10.62, this function is deprecated.  Use
+					sock_awrite() with the second parameter cast to
+					void far *.
+
+PARAMETER1: 	socket
+PARAMETER2: 	buffer containing data to write
+PARAMETER3: 	number of bytes to write to the socket buffer
+
+RETURN VALUE:  -1: len is greater than the total socket transmit buffer
+                   size, hence this request could never be satisfied in
+                   one call.
+               -2: the socket has been closed for further transmissions
+                   e.g. because sock_close() has already been called.
+               -3: len < 0 or the socket parameter was invalid.
+               0:  there is insufficient free space in the transmit buffer
+                   to satisfy the request, or the len parameter was zero.
+                   Try again later since the peer will eventually
+                   acknowledge the receipt of previous data, freeing up
+                   transmit buffer space.
+               len: the len parameter is returned if there was sufficient
+                   space in the socket transmit buffer to satisfy the
+                   request.
+
+SEE ALSO:      sock_fastread, sock_fastwrite,
+               sock_aread, sock_awrite
+
+END DESCRIPTION **********************************************************/
+
+int sock_axwrite( void *_s, long dp, int len );
+/*** EndHeader */
+
+#warnt "sock_axwrite deprecated: use sock_awrite(s,(void far *)dp,len)"
+
+_tcp_nodebug
+int sock_axwrite( void *_s, long dp, int len )
+{
+	return sock_awrite(_s, (void __far *)dp, len);
+}
+
+/*** BeginHeader sock_noflush */
+/* START FUNCTION DESCRIPTION ********************************************
+sock_noflush                             <TCP.LIB>
+
+SYNTAX: void sock_noflush( void *s );
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	this function prevents the next write to the socket from
+               transmitting a data segment.  It needs to be issued
+               before each write function in which it is desired not
+               to transmit.  It can be used to make more efficient use
+               of network bandwidth when the Nagle algorithm is turned
+               off for the socket.  If Nagle is on, then there is not
+               much benefit to using this function.
+
+PARAMETER1: 	TCP socket
+
+SEE ALSO:      sock_flushnext, sock_fastwrite, sock_write, sock_flush
+
+END DESCRIPTION **********************************************************/
+
+void sock_noflush( void *s );
+/*** EndHeader */
+
+_tcp_nodebug
+void sock_noflush( void *s )
+{
+	LOCK_SOCK(s);
+#ifdef USING_SSL
+	if (_IS_SSL_SOCK(s))
+		s = _TCP_SOCK_OF_SSL(s);
+#endif
+   if (_IS_TCP_SOCK(s))
+      _TCP_FIELD(s, sock_mode) |= TCP_LOCAL ;
+   UNLOCK_SOCK(s);
+}
+
+/*** BeginHeader sock_flush */
+
+/* START FUNCTION DESCRIPTION ********************************************
+sock_flush                             <TCP.LIB>
+
+SYNTAX: void sock_flush( void *s );
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	this function flushes the unwritten portion of the tcp
+               buffer to the network.  No guarentee is given that the data
+               was actually delivered.
+
+PARAMETER1: 	socket
+
+SEE ALSO:      sock_flushnext, sock_fastwrite, sock_write, sockerr,
+               sock_noflush
+
+END DESCRIPTION **********************************************************/
+
+void sock_flush( void *s );
+/*** EndHeader */
+
+_tcp_nodebug
+void sock_flush( void *s )
+{
+	LOCK_SOCK(s);
+#ifdef USING_SSL
+	if (_IS_SSL_SOCK(s))
+		s = _TCP_SOCK_OF_SSL(s);
+#endif
+   if (_IS_TCP_SOCK(s)) {
+      _TCP_FIELD(s, sock_mode) &= ~TCP_LOCAL;
+      tcp_Flush(_TCP_SOCK(s));
+   }
+   UNLOCK_SOCK(s);
+}
+
+/*** BeginHeader sock_flushnext */
+/* START FUNCTION DESCRIPTION ********************************************
+sock_flushnext                         <TCP.LIB>
+
+SYNTAX: void sock_flushnext( void *s );
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	this function will flush the unwritten portion of the tcp
+               buffer to the network, on the next "write" call.
+
+PARAMETER1: 	socket
+
+SEE ALSO:      sock_flush, sock_fastwrite, sock_write, sockerr,
+               sock_noflush
+
+END DESCRIPTION **********************************************************/
+
+void sock_flushnext( void* s);
+/*** EndHeader */
+
+/*
+ * sock_flushnext - cause next transmission to have a flush
+ */
+_tcp_nodebug
+void sock_flushnext( void* s)
+{
+	LOCK_SOCK(s);
+#ifdef USING_SSL
+	if (_IS_SSL_SOCK(s))
+		s = _TCP_SOCK_OF_SSL(s);
+#endif
+   if (_IS_TCP_SOCK(s))
+      _TCP_FIELD(s, sock_mode) &= ~TCP_LOCAL ;
+   UNLOCK_SOCK(s);
+}
+
+/*** BeginHeader sock_putc */
+/* START FUNCTION DESCRIPTION ********************************************
+sock_putc                              <TCP.LIB>
+
+SYNTAX: byte sock_putc( void* s, byte c );
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	A single character is placed on the output buffer.  In the
+               case of a newline character, the buffer is flushed as
+               described under sock_flushnext.  No other ASCII character
+               expansion is performed.  This function is only valid for
+               TCP sockets.
+
+               This function may block like sock_write().
+
+PARAMETER1: 	socket
+PARAMETER1: 	character to send
+
+RETURN VALUE:	c
+
+SEE ALSO:      sock_read, sock_write, sock_fastread, sock_fastwrite,
+					sock_mode
+
+END DESCRIPTION **********************************************************/
+
+byte sock_putc( void *s, byte c );
+/*** EndHeader */
+
+/*
+ * sock_putc - put a character
+ *	     - no expansion but flushes on '\n'
+ *	     - returns character
+ */
+_tcp_nodebug byte sock_putc( void *s, byte c )
+{
+   if (c == '\n')
+      sock_flushnext(s);
+   sock_write(s, &c, 1);
+   return c;
+}
+
+/*** BeginHeader sock_getc */
+
+/* START FUNCTION DESCRIPTION ********************************************
+sock_getc                              <TCP.LIB>
+
+SYNTAX: int sock_getc( void *s );
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	get the next character from the socket.  This function is
+					only valid for TCP sockets.  NOTE:  this function blocks.
+
+PARAMETER1: 	socket
+
+RETURN VALUE:  character read or -1 if there was an error
+
+SEE ALSO:      sock_putc, sock_gets, sock_puts, sock_read, sock_write
+
+END DESCRIPTION **********************************************************/
+
+int sock_getc( void *s );
+/*** EndHeader */
+
+_tcp_nodebug int sock_getc( void *s )
+{
+   auto byte ch;
+   return sock_read(s, &ch, 1) < 1 ? EOF : ch;
+}
+
+/*** BeginHeader sock_puts */
+/* START FUNCTION DESCRIPTION ********************************************
+sock_puts                              <TCP.LIB>
+
+SYNTAX: int sock_puts( void *s, const byte* dp );
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION:   writes a string to a socket.  If the socket is in ASCII
+               mode, CR and LF are appended to the string.  In binary
+               mode, the string is sent as-is.  This function is only
+               valid for TCP sockets.
+
+PARAMETER1: 	socket
+PARAMETER2: 	buffer to read the string from
+
+RETURN VALUE:  >= 0  length of string in dp
+					-1		error
+
+SEE ALSO:      sock_gets, sock_putc, sock_getc, sock_read, sock_write
+
+END DESCRIPTION **********************************************************/
+
+int sock_puts( void *_s, const byte *dp );
+/*** EndHeader */
+
+/*
+ * sock_puts - does not append carriage return in binary mode
+ *	     - returns length
+ */
+_tcp_nodebug
+int sock_puts( void *_s, const byte *dp )
+{
+   auto int len;
+   auto tcp_Socket *s;
+
+   len = strlen( dp );
+
+   LOCK_SOCK(s);
+#ifdef USING_SSL
+	if (_IS_SSL_SOCK(_s))
+		s = _TCP_SOCK_OF_SSL(_s);
+	else
+#endif
+	s = _TCP_SOCK(_s);
+	if (_IS_TCP_SOCK(s)) {
+   	if(s->sock_mode & TCP_MODE_ASCII ) {
+        	s->sock_mode |= TCP_LOCAL;
+      	if (len)
+      		sock_write(_s, dp, len);
+        	s->sock_mode &= ~TCP_LOCAL;
+      	sock_write(_s, "\r\n", 2);
+   	} else {
+        	s->sock_mode &= ~TCP_LOCAL;
+      	sock_write(_s, dp, len);
+   	}
+   } else
+   	len = -1;
+   UNLOCK_SOCK(s);
+   return len;
+}
+
+/*** BeginHeader sock_update */
+void sock_update( tcp_Socket *s );
+/*** EndHeader */
+
+/*
+ * sock_update - update this socket window size to the peer
+ */
+_tcp_nodebug void sock_update( tcp_Socket *s )
+{
+	auto word realwindow;
+   // Caller must have socket locks
+
+   // Update window if peer has not yet sent FIN.  Only update if at
+   // least one MSS more available than last advertised.  Lazy update (sendsoon)
+   // if the previous window was at least one mss, because peer is not hanging
+   // out for more window.
+#if USING_VSPD
+	if (s->hisaddr == VSPD_LOCALHOST)
+   	return;	// Nothing to do for VSPD sockets (no windowing)
+#endif
+   if (s->state & (tcp_StateESTAB | tcp_StateFINWT1 | tcp_StateFINWT2)) {
+      realwindow = _tbuf_remain(&s->rd);
+      if (realwindow >= s->advwindow + s->mss || s->advwindow < 0)
+         if (s->advwindow > s->mss)
+            tcp_sendsoon(s, TCP_LAZYUPD, 85);
+         else
+            tcp_send(s, 86);
+   }
+}
+
+
+/*** BeginHeader sock_stringready */
+int sock_stringready(void *s, word * delim, word maxlen);
+// LSB reserved for "custom delimiter char".
+#define DELIM_NULL	0x0100	// Allow null character delimiter (like C strings)
+#define DELIM_CR		0x0200	// Bare carriage return \r delimiter
+#define DELIM_LF		0x0400	// Bare line feed \n delimiter
+#define DELIM_CRLF	0x0800	// \r\n delimiter (standard network line terminator)
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+sock_stringready                        <NET.LIB>
+
+SYNTAX: int sock_stringready(tcp_Socket *s, word * delim, word maxlen);
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION:	This function determines how many bytes would be returned
+					by a call to sock_gets().  It is similar (but superior) to
+					sock_bytesready() called with a TCP socket in ASCII mode,
+					except that the type of delimiter (if any) is both controllable
+					and queryable based on the "delim" parameter.  Also, the
+					return code is always non-negative except in case of error.
+
+					0 is returned if the string that is buffered is incomplete
+					(no line terminating character has been read.)  A string is
+					considered to be complete when any of the following:
+					   * there is more data in the buffer than maxlen.
+ 						* the buffer is so full as to preclude the peer sending
+ 						   more data until we have read something from the buffer.
+						* the socket is no longer readable as defined by
+						   sock_readable() - this means the peer closed the
+						   socket for further writing, thus whatever data is in
+						   the buffer will never be terminated.
+						* a complete string is ready, with one of the specified
+						   delimiters.  Note that the length of the
+						   delimiter (1 or 2) is included in the return
+						   value.
+					The above cases can be distinguished by examining the result
+					returned at *delim, which will be 0 in the first three cases,
+					or set to indicate the type of delimiter seen, from which the
+					number of characters in the delimiter may be deduced.
+
+PARAMETER1: 	socket
+PARAMETER2: 	pointer to delimiter set.  This is an in-out parameter.
+               Before calling, this is set to the bitwise OR of the following
+               values:
+               	DELIM_NULL  - Allow null character delimiter (like C strings)
+						DELIM_CR    - Bare carriage-return \r delimiter
+						DELIM_LF    - Bare line-feed \n delimiter
+						DELIM_CRLF  - \r\n delimiter (standard network line
+						              terminator)
+					On return, the value will be set to 0 if no delimiter was found,
+					or one of the possible values above will be retained if that
+					type of delimiter was found.
+
+					In the case that more than one delimiter is acceptable, the
+					first one encountered in the buffer will be used.
+					If both DELIM_CR and DELIM_CRLF are specified, then a CR
+					delimiter is accepted as such only if not followed by a LF.
+					Thus, a CR is not accepted as a delimiter if it happens to
+					be the last character in the buffer (since it may be followed
+					by a LF in data not yet received).
+PARAMETER3: 	Maximum length of string.  If the string is larger than this
+					in the socket buffer, then this function will return this
+					parameter value.  For example, if the buffer contains
+					  'ABC\r\n'  (5 bytes)
+					but maxlen was passed as 4, then the return value will
+					be 4.  If the buffer contained
+					  'A\r\n' (3 bytes)
+					and maxlen was 4, then the return value would be 3.
+					Hint: pass 0 for this parameter to bypass this length test.
+
+RETURN VALUE:	-EEOF: no data in buffer, and socket not readable.
+					other negative: error such as invalid socket.
+					0		no string yet available in buffer, however socket is
+                     still readable.
+					> 0	A non-empty string is available, with this length
+					      including the delimiter (if any).
+
+SEE ALSO:      sock_bytesready, sock_gets
+
+END DESCRIPTION **********************************************************/
+
+_tcp_nodebug
+int sock_stringready(void *s, word * delim, word maxlen)
+{
+	auto unsigned int linelen, linelen0, linelenr, linelenn;
+   auto tcp_Socket* tcp_sock;
+   auto int rdable, retval;
+   auto word d;
+
+   d = *delim;
+   *delim = 0;
+
+   LOCK_SOCK(s);
+
+   rdable = sock_readable(s);
+   if (rdable) {
+	   retval = 0; // assume insufficient data
+
+	   switch (_SOCK_TYPE(s)) {
+	   default:
+	   	retval = -EINVAL;
+	   	break;
+	#ifdef USING_SSL
+	   case SSL_PROTO:
+	      tcp_sock = _TCP_SOCK_OF_SSL(s);
+	      goto _tcp_proc;
+	#endif
+	   case TCP_PROTO:
+	      tcp_sock = _TCP_SOCK(s);
+	   _tcp_proc:
+	      // If readable, but currently no data available
+	      if (rdable == 1)
+	         break;
+
+	      // At least some data to read...
+			if (d & (DELIM_LF | DELIM_CRLF))
+         	linelenn = sock_chr(tcp_sock, 0, 0, '\n');
+         else
+         	linelenn = 0;
+			if (d & DELIM_NULL)
+         	linelen0 = sock_chr(tcp_sock, 0, 0, '\0');
+         else
+         	linelen0 = 0;
+
+			if (d & (DELIM_CR | DELIM_CRLF)) {
+         	linelenr = sock_chr(tcp_sock, 0, 0, '\r');
+	         if (d & DELIM_CRLF && linelenr == tcp_sock->app_rd->len)
+	         	// don't count if \r exactly at end of buffer, and allows \r\n
+   	         linelenr = 0;
+      }
+         else
+         	linelenr = 0;
+
+         // OK, find minimum of all
+         if (!linelenn && !linelenr && !linelen0) {
+            // not yet available.  Can get more?
+            if (0 < (int)maxlen && maxlen < (word)rdable)
+            	retval = maxlen;
+            else if (tcp_sock->state & (tcp_StateCLOSWT|tcp_StateCLOSING|tcp_StateLASTACK|
+                                        tcp_StateTIMEWT|tcp_StateCLOSED)
+                || tcp_sock->advwindow < 1)
+               // Cannot get more
+               retval = tcp_sock->app_rd->len;
+            break;
+         }
+         // Make non-existent seem to be furthest away
+         if (!linelenn) linelenn = -1;
+         if (!linelen0) linelen0 = -1;
+         if (!linelenr) linelenr = -1;
+         linelen = linelenr < linelen0 ? linelenr : linelen0;
+         // linelenn is set for DELIM_CRLF, but only consider linelenn if
+         // DELIM_LF is valid
+         if (d & DELIM_LF)
+            linelen = linelen < linelenn ? linelen : linelenn;
+
+         retval = linelen;
+         if (0 < (int)maxlen && maxlen < linelen)
+         	retval = maxlen;
+         else if (d & DELIM_CRLF && linelen == linelenr && linelenn == linelenr + 1) {
+         	*delim = DELIM_CRLF;
+         	++retval;
+    		}
+         else if (linelen == linelenr)
+         	*delim = DELIM_CR;
+         else if (linelen == linelenn)
+         	*delim = DELIM_LF;
+         else
+         	*delim = DELIM_NULL;
+         break;
+      }
+   }
+	else
+		retval = -EEOF;
+
+   	UNLOCK_SOCK(s);
+	return retval;
+
+   }
+
+/*** BeginHeader sock_gets */
+
+/* START FUNCTION DESCRIPTION ********************************************
+sock_gets                              <TCP.LIB>
+
+SYNTAX: int sock_gets( tcp_Socket *s, char far * dp, int len );
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	read a string from a socket and replace the CR or LF with
+               a '\0'.  If the string is longer than len, the string is
+               null terminated and any remaining characters will be
+               returned on the next sock_gets() call.  This function is
+               only valid for TCP sockets.
+
+PARAMETER1: 	socket
+PARAMETER2: 	buffer to get the string into
+PARAMETER3: 	the maximum length of buffer
+
+RETURN VALUE:  0   if buffer is empty, or
+					    if no '\r' or '\n' is read, but buffer had room *and*
+					    the connection can get more data!
+					> 0 is the length of the string
+					negative:  error code:
+						-EINVAL: socket invalid
+						other: return code from sock_stringready(), typically
+						  -EEOF: socket closed for further reading
+
+SEE ALSO:      sock_puts, sock_putc, sock_getc, sock_read, sock_write,
+					sock_stringready
+
+END DESCRIPTION **********************************************************/
+
+int sock_gets( void *_s, char __far *dp, int n );
+/*** EndHeader */
+
+_tcp_nodebug
+int sock_gets( void *_s, char __far *dp, int n )
+{
+	auto int sr;
+	auto word delim, len;
+   auto tcp_Socket* tcp_sock;
+
+   switch (_SOCK_TYPE(_s)) {
+   default:
+      return -EINVAL;
+#ifdef USING_SSL
+   case SSL_PROTO:
+      tcp_sock = _TCP_SOCK_OF_SSL(_s);
+      break;
+#endif
+   case TCP_PROTO:
+      tcp_sock = _TCP_SOCK(_s);
+      break;
+   }
+
+	delim = DELIM_NULL | DELIM_LF | DELIM_CR | DELIM_CRLF;
+	sr = sock_stringready(tcp_sock, &delim, n-1);
+	if (sr < 0)
+		return sr;
+	if (sr == 0)
+		return 0;
+	len = sr;
+	if (delim) {
+		--len;
+		if (delim == DELIM_CRLF)
+			--len;
+   }
+   _tbuf_xread(dp, tcp_sock->app_rd, 0, len);	// copy everything except delims
+  	dp[len] = 0;                						// terminate new string
+	_tbuf_delete(tcp_sock->app_rd, sr);				// delete all incl delims
+
+	return len;
+
+}
+
+/*** BeginHeader sock_established */
+
+/* START FUNCTION DESCRIPTION ********************************************
+sock_established                       <TCP.LIB>
+
+SYNTAX: int sock_established(void* s)
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	return true if the socket is currently active (technically, in
+               either the ESTABLISHED or CLOSE_WAIT states).  It is not
+               enough to spin on this after a listen because it is
+               possible for the socket to be opened, written to and closed
+               between two checks.  sock_bytesready can be called with
+               sock_established to handle this case.  For new code,
+               please see sock_waiting() for a more robust method of
+               checking socket status after an initial sock_listen().
+
+PARAMETER1: 	socket
+
+RETURN VALUE:  0 not established
+               1 established
+
+SEE ALSO:      sock_waiting, sock_bytesready, sock_state
+
+END DESCRIPTION **********************************************************/
+
+int sock_established( void *s );
+/*** EndHeader */
+
+_tcp_nodebug int sock_established( void *s )
+{
+   switch (_SOCK_TYPE(s)) {
+#ifndef DISABLE_UDP
+   case UDP_PROTO :
+      return 1;
+#endif
+#ifdef USING_SSL
+	case SSL_PROTO:
+      return _TCP_FIELD(_TCP_SOCK_OF_SSL(s), state) & (tcp_StateESTAB | tcp_StateCLOSWT) &&
+             (_SSL_FIELD(s, cur_state) == SSL_STATE_APP_DATA ||
+              _SSL_FIELD(s, cur_state) == SSL_STATE_WAIT_CLOSE ||
+              _SSL_FIELD(s, cur_state) == SSL_STATE_HALF_CLOSED ||
+              _SSL_FIELD(s, cur_state) == SSL_STATE_DRAINING);
+
+#endif
+#ifndef DISABLE_TCP
+   case TCP_PROTO :
+      return (_TCP_FIELD(s, state) & (tcp_StateESTAB | tcp_StateCLOSWT)) != 0;
+#endif
+   }
+   return 0;
+}
+
+/*** BeginHeader sock_sturdy */
+void sock_sturdy( tcp_Socket *s, int level );
+/*** EndHeader */
+
+_tcp_nodebug void sock_sturdy( tcp_Socket *s, int level )
+{
+	LOCK_SOCK(s);
+   s->rigid = level;
+   if( s->rigid < s->stress ) tcp_abort( s );
+   UNLOCK_SOCK(s);
+}
+
+/*** BeginHeader tcp_pendingpoolget, tcp_pendingpoolreturn */
+tcp_Pending __far *tcp_pendingpoolget();
+void tcp_pendingpoolreturn(tcp_Pending __far *p);
+/*** EndHeader */
+
+_tcp_nodebug tcp_Pending __far *tcp_pendingpoolget()
+{
+	auto int temp;
+
+	if(tcp_pendingbuffer_head == tcp_pendingbuffer_tail)
+		//buffer is empty
+		return NULL;
+	else {
+		temp = tcp_pendingbuffer_head;
+		tcp_pendingbuffer_head++;
+		if (tcp_pendingbuffer_head > TCP_MAXPENDING)
+			tcp_pendingbuffer_head = 0;
+		return tcp_pendingbuffer[temp];
+	}
+}
+
+_tcp_nodebug void tcp_pendingpoolreturn(tcp_Pending __far *p)
+{
+	auto int newtail;
+
+	newtail = tcp_pendingbuffer_tail + 1;
+	if (newtail > TCP_MAXPENDING)
+		newtail = 0;
+	if(newtail == tcp_pendingbuffer_head)
+		//buffer is full, that shouldn't happen
+		return;
+	else {
+		tcp_pendingbuffer[tcp_pendingbuffer_tail] = p;
+		tcp_pendingbuffer_tail = newtail;
+	}
+}
+
+/*** BeginHeader sockstate */
+
+/* START FUNCTION DESCRIPTION ********************************************
+sockstate                              <TCP.LIB>
+
+SYNTAX: const char *sockstate( void *s );
+
+KEYWORDS:		tcpip, socket
+
+DESCRIPTION: 	Return a string that gives the current state for a socket.
+
+PARAMETER1: 	socket
+
+RETURN VALUE:  The string which represents the current state of the
+               socket.  These strings should not be modified.
+
+SEE ALSO:      sock_established, sock_bytesready
+
+END DESCRIPTION **********************************************************/
+
+const char *sockstate( void *s );
+/*** EndHeader */
+
+const char *const sock_states[] = {
+   "Listen","ARP res", "SynSent","SynRcvd","Established","FinWait1",
+   "FinWait2","CloseWait","Closing","LastAck","TimeWait","?","??","???","????",
+   "Closed","Bad"
+   };
+
+const char *sockstate( void *s )
+{
+	auto word st;
+	auto int i;
+
+	switch (_SOCK_TYPE(s))
+	{
+#ifndef DISABLE_UDP
+   case UDP_PROTO:
+   	return "UDP Socket";
+#endif
+#ifdef USING_SSL
+   case SSL_PROTO:
+   	s = _TCP_SOCK_OF_SSL(s);
+   	// fall thru to TCP...
+#endif
+#ifndef DISABLE_TCP
+   case TCP_PROTO:
+   	st = ((struct _tcp_socket *)s)->state;
+   	for (i = 0; i < 16; i++) {
+   		if ((st & 1) == 1)
+   			break;
+   		st >>= 1;
+   	}
+   	return sock_states[i];
+#endif
+   default : return "Not a socket";
+   }
+}
+
+
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

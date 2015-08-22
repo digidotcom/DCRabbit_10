@@ -1,0 +1,2891 @@
+/*** BeginHeader */
+#ifndef __FATFTL_LIB
+#define __FATFTL_LIB
+
+#define FTL_VERSION 0x0100
+
+#ifndef MBR_DRIVER_INIT
+	#define MBR_DRIVER_INIT ftl_InitDriver( root_driver, NULL )
+#endif
+
+/*** EndHeader */
+
+
+/* START LIBRARY DESCRIPTION *********************************************
+FATFTL.LIB
+
+COPYRIGHT - Digi International, Inc. (c) 2010
+
+Flash translation layer for the FAT Filesystem
+
+This library is called in place of the direct driver for devices that
+need the services of the Flash Translation Layer.  This creates a
+virtual sector pool on the flash device that allows data to migrate
+across the device.  This alleviates large erase block size issues and
+allows more complete wear leveling across the entire flash device.  It
+also adds a bad block replacement mechanism.  There is a minor loss in
+the amount of usable space on the device (about 0.78 percent).
+
+Change history:
+   Who    When          What
+   ----   -----------   ------------------------
+   WTS    2010 Jun 22   Completed initial version
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader */
+
+/*************************************************************************/
+/* CONFIGURATION CONFIGURATION CONFIGURATION CONFIGURATION CONFIGURATION */
+/*************************************************************************/
+
+/* This section covers the major configuration macros for the library
+    which control	the memory footprint vs. capability. */
+
+//#define FTL_DEBUG         // outputs debug printf statements etc.
+
+//#define FTL_LBNAND_SUPPORT  // Adds support for large block NAND (>=128KB EB)
+
+
+#ifndef FTL_MAXDEV
+  #define FTL_MAXDEV    1    // Maximum FTL devices supported
+#endif
+#ifndef FTL_MAXSECTORS
+  #ifdef FTL_LBNAND_SUPPORT
+    #define FTL_MAXSECTORS  256  // Maximum sectors per erase block (LB-NAND)
+  #else
+    #define FTL_MAXSECTORS  32   // Maximum sectors per erase block (SB-NAND)
+  #endif
+#endif
+#ifndef FTL_MAXCACHE
+  #define FTL_MAXCACHE  ((FAT_MAXBUFS*3)/2)  // Maximum blockinfo cache units
+#endif
+
+/***********************************************************************/
+/* END OF CONFIGURATION - END OF CONFIGURATION - END OF CONFIGURATION  */
+/***********************************************************************/
+
+#ifdef FTL_DEBUG
+	#define _ftl_debug __debug
+#else
+	#define _ftl_debug __nodebug
+#endif
+
+
+enum {                        // FTL supported flash types
+   FTL_TYPE_SERIAL = 1,       // Serial Flash type
+   FTL_TYPE_NAND              // NAND Flash type
+};
+
+
+// Base Device States & Operation Request Codes for xxx_InformStatus functions
+//  DO NOT CHANGE VALUES OF THESE STATES
+#define FTLS_STATUS      0x0000  // Status only request to InformStatus
+#define FTLS_IDLE        0x0000  // Device is idle
+#define FTLS_SCAN        0x1000  // Scan of PBN in progress
+#define FTLS_ERASE       0x2000  // Erasing the page containing 'sector'
+#define FTLS_COMPACT     0x3000  // Garbage collection/compacting state
+#define FTLS_BACKGROUND  0x4000  // Background system maintenance operations
+#define FTLS_MOVE        0x5000  // Move PBN of 'sector' to PBN at 'dest'
+#define FTLS_FORMAT      0x6000  // Requests low level formating of the device
+#define FTLS_UNMOUNT     0x7000  // Specifies the device is/should be unmounted
+// UPPER STATES POSSIBLE DURING ENUMERATION
+#define FTLS_ENUM_SCAN   0x9000  // Scan to build location & status tables
+#define FTLS_ENUM_INIT   0xA000  // Initial enumeration state (Driver init)
+#define FTLS_BADBLOCK    0xB000  // Marking bad block on device
+#define FTLS_ERASE_CHK   0xE000  // Erase verification is in progress
+#define FTLS_MASK        0xF000  // Main state code mask (removes sub-states)
+
+// Some fixed constants
+#define FTL_MAX_PARTITIONS  4	      // Deal only with primary partitions
+#define FTL_SECSIZE	   FAT_LBASIZE	// size of a sector (Must be power of 2)
+#define FTL_MAX_DISCARDS   16       // Maximum discard entries per device
+#define FTL_SBN_SHIFT       5       // Sector offset shift for small block NAND
+
+// Option flags for _ftl_getblock function
+#define FTLGB_BLOCK    0x1000  // Function should block on any BUSY state
+#define FTLGB_SECOND   0x2000  // Function should get new secondary block
+#define FTLGB_FIND     0x4000  // Function should just return available block
+#define FTLGB_COMPACT  0x8000  // Call flag set by _ftl_compact function
+
+// Logical Block Location table reserved values (Logical Block Status - LBS)
+#define FTLBS_RESERVED   0xFF00  // Start of reserved block numbers
+#define FTLBS_SECONDARY  0xFFD8  // Secondary Block marker
+#define FTLBS_COMPLETE   0xFFDC  // Complete Block (full with no secondary)
+#define FTLBS_DISCARD    0xFFDD  // Discarded Block (free, but needs erasure)
+#define FTLBS_FREE       0xFFFF  // Free Block Marker (erased, ready to use)
+
+// Secondary block management entry structure (array for each device)
+typedef struct
+{
+   word pbn;          // Primary physical block number
+   word sbn;          // Secondary physical block number
+   word garbage;      // Garbage count for primary/secondary pair
+} _FTL_Secondary;
+
+// Block info, location/usage data and sector layout of physical blocks
+//  in use by the cache layer
+typedef struct _FTL_BlkInfo
+{
+	// Younger and older entries in order of most recent access.  This the the
+   // doubly-linked LRU list. The "younger" pointer of the youngest entry points
+   // to the "no_younger" field in _ftc, and the "older" pointer of the
+   // oldest (i.e. LRU) entry points to the "oldest" field in _ftc.
+   // Both pointers must be not NULL, or both NULL if this entry is not used.
+   // NOTE: these fields must be the first 2 fields, and in the order given.
+   struct _FTL_BlkInfo __far * younger;
+   struct _FTL_BlkInfo __far * older;
+
+  // Map of physical sector offsets of all sectors within the logical block
+   word sector[FTL_MAXSECTORS];
+   word devnum;        // Device number
+   word pbn;           // Primary physical block number
+   _FTL_Secondary __far *sentry;  // Secondary block entry pointer (NULL if none)
+   word in_use;        // Count of sectors in use (primary & secondary)
+   word garbage;       // Sectors containing garbage (MSB is set if released)
+} _FTL_BlockInfo;
+
+
+
+// Primary data structure for each FTL device
+//  (with links to location, status & usage tables and low level driver)
+typedef struct
+{
+   word __far * locate;     // Logical Block Map (Hosting PBN or 0xFFFF)
+   char __far * status;     // Block status tables (4 blocks/byte, 2 bit code)
+   _FTL_Secondary __far * second;  // Secondary block management structure
+   word       type;       // Type code of flash device (1=Serial, 2=NAND)
+   word       state;      // State of device (for non-blocking mode)
+   long       sector;     // Sector pointer (used within several states & enum)
+   long       dest;       // Destination sector during relocation operations
+   word       sec_shift;  // Sector shift to get LBN from LSN
+   word       blocks_max; // Maximum blocks allocated for (removable devices)
+   word       locate_max; // Maximum logical block map size
+   word       blocks;     // Number of blocks on this device
+   word       second_size;// Number of secondary blocks entries for this device
+   word       locate_size;// Number of logical block map entries for this device
+   word       free;       // Number of free blocks on this device
+   word       bad;        // Number of bad blocks on this device
+   word       next;       // Next PBN to be assigned a logical block
+   word       second_cnt; // Count of secondary blocks in use
+   word       discards[FTL_MAX_DISCARDS]; // Queue of discard blocks to erase
+   char       d_que_head;                 // Head of circular discard queue
+   char       d_que_tail;                 // Tail of circular discard queue
+   word       d_que_over; // Overflow count of discarded blocks not in queue
+   mbr_drvr * drv;        // Pointer to the driver for the flash device
+   mbr_dev *  dev;        // Pointer to the device info for the flash device
+   int (*xxx_EnumDevice)();     // enumerate pointer for physical driver
+   int (*xxx_ReadSector)();     // read sector pointer for physical driver
+   int (*xxx_WriteSector)();    // write sector pointer for physical driver
+   int (*xxx_InformStatus)();   // status function pointer for physical driver
+} _FTL_Device;
+
+// Master data structure for all global Flash Translation Layer data
+__far struct _FTL_Master
+{
+   // The following 4 fields are for the start and end of the LRU doubly linked
+   // list.  They must be in the order given, since each pair to look like the
+   // first 2 fields of FTCRoot.
+   _FTL_BlockInfo __far * no_younger; // This field always NULL
+   _FTL_BlockInfo __far * youngest;	// Point to MRU (or oldest if empty list)
+   _FTL_BlockInfo __far * oldest;	   // Point to LRU (or no_younger if empty)
+   _FTL_BlockInfo __far * no_older;	// This field always NULL (and is needed)
+
+   _FTL_Device     dev[FTL_MAXDEV];      // Data structure for each FTL device
+   _FTL_BlockInfo  block[FAT_MAXBUFS];   // Cache for block info/sector mapping
+   int             block_ptr;            // Pointer for block info cache
+} ftl;
+
+
+
+// Spare data usage for small block NAND flash
+typedef struct
+{
+   char lsn[3];     // Logical sector number
+   word link;       // Movement link (first sector of primary block) or
+                    // Primary link (first sector of secondary block)
+   char badinfo;    // Bad block marker (0xFF = Block OK, not 0xFF = Bad)
+   char resv;       // Reserved
+   char gcount;     // Count of garbage sectors before this sector (on block)
+   long blank0;     // Two long values used for quick check of erasure
+   long blank1;
+} _FTL_SBspare;
+
+// Spare data usage for large block NAND & serial flash (Standard spare layout)
+typedef struct
+{
+   char badinfo;    // Bad block marker (0xFF = Block OK, not 0xFF = Bad)
+   char gcount;     // Count of garbage sectors before this sector (on block)
+   char lsn[3];     // Logical sector number
+   word link;       // Movement link (first sector of primary block) or
+                    // Primary link (first sector of secondary block)
+   char resv;       // Reserved
+   char ecc1[3];    // ECC of second 256 bytes
+   word spare_ecc;  // ECC of first 8 bytes of spare data
+   char ecc0[3];    // ECC of first 256 bytes
+} _FTL_LBspare;
+
+// Universal spare data buffer
+typedef union {
+   _FTL_LBspare std;    // Standard large block/serial spare data buffer
+   _FTL_SBspare small;  // Small block nand spare data buffer
+} _FTL_spare;
+
+// Macro to read and verify/correct spare data from a given device & sector
+//   DEV is a pointer to a FTL device, SECT is the LBA sector number to read,
+//   BUF is a spare data structure (not pointer) & ERR is an int return code.
+#define _ftl_ReadSpare(DEV,SECT,BUF,ERR) \
+   ERR = DEV->xxx_ReadSector(SECT,(long)NULL,(char __far *)&BUF,DEV->dev);
+
+// No Busy version of above, will block on device or driver busy conditions
+#define _ftl_ReadSpareNB(DEV,SECT,BUF,ERR) \
+   do { _ftl_ReadSpare(DEV,SECT,BUF,ERR) \
+   } while ((ERR == -EBUSY) || (ERR == -EDRVBUSY))
+
+// Spare data field macros, gets/sets specified values of a _FTL_spare struct
+//   SBF = Small block flag, 1 if small block NAND, 0 if large block NAND
+//   SPARE = Variable name of a _FTL_spare data structure
+// ---------------------------------------------------------------------------
+// _ftl_getLBN gives the Logical Block Number (word)
+#define _ftl_getLBN(SBF, SPARE) (!SBF ? *((word *)&SPARE.std.lsn[1]) : \
+       (word)(((*((long *)SPARE.small.lsn)) & 0x00FFFFFFL) >> FTL_SBN_SHIFT))
+// _ftl_getLBS gives the Logical Block Status (word)
+#define _ftl_getLBS(SBF, SPARE) (SBF ? *((word *)&SPARE.small.lsn[1]) : \
+                         *((word *)&SPARE.std.lsn[1]))
+// _ftl_getOffset gives the Logical Sector Offset (char)
+#define _ftl_getOffset(SBF, SPARE) (SBF ? SPARE.small.lsn[0] & 0x1F : \
+                                          SPARE.std.lsn[0])
+// _ftl_getPtrLSN gives a (char *) ptr. to the Logical Sector Number array [0:2]
+#define _ftl_getPtrLSN(SBF, SPARE) (SBF ? SPARE.small.lsn : SPARE.std.lsn)
+// _ftl_getLink gives the Link field (word)
+#define _ftl_getLink(SBF, SPARE) (SBF ? SPARE.small.link : SPARE.std.link)
+// _ftl_getBad gives the Bad Block Marker value (char)
+#define _ftl_getBad(SBF, SPARE) (SBF ? SPARE.small.badinfo : SPARE.std.badinfo)
+// _ftl_getCount gives the Garbage Count value (char)
+#define _ftl_getCount(SBF, SPARE) (SBF ? SPARE.small.gcount : SPARE.std.gcount)
+// _ftl_getSPlink gives the Secondary to Primary Link value (word)
+#define _ftl_getSPlink(SBF, SPARE) (SBF ? *((word *)&SPARE.small.resv) : \
+                              ((word)SPARE.std.resv << 8) | SPARE.std.gcount)
+// ---------------------------------------------------------------------------
+// _ftl_setLBS sets the Logical Block Status value (word)
+#define _ftl_setLBS(SBF, SPARE, X) \
+                             if (SBF) { *((word *)&SPARE.small.lsn[1]) = X; } \
+                                 else { *((word *)&SPARE.std.lsn[1]) = X; }
+// _ftl_setLink sets the Link field value (word)
+#define _ftl_setLink(SBF, SPARE, X) \
+                             if (SBF) { SPARE.small.link = X; } \
+                                 else { SPARE.std.link = X; }
+// _ftl_setLBS sets the Garbage Count value (char)
+#define _ftl_setCount(SBF, SPARE, X) \
+                             if (SBF) { SPARE.small.gcount = X; } \
+                                 else { SPARE.std.gcount = X; }
+// _ftl_setLBS sets the Garbage Count value (char) using a (_FTL_spare *) ptr.
+#define _ftl_setCountPtr(SBF, SPARE, X) \
+                             if (SBF) { SPARE->small.gcount = X; } \
+                                 else { SPARE->std.gcount = X; }
+// _ftl_setSPlink sets the Secondary to Primary Link value (word)
+#define _ftl_setSPlink(SBF, SPARE, X) \
+                           if (SBF) { *((word *)&SPARE.small.resv) = X; } \
+  else { SPARE.std.resv = (char)(X >> 8); SPARE.std.gcount = (char)(X & 255); }
+
+const char ftl_bitmask[8] = { 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80 };
+
+// Flag used to indicate device has idle timestamp in dest variable
+#define FTLSF_IDLE_TIMER 0xFF000000L
+
+enum {                        // FTL Block Status codes (DO NOT CHANGE ORDER!!)
+   FTL_STAT_FREE = 0,         // Block is free for use (erased)
+   FTL_STAT_INUSE,            // Block is in use by the file system
+   FTL_STAT_BAD,              // Block is marked bad and should not be used
+   FTL_STAT_DISCARD           // Block has been discarded and awaits erasure
+};
+
+// Block Status masks & codes shifted to position for index within status bytes
+const char ftl_blockmask[4]    = { 0x03, 0x0C, 0x30, 0xC0 };
+const char ftl_invmask[4]      = { 0xFC, 0xF3, 0xCF, 0x3F };
+const char ftl_blockused[4]    = { 0x01, 0x04, 0x10, 0x40 };
+const char ftl_blockbad[4]     = { 0x02, 0x08, 0x20, 0x80 };
+
+// Macros to return and set status of PBN 'X' (all depend on ftl_dev pointer)
+#define _ftl_isfree(X) (!(ftl_dev->status[X >> 2] & ftl_blockmask[X & 3]))
+#define _ftl_notfree(X) (ftl_dev->status[X >> 2] & ftl_blockmask[X & 3])
+#define _ftl_isbad(X) (_ftl_notfree(X) == ftl_blockbad[X & 3])
+#define _ftl_status(X) ((ftl_dev->status[X >> 2] & ftl_blockmask[X & 3]) \
+                              >> ((X & 3) << 1))
+#define _ftl_markstatus(X,Y) ftl_dev->status[X >> 2] = (ftl_dev->status[X >> 2]\
+                             & ftl_invmask[X & 3]) | (Y << ((X & 3) << 1))
+#define _ftl_markfree(X)    ftl_dev->status[X >> 2] &= ftl_invmask[X & 3]
+#define _ftl_markdiscard(X) ftl_dev->status[X >> 2] |= ftl_blockbad[X & 3]
+#define _ftl_markused(X)    ftl_dev->status[X >> 2] |= ftl_blockused[X & 3]
+
+// Macros for LBA sector number of first or last sector of a physical block
+//  DEV is a pointer to a FTL device, PBN is a physical block number
+#define _ftl_first(DEV,PBN) (((long)PBN) << DEV->sec_shift)
+#define _ftl_last(DEV,PBN)  ((((long)(PBN + 1)) << DEV->sec_shift) - 1)
+
+// Macro to return block portion of a Logical Sector Number (LSN)
+//  DEV is a pointer to a FTL device, LSN is a logical sector number
+#define _ftl_blocknum(DEV,LSN) ((word)(LSN >> DEV->sec_shift))
+
+// Macro to give the sector offset portion of a Logical Sector Number (LSN)
+//  MBR is a pointer to a MBR device structure, LSN is a logical sector number
+#define _ftl_offset(MBR,LSN) (((word)LSN) & (MBR->sec_block - 1))
+
+#use _FTL_DRIVER				// Underlying device driver library
+
+extern const __far char mbr_start[];
+
+/*** EndHeader */
+
+
+/**************************************************************************/
+/* Start of external API functions.                                       */
+/**************************************************************************/
+
+/*** BeginHeader ftl_InitDriver */
+int ftl_InitDriver(mbr_drvr *driver, char * type);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION *******************************************
+ftl_InitDriver                   <FATFTL.LIB>
+
+SYNTAX: int ftl_InitDriver(mbr_drvr *driver, char * type);
+
+DESCRIPTION: Initializes the Flash Translation Layer on first call
+             and adds driver to the root data structure.  Also
+             initializes underlying flash driver and enumerates
+             the given driver structure if needed.
+
+PARAMETER1:  driver is an empty mbr_drvr structure.  It must be
+             initialized with this function before it can be used
+             with the FTL and cache layer.
+
+PARAMETER2:  Reserved future parameter, should be NULL
+
+RETURNS:	     0 for Success
+              -EINVAL - invalid argument or device type
+              -EEXIST - driver already registered and enumurated
+              -ENOSPC - all driver slots are already in use
+
+SEE ALSO:     ftl_EnumDevice
+*************************************************************************/
+// Define configuration variable
+const _fat_driver_descr _ftlConfig = _FTL_DRIVER_INIT;
+
+_ftl_debug int ftl_InitDriver(mbr_drvr *driver, char * type)
+{
+   auto int i, rc;
+   auto word t;
+
+   #GLOBAL_INIT { _f_memset(&ftl, 0, sizeof(ftl)); }
+
+#ifndef _FTL_DRIVER_INIT
+   #fatal "Must be a FTL compatible device to use the FTL library."
+#else
+   if (!driver) {
+      return -EINVAL;      // Driver pointer can not be NULL
+   }
+   for (i = 0; i < FTL_MAXDEV && ftl.dev[i].drv; i++) {
+      if (ftl.dev[i].drv == driver) {
+         return -EEXIST;   // Driver already found in root structure
+      }
+   }
+   if (i >= FTL_MAXDEV) {
+      return -ENOSPC;
+   }
+
+   // Found space in root structure, init if NAND or Serial Translation type
+   if (*(_ftlConfig.type) == 'N') {       // Check for NAND Translation type
+      t = FTL_TYPE_NAND;
+   }
+   else if (*(_ftlConfig.type) == 'S') {  // Check for Serial Translation type
+      t = FTL_TYPE_SERIAL;
+   }
+   else {
+      return -EINVAL;
+   }
+   rc = _ftlConfig.InitDriver(driver, NULL);
+
+   if (!rc) {
+      ftl.dev[i].drv = driver;   // Device driver initialized OK, add to FTL
+      ftl.dev[i].type = t;
+      ftl.dev[i].state = FTLS_UNMOUNT;   // Set device state to unmounted
+      // Save function pointers for physical device driver
+      ftl.dev[i].xxx_EnumDevice = driver->xxx_EnumDevice;
+      ftl.dev[i].xxx_ReadSector = driver->xxx_ReadSector;
+      ftl.dev[i].xxx_WriteSector = driver->xxx_WriteSector;
+      ftl.dev[i].xxx_InformStatus = driver->xxx_InformStatus;
+	   // Make an empty LRU list.  We do not yet add entries to the LRU, since
+	   // a device must be registered before any of its cache entries are
+	   // allowed to be on the LRU.
+	   ftl.youngest = (_FTL_BlockInfo __far *)&ftl.oldest;
+	   ftl.oldest = (_FTL_BlockInfo __far *)&ftl.no_younger;
+      // Hijack function pointers in the physical driver structure
+      driver->xxx_EnumDevice = ftl_EnumDevice;
+      driver->xxx_ReadSector = ftl_ReadSector;
+      driver->xxx_WriteSector = ftl_WriteSector;
+      driver->xxx_InformStatus = ftl_InformStatus;
+#ifdef FTL_VERBOSE
+   	printf("ftl_InitDriver: Driver %d initialized.\n", i);
+#endif
+		for (i = 0; i < (t == FTL_TYPE_NAND ? _NFLASH_MAXDEVICES : 1); ++i) {
+         driver->type[i] |= MBRTYPE_FTL_LIB | MBRTYPE_SECTOR_FTL;
+      }
+   }
+#endif
+   return rc;
+}
+
+
+/*** BeginHeader ftl_EnumDevice */
+int ftl_EnumDevice(mbr_drvr *driver, mbr_dev *dev, int devnum);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION *******************************************
+ftl_EnumDevice                   <FATFTL.LIB>
+
+SYNTAX: int ftl_EnumDevice(mbr_drvr *driver, mbr_dev *dev, int devnum);
+
+DESCRIPTION: Function used by cache layer code to initialize the storage
+             device and associated data structures.
+
+PARAMETER1:  driver is a pointer to the device driver structure.
+
+PARAMETER2:  dev is a pointer to a device structure that will be filled in.
+
+PARAMETER3:  devnum is the number of the device that is being initialized.
+
+RETURNS:	    0 for Success
+             -EIO     - I/O error, device driver may not be initialized
+             -EINVAL  - invalid argument
+             -EEXIST  - device already exists in FTL
+             -ENOSPC  - no room in FTL device structure for this device
+             -ENOMEM  - not enough memory available for device tables
+             -EFAULT  - fault found in FTL block structure on this device
+             -EBADMAX - device has too many bad blocks for FTL usage
+             -EBUSY if the device is busy.
+
+SEE ALSO:     ftl_InitDriver
+*************************************************************************/
+
+_ftl_debug int ftl_EnumDevice(mbr_drvr *driver, mbr_dev *dev, int devnum)
+{
+   auto int i, j, ftl_idx, rc, small;
+   auto word lbn, pbn, status, block;
+   auto long lval;
+   auto _FTL_spare spare;          // Spare data structure for sector reads
+   auto _FTL_Device __far * ftl_dev; // Pointer to FTL device being enumerated
+   auto char buf[FAT_LBASIZE];     // Sector data buffer
+
+   if (!driver || !dev || devnum >= FTL_MAXDEV) {
+      return -EINVAL;
+   }
+#ifdef FTL_VERBOSE
+   printf("ftl_EnumDevice: Enum device %d.\n", devnum);
+#endif
+
+   // Scan FTL devices to find driver
+   for (i = 0, ftl_idx = -1; i < FTL_MAXDEV && ftl.dev[i].drv; i++) {
+      if (ftl.dev[i].drv == driver) {
+         if (ftl.dev[i].dev == dev) {
+            if (!dev->driver) {  // Check for re-use of device after format
+               ftl.dev[i].state = FTLS_ENUM_INIT;
+            }
+            if (ftl.dev[i].state >= FTLS_UNMOUNT) {
+               ftl_idx = i;   // Allow unmounted device to enumerate
+               break;         // or incomplete enumeration to finish
+            }
+#ifdef FTL_VERBOSE
+            printf("ftl_EnumDevice: Device already exists.\n");
+#endif
+            return -EEXIST;   // Device already exists in root structure
+         }
+         if (!ftl.dev[i].dev) {
+            if (ftl_idx < 0) {
+               ftl_idx = i;       // Driver initialized and awaiting
+               break;
+            }
+         }
+         else {
+            if (ftl_idx < 0) {
+               ftl_idx = 99 - i;  // Driver exists, but tied to other device
+            }
+         }
+      }
+   }
+   if (ftl_idx == -1) {
+      return -EIO;       // Driver for device not initialized
+   }
+   if (i == FTL_MAXDEV) {
+      return -ENOSPC;    // No room in FTL root structure for this device
+   }
+   ftl_dev = &(ftl.dev[i]);
+   ftl_dev->dev = dev;          // Save MBR Device pointer
+   dev->ftl_dev_idx = i;
+   if (ftl_idx > FTL_MAXDEV) {
+	   ftl_dev->drv = driver;    // Multiple devices on same driver, set type
+	   ftl_dev->type = ftl.dev[99 - ftl_idx].type;  // same as sibling device
+	   ftl_dev->state = FTLS_UNMOUNT;
+   }
+
+   if (ftl_dev->state == FTLS_UNMOUNT) {
+      // Set to initial enumeration state
+      ftl_dev->state = FTLS_ENUM_INIT;
+   }
+   rc = 0;
+
+   switch (ftl_dev->state) {
+     case FTLS_ENUM_INIT:    // Enumerate device, allocate & fill tables
+       // Short status delay in case device was just formatted
+       if (dev->byte_sec) {   // Only if device already initialized
+          for (i = 0; i < 50; i++, ftl_dev->xxx_InformStatus(dev, 0));
+       }
+       rc = ftl_dev->xxx_EnumDevice(driver, dev, devnum);
+       if (rc < 0 && rc != -EEXIST) {
+#ifdef FTL_VERBOSE
+          printf("ftl_EnumDevice: Failed driver layer enumeration (%d).\n", rc);
+#endif
+          break;   // Break out on any error but EEXIST (previous enum OK)
+       }
+       if (ftl.block_ptr) {   // If block info entries, scan for prior usage
+   	   for (i = j = 0; i < ftl.block_ptr; i++) {
+            if (ftl.block[i].devnum == dev->ftl_dev_idx) { // From this device?
+               ftl.block[i].pbn = FTLBS_FREE;      // Yes, then free the entry
+               j++;
+            }
+         }
+         if (j == ftl.block_ptr) { // All existing entries are from this device
+            ftl.block_ptr = 0;     // Reset block info chains and pointer
+	         ftl.youngest = (_FTL_BlockInfo __far *)&ftl.oldest;
+	         ftl.oldest = (_FTL_BlockInfo __far *)&ftl.no_younger;
+         }
+       }
+       ftl_dev->sector = 0L;
+       ftl_dev->free = ftl_dev->second_cnt = ftl_dev->bad = 0;
+       for (i = dev->sec_block >> 1, rc = 0; i; i >>= 1, rc++);
+       ftl_dev->sec_shift = rc;                      // Save sector offset shift
+       lval = dev->seccount >> ftl_dev->sec_shift;   // Calculate # of blocks
+	    block = (lval > 0xFFFFL ? 0xFFFF : (word)lval);  //  on device
+       rc = _ftl_initdev(ftl_dev, block);  // Allocate/initialize device tables
+       if (rc < 0) {
+       	 break;  // If error, break out and return error code, otherwise
+       }          // Initialization complete, drop into device scan
+
+       // Fill location table with 0xFFFF (All Blocks Free)
+       _f_memset(ftl_dev->locate, 0xFF, ((long)ftl_dev->locate_max) << 1);
+
+       // Fill status table with 0's (All Free)
+       _f_memset(ftl_dev->status, 0, ftl_dev->blocks >> 2);
+
+       // Fill secondary block table with 0xFF's (All Unused)
+       _f_memset(ftl_dev->second, 0xFF, ftl_dev->second_size * 6);
+       ftl_dev->state = FTLS_ENUM_SCAN;  // Set state and drop into scan case
+
+	   // Initialize the discard queue to empty
+	   _f_memset(ftl_dev->discards, 0xFF, FTL_MAX_DISCARDS*2);
+      ftl_dev->d_que_head = ftl_dev->d_que_tail = ftl_dev->d_que_over = 0;
+
+     case FTLS_ENUM_SCAN:   // Scan device and build locate & status tables
+       // Identify small block NAND by unique 16KB erase blocks
+       small = (ftl_dev->sec_shift == FTL_SBN_SHIFT) ? 1 : 0;
+       // Scan the device and build the location table (*lptr = sector #)
+       for (lval = dev->seccount; ftl_dev->sector < lval;
+               ftl_dev->sector += dev->sec_block) {
+          pbn = _ftl_blocknum(ftl_dev, ftl_dev->sector);
+          _ftl_ReadSpare(ftl_dev, ftl_dev->sector, spare, rc);
+          if (rc < 0) {
+             if (rc == -EBADBLOCK) {
+                _ftl_markstatus(pbn, FTL_STAT_BAD); // Mark bad in status table
+                if ((++ftl_dev->bad) >= ((ftl_dev->blocks >> 7) - 1)) {
+                   rc = -EBADMAX;    // Show device has too many bad blocks
+#ifndef FAT16_READONLY
+                   break;
+#endif
+                }
+                rc = 0;              // Clear error code in case last block
+                continue;            // Done with this block, move to next
+             }
+#ifdef FTL_VERBOSE
+             if (rc != -EBUSY) {
+                printf("ftl_EnumDevice: Device scan read error (%d).\n", rc);
+             }
+#endif
+             break;     // Break out on read error or busy
+          }
+          if (_ftl_getBad(small, spare) != 0xFF) { // See if block marked bad
+             _ftl_markstatus(pbn, FTL_STAT_BAD);   // Mark bad in status array
+             ftl_dev->bad++;                       // Add to bad block count
+#ifdef FTL_VERBOSE
+             printf("ftl_EnumDevice: Block %d marked as bad.\n", pbn);
+#endif
+             continue;
+          }
+
+          status = _ftl_getLBS(small, spare); // Get Logical Block Status value
+          if (status != FTLBS_FREE) {           // See if block is in use
+             _ftl_markused(pbn);              // Mark block status as in use
+             if (status < FTLBS_RESERVED) {
+                lbn = _ftl_getLBN(small, spare);  // Get LBN for live block
+                if (ftl_dev->locate[lbn] == FTLBS_FREE) {
+   	             // Save PBN in locate table entry for this LBN
+	                ftl_dev->locate[lbn] = pbn;
+                }
+                else {
+                   // Check and attempt correction of duplicate LBN's
+                   if (rc = _ftl_LBNcheck(ftl_dev, lbn, pbn,
+                                            _ftl_getLink(small, spare))) {
+                      break;  // Error, break out with error code in rc
+                   }
+                }
+             }
+             else {   // Handle blocks with other status codes
+                if (status == FTLBS_SECONDARY) {  // Check for secondary block
+                   block = _ftl_getLink(small, spare);  // Save primary block #
+                   // Then read last sector of block to see if discarded/active
+                   _ftl_ReadSpareNB(ftl_dev,
+                          (ftl_dev->sector | (dev->sec_block - 1)), spare, rc);
+                    // Check last sector of the block to see if it was discarded
+                   if (rc || _ftl_getLBS(small, spare) != FTLBS_DISCARD) {
+                      if (!rc && _ftl_getLBS(small, spare) == FTLBS_FREE) {
+	                      // Not discarded, add Primary to Secondary link
+	                      if (rc = _ftl_secondary(ftl_dev, block, &pbn)) {
+	                         break;  // Error, break out with error code in rc
+	                      }
+                      }
+                      else {   // Corrupt secondary block, check for bad block
+                         _ftl_ReadSpareNB(ftl_dev, _ftl_first(ftl_dev, block),
+                                            spare, rc);
+                         if (rc || _ftl_getLBS(small, spare) >= FTLBS_RESERVED)
+                         {
+                            ftl_dev->xxx_InformStatus(ftl_dev->dev, FTLS_ERASE);
+	                         ftl_dev->state = FTLS_BADBLOCK;
+	                         rc = -EBUSY;
+                            break;
+                         }
+                         else {
+                            lval = dev->seccount;
+                         }
+                      }
+                   }
+                   else {  // Secondary block found has been marked discarded
+                      // Possible interrupted move operation, fix if needed
+                      rc = _ftl_fixmove(ftl_dev, block, pbn,
+                                            _ftl_getLink(small, spare));
+                      if (rc < 0) {
+                         break;
+                      }
+                   }
+                }
+                else {  // Other status codes not supported at start of block
+                   rc = -EFAULT;       // Show fault in FTL structure on device
+                   break;
+                }
+             }
+          }
+          else {
+             if (spare.small.blank0 != spare.small.blank1) {
+                rc = _ftl_blankcheck(ftl_dev);
+                if (rc) {
+                   if (rc == -EBADBLOCK) {
+                      ftl_dev->bad++;             // Add to bad block count
+                      continue;  // Block went bad and is now marked as bad
+                   }
+                   break; // Format type is wrong or block is corrupt, break out
+                }
+             }
+             ftl_dev->free++;   // Block available, add to free block count
+          }
+       }
+       if (!rc) {
+          ftl_dev->state = FTLS_IDLE;  // Done, device is ready for FTL usage
+          // Adjust usable space on an FTL obscured device
+          dev->seccount = ftl_dev->locate_size << ftl_dev->sec_shift;
+          // Create workable cylinder/head/track layout for fat MBR
+          while (dev->seccount % dev->cylinder) {
+            if (dev->seccount > 0x0FFFFL) {
+               for (i = 2; (((dev->seccount % i) ||
+                     ((dev->seccount / i) & 0xFFFF0000L)) && (i < 22)); i++);
+               if (i == 22) {
+                  dev->seccount--;   // Not easily divisable, lose a sector
+               }
+               else {
+                  dev->cylinder = i;
+               }
+            }
+            else {
+               dev->cylinder = 1;
+            }
+          }
+          dev->sec_track = (word)(dev->seccount / dev->cylinder);
+#ifdef FTL_VERBOSE
+          printf("ftl_EnumDevice: Success!! (Free: %d, Bad: %d).\n",
+                   ftl_dev->free, ftl_dev->bad);
+#endif
+       }
+       break;
+
+     default:     // Erasing or marking bad block, return to scan when done
+       if ((ftl_dev->state & FTLS_MASK) > FTLS_ENUM_SCAN) {
+	       rc = ftl_InformStatus(ftl_dev->dev, 0);
+          if (!rc) {
+             ftl_dev->sector += dev->sec_block; // Move to next block
+             ftl_dev->state = FTLS_ENUM_SCAN;   // Set state back to scan
+             rc = -EBUSY;                       // Return busy to continue scan
+          }
+       }
+	    else {
+	       rc = -EFAULT;   // Invalid state during enumeration
+	    }
+       break;
+	}  // End of switch statement
+
+   if (rc && rc != -EBUSY) {
+      if (ftl_dev->state >= FTLS_ENUM_INIT) {
+         ftl_dev->dev = NULL;        // Error on initilization, remove device
+		   dev->ftl_dev_idx = -1 - dev->ftl_dev_idx;
+      }
+	   ftl_dev->state = FTLS_UNMOUNT;
+   }
+   return rc;
+}
+
+
+/*** BeginHeader ftl_ReadSector */
+int ftl_ReadSector(unsigned long lsn, char __far *buffer,
+                          _FTL_spare __far *spare, mbr_dev *device);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION *******************************************
+ftl_ReadSector                   <FATFTL.LIB>
+
+SYNTAX:      int ftl_ReadSector(unsigned long lsn, char __far *buffer,
+                                  _FTL_spare __far *spare, mbr_dev *device);
+
+DESCRIPTION: Function used by cache layer to read a sector from the
+             specified device.
+
+PARAMETER1:  lsn    - logical sector number of the sector to read.
+PARAMETER2:  buffer - a far pointer to a buffer to read the main data
+                        into.  If NULL, the main data is not read.
+PARAMETER3:	 spare  - a far pointer to a buffer to read the spare data
+                        into.  If NULL, the spare data is not read.
+PARAMETER3:	 device - mbr_dev structure for the device being read
+
+RETURNS:	    0 for Success
+             -EDEVNOTREG - Device not registered or mounted -
+                              call ftl_EnumDevice
+             -EIO        - I/O error, device driver may not be initialized
+             -EINVAL     - invalid argument
+             -EBADDATA   - uncorrectable data or ECC I/O error
+             -EBUSY      - device is busy
+
+SEE ALSO:    ftl_WriteSector, ftl_EnumDevice
+*************************************************************************/
+_ftl_debug int ftl_ReadSector(unsigned long lsn, char __far *buffer,
+                                _FTL_spare __far *spare, mbr_dev *device)
+{
+   auto int i, rc;
+   auto word lbn, offset, pbn;
+   auto _FTL_Device __far *ftl_dev;
+
+   assert(device != NULL);
+   if (device->ftl_dev_idx < 0) {
+      return -EDEVNOTREG;      // Device not registered with the FTL
+   }
+   ftl_dev = &ftl.dev[device->ftl_dev_idx];  // Save pointer to FTL device
+   lbn = _ftl_blocknum(ftl_dev, lsn);        // Get LBN from LSN
+   if (lbn >= ftl_dev->locate_size || (!spare && !buffer)) {
+      return -EINVAL;          // Invalid LSN or no buffers given
+   }
+   if (ftl_dev->state == FTLS_UNMOUNT) {
+      return -EDEVNOTREG;      // Device must be mounted by ftl_EnumDevice
+   }
+   if (ftl_dev->state && (rc = ftl_InformStatus(device, 0))) {
+      return rc;               // Device busy - try to drive through
+   }
+
+#ifdef FTL_VERBOSE
+   printf("ftl_ReadSector: Read logical sector %lu.\n", lsn);
+#endif
+   pbn = ftl_dev->locate[lbn]; // Get PBN for given LSN
+   if (pbn != FTLBS_FREE) {    // See if a host block has been assigned yet
+      i = _ftl_findblock(ftl_dev, pbn);
+      if (i >= 0) {  // Check for valid block index
+         offset = ftl.block[i].sector[_ftl_offset(device, lsn)];
+         if (offset >= FTL_MAXSECTORS) {    // Does offset point to secondary?
+            pbn = ftl.block[i].sentry->sbn; // Setup to read secondary block
+            offset -= FTL_MAXSECTORS;       // Correct offset value
+         }
+#ifdef FTL_VERBOSE
+         rc = ftl_dev->xxx_ReadSector((((long)(pbn)) << ftl_dev->sec_shift)
+                                           + offset, buffer, spare, device);
+         if (rc && rc != -EBUSY) {
+            printf("ftl_ReadSector: Read error %d on pbn:%u, offset:%u",
+                     rc, pbn, offset);
+#ifdef FTL_VERBOSE_DUMP
+            _ftl_DumpStatus(ftl_dev, 0, pbn | 127);
+            _ftl_DumpMap(ftl_dev, 0, pbn | 127);
+#endif
+         }
+         return rc;
+#else
+         return ftl_dev->xxx_ReadSector((((long)(pbn)) << ftl_dev->sec_shift)
+                                           + offset, buffer, spare, device);
+#endif
+      }
+      else {
+         return i;     // Error code received, return the code
+      }
+   }
+   if (buffer) {  // Fill data buffer with 0xFF's
+      _f_memset(buffer, 0xFF, FAT_LBASIZE);
+   }
+   if (spare) {   // Create valid spare data for a blank data sector
+      _f_memset(spare, 0xFF, FAT_MAXSPARE);
+      if (ftl_dev->sec_shift == 5) {
+         *((__far long *)(spare->small.lsn)) = lsn;
+         spare->small.link = 0xFFFF;
+         spare->small.gcount = 0;
+      }
+      else {
+         *((__far long *)(spare->std.lsn)) = lsn;
+         spare->std.link = 0xFFFF;
+         spare->std.gcount = 0;
+      }
+      spare->std.spare_ecc = calculateECC8((char __far *)spare);
+   }
+   return 0;
+}
+
+
+/*** BeginHeader ftl_WriteSector */
+int ftl_WriteSector(unsigned long lsn, char __far *buffer,
+                     _FTL_spare __far *spare, mbr_dev *device, word options);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION *******************************************
+ftl_WriteSector                   <FATFTL.LIB>
+
+SYNTAX:      int ftl_WriteSector(unsigned long lsn, char __far *buffer,
+                 _FTL_spare __far *spare, mbr_dev *device, word options);
+
+DESCRIPTION: Function used by cache layer to write to a sector on the
+             specified device.
+
+             IMPORTANT NOTE: If the -EBUSY code is returned, you should
+             then call ftl_InformStatus to wait for the busy to clear as
+             the code indicates the write was started, but the device is
+             now busy with the requested write.  DO NOT call this function
+             again until ftl_InformStatus shows the device is not busy.
+
+PARAMETER1:  lsn    - logical sector number of the sector to write to.
+PARAMETER2:  buffer - a far pointer to a buffer to write the data from.
+                       This argument should never be NULL.
+PARAMETER3:  spare  - a far pointer to a buffer to write the spare data
+                       from.  This argument may be NULL.
+PARAMETER4:	 device - mbr_dev structure for the device being written to
+PARAMETER5:  options - Flags for optional processing requests:
+                        FTC_CONTINUE  - Write to be continued with
+                                        additional call(s) to this function
+
+RETURNS:	    0 for Success
+             -EDEVNOTREG - Device not registered or mounted -
+                              call ftl_EnumDevice
+             -EIO        - I/O error, device driver may not be initialized
+             -EINVAL     - invalid argument
+             -EBADDATA   - uncorrectable data or ECC I/O error
+             -EWRITEFAIL - write to device failed
+             -EBUSY      - write accepted and initiated, device now busy,
+                            call ftl_InformStatus to check for completion
+             -EDRVBUSY   - driver was already busy, write was not accepted
+
+SEE ALSO:     ftl_InformStatus, ftl_ReadSector, ftl_EnumDevice
+*************************************************************************/
+_ftl_debug int ftl_WriteSector(unsigned long lsn, char __far *buffer,
+                        _FTL_spare __far *spare, mbr_dev *device, word options)
+{
+   auto int i, rc, small;
+   auto word offset, loffset, lbn, pbn, link;
+   auto _FTL_Device __far *ftl_dev;
+   auto _FTL_BlockInfo __far *block;
+   auto _FTL_spare sparebuf;
+
+   assert(device != NULL);
+   if (device->ftl_dev_idx < 0) {
+      return -EDEVNOTREG;     // Device not registered with the FTL
+   }
+   ftl_dev = &ftl.dev[device->ftl_dev_idx];  // Save pointer to FTL device
+   lbn = _ftl_blocknum(ftl_dev, lsn); // Get Logical block from Logical sector
+   if (lbn >= ftl_dev->locate_size || !buffer) {
+      return -EINVAL;
+   }
+   if (ftl_dev->state) {  // Is device busy or not registered?
+      return (ftl_dev->state == FTLS_UNMOUNT ? -EDEVNOTREG : -EDRVBUSY);
+   }
+#ifdef FTL_VERBOSE
+   printf("ftl_WriteSector: Write logical sector %lu.\n", lsn);
+#endif
+   pbn = ftl_dev->locate[lbn];        // Get Physical block for this LBN
+   if (pbn == FTLBS_FREE) {   // See if a host block has not been assigned yet
+      rc = _ftl_getblock(ftl_dev, lbn, 0);
+      if (rc) { return rc; }  // Return if busy/error code from _ftl_getblock
+      pbn = ftl_dev->locate[lbn];     // Get new Physical Block Number (empty)
+   }
+   i = _ftl_findblock(ftl_dev, pbn);  // Find/add block info structure for PBN
+   if (i < 0) {
+      return i;                       // Return error code if error detected
+   }
+
+   small = (ftl_dev->sec_shift == FTL_SBN_SHIFT ? 1 : 0); // Small block flag
+   block = &ftl.block[i];                     // Block info entry pointer
+   offset = block->in_use;                    // Physical offset within block
+   loffset = _ftl_offset(ftl_dev->dev, lsn);  // Logical offset within block
+   link = FTLBS_FREE;                         // Default link for most writes
+
+   if (offset >= FTL_MAXSECTORS) { // See if offset points to secondary block
+      offset -= FTL_MAXSECTORS;
+      if (!offset) {             // See if secondary block doesn't exist yet
+         // Make sure driver is not busy before getting secondary block
+         if (ftl_dev->xxx_InformStatus(ftl_dev->dev, 0)) {
+            return -EDRVBUSY;
+         }
+
+         // Primary is full, add secondary or relocate the block now
+         rc = _ftl_getblock(ftl_dev, lbn, FTLGB_SECOND | i);
+         if (!rc) {   // Secondary available, write first sector link/data
+            memset(&sparebuf, 0xFF, 8);
+            if (small) {  // Setup spare area w/ primary/secondary block link
+               *((word *)&sparebuf.small.lsn[1]) = FTLBS_SECONDARY;
+               sparebuf.small.link = block->pbn;
+               sparebuf.small.gcount = block->garbage;
+            } else {
+               *((word *)&sparebuf.std.lsn[1]) = FTLBS_SECONDARY;
+               sparebuf.std.link = block->pbn;
+               sparebuf.std.gcount = block->garbage;
+            }
+            _nf_updateECCs((char __far *)block->sector, (char __far *)&sparebuf);
+            rc = ftl_dev->xxx_WriteSector(_ftl_first(ftl_dev,block->sentry->sbn),
+                   (char __far *)block->sector, (char __far *)&sparebuf, device,
+                      FTC_CONTINUE);
+	         while (rc == -EBUSY) {
+	            rc = ftl_dev->xxx_InformStatus(ftl_dev->dev, 0);
+	         }   // Drive write thru to completion
+#ifdef FTL_VERBOSE
+            if (rc && rc != -EDRVBUSY) {
+               printf("ftl_WriteSector: Write error %d on sbn:%u, offset: 0",
+                     rc, block->sentry->sbn);
+#ifdef FTL_VERBOSE_DUMP
+            	_ftl_DumpStatus(ftl_dev, 0, block->sentry->sbn | 127);
+            	_ftl_DumpMap(ftl_dev, 0, block->sentry->sbn | 127);
+#endif
+            }
+#endif
+            pbn = block->sentry->sbn; // Setup to write to new secondary block
+            offset = 1;               //  and to use first available data sector
+            block->in_use++;          // Add secondary header to in use count
+            block->sentry->garbage = ++block->garbage; // And include in garbage
+         }
+         else if (rc == -EBUSY) {
+            return -EDRVBUSY;   // Show write has not been cached yet
+         }
+         else if (rc == -ENOSPC) {  // No room, must relocate block now
+            // Block is full, relocate/pack block (less sector to be written)
+            rc = _ftl_getblock(ftl_dev, lbn, FTLGB_FIND); // Find a free block
+            link = pbn;             // Current PBN will be saved in link field
+            pbn = ftl_dev->next;    // Write this sector to start of new block
+            block->garbage = 0;     //   and set garbage count to 0
+         }
+         if (rc) { return rc; } // Error detected, return error code
+      }
+      else {
+         if (offset < (FTL_MAXSECTORS - 1)) {  // See if secondary has space
+            // Adding sector to secondary block
+            pbn = block->sentry->sbn;
+         }
+         else while (1) {
+            // Secondary full, relocate/pack block (less sector to be written)
+            rc = _ftl_getblock(ftl_dev, lbn, FTLGB_FIND); // Find a free block
+            if (rc) { return rc; }
+            // Write old PBN as move link to new block along with sector data
+	         if (small) {
+               *((unsigned long *)sparebuf.small.lsn) = lsn;
+	            sparebuf.small.link = pbn;
+	            sparebuf.small.badinfo = 0xFF;
+	            sparebuf.small.resv = 0xFF;
+               sparebuf.small.gcount = block->garbage;
+	         } else {
+               *((unsigned long *)sparebuf.std.lsn) = lsn;
+	            sparebuf.std.link = pbn;
+	            sparebuf.std.badinfo = 0xFF;
+	            sparebuf.std.resv = 0xFF;
+               sparebuf.std.gcount = block->garbage;
+	         }
+            _nf_updateECCs(buffer, (char __far *)&sparebuf);
+            rc = ftl_dev->xxx_WriteSector(_ftl_first(ftl_dev, ftl_dev->next),
+                  buffer,(_FTL_spare __far *)&sparebuf, device, options);
+	         while (rc == -EBUSY) {
+	            rc = ftl_dev->xxx_InformStatus(ftl_dev->dev, 0);
+	         }   // Drive write thru to completion
+            if (rc && rc != -EDRVBUSY) {
+#ifdef FTL_VERBOSE
+               printf("ftl_WriteSector: Write error %d on new pbn:%u, offset: 0"
+                       , rc, ftl_dev->next);
+#ifdef FTL_VERBOSE_DUMP
+            	_ftl_DumpStatus(ftl_dev, 0, ftl_dev->next | 127);
+            	_ftl_DumpMap(ftl_dev, 0, ftl_dev->next | 127);
+#endif
+#endif
+               _ftl_discardblock(ftl_dev, ftl_dev->next);
+					return rc;
+            }
+            if (!rc) {  // Setup discard code and movement link for old block
+               pbn = block->sentry->sbn;    // Write movement link to last
+               offset = FTL_MAXSECTORS - 1; //   sector of secondary block
+               link = ftl_dev->next;      // New PBN will be saved in link field
+               lsn = (unsigned long)FTLBS_DISCARD << 8;
+			      block->garbage = block->in_use; // Source in_use count to g-count
+               _f_memcpy(buffer, block->sector, FTL_MAXSECTORS * 2);
+               break;
+            }
+         }
+      }
+   }
+   if (link == FTLBS_FREE) {  // Free link means normal write operation
+	   // See if this sector is replacing an existing sector on the block
+	   if (block->sector[loffset] != FTLBS_FREE) {  // Replacing existing sector?
+         block->sentry->garbage = ++block->garbage;  // If so, add to garbage
+	   }
+   }
+   // Setup sector info in spare data and add to block's in use count
+   if (!spare) {                   // Setup sparebuf if not given
+      spare = (_FTL_spare __far *)&sparebuf;
+   }
+   if (small) {
+      *((__far unsigned long *)spare->small.lsn) = lsn;
+      spare->small.link = link;
+      spare->small.gcount = block->garbage;
+      spare->small.badinfo = 0xFF;
+      spare->small.resv = 0xFF;
+   } else {
+      *((__far unsigned long *)spare->std.lsn) = lsn;
+      spare->std.link = link;
+      spare->std.gcount = block->garbage;
+      spare->std.badinfo = 0xFF;
+      spare->std.resv = 0xFF;
+   }
+
+   // Setup spare and data ECC's and write sector to the device
+   _nf_updateECCs(buffer, (char __far *)spare);
+   rc = ftl_dev->xxx_WriteSector(_ftl_first(ftl_dev, pbn) + offset,
+                                   buffer, spare, device, options);
+   while (rc == -EBUSY) {
+      rc = ftl_dev->xxx_InformStatus(ftl_dev->dev, 0);
+   }   // Drive write thru to completion
+#ifdef FTL_VERBOSE
+   if (rc && rc != -EDRVBUSY) {
+      printf("ftl_WriteSector: Write error %d on pbn:%u, offset: %u"
+              , rc, pbn, offset);
+#ifdef FTL_VERBOSE_DUMP
+      _ftl_DumpStatus(ftl_dev, 0, pbn | 127);
+      _ftl_DumpMap(ftl_dev, 0, pbn | 127);
+#endif
+   }
+#endif
+   if (link != FTLBS_FREE) {   // See if movement operation is under way
+      block->sector[loffset] = FTLBS_FREE;   // Free up LSN just written before
+      rc = _ftl_moveblock(ftl_dev, lbn, ftl_dev->next);  // completing the move
+   }
+   else {
+      block->sector[loffset] = block->in_use++;
+   }
+   return rc;
+}
+
+
+/*** BeginHeader ftl_InformStatus */
+int ftl_InformStatus(mbr_dev *device, int status);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION *******************************************
+ftl_InformStatus                   <FATFTL.LIB>
+
+SYNTAX:      int ftl_InformStatus(mbr_dev *device, int status);
+
+DESCRIPTION: Function used by cache layer to allow background processing
+             and to request special functions (FTL format or unmount).
+
+PARAMETER1:  device is a pointer to the mbr_dev structure for a device.
+
+PARAMETER2:  status is the device status request passed to FTL from
+             the cache.  Zero is no request and gives status info only.
+             Values other not on list will be treated as zero (status only).
+                 FTLS_STATUS: (0) only delivers status information
+                 FTLS_BACKGROUND: checks for background maintenance
+                 FTLS_ERASE: starts erasure of a physical block (UTILITY USE)
+                  NOTE: Erasing physical blocks on a FTL formatted device will
+                        DESTROY THE FTL IMAGE, the FTL erases blocks internally.
+                        Only use this to prepare a device for re-formatting.
+                 FTLS_FORMAT: forces a low level device format (BLOCKING!!)
+                      Format ALWAYS BLOCKS and must be issued twice to invoke.
+                      After low level format, enumerate device before use.
+                 FTLS_UNMOUNT: specifies that the given device is being
+                        unregistered from the cache and may be unmounted.
+
+RETURNS:	     0 for Success
+              -EINVAL - Invalid parameter value
+              -EIO    - I/O error, device driver may not be initialized
+              -EDEVNOTREG - Device not registered - call ftl_EnumDevice
+              -EBADDATA - uncorrectable data or ECC I/O error
+              -EBUSY if the device is busy.
+              Other negative values possible from internal calls
+
+SEE ALSO:     ftl_EnumDevice, ftl_WriteSector
+*************************************************************************/
+_ftl_debug int ftl_InformStatus(mbr_dev *device, int status)
+{
+   auto char blk_stat;
+   auto int i, j, rc;
+   auto word block, bptr, base_state, discard, max;
+   auto long sector, end;
+   auto char __far *sptr;
+   auto _FTL_Device __far *ftl_dev;
+   auto nf_device nf_dev;
+   auto _FTL_spare spare;      // Spare data structure for sector reads
+
+   assert(device != NULL);
+   if (device->ftl_dev_idx < 0) {
+      return -EDEVNOTREG;     // Device not registered with the FTL
+   }
+   ftl_dev = &(ftl.dev[device->ftl_dev_idx]);
+
+   if (status) {
+      if (status == FTLS_BACKGROUND) {
+         switch (ftl_dev->state & FTLS_MASK) {  // Switch on main state
+            case FTLS_IDLE:   // Idle state - Check/start background timer
+#ifndef FAT_BLOCK
+               if (ftl_dev->sector == FTLSF_IDLE_TIMER) { // BG timer inactive?
+                  if ((MS_TIMER - ftl_dev->dest) > 500) { // Idle for 1/2 sec?
+                     ftl_dev->dest = MS_TIMER;   // Reset device idle timer
+                  }                              // And drop into compact state
+                  else {
+                     break;   // Break and wait for BG timer to reach 1/2 sec
+                  }
+               }
+               else {
+                  // Background timer not intialized, start it now
+                  ftl_dev->sector = FTLSF_IDLE_TIMER; // Set idle timer active
+                  ftl_dev->dest = MS_TIMER;           // And save timestamp
+	               break;
+               }
+#endif
+
+            case FTLS_COMPACT:   // MUST STAY UNDER IDLE STATE FOR DROP THRU
+               // Garbage collection: check erase queue
+               if ((ftl_dev->d_que_head != ftl_dev->d_que_tail) ||
+                   (ftl_dev->discards[ftl_dev->d_que_head] != FTLBS_FREE))
+               {
+                  block = ftl_dev->discards[ftl_dev->d_que_head];
+                  ftl_dev->discards[ftl_dev->d_que_head++] = FTLBS_FREE;
+                  if (ftl_dev->d_que_head == FTL_MAX_DISCARDS) {
+                     ftl_dev->d_que_head = 0;   // Wrap head ptr to start
+                  }
+                  if (_ftl_status(block) == FTL_STAT_DISCARD) {
+                     ftl_dev->sector = _ftl_first(ftl_dev, block);
+                     ftl_dev->state = FTLS_ERASE_CHK;
+#ifdef FTL_VERBOSE
+                     printf("ftl_InformStatus: Erasing queued block %d.\n",
+                               block);
+#endif
+                     ftl_dev->xxx_InformStatus(device, FTLS_ERASE);
+                  }
+                  // See if queue overflow and queue is half empty or more
+                  if (ftl_dev->d_que_over &&
+                       ((ftl_dev->d_que_head <= ftl_dev->d_que_tail ?
+                        (ftl_dev->d_que_tail - ftl_dev->d_que_tail) :
+                        (FTL_MAX_DISCARDS + ftl_dev->d_que_tail -
+                         ftl_dev->d_que_head)) < (FTL_MAX_DISCARDS >> 1)))
+                  {
+                    // Scan for other discarded blocks and add to queue
+                    for (bptr = 0, max = ftl_dev->blocks,
+                          sptr = ftl_dev->status; bptr < max; bptr += 4)
+                    {
+                      blk_stat = *sptr++;    // Get packed block status byte
+                      blk_stat &= blk_stat >> 1;
+                      if (blk_stat) {        // See if any discarded blocks
+                        for (j = 0; blk_stat; j++, blk_stat >>= 2) {
+                          if (blk_stat & 1) {  // If discarded, scan queue
+                            discard = bptr + j;
+                            // If block just erased, move to next block
+                            if (discard == block) { continue; }
+                            for (i = ftl_dev->d_que_head,
+                                   rc = ftl_dev->d_que_tail; i != rc; )
+                            {
+                              if (ftl_dev->discards[i] == discard) {
+                                 break;
+                              }
+                              if (++i == FTL_MAX_DISCARDS) { i = 0; }
+                            }
+                            if (i == rc) {  // See if block not in queue
+                              ftl_dev->discards[rc] = discard;
+                              if (++ftl_dev->d_que_tail==FTL_MAX_DISCARDS) {
+                                ftl_dev->d_que_tail = 0; // Wrap tail ptr
+                              }
+                              if((!(--ftl_dev->d_que_over)) ||
+                                  ftl_dev->d_que_head == ftl_dev->d_que_tail)
+                              {
+                                max = 0;
+                                break;  // No more overflow or room, exit
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+               }
+               else {   // No queued erasures, so look at free space
+                  // Check if current free space is getting very low
+                  if ((ftl_dev->free < (ftl_dev->blocks >> 7))
+                                 && (ftl_dev->state == FTLS_IDLE))
+                  {
+                     rc = _ftl_compact(ftl_dev);
+                  }
+               }
+               break;
+
+            case FTLS_MOVE:   // Continue move operation
+               return _ftl_moveblock(ftl_dev, FTLBS_FREE, 0);
+
+            case FTLS_FORMAT:        // Awaiting format state
+               ftl_dev->state |= 1;  // Set to FTLS_FORMAT+1 and check busy
+
+            default:
+               break;
+         }
+         if (ftl_dev->state == FTLS_COMPACT) {
+            ftl_dev->state = FTLS_IDLE; // Clear compact state if no garbage
+         }
+      }
+      else if (status == FTLS_ERASE) {  // Issue block erase command to device
+         if (!(ftl_dev->state)) {
+#ifdef FTL_VERBOSE
+	         printf("ftl_InformStatus: Direct erase of block %lu.\n",
+   		                  ftl_dev->sector >> ftl_dev->sec_shift);
+#endif
+            ftl_dev->state = FTLS_ERASE_CHK;   // Show erasure has been started
+            ftl_dev->sector &= (-1L) << ftl_dev->sec_shift;
+            ftl_dev->xxx_InformStatus(device, FTLS_ERASE);
+         }
+		}
+      else if (status == FTLS_FORMAT) {
+         if (ftl_dev->state == FTLS_FORMAT) {
+#ifdef FTL_VERBOSE
+            for (i = 0; i < FTL_MAXDEV && &ftl.dev[i] != ftl_dev; i++);
+            printf("ftl_InformStatus: Format device %d.\n", i);
+#endif
+            // Proper second call - Initiate format (Complete Erasure)
+            rc = ftl_dev->xxx_InformStatus(device, FTLS_ERASE);
+            ftl_dev->state = FTLS_UNMOUNT;
+         }
+         else if (ftl_dev->state == FTLS_UNMOUNT)
+         {
+            ftl_dev->state = FTLS_FORMAT;
+            return ftl_dev->xxx_InformStatus(device, 0);
+         }
+      }
+      else if (status == FTLS_UNMOUNT) {
+         rc = 0;
+         if (ftl_dev->state != FTLS_IDLE) {
+		      rc = ftl_InformStatus(device, 0);
+         }
+         if (rc) {
+            return rc;
+         }
+         ftl_dev->state = FTLS_UNMOUNT;
+      }
+#ifdef FTL_VERBOSE
+      else {
+         printf("ftl_InformStatus: Unknown Status %d.\n", status);
+      }
+#endif
+   }
+   else {  // Status is zero
+      if ((ftl_dev->state & FTLS_MASK) == FTLS_MOVE) {
+         return _ftl_moveblock(ftl_dev, FTLBS_FREE, 0);
+      }
+      else if (ftl_dev->state == FTLS_FORMAT) { // See if awaiting format state
+         ftl_dev->state |= 1;    // Set to FTLS_FORMAT+1 and drop to check busy
+      }
+   }
+
+   rc = ftl_dev->xxx_InformStatus(device, 0);
+
+   base_state = ftl_dev->state & FTLS_MASK;
+   if (base_state == FTLS_ERASE_CHK) {
+      if (!rc) {
+         block = _ftl_blocknum(ftl_dev, ftl_dev->sector);  // Get block erased
+         _ftl_markfree(block);          // Free block in status array
+         ftl_dev->free++;               // And add to free block count
+         ftl_dev->state = FTLS_IDLE;    // Erase complete, return to idle state
+      }
+      else {
+         if (rc == -EERASEFAIL) {            // Did the erasure fail?
+	         ftl_dev->state = FTLS_BADBLOCK;  // Yes, then mark block bad
+	         rc = _ftl_mark_bad(ftl_dev);
+         }
+      }
+   }
+   if (base_state == FTLS_BADBLOCK)
+   {
+      if (!rc) {                        // If not busy and no errors then
+         rc = _ftl_mark_bad(ftl_dev);   // Drive block marking to completion
+      }
+   }
+   else {
+	   if (!rc) {
+   	   if (ftl_dev->state != FTLS_UNMOUNT) {
+      	   ftl_dev->state = FTLS_IDLE;    // Go back to idle state
+
+      	}
+      }
+   }
+
+   return rc;
+}
+
+/**************************************************************************/
+/* Start of internal FTL functions.                                       */
+/**************************************************************************/
+
+/*** BeginHeader _ftl_blankcheck */
+int _ftl_blankcheck(_FTL_Device __far *ftl_dev);
+/*** EndHeader */
+
+/*************************************************************************
+_ftl_blankcheck                   <FATFTL.LIB>
+
+SYNTAX: int _ftl_blankcheck(_FTL_Device far *ftl_dev);
+
+DESCRIPTION: Internal function to check a block on a device which is
+             marked as free, but appears to not be erased.  This will
+             check the first and second sectors to verify that the block
+             is erased.  If the first sector on the device is not erased,
+             it will check for an original FAT MBR record.  If found, it
+             will report the device having a format type error.  There is
+             an auto erase mechanism that will make a single attempt at
+             re-erasing the block if it appears an erasure was attempted
+             but didn't succeed.  If block fails this erase attempt, it
+             is marked bad both on the device and in the status table,
+             then -EBADBLOCK is returned.  This function makes no
+             adjustments to free or bad block counts for the device.
+             The caller should handle this bookkeeping if an -EBADBLOCK
+             status is returned.
+
+             This is a blocking function!
+
+PARAMETER1:  ftl_dev is a far pointer to the FTL device structure.
+               NOTE: ftldev->sector must be set to first sector of the
+                     block to be checked before calling this function!!
+
+RETURNS:	     0 if re-erased and recovered as a usable free block
+              -EIO      - I/O error, device driver may not be initialized
+              -EINVAL    - invalid argument
+              -EBADDATA  - uncorrectable data or ECC I/O error
+              -EBADBLOCK - block has gone bad and has been marked
+              -ECORRUPT  - block appears to be written with corrupt data
+              -ETYPE     - device has an original FAT format - not FTL
+*************************************************************************/
+_ftl_debug int _ftl_blankcheck(_FTL_Device __far *ftl_dev)
+{
+   auto int i, rc, rc2, buf[FAT_LBASIZE/2];
+   auto _FTL_spare spare;
+
+   assert(ftl_dev != NULL);
+#ifdef FTL_VERBOSE
+	printf("_ftl_blankcheck: Block %lu being checked.\n",
+                       ftl_dev->sector >> ftl_dev->sec_shift);
+#endif
+   for (i = 0; i < 2; i++) {
+	   while ((rc = ftl_dev->xxx_ReadSector(ftl_dev->sector, (char __far *)&buf,
+                        (char __far *)&spare, ftl_dev->dev)) == -EBUSY);
+	   if (rc && rc != -EBADDATA) {
+	      return rc;
+	   }
+      if (i) {
+         if (rc || spare.std.spare_ecc != 0xFFFF) {
+            i = 2;   // Show erasure failed and exit loop
+            break;
+         }
+      }
+      else { // If checking sector 0, see if MBR exists with invalid spare data
+	      if (!ftl_dev->sector && buf[255] == 0xAA55 &&
+	                !memcmp(mbr_start, (char __far *)buf, 0xE0)) {
+	         return -ETYPE;  // MBR found on sector 0 - Invalid file system type
+	      }
+      }
+	   while ((rc2 = ftl_dev->xxx_ReadSector(ftl_dev->sector + 1,
+               (char __far *)&buf, (char __far *)&spare, ftl_dev->dev)) == -EBUSY);
+      if (!rc && !rc2 && spare.std.spare_ecc == 0xFFFF) {
+         return 0;   // Block appears to be erased, use as a free block
+      }
+	   if (!i && (rc || spare.std.spare_ecc == 0xFFFF || rc2 == -EBADDATA)) {
+         ftl_dev->state = FTLS_ERASE_CHK;
+         rc = ftl_dev->xxx_InformStatus(ftl_dev->dev,FTLS_ERASE); // Erase block
+	   }
+   }
+   if (i == 2) {   // Attempted re-erase and still had problems, mark bad block
+      if (ftl_dev->sec_shift == 5) {   // Set bad block marker in spare data
+         spare.small.badinfo = 0xE6;
+      }
+      else {
+         spare.std.badinfo = 0xE6;
+      }
+      spare.std.spare_ecc = calculateECC8((char __far *)&spare);
+      // Write bad block marker to device so block will not be used
+      rc = ftl_dev->xxx_WriteSector(ftl_dev->sector, (char __far *)&buf,
+                                         (char __far *)&spare, ftl_dev->dev, 0);
+	   while (rc == -EBUSY) {
+	      rc = ftl_dev->xxx_InformStatus(ftl_dev->dev, 0);
+	   }   // Drive write thru to completion
+      _ftl_markstatus(_ftl_blocknum(ftl_dev, ftl_dev->sector), FTL_STAT_BAD);
+#ifdef FTL_VERBOSE
+		printf("_ftl_blankcheck: Block %lu marked as bad.\n",
+                       ftl_dev->sector >> ftl_dev->sec_shift);
+#endif
+      rc = -EBADBLOCK;
+   }
+   if (!rc && !rc2) {
+#ifdef FTL_VERBOSE
+		printf("_ftl_blankcheck: Block %lu is corrupted.\n",
+                       ftl_dev->sector >> ftl_dev->sec_shift);
+#endif
+      rc = -ECORRUPT;
+   }
+   return (rc ? rc : rc2);
+}
+
+
+/*** BeginHeader _ftl_compact */
+int _ftl_compact(_FTL_Device __far *ftl_dev);
+/*** EndHeader */
+
+/*************************************************************************
+_ftl_compact                   <FATFTL.LIB>
+
+SYNTAX: int _ftl_compact(_FTL_Device far *ftl_dev);
+
+DESCRIPTION: Internal function to free/compact blocks on a device.  This
+             will scan primary/secondary pairs and initiate a move of the
+             pair with the highest garbage count to a single primary block.
+
+PARAMETER1:  ftl_dev is a far pointer to the FTL device structure.
+
+RETURNS:	     0 for Success
+              -EIO      - I/O error, device driver may not be initialized
+              -EINVAL   - invalid argument
+              -EBADDATA - uncorrectable data or ECC I/O error
+              -ENOSPC   - No space remaining on the device
+              -EBUSY if the device is busy.
+*************************************************************************/
+_ftl_debug int _ftl_compact(_FTL_Device __far *ftl_dev)
+{
+   auto int i, entry, rc, small;
+   auto word block, lbn, gmax;
+   auto long sector, last;
+   auto char buffer[FTL_SECSIZE];
+   auto _FTL_BlockInfo __far *info; // Pointer to block info entry to fill in
+   auto _FTL_spare sparebuf;
+
+   assert(ftl_dev != NULL);
+#ifdef FTL_VERBOSE
+		printf("_ftl_compact: -----------.\n");
+#endif
+   if (!ftl_dev->second_cnt) {
+      return 0;       // Device has no secondaries, no compacting available
+   }
+   if (ftl_dev->state != FTLS_IDLE) {
+      return -EBUSY;  // Must wait for device to become idle for compacting
+   }
+   if (!ftl_dev->free) {
+      // No blocks to relocate to, must erase one from discard queue
+      ftl_dev->state = FTLS_COMPACT;
+      rc = ftl_InformStatus(ftl_dev->dev, FTLS_BACKGROUND);
+      if (rc) { return rc; }
+      if (!ftl_dev->free) { // Did forced discard queue processing free anything
+         return -ENOSPC;    // If not, device is full
+      }
+   }
+   // Find highest garbage count in the secondary block list
+	for (i = 0, entry = 0, gmax = 0; i < ftl_dev->second_cnt; i++) {
+      if (ftl_dev->second[i].garbage > gmax) {
+         gmax = ftl_dev->second[i].garbage;
+         entry = i;
+      }
+   }
+
+   if ((rc = _ftl_findblock(ftl_dev, ftl_dev->second[entry].pbn)) < 0) {
+      return rc;
+   }
+   // Device is not busy, start new block movement operation
+   info = &ftl.block[rc];     // Get block info pointer for block to move
+
+   // Initiate move of primary/secondary pair with highest garbage count
+   rc = _ftl_getblock(ftl_dev, 0, FTLGB_FIND | FTLGB_COMPACT); //Find free block
+   if (rc) { return rc; }
+   block = ftl_dev->next;     // Save PBN of new primary block
+
+   small = (ftl_dev->sec_shift == FTL_SBN_SHIFT ? 1 : 0);  // Small block flag
+   // Setup discard marker for end of secondary block
+   if (small) {
+      *((word *)&sparebuf.small.lsn[1]) = FTLBS_DISCARD;
+      sparebuf.small.link = block;
+      sparebuf.small.badinfo = 0xFF;
+      sparebuf.small.resv = 0xFF;
+      sparebuf.small.gcount = gmax;
+   } else {
+      *((word *)&sparebuf.std.lsn[1]) = FTLBS_DISCARD;
+      sparebuf.std.link = block;
+      sparebuf.std.badinfo = 0xFF;
+      sparebuf.std.resv = 0xFF;
+      sparebuf.std.gcount = gmax;
+   }
+   _nf_updateECCs(buffer, (char __far *)&sparebuf);
+   // Write last sector of secondary block with discard marker
+   sector = _ftl_last(ftl_dev, ftl_dev->second[entry].sbn);
+   rc = ftl_dev->xxx_WriteSector(sector, (char __far *)buffer,
+	                                (char __far *)&sparebuf, ftl_dev->dev, 0);
+   while (rc == -EBUSY) {
+      rc = ftl_dev->xxx_InformStatus(ftl_dev->dev, 0);
+   }   // Drive write thru to completion
+   if (rc) { return rc; }
+
+   // Find first used sector from block to be moved
+   for (i = 0; i < FTL_MAXSECTORS && info->sector[i] == FTLBS_FREE; i++);
+   rc = (int)info->sector[i];
+   if (rc < FTL_MAXSECTORS) {
+      sector = _ftl_first(ftl_dev, ftl_dev->second[entry].pbn) + rc;
+   }
+   else {
+      sector = _ftl_first(ftl_dev, ftl_dev->second[entry].sbn) +
+                  rc - FTL_MAXSECTORS;
+   }
+
+   // Read first used sector from block to be moved
+   while ((rc = ftl_dev->xxx_ReadSector(sector, (char __far *)buffer,
+                          (char __far *)&sparebuf, ftl_dev->dev)) == -EBUSY);
+   if (rc) { return rc; }
+   // Write first used sector of movement block to new primary block
+   _ftl_setLink(small, sparebuf, ftl_dev->second[entry].pbn);
+   _ftl_setCount(small, sparebuf, 0);
+   sparebuf.std.spare_ecc = calculateECC8((char __far *)&sparebuf);
+   lbn = _ftl_getLBN(small, sparebuf);
+   rc = ftl_dev->xxx_WriteSector(_ftl_first(ftl_dev, block),
+              (char __far *)buffer, (char __far *)&sparebuf, ftl_dev->dev, 0);
+   while (rc == -EBUSY) {
+      rc = ftl_dev->xxx_InformStatus(ftl_dev->dev, 0);
+   }   // Drive write thru to completion
+   info->sector[i] = FTLBS_FREE;    // Mark first moved sector as free
+
+   rc = _ftl_moveblock(ftl_dev, lbn, block);   // Complete the move
+   return rc;
+}
+
+/*** BeginHeader _ftl_discardblock */
+void _ftl_discardblock(_FTL_Device __far *ftl_dev, word pbn);
+/*** EndHeader */
+
+/*************************************************************************
+_ftl_discardblock                   <FATFTL.LIB>
+
+SYNTAX: void _ftl_discardblock(_FTL_Device far *ftl_dev, word pbn);
+
+DESCRIPTION: Internal function to discard a physical block.  This will
+             add the block to the discard queue unless there is no room.
+             In this case, the block will be marked as discarded and
+             added to the queue overflow count.
+
+PARAMETER1:  ftl_dev is a far pointer to the FTL device structure.
+
+PARAMETER2:  pbn is the physical block number of the block to discard.
+
+RETURNS:	     0 for Success
+              -EIO      - I/O error, device driver may not be initialized
+              -EINVAL   - invalid argument
+*************************************************************************/
+_ftl_debug void _ftl_discardblock(_FTL_Device __far *ftl_dev, word pbn)
+{
+   assert(ftl_dev != NULL);
+   // See if there is any space in the discards queue
+   if ((ftl_dev->d_que_head == ftl_dev->d_que_tail) &&
+          (ftl_dev->discards[ftl_dev->d_que_tail] != FTLBS_FREE)) {
+	   // Discards queue is full so add to overflow
+      ftl_dev->d_que_over++;
+#ifdef FTL_VERBOSE
+		printf("_ftl_discardblock: Discarded block %d.\n", pbn);
+#endif
+   }
+   else {     // Free entry found, add to discard queue
+      ftl_dev->discards[ftl_dev->d_que_tail++] = pbn;
+      if (ftl_dev->d_que_tail == FTL_MAX_DISCARDS) {
+         ftl_dev->d_que_tail = 0;
+      }
+#ifdef FTL_VERBOSE
+		printf("_ftl_discardblock: Queued block %d.\n", pbn);
+#endif
+   }
+   _ftl_markdiscard(pbn);    // Set discard code on the current block
+   return;
+}
+
+/*** BeginHeader _ftl_findblock */
+int _ftl_findblock(_FTL_Device __far *ftl_dev, word pbn);
+/*** EndHeader */
+
+/*************************************************************************
+_ftl_findblock                   <FATFTL.LIB>
+
+SYNTAX: int _ftl_findblock(_FTL_Device far *ftl_dev, word pbn);
+
+DESCRIPTION: Internal function to find a primary block in the block info
+             structure.  If it is not already in the structure, an entry
+             will be built for the specified primary block.
+
+PARAMETER1:  ftl_dev is a far pointer to the FTL device structure.
+
+PARAMETER2:  pbn is the physical block number of the block to locate.
+
+RETURNS:	     Index of ftl.block[] entry for the given LBN on success
+              -EIO      - I/O error, device driver may not be initialized
+              -EINVAL   - invalid argument
+              -EPERM    - pbn was discarded, must be erased before re-use
+              -EBADDATA - uncorrectable data or ECC I/O error
+              -EBUSY if the device is busy.
+*************************************************************************/
+_ftl_debug int _ftl_findblock(_FTL_Device __far *ftl_dev, word pbn)
+{
+   auto int dn, small;
+   auto int i, j, rc;
+   auto word mask, sbn;
+   auto long sector;
+   auto _FTL_spare spare;          // Spare data structure for sector reads
+   auto _FTL_BlockInfo __far *block; // Pointer to block info entry to fill in
+   auto char buf[FAT_LBASIZE];     // Sector read buffer
+
+   assert(ftl_dev != NULL);
+   for (dn = 0; dn < FTL_MAXDEV; dn++) {  // Find device number of ftl_dev
+      if (ftl_dev == (&(ftl.dev[dn]))) {
+         break;                           // Exit if device number is found
+      }
+      if (dn == FTL_MAXDEV) {
+         return -EINVAL;                  // Device not found, ftl_dev invalid
+      }
+   }
+   if (ftl_dev->state && (ftl_dev->state & 0x7000) != FTLS_SCAN) {
+      return -EBUSY;                      // Device busy with other operation
+   }
+   if (ftl_dev->state == FTLS_IDLE)
+   {
+	   // Scan for matching PBN entry on proper FTL device
+	   for (i = 0; i < ftl.block_ptr && !(ftl.block[i].pbn == pbn &&
+                    ftl.block[i].devnum == dn); i++);
+	   if (i == ftl.block_ptr) {
+	      // Block entry not found, create in block info cache from device
+	      if (i == FAT_MAXBUFS) {
+	         // Block info structure is full, replace oldest block (LRU)
+            block = ftl.oldest;
+            i = (int)((long)block - (long)ftl.block) / sizeof(_FTL_BlockInfo);
+#ifdef FTL_VERBOSE
+     			printf("_ftl_findblock: Replace block info (%d -> %d).\n",
+                      block->pbn, pbn);
+#endif
+            ftl.oldest = block->younger;    // Remove oldest from list
+            block->younger->older = (_FTL_BlockInfo __far *)&ftl.oldest;
+	      }
+	      else {
+            block = &ftl.block[i];        // Setup block pointer
+            ftl.block_ptr++;        // Structure not full, add to end
+	      }
+         // Insert block at beginning of LRU list (Most Recently Used)
+         block->older = ftl.youngest;
+         block->younger = (_FTL_BlockInfo __far *)&ftl.no_younger;
+         ftl.youngest->younger = block;
+         ftl.youngest = block;
+	   }
+      else {  // Desired block already exists in block info cache
+         block = &ftl.block[i];        // Setup block pointer
+         if (ftl.youngest != block) {  // If not youngest, then make youngest
+            // Remove block from list
+            block->older->younger = block->younger;
+            block->younger->older = block->older;
+	         // Insert block at beginning of LRU list (Most Recently Used)
+	         block->older = ftl.youngest;
+	         block->younger = (_FTL_BlockInfo __far *)&ftl.no_younger;
+	         ftl.youngest->younger = block;
+	         ftl.youngest = block;
+         }
+         return i;
+      }
+      ftl_dev->state = FTLS_SCAN + (i << 2);  // Embed block index in scan state
+   }  // End of if (ftl_dev->state == FTLS_IDLE)
+   else {
+      i = (ftl_dev->state & 0x0FFF) >> 2;     // Get block index from scan state
+      block = &ftl.block[i];
+      if ((ftl_dev->state & 3) == 1) {  // Check for alternate entry condition
+         sbn = FTLBS_SECONDARY;         // If found, find secondary block
+         if (!_ftl_secondary(ftl_dev, pbn, &sbn)) {
+            block->sentry = &ftl_dev->second[sbn];   // Save ptr to entry
+         }
+      }
+   }
+   small = (ftl_dev->sec_shift == FTL_SBN_SHIFT ? 1:0); // 1 if small block
+   mask = (word)(ftl_dev->dev->sec_block - 1);          // Sector offset mask
+   block->devnum = dn;                                  // Save device number
+
+   // Scan host block(s) and build the block info entries
+   while (ftl_dev->state != FTLS_IDLE) {
+      switch (ftl_dev->state & 3) {
+         case 0:
+            // Need to check for secondary, get last sector of primary block
+            ftl_dev->sector = _ftl_last(ftl_dev, pbn);
+            _ftl_ReadSpare(ftl_dev, ftl_dev->sector, spare, rc);
+	         if (rc < 0) {
+	            return rc;
+	         }
+            block->sentry = NULL;    // Initially assume no secondary block
+            if (_ftl_getLBS(small, spare) != FTLBS_FREE) { // Is primary full?
+               sbn = FTLBS_SECONDARY;   // Yes, check for secondary block
+               if (!_ftl_secondary(ftl_dev, pbn, &sbn)) {
+                  block->sentry = &ftl_dev->second[sbn];   // Save ptr to entry
+	               ftl_dev->sector = _ftl_first(ftl_dev, block->sentry->sbn);
+	               ftl_dev->state++;
+               }
+            }
+            if (!(ftl_dev->state & 1)) {
+	            ftl_dev->sector = _ftl_first(ftl_dev, pbn);
+               _f_memset(&block->sector[0], 0xFF, FTL_MAXSECTORS * 2);
+               ftl_dev->state += 2;   // No secondary, scan the primary block
+            }
+            block->pbn = pbn;  // Save physical block number in block info entry
+            block->in_use = 0;
+            block->garbage = 0;
+            break;
+
+         case 1:   // Setup primary block map from first sector of secondary
+            rc = ftl_dev->xxx_ReadSector(ftl_dev->sector, (char __far *)&buf,
+	                                        (char __far *)&spare, ftl_dev->dev);
+            if (rc < 0) {
+#ifdef FTL_VERBOSE
+      			printf("_ftl_findblock: Error reading block %d map data (%d).\n",
+                      pbn, rc);
+#endif
+               return rc;
+            }
+            block->in_use = FTL_MAXSECTORS;   // Show primary in full usage
+            _f_memcpy(block->sector, (char __far *)buf, FTL_MAXSECTORS<<1);
+            block->garbage = _ftl_getCount(small, spare) + 1;
+            ftl_dev->sector++;
+            ftl_dev->state++;  // Set to scan state and drop thru
+
+         default:  // Complete block map with scan of block
+            _ftl_ReadSpare(ftl_dev, ftl_dev->sector, spare, rc);
+            if (rc < 0) {
+#ifdef FTL_VERBOSE
+      			printf("_ftl_findblock: Error reading block %d info (%d).\n",
+                      pbn, rc);
+#endif
+               return rc;
+            }
+            if (_ftl_getLBS(small, spare) < FTLBS_DISCARD) {
+               j = _ftl_getOffset(small,spare);
+               if (block->sector[j] != FTLBS_FREE) {
+                  block->garbage++;
+               }
+               block->sector[j] = ((*((word __far *)&ftl_dev->sector)) & mask) +
+                                    block->in_use;
+               if (!(((word)(++ftl_dev->sector)) & mask)) {
+                  block->in_use = FTL_MAXSECTORS;  // Full primary block
+                  ftl_dev->state = FTLS_IDLE;      // Scan completed
+#ifdef FTL_VERBOSE
+         			printf("_ftl_findblock: Added block %d info (U=%d, G=%d).\n",
+                            pbn, block->in_use, block->garbage);
+#endif
+               }
+            }
+            else {
+               if (_ftl_getLBS(small, spare) == FTLBS_DISCARD &&
+                    (ftl_dev->state & (FTLS_ENUM_SCAN+3)) != (FTLS_ENUM_SCAN+1))
+               {  // Attempted use of discarded block outside of fixmove
+                  block->pbn = FTLBS_FREE;      // Invalidate block info entry
+	               ftl.youngest = block->older;  //  and make oldest in list
+	               ftl.youngest->younger=(_FTL_BlockInfo __far *)&ftl.no_younger;
+                  block->younger = ftl.oldest;
+                  ftl.oldest->older = block;
+                  ftl.oldest = block;
+                  block->older = (_FTL_BlockInfo __far *)&ftl.no_older;
+                  i = -EPERM;     // Show pbn discarded and needs to be erased
+               }
+               else {
+	               block->in_use += ((*((word __far *)&ftl_dev->sector)) & mask);
+	               if (block->sentry) { // Does secondary entry exist?
+	                  block->sentry->garbage = block->garbage; // Update garbage
+	               }
+#ifdef FTL_VERBOSE
+	               printf("_ftl_findblock: Added block %d info (U=%d, G=%d).\n",
+	                         pbn, block->in_use, block->garbage);
+#endif
+					}
+               ftl_dev->state = FTLS_IDLE;      // Scan completed
+            }
+            break;
+      }
+   }
+
+   return i;
+}
+
+
+/*** BeginHeader _ftl_fixmove */
+int _ftl_fixmove(_FTL_Device __far *ftl_dev, word pbn, word sbn, word dbn);
+/*** EndHeader */
+
+/*************************************************************************
+_ftl_fixmove                   <FATFTL.LIB>
+
+SYNTAX: int _ftl_fixmove(_FTL_Device far *ftl_dev, word pbn, word sbn,
+                           word dbn);
+
+DESCRIPTION: Internal function to scan discarded block(s) and verify
+             that the move was completed.  If not, the move operation
+             is completed.  It also adds the discarded blocks to the
+             discard queue.
+
+             NOTE: This is a blocking function!!!
+
+PARAMETER1:  ftl_dev is a far pointer to the FTL device structure.
+
+PARAMETER2:  pbn is the physical block number of the primary that was moved.
+
+PARAMETER3:  sbn is the physical block number of the secondary that was moved.
+                 (FTLBS_FREE if no secondary was involved)
+
+PARAMETER4:  dbn is the physical block number of the destination primary block.
+
+RETURNS:	     0 for Success
+              -EIO      - driver for the device is not initialized
+              -EINVAL   - invalid argument
+              -EBADDATA - uncorrectable data or ECC I/O error
+              -ENOSPC   - no room to add new primary/secondary block
+              -EEXIST   - primary block already has a secondary block
+              -EBUSY if the device is busy.
+*************************************************************************/
+_ftl_debug int _ftl_fixmove(_FTL_Device __far *ftl_dev, word pbn, word sbn,
+                              word dbn)
+{
+   static long saved_sector;       // Static variables for saving incoming
+   static word saved_state;        //  ftl_dev->sector & ftl_dev->state values
+   auto int rc, small;
+   auto word i, j, lbn;
+   auto long sector;
+   auto _FTL_BlockInfo __far *block; // Pointer to block info entry to fill in
+   auto _FTL_spare spare;          // Spare data structure for sector reads
+   auto char buf[FTL_SECSIZE];     // Sector data buffer
+
+   assert(ftl_dev != NULL);
+   small = (ftl_dev->sec_shift == FTL_SBN_SHIFT ? 1 : 0);  // 1 if small block
+   if (ftl.block_ptr < FAT_MAXBUFS) {
+      for (j = 0; (j < FTL_MAXDEV) && (ftl_dev != &ftl.dev[j]); j++);
+      if (j >= FTL_MAXDEV) {
+         return -EINVAL;
+      }
+      i = ftl.block_ptr++;         // Unused block, use it in background
+      block = &ftl.block[i];       // Setup pointer to block info entry
+      block->devnum = j;
+   }
+   else {
+	   // Block info structure is full, use oldest block (LRU) and overwrite
+      block = ftl.oldest;
+      i = (int)((long)block - (long)ftl.block) / sizeof(_FTL_BlockInfo);
+   }
+   saved_sector = ftl_dev->sector; // Save incoming values to restore later
+   saved_state = ftl_dev->state;
+   block->pbn = pbn;               // Save physical/secondary blocks
+   // Embed block index with secondary scan state for call to _ftl_findblock
+   ftl_dev->state = FTLS_ENUM_SCAN + (i << 2) + 1;
+   if (sbn == FTLBS_FREE) {        // Is there a secondary block?
+      ftl_dev->state++;            // No, change to primary scan state and clear
+      block->sentry = NULL;
+      _f_memset(&block->sector[0], 0xFF, FTL_MAXSECTORS * 2);  // sector map
+	   block->in_use = 0;
+      block->garbage = 0;
+   }
+   else {
+      _ftl_secondary(ftl_dev, pbn, &sbn);  // Add secondary block entry
+   }
+   do {
+      rc = _ftl_findblock(ftl_dev, pbn);   // Setup sector map in block info
+   } while (rc == -EBUSY);
+
+   j = block->in_use - (block->garbage + 1); // Get last active sector offset
+   ftl_dev->sector = _ftl_first(ftl_dev, dbn) + j; // Get last active sector
+   _ftl_ReadSpareNB(ftl_dev, ftl_dev->sector, spare, rc);
+   if (rc) { goto _ftl_fixexit; }  // Restore sector/state and exit w/error
+   if (_ftl_getLBS(small, spare) < FTLBS_RESERVED) { // Did move complete?
+      // Is sector valid based on source mapping?
+      if (block->sector[_ftl_getOffset(small, spare)] != FTLBS_FREE) {
+         lbn = _ftl_getLBN(small, spare);        // Get logical block number
+         sector = _ftl_first(ftl_dev, pbn);      // Read first sector
+         _ftl_ReadSpareNB(ftl_dev, sector, spare, rc);
+		   if (rc) { goto _ftl_fixexit; }  // Restore sector/state & exit w/error
+         if (lbn == _ftl_getLBN(small, spare) ||
+                _ftl_getLBN(small, spare) == FTLBS_FREE) {
+	         goto _ftl_moved;
+         }
+      }
+   }
+   // Fix copy, erase destination block (blocking until erasure is completed)
+   rc = ftl_dev->xxx_InformStatus(ftl_dev->dev, FTLS_ERASE);
+   while (rc == -EBUSY) {
+      rc = ftl_dev->xxx_InformStatus(ftl_dev->dev, 0);
+   }
+   for (j = 0; j < FTL_MAXSECTORS && block->sector[j] == FTLBS_FREE; j++);
+   if (block->sector[j] < FTL_MAXSECTORS) {
+      sector = _ftl_first(ftl_dev, pbn) + block->sector[j];
+   }
+   else {
+      sector = _ftl_first(ftl_dev, sbn) + block->sector[j] - FTL_MAXSECTORS;
+   }
+   do {
+      rc = ftl_dev->xxx_ReadSector(sector, (char __far *)&buf,
+                                     (char __far *)&spare, ftl_dev->dev);
+   } while (rc == -EBUSY);
+   if (rc) { goto _ftl_fixexit; }    // Restore sector/state and exit w/error
+   lbn = _ftl_getLBN(small, spare);  // Get logical block number
+   if (ftl_dev->locate[lbn] == FTLBS_FREE || ftl_dev->locate[lbn] == dbn) {
+      ftl_dev->locate[lbn] = pbn;    // Setup link to discarded PBN for move
+   }
+   else {  // Destination block has been replaced - just delete discarded block
+      sector = _ftl_first(ftl_dev, pbn);
+	   _ftl_ReadSpareNB(ftl_dev, sector, spare, rc);
+   	if (rc) { goto _ftl_fixexit; }  // Restore sector/state and exit w/error
+      if (_ftl_getLBN(small, spare) == pbn) {
+		   _ftl_discardblock(ftl_dev, pbn);      // Delete primary block
+      }
+      if (sbn != FTLBS_FREE) {
+   	   _ftl_discardblock(ftl_dev, sbn);      // Delete secondary block
+      }
+      goto _ftl_fixexit;
+   }
+   sector = _ftl_first(ftl_dev, dbn);
+   _ftl_setLink(small, spare, pbn);
+   spare.std.spare_ecc = calculateECC8((char __far *)&spare);
+   // Write first sector back to destination block then move rest of block
+   rc = ftl_dev->xxx_WriteSector(sector, (char __far *)&buf,
+                                  (char __far *)&spare, ftl_dev->dev, 0);
+   while (rc == -EBUSY) {
+      rc = ftl_dev->xxx_InformStatus(ftl_dev->dev, 0);
+   }
+   do {
+      rc = _ftl_moveblock(ftl_dev, lbn, dbn); // Move block to destination
+   } while (rc == -EBUSY);
+
+   if (!rc) {
+_ftl_moved:
+      _ftl_discardblock(ftl_dev, pbn);         // Delete source primary
+      if (sbn != FTLBS_FREE) {
+         sbn = FTLBS_FREE;    // Use pbn for _ftl_secondary removal option
+         _ftl_secondary(ftl_dev, pbn, &sbn);   // Remove secondary entry
+         _ftl_discardblock(ftl_dev, sbn);      // Delete source secondary
+      }
+      ftl_dev->locate[lbn] = dbn;    // Set location map to destination block
+   }
+_ftl_fixexit:
+   if (block == ftl.oldest) {
+      block->pbn = FTLBS_FREE;        // Invalidate oldest block for re-use
+      block->sentry = NULL;
+   }
+   else {
+      ftl.block_ptr--;
+   }
+   ftl_dev->sector = saved_sector;    // Restore original sector value
+   ftl_dev->state = saved_state;      // Restore original device state
+   return rc;
+}
+
+
+/*** BeginHeader _ftl_getblock */
+int _ftl_getblock(_FTL_Device __far *ftl_dev, word lbn, word option);
+/*** EndHeader */
+
+/*************************************************************************
+_ftl_getblock                   <FATFTL.LIB>
+
+SYNTAX: int _ftl_getblock(_FTL_Device far *ftl_dev, word lbn, word option);
+
+DESCRIPTION: Internal function to get free block and assign it to the
+             given logical block number (unless FTLGB_FIND flag is set).
+             Updates 'next' value in device structure to point to the
+             free block found.  If free space is exhausted, it will
+             call _ftl_compact to compact the space already in use to
+             create new free blocks.
+
+PARAMETER1:  ftl_dev is a far pointer to the FTL device structure.
+
+PARAMETER2:  lbn is the logical block number of the block to assign.
+
+PARAMETER3:  option is a set of flags for customizing the operation
+               FTLGB_BLOCK - If erasure is needed, block during the operation
+               FTLGB_SECOND - New block is added to lbn as a secondary block
+                            (lowest 12 bits contain block info entry index)
+               FTLGB_FIND - Verify ftl_dev->next is a free block and if not,
+                            find next free block and save in ftl_dev->next
+                            Does not assign block as primary/secondary of LBN
+                            but does mark block as 'in use' in status array.
+
+RETURNS:	     0 for Success
+              -EIO      - I/O error, device driver may not be initialized
+              -EINVAL   - invalid argument
+              -EBADDATA - uncorrectable data or ECC I/O error
+              -ENOSPC   - no room to add new primary/secondary block
+              -EEXIST   - primary block already has a secondary block
+              -EBUSY if the device is busy.
+*************************************************************************/
+_ftl_debug int _ftl_getblock(_FTL_Device __far *ftl_dev, word lbn, word option)
+{
+   auto int rc, small;
+   auto word block, start, bad;
+   auto _FTL_spare spare;      // Spare data structure for sector reads
+
+   assert(ftl_dev != NULL);
+   // Check that primary is not assigned (unless Find or Secondary options set)
+   if ((!(option & (FTLGB_SECOND | FTLGB_FIND))) &&
+          ftl_dev->locate[lbn] != FTLBS_FREE) {
+      return 0;                // Logical block already has a primary, return
+   }
+#ifdef FTL_VERBOSE
+   if (option & FTLGB_FIND) {
+  		printf("_ftl_getblock: Free block find request.\n", lbn);
+   } else if (option & FTLGB_SECOND) {
+  		printf("_ftl_getblock: LBN %d secondary request.\n", lbn);
+   } else {
+	  	printf("_ftl_getblock: LBN %d get request.\n", lbn);
+   }
+#endif
+   // See if block is available (conditions based on primary/secondary request)
+   if (ftl_dev->free < ((option & FTLGB_SECOND) ? 4 : 2)) {
+      if (ftl_dev->state) {
+         rc = ftl_InformStatus(ftl_dev->dev, 0);
+      }
+      else {
+         ftl_dev->state = FTLS_COMPACT;   // Set to garbage collection state
+         rc = ftl_InformStatus(ftl_dev->dev, FTLS_BACKGROUND);
+         if (!rc && ftl_dev->state == FTLS_IDLE) { // No discards, must compact
+	         if (!option & FTLGB_COMPACT) {
+	            rc = _ftl_compact(ftl_dev);
+	         }
+         }
+      }
+      if (rc) { return rc; }
+      if (!ftl_dev->free) {
+         return -ENOSPC;
+      }
+   }
+   small = (ftl_dev->sec_shift == FTL_SBN_SHIFT ? 1 : 0);  // 1 if small block
+   block = start = ftl_dev->next;
+
+   while (1) {
+      while (!_ftl_isfree(block)) {      // Scan until next free block is found.
+         if ((++block) >= ftl_dev->blocks) {
+            block = 0;                   // Wrap block pointer if at maximum
+         }
+         if (block == start) {           // No free space found on device
+            ftl_dev->free = 0;           // Correct free block count
+            return -EBUSY;               // Return -EBUSY to get recalled
+         }
+      }
+      ftl_dev->next = block;             // Save next free block to allocate
+
+	   rc = ftl_dev->xxx_ReadSector((((long)block) << ftl_dev->sec_shift),
+	                             (long)NULL, (char __far *)&spare, ftl_dev->dev);
+      if (rc) { return rc; }
+      // Verify the next free block is really free
+      if (_ftl_getLBS(small, spare) == FTLBS_FREE) {
+         if (!(option & FTLGB_FIND)) {   // Skip linking if find flag is set
+	         if (option & FTLGB_SECOND) { // See if adding as secondary
+	            option &= 0x0FFF;         // Mask to get block info index value
+	            rc = _ftl_secondary(ftl_dev, ftl.block[option].pbn, &block);
+	            if (rc) { return rc; }
+               // Add link to new secondary block
+	            ftl.block[option].sentry =
+                                   &ftl_dev->second[ftl_dev->second_cnt - 1];
+	         }
+	         else {
+	            ftl_dev->locate[lbn] = block;  // Link to lbn as primary block
+	         }
+#ifdef FTL_VERBOSE
+	         printf("_ftl_getblock: LBN %d assigned to block %d, free=%d.\n",
+	                     lbn, block, ftl_dev->free - 1);
+#endif
+			}
+	      _ftl_markused(block);        // Mark block as now in use
+	      ftl_dev->free--;             // Adjust number of free blocks on device
+         break;
+      }
+      else {   // Block marked as free, but not erased - Fix status entry
+         bad = _ftl_getLBS(small,spare);
+         if (bad < FTLBS_RESERVED) {
+            bad = _ftl_getLBN(small,spare);
+	         if (bad < ftl_dev->locate_size && ftl_dev->locate[bad] == block) {
+	            _ftl_markused(block);     // Block in locate, so mark as used
+#ifdef FTL_VERBOSE
+	            printf("_ftl_getblock: PBN %d not free, re-linked to LBN %d.\n",
+	                         block, bad);
+#endif
+	         }
+	         else {
+	            _ftl_discardblock(ftl_dev, block);  // Otherwise, assume discarded
+               ftl_dev->free--;
+#ifdef FTL_VERBOSE
+	            printf("_ftl_getblock: PBN %d not free, discarded with LBN %d.\n",
+	                         block, bad);
+#endif
+	         }
+         }
+         else {
+            _ftl_discardblock(ftl_dev, block);  // If status code, discard
+#ifdef FTL_VERBOSE
+	         printf("_ftl_getblock: PBN %d not free, discarded with LBS %04X.\n",
+	                         block, bad);
+#endif
+         }
+      }
+   }
+   return 0;
+}
+
+/*** BeginHeader _ftl_initdev */
+int _ftl_initdev(_FTL_Device __far *ftl_dev, word blocks);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION *******************************************
+_ftl_initdev                   <FATFTL.LIB>
+
+SYNTAX: int _ftl_initdev(_FTL_Device far *ftl_dev, word blocks);
+
+DESCRIPTION: Internal function to allocate and initialize device
+             tables used by the FTL library.  If tables have already
+             been allocated, then they will just be initialized to
+             startup values needed to start device enumeration.
+
+PARAMETER1:  ftl_dev is a far pointer to the FTL device structure.
+
+PARAMETER2:  blocks is the number of physical blocks on the device
+
+RETURNS:     0 on success
+            -ENOMEM if memory could not be allocated for device tables
+*************************************************************************/
+_ftl_debug int _ftl_initdev(_FTL_Device __far *ftl_dev, word blocks)
+{
+	auto word blocks_max;
+   auto long alloc, alloc2, alloc3;
+
+   assert(ftl_dev != NULL);
+#ifdef FTL_SET_BLOCKS
+   // Larger maximum may be used for allocation if device is removable
+	blocks_max = ((ftl_dev->drv->type[ftl_dev->dev->dev_num] & MBRTYPE_REMOVE) &&
+                 (blocks < FTL_SET_BLOCKS)) ? FTL_SET_BLOCKS : blocks;
+#else
+   blocks_max = blocks;  // Maximum blocks is equal to device blocks
+#endif
+	if (!ftl_dev->locate) {  // Skip if block location table exists
+	   // Get space for block location table since not allocated already
+      ftl_dev->locate_max = blocks_max - (blocks_max >> 7);
+      if (ftl_dev->locate_max < 64) { ftl_dev->locate_max << 1; }
+      alloc = (long)(ftl_dev->locate_max) << 1;
+	   if (xavail(NULL) < alloc) {
+	      return -ENOMEM;  // Not enough memory, nothing allocated.
+	   }
+	   // Subtract out reserved space (1/128th) and save storage size for device
+	   ftl_dev->locate_size = blocks - (blocks >> 7);
+      if (ftl_dev->locate_size < 64) { ftl_dev->locate_size << 1; }
+      ftl_dev->blocks_max = blocks_max;
+      ftl_dev->blocks = blocks;
+	   // Allocate memory for locate table and save pointer
+	   ftl_dev->locate = (word __far *)xalloc(alloc);
+	}
+
+	if (!ftl_dev->status) {
+	   // Get space for block status table if not allocated already
+      alloc2 = (long)(blocks_max >> 2);
+	   if (xavail(NULL) < alloc2) {
+	      xrelease((long)ftl_dev->locate, alloc);
+	      ftl_dev->locate = (long)NULL;
+	      ftl_dev->locate_max = 0;
+	      return -ENOMEM;    // Not enough memory, memory released upon error
+	   }
+	   ftl_dev->status = (char __far *)xalloc(alloc2);
+	}
+
+   // Compute maximum number of secondary blocks if block size warrants
+   if (ftl_dev->sec_shift > 1) {
+      ftl_dev->second_size = (blocks > 4096) ? 512 : blocks >> 4;
+	   if (!ftl_dev->second) {
+	      // Get space for seondary block structure if not allocated already
+   	   alloc3 = (blocks_max > 4096) ? 3072 : (blocks_max >> 4) * 6;
+	      if (xavail(NULL) < alloc3) {
+            xrelease((long)ftl_dev->status, alloc2);
+	         xrelease((long)ftl_dev->locate, alloc);
+	         ftl_dev->locate = (long)NULL;
+	         ftl_dev->locate_max = 0;
+            ftl_dev->status = (long)NULL;
+	         return -ENOMEM;    // Not enough memory, memory released upon error
+	      }
+	      ftl_dev->second = (_FTL_Secondary __far *)xalloc(alloc3);
+	   }
+   }
+   else {
+      ftl_dev->second_size = 0;  // Small page device, disable secondary blocks
+   }
+#ifdef FTL_VERBOSE
+   for (blocks=0; blocks < FTL_MAXDEV && &ftl.dev[blocks] != ftl_dev; blocks++);
+   printf("ftl_initdev: Device %d initialized with %d blocks.\n",
+              blocks, blocks_max);
+#endif
+   return 0;
+}
+
+/*** BeginHeader _ftl_LBNcheck */
+int _ftl_LBNcheck(_FTL_Device __far *ftl_dev, word lbn, word pbn, word pbn_link);
+/*** EndHeader */
+
+/*************************************************************************
+_ftl_LBNcheck                   <FATFTL.LIB>
+
+SYNTAX: int _ftl_LBNcheck(_FTL_Device far *ftl_dev, word lbn,
+                                  word pbn, word pbn_link);
+
+DESCRIPTION: Internal function to investigate duplicate logical block
+             numbers during enumeration and determine which physical
+             block(s) to keep and which to add to the discards tables.
+             Will detect incomplete block moves and finish the move.
+             NOTE!!! THIS IS A BLOCKING FUNCTION!
+
+PARAMETER1:  ftl_dev is a far pointer to the FTL device structure.
+
+PARAMETER2:  lbn is the logical block number with a duplicate issue
+
+PARAMETER3:  pbn is the physical block number of the new block
+
+PARAMETER4:  pbn_link is the link value from the 1st sector of new block
+
+RETURNS:	     0 for Success
+              -EIO      - I/O error, device driver may not be initialized
+              -EINVAL   - invalid argument
+              -EBADDATA - uncorrectable data or ECC I/O error
+*************************************************************************/
+_ftl_debug int _ftl_LBNcheck(_FTL_Device __far *ftl_dev, word lbn,
+                                    word pbn, word pbn_link)
+{
+   auto int rc, small;
+   auto word block;
+   auto _FTL_spare spare;      // Spare data structure for sector reads
+
+   assert(ftl_dev != NULL);
+   // locate[lbn] and pbn must point to physical data blocks on the device
+   block = ftl_dev->locate[lbn];
+   if (block >= FTLBS_RESERVED || pbn == FTLBS_FREE) {
+      return -EINVAL;
+   }
+   if (block == pbn) {
+      return 0;    // Block put into locate table early (due to secondary link)
+   }
+
+   if (pbn_link == block) {
+      ftl_dev->locate[lbn] = pbn;
+      _ftl_discardblock(ftl_dev, block);
+      return 0;
+   }
+
+   // Read spare data area of the first sector of current LBN host block
+   _ftl_ReadSpareNB(ftl_dev, _ftl_first(ftl_dev, block), spare, rc);
+   if (rc < 0) {
+      return rc;     // Exit on read error
+   }
+   small = (ftl_dev->sec_shift == FTL_SBN_SHIFT) ? 1 : 0;
+   if (_ftl_getLink(small, spare) == pbn) {
+      // Block already assigned in locate table is correct, discard pbn block
+      _ftl_discardblock(ftl_dev, pbn);
+      return 0;
+   }
+
+   // Read spare data area of the last sector of current LBN host block
+   _ftl_ReadSpareNB(ftl_dev, _ftl_last(ftl_dev, block), spare, rc);
+   if (rc < 0) {
+      return rc;     // Exit on read error
+   }
+   if (_ftl_getLBS(small, spare) == FTLBS_DISCARD) {
+      ftl_dev->locate[lbn] = pbn;
+      _ftl_discardblock(ftl_dev, block);
+      return 0;
+   }
+
+   // Read spare data area of the last sector of new block
+   _ftl_ReadSpareNB(ftl_dev, _ftl_last(ftl_dev, pbn), spare, rc);
+   if (rc < 0) {
+      return rc;     // Exit on read error
+   }
+   if (_ftl_getLBS(small, spare) == FTLBS_DISCARD) {
+      _ftl_discardblock(ftl_dev, pbn);
+   }
+
+   return 0;   // Wait for secondary to scan to determine which is real
+}
+
+/*** BeginHeader _ftl_mark_bad */
+int _ftl_mark_bad(_FTL_Device __far *ftl_dev);
+/*** EndHeader */
+
+/*************************************************************************
+_ftl_mark_bad                   <FATFTL.LIB>
+
+SYNTAX: int _ftl_mark_bad(_FTL_Device __far *ftl_dev);
+
+DESCRIPTION: Internal function to mark a block as bad.
+
+PARAMETER1:  ftl_dev is a far pointer to the FTL device structure.
+
+RETURNS:	     0 for Success
+              -EIO      - I/O error, device driver may not be initialized
+              -EINVAL   - invalid argument
+              -EBADDATA - block did not completely erase
+              -EBADMAX  - device has too many bad blocks for FTL usage
+              -EBUSY if the device is busy.
+*************************************************************************/
+_ftl_debug int _ftl_mark_bad(_FTL_Device __far *ftl_dev)
+{
+   auto int rc;
+   auto word offset, last;
+   auto char buffer[FTL_SECSIZE];
+   auto char spare[16];
+   auto char erased[2];
+
+   assert(ftl_dev != NULL);
+   if ((ftl_dev->state & FTLS_MASK) != FTLS_BADBLOCK) {
+      return -EINVAL;  // Device must be in the mark block bad state
+   }
+
+   offset = ftl_dev->state & (~FTLS_MASK);
+   last = offset + 16;            // Setup end point for this pass
+   if (last > ftl_dev->dev->sec_block) {
+      last = ftl_dev->dev->sec_block;     // Keep within bounds of block
+   }
+
+   memset(buffer, 0xff, FTL_SECSIZE);
+   memset(spare, 0, 16);
+   for (rc = 0 ; offset < last; offset++, ftl_dev->state++) {
+	   // Write each sector in block with bad block marker
+	   while ((rc = ftl_dev->xxx_WriteSector(ftl_dev->sector + offset,
+                (char __far *)buffer, (char __far *)spare,
+                   ftl_dev->dev)) == -EBUSY);
+	   if (rc) {
+         break;
+      }
+   }
+   if (!rc) {
+      if (offset < last) {
+	      rc = -EBUSY;         // Needs another pass to complete, keep busy
+      }
+      else {
+         last = _ftl_blocknum(ftl_dev, ftl_dev->sector);  // Get block marked
+         _ftl_markstatus(last, FTL_STAT_BAD);  // Mark as bad
+         ftl_dev->state = FTLS_IDLE;
+         // Block marked bad, add to bad blocks and check bad block limit
+         if ((++ftl_dev->bad) >= ((ftl_dev->blocks >> 7) - 1)) {
+         	return -EBADMAX;  // Show device has too many bad blocks
+         }
+      }
+   }
+   return rc;
+}
+
+
+/*** BeginHeader _ftl_moveblock */
+int _ftl_moveblock(_FTL_Device __far *ftl_dev, word lbn, word dbn);
+/*** EndHeader */
+
+/*************************************************************************
+_ftl_moveblock                   <FATFTL.LIB>
+
+SYNTAX: int _ftl_moveblock(_FTL_Device far *ftl_dev, word lbn, word dbn);
+
+DESCRIPTION: Internal function to complete the move of active sectors from
+             a source physical block to a destination physical block.  The
+             logical sector numbers will be carried through in the move
+             operation.  Sectors that have been superceded (garbage sectors)
+             will not be moved.  Block must already exist in the block info
+             cache and first sector must already be written with back link.
+             A move in progress can be continued by setting lbn parameter
+             to FTLBS_FREE (dbn parameter is ignored in this case).
+
+PARAMETER1:  ftl_dev is a far pointer to the FTL device structure.
+
+PARAMETER2:  lbn is the logical block number to be moved.
+               (For continuation call, set this to FTLBS_FREE (dbn ignored))
+
+PARAMETER3:  dbn is the physical destination block number
+
+RETURNS:	     0 for Success
+              -EIO      - I/O error, device driver may not be initialized
+              -EINVAL   - invalid argument
+              -EBADDATA - uncorrectable data or ECC error
+              -EBUSY if the device is busy.
+              -EDRVBUSY if the device is busy with other operation
+*************************************************************************/
+_ftl_debug int _ftl_moveblock(_FTL_Device __far *ftl_dev, word lbn, word dbn)
+{
+   static int count;             // Static internal counter for block movement
+   auto int rc, small;
+   auto word sbn;              // Source physical block number
+   auto _FTL_BlockInfo __far *block;
+   auto char buf[FTL_SECSIZE];
+   auto _FTL_spare spare;      // Spare data structure for sector reads
+
+   assert(ftl_dev != NULL);
+   if (!ftl_dev->state) {
+      if (lbn >= ftl_dev->locate_size) { return -EINVAL; }
+      sbn = ftl_dev->locate[lbn];
+	   if ((rc = _ftl_findblock(ftl_dev, sbn)) < 0) {
+	      return rc;
+	   }
+      // Device is not busy, start new block movement operation
+	   block = &ftl.block[rc];          // Get block info pointer for source
+      ftl_dev->state = FTLS_MOVE + rc;  // Save block info index within state
+      // Get the sector number of the second sector of the destination block
+      ftl_dev->dest = _ftl_first(ftl_dev, dbn) + 1;
+      count = 0;           // Clear static move progress counter for new move
+      block->in_use = 1;   // Set in_use to account for first sector present
+   }
+   else {
+	   if ((ftl_dev->state & FTLS_MASK) != FTLS_MOVE) {
+#ifdef FTL_VERBOSE
+  			printf("_ftl_moveblock: Device busy with other operation (%d : %d).\n",
+                  lbn, dbn);
+#endif
+	      return -EDRVBUSY;     // Device is busy with a different operation
+	   }
+
+      do {       // Make sure prior write has completed
+         rc = ftl_dev->xxx_InformStatus(ftl_dev->dev, 0);
+      } while (rc == -EBUSY);
+
+	   if ((lbn != FTLBS_FREE) && (_ftl_blocknum(ftl_dev, ftl_dev->dest) != dbn))
+      {
+#ifdef FTL_VERBOSE
+  			printf("_ftl_moveblock: Device busy with other move (%d : %d != %d).\n",
+                  lbn, dbn, _ftl_blocknum(ftl_dev, ftl_dev->dest));
+#endif
+	      return -EDRVBUSY;     // Device is busy with other move operation
+	   }
+
+      // Get block info pointer from lower bits of device state
+      block = &ftl.block[ftl_dev->state & 0x0FFF];
+      sbn = block->pbn;            // Get source block number from block info
+      dbn = _ftl_blocknum(ftl_dev, ftl_dev->dest - 1);  // Get dbn from dest.
+      if ((sbn >= ftl_dev->locate_size) || (dbn >= ftl_dev->locate_size)) {
+         ftl_dev->state = FTLS_IDLE;  // Either block invalid, then clear move
+         return 0;
+      }
+   }
+
+   small = (ftl_dev->sec_shift == FTL_SBN_SHIFT ? 1 : 0);  // 1 if small block
+
+   while (count < FTL_MAXSECTORS) {
+      if (block->sector[count] != FTLBS_FREE) {
+         // Get sector to be moved from either primary or secondary block
+         if (block->sector[count] >= FTL_MAXSECTORS) {
+            ftl_dev->sector = _ftl_first(ftl_dev, block->sentry->sbn) +
+                               (block->sector[count] ^ FTL_MAXSECTORS);
+         }
+         else {
+            ftl_dev->sector = _ftl_first(ftl_dev, sbn) + block->sector[count];
+         }
+         do {
+            rc = ftl_dev->xxx_ReadSector(ftl_dev->sector, (char __far *)buf,
+                                           (char __far *)&spare, ftl_dev->dev);
+         } while (rc == -EBUSY);  // Reads are quick, so block on reading
+         if (rc) {
+            if (rc == -EBADDATA) {  // ECC error, try reading once more
+#ifdef FTL_VERBOSE
+      			printf("_ftl_moveblock: Bad ECC on Read 1 (PBN %d -> %d).\n",
+                          sbn, dbn);
+#endif
+               rc = ftl_dev->xxx_ReadSector(ftl_dev->sector, (char __far *)buf,
+                                             (char __far *)&spare, ftl_dev->dev);
+            }
+            if (rc) {
+#ifdef FTL_VERBOSE
+               if (rc == -EBADDATA) {
+         			printf("_ftl_moveblock: Bad ECC on Read 2 (PBN %d -> %d).\n",
+                               sbn, dbn);
+               } else {
+         			printf("_ftl_moveblock: Read error = %d (PBN %d -> %d).\n",
+                              rc, sbn, dbn);
+               }
+#endif
+					block->pbn = FTLBS_FREE;           // Free corrupt block info
+	            if (ftl.oldest != block) {  // If not oldest, then make oldest
+	               // Remove block from list
+	               block->older->younger = block->younger;
+	               block->younger->older = block->older;
+	               // Insert block at end of LRU list (Least Recently Used)
+	               block->younger = ftl.oldest;
+	               block->older = (_FTL_BlockInfo __far *)&ftl.oldest;
+	               ftl.oldest->older = block;
+	               ftl.oldest = block;
+	            }
+               return rc;   // Exit with code on error
+            }
+         }
+         _ftl_setCount(small, spare, 0); // Reset garbage counter on all sectors
+         spare.std.spare_ecc = calculateECC8((char __far *)&spare);
+	      // Write sector & modified spare data to the destination block
+         rc = ftl_dev->xxx_WriteSector(ftl_dev->dest, (char __far *)buf,
+                                        (char __far *)&spare, ftl_dev->dev);
+	      if (!rc || rc == -EBUSY) {
+            block->sector[count++] = block->in_use++; //Save offset in new block
+	         ftl_dev->dest++;     // Write was accepted, so move to next sector
+         }
+         if (rc) {
+#ifdef FTL_VERBOSE
+            if (rc != -EBUSY) {
+       			printf("_ftl_moveblock: Write error = %d (PBN %d -> %d).\n",
+                        rc, sbn, dbn);
+            }
+#endif
+            return rc;   // Exit with code on busy or error
+         }
+      }
+      else {
+         count++;
+      }
+      rc = ftl_dev->xxx_InformStatus(ftl_dev->dev, 0);
+      if (rc) {
+         return rc;    // Do not proceed if underlying driver is busy
+      }
+   }
+
+   // Block move completed, change block info entry for new block location
+   block->pbn = dbn;
+   block->garbage = 0;
+   _ftl_ReadSpare(ftl_dev, _ftl_first(ftl_dev, dbn), spare, rc);
+   block->sector[_ftl_getOffset(small, spare)] = 0; //Restore link to 1st sector
+   lbn = _ftl_getLBN(small, spare);
+   ftl_dev->locate[lbn] = dbn;     // Change primary block link to new host
+   ftl_dev->state = FTLS_IDLE;
+
+   // Discard replaced block(s)
+   _ftl_discardblock(ftl_dev, sbn);   // Discard source primary block
+   if (block->sentry) {    // See if secondary exists to discard
+      dbn = FTLBS_FREE;    // Borrow dbn for removal option to _ftl_secondary
+      _ftl_secondary(ftl_dev, sbn, &dbn);   // Remove secondary block entry
+      _ftl_discardblock(ftl_dev, dbn); // Discard secondary host block
+	   block->sentry = NULL;         // Remove secondary block link in info entry
+   }
+#ifdef FTL_VERBOSE
+	printf("_ftl_moveblock: Block movement complete (LBN %d : PBN %d -> %d).\n",
+             lbn, sbn, block->pbn);
+#endif
+   return rc;
+}
+
+/*** BeginHeader _ftl_secondary */
+int _ftl_secondary(_FTL_Device __far *ftl_dev, word pbn, word *sbn);
+/*** EndHeader */
+
+/*************************************************************************
+_ftl_secondary                   <FATFTL.LIB>
+
+SYNTAX: int _ftl_secondary(_FTL_Device far *ftl_dev, word pbn, word *sbn)
+
+DESCRIPTION: Internal function to either find, add or remove a secondary
+             block from the secondary block table.  Operation performed
+             is based on initial value of *sbn.  If equal to FTLBS_FREE,
+             the secondary for the primary block is removed and the host
+             found is returned in *sbn.  If equal to FTLBS_SECONDARY, the
+             secondary for the primary block is found and the index for
+             the secondary block entry is returned in *sbn. Otherwise,
+             the primary/secondary link given by pbn and *sbn is added
+             to the secondary table.
+
+PARAMETER1:  ftl_dev is a far pointer to the FTL device structure.
+
+PARAMETER2:  pbn - Primary block number
+
+PARAMETER3:  sbn - Pointer to the Secondary block number variable
+                   ENTRY VALUE CONTROLS TYPE OF OPERATION:
+                     FTLBS_FREE removes secondary for given pbn
+                            (returns with secondary host block number in sbn)
+                     FTLBS_SECONDARY returns index to the secondary block
+                             entry for the given pbn
+                     Otherwise, it should be a free block which is linked
+                       as a new secondary block to the given pbn
+
+RETURNS:	    0 for Success
+             -EINVAL   - invalid argument
+             -EBADDATA - uncorrectable data or ECC I/O error
+             -ENOENT   - secondary block not found for given PBN
+             -ENOSPC   - no room to add new secondary block
+             -EEXIST   - primary block already has a secondary block
+*************************************************************************/
+_ftl_debug int _ftl_secondary(_FTL_Device __far *ftl_dev, word pbn, word *sbn)
+{
+   static int count;
+   auto int i, dn, end, rc, small;
+   auto _FTL_Secondary __far *second;
+   auto _FTL_BlockInfo __far *bptr;
+   auto _FTL_spare spare;      // Spare data structure for sector reads
+   auto char buf[FTL_SECSIZE];
+
+   assert(ftl_dev != NULL);
+   if (pbn > ftl_dev->blocks) {
+      return -EINVAL;
+   }
+   second = ftl_dev->second;      // Setup table pointer and entries count
+   end = ftl_dev->second_cnt;
+   rc = 0;
+
+   // Find entry for PBN, if one exists
+   for (i = 0; i < end && second->pbn != pbn; i++, second++);
+
+   if (*sbn == FTLBS_SECONDARY) {
+      if (i < end) {
+         *sbn = i;            // Entry found, return index to secondary entry
+#ifdef FTL_VERBOSE
+//			printf("_ftl_secondary: Secondary entry found (%d / %d).\n", pbn,
+//                 ftl_dev->second[i].sbn);
+#endif
+      }
+      else {
+         rc = -ENOENT;         // No entry found, return error
+#ifdef FTL_VERBOSE
+//			printf("_ftl_secondary: No secondary entry found for pbn %d.\n", pbn);
+#endif
+      }
+   }
+   else if (*sbn == FTLBS_FREE) {  // Delete secondary entry for given PBN
+      if (i < end) {                      // See if entry for PBN was found
+         *sbn = ftl_dev->second[i].sbn;   // Get secondary host block number
+         if (i < (end - 1)) {  // Not last secondary entry? Overwrite w/ last
+            _f_memcpy(second, (ftl_dev->second + (end-1)),
+                                                   sizeof(_FTL_Secondary));
+            pbn = ftl_dev->second[i].pbn; // Get PBN of entry just moved
+            // Find dev number, see if a block info entry points to moved entry
+            for (dn = 0; (dn < FTL_MAXDEV) && (ftl_dev != &ftl.dev[dn]); dn++);
+      	   for (end = 0; end < ftl.block_ptr && !(ftl.block[end].pbn == pbn &&
+                        ftl.block[end].devnum == dn); end++);
+	         if (end < ftl.block_ptr) {   // See if block info correction needed
+               ftl.block[end].sentry = &ftl_dev->second[i];
+            }
+         }
+         ftl_dev->second_cnt--;  // Decrement count of secondary entries
+#ifdef FTL_VERBOSE
+			printf("_ftl_secondary: Secondary block link removed (%d / %d).\n",
+                  pbn, *sbn);
+#endif
+      }
+      else {
+         rc = -ENOENT;         // No entry found, return error
+#ifdef FTL_VERBOSE
+			printf("_ftl_secondary: No secondary link found to remove (%d).\n",
+                 pbn);
+#endif
+      }
+   }
+   else if (i == end) {          // Add secondary block entry
+      if (*sbn < ftl_dev->blocks) {   // Make sure SBN is a valid block number
+         if (end < ftl_dev->second_size) {
+            second->pbn = pbn;       // Save PBN and SBN link at end of list
+            second->sbn = *sbn;
+            second->garbage = 0;     // Zero here indicates block not scanned
+            ftl_dev->second_cnt++;
+#ifdef FTL_VERBOSE
+//   			printf("_ftl_secondary: Secondary block added (%d / %d).\n",
+//                  pbn, *sbn);
+#endif
+         }
+         else {
+            rc = -ENOSPC;            // No space left in secondary block table
+#ifdef FTL_VERBOSE
+	   		printf("_ftl_secondary: No room for secondary block (%d / %d).\n",
+                  pbn, *sbn);
+#endif
+         }
+      }
+      else {
+         rc = -EINVAL; // Block given for new sbn is not a valid block number
+#ifdef FTL_VERBOSE
+			printf("_ftl_secondary: Invalid secondary blocks number (%d / %d).\n",
+                  pbn, *sbn);
+#endif
+      }
+   }
+   else {
+      rc = -EEXIST;   // Trying to add when pbn already has a secondary block
+#ifdef FTL_VERBOSE
+		printf("_ftl_secondary: Add to pbn %d which has a secondary block.\n",
+               pbn);
+#endif
+   }
+   return rc;
+}
+
+/***************************************************************************/
+/* Some internal debugging functions (Displays various device information) */
+/***************************************************************************/
+
+/*** BeginHeader _ftl_DumpInfo */
+void _ftl_DumpInfo( void );
+/*** EndHeader */
+
+// Displays all block info entries
+void _ftl_DumpInfo( void )
+{
+   auto int i, j;
+   auto _FTL_BlockInfo __far *block;
+
+   printf("\n   ********** Block Info Structure **********\n       ");
+   printf("  0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15");
+   for (i = 0, block = ftl.block; i < FAT_MAXBUFS; i++, block++)
+   {
+      if (block->sentry) {
+         printf("\nEnt(%2d) Pri:0x%04x  Sec:0x%04x  Used:%3d  G:%3d ", i,
+                 block->pbn, block->sentry->sbn, block->in_use, block->garbage);
+      }
+      else {
+         printf("\nEnt(%2d) Pri:0x%04x  Sec: None   Used:%3d  G:%3d ",
+                i, block->pbn, block->in_use, block->garbage);
+      }
+      if (block->pbn != FTLBS_FREE) {
+	      for (j = 0; j < FTL_MAXSECTORS; j++)
+	      {
+	         if (!(j & 15)) {
+	            printf("\n %3d:  ", j);
+	         }
+	         printf("%3d ", (int)block->sector[j]);
+	      }
+      }
+   }
+   printf("\n\n");
+   return;
+}
+
+
+/*** BeginHeader _ftl_DumpMap */
+void _ftl_DumpMap( _FTL_Device __far *ftl_dev, word min, word max );
+/*** EndHeader */
+
+// Displays map of logical block locations on the physical device (min to max)
+void _ftl_DumpMap( _FTL_Device __far *ftl_dev, word min, word max )
+{
+   auto word i;
+   auto _FTL_BlockInfo __far *block;
+
+   assert(ftl_dev != NULL);
+   if (max > ftl_dev->locate_size) {
+      max = ftl_dev->locate_size;
+   }
+   if (min < max) {
+	   min &= 0xFFF8;              // Lower min to closest 8 block boundary
+      max = (max + 7) & 0xFFF8;   // Raise max to closest 8 block boundary
+	   printf("\n ********** Block Location Map **********\n       ");
+	   printf("   0    1    2    3    4    5    6    7");
+	   if (min & 7) {
+	      printf("\n %04x: ", min & 0xFFF8);
+	      for (i = 0; i < (min & 7); i++, printf("  .. "));
+	   }
+	   for (i = min; i < max; i++)
+	   {
+	      if (!(i & 7)) {
+	         printf("\n %04x: ", i);
+	      }
+	      printf(" %04x", ftl_dev->locate[i]);
+	   }
+	   i &= 7;
+	   if (i) {
+	      for ( ; i < 8; i++, printf("  .. "));
+	   }
+	   printf("\n\n");
+   }
+   return;
+}
+
+
+/*** BeginHeader _ftl_DumpStatus */
+void _ftl_DumpStatus( _FTL_Device __far *ftl_dev, word min, word max );
+/*** EndHeader */
+
+const char status[4] = { '.', 'U', 'B', 'D' };
+
+// Displays status of the physical blocks on the device (min to max)
+void _ftl_DumpStatus( _FTL_Device __far *ftl_dev, word min, word max )
+{
+   auto char stat;
+   auto word i, j;
+
+   assert(ftl_dev != NULL);
+   if (max > ftl_dev->blocks) {
+      max = ftl_dev->blocks;
+   }
+   if (min < max) {
+	   min &= 0xFFF0;              // Lower min to closest 16 block boundary
+      max = (max + 15) & 0xFFF0;  // Raise max to closest 16 block boundary
+	   printf("\n ********** Block Status Table **********\n       ");
+	   printf(" 0 1 2 3 4 5 6 7 8 9 A B C D E F");
+	   for (i = j = min; i < max; )
+	   {
+         if (!(i & 15)) {
+	         printf("\n %04x: ", i);
+         }
+	      for (j += 4, stat = ftl_dev->status[i >> 2]; i < j; stat >>= 2, i++) {
+	         printf(" %c", status[stat & 3]);
+	      }
+	   }
+	   printf("\n\n");
+   }
+   return;
+}
+
+
+/*** BeginHeader _ftl_DumpSecondary */
+void _ftl_DumpSecondary( _FTL_Device __far *ftl_dev, word max );
+/*** EndHeader */
+
+// Displays secondary blocks in use on the device (up to max)
+void _ftl_DumpSecondary( _FTL_Device __far *ftl_dev, word max )
+{
+   auto word i;
+   auto _FTL_Secondary __far * second;
+
+   assert(ftl_dev != NULL);
+   printf("\n ********** Secondary Block Links **********\n");
+   printf("   Pri./Sec./G-C   Pri./Sec./G-C   Pri./Sec./G-C   Pri./Sec./G-C");
+   if (max > ftl_dev->second_cnt) {
+      max = ftl_dev->second_cnt;
+   }
+   for (i = 0, second = ftl_dev->second; i < max; i++, second++)
+   {
+      if (!(i & 3)) {
+         printf("\n");
+      }
+      printf("   %04x/%04x/%03d", second->pbn, second->sbn, second->garbage);
+   }
+   printf("\n\n");
+   return;
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+
+
+
+

@@ -1,0 +1,653 @@
+/*
+ * tftp.lib
+ *
+ * Copyright (C) Rabbit Semiconductor, Inc. All rights reserved.
+ *
+ * Trivial File Transfer Protocol (TFTP)
+ * Based on RFCs:
+ *   783 'THE TFTP PROTOCOL (REVISION 2)'
+ *
+ */
+
+/* START LIBRARY DESCRIPTION *********************************************
+TFTP.LIB
+	Copyright (c) 2006, Rabbit Semiconductor.
+
+DESCRIPTION:
+	Trivial File Transfer Protocol.
+
+	This standard protocol (internet RFC783) is a lighweight protocol
+	typically used to transfer bootstrap or configuration files from
+	a server to a client host such as a diskless workstation.  TFTP
+	allows data to be sent in either direction between client and server,
+	using UDP as the underlying transport.
+
+	This library fully implements TFTP, but as a client only.
+
+	Compared with more capable protocols such as FTP, TFTP:
+	  . has no security or authentication
+	  . is not as fast because of the step-by-step protocol
+	  . uses fewer machine resources.
+	Because of the lack of authentication, most TFTP servers restrict
+	the set of accessible files to a small number of configuration files
+	in a single directory.  For upload of files, servers are usually
+	configured to accept only certain file names that are writable by
+	any user.
+
+	If these restrictions are acceptable, TFTP has the advantage of
+	requiring very little 'footprint' in the client host.  In conjunction
+	with DHCP/BOOTP (see BOOTP.LIB), and appropriate server configuration,
+	TFTP is often used to download a kernel image to a diskless host.
+	The target TCP/IP board does not currently support loading the BIOS
+	in this way, since the BIOS and application program are written to
+	non-volatile flash memory.  However, the downloaded file does not
+	have to be a binary executable - it can be any reasonably small file
+	such as an application configuration file.  TFTP and DHCP/BOOTP can
+	thus be used to administer the configuration of multiple targets from
+	a central server.
+
+	Using TFTP with BOOTP/DHCP requires minimal additional effort for
+	the programmer.  See the sample program samples\tcpip\dhcp_bootfile.c
+   for an example of this use.
+
+	The Dynamic C TFTP library contains the following functions.  Any of
+	these functions will require approximately 600-800 bytes of free
+	stack.  The data buffer for the file to put or get is always
+	allocated in xmem (see xalloc()).  The tftp_struct structure, which
+	is required for most of these functions, may be allocated either
+	in root data memory or in xmem.  The tftp_struct structure is
+	approximately 155 bytes long.
+
+	  tftp_init()    Prepare for a TFTP session
+	  tftp_initx()   Prepare for a TFTP session
+	  tftp_tick()    Execute one non-blocking step in the TFTP session
+	  tftp_tickx()   Execute one non-blocking step in the TFTP session
+	  tftp_exec()    Prepare and execute a complete TFTP session, blocking
+	                 until complete.
+
+	A session can be either a single download (get) or upload (put).
+	The functions ending with 'x' are versions which use a data structure
+	allocated in extended memory, for applications which are constrained
+	in their use of root data memory.
+END DESCRIPTION **********************************************************/
+
+
+/*** BeginHeader */
+
+#ifdef TFTP_DEBUG
+	#define _tftp_nodebug __debug
+#else
+	#define _tftp_nodebug __nodebug
+#endif
+
+/*
+ * UDP well-known port number for TFTP server.
+ */
+#define	IPPORT_TFTP			69
+
+// Initial timeout value in milliseconds - default 3/4 sec.  Will double every retry.
+#ifndef TFTP_TIMEOUT
+#define TFTP_TIMEOUT		750
+#endif
+
+// Number of times to retransmit same packet after successive timeouts
+// before giving up.
+#ifndef TFTP_RETRIES
+#define TFTP_RETRIES		5
+#endif
+
+
+// TFTP opcodes - for efficiency, these are in (16-bit) network order
+#define TFTP_OP_RRQ		0x0100
+#define TFTP_OP_WRQ		0x0200
+#define TFTP_OP_DATA		0x0300
+#define TFTP_OP_ACK		0x0400
+#define TFTP_OP_ERROR	0x0500
+
+
+// Packet structure used by TFTP
+typedef struct tftp_packet {
+	word			opcode;
+	union {
+		char name_and_mode[514];	// For RRQ or WRQ
+		struct {
+			word	blocknum;
+			char	data[512];
+		} d;	// For DATA or ACK
+		struct {
+			word	errorcode;
+			char	errmsg[512];
+		} e;	// For ERROR
+	} u;
+};
+
+/*
+ * structure for send and receives
+ */
+typedef struct tftp_state {
+	byte			state;			// Current state.  LSB indicates read(0) or write(1).  Other bits
+										// determine state within this:
+#define TFTP_ST_INIT				0	// Initial (sending RRQ/WRQ)
+#define TFTP_ST_WAIT				2	// Waiting for response (data if read, ack if write)
+#define TFTP_ST_DONE				4	// Finished.
+#define TFTP_ST_RETRY			6	// Resending previous packet (transient state)
+#define TFTP_ST_ARP				8	// waiting for ARP resolution before opening
+	long			buf_addr;		// Physical address of buffer
+	word			buf_len;			// Length of buffer
+	word			buf_used;		// Amount Tx or Rx from/to buffer
+	word			next_blk;		// Next expected block number, or next to Tx
+	word			my_tid;			// UDP port number used by this host
+	udp_Socket * sock;			// UDP socket to use
+	longword		rem_ip;			// IP address of remote host
+	longword		timeout;			// ms timer value for next timeout
+	char			retry;			// retransmit retry counter
+	char			flags;			// misc flags
+#define TFTP_F_EXIT	0x01			// Exit from receive processing flag
+#define TFTP_F_TRUNC	0x02			// Received file truncated
+	long			sbufaddr;		// Socket buffer address (0 if use UDP socket buffer pool)
+	word			sbuflen;			// Socket buffer length.
+
+	// Following fields not used after initial request has been acknowledged.
+	char			mode;				// Translation mode as follows:
+#define TFTP_MODE_NETASCII		0		// ASCII text
+#define TFTP_MODE_OCTET			1		// 8-bit binary
+#define TFTP_MODE_MAIL			2		// Mail (remote file name is email address e.g. user@host.blob.org)
+	char			file[129];		// File name on remote host (TFTP server) - null terminated.
+										// This field will be overwritten with a null-term error message from the
+										// sever if an error occurs.
+
+	ATHandle		ath;				// handle for ARP resolution
+};
+
+/*** EndHeader */
+
+
+/*** BeginHeader tftp_init, tftp_tick */
+
+int tftp_init(struct tftp_state * ts);
+int tftp_tick(struct tftp_state * ts);
+
+/*** EndHeader */
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+tftp_init                       <TFTP.LIB>
+
+SYNTAX: int tftp_init(struct tftp_state * ts);
+
+PARAMETER1:		Pointer to TFTP state.  This must have been set up according
+               to the description here.
+
+KEYWORDS:		tcpip dhcp bootp tftp
+
+DESCRIPTION: 	This function is called to complete initialisation of the
+               TFTP state structure.  Before calling this function, some
+               fields in the struct tftp_state must be set up as follows:
+                 ts->state = <0 for read, 1 for write>
+                 ts->buf_addr = <physical address of xmem buffer>
+                 ts->buf_len = <length of physical buffer, 0-65535>
+                 ts->my_tid = <UDP port number.  Set 0 for default>
+                 ts->sock = <address of UDP socket (udp_Socket *)>
+                 ts->rem_ip = <IP address of TFTP server host>
+                 ts->mode = <one of the following constants:
+                   TFTP_MODE_NETASCII   ASCII text
+                   TFTP_MODE_OCTET      8-bit binary
+                   TFTP_MODE_MAIL       Mail>
+                 strcpy(ts->file, <remote filename or mail address>)
+               Note that mail mode can only be used to write mail to
+               the TFTP server, and the file name is the email address
+               of the recipient.  The mail message must be ASCII-encoded
+               and formatted with RFC822 headers.
+
+
+RETURN VALUE:  0: OK
+               -4: Error, socket NULL.
+					-7: Server address zero.
+
+SEE ALSO:      tftp_tick, tftp_exec, tftp_initx, tftp_tickx
+
+END DESCRIPTION **********************************************************/
+
+_tftp_nodebug int tftp_init(struct tftp_state * ts)
+{
+	if (!ts->my_tid)
+		ts->my_tid = findfreeport(0, 0);	// Next unused UDP port, non-privileged.
+	ts->retry = 0;
+	ts->flags = 0;
+	ts->state &= 0x01;				// Isolate to initial state.
+	if (!ts->sock)
+		return -4;
+	if (!ts->rem_ip)
+		return -7;
+	return 0;
+}
+
+/* START FUNCTION DESCRIPTION ********************************************
+tftp_tick                       <TFTP.LIB>
+
+SYNTAX: int tftp_tick(struct tftp_state * ts);
+
+PARAMETER1:		Pointer to TFTP state.  This must have been set up using
+               tftp_init(), and must be passed to each call of tftp_tick()
+               without alteration.
+
+KEYWORDS:		tcpip dhcp bootp tftp
+
+DESCRIPTION: 	This function is called periodically in order to take the
+               next step in a TFTP process.  Appropriate use of this
+               function allows single or multiple transfers to occur
+               without blocking.  For multiple concurrent transfers,
+               there must be a unique tftp_state structure, and a unique
+               UDP socket, for each transfer in progress.  This function
+               calls tcp_tick().
+
+RETURN VALUE:  1: OK, transfer not yet complete.
+               0: OK, transfer complete
+               -1: Error from remote side, transfer terminated.  In this
+                   case, the ts_addr->file field will be overwritten with a
+                   null-terminated error message from the server.
+               -2: Error, could not contact remote host or lost contact.
+               -3: Timed out, transfer terminated.
+               -4: (not used)
+               -5: Transfer complete, but truncated because buffer too
+                   small to receive the complete file.
+
+SEE ALSO:      tftp_init, tftp_exec, tftp_initx, tftp_tickx
+
+END DESCRIPTION **********************************************************/
+
+_tftp_nodebug int tftp_tick(struct tftp_state * ts)
+{
+	auto struct tftp_packet tp;	// 516 bytes
+	auto char * p;
+   auto int status;
+   auto int len;
+   auto word newlen;
+   auto byte write;
+   auto byte state;
+   auto int retval;
+#ifdef TFTP_ALLOW_BUG
+	auto int rh_bug;
+#endif
+
+   write = ts->state & 0x01;
+   state = ts->state & 0xFE;
+
+   // Handle possible timeouts in states where waiting for response.
+   if (state == TFTP_ST_WAIT) {
+   	if ((long)(MS_TIMER - ts->timeout) > 0) {
+   		ts->retry++;
+   		if (ts->retry > TFTP_RETRIES)
+   			goto _tftp_return_timeout;	// Timeout and all retries exhausted.
+   		if (!ts->next_blk)
+   			state &= 0x01;	// Go to reinit state temporarily
+   		else
+   			state |= 0x06;	// Go to retry state temporarily
+   	}
+   }
+
+	switch (state) {
+	case TFTP_ST_INIT:
+#ifdef TFTP_VERBOSE
+		printf("TFTP INIT\r\n");
+#endif
+	  	ts->buf_used = 0;
+	  	ts->next_blk = 0;
+
+		ts->ath = arpresolve_start( ts->rem_ip);
+		if (ts->ath < 0)
+		{
+			goto _tftp_return_openerr;	// couldn't start ARP, error out
+		}
+		ts->state = TFTP_ST_ARP + write;
+		ts->timeout = MS_TIMER + 5000;		// allow up to 5 seconds for ARP
+
+		// fall through to TFTP_ST_ARP -- arpresolve_check() will succeed
+		// immediately if this IP is already in the ARP table.
+
+	case TFTP_ST_ARP:			// waiting for ARP resolution to commplete
+		tcp_tick( NULL);
+		retval = arpresolve_check( ts->ath, ts->rem_ip);
+		if (retval == ATH_AGAIN && (long)(MS_TIMER - ts->timeout) < 0)
+		{
+			return 1;		// not yet complete
+		}
+		else if (retval < 0)
+		{
+			goto _tftp_return_openerr;	// ARP failed or timed out
+		}
+
+		// ARP successful, can now open UDP port and send data
+#ifdef TFTP_VERBOSE
+		printf("TFTP OPEN\r\n");
+#endif
+		// continue with setting up connection
+      tp.opcode = write ? TFTP_OP_WRQ : TFTP_OP_RRQ;
+		strcpy(tp.u.name_and_mode, ts->file);
+		switch(ts->mode) {
+		case TFTP_MODE_NETASCII:
+			p = "netascii"; break;
+		case TFTP_MODE_MAIL:
+			p = "mail"; break;
+		default:
+			p = "octet";
+		}
+		newlen = strlen(ts->file) + 1;
+		strcpy(tp.u.name_and_mode + newlen, p);
+		newlen += strlen(p) + 1 + 2;
+#ifdef TFTP_ALLOW_BUG
+		rh_bug = 0;
+#endif
+
+     	// Open to well-known port
+      if (udp_extopen( ts->sock, IF_ANY, ts->my_tid, ts->rem_ip,
+      																	0, NULL, 0, 0) <= 0)
+		{
+         goto _tftp_return_openerr;	// couldn't create the UDP socket
+		}
+      // Send initial packet to his well-known port.  He will reply
+      // from a different port, which we will later "bind to" on this
+      // socket.
+	  	udp_sendto(ts->sock, (byte *)&tp, newlen, ts->rem_ip, IPPORT_TFTP);
+	  	ts->timeout = MS_TIMER + (TFTP_TIMEOUT << ts->retry);
+	  	ts->state = TFTP_ST_WAIT + write;
+		break;
+	case TFTP_ST_RETRY:
+#ifdef TFTP_VERBOSE
+		printf("TFTP: retry\n");
+#endif
+	  	if (write)
+	  		goto _tftp_resend_data;
+	  	else
+	  		goto _tftp_resend_ack;
+	case TFTP_ST_WAIT:
+		tcp_tick(NULL);
+      len = udp_recv(ts->sock, (byte *)&tp, sizeof(tp));
+      if (len == -1)
+      	break;
+      if (len < 0)
+      	goto _tftp_sock_err;
+		if (len < 4)
+			break;	// Min TFTP packet is 4 bytes; ignore less.
+		len -= 4;	// Reduce len to actual data length
+		// Reverse blocknum
+		tp.u.d.blocknum = intel16(tp.u.d.blocknum);
+#ifdef TFTP_VERBOSE
+		printf("TFTP got opc=%d blk=%d length=%d\r\n", intel16(tp.opcode), tp.u.d.blocknum, len);
+#endif
+		switch (tp.opcode) {
+		case TFTP_OP_DATA:
+			if (write)
+				break;	// Ignore data packets if writing
+			if (tp.u.d.blocknum != ts->next_blk+1)	// Ignore if not expected block
+				break;
+			ts->retry = 0;	// Reset retry counter, since got data
+			if (len < 512)	// TFTP last data packet
+				ts->flags |= TFTP_F_EXIT;
+			newlen = ts->buf_used + (word)len;	// Total length of data obtained
+			if (newlen < ts->buf_used || newlen > ts->buf_len)	{ // Buffer overflow?
+				len = ts->buf_len - ts->buf_used;
+				ts->flags |= TFTP_F_TRUNC | TFTP_F_EXIT;
+				}
+			if (len > 0) {
+				root2xmem(ts->buf_addr + ts->buf_used, tp.u.d.data, len);
+				ts->buf_used += len;
+			}
+			ts->next_blk++;
+		_tftp_resend_ack:
+			// Send an ACK for last block seen
+			tp.opcode = TFTP_OP_ACK;
+			tp.u.d.blocknum = intel16(ts->next_blk);
+	  		udp_send(ts->sock, (byte *)&tp, 4);
+#ifdef TFTP_VERBOSE
+	  		printf("TFTP sent ack blk=%d\r\n", ts->next_blk);
+#endif
+	  		ts->timeout = MS_TIMER + (TFTP_TIMEOUT << ts->retry);
+			// If len is < 512, then transmission is finished, either because a short packet was
+			// transmitted, or because our own buffer was filled.  Really, we should linger on
+			// to make sure that server doesn't retransmit the last packet (indicating that it
+			// didn't get our ACK), but no great loss if we don't...
+			if (ts->flags & TFTP_F_EXIT)
+				goto _tftp_return_complete;
+			break;
+		case TFTP_OP_ACK:
+			if (!write)
+				break;	// Ignore ack packets if reading
+#ifdef TFTP_ALLOW_BUG
+			// Some versions of tftp server (e.g. RH Linux 7.0) had bug where 1st block was set to
+			// 1 instead of 0.  Try to hack around this.  A very bad hack - don't use it!
+			if (tp.u.d.blocknum == 1 && !ts->next_blk)
+				rh_bug = 1;
+			if ( //!(tp.u.d.blocknum == 1 && !ts->next_blk) &&
+			    tp.u.d.blocknum != ts->next_blk + rh_bug)	// Ignore if not expected block
+				break;
+#else
+			if (tp.u.d.blocknum != ts->next_blk)	// Ignore if not expected block
+				break;
+#endif
+			ts->retry = 0;	// Reset retry counter, since got acknowledgement
+			if (ts->next_blk) {
+				ts->buf_used += 512;
+				if (ts->buf_used > ts->buf_len || !ts->buf_used)
+					goto _tftp_return_complete;
+			}
+			ts->next_blk++;
+		_tftp_resend_data:
+			len = ts->buf_len - ts->buf_used;
+			if (len < 0 || len > 512) len = 512;	// Max size block
+			if (len > 0)
+				xmem2root(tp.u.d.data, ts->buf_addr + ts->buf_used, len);
+			tp.opcode = TFTP_OP_DATA;
+			tp.u.d.blocknum = intel16(ts->next_blk);
+	  		udp_send(ts->sock, (byte *)&tp, len+4);
+#ifdef TFTP_VERBOSE
+	  		printf("TFTP sent data blk=%d len=%d\r\n", ts->next_blk, len);
+#endif
+	  		ts->timeout = MS_TIMER + (TFTP_TIMEOUT << ts->retry);
+			break;
+		case TFTP_OP_ERROR:
+			tp.u.e.errmsg[127] = 0;	// Truncate to 127 chars
+#ifdef TFTP_VERBOSE
+			printf("TFTP Error: code=%d msg=%s\r\n", intel16(tp.u.e.errorcode), tp.u.e.errmsg);
+#endif
+			strcpy(ts->file, tp.u.e.errmsg);
+			goto _tftp_return_tftperr;
+		default:
+			break;
+		}	// switch on opcode
+		break;
+	default:
+		return 0;
+	}	// switch on state
+
+	// Indicate not yet complete
+	return 1;
+
+_tftp_return_tftperr:
+	retval = -1;
+	goto _tftp_bye;
+
+_tftp_return_timeout:
+	retval = -3;
+	goto _tftp_bye;
+
+_tftp_sock_err:
+_tftp_return_openerr:
+	retval = -2;
+	goto _tftp_bye;
+
+_tftp_return_complete:
+	retval = 0;
+	if (ts->flags & TFTP_F_TRUNC)
+		retval = -5;
+
+_tftp_bye:
+	ts->state = TFTP_ST_DONE;
+	sock_close((sock_type *)ts->sock);
+	return retval;
+
+}
+
+/*** BeginHeader tftp_initx, tftp_tickx */
+
+int tftp_initx(long ts_addr);
+int tftp_tickx(long ts_addr);
+
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+tftp_initx                      <TFTP.LIB>
+
+SYNTAX: int tftp_initx(long ts_addr);
+
+PARAMETER1:		Physical address of TFTP state (struct tftp_state).
+
+KEYWORDS:		tcpip dhcp bootp tftp
+
+DESCRIPTION: 	This function is called to complete initialisation of the
+               TFTP state structure, where the structure is possibly
+               stored somewhere other than in the root data space.
+               This is a wrapper function for tftp_init().  See that
+               function description for details.
+
+
+RETURN VALUE:  0: OK
+               -1: Error, default socket in use.
+
+SEE ALSO:      tftp_tick, tftp_exec, tftp_init, tftp_tickx
+
+END DESCRIPTION **********************************************************/
+
+_tftp_nodebug int tftp_initx(long ts_addr)
+{
+	auto struct tftp_state ts;
+	auto int rc;
+
+	xmem2root(&ts, ts_addr, sizeof(ts));
+	rc = tftp_init(&ts);
+	root2xmem(ts_addr, &ts, sizeof(ts));
+	return rc;
+}
+
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+tftp_tickx                      <TFTP.LIB>
+
+SYNTAX: int tftp_tickx(long ts_addr);
+
+PARAMETER1:		Physical address of TFTP state (struct tftp_state).
+
+KEYWORDS:		tcpip dhcp bootp tftp
+
+DESCRIPTION: 	This function is a wrapper for calling tftp_tick(), where
+					the structure is possibly stored somewhere other than in
+					the root data space.  See that function description for
+					details.
+
+RETURN VALUE:  1: OK, transfer not yet complete.
+               0: OK, transfer complete
+               -1: Error from remote side, transfer terminated.  In this
+                   case, the ts_addr->file field will be overwritten with a
+                   null-terminated error message from the server.
+               -2: Error, could not contact remote host or lost contact.
+               -3: Timed out, transfer terminated.
+               -4: (not used)
+               -5: Transfer complete, but truncated because buffer too
+                   small to receive the complete file.
+
+SEE ALSO:      tftp_init, tftp_exec, tftp_initx, tftp_tick
+
+END DESCRIPTION **********************************************************/
+
+_tftp_nodebug int tftp_tickx(long ts_addr)
+{
+	auto struct tftp_state ts;
+	auto int rc;
+
+	xmem2root(&ts, ts_addr, sizeof(ts));
+	rc = tftp_tick(&ts);
+	root2xmem(ts_addr, &ts, sizeof(ts));
+	return rc;
+}
+
+
+/*** BeginHeader tftp_exec */
+
+int tftp_exec( char write, long buf_addr, word * len, int mode,
+			char * host, char * hostfile, udp_Socket * sock );
+
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+tftp_exec                       <TFTP.LIB>
+
+SYNTAX: int tftp_exec( char put, long buf_addr, word * len, int mode,
+			               char * host, char * hostfile, udp_Socket * sock );
+
+PARAMETER1:		0: get file from remote host; 1: put file to host.
+PARAMETER2:    physical address of data buffer.
+PARAMETER3:    length of data buffer.  This is both an input and a return
+               parameter.  It should be initialised to the buffer
+               length.  On return, it will be set to the actual length
+               received (for a get), or unchanged (for a put).
+PARAMETER4:    Data representation: 0=NETASCII, 1=OCTET (binary), 2=MAIL.
+PARAMETER5:    Remote host name.
+PARAMETER6:    Name of file on remote host, or email address for mail.
+PARAMETER7:    UDP socket to use
+
+KEYWORDS:		tcpip dhcp bootp tftp
+
+DESCRIPTION: 	This function is a wrapper for tftp_init() and tftp_tick().
+               It does not return until the complete file is transferred
+               or an error occurs.  Note that approximately 750 bytes of
+               free stack will be required by this function.
+
+RETURN VALUE:  0: OK, transfer complete.
+               -1: Error from remote side, transfer terminated.  In this
+                   case, the ts_addr->file field will be overwritten with a
+                   null-terminated error message from the server.
+               -2: Error, could not contact remote host or lost contact.
+               -3: Timed out, transfer terminated.
+               -4: sock parameter was NULL
+               -7: host was NULL
+
+SEE ALSO:      tftp_init, tftp_initx, tftp_tick, tftp_tickx
+
+END DESCRIPTION **********************************************************/
+
+_tftp_nodebug
+int tftp_exec( char put, long buf_addr, word * len, int mode,
+			char * host, char * hostfile, udp_Socket * sock )
+{
+	auto struct tftp_state ts;
+	auto int status;
+
+	ts.state = put ? 1 : 0;
+	ts.buf_addr = buf_addr;
+	ts.buf_len = *len;
+	if (!put)
+		*len = 0;
+	ts.my_tid = 0;	// Find an unused one
+	ts.sock = sock;
+	if (host) {
+		ts.rem_ip = resolve(host);
+		if (!ts.rem_ip) return -2;	// Host not resolved
+	}
+	else
+		return -7;
+	ts.mode = mode;
+	strcpy(ts.file, hostfile);
+
+	// Now do the transfer
+	status = tftp_init(&ts);
+	if (status) return status;
+	while ((status = tftp_tick(&ts)) == 1);	// Loop until complete or error
+	if (!put)
+		*len = ts.buf_used;
+	return status;
+}
+
+
+
+

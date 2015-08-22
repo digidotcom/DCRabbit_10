@@ -1,0 +1,1620 @@
+
+/* START LIBRARY DESCRIPTION ***************************************************
+mparith.lib
+ *-----------------------------------------------------------------------------
+ * Copyright (c) 2008 Digi International Inc., All Rights Reserved
+ *
+ * This software contains proprietary and confidential information of Digi
+ * International Inc.  By accepting transfer of this copy, Recipient agrees
+ * to retain this software in confidence, to prevent disclosure to others,
+ * and to make no use of this software other than that for which it was
+ * delivered.  This is a published copyrighted work of Digi International
+ * Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+ * prohibited.
+ *
+ * Restricted Rights Legend
+ *
+ * Use, duplication, or disclosure by the Government is subject to
+ * restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+ * Technical Data and Computer Software clause at DFARS 252.227-7031 or
+ * subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+ * Restricted Rights at 48 CFR 52.227-19, as applicable.
+ *
+ * Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+ *-----------------------------------------------------------------------------
+
+DESCRIPTION: Multiple precision arithmetic for cryptography support.
+
+  Arithmetic is generally performed using 16-bit 'digits' since this is most
+  efficient for the Rabbit, however some things are specified in number of
+  bytes or bits (be careful!).
+
+  Numbers are stored in little-endian order.
+
+  MP_S is defined to be the number of bytes in the largest numbers to be
+  processed.  It should be set to a multiple of 16, plus 2, since the inner
+  arithmetic loops are unrolled to 8 word operations at a time.  Some
+  operations support specification of the number of digits (<= MP_S).
+
+  When modular arithmetic is performed, the modulus is stored in the global
+  variable mp_m.  Several other values (which may be used repeatedly) are
+  also stored in global variables, such as the modulus "reciprocal".
+
+NOTE: library modified on Aug 21 2007 to be re-entrant, and to allow
+  more flexible bit length.  The old MP_SIZE macro now defines the
+  _maximum_ byte length of the modulus, and a new structure is defined
+  in order to specify the modulus, its size, and its approximate
+  reciprocal.  Far pointers are also supported.
+
+Performance note:
+  With a Rabbit4000 running at 58MHz, the following table shows the
+  execution time for a full size exponentiation with equal number of
+  1- and 0-bits in the exponent.  This is a typical time for an RSA
+  operation with the given key length.
+    Bits     Time (sec)
+    512        2.3
+    1024      14.7
+    1920      82.7
+  As of Aug 2007, 512-bit RSA keys have been cracked, however 768-bit keys
+  have defied any publicly known attack.
+
+2008/11/14  SJH  Added support for Rabbit 6000 (mainly the PUMA/PUMS
+                 instructions for native far memory support).
+                 Added implementation of Karatsuba algorithm for
+                 speeding up multiplication (but don't use, since it
+                 is slower for keys less than about 4000 bits, which
+                 we don't even support).
+                 Basic long multiply routine mp_M16 changed to accept
+                 a digit length of the X operand.  Thus, if xdig+ydig<mdig
+                 then modular reduction is not attempted.
+2009/03/18  SJH  Removed restriction on maximum length of moduli.  Now is
+                 word sized field.
+
+END DESCRIPTION ***************************************************************/
+
+/*** BeginHeader mp_Zeros */
+#ifndef MPARITH_H
+#define MPARITH_H
+
+#ifndef MP_SIZE
+	// Number of bytes in modulus, plus 2 for temporary 16-bit carry out
+   // Make this a multiple of 4, plus 2.  The default, 130, specifies
+	// 1024-bit key lengths.  This is the maximum key size supported;
+	// all shorter lengths are automatically supported.
+	#define MP_SIZE 130
+#endif
+
+#ifdef MPARITH_DEBUG
+	#define _mparith_debug __debug
+#else
+	#define _mparith_debug __nodebug
+#endif
+
+#if _RAB6K
+	#define MPA_FQ		__far
+	#define MPA_MEMSET _f_memset
+	#define MPA_MEMCPY _f_memcpy
+	#define MPA_M16 	_f_mp_M16
+	#define MPA_ADD 	_f_mp_add
+	#define MPA_SUB 	_f_mp_sub
+	#define MPA_MUL 	_f_mp_mul3
+	#define MPA_REDUCE 	_f_mp_reduce
+#else
+	#define MPA_FQ
+	#define MPA_MEMSET memset
+	#define MPA_MEMCPY memcpy
+	#define MPA_M16 	mp_M16
+	#define MPA_ADD 	mp_add
+	#define MPA_SUB 	mp_sub
+	#define MPA_MUL 	mp_mul3
+	#define MPA_REDUCE 	mp_reduce
+#endif
+
+#if 0 != (MP_SIZE-2 & 3) || MP_SIZE < 6
+	#error MP_SIZE must be multiple of 4, plus 2; 6 <= MP_SIZE.
+#endif
+
+// Note that the following struct is used mainly for the RSA modulus,
+// but is also used for other long precision unsigned integers ("bignums")
+// in which case the recip field is not set.  The longest supported
+// numbers are 254 bytes (i.e. 2016 bits not counting the 16 bit pad at end)
+typedef struct {
+	word		length;					// Modulus length (6..MP_SIZE)
+	unsigned long recip;				// 24-bit approximate reciprocal of
+											// modulus (i.e. floor(2**48/(MMM+1)) where MMM
+											// is 3 MSBs of modulus, treated as a
+											// number 2**23..2**24-1.  recip in range
+											// 2**24..2**25-1.
+	byte		mod[MP_SIZE];			// Modulus, stored in little-endian form.
+											// Should be padded with at least 16 trailing
+											// zero bits.  The MSbit of mod[length-3]
+											// should be 1 i.e. there should be no leading
+											// zero bits other than the 16 zero pad bits
+											// in mod[length-2] and mod[length-1].
+} MP_Mod;
+
+// Define this symbol to keep and print statistics on the number of
+// basic operations.
+
+
+// Zero bytes for using UMS for negation, adding in a carry, etc.
+extern const char mp_Zeros[MP_SIZE];
+
+
+/*** EndHeader */
+
+
+const char mp_Zeros[MP_SIZE] = { 0, };
+
+
+
+/*** Beginheader xor8, xor16 */
+__root void xor8(char __far * inout, char __far * in);
+__root void xor16(char __far * inout, char __far * in);
+/*** EndHeader */
+
+// inout ^= in  (for 16 or 8 bytes - useful for AES and other ciphers)
+#asm __root
+xor8::
+	ld		py,(sp+6)		; get 'in' - assumes 2 byte return addr
+	jr		.do8
+xor16::
+	; px already points to inout by C calling convention
+	ld		py,(sp+6)		; get 'in' - assumes 2 byte return addr
+	ld		jkhl,(px+12)
+	ld		bcde,(py+12)
+	xor	jkhl,bcde
+	ld		(px+12),jkhl
+	ld		jkhl,(px+8)
+	ld		bcde,(py+8)
+	xor	jkhl,bcde
+	ld		(px+8),jkhl
+.do8:
+	ld		jkhl,(px+4)
+	ld		bcde,(py+4)
+	xor	jkhl,bcde
+	ld		(px+4),jkhl
+	ld		jkhl,(px+0)
+	ld		bcde,(py+0)
+	xor	jkhl,bcde
+	ld		(px+0),jkhl
+	ret
+#endasm
+
+
+
+/*** Beginheader xor_n */
+__root void xor_n(char __far * inout, char __far * in, word n);
+/*** EndHeader */
+
+// inout ^= in  (for n bytes)
+__nodebug
+__root void xor_n(char __far * inout, char __far * in, word n)
+{
+#asm
+	; px points to inout
+	; set py from in
+	ld		py,(sp+@sp+in)
+	ld		hl,(sp+@sp+n)
+	test	hl
+	jr		z,.exit
+	ld		bc,hl
+	xor	a
+	rr		bc
+	rra
+	rr		bc
+	rra			; now A (two msbs) = n % 4
+					; bc = floor(n / 4)
+	ld		hl,bc
+	test	hl
+	jr		z,.last3
+.loop4:
+	exx
+	ld		jkhl,(px+0)
+	ld		bcde,(py+0)
+	xor	jkhl,bcde
+	ld		(px+0),jkhl
+	ld		px,px+4
+	ld		py,py+4
+	exx
+	dwjnz	.loop4
+.last3:
+	ld		bcde,(py+0)	; last 0-3 bytes (get 4, but not all used)
+	rla
+	jr		nc,.last1
+	ld		hl,(px+0)
+	xor	hl,de
+	ld		(px+0),hl
+	ld		e,c			; shift down the possible last byte
+	ld		px,px+2
+.last1:
+	rla
+	jr		nc,.exit
+	ld		a,(px+0)
+	xor	e
+	ld		(px+0),a
+.exit:
+#endasm
+}
+
+
+
+/*** Beginheader xor_n_const */
+__xmem void xor_n_const(char __far * inout, unsigned long k, word n);
+/*** EndHeader */
+
+// inout ^= a constant longword k  (for n bytes)
+// e.g. if k is 0xFFFFFFFF, then all bytes are complemented.
+// The last (n mod 4) bytes are xored with that many LSBs of k i.e.
+// k is considered little-endian.
+__nodebug
+__xmem void xor_n_const(char __far * inout, unsigned long k, word n)
+{
+#asm
+	; px points to inout
+	; preload BCDE' with constant
+	ld		bcde',(sp+@sp+k)
+	ld		hl,(sp+@sp+n)
+	test	hl
+	jr		z,.exit
+	ld		bc,hl
+	xor	a
+	rr		bc
+	rra
+	rr		bc
+	rra			; now A (two msbs) = n % 4
+					; bc = floor(n / 4)
+	ld		hl,bc
+	test	hl
+	jr		z,.last3
+.loop4:
+	exx
+	ld		jkhl,(px+0)
+	xor	jkhl,bcde
+	ld		(px+0),jkhl
+	ld		px,px+4
+	ld		py,py+4
+	exx
+	dwjnz	.loop4
+.last3:
+	exx
+	rla
+	jr		nc,.last1
+	ld		hl,(px+0)
+	xor	hl,de
+	ld		(px+0),hl
+	ld		e,c			; shift down the possible last byte
+	ld		px,px+2
+.last1:
+	rla
+	jr		nc,.exit
+	ld		a,(px+0)
+	xor	e
+	ld		(px+0),a
+.exit:
+#endasm
+}
+
+
+
+
+
+/*** BeginHeader _mp_ss */
+// If x >= m, then x -= m.  If x < 2m, then this is a modular reduction.
+// Otherwise, x is not fully reduced.
+// Not a C function!
+__nodebug __xmem void _mp_ss(char *x, MP_Mod * m);
+/*** EndHeader */
+
+#asm __xmem
+_mp_ss::
+	; HL = (x) long precision quantity to reduce modulo m
+	; PX = (m) MP_Mod struct
+	;  NB: although we are using PX, we cannot use physical memory access.
+	;  Thus, PX must be loaded using LDL, i.e. must point to root memory.
+	ex		de',hl	; save X
+	; set DE = modulus pointer (LSB addr)
+	ld		de,[MP_Mod]+mod
+	ld		jkhl,px	; We discard JK, since PX must be a logical pointer
+	add	hl,de
+	ex		de,hl		; DE used as modulus pointer
+	ld		hl,(px+[MP_Mod]+length)
+	ld		bc,hl		; BC now length
+	ex		de',hl	; restore HL->x
+	dec	bc			; Offset to MSB.
+	ld		iy,hl		; IY->x
+	push	de			; push modulus pointer
+	add	hl,bc		;2
+	ex		de,hl		;2
+	add	hl,bc		;2
+.loop:
+	ld		a,(de)	;6
+	cp		(hl)		;5
+	jr		nz,.loopexit	;5
+	dec	de			;2
+	dec	hl			;2
+	dwjnz	.loop
+	ld		a,(de)	; A = x[v]
+	cp		(hl)		; Carry if x[v] < m[v]
+.loopexit:
+	jr		c,.exit	;5		/ total = 23 + 25 + 16 + 13 = 77
+
+	; Subtract modulus (top of stack) from x (in iy) using UMS
+	ld		hl,(px+[MP_Mod]+length)
+	ld		bc,hl		; BC now length
+	ld		hl,iy		; HL -> x
+	pop	iy			; IY -> mod
+	push	ix
+	ld		ix,hl		  ; source and dest the same
+	ld		de',0
+	or		a
+	ld		de,1		  ; multiply by 1
+	UMS
+	pop	ix
+
+	scf				; Set carry: needed to subtract - may need another round
+	lret
+
+.exit:
+	add	sp,2		; discard modulus parameter
+	or		a			; Clear carry: no subtraction required, hence x is fully reduced
+	lret
+#endasm
+
+
+/*** BeginHeader _f_mp_ss */
+// If x >= m, then x -= m.  If x < 2m, then this is a modular reduction.
+// Otherwise, x is not fully reduced.
+// Not a C function!
+__nodebug __xmem void _f_mp_ss(char __far *x, MP_Mod __far * m);
+/*** EndHeader */
+
+#if !_RAB6K
+	#error "_f_mp_ss requires Rabbit 6000"
+#endif
+
+
+#asm __xmem
+_f_mp_ss::
+	; PZ = (x) long precision quantity to reduce modulo m
+	; PW = (m) MP_Mod struct
+	; AF,BC,DE,HL,DE',PX,PY,PZ trashed
+	; Returns Cy set if a subtraction was required
+	ld		hl,(pw+[MP_Mod]+length)
+	ld		bc,hl					; loop counter
+	ld		px,pw+[MP_Mod]+mod
+	dec	hl
+	ld		px,px+hl				; End of modulus
+	ld		py,pz+hl				; End of x
+.loop:
+	ld		a,(py)				; Get X byte
+	cp		a,(px)				; Compare to mod.  Carry if x[v] < m[v]
+	jr		nz,.loopexit	;5
+	dec	py
+	dec	px
+	dwjnz	.loop		;5	/ 25
+.loopexit:
+	jr		c,.exit	;5		/ total = 23 + 25 + 16 + 13 = 77
+
+	; Subtract modulus from x using UMS
+	ld		hl,(pw+[MP_Mod]+length)
+	ld		bc,hl		; BC now length
+	ld		px,pz		; dest and minuend the same
+	ld		py,pw+[MP_Mod]+mod	; subtrahend
+	ld		de',0		; Clear carry ins
+	or		a
+	ld		de,1		  ; multiply subtrahend by 1
+	pums
+
+	scf				; Set carry: needed to subtract - may need another round
+	lret
+
+.exit:
+	or		a			; Clear carry: no subtraction required, hence x is fully reduced
+	lret
+#endasm
+
+
+/*** BeginHeader mp_mul16 */
+// result = x * val - needs extra word at end of result for 16-bit carry out.
+// Not a C function!  IY = x, DE = val, HL = result, BC = length, however
+// result area must contain an extra 2 bytes for cary out; hence BC <= sizeof(*result)-2.
+// R6k: different regs: PY -> x, DE = val, PZ -> result, BC = length.
+__nodebug __xmem void mp_mul16(char * x, word val, char * result);
+/*** EndHeader */
+#asm __xmem
+mp_mul16::
+#if _RAB6K
+	push	px
+	ld		de',0
+	ldl	px,mp_Zeros
+	or		a
+	puma
+	ex		de',hl
+	ld		(pz),hl
+	pop	px
+#else
+	push	ix
+	ld		de',0
+	ld		ix,mp_Zeros		; Add in nothing
+	or		a
+	UMA
+	ex		de,hl			; Dest pointer in DE
+	ex		de',hl		; Get carry out to HL
+	ex		de,hl
+	ld		(hl),e
+	inc	hl
+	ld		(hl),d
+	pop	ix
+#endif
+
+	lret
+#endasm
+
+/*** BeginHeader mp_mod16 */
+// x = x mod mp_m.  On entry, 0 <= x < m->mod * 2**16
+// Not a C function!  On entry, HL = x; PX = m.
+// Set up PX to point to modulus info.  Note that LDL _must_ be used since
+// other routines depend on this.  Fundamentally, UMA and UMS require root
+// addresses.
+// Trashes IX!
+__xmem void mp_mod16(char * x, MP_Mod * m);
+/*** EndHeader */
+
+#asm __xmem _mparith_debug
+mp_mod16::
+	; Compute multiple of modulus to subtract from x so that x < m.
+	; We have precomputed mrecip so that multiply is used.
+
+	; mp_mrecip2 contains modulus reciprocal (2**24..2**25-1).  Multiplying this
+	; by the 3 MSBs of x, then dividing by 2**32, gives the appropriate multiple
+   ; of the modulus to subtract.  There is a small (1/256) probability of requiring
+   ; an extra sub.
+
+   ; We need a 3-byte work area for computing the initial modulus multiple.
+   ; This is allocated on the stack for re-entrancy.
+	push	hl						; save X on stack
+	ld		bc,hl					; save X
+	add	sp,-3
+	clr	hl
+	add	hl,sp
+	push	hl						; temp area
+	ld		hl,(px+[MP_Mod]+recip)	; LSBs of recip
+	ex		de,hl					; becomes multiplicand for UMA
+	ld		hl,(px+[MP_Mod]+length)
+	add	hl,bc
+	dec	hl						; HL points to MSB of x
+	ld		iy,hl
+	pop	hl						; Point to 3-byte temp area allocated above
+	ld		(hl),0
+	ld		ix,hl					; Point to a known zero byte at start of temp area
+	ld		bc,1
+	ld		de',0
+	or		a
+	UMA	; now temp[0] contains LSB of result, DE' contains 2 byte carry out (cy will be clear)
+	clr	hl
+	ex		de',hl				; zero carry in for next (DE') and get cout to HL
+	ld		(ix),hl
+	ld		hl,(px+[MP_Mod]+recip+2)	; MSBs of recip
+	ex		de,hl	; MSBs of recip (in range 256..511) to DE
+	dec	ix						; back to start of temp
+	ld		hl,ix
+	ld		c,3		; BC = 3
+	dec	iy
+	dec	iy
+	dec	iy
+	UMA	; Now DE' and (ix-1) have the required result (except there may be a carry out from the addition)
+	ex		de',hl
+	jr		nc,.nocy
+	inc	hl
+.nocy:
+	ex		de,hl
+	ld		a,(ix-1)
+	rla
+	rl		de
+
+	; Do: x = x - mp_m * de
+	; This is done by a single UMS insn.
+	ld		ix,(sp+3)	; Dest and minuend (skip 3 bytes temp area)
+	ld		jkhl,px			; load logical address in LSBs of px (it must be set using LDL!)
+	ld		jk,[MP_Mod]+mod
+	add	hl,jk				; points to modulus (LSB)
+	ld		bc',hl			; save it for later
+	ld		iy,hl				; multiplicand (the modulus)
+	ld		de',0				; zero carry ins
+	or		a
+	ld		hl,(px+[MP_Mod]+length)
+	ld		bc,hl
+	ld		hl,ix				; dest and minuend same area (x -= mod*DE)
+	UMS
+	; Do 2 extra single reductions (compensate for possible rounding error in mrecip)
+	exx
+	ld		de',bc
+	exx					; get modulus pointer back in DE
+	ld		hl,(sp+3)
+	lcall	_mp_ss
+	jr		nc,.nosub			; will jump with probability 255/256
+	exx
+	ld		de',bc
+	exx					; get modulus pointer back in DE
+	ld		hl,(sp+3)
+	lcall	_mp_ss				; no need to check; must be fully reduced now
+.nosub:
+	add	sp,5					; discard temp area and saved X
+	lret
+#endasm
+
+
+/*** BeginHeader _f_mp_mod16 */
+// x = x mod mp_m.  On entry, 0 <= x < m->mod * 2**16
+// Not a C function!  On entry, JKHL = address of x; PW = m.
+// Set up PW to point to modulus info.
+__xmem void _f_mp_mod16(char __far * x, MP_Mod __far * m);
+/*** EndHeader */
+
+#if !_RAB6K
+	#error "_f_mp_mod16 requires Rabbit 6000"
+#endif
+
+#asm __xmem _mparith_debug
+_f_mp_mod16::
+	; Compute multiple of modulus to subtract from x so that x < m.
+	; We have precomputed mrecip so that multiply is used.
+
+	; mp_mrecip2 contains modulus reciprocal (2**24..2**25-1).  Multiplying this
+	; by the 3 MSBs of x, then dividing by 2**32, gives the appropriate multiple
+   ; of the modulus to subtract.  There is a small (1/256) probability of requiring
+   ; an extra sub.
+   push	pz								; Need to preserve this
+   ld		px,jkhl						; X pointer to PX
+   ld		pz',jkhl						; Also save in PZ'
+   ld		hl,(pw+[MP_Mod]+length)
+   ld		px,px+hl						; adjust to point to end of X plus 1.
+   ld		hl,(pw+[MP_Mod]+recip)	; LSBs of recip
+   ex		de,hl
+   ld		hl,(px-3)					; 2nd MSBs of X
+   ex		bc,hl
+   mulu									; result in HLBC
+   ex		bc,hl							; save result MSB in BC (LSBs are insignificant
+   										;  and have no effect)
+   ld		hl,(px-1)					; MSBs of X
+   ld		h,0
+	mulu	hl,de							; result in jkhl
+	ex		de,hl
+	clr	hl
+	ex		bc,hl							; extend 1st result to 32 bit
+	add	jkhl,bcde					; this cannot carry out
+	ld		py,jkhl						; save into PY
+	ld		hl,(pw+[MP_Mod]+recip+2); MSBs of recip
+	ex		de,hl
+	ld		hl,(px-3)					; 2nd MSBs of X
+	mulu	hl,de							; result in jkhl
+	add	jkhl,py						; accumulate previous partial product
+	clr	hl								; zap the LSBs
+	ex		jk,hl							; effectively shift left 16
+	ld		py,jkhl						; save partial prod in PY
+
+   ld		hl,(px-1)					; MSBs of X
+   ld		h,0
+	mulu	hl,de							; Result will be in HL (JK will be 0) because
+											; this is a 24x24 multiply.
+	add	jkhl,py						; add in previous p.p.
+	ex		de,hl							; This becomes multiplier for X to perform
+											; the modulus reduction
+
+	; Do: x = x - mp_m * de
+	; This is done by a single UMS insn.
+	; DE already holds multiplier
+	; PX points just past end of X
+	; Need to set PZ to start of X (dest)
+	;             PY to modulus (multiplicand)
+	;             PX to start of X (source minuend)
+   ld		hl,(pw+[MP_Mod]+length)
+   ld		bc,hl							; BC is length
+   alts ld		pz,pz					; PZ now points back to start of X
+   ld		px,pz
+   ld		py,pw+[MP_Mod]+mod
+	ld		de',0				; zero carry ins
+	or		a
+   pums
+
+	; Do 2 extra single reductions (compensate for possible rounding error in mrecip)
+   alts ld		pz,pz					; PZ now points back to start of X
+	lcall	_f_mp_ss
+	jr		nc,.nosub			; will jump with probability 255/256
+   alts ld		pz,pz					; PZ now points back to start of X
+	lcall	_f_mp_ss				; no need to check; must be fully reduced now
+.nosub:
+	pop	pz
+	lret
+#endasm
+
+
+/*** BeginHeader mp_reduce */
+// Like mp_mod16, except allows arbitrary reduction until x < mod.
+void mp_reduce(char * x, word xdig, MP_Mod * mod);
+/*** EndHeader */
+_mparith_debug
+void mp_reduce(char * x, word xdig, MP_Mod * mod)
+{
+	auto word mdig;
+
+	mdig = mod->length-2>>1;
+	// Initial possible reduction of 1 bit in case mod <= x < 2.mod
+	if (((word *)x)[xdig-1] >= ((word *)mod->mod)[mdig-1]) {
+		#asm
+		push	ix
+		ldl	px,(sp+@sp+mod+2)
+		ld		hl,(sp+@sp+mdig+2)
+		ex		de,hl
+		ld		hl,(sp+@sp+xdig+2)
+		sub	hl,de
+		add	hl,hl
+		ex		de,hl
+		ld		hl,(sp+@sp+x+2)
+		add	hl,de
+		lcall	_mp_ss
+		pop	ix
+		#endasm
+	}
+	while (xdig > mdig) {
+		#asm
+		push	ix
+		ldl	px,(sp+@sp+mod+2)
+		ld		hl,(sp+@sp+mdig+2)
+		ex		de,hl
+		ld		hl,(sp+@sp+xdig+2)
+		sub	hl,de
+		dec	hl
+		add	hl,hl
+		ex		de,hl
+		ld		hl,(sp+@sp+x+2)
+		add	hl,de
+		lcall	mp_mod16		;(x + (xdig-mdig<<1), mod);
+		pop	ix
+		#endasm
+		--xdig;
+	}
+
+}
+
+
+
+/*** BeginHeader _f_mp_reduce */
+// Like _f_mp_mod16, except allows arbitrary reduction until x < mod.
+void _f_mp_reduce(char __far * x, word xdig, MP_Mod __far * mod);
+/*** EndHeader */
+#if !_RAB6K
+	#error "_f_mp_reduce requires Rabbit 6000"
+#endif
+_mparith_debug
+void _f_mp_reduce(char __far * x, word xdig, MP_Mod __far * mod)
+{
+	auto word mdig;
+
+	mdig = mod->length-2>>1;
+	// Initial possible reduction of 1 bit in case mod <= x < 2.mod
+	if (((word __far *)x)[xdig-1] >= ((word __far *)mod->mod)[mdig-1]) {
+		#asm
+		push	pw
+		ld		pw,(sp+@sp+mod+4)
+		ld		pz,(sp+@sp+x+4)
+		ld		hl,(sp+@sp+mdig+4)
+		ex		de,hl
+		ld		hl,(sp+@sp+xdig+4)
+		sub	hl,de
+		add	hl,hl
+		ld		pz,pz+hl
+		lcall	_f_mp_ss
+		pop	pw
+		#endasm
+	}
+	while (xdig > mdig) {
+		#asm
+		push	pw
+		ld		pw,(sp+@sp+mod+4)
+		ld		pz,(sp+@sp+x+4)
+		ld		hl,(sp+@sp+mdig+4)
+		ex		de,hl
+		ld		hl,(sp+@sp+xdig+4)
+		sub	hl,de
+		dec	hl
+		add	hl,hl
+		ld		pz,pz+hl
+		ld		jkhl,pz
+		lcall	_f_mp_mod16		;(x + (xdig-mdig<<1), mod);
+		pop	pw
+		#endasm
+		--xdig;
+	}
+
+}
+
+
+
+/*** BeginHeader mp_M16 */
+// x *= y (mod mp_m).
+// xdig and ydig contains number of (16-bit) digits in x and y.
+void mp_M16(char *x, word xdig, char *y, word ydig, MP_Mod * mod);
+/*** EndHeader */
+
+_mparith_debug
+void mp_M16(char *x, word xdig, char *y, word ydig, MP_Mod * mod)
+{
+	auto char t[MP_SIZE<<1];
+	mp_mul3(t, x, xdig, y, ydig);
+	mp_reduce(t, xdig+ydig, mod);
+	memcpy(x, t, mod->length);
+}
+
+/*** BeginHeader mp_mul3 */
+// r = xy.
+// x is xdig digits long.  y is ydig digits long.
+// r must have space for xdig+ydig digits.
+// x and y may be same pointer, but r must not overlap either x or y.
+// xdig and ydig must both be greater than zero.
+void mp_mul3(char * r, char __far * x, word xdig, char * y, word ydig);
+/*** EndHeader */
+_mparith_debug
+void mp_mul3(char * r, char __far * x, word xdig, char * y, word ydig)
+{
+	#asm _mparith_debug
+	push	ix
+	ldl	pz,(sp+@sp+r+2)	; Result pointer
+	ldl	py,(sp+@sp+y+2)	; Y operand (multiplied by successive digits from X)
+	ld		px,(sp+@sp+x+2)	; Successive digits from X  (PX was PW in far model)
+	ld		ix,mp_Zeros			; Initial sum is zero
+	ld		hl,(sp+@sp+xdig+2)
+	ld		bc,hl					; BC is X digit counter
+	ld		de,0					; initial carry in
+	ld		hl,(sp+@sp+ydig+2)
+	add	hl,hl					; HL is number of bytes in Y
+									; Also clears Cy for loop
+.loop:
+	ld		bc',hl				; Set UMA byte count
+	exx
+	ld		hl,(px)				; Digit from X (multiplier)
+	ld		px,px+2
+	ex		de,hl
+	ld		jkhl,py
+	ld		iy,hl					; Get Y multiplicand (low order from PY)
+	ld		jkhl,pz				; Get dest (hl, low order from pz, ignore jk)
+	uma							; (hl) = (ix) + (iy)*DE
+	ld		ix,hl					; save carry out position
+	clr	hl						; clear digit carry for next UMA
+	ex		de',hl				; get the carry out in HL
+	adc	hl,bc					; BC is zero, so this just adds in final carry
+									; This is also guaranteed to clear the Cy for next
+									; round
+	ld		(ix),hl				; Save the final carry out digit
+	ld		pz,pz+2				; advance result pointer
+	ld		jkhl,pz				; After first iteration, accumulate into the result
+	ld		ix,hl
+	exx
+	dwjnz	.loop
+
+.exit:
+	pop	ix
+	#endasm
+}
+
+
+/*** BeginHeader _f_mp_mul3 */
+// r = xy.
+// x is xdig digits long.  y is ydig digits long.
+// r must have space for xdig+ydig digits.
+// x and y may be same pointer, but r must not overlap either x or y.
+void _f_mp_mul3(char __far * r, char __far * x, word xdig, char __far * y, word ydig);
+/*** EndHeader */
+#if !_RAB6K
+	#error "_f_mp_mul3 requires Rabbit 6000"
+#endif
+_mparith_debug
+void _f_mp_mul3(char __far * r, char __far * x, word xdig, char __far * y, word ydig)
+{
+	#asm _mparith_debug
+	push	pw
+	ld		pz,(sp+@sp+r+4)	; Result pointer
+	ld		py,(sp+@sp+y+4)	; Y operand (multiplied by successive digits from X)
+	ld		pw,(sp+@sp+x+4)	; Successive digits from X
+	ldl	px,mp_Zeros			; Initial sum is zero
+	; The following should not be required, but works around a processor bug
+	; (early release only?)
+	cnvd	px
+	cnvd	py
+	cnvd	pz
+
+.loop:
+	ld		hl,(sp+@sp+xdig+4)
+	test	hl
+	dec	hl
+	ld		(sp+@sp+xdig+4),hl
+	jr		z,.exit
+	ld		hl,(pw)
+	ld		pw,pw+2
+	ex		de,hl
+	ld		hl,(sp+@sp+ydig+4)
+	add	hl,hl
+	ld		bc,hl
+	ld		de',0
+	or		a
+	puma							; (pz) = (px) + (py)*DE
+	ex		de',hl				; save the carry out
+	adc	hl,bc					; BC is zero, so this just adds in final carry
+	ld		(pz),hl
+	ld		pz,pz+2
+	ld		hl,(sp+@sp+ydig+4)
+	add	hl,hl
+	neg	hl
+	ld		pz,pz+hl				; Reset to start of result (but advanced one digit)
+	ld		py,py+hl				; Reset to start of Y operand
+	ld		px,pz					; After first iteration, accumulate into the result
+	jr		.loop
+
+.exit:
+	pop	pw
+	#endasm
+}
+
+
+
+/*** BeginHeader _f_mp_M16 */
+// x *= y (mod mp_m).
+// xdig and ydig contains number of (16-bit) digits in x and y.
+// Note that x returns the result (is overwritten) so it must have the
+// same storage length as the modulus.
+void _f_mp_M16(char __far *x, word xdig, char __far *y, word ydig, MP_Mod __far * mod);
+/*** EndHeader */
+
+#if !_RAB6K
+	#error "_f_mp_M16 requires Rabbit 6000"
+#endif
+
+
+
+_mparith_debug
+void _f_mp_M16(char __far *x, word xdig, char __far *y, word ydig, MP_Mod __far * mod)
+{
+	auto char t[MP_SIZE<<1];
+#ifdef MPA_USE_KARATSUBA
+	if (xdig == ydig && xdig > 16)
+		_f_mp_karat3(t, x, y, xdig);
+	else
+#endif
+		_f_mp_mul3(t, x, xdig, y, ydig);
+	_f_mp_reduce(t, xdig+ydig, mod);
+	_f_memcpy(x, t, mod->length);
+}
+
+
+
+
+/*** BeginHeader mp_add */
+// Add y to x giving r.  All contain 'digs' non-zero digits.
+// If the result carries out, then return value is 1, else 0.
+// Only 'digs' digits of r will be modified.
+int mp_add(char * r, char * x, char * y, word digs);
+/*** EndHeader */
+_mparith_debug
+int mp_add(char * r, char * x, char * y, word digs)
+{
+	#asm _mparith_debug
+	push	ix
+	ld		hl,(sp+@sp+digs+2)
+	add	hl,hl
+	ld		bc,hl
+	ld		hl,(sp+@sp+r+2)
+	ld		ix,(sp+@sp+x+2)
+	ld		iy,(sp+@sp+y+2)
+	ld		de,1
+	ld		de',0
+	or		a
+	uma
+	flag	c,hl			; HL will be 1 if carry out
+	pop	ix
+	#endasm
+}
+
+
+
+/*** BeginHeader _f_mp_add */
+// Add y to x giving r.  All contain 'digs' non-zero digits.
+// If the result carries out, then return value is 1, else 0.
+// Only 'digs' digits of r will be modified.
+int _f_mp_add(char __far * r, char __far * x, char __far * y, word digs);
+/*** EndHeader */
+#if !_RAB6K
+	#error "_f_mp_add requires Rabbit 6000"
+#endif
+_mparith_debug
+int _f_mp_add(char __far * r, char __far * x, char __far * y, word digs)
+{
+	#asm _mparith_debug
+	ld		hl,(sp+@sp+digs)
+	add	hl,hl
+	ld		bc,hl
+	ld		pz,(sp+@sp+r)
+	ld		px,(sp+@sp+x)
+	ld		py,(sp+@sp+y)
+	ld		de,1
+	ld		de',0
+	or		a
+	puma
+	flag	c,hl			; HL will be 1 if carry out
+	#endasm
+}
+
+
+
+/*** BeginHeader mp_sub */
+// Subtract y from x, giving r.  All contain 'digs' non-zero digits.
+// If the result is negative, then return value is -1, else 0.
+// In the -ve case, the caller may need to add in the modulus in
+// order to have correct modulo arithmetic.
+// Only 'digs' digits of r will be modified.
+int mp_sub(char * r, char * x, char * y, word digs);
+/*** EndHeader */
+_mparith_debug
+int mp_sub(char * r, char * x, char * y, word digs)
+{
+	#asm _mparith_debug
+	push	ix
+	ld		hl,(sp+@sp+digs+2)
+	add	hl,hl
+	ld		bc,hl
+	ld		hl,(sp+@sp+r+2)
+	ld		ix,(sp+@sp+x+2)
+	ld		iy,(sp+@sp+y+2)
+	ld		de,1
+	ld		de',0
+	or		a
+	ums
+	; Sign extend the result
+	flag	nc,hl			; HL will be 1 if no carry out i.e. result non-negative
+	dec	hl				; Change to a sign extension value (for return value)
+	pop	ix
+	#endasm
+}
+
+/*** BeginHeader _f_mp_sub */
+// Subtract y from x, giving r.  All contain 'digs' non-zero digits.
+// If the result is negative, then return value is -1, else 0.
+// In the -ve case, the caller may need to add in the modulus in
+// order to have correct modulo arithmetic.
+// Only 'digs' digits of r will be modified.
+int _f_mp_sub(char __far * r, char __far * x, char __far * y, word digs);
+/*** EndHeader */
+#if !_RAB6K
+	#error "_f_mp_sub requires Rabbit 6000"
+#endif
+_mparith_debug
+int _f_mp_sub(char __far * r, char __far * x, char __far * y, word digs)
+{
+	#asm _mparith_debug
+	ld		hl,(sp+@sp+digs)
+	add	hl,hl
+	ld		bc,hl
+	ld		pz,(sp+@sp+r)
+	ld		px,(sp+@sp+x)
+	ld		py,(sp+@sp+y)
+	ld		de,1
+	ld		de',0
+	or		a
+	pums
+	; Sign extend the result
+	flag	nc,hl			; HL will be 1 if no carry out i.e. result non-negative
+	dec	hl				; Change to a sign extension value (for return value)
+	#endasm
+}
+
+/*** BeginHeader _f_mp_karat3 */
+// r = = x * y.
+// Analogous to _f_mp_mul3
+// r must have 2.xydig digits
+// both x and y have xydig digits.  digit is 16 bits.
+void _f_mp_karat3(char __far * r, char __far *x, char __far *y, word xydig);
+/*** EndHeader */
+
+_mparith_debug
+void _f_mp_karat3(char __far * r, char __far *x, char __far *y, word xydig)
+{
+	auto char t[MP_SIZE];
+	auto word N;	// Number of digits considered in low half of x,y
+	auto word N2;
+	auto word N4;
+	auto char __far * xh;
+	auto char __far * yh;
+	auto char __far * rlh;
+	auto char __far * rh;
+	auto char __far * rhh;
+
+	if (xydig < 64 || (xydig & 1)) {
+		// End recursion at this point, where book-keeping overhead exceeds
+		// benefit.
+		_f_mp_mul3(r, x, xydig, y, xydig);
+		return;
+	}
+
+	xh = x + xydig;
+	yh = y + xydig;
+	N = xydig>>1;
+	rlh = r + xydig;
+	//if (xydig & 1) {
+		// Odd digits.  Consider high part to have 1 less digit than low part.
+		//FIXME: this case covered by not recursing (see above)
+	//}
+	//else {
+		// Even digits, hence even low/high split
+		rh = rlh + xydig;
+		rhh = rh + xydig;
+		*(word __far *)rlh = _f_mp_add(r, x, xh, N);
+		*(word __far *)rhh = _f_mp_add(rh, y, yh, N);
+		_f_mp_karat3(t, r, rh, N+1);	// Result is 2N+2 digits, but last dig will be 0.
+		N2 = xydig+2;
+		N4 = N<<2;
+		_f_mp_karat3(r, x, y, N);
+		_f_mp_karat3(rh, xh, yh, N);
+		*(word __far *)(t+N4) += _f_mp_sub(t, t, r, xydig);
+		*(word __far *)(t+N4) += _f_mp_sub(t, t, rh, xydig);
+		if (_f_mp_add(rlh, rlh, t, N2)) {
+			// Unusual case of carrying out from adding middle digits.
+			memset(t, 0, xydig);
+			*t = 1;
+			rhh += 4;
+			_f_mp_add(rhh, rhh, t, N-2);
+		}
+	//}
+}
+
+
+
+
+/*** BeginHeader bin2mp */
+void bin2mp(char __far *input, MP_Mod __far *output, word in_len);
+/*** EndHeader */
+
+// Convert binary data into mp format (reverse endianness)
+// output must have its length field set correctly
+// We also support special case where input == output->mod,
+// in which case an in-place operation is performed.
+_mparith_debug
+void bin2mp(char __far *input, MP_Mod __far *output, word in_len) {
+	auto int i,j;
+	auto word k;
+
+	k = output->length;
+	if (k > in_len)
+   	_f_memset(output->mod + in_len, 0, k-in_len);
+   // Need to reverse bytes, with padding zeros at end.
+   // We move both ends of input at once, so that reversal-in-place
+   // will work.
+   for(i = 0, j = in_len-1; i <= j; ++i, --j) {
+    	output->mod[i] = input[j];
+    	output->mod[j] = input[i];
+   }
+}
+
+/*** BeginHeader mp2bin */
+void mp2bin(MP_Mod __far * input, char __far * output, word out_len);
+/*** EndHeader */
+
+// Convert an mp number into its representative binary
+// input must have its length field set correctly
+// We also support special case where input == output->mod *and*
+// out_len <= input len, in which case an in-place operation is performed.
+_mparith_debug
+void mp2bin(MP_Mod __far * input, char __far * output, word out_len) {
+	auto int i,j;
+	auto word k;
+
+	k = input->length;
+	if (k < out_len) {
+		// leading zeros in MSBs
+   	_f_memset(output, 0, out_len - k);
+
+	   // Need to reverse bytes, with padding zeros at start
+	   for(i = 0, j = out_len-1; i < k && (int)j >= 0; i++, j--) {
+	      output[j] = input->mod[i];
+	   }
+	}
+	else {
+		// No padding, reverse start stretch
+	   for(i = 0, j = out_len-1; i <= j; ++i, --j) {
+	      output[i] = input->mod[j];
+	      output[j] = input->mod[i];
+	   }
+	}
+}
+
+
+/*** BeginHeader hex2mp */
+// Load number with hexadecimal-encoded ascii string
+// y->length must be set correctly before calling
+void hex2mp(char __far *x, MP_Mod __far *y);
+/*** EndHeader */
+_mparith_debug
+void hex2mp(char __far *x, MP_Mod __far *y)
+{
+	auto len;
+
+	len = y->length - sizeof(word);
+	*(word __far *)(y->mod + len) = 0u;	// 2 byte zero pad at MSBs
+	numhexstr2bin (x, y->mod, len);
+
+}
+
+
+
+
+/*** BeginHeader mp_setup_mrecip2 */
+void mp_setup_mrecip2(MP_Mod __far *y);
+/*** EndHeader */
+_mparith_debug
+void mp_setup_mrecip2(MP_Mod __far *y)
+{
+	// To avoid divisions in mp_mod16(), precompute the reciprocal of the MSBs
+	// of the modulus, so we can use multiplication instead.
+	// m' = 4MSBs of modulus.  Assumed to be in range [2**31,2**32)
+	// m" = M' + 1.  (If overflow on the +1, recip is 0x80000000)
+	// R = floor(2**63/m").  Will be in range [2**31,2**32)
+	// When we later wish to find Q = floor(A/M) where M <= A < M*(2**16-1)
+	// then we take N = 6MSBs of A (assuming A has two extra MSBs than M)
+	// and compute Q = floor(A/M) = floor(AR/MR) =
+	//  floor(AR/2**63).
+	// In other words, compute AR (in range 2**63..2**79) and throw away all
+	// but 16 MSbs.
+
+	auto unsigned long w, k, v, r;
+	auto word i, s;
+
+	s = y->length & ~3;
+	w = *(unsigned long __far *)(y->mod + (s-4)) + 1uL;
+	//mp_mrecip2 = (unsigned long)(2**48 / w);
+	if (!w)
+		// Overflowed from 0xFFFFFFFF.  The reciprocal must be 0x80000000
+		r = 0x80000000uL;
+	else {
+		v = w >> 1;
+		k = 0x80000000uL;
+		r = 0;
+		for (i = 0; i < 32; i++) {
+			r <<= 1;
+			if (k >= v)
+				r |= 1, k -= v;
+			k <<= 1;
+		}
+	}
+#if _RAB6K
+	// Above level of precision is superfluous.
+	// Cut down range of R to floor(2**56/m") i.e. 2**24<=R<2**25
+	r >>= 7;
+#endif
+	y->recip = r;
+}
+
+/*** BeginHeader mp_modexp, _f_mp_modexp */
+// b = g^expon mod m.
+// This is the basic asymmetric key operation, so stats are reset and printed
+// at end.
+// All fields of m (incl. m->recip) must be set up prior to calling.
+// Length of b, g and e must be at least m->length.
+void mp_modexp(char MPA_FQ * b, char MPA_FQ * g, char __far * expon, MP_Mod MPA_FQ * m);
+
+#if _RAB6K
+	#define _f_mp_modexp  mp_modexp
+#else
+// This not only copies the far data to temporary root buffers, but also
+// evaluates the recip field for the modulus.
+void _f_mp_modexp(char __far * b, char __far * g, char __far * expon, MP_Mod __far * m);
+#endif
+
+/*** EndHeader */
+
+#if !_RAB6K
+_mparith_debug
+void _f_mp_modexp(char __far * b, char __far * g, char __far * expon, MP_Mod __far * m)
+{
+	char nb[MP_SIZE], ng[MP_SIZE];
+	MP_Mod nm;
+	// This is not very elegant, however there is not really much additional
+	// overhead considering the large amount of procesing done.
+	_f_memcpy(&nm, m, sizeof(nm));
+	_f_memcpy(ng, g, nm.length);
+	mp_setup_mrecip2(&nm);
+	mp_modexp(nb, ng, expon, &nm);
+	_f_memcpy(b, nb, nm.length);
+}
+#endif
+
+_mparith_debug
+void mp_modexp(char MPA_FQ * b, char MPA_FQ * g, char __far * expon, MP_Mod MPA_FQ * m)
+{
+	auto long tt;
+	auto word a, aa;
+	auto word gdigs, edigs;
+	auto word __far * w;
+	auto word notfirst;
+   auto int n;
+   auto word s, sw, len;
+
+
+	len = m->length;
+	s = len & ~3;
+	sw = s >> 1;
+	for (w = (word __far *)(g + (s - 2)), gdigs = sw;
+        gdigs && !*w;
+        w--, gdigs--);
+	for (w = (word __far *)(expon + (s - 2)), edigs = sw;
+        edigs && !*w;
+        w--, edigs--);
+
+	MPA_MEMSET(b, 0, len);
+	b[0]=1;
+	a = 128;
+	aa = (edigs<<1)-1;
+	notfirst = 0;
+	for(n=(aa+1)*8;n--;){
+	  	if (notfirst) {
+	  		MPA_M16(b,sw,b,sw,m);
+		}
+		if (expon[aa]&a) {
+	  		MPA_M16(b,sw,g,gdigs,m);
+	  		notfirst = 1;		// Avoid initial squarings of 1.
+	  	}
+	  	a>>=1;
+	  	if (!a)
+	  		a = 128, aa--;
+	}
+
+}
+
+
+/*** BeginHeader mp_modexp_1, mp_modexp_2 */
+
+// State struct for non-blocking.  This must be in root memory (unless Rabbit 6000)
+typedef struct {
+	word		aa;	// word counter
+	word		a;		// bit within word
+	char __far * expon;	// Current exponent.  This is the only thing which can be far.
+						// it is constant thru the calculation
+	word		gdigs;	// Digits in g.  Computed at start, then const
+	word		sw;	// word length
+	word		n;		// bit counter
+	char		b[MP_SIZE];
+	char		g[MP_SIZE];
+#if _RAB6K
+	MP_Mod __far * m;	// On Rabbit 6000, no need to copy modulus since far
+							//  memory is directly supported.
+#else
+	MP_Mod	m;		// Modulus.  This is constant, but kept here since needs to
+						// be copied to root.
+#endif
+} mp_modexp_state;
+
+// This sets up for non-blocking operation
+void mp_modexp_1(mp_modexp_state MPA_FQ * state, char __far * g,
+						char __far * expon, MP_Mod __far * m);
+
+// This continues and eventially completes the non-blocking operation started by the above
+// Returns 0 when complete, else non-zero.  Each step will process one bit from the
+// exponent.  Thus, it will typically run for about 1/512 of the total time for a 512-bit
+// RSA private key operation.
+// When complete, state->b contains the answer.
+// If g is NULL, then state->g must be already set up with g operand.
+// If m is null, then state->m must already have the modulus (complete with reciprocal).
+int mp_modexp_2(mp_modexp_state MPA_FQ * state);
+/*** EndHeader */
+
+_mparith_debug
+void mp_modexp_1(mp_modexp_state MPA_FQ * state, char __far * g,
+						char __far * expon, MP_Mod __far * m)
+{
+	auto word edigs;
+	auto word __far * w;
+   auto word s, len;
+
+#if _RAB6K
+	if (m) {
+		len = m->length;
+		state->m = m;
+		mp_setup_mrecip2(state->m);
+	}
+	else
+		len = state->m->length;
+#else
+	if (m) {
+		len = m->length;
+		_f_memcpy(&state->m, m, sizeof(state->m));
+		mp_setup_mrecip2(&state->m);
+	}
+	else
+		len = state->m.length;
+#endif
+	if (g)
+		_f_memcpy(state->g, g, len-2);
+	if (expon)
+		state->expon = expon;
+
+	s = len & ~3;
+	state->sw = s >> 1;
+	for (w = (word __far *)(state->g + (s - 2)), state->gdigs = state->sw;
+        state->gdigs && !*w;
+        --w, --state->gdigs);
+	for (w = (word __far *)(expon + (s - 2)), edigs = state->sw;
+        edigs && !*w;
+        --w, --edigs);
+
+	MPA_MEMSET(state->b, 0, len);
+	state->b[0]=1;
+	state->a = 128;
+	state->aa = (edigs<<1)-1;
+	state->n = (state->aa+1)*8 - 1;
+}
+
+_mparith_debug
+int mp_modexp_2(mp_modexp_state MPA_FQ * state)
+{
+	// Difference is that on _RAB6K, state->m is a pointer not an instance.
+#if _RAB6K
+  	// square...
+   MPA_M16(state->b, state->sw, state->b, state->sw, state->m);
+   if (state->expon[state->aa] & state->a)
+   	// multiply...
+      MPA_M16(state->b, state->sw, state->g, state->gdigs, state->m);
+#else
+  	// square...
+   MPA_M16(state->b, state->sw, state->b, state->sw, &state->m);
+   if (state->expon[state->aa] & state->a)
+   	// multiply...
+      MPA_M16(state->b, state->sw, state->g, state->gdigs, &state->m);
+#endif
+   state->a>>=1;
+   if (!state->a)
+      state->a = 128, --state->aa;
+	if (state->n--)
+		return -EAGAIN;
+	return 0;	// done
+}
+
+/*** BeginHeader mp_modexpCRT */
+// b = g^d mod m.
+// This is similar to the basic mp_modexp(), except that the Chinese Remainder
+// Theorem (and Garner's algorithm) is used to speed up the calculation.  Use of CRT requires additional
+// "helper" parameters, which are normally provided in the private key information
+// for e.g. RSA.  The private exponent (d) and full modulus (n) are not explicitly provided.
+// This approaches 4 times faster than direct exponentiation mod n.
+// Note: lengths of p, q parameters must be exactly half the key length (n).  It is
+//  assumed that p and q are approx sqrt(m).  Their MSBs must be set.
+
+void mp_modexpCRT(char MPA_FQ * b, char MPA_FQ * g,
+                  MP_Mod MPA_FQ * p,	// Prime p, factor of m
+                  MP_Mod MPA_FQ * q,	// Prime q, factor of m: pq = m
+                  char __far * dmp1,// d mod (p - 1); CRT exponent
+                  char __far * dmq1,// d mod (q - 1); CRT exponent
+                  char MPA_FQ * iqmp,// 1 / q mod p; CRT coefficient
+                  );
+/*** EndHeader */
+
+
+void mp_modexpCRT(char MPA_FQ * b, char MPA_FQ * g,
+                  MP_Mod MPA_FQ * p,	// Prime p, factor of m
+                  MP_Mod MPA_FQ * q,	// Prime q, factor of m: pq = m
+                  char __far * dmp1,// d mod (p - 1); CRT exponent
+                  char __far * dmq1,// d mod (q - 1); CRT exponent
+                  char MPA_FQ * iqmp,// 1 / q mod p; CRT coefficient
+                  )
+{
+	char nb[MP_SIZE];
+	char na[MP_SIZE];
+	char ng[MP_SIZE];
+#if !_RAB6K
+	MP_Mod np, nq;
+#endif
+	word	gdig, pdig;
+
+#if _RAB6K
+	#define MPA_CRT_P  p
+	#define MPA_CRT_Q  q
+#else
+	// This is not very elegant, however there is not really much additional
+	// overhead considering the large amount of procesing done.
+	_f_memcpy(&np, p, sizeof(np));
+	_f_memcpy(&nq, q, sizeof(nq));
+	#define MPA_CRT_P  (&np)
+	#define MPA_CRT_Q  (&nq)
+#endif
+	mp_setup_mrecip2(MPA_CRT_P);
+	mp_setup_mrecip2(MPA_CRT_Q);
+	/*
+
+	   Basic Algorithm (see also RFC3447):
+	     na = g ^ dmp1 mod p
+	     nb = g ^ dmq1 mod q
+	     ne = na - nb mod p
+		  na = ne * iqmp mod p
+		  b = nb + q * na
+
+		Implementation notes:
+		  Compute number of digits in m (required for mod reductions of g).
+		  Assumed to be 2 times number of digits in p ( = digits in q).
+
+	     na = (g mod p) ^ dmp1 mod p
+	     nb = (g mod q) ^ dmq1 mod q
+
+	     The above works because the magic of modular arithmetic makes
+	       a^b mod M == (a mod M)^b mod M
+		  Since these exponentiations are half size of g^d, but there are two
+		  of them, this only takes 1/4 the time (in the limit).  Our initial
+		  reductions of g have about the same complexity order as multiplication
+		  and are thus insignificant.
+
+	     na -= nb
+	     if (na < 0)
+	       na += p
+		  na = na * iqmp mod p
+		  b = nb + q * na
+
+		It is assumed that p and q are both numbers with half as many bits as
+		the product m=pq.  They must both be a multiple of 32 bits in length,
+		and the MSBs must be 1.
+		This is because our basic exponentiation routine expects this constraint.
+		Should be OK in practice, since RSA keys are generated this way.
+
+	*/
+	gdig = p->length-2;	// Length in bytes, hence equal to *digits* in g.
+	pdig = gdig>>1;
+
+	// na = (g mod p) ^ dmp1 mod p
+	_f_memcpy(ng, g, gdig<<1);
+	MPA_REDUCE(ng, gdig, MPA_CRT_P);
+	mp_modexp(na, ng, dmp1, MPA_CRT_P);
+
+	// nb = (g mod q) ^ dmq1 mod q
+	_f_memcpy(ng, g, gdig<<1);
+	MPA_REDUCE(ng, gdig, MPA_CRT_Q);
+	mp_modexp(nb, ng, dmq1, MPA_CRT_Q);
+
+	// na = na - nb mod p
+	if (MPA_SUB(na, na, nb, pdig))
+		MPA_ADD(na, na, MPA_CRT_P->mod, pdig);
+
+	// na = na * iqmp mod p
+	MPA_M16(na, pdig, iqmp, pdig, MPA_CRT_P);
+
+	// b = nb + q * na
+	MPA_MUL(b, MPA_CRT_Q->mod, pdig, na, pdig);
+	MPA_ADD(b, b, nb, pdig+1);	// Extra 1 to allow carry.  nb will always have
+											// an extra trailing MSB 0, because it was set
+											// using mp_modexp.
+#undef MPA_CRT_P
+#undef MPA_CRT_Q
+}
+
+
+/*** BeginHeader mp_modexpCRT_1, mp_modexpCRT_2 */
+
+// State struct for non-blocking.  This must be in root memory (unless Rabbit 6000)
+typedef struct {
+	word step;
+	word	gdig, pdig;
+	char __far * dmp1;
+	char __far * iqmp;
+	MP_Mod __far * p;
+	MP_Mod __far * q;
+	//char far * g;	// Would like this, but to save stack frame in
+							// RSA encrypt, make this an array.
+	char g[MP_SIZE];
+	char nb[MP_SIZE];
+	mp_modexp_state	ms;
+} mp_modexpCRT_state;
+
+// This sets up for non-blocking operation
+void mp_modexpCRT_1(mp_modexpCRT_state MPA_FQ * state, char __far * g,
+                  MP_Mod __far * p,	// Prime p, factor of m
+                  MP_Mod __far * q,	// Prime q, factor of m: pq = m
+                  char __far * dmp1,// d mod (p - 1); CRT exponent
+                  char __far * dmq1,// d mod (q - 1); CRT exponent
+                  char __far * iqmp,// 1 / q mod p; CRT coefficient
+                  );
+
+// This continues and eventially completes the non-blocking operation started by the above
+// Returns 0 when complete, else non-zero.
+// When complete, state->ms.b contains the answer.
+int mp_modexpCRT_2(mp_modexpCRT_state MPA_FQ * state);
+/*** EndHeader */
+
+_mparith_debug
+void mp_modexpCRT_1(mp_modexpCRT_state MPA_FQ * state, char __far * g,
+                  MP_Mod __far * p,	// Prime p, factor of m
+                  MP_Mod __far * q,	// Prime q, factor of m: pq = m
+                  char __far * dmp1,// d mod (p - 1); CRT exponent
+                  char __far * dmq1,// d mod (q - 1); CRT exponent
+                  char __far * iqmp,// 1 / q mod p; CRT coefficient
+                  )
+{
+	state->step = 1;
+	state->gdig = p->length-2;	// Length in bytes, hence equal to *digits* in g.
+	state->pdig = state->gdig>>1;
+	state->dmp1 = dmp1;
+	state->iqmp = iqmp;
+	state->p = p;
+	state->q = q;
+	if (g)
+		_f_memcpy(state->g, g, sizeof(state->g));
+	else
+		g = state->g;
+
+	_f_memcpy(state->ms.g, g, state->gdig<<1);
+#if _RAB6K
+	state->ms.m = q;
+	mp_setup_mrecip2(q);
+	MPA_REDUCE(state->ms.g, state->gdig, q);
+#else
+   _f_memcpy(&state->ms.m, q, sizeof(state->ms.m));
+   mp_setup_mrecip2(&state->ms.m);
+	MPA_REDUCE(state->ms.g, state->gdig, &state->ms.m);
+#endif
+	// Use NULLs because g and modulus already set up
+	mp_modexp_1(&state->ms, NULL, dmq1, NULL);
+
+}
+
+_mparith_debug
+int mp_modexpCRT_2(mp_modexpCRT_state MPA_FQ * state)
+{
+	switch (state->step) {
+	case 1:
+		// Finish the first exponentiation
+		if (mp_modexp_2(&state->ms))
+			break;
+		// Done. Now state->ms.b = g ^ dmq1 (mod q).  Save in nb.
+		// Extra 2 copied to put a trailing zero, since we need it for add carry below.
+		_f_memcpy(state->nb, state->ms.b, state->gdig+2);
+		// Start off the next expon...
+		state->step = 2;
+	   _f_memcpy(state->ms.g, state->g, state->gdig<<1);
+	#if _RAB6K
+	   state->ms.m = state->p;
+	   mp_setup_mrecip2(state->ms.m);
+	   MPA_REDUCE(state->ms.g, state->gdig, state->ms.m);
+	#else
+	   _f_memcpy(&state->ms.m, state->p, sizeof(state->ms.m));
+	   mp_setup_mrecip2(&state->ms.m);
+	   MPA_REDUCE(state->ms.g, state->gdig, &state->ms.m);
+	#endif
+	   // Use NULLs because g and modulus already set up
+	   mp_modexp_1(&state->ms, NULL, state->dmp1, NULL);
+	   break;
+	case 2:
+		// Finish the second exponentiation
+		if (mp_modexp_2(&state->ms))
+			break;
+		// Done. Now state->ms.b = na = g ^ dmp1 (mod p).
+		// We now finish up the algorithm, since following steps are all fast.
+	   // na = na - nb mod p
+	#if _RAB6K
+	   if (MPA_SUB(state->ms.g, state->ms.b, state->nb, state->pdig))
+	      MPA_ADD(state->ms.g, state->ms.g, state->p->mod, state->pdig);
+	   // na = na * iqmp mod p
+	   MPA_M16(state->ms.g, state->pdig, state->iqmp, state->pdig, state->ms.m);
+	#else
+	   if (MPA_SUB(state->ms.g, state->ms.b, state->nb, state->pdig))
+	      MPA_ADD(state->ms.g, state->ms.g, state->ms.m.mod, state->pdig);
+	   // na = na * iqmp mod p
+	   _f_memcpy(state->ms.b, state->iqmp, state->gdig);
+	   MPA_M16(state->ms.g, state->pdig, state->ms.b, state->pdig, &state->ms.m);
+	#endif
+	   // b = nb + q * na
+	   // 1 extra digit in state->ms.g (which will be zero), to give trailing zero on result
+	   MPA_MUL(state->ms.b, state->q->mod, state->pdig, state->ms.g, state->pdig+1);
+	   MPA_ADD(state->ms.b, state->ms.b, state->nb, state->pdig+1);
+		return 0;
+
+	}
+	return -EAGAIN;	// incomplete if get here
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+

@@ -1,0 +1,506 @@
+/*** BeginHeader */
+#ifndef __DKENTRY_LIB
+#define __DKENTRY_LIB
+/*** EndHeader */
+
+/*** BeginHeader dkPrologCount, dkOSRunning, dkContextSwitch, dkLastTCB,
+				     dkDbgTCB */
+
+extern char dkPrologCount;
+extern char dkOSRunning;
+extern char dkContextSwitch;
+extern void* dkLastTCB;
+extern void* dkDbgTCB;
+/*** EndHeader */
+
+char dkPrologCount;
+char dkOSRunning;
+char dkContextSwitch;
+void* dkLastTCB;
+void* dkDbgTCB;
+
+/*** BeginHeader dkExit */
+__xmem void dkExit(void);
+/*** EndHeader */
+
+#asm __xmem
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;
+dkExit::
+#ifdef MCOS
+	ld		a,(dkStatusFlags)
+	bit	DKF_STAT_CONTEXTSWITCH,a
+	jr		z,__dk_uedone
+	ld		hl,(OSTCBCur)
+	ld		(dkLastTCB),hl
+__dk_uedone:
+#endif
+   lret
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+#endasm
+
+/*** BeginHeader dkSingleStepExit */
+__xmem void dkSingleStepExit(void);
+/*** EndHeader */
+
+#asm __xmem
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;
+dkSingleStepExit::
+#ifdef MCOS
+	ld		hl,(OSTCBCur)
+	bool	hl
+	jr		z,__dk_csse_done		;exit if os is not yet running
+	ld		hl,(OSTCBCur)			;set current TCB as tcb being debugged
+	ld		(dkDbgTCB),hl
+
+__dk_csse_done:
+#endif
+	lret
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+#endasm
+
+/*** BeginHeader dkProlog */
+__root void dkProlog(void);
+/*** EndHeader */
+
+#asm __root
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; dkProlog
+; this routine is called on each entry to the debug kernel
+dkProlog::
+	push	ip
+	ipset	1
+
+	push	af
+	push	hl
+
+#ifdef MCOS
+   ld		a,(dkPrologCount)
+	or		a
+	jr		nz, __dk_prolog_exit
+
+	ld		hl,(OSRunning)			; disable MCOS scheduling if MCOS active
+	ld		a,l
+	or		l
+	jr		z,__dk_prolog_exit
+
+	ld		a,l
+	ld		(dkOSRunning),a
+	xor	a
+	ld		(OSRunning),a
+
+__dk_prolog_exit:
+	ld		a,(dkPrologCount)
+	inc	a
+	ld		(dkPrologCount),a
+#else
+	ld		hl,(FSP)
+	ld		a,h
+	or		l
+	jr		z,__dkprolog_done
+
+	ld		(DBGFSP),hl
+
+	bool	hl
+	ld		l,h
+	ld		(FSP),hl
+
+__dkprolog_done:
+#endif
+	pop	hl
+	pop	af
+	pop	ip
+	ret
+#endasm
+
+/*** BeginHeader dkEpilog */
+__root void dkEpilog(void);
+/*** EndHeader */
+
+#asm
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; dkEpilog
+; this routine is called on each exit from the debug kernel
+dkEpilog::
+  	push	ip
+  	ipset	1
+
+	push	af
+
+#ifdef MCOS
+	ld		a,(dkPrologCount)
+	dec	a
+	ld		(dkPrologCount),a
+
+	or		a
+	jr		nz,__dk_epilog_exit
+
+	ld		a,(dkOSRunning)			;restore MCOS active status
+	ld		(OSRunning),a
+	xor	a
+	ld		(dkOSRunning),a
+
+__dk_epilog_exit:
+#else
+	push	hl
+	ld		hl,(DBGFSP)
+	ld		(FSP),hl
+	bool	hl
+	ld		l,h
+	ld		(DBGFSP),hl
+
+	pop	hl
+#endif
+	pop	af
+  	pop	ip
+	ret
+#endasm
+
+/*** BeginHeader dkDetectContextSwitch */
+__xmem void dkDetectContextSwitch(void);
+/*** EndHeader */
+#asm __xmem
+dkDetectContextSwitch::
+	ld		hl,(OSTCBCur)
+	ld		a,l
+	or		h
+	jr		z,__dk_dcsdone
+
+	ld		hl,(dkLastTCB)
+	ld		a,l
+	or		h
+	jr		nz,__dk_dcsosstarted
+	ld		(dkLastTCB),hl		; if os just started, init OSDbgTCB
+
+__dk_dcsosstarted:
+
+	ld		hl,(OSTCBCur)
+	ld		de,(dkLastTCB)
+	xor	a											; clear carry
+	sbc	hl,de
+	jr		z,__dk_dcsdone
+
+
+	ld		a,(dkStepFlags)
+	bit	DKF_STEP_OVER,a
+	jr		nz,__dk_dcsdone
+	add	sp,2
+	ld		a,TC_DEBUG_SINGLESTEP
+	ld		(dkRequest),a
+	ld		hl,dkStatusFlags
+	set	DKF_STAT_CONTEXTSWITCH,(hl)
+	ljp	dkSingleStep				; bypass dkCore and treat this as a
+	                              ; source level step. Context switch occurred while
+	                              ; single stepping in disassembled code.
+__dk_dcsdone:
+	lret
+#endasm
+
+/*** BeginHeader dk_bdcr, dkHWBP_enabled, dkSavedIPReg, dkUseSavedIPReg*/
+// dk_bdcr stores BDCR register plus 4 more
+// bytes to store return address: lxpc:OFFSET:bdcr
+extern byte dk_bdcr[5];
+//dkHWBP_enabled acts as lock for enabling/disabling
+//the handling of hardware breakpoints.
+extern byte dkHWBP_enabled;
+extern byte dkSavedIPReg;
+extern byte dkUseSavedIPReg;
+/*** EndHeader */
+
+// dk_bdcr stores BDCR register plus 4 more
+// bytes to store return address: lxpc:OFFSET:bdcr
+byte dk_bdcr[5];
+//dkHWBP_enabled acts as lock for enabling/disabling
+//the handling of hardware breakpoints.
+byte dkHWBP_enabled;
+byte dkSavedIPReg;
+byte dkUseSavedIPReg;
+
+/*** BeginHeader dkHandleRST18, dkHandleHardBreak */
+__root void dkHandleRST18(void);
+__root void dkHandleHardBreak(void);
+
+/*** EndHeader */
+
+#asm __root
+dkHandleHardBreak::
+     push  af
+
+     ld a,(dkHWBP_enabled);First check to see if Hardware breakpoints are enabled.
+     bit 0,a
+     jp z,.dkHWBreakpointsDisabled
+
+ioi  ld    a, (BDCR) //< we handle all hardware breakpoints here now, so read
+                          // and clear them all in one shot.
+     ld    (dk_bdcr),a
+
+     ; Clear the status register, so that breakpoint 0 doesn't occur
+     ; again (in case this happens to be breakpoint 0).
+     xor    a
+ioi  ld    (B0CR), a
+     pop   af
+
+	  call  dkProlog
+
+#ifdef MCOS
+	 ; call	dkCheckCurrentTask  omid - this is not needed at current IP setting.
+#endif
+     ;omid7-12-07 The following block is a substitution to the call
+     ;to ipres, to maintain interrupt priority for "Hard" breakpoints.
+     push ip
+     push hl
+     push af
+     ld  hl,(sp+4)
+     rr  l                  ;right shift the copy of  IP register to prepare for
+     rr  l                  ;call to dkSaveContext.
+     ld  a,l
+	  ld  (dkSavedIPReg),a   ;save the modified copy of IP register.
+     ld  a,0x01
+     ld  (dkUseSavedIPReg),a  ;this tells dkSaveContext to use the saved copy,
+                              ;rather than the actual IP register.
+     pop af
+     pop hl
+     pop ip
+	  call  dkSaveContext	 ; save context of user program
+     xor  a
+     ld  (dkUseSavedIPReg),a  ;clear dkUseSavedIPReg
+
+     call  dkSavepcrst2028
+
+.dkHandleHardBreakExit:
+   ld    hl,(sp)         ; Save off the return address so we can send it to DC...
+   ld    (dk_bdcr+1),hl
+   ld    hl,lxpc
+   ld    (dk_bdcr+3),hl  ;
+	add	sp,2							; adjust stack pointer to remove return address
+#ifdef MCOS
+   ;call	dkDetectContextSwitch  omid - this is not needed at current IP setting.
+#endif
+   ld    a,(dk_bdcr)
+   and   0x7E
+   jr    z,.dkIsBreakpoint0   ;is this a user-specified HW breakpoint other than BP 0?
+
+	xor	a
+	set	DKF_STAT_AT_HARD_BP,a
+	ld		(dkStatusFlags),a
+	ld		bc,0x05                       ; 0x02 signals special message to DC handler
+   ld    hl,dk_bdcr
+	ld		d,TC_TYPE_DEBUG					; d has packet type
+	ld		e,TC_DEBUG_REGDATA				; e has packet subtype
+	call 	dkRespond							; send packet
+	xor	a
+	set	DKF_STAT_AT_HARD_BP,a
+	ld		(dkStatusFlags),a
+	; Target is stopped at breakpoint - send message to DC
+	ld		a,(dkSendFlags)
+	set	DKF_SEND_STATUS,a
+	set	DKF_SEND_ACK,a							; set send ack bit
+	ld		(dkSendFlags),a						; save send flags
+	ld		a,TC_DEBUG_ATBREAKPOINT				; notify dc at bp
+	ld		(dkAckToSend),a						; queue this ack to be sent after single step
+
+   ljp dkCore
+
+.dkIsBreakpoint0:
+	ipres
+	; if next instruction to execute is an rst 20 or 28, jump straight
+	; to the asm single step handler, and skip the instruction
+	ld		iy,(dkRegisters+__dkregisters+_pc)
+   ex		jk',hl
+	ld		hl,(dkRegisters+__dkregisters+_xpc)
+   ex		jk,hl
+   ex		jk',hl
+	lcall	__dk_ldp_LogToPhyCode
+	ld		a, l
+	cp		DK_RST20
+	jr		nz,.dk_notrst20
+	ljp	dkAsmSingleStep
+.dk_notrst20:
+	cp		DK_RST28
+	jr		nz,.dk_notrst28
+	ljp	dkAsmSingleStep
+.dk_notrst28:
+	ld		iy,TCState					; disable nesting of interrupts during tc callbacks
+	ld		a,1
+	TC_STOR(dont_nest_interrupts,a)
+	ljp   dkCore
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+.dkHWBreakpointsDisabled:
+  	ioi  ld a, (BDCR) ;clear hwbp
+   pop af
+	ipres
+   ret
+#endasm
+
+#if DK_ENABLE_ASMSINGLESTEP
+
+#asm __root
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; Disassembled code single step handler.  After an instruction
+; executes in RAM, execution ends up here.
+dkHandleRST18::
+	push	ip
+	ipset	1
+	call	dkProlog
+	pop	ip
+#ifdef MCOS
+	call	dkCheckCurrentTask
+#endif
+	call	dkSaveContext				; save context of user program
+	add	sp,2							; adjust stack pointer to remove return address
+	call 	dkSavepc
+#ifdef MCOS
+   call	dkDetectContextSwitch
+#endif
+	; if next instruction to execute is an rst 20 or 28, jump straight
+	; to the asm single step handler, and skip the instruction
+	ld		iy,(dkRegisters+__dkregisters+_pc)
+   ex		jk',hl
+	ld		hl,(dkRegisters+__dkregisters+_xpc)
+   ex		jk,hl
+   ex		jk',hl
+	lcall	__dk_ldp_LogToPhyCode
+	ld		a, l
+	cp		DK_RST20
+	jr		nz,.dk_notrst20
+	ljp	dkAsmSingleStep
+.dk_notrst20:
+	cp		DK_RST28
+	jr		nz,.dk_notrst28
+	ljp	dkAsmSingleStep
+.dk_notrst28:
+	ld		iy,TCState					; disable nesting of interrupts during tc callbacks
+	ld		a,1
+	TC_STOR(dont_nest_interrupts,a)
+	ljp	dkCore
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+#endasm
+#endif     //assembly single step
+
+/*** BeginHeader dkCheckCurrentTask */
+__root void dkCheckCurrentTask(void);
+/*** EndHeader */
+#asm __root
+dkCheckCurrentTask::
+	push	af
+	push	hl
+	push	de
+	ld		hl,(OSTCBCur)
+	bool	hl
+	jr		z,__dkcct_done		; if OSTCBCur = 0, os not yet running
+	ld		hl,(dkDbgTCB)
+	bool	hl
+	jr		nz,__dk_cctosstarted
+	ld		hl,(OSTCBCur)
+	ld		(dkDbgTCB),hl		; if os just started, init OSDbgTCB
+
+__dk_cctosstarted:
+	ld		a,(dkStepFlags)
+	bit	DKF_STEP_INTO,a
+	jr		nz,__dkcct_done		; if stepping into, must enter dk
+
+	ld		a,(dkRequest)			; if stopping, stop regardless of running task
+	cp		TC_DEBUG_STOPPROGRAM
+	jr		z,__dkcct_done
+
+
+__dk_cctnotstop:
+	ld		hl,(OSTCBCur)
+	ex		de,hl
+	xor	a						; clear carry
+	ld		hl,(dkDbgTCB)		; TCB of task currently being debugged
+	sbc	hl,de
+	jr		z,__dkcct_done		; (z set at last sbc) enter dk if this task is being debugged
+
+									; once this is actually implemented, should check to see if
+									; STOPPROGRAM is the current command. If so, even if the
+									; current task is not the one we are interested in, the debug
+									; kernel should be entered so that the program can be stopped.
+
+#if (DK_ENABLE_TRACING == 1)
+__dk_tracesendcont:
+	ld		hl,dkTraceFlags
+   bit	DKF_TRACE_ON,(hl)
+   jr		z,__dkcct_notrace
+	ld		a,(dkSendFlags)					; get send flags into a
+	bit	DKF_SEND_TRACE,a				   ; check if watches should be sent
+	jr		z,__dkcct_notrace
+   ld    hl,dkDebugTraceMsg
+   lcall dkSendTrace
+	ld		hl,dkTraceFlags
+   bit	DKF_TRACE_FENTRY,(hl)
+   res	DKF_TRACE_FENTRY,(hl)
+   res	DKF_TRACE_FEXIT,(hl)
+   jr		nz,__dk_tracesendcont    ; now repeat Entry trace with Execute or MACRO
+   res	DKF_TRACE_RST,(hl)
+__dkcct_notrace:
+#endif
+	pop	de
+	pop	hl
+	pop	af
+	add	sp,2
+	jp		dkEpilog
+
+__dkcct_done:
+	pop	de
+	pop	hl
+	pop	af
+	ret
+#endasm
+
+
+/*** BeginHeader dkHandleRST28 */
+__root void dkHandleRST28(void);
+/*** EndHeader */
+
+#asm
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; Source level single step.  An rst 28 is
+; placed before every series of instructions making up a single
+; c statement in non-nodebug code.
+dkHandleRST28::
+	push	ip
+	ipset	1
+	call 	dkProlog
+	pop	ip
+
+#ifdef MCOS
+	call	dkCheckCurrentTask
+#endif
+
+	push	af
+   push	hl                ; save hl
+	ld		hl,lxpc
+	ex		jk,hl
+   call	dkCheckEntry
+   ex		jk,hl
+   ld		lxpc,hl
+   pop	hl                ; restore hl
+	jp		z,.dk_hr28enter
+	pop	af
+	ret
+
+.dk_hr28enter:
+	pop	af
+
+#if (DK_ENABLE_TRACING == 1)
+	lcall	dkSetTraceRST28
+#endif
+
+	call 	dkSaveContext
+	call	dkSavepcrst2028
+
+	add	sp,2
+#if (DK_ENABLE_ASMSINGLESTEP == 1)
+	call dkSetReturnAddress
+#endif
+	ljp	dkCore
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+#endasm
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+

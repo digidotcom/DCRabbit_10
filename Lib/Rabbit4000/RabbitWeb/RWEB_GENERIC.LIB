@@ -1,0 +1,5233 @@
+/*
+ *	rweb-generic.lib -- RabbitWeb generic functionality
+ *
+ * Copyright (c) 2008 Digi International Inc., All Rights Reserved
+ *
+ * This software contains proprietary and confidential information of Digi
+ * International Inc.  By accepting transfer of this copy, Recipient agrees
+ * to retain this software in confidence, to prevent disclosure to others,
+ * and to make no use of this software other than that for which it was
+ * delivered.  This is a published copyrighted work of Digi International
+ * Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+ * prohibited.
+ *
+ * Restricted Rights Legend
+ *
+ * Use, duplication, or disclosure by the Government is subject to
+ * restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+ * Technical Data and Computer Software clause at DFARS 252.227-7031 or
+ * subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+ * Restricted Rights at 48 CFR 52.227-19, as applicable.
+ *
+ * Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+ *
+ *    This library includes the library support for the RabbitWeb HTTP
+ *    enhancements.
+ */
+
+/*** BeginHeader _web_gi */
+#ifndef _RWEB_GENERIC_INCL
+#define _RWEB_GENERIC_INCL
+
+#if CC_VER < 0xA20
+	#fatal "This library must be used with Dynamic C version 10.21 or later."
+#endif
+
+#ifndef MALLOC_H_Incl
+#use "malloc.lib"
+#endif
+
+
+//#define RWEB_DEBUG
+#ifdef RWEB_DEBUG
+	#define _web_debug	__debug
+	#define _web_assert(exp) assert(exp)
+#else
+	#define _web_debug	__nodebug
+	#define _web_assert(exp)
+#endif
+
+#define _WEB_INITIAL_ALLOC	500
+#define _WEB_ROOTBUF_SIZE 128
+#define _WEB_MAX_FQNLEN 128	// Max variable name length (in C syntax form)
+
+// Define to nothing at present.  When RabbitWeb compiler supports far,
+// change this to "far". (and format to %08lX)
+#define RWEB_FQ
+#define RWEB_FQ_FORMAT	"%04X"
+#define RWEB_FQ_FORMAT_STR	"%s"
+
+// Max hierarchy nesting levels supported by parser/generator.
+#define _WEB_MAX_X_NEST 10
+// Max possible cname length. 1 byte for each possible nesting level,
+// plus 1 byte for length byte, plus a max of 4 entries which could
+// require a value more than 254.  (There could be no more than this,
+// since total address space would be exceeded even using far variables).
+#define _WEB_MAX_CNAME (_WEB_MAX_X_NEST+1+2*4)
+
+
+
+struct WebStructMemInfo;
+struct WebStructMemList;
+struct WebExtrep;
+struct WebConditional;
+struct WebIteratorFilter;
+struct WebIterator;
+
+typedef struct {
+   unsigned simple;	// Identifies simple type (int, char, long, etc) versus
+   						// struct (simple>=TSTRUCT).  If this value is >=TSTRUCT
+   						// then the ptr member should be used instead of simple
+   struct WebStructMemList __far *ptr;
+   						// pointer to a structure member definition array
+} WebVarType_t;
+
+
+
+typedef struct WebErrorList {
+	char __far * group_name;	// Error group name
+										// Generated as "egrp" plus 2 hex digits
+										// for each level in the hierarch.  The digits
+										// are (arbitrarily) set to the field index
+										// in the parent structure.
+	unsigned		id;			// Starting error ID
+	unsigned		n_msgs;		// Number of messages in following list
+	char __far * __far * msgs;	// Array of ptrs to error message text
+} WebErrorList_t;
+
+// Organize the following struct with the most commonly used items near
+// the start.  Since it is dynamically allocated, the "tail" parts may not
+// exist if the corresponding flag is not set.
+typedef struct WebMetadata {
+	word flags;
+#define WM_HAVE_MIN_L	0x0001
+#define WM_HAVE_MIN_UL	0x0002
+#define WM_HAVE_MIN_F	0x0003
+#define WM_HAVE_MAX_L	0x0004
+#define WM_HAVE_MAX_UL	0x0008
+#define WM_HAVE_MAX_F	0x000C
+#define WM_IDX_OK			0x0010	// OK to use array indexing for member access
+										// even though this is a struct.  This is used to
+										// implement non-homegeneous "arrays".
+#define WM_HAVE_
+#define WM_ATTRIBUTE		0x1000	// This is attribute (else element) - XML only.
+#define WM_CUSTOM			0x2000	// This is custom i.e. 'cond' points to an
+											// entry with custom callback.
+	// Always have this field...
+	struct WebExtrep __far * extrep;	// External representation (string format) or NULL
+
+	_rweb_fcnptr* guardptr; 	// array of guards
+	_rweb_fcnptr* updateptr; 	// array of update functions
+
+	char auth;  			// Authentication requirement flags.  These specify the
+								// user authentication level required to access this
+								// variable, for read or write.  If zero, any method
+								// is acceptable.  If PK is set, then server must be
+								// using crypto, regardless of other bits.
+//DEVIDEA: these copied from zserver.  Need to be generic.
+#define SERVER_AUTH_NONE 0x01			// No user/group identification available
+#define SERVER_AUTH_BASIC 0x02		// Plaintext password
+#define SERVER_AUTH_DIGEST 0x04		// Hashed password
+													// <- above three are mutually exclusive
+#define SERVER_AUTH_PK 0x08			// Cryptographically secured (e.g. TLS).
+													// This may be used in combo with one
+													// of the above.
+	unsigned groups; 		// group bits.  If auth test passes, this filters out
+								// an allowable subset of user groups.  If 0, then
+								// any group is acceptable.
+#define RCI_GROUP	0x8000		// Special group bit for RCI.  This is forced
+										// to be set when populating the metadata from
+										// the RCI JSON file, regardless of the #web
+										// setting.
+	unsigned wperm; 		// write permission bits (bitwise for groups)
+	unsigned rperm; 		// read permission bits (bitwise for groups)
+	_Web_Select select; 	// Selection array (string<->int mapping) or NULL
+	char __far * desc;				// Description string or NULL
+	union {
+		// Numeric or string length bounds (only if flags & WM_HAVE_MIN etc.)
+		long	l;
+		unsigned long u;
+		float f;
+	} min, max;
+	struct WebStructMemInfo __far * key;
+			 // Member field if this is a dict-style array of struct
+	char	c[2];				// Condition test parameter (empty string if none).
+								// Else passed to nearest conditional test callback.
+	struct WebConditional __far * cond;
+								// Conditional test callback function, or NULL
+								// All functions must be registered using
+								// web_register_conditional() and/or
+                        // web_register_custom() before calling web_init.
+                        // Note that 'cust' metadata also uses this entry
+                        // hence 'cond' and 'cust' must use the same name
+                        // in the same metadata.
+	WebErrorList_t __far * errs;
+	void __far * factory_dflt;	// If NULL, then the default is binary zeros.
+								// Otherwise, this points to a non-zero value of the
+								// same size as the corresponding field, which is the
+								// "factory default" setting.  Should only apply to
+								// leaves.  This is used primarily for the descriptors,
+								// or for a default which is suitable for all elements
+								// in an array.  fd (below) is more versatile, since it
+								// acts more like shadow i.e. there is a complete
+								// backing object.  The two default types are required
+								// because of the differing requirements of RCI
+								// descriptors and actual field defaults.
+	void __far * fd;			// If not NULL, points to allocated factory default
+								// field.  Similar considerations to shadow.
+	void __far * shadow;	// If not NULL, points to allocated shadow of this
+								// field.  This should normally occur near the root,
+								// since lower levels then automatically get shadows.
+								// Shadow may be used for various purposes.  In RCI it
+								// is used to represent the "stored settings".
+} WebMetadata_t;
+
+
+typedef struct WebStructMemInfo {
+   char __far *name;			// Name of data member (field) or root variable
+   unsigned int offset;		// Field offset into the structure
+   void RWEB_FQ * valptr;	// If a base level variable, this is address of same
+   									// Note that this must be a near pointer for now.
+   WebVarType_t type;		// Field or object type
+   int __far * dims;			// Array of dimensions
+   WebMetadata_t __far * meta;	// Additional information
+} WebStructMemInfo_t;
+
+
+typedef struct WebStructMemList {
+	int strsize; 					// size of the structure
+	unsigned nmemb;				// number of members in this list...
+	WebStructMemInfo_t __far *ptr; // array of member information
+} WebStructMemList_t;
+
+
+typedef void __far * (*_web_updptr)(int);
+
+
+// This structure keeps information on a particular (instance) variable during the
+// parsing process.
+
+typedef struct WebInstInfo {
+	// Note that most of these pointers could well be near, however we make them
+	// far for upward compatibility.  The exception is "valptr" since it can't
+	// be changed until true compiler support for far RabbitWeb is available.
+
+	// This struct basically contains info about a
+	// particular "leaf" node of the web variable tree e.g. an array element or
+	// struct field.  This is why we can't just use the compiler-generated
+	// metadata, since it is not specific enough.
+	void RWEB_FQ * valptr;  // pointer to the actual 'C' variable
+	WebVarType_t type;  		// type of the web variable
+	int __far * dims;  			// pointer to list of dimensions (upper bound).
+									// dims is NULL if this webvar is not an array
+	WebMetadata_t __far * meta;	// pointer to most specific metadata
+} WebInstInfo_t;
+
+#ifndef _web_malloc
+	#define _web_malloc _sys_malloc
+	#define _web_calloc _sys_calloc
+	#define _web_realloc _sys_realloc
+	#define _web_free _sys_free
+#endif
+
+
+
+
+typedef struct WebTransEntry {
+	// WTEs are actually variable length (even the cname is really
+	// variable length).  This is a dummy struct to be used as a placeholder
+	// and parameter type.
+	char cname[_WEB_MAX_CNAME];	// 1st byte is length of cname (incl length).
+											// The name part is a list of indices which
+											// specify the child index of the current level
+											// down which to proceed.  Should terminate
+											// at a leaf node.
+	// int error_id;		// +ve: RCI compliant error ID
+								// 0: no error, new value OK
+								// -1: no error, marks entries with no change in value
+								// -2: error_msg is pointer to dynamically allocated error
+								//  message.  This will be turned into RCIERR_CUST_STRING
+								//  error ID.
+	// int len;				// Binary variable length.
+	// char far * error_msg;
+								// Pointer to custom error message if error_id==-2.
+								// Customer error messages are freed automatically
+								// at web_transaction_free().  If error_id != 2,
+								// then this may be NULL or point to a standard
+								// error message (which must not be freed!).
+	// char far * orig_str;
+								// If not NULL, points to original input string
+								// (length orig_len, not necessarily null terminated).
+								// Caller is responsible for this memory, and should
+								// not delete or move it until finished with the
+								// transaction.
+	// int orig_len;		// Original string length
+	// char data[len];	// New binary value
+} WebTransEntry_t;
+
+typedef struct WebTrans {
+	long	alloc_size;			// Amount allocated (incl this header)
+	long	used_size;			// Next available byte offset
+	word	auth;					// Server/user authentication method for this.
+	word	group;				// Group (user) using this transaction
+	void __far * user_data;	// Parameter data for following callback
+	// Callback function, registered with web_transaction_set_test(),
+	// which is responsible for doing access tests on entries added to the
+	// transaction.  If not provided, defaults to a simple test using the
+	// group bits (set using web_transaction_set_group()).  Otherwise,
+	// this function returns 0 if OK, or -EACCES if access denied.  'write'
+	// is TRUE if test is for write access, else test is for read access.
+	int  (*test_access)(struct WebTrans __far * wt,
+		                 struct WebIterator __far * wc,
+		                 int write,
+							  void __far * data
+							  );
+	/*
+	Transaction data follows.  It is a sequence of
+	    [cname, error_id, len, error_msg, orig_str, orig_len, data]
+	where
+	cname: condensed variable name.  This is a list of bytes which indicates
+	  the traversal path for a cursor starting at the root.  First byte is
+	  the number of bytes following in the name, plus 1 for the length byte
+	  itself.  Subsequent bytes are the
+	  field or index number for each level down.  Each index is a single byte
+	  if the value is <= 254, else 255 followed by the LSB then MSB for an index
+	  >= 255.  For example, foo.bar[77].baz might be coded as
+	     5,1,3,77,0
+	  and foo.bar[513].baz would be
+	     7,1,3,255,1,2,0
+	  If the first byte is 0, this indicates the end of the transaction list.
+	error_id: If not zero, indicates an RCI error ID for this value.  Errors
+	  may occur when the item is added to the transaction list (e.g. when
+	  converting from string to binary), or when the transaction is executed
+	  if a guard function fails.  In the latter case, custom error text may
+	  be specified.  If so, then this field has the MSB set, and there will
+	  be an entry in the list starting at err_offset.  This list is a sequence
+	  of null terminated error message strings (max length 255).
+	len: length of following data.
+	error_msg: error message string
+	orig_str: original string data (even if in error)
+	orig_len: original string length
+	data: new binary value for the variable.
+	*/
+	WebTransEntry_t	first;
+} __far * WebTrans_t;
+//... note that we define the type as a pointer, since this is a variable
+// sized struct which is managed using malloc/realloc/free.  The application
+// does not need to be aware of this.
+
+
+/*********** Structs for parsing and generating external representations ********/
+
+// Web Parse eXternal representation Event codes...
+typedef enum WebParseXEvent {
+	// Basic structure events.  Since XML does not inherently distinguish
+	// between object/struct/dict and arrays, an array is only recognized
+	// by context i.e. it must have a corresponding #web var which is an
+	// array.  Thus, when XML is parsed only *_OBJECT events will be seen,
+	// and the callback (WPXCallback_t) will need to maintain sufficient
+	// context to distinguish between objects and arrays.  Note also that
+	// RCI XML does not support multi-dimensional arrays, so access to such
+	// #web variables is not possible when expressed in RCI XML.  [This limitation
+	// is because only one index=n attribute is specified.  Later versions
+	// could introduce index2=m or <openbracket> elements etc.]
+	// Note that JSON gets a WPJ_START/END_OBJECT event for the outermost
+	// set of braces, and XML also generates these events as a "wrapper".
+	WPJ_START_OBJECT,		// Open brace of JSON object, or inside XML start element
+								// which has at least one child element.
+	WPJ_END_OBJECT,		// Close brace of JSON object, or before XML end element
+								// which had at least one child element.
+	WPJ_START_ARRAY,		// Open bracket of JSON array.
+	WPJ_END_ARRAY,			// Close bracket of JSON array.
+	WPJ_END_LEAF,			// For XML only: end of element which had no
+								// child elements i.e. end of a "leaf" element.
+
+	// Following for non-object, non-array values.  Corresponds to JSON int,
+	// float, string, true, false, null types.  XML char data always presented
+	// as (possibly zero length) string.  XML might get more than one string
+	// for an element, if that element mixes char data and child elements.
+	WPJ_STRING,				// Simple string value (in key).  For XML, also gets
+								// length of char data in idx.
+	WPJ_INT,					// Simple integer value (in key and idx)
+	WPJ_FLOAT,				// Simple float value (as a string in key,
+									// and also as float in wpj->floatval)
+	WPJ_TRUE,				// 'true'
+	WPJ_FALSE,				// 'false'
+	WPJ_NULL,				// 'null'
+	WPJ_EMPTY,				// no value given (JSON extension)
+
+	// Following for objects or arrays (JSON) or elements (XML)
+	WPJ_KEY,					// Key (string) for next object member.  'key' provided.
+	WPJ_IDX,					// Index (0..N) for next array item. 'idx' provided.
+	WPJ_KEY_IDX,			// Key and index.  This used for XML, which has no
+								// inherent distinction between objects and arrays.
+								// idx set from the index=n attribute, minus 1.
+
+	// Events for various errors
+	WPJ_BAD_KEY,			// Field not found
+	WPJ_BAD_IDX,			// Index out of bounds for array
+	WPJ_BAD_KEY_IDX,		// Combo of the above
+	WPJ_BAD_KEY_MATCH,	// For XML: matching entry not found.
+} WebParseXEvent_t;
+
+// Return codes from WPXCallback_t (parser event callback).  These instruct
+// the parser engine about further processing.  Can also return negative
+// value to terminate with extreme prejudice.
+typedef enum WebParseXInsn {
+	WPI_CONTINUE,			// Continue as normal
+	WPI_SKIP,				// Skip this level of hierarchy
+	WPI_TERMINATE,			// Terminate with no error
+} WebParseXInsn_t;
+
+
+
+// State structure for parsing eXternal representaions (currently, JSON and
+// XML).
+typedef struct WebParseX
+{
+	struct WebIteratorFilter __far * wif;
+										// A filter to enforce a subset of #web vars
+										// for which the transaction is built.  This
+										// may include a callback function, which will
+										// be called with the above event codes.
+	WebTrans_t __far * wtp;		// Transaction being built
+	struct WebIterator __far * cursor;	// NULL, or a tracking cursor
+	float	floatval;
+	int	start_level;			// Level at which to start tracking cursor
+	int	skip;						// Skip flag
+	int	level;					// Parsing nest level
+	const char __far * key[_WEB_MAX_X_NEST];	// key for each object level, or NULL if
+													// this is an array level
+	int	idx[_WEB_MAX_X_NEST];		// Array element indices (counters)
+	int	arry[_WEB_MAX_X_NEST];		// Array dimension, or 0 if not an array level
+												// Note that general parsers set this to 0,
+												// except the JSON parser can recognize array
+												// levels and will set to 1 (since it doesn't
+												// know the dimension of the corresponding
+												// storage).  It is up to a callback to
+												// set this to the correct value.
+	int	chld[_WEB_MAX_X_NEST];		// Child element counter (XML only)
+
+} WebParseX_t;
+
+
+typedef int (*WPXCallback_t)(WebParseX_t __far * wpx, int event,
+										const char __far * key, long idx);
+
+
+
+typedef void (*WIFCallback_t)(struct WebIterator __far * wi, int event,
+										const char __far * name, int dim);
+typedef struct WebIteratorFilter {
+	void __far * data;				// General caller data
+	word	auth;						// Mask of authentication methods (0 for all)
+	word	groups;					// Mask of groups (0 for all)
+	word	perm;						// Mask of read/write permission
+	char __far * __far * varlist;	// Null term list of root level variable names
+	WIFCallback_t callback;		// Called when enumerating #web variables
+	WPXCallback_t parser_callback;	// Called when parsing JSON string
+} WebIteratorFilter_t;
+// Web Iterator Filter Event codes...
+typedef enum WebIteratorFilterEvent {
+	WIFE_ENTER_STRUCT,	// Entering struct.  name is field name of struct member
+	WIFE_TWEEN_STRUCT,	// Between two successive members of the same struct.
+								// This might be used to emit a comma separator etc.
+	WIFE_EXIT_STRUCT,		// Exiting struct
+	WIFE_ENTER_ARRAY,		// Entering array.  dim is element count at this level
+	WIFE_TWEEN_ARRAY,		// Between two successive elements of the same array.
+	WIFE_EXIT_ARRAY,		// Exiting array
+	WIFE_MEMBER				// New struct member.  name is member name
+} WebIteratorFilterEvent_t;
+
+typedef struct WebIterator {
+	// Following used by iterator functions...
+	WebIteratorFilter_t __far * wif;
+	int 	phase;	// Current scan phase (0 = members, 2 = finished)
+
+	// Following used by cursor and iterator functions...
+	int	case_insens;	// Use case insensitive name matching
+	int	leaf_flag;		// In web_cursor_down(), set 1 if leaf level, else 0.
+								// Can be used to track actions performed at leaf level.
+	int	level;	// Current level in following tables
+	int	alevel;	// Array levels filled in advance of level.  alevel>=level
+	int	idx[_WEB_MAX_X_NEST];	// Current array index.
+	int	arry[_WEB_MAX_X_NEST];
+					// Array bounds (or 0 if not array at this level).  Last index
+					// of string types is not counted, since it's the string
+					// length.
+	void RWEB_FQ * val[_WEB_MAX_X_NEST];	// Pointer to start of value at each level
+	int	len[_WEB_MAX_X_NEST];
+					// Size of type at each level.  For array levels, this is the
+					// size of one instance (not all of them).
+	// Pointers to current WSMI, except level 0 points to current WVI, cast as a WSMI.
+	WebStructMemInfo_t __far * wsmi[_WEB_MAX_X_NEST];
+} WebIterator_t;
+
+// Web cursor is same as iterator.  The cursor functions disregard any
+// filtering or callbacks.
+typedef WebIterator_t WebCursor_t;
+
+struct _xmlCtx;
+
+typedef int (*WebConditionalCallback_t)(WebCursor_t __far * wc, char __far * c);
+typedef int (*WebCustomCallback_t)(WebCursor_t __far * wc, int type, struct _xmlCtx __far * gen);
+
+typedef struct WebConditional {
+	struct WebConditional __far * next;
+	char name[16];
+   // NOTE: 'cond' and 'cust' fields interact in that if they both apply to
+   //  the same metadata, then they must both use the same registered
+   //  conditional e.g. can't have cond="foo",cust="bar".
+	/*
+	This function is called when traversing to a variable which has a registered
+	conditional.  The metadata for the variable contains a non-null condition
+	string (currently, a single char).  The nearest conditional callback function
+	is located in the hierarchy (moving towards the root).  The function is
+	called with the current cursor position (the variable instance in question)
+	along with the fixed condition string.  The function returns 1 if the
+	variable is visible, or 0 if invisible.  (Other codes reserved).
+	The function is allowed to modify the provided cursor since a temporary
+	copy is created.
+	*/
+	WebConditionalCallback_t cond;
+   /*
+   This callback is invoked for custom processing.  Currently, ZigBee support
+   in iDigi makes use of this owing to the complexity of describing which
+   XBee commands are applicatble to which firmware.
+   */
+   WebCustomCallback_t cust;
+} WebConditional_t;
+
+
+
+
+
+
+typedef struct WebExtrep {
+	struct WebExtrep __far * next;
+	char name[16];	// "int32", "ipv4" etc.
+	/*
+	Binary (internal) to string (external) conversion.  Return 0 for success,
+	else a positive number if cannot fit in given string buffer (including the null
+	terminator).  The return value should be at least the required buffer size.
+	Apart from insufficient buffer length, these routines must always succeed.
+	If the binary data is "bad", then an arbitrary valid string should be
+	returned.  (Data should only be bad if program code sets the variable
+	incorrectly).
+
+	wc points to variable to convert to string.  web_size(wc) will return the
+	variable size etc., however the bin parameter does not necessarily point
+	to the variable location, since this may be being called to format the
+	default or stored value.
+	*/
+	int (*bin2str)(WebCursor_t __far * wc, char __far * str, int maxlen, void __far * bin);
+	/*
+	String (external) to binary (internal) conversion.  Return 0 for success,
+	else one of the enumerated codes in WebTopLevelErrors enum.  Note that the
+	string might not be null terminated.  Its length is specified in len.
+	If necessary str[len] can be overwritten with null, but it must be
+	restored to its original value before returning.
+
+	wc points to variable which will be set to the binary value, however the
+	variable at this location must not be modified by this routine.  Instead,
+	the binary value should be placed in the given buffer (bin), which will be
+	sized the same as the destination variable.
+	*/
+	int (*str2bin)(WebCursor_t __far * wc, char __far * str, int len, void __far * bin);
+} WebExtrep_t;
+
+
+
+
+// This provides standard error message IDs for the top level error
+// message group used by all Rabbit RCI applications.
+typedef enum {
+	RCIERR_NOT_XML = 1,
+	RCIERR_BAD_REQ,
+	RCIERR_BAD_CMD,
+	RCIERR_INVALID_FORMAT,
+	RCIERR_VALUE_ENUM,
+	RCIERR_VALUE_RANGE,
+	RCIERR_STRING_LENGTH,
+	RCIERR_NO_INDEX,
+	RCIERR_NO_MATCH,
+	RCIERR_PERMISSION_DENIED,
+	RCIERR_INSUFFICIENT_AUTH,
+	RCIERR_FIELD_NOT_EXIST,
+	RCIERR_FIELD_NOT_APPLICABLE,
+	RCIERR_FIELD_AGGREGATE,
+	RCIERR_SPEC,
+	RCIERR_CUST_STRING,
+	RCIERR_CUST_ID,
+	RCIERR_TEMP_RESOURCE,
+	RCIERR_PERM_RESOURCE,
+	RCIERR_IP_NOT_D,
+	RCIERR_IP_NOT_E,
+	RCIERR_IP_NOT_BCAST,
+	RCIERR_BAD_DOCMD,
+   RCIERR_BAD_WEPKEY,
+   RCIERR_DOCMD_ERR,
+   RCIERR_DOCMD_NO_QD,
+   RCIERR_QUERY,
+   RCIERR_SETTING,
+
+	RCIERR_LAST		// Last code (+1) - does not correspond to a mesage
+} WebTopLevelErrors;
+
+
+// This struct provides data to the guard and update functions.  Unfortunately,
+// there needs to be a single global instance of this since there is no
+// re-entrant way of passing the data to the functions.
+typedef struct WebGuardinfo
+{
+	char name[_WEB_MAX_FQNLEN];
+	WebTransEntry_t __far * we;
+	WebTrans_t wt;
+	WebCursor_t __far * wc;
+	int dims[_WEB_MAX_X_NEST];
+} WebGuardinfo_t;
+
+extern __far WebGuardinfo_t _web_gi;
+
+/*** EndHeader */
+
+__far WebGuardinfo_t _web_gi;
+
+/*** BeginHeader _web_getnewval, _web_getwildval */
+// Limited to near pointers because of compiler
+void *_web_getnewval(char *name, int type, void *curval);
+void *_web_getwildval(char *s, int *dims);
+/*** EndHeader */
+
+// Silly requirement for current compiler (no far data for rweb).
+// Address of this is returned to guard functions to get the "new" value.
+static char _web_rootbuf[_WEB_ROOTBUF_SIZE];
+
+// Fixed-name helper functions for guard evaluation
+_web_debug
+// Limited to near pointers because of compiler.  It's also really horrible
+// because of the reliance on string matching.  The compiler should generate
+// cnames (or better, allow use of a shadow newval structure).
+void RWEB_FQ *_web_getnewval(char RWEB_FQ *_name, int type, void RWEB_FQ *curval)
+{
+	char name[_WEB_MAX_FQNLEN];
+	WebCursor_t wc_inst;
+	WebTransEntry_t __far * we = _web_gi.we;
+	WebCursor_t __far * wc;
+	WebTransEntry_t c;
+	WebInstInfo_t varinfo;
+	void __far * v;
+	int vlen, i;
+	int __far * error_id;
+	int __far * bin_len;
+	void __far * newbin;
+
+	_f_strcpy(name, _name);
+#ifdef RABBITWEB_VERBOSE
+	printf("_web_getnewval(" RWEB_FQ_FORMAT_STR ")\n", name);
+#endif
+
+	// Most common case: the guard wants new value of its own variable
+	if (strcmp(name, _web_gi.name)) {
+		// Not the same, search for it
+		wc = &wc_inst;
+	   i = web_getvarinfo(name, wc, &varinfo, 0);
+	   if (i < 0)
+	      return NULL;
+		web_cname(wc, c.cname);
+		we = _web_transaction_find_cname(_web_gi.wt, c.cname);
+	}
+	else
+		wc = _web_gi.wc;
+
+	if (!we)
+		return curval;
+
+	_web_grok_wte(we, &error_id, &bin_len, &newbin);
+
+   _f_memcpy(_web_rootbuf, newbin, i_min(sizeof(_web_rootbuf), *bin_len));
+	return _web_rootbuf;
+}
+
+_web_debug
+// Limited to near pointers because of compiler.
+void RWEB_FQ *_web_getwildval(char RWEB_FQ *_s, int RWEB_FQ *dims)
+{
+	/*
+	s contains a wildcarded name like foo[@].bar[@[1]][@[2]].  Unlike old
+	RabbitWeb, we ignore the qualifications on the '@' and automatically
+	substitute the correct dimension.  E.g. one could code
+	  #web foo[@].bar[@][@] ($foo[@].bar[@][@] < 50)
+	Each [@] uses the index (in _web_gi.wc) from that level in the variable.
+	*/
+	char s[_WEB_MAX_FQNLEN];
+	WebTransEntry_t c;
+	WebCursor_t wc;
+	WebInstInfo_t varinfo;
+	WebTransEntry_t __far * we = _web_gi.we;
+   int i;
+	int __far * error_id;
+	int __far * bin_len;
+	void __far * newbin;
+
+	_f_strcpy(s, _s);
+#ifdef RABBITWEB_VERBOSE
+	printf("_web_getwildval(" RWEB_FQ_FORMAT_STR ")\n", s);
+#endif
+
+	// Get the variable information
+	i = web_getvarinfo(s, &wc, &varinfo, 0);
+	if (i < 0)
+   	return NULL;
+   web_cname(&wc, c.cname);
+	we = _web_transaction_find_cname(_web_gi.wt, c.cname);
+	if (!we)
+		return web_loc(&wc);	// not in transaction, return old value
+	_web_grok_wte(we, &error_id, &bin_len, &newbin);
+
+   _f_memcpy(_web_rootbuf, newbin, i_min(sizeof(_web_rootbuf), *bin_len));
+	return _web_rootbuf;
+}
+
+
+
+/*** BeginHeader _web_cname_cmp */
+int _web_cname_cmp(char __far * cname1, char __far * cname2);
+/*** EndHeader */
+_web_debug
+int _web_cname_cmp(char __far * cname1, char __far * cname2)
+{
+	return memcmp(cname1, cname2, cname1[0]);
+}
+
+
+
+
+/*** BeginHeader web_getvarinfo */
+int web_getvarinfo(const char __far *p,
+						WebCursor_t __far * wc,
+						WebInstInfo_t __far *info,
+						int case_insens);
+/*** EndHeader */
+
+// Find the best match for given variable.
+// Information on the match is passed out in the info
+// structure.
+//
+// p -- The variable name ('const' is cast away if case_insens is true).
+// wc -- if not NULL, this cursor is used to traverse the tree
+// info -- OUTPUT.  If not null, information on the variable is returned in
+//		this structure.
+// case_insens -- Bit 0 non-zero for case-insensitive match.  In this case, the input
+//             name (p) will be overwritten with the canonical (case-correct)
+//             name.
+//             -- Bit 1 non-zero for relative search.  In this case, wc must
+//             be initialized to access the "starting point" of the search,
+//             however the search will be absolute if the variable name
+//             does not start with '.' or '['.
+// Return   -- 0 if OK, or -ENOENT if not a leaf-level variable,
+//             or -EINVAL if not found, or variable format error.
+//    If -ENOENT, info is still valid, but refers to a struct or array level.
+
+/* HACK:
+
+  The global data _web_gi.wc is used to provide substitutions for array
+  levels named '[@]'.  This allows this function to work for guard expressions.
+*/
+
+_web_debug
+int web_getvarinfo(const char __far *p,
+						WebCursor_t __far * wc,
+						WebInstInfo_t __far *info,
+						int case_insens)
+{
+	auto unsigned i, idx;
+	const char __far * key;
+	WebStructMemInfo_t __far * wsmi;
+	WebMetadata_t __far * meta;
+	WebMetadata_t __far * new_meta;
+	WebCursor_t wc_inst;
+	char oldc;
+	int rc, len;
+
+	if (!wc)
+		wc = &wc_inst;
+
+	if ((*p && *p != '.' && *p != '[') || !(case_insens & 2))
+		web_cursor_start(wc);
+	if (*p == '.')
+		++p;
+	wc->case_insens = case_insens & 1;
+	meta = NULL;
+	while (*p) {
+		if (*p == '[') {
+			++p;
+			if (*p == '@') {
+				if (p[1] == '[') {
+					// Skip obsolete index qualifier e.g. @[1].
+					while (*++p && *p != ']');
+					if (*p==']') ++p;
+				}
+				while (*p && *p != ']') ++p;
+				idx = _web_gi.wc->idx[wc->level+1];
+			}
+			else {
+	         idx = (unsigned)_f_strtol(p, (char __far * __far *)&p, 10);
+			}
+         if (*p != ']')
+            return -EINVAL;
+			++p;
+			if (*p == '.') ++p;
+			key = NULL;
+			oldc = 0;
+		}
+		else {
+			key = p;
+			while (*p && *p != '.' && *p != '[') ++p;
+			oldc = *p;
+			*(__far char *)p = 0;
+		}
+		rc = web_cursor_down(wc, key, idx);
+		// Overwrite with correct case if field name...
+		if (!rc && case_insens && key) {
+			len = (int)(p - key);	// Length of field name
+			_f_memcpy((char __far *)key, wc->wsmi[wc->level]->name, len);
+		}
+
+		if (oldc) {
+			*(__far char *)p = oldc;
+			if (oldc == '.') ++p;
+		}
+		if (rc < 0)
+			return -EINVAL;
+
+		new_meta = web_metadata(wc);
+		if (new_meta)
+			meta = new_meta;
+	}
+	if (info) {
+	   web_info(wc, info);
+	   info->meta = meta;
+	}
+	if (!web_leaf(wc))
+		return -EISDIR;
+	return 0;
+}
+
+
+
+
+/*** BeginHeader _web_getstrsize */
+int _web_getstrsize(int __far *bounds);
+/*** EndHeader */
+
+// Get the size of a string, given the array bounds for the variable.  The
+// string length will be the last entry in the array bounds.
+//
+// bounds -- An array of array bounds.
+// Return -- Length of the string.
+
+_web_debug
+int _web_getstrsize(int __far *bounds)
+{
+	auto int i;
+
+	_web_assert(bounds != NULL);
+
+	// The maximum length of the string is given by the last dimension
+	i = 0;
+	while (bounds[i] != 0) {
+		i++;
+	}
+	return bounds[i-1];
+}
+
+
+/*** BeginHeader _web_gettypesize */
+int _web_gettypesize(WebVarType_t __far * type, int __far *bounds);
+/*** EndHeader */
+
+// Get the size of the given type.  bounds are passed in in case it is a
+// string type.
+//
+// type   -- The type of the variable (_DK_T_CHAR, _DK_TINT, etc...)
+// bounds -- The array bounds for the variable (only useful if this is a string
+//           type variable).
+// Return -- The size of the variable
+
+_web_debug
+int _web_gettypesize(WebVarType_t __far * type, int __far *bounds)
+{
+	// Check if it is a structure, and return the size of that structure if so
+	if (type->simple >= _DK_TSTRUCT) {
+   	return type->ptr->strsize;
+   }
+   // Return the size of the type
+   else {
+   	switch (type->simple) {
+      case _DK_T_CHAR:
+      	return sizeof(char);
+      case _DK_TSIGNEDCHAR:
+      	return sizeof(unsigned char);
+      case _DK_TINT:
+      	return sizeof(int);
+      case _DK_TUNSIGNED:
+      	return sizeof(unsigned int);
+   	case _DK_TLONG:
+      	return sizeof(long);
+      case _DK_TULONG:
+      	return sizeof(unsigned long);
+		case _DK_TFLOAT:
+      	return sizeof(float);
+      case _DK_TSTRING:
+      	_web_assert(bounds != NULL);
+      	return _web_getstrsize(bounds);
+      }
+   }
+   // Error!
+   return -1;
+}
+
+/*** BeginHeader _web_integer_len */
+int _web_integer_len(unsigned simple);
+/*** EndHeader */
+
+// Return length of an integer type, or zero if it is not an integer.
+
+_web_debug
+int _web_integer_len(unsigned simple)
+{
+	switch (simple) {
+	case _DK_TINT: case _DK_TUNSIGNED:
+		return sizeof(int);
+	case _DK_TLONG: case _DK_TULONG:
+		return sizeof(long);
+	}
+	return 0;
+}
+
+
+
+/*** BeginHeader _web_gobble_whitespace */
+char __far * _web_gobble_whitespace(char __far *buffer, long len);
+/*** EndHeader */
+
+// Skip the whitespace pointed to by buffer.  C++ style comments are
+// considered to be whitespace.  A C++ comment is '//' and terminates at
+// end of string or the next '\n', whichever comes first.
+//
+// buffer -- Buffer which may contain whitespace to skip.
+// len    -- length of buffer.  Pass -1 if buffer guaranteed to contain
+//           a non-whitespace char (or null terminator).
+// Return -- Pointer to the first character in buffer that is not whitespace
+//           or 1 past last buffer char if is all whitespace.
+
+_web_debug
+char __far *_web_gobble_whitespace(char __far *buffer, long len)
+{
+	for (;;) {
+	   while (isspace(*buffer) && len)
+	      ++buffer, --len;
+	   // Process C++ style comments
+	   if ((unsigned long)len >= 2 && buffer[0] == '/' && buffer[1] == '/') {
+	   	while (len && *buffer && *buffer != '\n')
+	   		++buffer, --len;
+	   }
+	   else
+	   	break;
+	}
+	return buffer;
+}
+
+
+
+/*****************************************************************************
+******************************************************************************
+******************************************************************************
+***
+***
+***  Start of public API functions
+***
+***
+******************************************************************************
+******************************************************************************
+*****************************************************************************/
+
+/*****************************************************************************
+******************************************************************************
+
+Initialization
+
+This function must always be called first in any application which uses
+RabbitWeb.  It is safe to call this function multiple times.  Only the first
+call does anything.
+
+The init function overcomes some limitations in the current DC compiler.  The
+main limitation is that there is no mechanism for extending variables with
+arbitrary metadata.  Additional metadata is needed for support of iDigi.
+
+The init function basically replicates the compiler-generated data into a
+dynamically allocated memory area.  It then parses a text file to obtain the
+extra metadata, and attaches it to the information for the relevant
+variables.
+
+******************************************************************************
+*****************************************************************************/
+
+/*** BeginHeader web_init, _web_base, _web_base_errors, _web_base_descr */
+int web_init(void);
+extern WebStructMemList_t __far * _web_base;
+extern WebErrorList_t __far * _web_base_errors;
+extern char __far * _web_base_descr;
+/*** EndHeader */
+static int _web_init_done = 0;
+WebStructMemList_t __far * _web_base = NULL;
+WebErrorList_t __far * _web_base_errors = NULL;
+char __far * _web_base_descr = NULL;
+
+_web_debug
+WebStructMemList_t __far * _web_sml(_Web_Struct_Mem_List __far * wsml)
+{
+	unsigned i;
+	_Web_Struct_Mem_Info * ptr;
+	WebStructMemList_t __far * p;
+	WebStructMemInfo_t __far * m;
+
+	for (i = 0, ptr = wsml->ptr; ptr->name; ++ptr, ++i);
+	p = _web_malloc(sizeof(WebStructMemList_t) + i * sizeof(WebStructMemInfo_t));
+	if (!p)
+		return NULL;
+	p->strsize = wsml->strsize;
+	p->ptr = (WebStructMemInfo_t __far *)(p + 1);
+	p->nmemb = i;
+	for (m = p->ptr, ptr = wsml->ptr; ptr->name; ++ptr, ++m) {
+#ifdef RWEB_INIT_VERBOSE
+		printf("  .%s\n", ptr->name);
+#endif
+		m->name = ptr->name;
+		m->offset = ptr->offset;
+		m->valptr = NULL;
+		if (ptr->type.simple < _DK_TSTRUCT) {
+			m->type.simple = ptr->type.simple;
+			m->type.ptr = NULL;
+		}
+		else {
+			m->type.simple = _DK_TSTRUCT;
+			m->type.ptr = _web_sml(ptr->type.ptr);
+			if (!m->type.ptr)
+				return NULL;
+		}
+		m->dims = ptr->dims;
+		m->meta = NULL;	// no metadata known yet
+	}
+	return p;
+}
+
+#ifdef HAVE_RWEB_JSON
+// Base level error messages
+#ximport "lib/rabbit4000/RabbitWeb/err_strings.json" err_strings_json
+#endif
+
+_web_debug
+int web_init(void)
+{
+	unsigned i, all, len, j, more, lvl;
+	int rc;
+	_Web_Var_Info * wvi;
+	WebStructMemList_t __far * p;
+	WebStructMemInfo_t __far * wsmi;
+	WebMetadata_t __far * meta;
+	_Web_Struct_Mem_Info * k;
+
+	if (_web_init_done)
+		return 0;
+
+#ifdef HAVE_RWEB_JSON
+	web_register_metadata(err_strings_json);
+#endif
+
+	// Register default extreps for RCI
+	_web_register_default_extreps();
+
+	// Count number of base entries
+	for (i = 0, all = 0, wvi = _web_var_info; wvi->name; ++wvi, ++all) {
+		// Exclude dotted names
+		if (wvi->name[strlen(wvi->name)-1] == '.')
+			continue;
+		++i;
+	}
+
+	// Create base level array.  Always have metadata, since we are
+	// constructing from _Web_Var_Info structs.  Also count metadata
+	// entries for dotted names.
+	_web_base = _web_calloc(sizeof(WebStructMemList_t) +
+								i * sizeof(WebStructMemInfo_t) +
+								all * sizeof(WebMetadata_t));
+	if (!_web_base)
+		return -ENOMEM;
+	_web_base->nmemb = i;
+	_web_base->ptr = (WebStructMemInfo_t __far *)(_web_base + 1);
+	wsmi = _web_base->ptr;
+	meta = (WebMetadata_t __far *)(wsmi + i);
+	for (wvi = _web_var_info; wvi->name; ++wvi) {
+		if (wvi->name[strlen(wvi->name)-1] == '.')
+			continue;
+#ifdef RWEB_INIT_VERBOSE
+		printf("Added base %s\n", wvi->name);
+#endif
+		wsmi->name = wvi->name;
+		wsmi->valptr = wvi->valptr;
+		// Arbitrarily make offset as if it was 'field' in giant struct over all memory
+		wsmi->offset = (unsigned)wsmi->valptr;
+		if (wvi->type.simple < _DK_TSTRUCT) {
+			wsmi->type.simple = wvi->type.simple;
+			wsmi->type.ptr = NULL;
+		}
+		else {
+			wsmi->type.simple = _DK_TSTRUCT;
+			wsmi->type.ptr = _web_sml(wvi->type.ptr);
+			if (!wsmi->type.ptr)
+				return -ENOMEM;
+		}
+		wsmi->dims = wvi->dims;
+		wsmi->meta = meta;
+		meta->guardptr = wvi->guardptr;
+		meta->updateptr = wvi->updateptr;
+		meta->auth = wvi->auth;
+		// In the metadata, field names reflect slightly different meaning
+		// than in the compiler-generated info from #web groups.
+		// meta->groups is all groups with explicit read and/or write permission.
+		// Zero indicates that no access was specified, so we default to
+		// unlimited access including for anonymous users (no group).
+		// -- unfortunately, it's not that simple.  If *any* access perms
+		// specified, then expand groups mask to 0x7FFF (all but RCI) otherwise
+		// groups not mentioned in #web get full access.
+		meta->groups = wvi->groups | wvi->perm;
+		if (meta->groups) {
+			meta->wperm = wvi->perm;		// Write perm as specified
+			meta->rperm = wvi->groups;		// Read perm as specified
+			meta->groups |= 0x7FFF;
+		}
+		else {
+			// All 1's is special in that it implies that anonymous access is
+			// also OK.
+			meta->rperm = 0xFFFF;			// If no group, assume all read OK.
+			meta->wperm = 0xFFFF;			// If no group, assume all write OK.
+		}
+#ifdef RWEB_INIT_VERBOSE
+		printf("... guard=%s upd=%s auth=%02X grps=%04X r=%04X w=%04X\n",
+					meta->guardptr ? "yes" : "no",
+					meta->updateptr ? "yes" : "no",
+					meta->auth,
+					meta->groups,
+					meta->rperm,
+					meta->wperm);
+#endif
+		meta->select.ptr32 = wvi->select.ptr32;
+		++wsmi;
+		++meta;
+	}
+
+	// Now add metadata for dotted entries.  These are overrides for
+	// selected parts of the above structures (we currently don't
+	// support this for variables which are not completely registered
+	// i.e. if foo.bar is registered, but not foo, then foo.bar is an
+	// "orphan" entry which will not be considered in this library).
+	for (wvi = _web_var_info; wvi->name; ++wvi) {
+		if (wvi->name[strlen(wvi->name)-1] != '.')
+			continue;
+#ifdef RWEB_INIT_VERBOSE
+		printf("Looking for %s\n", wvi->name);
+#endif
+		lvl = 0;
+		meta->guardptr = wvi->guardptr;
+		meta->updateptr = wvi->updateptr;
+		meta->auth = wvi->auth;
+		meta->groups = wvi->groups | wvi->perm;
+		if (meta->groups) {
+			meta->wperm = wvi->perm;		// Write perm as specified
+			meta->rperm = wvi->groups;		// Read perm as specified
+		}
+		else {
+			// All 1's is special in that it implies that anonymous access is
+			// also OK.
+			meta->rperm = 0xFFFF;			// If no group, assume all read OK.
+			meta->wperm = 0xFFFF;			// If no group, assume all write OK.
+		}
+#ifdef RWEB_INIT_VERBOSE
+		printf("... guard=%s upd=%s auth=%02X grps=%04X r=%04X w=%04X\n",
+					meta->guardptr ? "yes" : "no",
+					meta->updateptr ? "yes" : "no",
+					meta->auth,
+					meta->groups,
+					meta->rperm,
+					meta->wperm);
+#endif
+		meta->select.ptr32 = wvi->select.ptr32;
+		// Locate main entry and point it to this metadata
+		p = _web_base;
+		k = (_Web_Struct_Mem_Info *)wvi;
+		while (k) {
+			len = strlen(k->name)-1;
+			if (k->name[len] != '.') {
+				more = 0;
+				++len;
+			}
+			else
+				more = 1;
+			if (lvl) {
+				// For name comparison, remove trailing [@] from name to
+				// compare, since this is not stored in data being created here.
+				if (strchr(k->name, '['))
+					len = strchr(k->name, '[') - k->name;
+			}
+			for (j = 0, wsmi = p->ptr; j < p->nmemb; ++j, ++wsmi)
+				if (!memcmp(k->name, wsmi->name, len) && !wsmi->name[len])
+					break;
+			if (j < p->nmemb) {
+				// Found matching entry
+				p = wsmi->type.ptr;
+				if (!p || !more)
+					break;
+#ifdef RWEB_INIT_VERBOSE
+				printf("  %s\n", k->name);
+#endif
+				k = k->type.ptr->ptr;
+			}
+			else {
+				wsmi = NULL;
+				break;
+			}
+			++lvl;
+		}
+		if (wsmi && !more) {
+#ifdef RWEB_INIT_VERBOSE
+			printf("  %s ...found\n", k->name);
+#endif
+			wsmi->meta = meta;
+		}
+		++meta;
+	}
+
+
+
+#ifdef HAVE_RWEB_JSON
+	rc = web_parse_metadata();
+	if (rc)
+		return rc;
+#endif
+
+
+	_web_init_done = 1;
+	return 0;
+}
+
+
+/*** BeginHeader web_register_conditional, _web_conditionals */
+WebConditional_t __far * web_register_conditional(
+		char __far * name,
+		WebConditionalCallback_t cond
+		);
+extern WebConditional_t __far * _web_conditionals;
+/*** EndHeader */
+
+WebConditional_t __far * _web_conditionals = NULL;
+
+
+_web_debug
+WebConditional_t __far * web_register_conditional(
+		char __far * name,
+		WebConditionalCallback_t cond
+		)
+{
+	WebConditional_t __far * wx = _web_find_conditional(name);
+
+	if (!wx) {
+		wx = _web_calloc(sizeof(*wx));
+		if (!wx)
+			return NULL;
+		_f_strcpy(wx->name, name);
+		wx->next = _web_conditionals;
+		_web_conditionals = wx;
+	}
+	wx->cond = cond;
+	return wx;
+}
+
+
+/*** BeginHeader web_register_custom */
+WebConditional_t __far * web_register_custom(
+		char __far * name,
+		WebCustomCallback_t cust
+		);
+/*** EndHeader */
+
+
+
+_web_debug
+WebConditional_t __far * web_register_custom(
+		char __far * name,
+		WebCustomCallback_t cust
+		)
+{
+	WebConditional_t __far * wx = _web_find_conditional(name);
+
+	if (!wx) {
+		wx = _web_calloc(sizeof(*wx));
+		if (!wx)
+			return NULL;
+		_f_strcpy(wx->name, name);
+		wx->next = _web_conditionals;
+		_web_conditionals = wx;
+	}
+	wx->cust = cust;
+	return wx;
+}
+
+
+/*** BeginHeader _web_find_conditional */
+WebConditional_t __far * _web_find_conditional(const char __far * name);
+/*** EndHeader */
+
+_web_debug
+WebConditional_t __far * _web_find_conditional(const char __far * name)
+{
+	WebConditional_t __far * wx;
+
+	for (wx = _web_conditionals; wx; wx = wx->next)
+		if (!strcmp(wx->name, name))
+			return wx;
+	return NULL;
+}
+
+
+/*** BeginHeader _web_selection_from_index */
+char __far * _web_selection_from_index(WebCursor_t __far * wc, int idx);
+/*** EndHeader */
+_web_debug
+char __far * _web_selection_from_index(WebCursor_t __far * wc, int idx)
+{
+	WebMetadata_t __far * meta = web_metadata(wc);
+	int i;
+	_Web_Select32 * p32;
+	_Web_Select16 * p16;
+
+	if (!meta)
+		return NULL;
+	if (web_size(wc) == 2) {
+		if (!meta->select.ptr16)
+			return NULL;
+		for (i = 0, p16 = meta->select.ptr16; p16->name && i < idx; ++p16, ++i);
+		return p16->name;
+	}
+	else {
+		if (!meta->select.ptr32)
+			return NULL;
+		for (i = 0, p32 = meta->select.ptr32; p32->name && i < idx; ++p32, ++i);
+		return p32->name;
+	}
+}
+
+/*** BeginHeader _web_selection_count */
+int _web_selection_count(WebCursor_t __far * wc);
+/*** EndHeader */
+_web_debug
+int _web_selection_count(WebCursor_t __far * wc)
+{
+	// Return number of selections, or 0 if not a selection variable.
+	WebMetadata_t __far * meta = web_metadata(wc);
+	int i;
+	_Web_Select32 * p32;
+	_Web_Select16 * p16;
+
+	if (!meta)
+		return 0;
+	if (web_size(wc) == 2) {
+		if (!meta->select.ptr16)
+			return 0;
+		for (i = 0, p16 = meta->select.ptr16;
+				p16->name;
+				++p16, ++i);
+	}
+	else {
+		if (!meta->select.ptr32)
+			return 0;
+		for (i = 0, p32 = meta->select.ptr32;
+				p32->name;
+				++p32, ++i);
+	}
+	return i;
+}
+
+/*** BeginHeader _web_index_from_selection */
+int _web_index_from_selection(WebCursor_t __far * wc, char __far * str);
+/*** EndHeader */
+_web_debug
+int _web_index_from_selection(WebCursor_t __far * wc, char __far * str)
+{
+	// Return index (0..N-1) of selection variable given string value.
+	// Returns -ENOENT or -EINVAL if error.
+	WebMetadata_t __far * meta = web_metadata(wc);
+	int i;
+	_Web_Select32 * p32;
+	_Web_Select16 * p16;
+
+	if (!meta)
+		return -EINVAL;
+	if (web_size(wc) == 2) {
+		if (!meta->select.ptr16)
+			return -EINVAL;
+		for (i = 0, p16 = meta->select.ptr16;
+				p16->name && strcasecmp(p16->name, str);
+				++p16, ++i);
+		if (p16->name)
+			return i;
+	}
+	else {
+		if (!meta->select.ptr32)
+			return -EINVAL;
+		for (i = 0, p32 = meta->select.ptr32;
+				p32->name && strcasecmp(p32->name, str);
+				++p32, ++i);
+		if (p32->name)
+			return i;
+	}
+	return -ENOENT;
+}
+
+
+/*** BeginHeader _web_value_from_index */
+int _web_value_from_index(WebCursor_t __far * wc, int idx, unsigned long * val);
+/*** EndHeader */
+_web_debug
+int _web_value_from_index(WebCursor_t __far * wc, int idx, unsigned long * val)
+{
+	// Get value (in *val) given index.
+	// Returns -ENOENT or -EINVAL if error, else 0.
+	WebMetadata_t __far * meta = web_metadata(wc);
+	int i;
+	_Web_Select32 * p32;
+	_Web_Select16 * p16;
+
+	if (!meta)
+		return -EINVAL;
+	if (web_size(wc) == 2) {
+		if (!meta->select.ptr16)
+			return -EINVAL;
+		for (i = 0, p16 = meta->select.ptr16;
+				p16->name && i < idx;
+				++p16, ++i);
+		if (p16->name) {
+			*val = p16->value;
+			return 0;
+		}
+	}
+	else {
+		if (!meta->select.ptr32)
+			return -EINVAL;
+		for (i = 0, p32 = meta->select.ptr32;
+				p32->name && i < idx;
+				++p32, ++i);
+		if (p32->name) {
+			*val = p32->value;
+			return 0;
+		}
+	}
+	return -ENOENT;
+}
+
+/*** BeginHeader _web_index_from_value */
+int _web_index_from_value(WebCursor_t __far * wc, unsigned long val);
+/*** EndHeader */
+_web_debug
+int _web_index_from_value(WebCursor_t __far * wc, unsigned long val)
+{
+	// Return index (0..N-1) of selection variable given numeric value.
+	// Returns -ENOENT or -EINVAL if error.
+	WebMetadata_t __far * meta = web_metadata(wc);
+	int i;
+	_Web_Select32 * p32;
+	_Web_Select16 * p16;
+
+	if (!meta)
+		return -EINVAL;
+	if (web_size(wc) == 2) {
+		if (!meta->select.ptr16)
+			return -EINVAL;
+		for (i = 0, p16 = meta->select.ptr16;
+				p16->name && p16->value != val;
+				++p16, ++i);
+		if (p16->name)
+			return i;
+	}
+	else {
+		if (!meta->select.ptr32)
+			return -EINVAL;
+		for (i = 0, p32 = meta->select.ptr32;
+				p32->name && p32->value != val;
+				++p32, ++i);
+		if (p32->name)
+			return i;
+	}
+	return -ENOENT;
+}
+
+/*** BeginHeader _web_selection_from_value */
+char __far * _web_selection_from_value(WebCursor_t __far * wc, unsigned long val);
+/*** EndHeader */
+_web_debug
+char __far * _web_selection_from_value(WebCursor_t __far * wc, unsigned long val)
+{
+	WebMetadata_t __far * meta = web_metadata(wc);
+	unsigned i16;
+	unsigned long i32;
+	_Web_Select32 * p32;
+	_Web_Select16 * p16;
+
+	if (!meta)
+		return NULL;
+
+	if (web_size(wc) == 2) {
+		if (!meta->select.ptr16)
+			return NULL;
+		i16 = (unsigned)val;
+		for (p16 = meta->select.ptr16; p16->name; ++p16)
+			if (p16->value == i16)
+				return p16->name;
+	}
+	else {
+		if (!meta->select.ptr32)
+			return NULL;
+		i32 = val;
+		for (p32 = meta->select.ptr32; p32->name; ++p32)
+			if (p32->value == i32)
+				return p32->name;
+	}
+	return NULL;
+}
+
+
+/*** BeginHeader _web_printf */
+int _web_printf(WebCursor_t __far * wc, char __far * spec,
+							char __far * dest, int maxlen, void __far * bin);
+/*** EndHeader */
+_web_debug
+int _web_printf(WebCursor_t __far * wc, char __far * spec,
+							char __far * dest, int maxlen, void __far * bin)
+{
+	int reqlen;
+	int len;
+
+	// Special processing for format string (spec):
+	//- If it starts with "%/" then these two chars are skipped.  This helps
+	// when calling via web_format(), since it requires the format string to
+	// start with a % because of the generic format characters which preceed
+	// the custom format spec.  E.g. "Ad%/Hello %s" will end up (here) as
+	// format string "Hello %s".
+	if (*spec == '%' && spec[1] == '/')
+		spec += 2;
+
+	switch (web_type(wc)) {
+	// Default for char is a space char, since a null does not make sense when
+	// converting to a null-terminated string.
+  	case _DK_T_CHAR:
+      reqlen = snprintf(dest, maxlen, spec, bin ? *((char __far *)bin) : ' ');
+   	break;
+  	case _DK_TSIGNEDCHAR:
+      reqlen = snprintf(dest, maxlen, spec,
+                  bin ? *((signed char __far *)bin) : ' ');
+   	break;
+   // All the following can be treated as one case, since the default bit
+   // pattern is all zeros in each case.  Also long vs short is handled
+   // using long, since the printf format is expected to be correct for the
+   // data size e.g. %d for short, %ld for long.
+   case _DK_TINT:
+   case _DK_TUNSIGNED:
+   case _DK_TLONG:
+   case _DK_TULONG:
+   case _DK_TFLOAT:
+      reqlen = snprintf(dest, maxlen, spec, bin ? *((long __far *)bin) : 0L);
+   	break;
+   case _DK_TSTRING:
+   	// String binary length is passed as extra parameter, which allows formats
+   	// like %.*s to be used for force the resulting field width to be
+   	// constant regardless of the string length.
+      reqlen = snprintf(dest, maxlen, spec, bin ? (char __far *)bin : (char __far *)"",
+      							web_size(wc));
+   	break;
+   default:
+   	// Should not happen, but if it does we just return a null string
+   	reqlen = 1;
+   	if (maxlen >= reqlen)
+   		*dest = 0;
+   	break;
+	}
+	if (maxlen < reqlen)
+		return reqlen;
+	return 0;
+}
+
+
+
+/*** BeginHeader web_register_extrep, _web_extreps, _web_std_extreps */
+WebExtrep_t __far * web_register_extrep(
+		char __far * name,
+		//DEVIDEA: add parm defs back in when compiler fixed
+		int (*bin2str)(/*WebCursor_t far * wc, char far * str, int maxlen, void far * bin*/),
+		int (*str2bin)(/*WebCursor_t far * wc, char far * str, int len, void far * bin*/)
+		);
+extern WebExtrep_t __far * _web_extreps;
+extern WebExtrep_t __far * __far _web_std_extreps[14];
+/*** EndHeader */
+
+WebExtrep_t __far * _web_extreps = NULL;
+WebExtrep_t __far * __far _web_std_extreps[14];
+
+
+_web_debug
+WebExtrep_t __far * web_register_extrep(
+		char __far * name,
+		int (*bin2str)(/*WebCursor_t far * wc, char far * str, int maxlen, void far * bin*/),
+		int (*str2bin)(/*WebCursor_t far * wc, char far * str, int len, void far * bin*/)
+		)
+{
+	WebExtrep_t __far * wx = _web_find_extrep(name);
+
+	if (!wx) {
+		wx = _web_malloc(sizeof(*wx));
+		if (!wx)
+			return NULL;
+		_f_strcpy(wx->name, name);
+		wx->next = _web_extreps;
+		_web_extreps = wx;
+	}
+	wx->bin2str = bin2str;
+	wx->str2bin = str2bin;
+	return wx;
+}
+
+
+/*** BeginHeader _web_find_extrep */
+WebExtrep_t __far * _web_find_extrep(const char __far * name);
+/*** EndHeader */
+
+_web_debug
+WebExtrep_t __far * _web_find_extrep(const char __far * name)
+{
+	WebExtrep_t __far * wx;
+
+	for (wx = _web_extreps; wx; wx = wx->next)
+		if (!strcmp(wx->name, name))
+			return wx;
+	return NULL;
+}
+
+
+/*** BeginHeader _web_b2s_xea, _web_s2b_xea */
+int _web_b2s_xea(WebCursor_t __far * wc, char __far * str, int maxlen, const void __far * bin);
+int _web_s2b_xea(WebCursor_t __far * wc, char __far * str, int len, void __far * bin);
+/*** EndHeader */
+_web_debug
+int _web_b2s_xea(WebCursor_t __far * wc, char __far * str, int maxlen, const void __far * bin)
+{
+	char __far * mac;
+	if (maxlen < 25)
+		return 25;
+	if (bin) {
+	   mac = (char __far *)bin;
+	   sprintf(str, "%02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X!",
+	      mac[0],mac[1],mac[2],mac[3],mac[4],mac[5],mac[6],mac[7]);
+	}
+	else
+		_f_strcpy(str, "00:00:00:00:00:00:00:00!");
+	return 0;
+}
+
+_web_debug
+int _web_s2b_xea(WebCursor_t __far * wc, char __far * str, int len, void __far * bin)
+{
+	// We are a bit more liberal in the strings we accept for xbee_ext_addr
+   // (i.e. 64-bit IEEE addresses).  We don't need the final "bang", and
+   // we don't care which delimiter is used (if any) provided it's not
+   // alphanumeric.  We only need 16 hex digits.
+   int digit;
+   int v;
+	_f_memset(bin, 0, 8);
+   for (digit = 0; digit < 16; ++digit) {
+   	while (len && !isalnum(*str)) ++str, --len;
+      if (len && isxdigit(*str)) {
+			if (isdigit(*str)) v = *str - '0';
+      	else v = toupper(*str) - ('A' - 10);
+         ((char __far *)bin)[digit>>1] |= v<<4*!(digit&1);
+         ++str, --len;
+      }
+      else
+			return RCIERR_INVALID_FORMAT;
+   }
+
+	return 0;
+}
+
+
+
+
+/*** BeginHeader _web_register_default_extreps */
+void _web_register_default_extreps(void);
+/*** EndHeader */
+
+_web_debug
+int _web_b2s_string(WebCursor_t __far * wc, char __far * str, int maxlen, const void __far * bin)
+{
+	int reqlen = web_size(wc);
+	if (maxlen < reqlen)
+		return reqlen;
+	if (!bin) {
+		_f_memset(str, 0, reqlen);
+		return 0;
+	}
+	_f_memcpy(str, bin, reqlen-1);
+	str[reqlen-1] = 0;
+	return 0;
+}
+
+_web_debug
+int _web_s2b_string(WebCursor_t __far * wc, char __far * str, int len, void __far * bin)
+{
+	int binlen, mlen;
+	WebMetadata_t __far * meta = web_metadata(wc);
+
+	binlen = web_size(wc)-1;	// Leave 1 byte for null term (mandatory)
+	mlen = i_min(binlen, len);
+	_f_memcpy(bin, str, mlen);
+	*((char __far *)bin + mlen) = 0;
+
+	if (len > binlen)
+		return RCIERR_STRING_LENGTH;
+	if (meta &&
+		 (meta->flags & WM_HAVE_MIN_L && len < meta->min.l ||
+	     meta->flags & WM_HAVE_MAX_L && len > meta->max.l))
+		return RCIERR_STRING_LENGTH;
+	return 0;
+}
+
+_web_debug
+int _web_b2s_password(WebCursor_t __far * wc, char __far * str, int maxlen, const void __far * bin)
+{
+	// Password reading, with obfuscation.  When converted to string, password
+	// is a single asterisk.  If a secure channel is used, then normal string
+	// conversion will be used rather than this converter.
+	if (maxlen < 2)
+		return 2;
+	_f_strcpy(str, "*");
+	return 0;
+}
+
+
+
+_web_debug
+int _web_b2s_int(WebCursor_t __far * wc, char __far * str, int maxlen, const void __far * bin)
+{
+	int x;
+
+	if (maxlen < 12)
+		return 12;
+
+	if (web_size(wc) == 2)
+		sprintf(str, "%d", bin ? *(int __far *)bin : 0);
+	else if (web_size(wc) == 4)
+		sprintf(str, "%ld", bin ? *(long __far *)bin :0L);
+	else {
+		// DC chars are always unsigned, so we manually do sign extension.
+		x = bin ? *(char __far *)bin : 0;
+		if (x & 0x80)
+			x |= 0xFF00;
+		sprintf(str, "%d", x);
+	}
+	return 0;
+}
+
+_web_debug
+int _web_s2b_int(WebCursor_t __far * wc, char __far * str, int len, void __far * bin)
+{
+	long v;
+	char __far * tail;
+	char old = str[len];
+	WebMetadata_t __far * meta = web_metadata(wc);
+
+	str[len] = 0;
+	if (str[0] == '0' && toupper(str[1]) == 'X')
+		v = _f_strtol(str+2, &tail, 16);
+	else
+		v = _f_strtol(str, &tail, 10);
+
+	if (web_size(wc) == 2)
+		*(int __far *)bin = (int)v;
+	else if (web_size(wc) == 4)
+		*(long __far *)bin = v;
+	else
+		*(char __far *)bin = (char)v;
+
+	str[len] = old;
+	if ((int)(tail-str) < len)
+		return RCIERR_INVALID_FORMAT;
+	if (meta) {
+		if (meta->flags & WM_HAVE_MIN_L && v < meta->min.l ||
+	       meta->flags & WM_HAVE_MAX_L && v > meta->max.l)
+			return RCIERR_VALUE_RANGE;
+	}
+	return 0;
+}
+
+
+_web_debug
+int _web_b2s_uint(WebCursor_t __far * wc, char __far * str, int maxlen, const void __far * bin)
+{
+	if (maxlen < 12)
+		return 12;
+
+	if (web_size(wc) == 2)
+		sprintf(str, "%u", bin ? *(unsigned __far *)bin : 0);
+	else if (web_size(wc) == 4)
+		sprintf(str, "%lu", bin ? *(unsigned long __far *)bin : 0uL);
+	else
+		sprintf(str, "%u", bin ? *(char __far *)bin : 0);
+	return 0;
+}
+
+_web_debug
+int _web_s2b_uint(WebCursor_t __far * wc, char __far * str, int len, void __far * bin)
+{
+	unsigned long v;
+	char __far * tail;
+	char old = str[len];
+	WebMetadata_t __far * meta = web_metadata(wc);
+
+	str[len] = 0;
+
+	if (str[0] == '0' && toupper(str[1]) == 'X')
+		v = _f_strtoul(str+2, &tail, 16);
+	else
+		v = _f_strtoul(str, &tail, 10);
+
+	if (web_size(wc) == 2)
+		*(unsigned __far *)bin = (unsigned)v;
+	else if (web_size(wc) == 4)
+		*(unsigned long __far *)bin = v;
+	else
+		*(char __far *)bin = (char)v;
+
+	str[len] = old;
+	if ((int)(tail-str) < len)
+		return RCIERR_INVALID_FORMAT;
+	if (meta) {
+		if (meta->flags & WM_HAVE_MIN_L && v < meta->min.u ||
+	       meta->flags & WM_HAVE_MAX_L && v > meta->max.u)
+			return RCIERR_VALUE_RANGE;
+	}
+	return 0;
+}
+
+
+_web_debug
+int _web_b2s_hex(WebCursor_t __far * wc, char __far * str, int maxlen, const void __far * bin)
+{
+	if (maxlen < 9)
+		return 9;
+
+	if (web_size(wc) == 2)
+		sprintf(str, "%X", bin ? *(unsigned __far *)bin : 0);
+	else if (web_size(wc) == 4)
+		sprintf(str, "%lX", bin ? *(unsigned long __far *)bin : 0uL);
+	else
+		sprintf(str, "%X", bin ? *(char __far *)bin : 0);
+	return 0;
+}
+
+_web_debug
+int _web_s2b_hex(WebCursor_t __far * wc, char __far * str, int len, void __far * bin)
+{
+	unsigned long v;
+	char __far * tail;
+	char old = str[len];
+	WebMetadata_t __far * meta = web_metadata(wc);
+
+	str[len] = 0;
+
+	v = _f_strtoul(str, &tail, 16);
+
+	if (web_size(wc) == 2)
+		*(unsigned __far *)bin = (unsigned)v;
+	else if (web_size(wc) == 4)
+		*(unsigned long __far *)bin = v;
+	else
+		*(char __far *)bin = (char)v;
+
+	str[len] = old;
+	if ((int)(tail-str) < len)
+		return RCIERR_INVALID_FORMAT;
+	if (meta) {
+		if (meta->flags & WM_HAVE_MIN_L && v < meta->min.u ||
+	       meta->flags & WM_HAVE_MAX_L && v > meta->max.u)
+			return RCIERR_VALUE_RANGE;
+	}
+	return 0;
+}
+
+
+_web_debug
+int _web_b2s_0xhex(WebCursor_t __far * wc, char __far * str, int maxlen, const void __far * bin)
+{
+	if (maxlen < 11)
+		return 11;
+
+	if (web_size(wc) == 2)
+		sprintf(str, "0x%X", bin ? *(unsigned __far *)bin : 0);
+	else if (web_size(wc) == 4)
+		sprintf(str, "0x%lX", bin ? *(unsigned long __far *)bin : 0uL);
+	else
+		sprintf(str, "0x%X", bin ? *(char __far *)bin : 0);
+	return 0;
+}
+
+
+
+_web_debug
+int _web_b2s_float(WebCursor_t __far * wc, char __far * str, int maxlen, const void __far * bin)
+{
+	int len = snprintf(str, maxlen, "%g", bin ? *(float __far *)bin : 0.0);
+	if (len > maxlen)
+		return len;
+	return 0;
+}
+
+_web_debug
+int _web_b2s_dotXfloat(WebCursor_t __far * wc, char __far * str, int maxlen, const void __far * bin)
+{
+	// Special condensed hex float format, used primarily by internal formatting
+	unsigned long f = bin ? *(unsigned long __far *)bin : 0uL;	// even though it's a float
+	if (maxlen < 11)
+		return 11;
+	sprintf(str, ".x%08lX", f);
+	return 0;
+}
+
+_web_debug
+int _web_s2b_float(WebCursor_t __far * wc, char __far * str, int len, void __far * bin)
+{
+	float v;
+	char __far * tail;
+	char old = str[len];
+	unsigned long f;
+	WebMetadata_t __far * meta = web_metadata(wc);
+
+	str[len] = 0;
+	if (str[0]=='.' && (str[1]=='x'||str[1]=='X')) {
+		f = _f_strtol(str+2, &tail, 16);
+		v = *(float *)&f;
+	}
+	else
+	   v = _f_strtod(str, &tail);
+
+	*(float __far *)bin = v;
+
+	str[len] = old;
+	if ((int)(tail-str) < len)
+		return RCIERR_INVALID_FORMAT;
+	if (meta) {
+	   if (meta->flags & WM_HAVE_MIN_F && v < meta->min.f ||
+	       meta->flags & WM_HAVE_MAX_F && v > meta->max.f)
+	      return RCIERR_VALUE_RANGE;
+	}
+	return 0;
+}
+
+_web_debug
+int _web_b2s_enum(WebCursor_t __far * wc, char __far * str, int maxlen, const void __far * bin)
+{
+	WebMetadata_t __far * meta = web_metadata(wc);
+	_Web_Select32 * p32;
+	_Web_Select16 * p16;
+	unsigned i16;
+	unsigned long i32;
+	char __far * p;
+	int reqlen;
+
+	*str = 0;
+	if (web_size(wc) == 2)
+		p = _web_selection_from_value(wc, bin ? *(unsigned __far *)bin : 0);
+	else
+		p = _web_selection_from_value(wc, bin ? *(unsigned long __far *)bin : 0);
+	if (!p)
+		return 0;
+
+	reqlen = strlen(p) + 1;
+	if (maxlen < reqlen)
+		return reqlen;
+	_f_strcpy(str, p);
+	return 0;
+}
+
+_web_debug
+int _web_s2b_enum(WebCursor_t __far * wc, char __far * str, int len, void __far * bin)
+{
+	_Web_Select32 * p32;
+	_Web_Select16 * p16;
+	char old = str[len];
+	WebMetadata_t __far * meta = web_metadata(wc);
+	int found = 0;
+
+	if (!meta || !meta->select.ptr16)
+		return RCIERR_SPEC;
+
+	str[len] = 0;
+	if (web_size(wc) == 2) {
+		for (p16 = meta->select.ptr16; p16->name; ++p16)
+			if (!strcmpi(str, p16->name))
+				break;
+		if (p16->name) {
+			found = 1;
+			*(unsigned __far *)bin = p16->value;
+		}
+		else
+			*(unsigned __far *)bin = meta->select.ptr16->value;
+	}
+	else {
+		for (p32 = meta->select.ptr32; p32->name; ++p32)
+			if (!strcmpi(str, p32->name))
+				break;
+		if (p32->name) {
+			found = 1;
+			*(unsigned long __far *)bin = p32->value;
+		}
+		else {
+			*(unsigned long __far *)bin = meta->select.ptr32->value;
+		}
+	}
+	str[len] = old;
+	if (!found)
+		return RCIERR_VALUE_ENUM;
+	return 0;
+}
+
+
+_web_debug
+int _web_b2s_enum_multi(WebCursor_t __far * wc, char __far * str, int maxlen, const void __far * bin)
+{
+	WebMetadata_t __far * meta = web_metadata(wc);
+	_Web_Select32 * p32;
+	_Web_Select16 * p16;
+	unsigned i16;
+	unsigned m16;
+	unsigned long i32;
+	unsigned long m32;
+	int subseq = 0;
+
+	if (!meta || !meta->select.ptr16) {
+		// Specification error.  Return empty string
+		*str = 0;
+		return 0;
+	}
+	//DEVIDEA: Hassle to compute true length.  Let's demand 256 and wing it for now.
+	if (maxlen < 256)
+		return 256;
+
+	*str = 0;
+	if (web_size(wc) == 2) {
+		i16 = bin ? *(unsigned __far *)bin : 0;
+		for (m16 = 1; m16; m16 <<= 1) if (i16 & m16) {
+	      for (p16 = meta->select.ptr16; p16->name; ++p16)
+	         if (p16->value == m16)
+	            break;
+	      if (p16->name) {
+	         if (subseq)
+	         	*str++ = ',';
+	         else
+	         	subseq = 1;
+            _f_strcpy(str, p16->name);
+            str += strlen(str);
+	      }
+	   }
+	}
+	else {
+		for (m32 = 1; m32; m32 <<= 1) if (i32 & m32) {
+	      i32 = bin ? *(unsigned long __far *)bin : 0uL;
+	      for (p32 = meta->select.ptr32; p32->name; ++p32)
+	         if (p32->value == i32)
+	            break;
+	      if (p32->name) {
+	         if (subseq)
+	         	*str++ = ',';
+	         else
+	         	subseq = 1;
+            _f_strcpy(str, p32->name);
+            str += strlen(str);
+	      }
+	   }
+	}
+	return 0;
+}
+
+_web_debug
+int _web_s2b_enum_multi(WebCursor_t __far * wc, char __far * str, int len, void __far * bin)
+{
+	char __far * comma;
+	char __far * s;
+	unsigned long vv;
+	unsigned long v = 0;
+	int rc;
+
+	comma = str;
+	do {
+	   for (s = comma; (int)(comma-str) < len; ++comma)
+	      if (*comma == ',' || isspace(*comma))
+	         break;
+		rc = _web_s2b_enum(wc, s, (int)(comma-s), &vv);
+		if (rc)
+			return rc;
+		v |= vv;
+		while ((int)(comma-str) < len && (*comma == ',' || isspace(*comma)))
+			++comma;
+	} while ((int)(comma-str) < len);
+	if (web_size(wc) == 2)
+		*(unsigned __far *)bin = (unsigned)v;
+	else
+		*(unsigned long __far *)bin = v;
+	return 0;
+}
+
+
+_web_debug
+int _web_b2s_on_off(WebCursor_t __far * wc, char __far * str, int maxlen, const void __far * bin)
+{
+	if (maxlen < 4)
+		return 4;
+	_f_strcpy(str, bin && *(int __far *)bin ? "on" : "off");
+	return 0;
+}
+
+_web_debug
+int _web_s2b_bool(WebCursor_t __far * wc, char __far * str, int len, void __far * bin)
+{
+	int b = 2;
+	char old = str[len];
+
+	str[len] = 0;
+	if (isdigit(*str))
+		b = _f_strtol(str, NULL, 10) != 0;
+	else if (!strcmpi(str, "false"))
+		b = 0;
+	else if (!strcmpi(str, "true"))
+		b = 1;
+	else if (!strcmpi(str, "off"))
+		b = 0;
+	else if (!strcmpi(str, "on"))
+		b = 1;
+	else if (!strcmpi(str, "no"))
+		b = 0;
+	else if (!strcmpi(str, "yes"))
+		b = 1;
+	else
+		b = 2;
+	str[len] = old;
+	if (b == 2) {
+		*(int __far *)bin = 0;
+		return RCIERR_VALUE_ENUM;
+	}
+	*(int __far *)bin = b;
+	return 0;
+}
+
+_web_debug
+int _web_b2s_boolean(WebCursor_t __far * wc, char __far * str, int maxlen, const void __far * bin)
+{
+	if (maxlen < 6)
+		return 6;
+	_f_strcpy(str, bin && *(int __far *)bin ? "true" : "false");
+	return 0;
+}
+
+
+
+_web_debug
+int _web_b2s_ipv4(WebCursor_t __far * wc, char __far * str, int maxlen, const void __far * bin)
+{
+	char __far * ip;
+	if (maxlen < 16)
+		return 16;
+	if (bin) {
+	   ip = (char __far *)bin;
+	   sprintf(str, "%d.%d.%d.%d", ip[3], ip[2], ip[1], ip[0]);
+	}
+	else
+		_f_strcpy(str, "0.0.0.0");
+	return 0;
+}
+
+#ifndef IP_H
+// Copy of routines in IP.LIB, in case it is not included.  Want to avoid
+// direct dependence on networking libraries.
+_web_debug
+unsigned long _aton2(int __far *offset, const char __far *text, int __far *bad,
+																					word __far *port)
+{
+   auto int i, wasbrkt;
+   auto long cur;
+   auto unsigned long ip;
+   auto const char __far * texto = text;
+
+   ip = 0;
+	*bad = 0;
+   while (isspace(*text)) ++text;
+   wasbrkt = *text == '[';
+   if (wasbrkt)
+      ++text;
+   if (*text == '/') {
+   	++text;
+   	// cast away const on text so strtol can set it
+      cur = _f_strtol(text, (char __far * __far *)&text, 10);
+		ip = 0xFFFFFFFFuL << (32 - cur);
+   }
+   else for( i = 24; i >= 0; i -= 8 ) {
+   	if (!isdigit(*text)) {
+      	*bad = NETERR_NOTDIGIT;
+      	goto _retz;
+      }
+   	// cast away const on text so strtol can set it
+   	cur = _f_strtol(text, (char __far * __far *)&text, 10);
+      if (cur < 0 || cur >= 256) {
+      	*bad = NETERR_TOOBIG;
+      	goto _retz;
+      }
+      ip |= cur << i;
+      if (!i) break;
+
+      if (*text != '.' && *text != ',') {
+      	*bad = NETERR_BADDELIM;
+      	goto _retz;
+      }
+      ++text;
+   }
+   if (port) {
+   	*port = 0;
+      if (*text == ':') {
+      	++text;
+	   	// cast away const on text so strtol can set it
+         cur = _f_strtol(text, (char __far * __far *)&text, 10);
+         if (cur < 0 || cur >= 65536) {
+         	*bad = NETERR_BADPORT;
+      		goto _retz;
+         }
+         *port = (word)cur;
+      }
+   }
+   if (wasbrkt)
+   	if (*text != ']') {
+      	*bad = NETERR_UNBALANCED;
+      	goto _retz;
+      }
+      else
+      	++text;
+   while (isspace(*text)) ++text;
+_ret:
+	*offset = (int)(text - texto);
+   return ip;
+_retz:
+	ip = 0;
+	goto _ret;
+}
+
+_web_debug
+longword _f_aton2(char __far * __far *textp, int __far * bad, word __far * port)
+{
+   int offset = 0;
+   long retval;
+
+   retval = _aton2( &offset, *textp, bad, port);
+   *textp += offset;
+
+   return retval;
+}
+#endif
+
+_web_debug
+int _web_s2b_ipv4(WebCursor_t __far * wc, char __far * str, int len, void __far * bin)
+{
+	unsigned long ip;
+	int bad;
+	char old = str[len];
+	char __far * str2 = str;
+
+	str[len] = 0;
+	ip = _f_aton2(&str2, &bad, NULL);
+	str[len] = old;
+	*(unsigned long __far *)bin = ip;
+	if (bad || str2 != str+len)
+		return RCIERR_INVALID_FORMAT;
+	return 0;
+}
+
+
+_web_debug
+int _web_b2s_mac(WebCursor_t __far * wc, char __far * str, int maxlen, const void __far * bin)
+{
+	char __far * mac;
+	if (maxlen < 18)
+		return 18;
+	if (bin) {
+	   mac = (char __far *)bin;
+	   sprintf(str, "%02X:%02X:%02X:%02X:%02X:%02X",
+	      mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+	}
+	else
+		_f_strcpy(str, "00:00:00:00:00:00");
+	return 0;
+}
+
+_web_debug
+int _web_s2b_mac(WebCursor_t __far * wc, char __far * str, int len, void __far * bin)
+{
+	//DEVIDEA: implement this when this type required
+	return RCIERR_SPEC;
+}
+
+
+_web_debug
+int _web_b2s_raw_data(WebCursor_t __far * wc, char __far * str, int maxlen, const void __far * bin)
+{
+	//DEVIDEA: implement this when this type required
+   // NOTE: will probably never be needed, since we are not implementing
+   // RCI filesystem support.  There are new, better, ways of doing this.
+	*str = 0;
+	return 0;
+}
+
+_web_debug
+int _web_s2b_raw_data(WebCursor_t __far * wc, char __far * str, int len, void __far * bin)
+{
+	//DEVIDEA: implement this when this type required
+	return RCIERR_SPEC;
+}
+
+
+
+_web_debug
+int _web_b2s_error(WebCursor_t __far * wc, char __far * str, int maxlen, const void __far * bin)
+{
+#ifdef RABBITWEB_VERBOSE
+	printf("Unexpected call of b2s function\n");
+#endif
+	*str = 0;
+	return 0;
+}
+
+_web_debug
+int _web_s2b_error(WebCursor_t __far * wc, char __far * str, int len, void __far * bin)
+{
+#ifdef RABBITWEB_VERBOSE
+	printf("Unexpected call of s2b function\n");
+#endif
+	return RCIERR_SPEC;
+}
+
+
+
+_web_debug
+void _web_register_default_extreps(void)
+{
+	_f_memset(_web_std_extreps, 0, sizeof(_web_std_extreps));
+	_web_std_extreps[TSTRING] =
+	web_register_extrep("string", _web_b2s_string, _web_s2b_string);
+	web_register_extrep("password", _web_b2s_password, _web_s2b_string);
+	_web_std_extreps[TSIGNEDCHAR] =
+	_web_std_extreps[TINT] =
+	_web_std_extreps[TLONG] =
+	web_register_extrep("int32", _web_b2s_int, _web_s2b_int);
+	_web_std_extreps[T_CHAR] =
+	_web_std_extreps[TUNSIGNED] =
+	_web_std_extreps[TULONG] =
+	web_register_extrep("uint32", _web_b2s_uint, _web_s2b_uint);
+	web_register_extrep("hex32", _web_b2s_hex, _web_s2b_hex);
+	web_register_extrep("0x_hex32", _web_b2s_0xhex, _web_s2b_uint);
+	_web_std_extreps[TFLOAT] =
+	web_register_extrep("float", _web_b2s_float, _web_s2b_float);
+	_web_std_extreps[0] =
+	web_register_extrep("dotXfloat", _web_b2s_dotXfloat, _web_s2b_float);
+	_web_std_extreps[6] =
+	web_register_extrep("enum", _web_b2s_enum, _web_s2b_enum);
+	web_register_extrep("enum_multi", _web_b2s_enum_multi, _web_s2b_enum_multi);
+	web_register_extrep("on_off", _web_b2s_on_off, _web_s2b_bool);
+	web_register_extrep("boolean", _web_b2s_boolean, _web_s2b_bool);
+	web_register_extrep("ipv4", _web_b2s_ipv4, _web_s2b_ipv4);
+	web_register_extrep("mac_addr", _web_b2s_mac, _web_s2b_mac);
+	web_register_extrep("raw_data", _web_b2s_raw_data, _web_s2b_raw_data);
+
+	// Following not yet supported on Rabbit.
+	//web_register_extrep("fqdnv4", _web_b2s_, _web_s2b_);
+	//web_register_extrep("fqdnv6", _web_b2s_, _web_s2b_);
+	web_register_extrep("xbee_ext_addr", _web_b2s_xea, _web_s2b_xea);
+	//web_register_extrep("file_name", _web_b2s_, _web_s2b_);
+	//web_register_extrep("multi", _web_b2s_, _web_s2b_);
+
+	// List is special case, since it is only used in places where the
+	// normal hierarchy covers formatting requirements, hence the callbacks
+	// are never invoked.  We register dummy callbacks which print an error
+	// message.
+	web_register_extrep("list", _web_b2s_error, _web_s2b_error);
+}
+
+/*****************************************************************************
+******************************************************************************
+
+Locking
+
+RabbitWeb API callers must lock/unlock around transactions.  A transaction is
+a set of updates which are applied "atomically" to the #web registered
+variables.  Each API caller (which we call a "server") must first register
+itself.  It then calls web_acquire_lock until it returns successfully.  If
+lock aquistion fails, the server will need to yield to other servers so that
+the other server which holds the lock can complete its transaction.  When
+complete, the server releases its lock.
+
+When a lock is obtained using web_acquire_lock...
+
+******************************************************************************
+*****************************************************************************/
+
+
+
+/*** BeginHeader web_acquire_lock, web_release_lock, web_register_server */
+unsigned long web_acquire_lock(int servernum);
+void web_release_lock(int servernum);
+int web_register_server(void);
+/*** EndHeader */
+
+static unsigned long _web_lock = 0;
+static int _web_lock_servernum = -1;
+static int _web_next_servernum = 0;
+
+// Acquires a lock on the rweb global data structures and data groups.
+// This prevents multiple update transactions from trampling each other--if a
+// request is unable to get a lock, it is forced to wait.
+//
+// servernum -- The number of the current server.  Used to remember which
+//              server has acquired the lock.  The same server can get the lock
+//              again, but the same update token will be returned each time.
+// Return    -- non-zero update token if lock acquired, 0 for lock not acquired
+_web_debug
+unsigned long web_acquire_lock(int servernum)
+{
+	if (_web_lock_servernum == -1)
+		return ++_web_lock;
+	if (_web_lock_servernum == servernum)
+		return _web_lock;
+	return 0;
+}
+
+// Releases lock.
+//
+// servernum -- The number of the current server.  The lock is only
+//              really released if this number matches the number remembered in
+//              the lock.
+_web_debug
+void web_release_lock(int servernum)
+{
+	if (_web_lock_servernum == servernum) {
+		_web_lock_servernum = -1;
+	}
+}
+
+
+// Register a server for use with RabbitWeb and the above functions.
+//
+// Returns: server number to use with web_acquire_lock and web_release_lock.
+//    This is simply an increasing integer counter.  The server should
+//    re-use the identifier for all its transactions that don't overlap,
+//    rather than getting a new identifier for each transaction.
+_web_debug
+int web_register_server(void)
+{
+	return ++_web_next_servernum;
+}
+
+
+
+/*****************************************************************************
+******************************************************************************
+
+Transaction definition
+
+A list of #web registered variables is built, along with the proposed new
+values for each variable.  This may be performed without holding the lock,
+since all code is re-entrant.
+
+******************************************************************************
+*****************************************************************************/
+
+
+/*** BeginHeader web_parse_state2name */
+/*
+	This function converts the current navigation state in wpx into a
+	canonical RabbitWeb variable name.
+
+	Returns >0 if OK (returns length of name, which will also be null term)
+	-E2BIG if name too long for given buffer
+*/
+int web_parse_state2name(WebParseX_t __far * wpx, char __far * name, int len);
+/*** EndHeader */
+_web_debug
+int web_parse_state2name(WebParseX_t __far * wpx, char __far * name, int len)
+{
+	char ibuf[10];
+	int i, nlen, xlen;
+
+	nlen = 0;
+	for (i = 0; i <= wpx->level; ++i) {
+		if (wpx->arry[i]) {
+			sprintf(ibuf, "[%d]", wpx->idx[i]);
+	      if (nlen + (xlen = strlen(ibuf)) > len-1)
+	         return -E2BIG;
+	      _f_strcpy(name + nlen, ibuf);
+	   }
+	   else {
+			if (nlen + (xlen = strlen(wpx->key[i])) + (i>0) > len-1)
+				return -E2BIG;
+			if (i)
+				name[nlen++] = '.';
+	      _f_strcpy(name + nlen, wpx->key[i]);
+	   }
+	   nlen += xlen;
+
+	}
+	name[nlen] = 0;
+	return nlen;
+}
+
+/*** BeginHeader _web_trans_first */
+WebTransEntry_t __far * _web_trans_first(WebTrans_t wt);
+/*** EndHeader */
+_web_debug
+WebTransEntry_t __far * _web_trans_first(WebTrans_t wt)
+{
+	WebTransEntry_t __far * we = &wt->first;
+	if ((char __far *)we - (char __far *)wt >= wt->used_size)
+		return NULL;
+	return we;
+}
+
+
+/*** BeginHeader _web_trans_next */
+WebTransEntry_t __far * _web_trans_next(WebTrans_t wt, WebTransEntry_t __far * we);
+/*** EndHeader */
+_web_debug
+WebTransEntry_t __far * _web_trans_next(WebTrans_t wt, WebTransEntry_t __far * we)
+{
+	int __far * error_id;
+	int __far * bin_len;
+	void __far * newbin;
+	WebTransEntry_t __far * we_next;
+
+	we_next = _web_grok_wte(we, &error_id, &bin_len, &newbin);
+	if ((char __far *)we_next - (char __far *)wt >= wt->used_size)
+		return NULL;
+	return we_next;
+}
+
+
+/*** BeginHeader _web_transaction_find_cname */
+WebTransEntry_t __far * _web_transaction_find_cname(WebTrans_t wt,
+								char __far * cname);
+/*** EndHeader */
+_web_debug
+WebTransEntry_t __far * _web_transaction_find_cname(WebTrans_t wt,
+								char __far * cname)
+{
+   WebTransEntry_t __far * we;
+	for (we = _web_trans_first(wt); we; we = _web_trans_next(wt, we))
+		if (!_web_cname_cmp(cname, we->cname))
+			return we;
+	return NULL;
+}
+
+
+
+
+/*** BeginHeader web_transaction_start,
+		web_transaction_add,
+		web_transaction_set_group,
+		web_transaction_set_auth,
+		web_transaction_set_test,
+		web_transaction_add_by_name,
+		web_transaction_free,
+		web_transaction_error_count
+	 */
+
+int web_transaction_start(WebTrans_t __far * wtp);
+int web_transaction_set_group(WebTrans_t __far * wtp, word group);
+int web_transaction_set_auth(WebTrans_t __far * wtp, word auth);
+int web_transaction_set_test(WebTrans_t __far * wtp, int (*test_func)(), void __far * data);
+int web_transaction_add(WebTrans_t __far * wtp,
+		WebCursor_t __far * wc, const void __far * val, int options, int slen);
+#define WTA_NOTEST	 0x0400	// Bypass the normal test_access callback function
+#define WTA_NOAUTH	 0x0800	// Bypass the normal authentication method test
+#define WTA_NOGROUP	 0x1000	// Bypass the normal group writable test
+#define WTA_BINARY	 0x2000
+#define WTA_CASE_SENS 0x4000
+#define WTA_NOREPLACE 0x8000
+int web_transaction_add_by_name(WebTrans_t __far * wtp,
+		const char __far * name, const void __far * val, int options, int slen);
+
+void web_transaction_free(WebTrans_t __far * wt);
+int web_transaction_error_count(WebTrans_t __far * wtp);
+
+
+/*** EndHeader */
+
+_web_debug
+int web_transaction_start(WebTrans_t __far * wtp)
+{
+	WebTrans_t wt;
+
+	wt = *wtp = _web_malloc(_WEB_INITIAL_ALLOC);
+	if (!wt)
+		return -ENOMEM;
+	wt->alloc_size = _WEB_INITIAL_ALLOC;
+	wt->used_size = sizeof(*wt)-sizeof(wt->first);
+	wt->group = 0;	// anonymous
+	wt->test_access = NULL;
+	return 0;
+}
+
+
+_web_debug
+int web_transaction_set_group(WebTrans_t __far * wtp, word group)
+{
+	if (!wtp || !*wtp)
+		return -EINVAL;
+	(*wtp)->group = group;
+	return 0;
+}
+
+
+_web_debug
+int web_transaction_set_auth(WebTrans_t __far * wtp, word auth)
+{
+	if (!wtp || !*wtp)
+		return -EINVAL;
+	(*wtp)->auth = auth;
+	return 0;
+}
+
+
+_web_debug
+int web_transaction_set_test(WebTrans_t __far * wtp, int (*test_func)(), void __far * data)
+{
+	if (!wtp || !*wtp)
+		return -EINVAL;
+	(*wtp)->user_data = data;
+	(*wtp)->test_access = test_func;
+	return 0;
+}
+
+
+_web_debug
+int web_transaction_add_by_name(WebTrans_t __far * wtp,
+		const char __far * name, const void __far * val, int options, int slen)
+{
+	// name is the variable name (a string with the variable instance as it
+	// would be written in C syntax).  See web_transaction_add() if using a
+	// cursor to point to web variables.
+	//
+	// options contains the following flags:
+	//  WTA_CASE_SENS: case-sensitive name match.  If not set, then
+	//   name will be overwritten with the case-sensitive version of the
+	//   variable name.  By default, name matching is case-insensitive (for
+	//   compat with ZHTML).
+	//  Others: used by web_transaction_add().
+	WebCursor_t wc;
+	int rc;
+
+	rc = web_getvarinfo(name, &wc, NULL, !(options & WTA_CASE_SENS));
+	if (rc < 0) {
+		// Not a registered #web variable.
+		return -ENOENT;
+	}
+
+	return web_transaction_add(wtp, &wc, val, options, slen);
+}
+
+_web_debug
+int web_transaction_add(WebTrans_t __far * wtp,
+		WebCursor_t __far * wc, const void __far * val, int options, int slen)
+{
+	// Note that we don't check for the new value being
+	// different from the current value, since this transaction could be
+	// set up well before it is actually used.
+	//
+	// options contains the following flags:
+	//  WTA_NOGROUP: bypass the normal group writable test.  If
+	//   web_transaction_set_group() specified a non-zero group, then normally
+	//   this routine checks that the variable is writable by that group.
+	//   This flag bypasses that test.
+	//  WTA_BINARY: value is already in binary form, and its length is the
+	//   same as the target #web variable.  Otherwise, the new value
+	//   is in a string format, which will be converted to the appropriate
+	//   binary value before storing in the transaction list.  A NULL value
+	//   is allowed, and is equivalent to memsetting the variable to zeros.
+	//  WTA_NOREPLACE: if same-named variable already in this transaction
+	//   list, this determines what to do: NOREPLACE means ignore the new
+	//   setting, otherwise the new setting overrides the previous one.
+	// The default (if options=0) is to COPY the data, assumed to be in
+	// string format, and to replace any previous settings.
+	//
+	// slen is the value length, unless val is null-terminated in which case
+	// it may be 0.
+	//
+	// All data in the transaction list is self-contained i.e. there are no
+	// pointers stored.  All necessary data is copied (including the new values).
+	WebTransEntry_t c;	// Store cname of new var
+	WebTrans_t wt = *wtp;
+   WebTransEntry_t __far * we;
+	int rc;
+	int len, vlen;
+	int __far * error_id;
+	int __far * vlenp;
+	void __far * newval;
+	char __far * __far * error_msg;
+	char __far * __far * orig_str;
+	int __far * orig_len;
+
+	if (!(options & WTA_NOTEST) && wt->test_access) {
+		rc = wt->test_access(wt, wc, 1, wt->user_data);
+		if (rc < 0)
+			return rc;
+	}
+	else {
+		if (!(options & WTA_NOAUTH)) {
+	      if (!web_auth_ok(wc, wt->auth))
+	         return -EACCES;
+	   }
+		if (!(options & WTA_NOGROUP)) {
+	      if (!web_writable(wc, wt->group))
+	         return -EACCES;
+	   }
+	}
+
+	// Check for existing in the transaction already.  If duplicate found,
+	// then 'overwrite' parameter determines whether to replace with the
+	// new value, or keep the old and ignore the new.
+
+	web_cname(wc, c.cname);
+
+	we = _web_transaction_find_cname(wt, c.cname);
+	if (we && options & WTA_NOREPLACE)
+		return 0;
+
+	// Get required binary size, and make sure there's room for it.
+	vlen = web_size(wc);
+	if (!we) {
+		len = 3*sizeof(int) + 2*sizeof(char __far *) + vlen + c.cname[0];
+	   if (wt->used_size + len >= wt->alloc_size) {
+	      // Need to resize it
+	      wt = _web_realloc(*wtp, wt->alloc_size * 2 + len);
+	      if (!wt) {
+	         web_transaction_free(wtp);
+	         return -ENOMEM;
+	      }
+	      *wtp = wt;
+	      wt->alloc_size += wt->alloc_size + len;
+	   }
+	   we = (WebTransEntry_t __far *)((char __far *)wt + wt->used_size);
+		_f_memcpy(we->cname, c.cname, c.cname[0]);
+	}
+	else
+		len = 0;	// not adding anything
+
+	_web_grok_wte_all(we, &error_id, &vlenp, &newval,
+						&error_msg, &orig_str, &orig_len);
+
+	*error_id = 0;
+	*error_msg = NULL;
+	*vlenp = vlen;
+
+	if (!(options & WTA_BINARY)) {
+		if (!slen)
+			slen = strlen((char __far *)val);
+		*orig_str = (char __far *)val;
+		*orig_len = slen;
+		// Convert to binary.  If error, this will be noted in the
+		// error_id field.  We keep this, since caller may want to craft
+		// a reply with all error messages intact.
+		rc = _web_str2bin(wc, (char __far *)val, slen,
+						newval, vlen, "X", error_id);
+	#ifdef RABBITWEB_VERBOSE
+		if (*error_id) {
+   		web_fqname(wc, _web_gi.name, sizeof(_web_gi.name));
+			printf("RWEB: Variable %ls:\n", _web_gi.name);
+			printf("  web_transaction_add: error ID %d\n", *error_id);
+		}
+	#endif
+	}
+	else {
+		*orig_str = NULL;
+		*orig_len = 0;
+		if (val)
+			_f_memcpy(newval, val, vlen);
+		else
+			_f_memset(newval, 0, vlen);
+		rc = 0;
+	}
+
+	wt->used_size += len;
+
+	return rc;
+}
+
+
+_web_debug
+void web_transaction_free(WebTrans_t __far * wtp)
+{
+	WebTrans_t wt = *wtp;
+	int __far * error_id;
+	int __far * bin_len;
+	void __far * newbin;
+   WebTransEntry_t __far * we;
+	char __far * __far * error_msg;
+	char __far * __far * orig_str;
+	int __far * orig_len;
+
+	if (wt) {
+		// Free any custom error messages
+		for (we = _web_trans_first(wt); we; we = _web_trans_next(wt, we)) {
+			_web_grok_wte_all(we, &error_id, &bin_len, &newbin,
+									&error_msg, &orig_str, &orig_len);
+			if (*error_id == -2) {
+				_web_free(*error_msg);
+				*error_msg = NULL;
+			}
+		}
+	}
+	_web_free(*wtp);
+	*wtp = NULL;
+}
+
+
+
+_web_debug
+int web_transaction_error_count(WebTrans_t __far * wtp)
+{
+	WebTrans_t wt = *wtp;
+	int __far * error_id;
+	int __far * bin_len;
+	void __far * newbin;
+   WebTransEntry_t __far * we;
+   int ec = 0;
+
+	if (wt) {
+		for (we = _web_trans_first(wt); we; we = _web_trans_next(wt, we)) {
+			_web_grok_wte(we, &error_id, &bin_len, &newbin);
+			if (*error_id && *error_id != -1)
+				++ec;
+		}
+	}
+	return ec;
+}
+
+
+
+
+/*****************************************************************************
+******************************************************************************
+
+Transaction Execute
+
+The list built up using web_transaction_add() etc. is applied to the
+current state using these functions.  The caller must have the lock, since
+there is only one (global) set of actual #web variables.
+
+web_transaction_execute() is the main function.  It applies the following
+steps in order:
+
+. String values are translated to binary.  There is a default mechanism for
+  this, however (as a temporary hack) if the variable name, excluding array
+  indices, but with a suffix of _attrs, exists then it is assumed to be a
+  WebAttrs_t struct.  This struct contains some function pointers, including
+  str2bin().  If this exists, then it is called to provide the translation
+  rather than using the default type-based method.
+
+  The binary value is placed in the transaction list unless it is a string
+  type.
+
+. If the WTE_APPLY_UNCHANGED flag is not set, any new values which are
+  no different from the current value are removed from the update list.
+
+
+******************************************************************************
+*****************************************************************************/
+
+/*** BeginHeader web_transaction_execute */
+int web_transaction_execute(WebTrans_t __far * wt, int options);
+// Following option causes *all* listed variables to be applied as changes,
+// even if their new value is the same as the current (committed) value.
+// Otherwise, if there is no actual change, it is as if the variable is
+// not listed.  The main effect of this is that guard and update functions are
+// called even if there is no physical change to the registered #web variable.
+// This can be useful when the guards have complex interdependency.
+#define WTE_APPLY_UNCHANGED	0x0001
+// Bypass the normal update function invocation
+#define WTE_NO_UPD_FUNC			0x0002
+// Bypass the normal guard function invocation
+#define WTE_NO_GUARD_FUNC		0x0004
+// Do NOT apply changes to normal (current) settings
+#define WTE_NO_CURRENT			0x0008
+// Apply changes to shadow settings.  Note that setting the shadow and not the
+// current still calls the guard and update functions (if enabled), however
+// those functions which access the variable directly will always see the current
+// values.  Also, the 'unchanged' flag applies with respect to the current
+// values.
+#define WTE_SET_SHADOW			0x0010
+// Apply changes to factory default settings.  This would not normally be
+// used, since FDs should be constant for any given firmware release.
+#define WTE_SET_FD				0x0020
+// Ignore any errors encountered when adding transaction items, such as
+// strings which were too long.  The affected variables will not be updated,
+// however the remaining items in the transaction will be applied.
+#define WTE_IGNORE_ADD_ERRORS	0x0040
+/*** EndHeader */
+
+
+_web_debug
+int web_transaction_execute(WebTrans_t __far * wtp, int options)
+{
+	WebCursor_t wc;
+   WebTransEntry_t __far * we;
+   WebTrans_t wt = *wtp;
+   WebMetadata_t __far * meta;
+	int __far * error_id;
+	int __far * bin_len;
+	void __far * newbin;
+   int error;
+   int any_error = 0;
+   int trial;
+   int j, retval, lvl, grdfail;
+   auto _rweb_fcnptr *fplist;
+   auto _rweb_fcnptr fp;
+   _web_updptr upd;
+
+	// Reset that "run once" thing...
+  	memset(_web_update_entry_ary, 0, _web_update_entry_ary_sz);
+
+	// Determine if "trial application"
+  	trial = (options & WTE_NO_CURRENT) &&
+  	        (options & WTE_NO_UPD_FUNC) &&
+  	        !(options & (WTE_SET_SHADOW|WTE_SET_FD));
+
+	for (we = _web_trans_first(wt); we; we = _web_trans_next(wt, we)) {
+
+		_web_grok_wte(we, &error_id, &bin_len, &newbin);
+		web_cursor_set(&wc, we->cname);
+		if (*error_id) {
+			if (*error_id != -1 &&	// -1 (unchanged) is not an error
+			    !(options & WTE_IGNORE_ADD_ERRORS))
+				any_error = 1;
+		}
+		else if (!(options & WTE_APPLY_UNCHANGED) && !_web_compare(&wc, we)) {
+			// No difference, mark as unapplied
+			*error_id = -1;
+	#ifdef RABBITWEB_VERBOSE
+   		web_fqname(&wc, _web_gi.name, sizeof(_web_gi.name));
+			printf("RWEB: Variable %ls is unchanged\n", _web_gi.name);
+	#endif
+		}
+	}
+
+	// Loop again, if no errors,
+	if (!any_error && !(options & WTE_NO_GUARD_FUNC)) {
+		_web_gi.wt = wt;
+	   for (we = _web_trans_first(wt); we; we = _web_trans_next(wt, we)) {
+	      _web_grok_wte(we, &error_id, &bin_len, &newbin);
+	      if (*error_id)
+	         continue;   // Error or unchanged entry
+	      web_cursor_set(&wc, we->cname);
+
+	      // Call guards.
+			// Run guard functions from the innermost levels first.
+			// Drop out when first guard fails.
+			grdfail = 0;
+			for (lvl = wc.level; lvl >= 0; --lvl) if (!wc.arry[lvl]) {
+	         meta = wc.wsmi[lvl]->meta;
+	         if (meta) {
+	            _web_gi.we = we;  // Set globals for guard funcs
+	            _web_gi.wc = &wc;
+	            fplist = meta->guardptr;
+	            if (fplist) {
+	               web_fqname(&wc, _web_gi.name, sizeof(_web_gi.name));
+	               while (*fplist && !grdfail) {
+	                  fp = *fplist++;
+	                  // The following actually calls each guard
+	                  if (!fp(NULL)) {
+	   #ifdef RABBITWEB_VERBOSE
+	                     printf("RWEB: Variable %ls failed the guard\n",
+	                        _web_gi.name);
+	   #endif
+	                     if (!*error_id)
+	                        *error_id = RCIERR_VALUE_RANGE;
+	                     any_error |= 2;
+	                     grdfail = 1;
+	                  }
+	               }
+	            }
+	         }
+	         if (grdfail)
+	         	break;
+	      } // for lvl
+	   }
+	}
+
+	if (!any_error) {
+	   for (we = _web_trans_first(wt); we; we = _web_trans_next(wt, we)) {
+	      _web_grok_wte(we, &error_id, &bin_len, &newbin);
+	      if (*error_id)
+	         continue;   // Error or unchanged entry
+	      web_cursor_set(&wc, we->cname);
+	      // All A-OK.  Now actually commit the new values and call update functions
+	      // if requested.
+	      if (!(options & WTE_NO_CURRENT))
+	      	_web_commit(&wc, we);
+	      if (options & WTE_SET_SHADOW)
+	      	_web_commit_shadow(&wc, we);
+	      if (options & WTE_SET_FD)
+	      	_web_commit_fd(&wc, we);
+	   }
+		if (!(options & WTE_NO_UPD_FUNC)) {
+	      // Reset that "run once" thing (again!)
+	      memset(_web_update_entry_ary, 0, _web_update_entry_ary_sz);
+	      for (we = _web_trans_first(wt); we; we = _web_trans_next(wt, we)) {
+	         _web_grok_wte(we, &error_id, &bin_len, &newbin);
+	         web_cursor_set(&wc, we->cname);
+	         if (*error_id)
+	            continue;   // Error or unchanged entry
+
+	         // Run update functions from the innermost levels first.
+	         for (lvl = wc.level; lvl >= 0; --lvl) if (!wc.arry[lvl]) {
+	            meta = wc.wsmi[lvl]->meta;
+	            if (meta && meta->updateptr)
+	               for (j = 0;;++j)
+	                  if (meta->updateptr[j]) {
+	                     upd = (_web_updptr)meta->updateptr[j];
+	                     upd(0);
+	                  }
+	                  else
+	                     break;
+	         }
+	      }
+	   }
+	}
+
+	return -any_error;
+}
+
+
+/*** BeginHeader web_error */
+int web_error(char __far *error);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+web_error                                   <RWEB_GENERIC.LIB>
+
+SYNTAX:		int web_error(char far *error)
+
+DESCRIPTION:	This function may be invoked from #web variable guard
+					expressions, to generate informative error messages.
+
+					Example:
+
+					int myvar;
+					#web myvar ($myvar < 16 ? 1 : web_error("Too big"))
+
+					This works because the return value of web_error() is
+					always zero, and hence causes the correct result for
+					the guard expression in the case that there is an error.
+
+					An alternative style of usage is:
+
+					#web myvar ($myvar < 16 || web_error("Too big"))
+
+					which takes advantage of C short-cut evaluation to
+					produce the same result as the first form.
+
+					NOTE: this function must only be called from
+					#web guard expressions, since it depends on some
+					global information which is set up during #web
+					transaction processing.
+
+PARAMETER 1:	Pointer to a null-terminated string containing the
+					error message.  When used with iDigi do_command
+					targets, this string appears in the <hint> element
+					of the <error> XML element.  Any error generated by
+					a guard expression (whether or not accompanied by
+					web_error()) causes the entire do_command to be
+					rejected i.e. there will be no update action.
+
+RETURN VALUE:  0
+
+SEE ALSO:	idigi_tick, idigi_register_target, web_error_id
+
+END DESCRIPTION **********************************************************/
+
+// This function is called explicitly by the user from guard expressions.  It
+// is used to associate an error message with a variable so that the message
+// can be displayed within a ZHTML file.  This function always returns 0 so that
+// it can evaluate to FALSE in a guard expression (hence indicating an error).
+// For example, it can be used in a guard like this:
+//   #web temp (($temp < 30) ? web_error("too low"):1)
+// Alternatively, use the following "assertion" style:
+//   #web temp (($temp >= 30) || web_error("too low"))
+
+// Note that this function determines which variable is referred to by the use
+// of global information.
+//
+// error  -- Error message to associate with the variable.
+// Return -- Always returns 0.
+
+/*
+NOTE: web_error deprecated in favor of web_error_id(), because the latter
+conforms with the RCI descriptor specification for error handling.  It is
+also more efficient because a numeric code is used instead of a string.
+
+Also, consider using the min and max metadata in order to handle simple
+range checking - this obviates use of guard expressions in many cases like
+the example above.
+
+web_error is implemented to locate the RCI error ID by performing a case-
+insensitive string match against the registered error message groups which
+are in scope for the current variable.  If no match is found, then the
+error ID is set to RCIERR_CUST_STRING, and the error message text is
+appended to the transaction (intended to be used as a "hint" element if this
+is actually an RCI transaction).
+*/
+
+_web_debug
+int web_error(char __far *error)
+{
+	int __far * error_id;
+	int __far * bin_len;
+	void __far * newbin;
+	int elen;
+	char __far * e;
+	char __far * grp_name;
+	char __far * __far * error_msg;
+	char __far * __far * orig_str;
+	int __far * orig_len;
+
+	_web_assert(error != NULL);
+
+	if (_web_gi.we) {
+		// Add error to current transaction entry.
+	   _web_grok_wte_all(_web_gi.we, &error_id, &bin_len, &newbin,
+	   						&error_msg, &orig_str, &orig_len);
+	   // Try to look up a registered error by case insensitive string match
+	   *error_id = web_error_match(_web_gi.wc, error, &grp_name);
+		if (*error_id > 0)
+			return 0;	// Match recognized, we're done.
+
+	   elen = strlen(error) + 1;
+	   e = _web_malloc(elen);
+	   if (!e)
+	   	// Cannot allocate custom message, so turn into this standard type.
+	   	// There will be no hint, but this is the best we can do.
+	   	*error_id = RCIERR_CUST_STRING;
+	   else {
+	   	_f_strcpy(e, error);
+	   	*error_msg = e;
+	   }
+	}
+
+	// Return a FALSE value
+	return 0;
+}
+
+/*** BeginHeader web_error_id */
+int web_error_id(int id, char __far *hint);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+web_error_id                                   <RWEB_GENERIC.LIB>
+
+SYNTAX:		int web_error_id(int id, char far *hint)
+
+DESCRIPTION:	This function may be invoked from #web variable guard
+					expressions, to generate informative error messages.
+
+					See web_error() for examples.  Use of this function
+					is analogous.
+
+					This function uses an error ID number.  If the number
+					matches a "standard" error code, then the corresponding
+					standard message string is used.  Otherwise, the error
+					ID is set to "custom" and the given "hint" is used
+					as the error text.
+
+					NOTE: this function must only be called from
+					#web guard expressions, since it depends on some
+					global information which is set up during #web
+					transaction processing.
+
+PARAMETER 1:	Standard error ID.  If not known, then use
+					web_error() instead of this function.
+PARAMETER 2:	Pointer to a null-terminated string containing the
+					error message.  May be NULL if id is known to be a
+					standard error ID.
+
+RETURN VALUE:  0
+
+SEE ALSO:	idigi_tick, idigi_register_target, web_error
+
+END DESCRIPTION **********************************************************/
+
+_web_debug
+int web_error_id(int id, char __far *hint)
+{
+	int __far * error_id;
+	int __far * bin_len;
+	void __far * newbin;
+	int elen;
+	char __far * e;
+	char __far * grp_name;
+	char __far * std;
+	char __far * __far * error_msg;
+	char __far * __far * orig_str;
+	int __far * orig_len;
+
+	if (_web_gi.we) {
+
+		// Add error to current transaction entry.
+	   _web_grok_wte_all(_web_gi.we, &error_id, &bin_len, &newbin,
+	   					&error_msg, &orig_str, &orig_len);
+		// Get standard error string (if any)
+		std = web_error_string(_web_gi.wc, id, &grp_name);
+	   *error_id = id;
+	   *error_msg = std;
+	   if (hint && !std) {
+	   	// Turned out to be custom message (id not found), thus
+	   	// we use the hint as the error message text.
+	   	*error_id = -2;	// Indicate non-standard error string
+	   	elen = strlen(hint) + 1;
+	   	e = _web_malloc(elen);
+	      if (e) {
+	         _f_strcpy(e, hint);
+	         *error_msg = e;
+	      }
+	      else
+	      	*error_id = RCIERR_CUST_STRING;
+	   }
+	}
+
+	// Return a FALSE value
+	return 0;
+}
+
+
+/*** BeginHeader web_transaction_message_by_name */
+char __far * web_transaction_message_by_name(WebTrans_t __far * wtp,
+		char __far * name, int __far * error_id, char __far * __far * grp_name,
+		int case_insens);
+/*** EndHeader */
+
+_web_debug
+char __far * web_transaction_message_by_name(WebTrans_t __far * wtp,
+		char __far * name, int __far * error_id, char __far * __far * grp_name,
+		int case_insens)
+{
+	// Look up error message for the given variable name, or may return NULL.
+	WebCursor_t wc;
+	int rc;
+
+	if (error_id)
+		*error_id = 0;
+	rc = web_getvarinfo(name, &wc, NULL, case_insens);
+	if (rc < 0)
+		// Not a registered #web variable.
+		return NULL;
+
+	return web_transaction_message(wtp, &wc, error_id, grp_name);
+}
+
+
+/*** BeginHeader web_transaction_message */
+char __far * web_transaction_message(WebTrans_t __far * wtp,
+		WebCursor_t __far * wc, int __far * error_id_ret, char __far * __far * grp_name);
+/*** EndHeader */
+
+_web_debug
+char __far * web_transaction_message(WebTrans_t __far * wtp,
+		WebCursor_t __far * wc, int __far * error_id_ret, char __far * __far * grp_name)
+{
+   WebTransEntry_t c;
+   WebTransEntry_t __far * we;
+	int rc;
+	int __far * error_id;
+	int __far * bin_len;
+	void __far * newbin;
+	char __far * __far * error_msg;
+	char __far * __far * orig_str;
+	int __far * orig_len;
+
+	if (error_id_ret)
+		*error_id_ret = 0;
+	rc = web_cname(wc, c.cname);
+	we = _web_transaction_find_cname(*wtp, c.cname);
+	if (!we)
+		return NULL;
+	_web_grok_wte_all(we, &error_id, &bin_len, &newbin,
+							&error_msg, &orig_str, &orig_len);
+	if (error_id_ret)
+		*error_id_ret = *error_id;
+	if (!*error_id || *error_id == -1)
+		return NULL;
+	if (*error_id == -2) {
+	   if (grp_name)
+	      *grp_name = NULL;
+		return *error_msg;	// Custom
+	}
+	return web_error_string(wc, *error_id, grp_name);
+}
+
+
+/*** BeginHeader web_error_string */
+char __far * web_error_string(WebCursor_t __far * wc,
+					int error_id, char __far * __far * grp_name);
+/*** EndHeader */
+
+_web_debug
+char __far * web_error_string(WebCursor_t __far * wc,
+					int error_id, char __far * __far * grp_name)
+{
+	/*
+	   Return error string.  The translation from number depends on context,
+	   since each branch of the variable tree can reuse numbers in sibling
+	   branches.  Errors are automatically numbered based on the metadata.
+	*/
+	int lvl;
+	WebStructMemInfo_t __far * wsmi;
+	WebErrorList_t __far * errs;
+
+	if (grp_name)
+		*grp_name = NULL;
+	lvl = wc->level;
+	while (lvl >= 0) {
+		wsmi = wc->wsmi[lvl];
+		if (wsmi->meta && (errs = wsmi->meta->errs)) {
+			if (error_id >= errs->id && error_id < errs->id + errs->n_msgs) {
+				if (grp_name)
+					*grp_name = errs->group_name;
+				return errs->msgs[error_id - errs->id];
+			}
+		}
+		--lvl;
+	}
+	// Finally, look in global messages
+   if ((errs = _web_base_errors) &&
+   		error_id >= errs->id && error_id < errs->id + errs->n_msgs) {
+      if (grp_name)
+         *grp_name = errs->group_name;
+      return errs->msgs[error_id - errs->id];
+   }
+
+	return NULL;
+}
+
+
+/*** BeginHeader web_error_match */
+int web_error_match(WebCursor_t __far * wc,
+					char __far * str, char __far * __far * grp_name);
+/*** EndHeader */
+
+_web_debug
+int web_error_match(WebCursor_t __far * wc,
+					char __far * str, char __far * __far * grp_name)
+{
+	/*
+	   Look up a matching string, by case-insensitive string compare.
+	*/
+	int lvl;
+	WebStructMemInfo_t __far * wsmi;
+	WebErrorList_t __far * errs;
+	int e;
+
+	if (grp_name)
+		*grp_name = NULL;
+	lvl = wc->level;
+	while (lvl >= 0) {
+		wsmi = wc->wsmi[lvl];
+		if (wsmi->meta && (errs = wsmi->meta->errs)) {
+			for (e = 0; e < errs->n_msgs; ++e)
+				if (!strcmpi(str, errs->msgs[e])) {
+					if (grp_name)
+						*grp_name = errs->group_name;
+					return errs->id + e;
+				}
+		}
+		--lvl;
+	}
+	// Finally, look in global messages
+   if ((errs = _web_base_errors)) {
+      for (e = 0; e < errs->n_msgs; ++e)
+         if (!strcmpi(str, errs->msgs[e])) {
+            if (grp_name)
+               *grp_name = errs->group_name;
+            return errs->id + e;
+         }
+   }
+
+	return -2;
+}
+
+
+/*****************************************************************************
+******************************************************************************
+
+Variable Enumeration
+
+These routines allow introspection of all registered #web variables, with
+optional filtering.  A callback function is invoked for each variable which
+passes the filtering.  Alternatively, an iterator can be used.
+
+NOTE: only variables which are defined as #web variables at their root level
+are considered.  #web variables with any '.' characters are not enumerable.
+For example
+  #web foo
+  #web foo_array[@]
+permits foo and foo_array and all their sub-structure to be enumerated, whereas
+  #web bar.baz
+does not allow bar to be enumerated unless there is a separate registration
+of just 'bar'.
+
+The filter may restrict variables to particular types, access (groups and/or
+read/write permissions), or attributes.
+
+Enumerator style: invokes the specified callback for each matching variable.
+This is basically a wrapper around the following iterator style.
+
+Iterator style: returns an iterator object, which the application may then
+use in its own processing loop.  The following idiom is suggested:
+
+	WebIterator_t  wi_inst, far * wi;
+
+	for (wi = web_iter_start(&wi_inst, ...);
+	     web_iter_get(wi);	// returns 0 when done
+	     web_iter_next(wi)) {
+		if (web_type(wi) == TFLOAT)
+			...
+	}
+
+
+web_iter_get() and the enumerator callback function both make use of
+a WebInstInfo_t struct.  The members of this struct should not be used
+directly by the application.  Instead, the following API functions allow
+most of the useful information to be accessed.
+
+	web_name(): return string name of variable (case-correct).  This is
+		last part of name for structure members e.g. if foo.bar.baz[9] is the
+		fully qualified name, then this returns just baz.
+	web_fqname(): return fully qualified string name of variable (or part
+	   of struct hierarchy).  Includes filled-in array indices.
+
+	web_type(): returns an enum type which indicates the basic type of
+	   the variable (int16, unsigned int32, float, string etc.)
+
+	web_dims(): return integer array, the values of which (if not zero)
+	  indicate the dimension of each axis of the variable array.  For
+	  example, for
+	  		float xxarray[3][4]
+	  		#web xxarray[@][@]
+	  the returned array will contain 3,4,0,0...
+	web_ndims(): return dimensionality.  Will be 0 for simple values,
+	  otherwise is the number of non-zero values in web_dims().
+
+	web_str(): returns string representation.  This always works.  If a
+	  bin2str() conversion function is specified, then it will be called.
+
+Filtering
+
+	The following options are available for restricting the objects returned
+	by iteration/enumeration:
+
+		group: only objects accessible by the specified group bitmask
+		auth: only objects with the specified authentication method bitmask
+		perm: only objects with (or without) read-write access to the given
+		      group(s).
+		varlist: list of strings (terminated with NULL pointer) which are
+		      root-level variable names to enumerate.  If no list, then
+		      defaults to all root-level variables.
+
+******************************************************************************
+*****************************************************************************/
+
+/*** BeginHeader _web_count_dims */
+int _web_count_dims(WebStructMemInfo_t __far * mi);
+/*** EndHeader */
+_web_debug
+int _web_count_dims(WebStructMemInfo_t __far * mi)
+{
+	int n = 0;
+	int __far * dims = mi->dims;
+	if (!dims)
+		return 0;
+	while (*dims++) ++n;
+	if (n && mi->type.simple == TSTRING)
+		--n;	// Don't count last dimension of string, since it's the string
+				// length -- we don't treat strings as 8-bit char arrays.
+	return n;
+}
+
+/*** BeginHeader web_iter_start, web_iter_get, web_iter_next */
+WebIterator_t __far * web_iter_start(WebIterator_t __far * wi,
+			WebIteratorFilter_t __far * wif);
+int web_iter_get(WebIterator_t __far * wi);
+WebIterator_t __far * web_iter_next(WebIterator_t __far * wi);
+/*** EndHeader */
+
+
+_web_debug
+WebIterator_t __far * web_iter_start(WebIterator_t __far * wi,
+			WebIteratorFilter_t __far * wif)
+{
+	if (!wi)
+		return NULL;
+	web_cursor_start(wi);
+	wi->wif = wif;
+	return web_iter_next(wi);	// Ready for 1st item (if any)
+}
+
+_web_debug
+int web_iter_get(WebIterator_t __far * wi)
+{
+	return wi && wi->phase < 2;
+}
+
+void _web_default_wif_callback(WebIterator_t __far * wi, int event,
+										const char __far * name, int dim)
+{
+}
+
+_web_debug
+WebIterator_t __far * web_iter_next(WebIterator_t __far * wi)
+{
+	char name[_WEB_MAX_FQNLEN];
+	WIFCallback_t cb;
+	_Web_Var_Info __far *vi;
+	WebStructMemList_t __far *wsml;
+	WebStructMemInfo_t __far *meminfo;
+	char __far * __far * vname;
+	int i, nd, k, tween;
+
+	if (!wi || wi->phase > 1)
+		return NULL;
+
+	if (wi->wif && wi->wif->callback)
+		cb = wi->wif->callback;
+	else
+		cb = _web_default_wif_callback;
+
+	tween = 1;
+	for (;;) {
+		// Locate next varinfo.  scanning for non-dotted structs and contained members.
+		if (wi->level <= 0) {
+	      if (wi->level < 0) {
+	         if (web_cursor_down(wi, NULL, 0)) {
+	            wi->phase = 2;
+	            return NULL;
+	         }
+	      }
+	      else {
+	         // At outermost level, assume process NEXT root-level variable
+	         if (web_cursor_next(wi)) {
+	            wi->phase = 2;
+	            return NULL;
+	         }
+	         if (tween)
+	         	cb(wi, WIFE_TWEEN_STRUCT, NULL, 0);
+         }
+
+			// Apply root variable name filter
+			tween = 1;
+         if (wi->wif->varlist) {
+            // Skip root names not in the list
+            i = web_name(wi, name, sizeof(name));
+            if (i < 0)
+               continue;
+            for (vname = wi->wif->varlist; *vname; ++vname)
+               if (!strcmp(*vname, name))
+                  break;
+            if (!*vname) {
+            	tween = 0;
+               continue;
+            }
+         }
+		}
+		else {
+	      // Going thru struct members
+
+	      // Next array iteration?
+	      nd = wi->level;
+	      while (wi->arry[wi->level]) {
+	         // Yes, in at least one array level
+	         // Always bump the pointer by its size at this level
+	         wi->val[wi->level] = (char RWEB_FQ *)wi->val[wi->level] + wi->len[wi->level];
+	         if (++wi->idx[wi->level] < wi->arry[wi->level]) {
+	            // Can successfully increment index at this level
+	            cb(wi, WIFE_TWEEN_ARRAY, NULL, 0);
+	            while (wi->level < nd) {
+	               // Coming back up to highest level
+	               cb(wi, WIFE_ENTER_ARRAY, NULL, wi->arry[wi->level]);
+	               ++wi->level;
+	            }
+	            meminfo = wi->wsmi[wi->level];
+	            goto _arrys;
+	         }
+	         // Ran out of indices at this level
+	         wi->idx[wi->level] = 0;   // Reset index
+	         --wi->level;
+	         cb(wi, WIFE_EXIT_ARRAY, NULL, 0);
+	      }
+
+	      // NEXT member
+	      if (!wi->level)
+	         continue;
+
+	      if (web_cursor_next(wi)) {
+	         // End of members on this level, go back out
+	         web_cursor_up(wi);
+	         cb(wi, WIFE_EXIT_STRUCT, NULL, 0);
+	         // Reset previous level to start, in case come back in for next
+	         // array element.
+	         wi->wsmi[wi->level+1] = wi->wsmi[wi->level]->type.ptr->ptr;
+	         wi->idx[wi->level+1] = 0;
+
+	         // Go do NEXT member at this (previous, outer) level
+	         continue;
+	      }
+	      else
+	         cb(wi, WIFE_TWEEN_STRUCT, NULL, 0);
+     	}
+
+		for (;;) {
+	      // Set up member info
+	      meminfo = wi->wsmi[wi->level];
+	      cb(wi, WIFE_MEMBER, meminfo->name, 0);
+
+			while (wi->level < wi->alevel) {
+				++wi->level;
+	         cb(wi, WIFE_ENTER_ARRAY, NULL, wi->arry[wi->level]);
+	      }
+
+	   _arrys:
+	      if (meminfo->type.simple >= _DK_TSTRUCT) {
+	         // Enter sub-structure
+	         cb(wi, WIFE_ENTER_STRUCT, meminfo->name, 0);
+	         // This can't fail, since must be at least one member in a struct
+	         web_cursor_down(wi, NULL, 0);
+	         // Go do FIRST member at this (inner) level and loop until leaf
+	         // object is found.
+	         continue;
+	      }
+	      break;
+      }
+
+      break;
+	}
+	return wi;
+}
+
+
+
+
+/*
+	web_name(): return string name of variable (case-correct).  This is
+		last part of name for structure members e.g. if foo.bar.baz is the
+		fully qualified name, then this returns just baz.  Trailing wildcards
+		("[@]") are deleted.
+*/
+/*** BeginHeader web_name */
+int web_name(WebIterator_t __far * wi, char __far * buf, int buflen);
+/*** EndHeader */
+
+_web_debug
+int web_name(WebIterator_t __far * wi, char __far * buf, int buflen)
+{
+	int lvl = wi->level;
+	char __far * name;
+	int len;
+
+	if (!wi || wi->phase > 1 || wi->level < 0)
+		return -EINVAL;
+	name = wi->wsmi[lvl]->name;
+	len = strlen(name);
+	if (len >= buflen)
+		return -E2BIG;
+	_f_strcpy(buf, name);
+	buf += len;
+   while (len >= 3 && !memcmp(buf-3, "[@]", 3)) {
+      buf -= 3;
+      len -= 3;
+      *buf = 0;
+   }
+	return len;
+}
+
+/*
+	web_fqname(): return fully qualified string name of variable (or part
+	   of struct hierarchy).
+*/
+/*** BeginHeader web_fqname */
+int web_fqname(WebIterator_t __far * wi, char __far * buf, int buflen);
+/*** EndHeader */
+_web_debug
+int web_fqname(WebIterator_t __far * wi, char __far * buf, int buflen)
+{
+	char ibuf[9];
+	int lvl, type, maxlvl;
+	char __far * name;
+	int len, xtra, tlen = 0;
+	WebStructMemInfo_t __far * wsmi;
+
+	if (!wi || wi->phase > 1 || wi->level < 0)
+		return -EINVAL;
+	maxlvl = wi->level;
+	for (lvl = 0; lvl <= maxlvl; ++lvl) {
+     	wsmi = wi->wsmi[lvl];
+      name = wsmi->name;
+      type = wsmi->type.simple;
+
+		if (!wi->arry[lvl]) {
+	      len = strlen(name);
+	      xtra = lvl > 0;
+	      if (len+xtra >= buflen)
+	         return -E2BIG;
+	      if (xtra) {
+	         *buf = '.';
+	         _f_strcpy(buf+1, name);
+	         ++len;
+	      }
+	      else
+	         _f_strcpy(buf, name);
+	      buf += len;
+	      buflen -= len;
+	      tlen += len;
+	      // Delete wildcard markers in name
+	      while (!memcmp(buf-3, "[@]", 3)) {
+	         buf -= 3;
+	         buflen += 3;
+	         tlen -= 3;
+	         *buf = 0;
+	      }
+		}
+		// Add proper dimensions
+		else {
+         sprintf(ibuf, "[%d]", wi->idx[lvl]);
+         xtra = strlen(ibuf);
+         if (xtra+1 > buflen)
+            return -E2BIG;
+         _f_strcpy(buf, ibuf);
+         buf += xtra;
+         buflen -= xtra;
+         tlen += xtra;
+		}
+	}
+	return tlen;
+}
+
+/*
+	web_type(): returns an enum type which indicates the basic type of
+	   the variable (int16, unsigned int32, float, string etc.).  If at
+	   an array level, this returns the type of each element (even for
+	   multi-dimensional arrays).  Use web_leaf() to check if this is
+	   a data item level.
+*/
+/*** BeginHeader web_type */
+int web_type(WebIterator_t __far * wi);
+/*** EndHeader */
+_web_debug
+int web_type(WebIterator_t __far * wi)
+{
+	int type;
+
+	if (!wi || wi->phase > 1 || wi->level < 0)
+		return -EINVAL;
+	type = wi->wsmi[wi->level]->type.simple;
+	return type;
+}
+
+
+/*
+	web_leaf(): returns non-zero if this is a leaf node i.e. the cursor points
+	to a value which can be updated in a transaction etc.
+*/
+/*** BeginHeader web_leaf */
+int web_leaf(WebIterator_t __far * wi);
+/*** EndHeader */
+_web_debug
+int web_leaf(WebIterator_t __far * wi)
+{
+	int type;
+
+	if (!wi || wi->phase > 1 || wi->level < 0)
+		return -EINVAL;
+	type = wi->wsmi[wi->level]->type.simple;
+	if (type >= _DK_TSTRUCT)
+		return 0;	// Structs are not assignable
+	return wi->level >= wi->alevel;
+}
+
+
+/*
+
+	web_loc(): returns a void pointer to the variable instance data
+*/
+/*** BeginHeader web_loc */
+void RWEB_FQ * web_loc(WebIterator_t __far * wi);
+/*** EndHeader */
+_web_debug
+void RWEB_FQ * web_loc(WebIterator_t __far * wi)
+{
+	if (!wi || wi->phase > 1 || wi->level < 0)
+		return NULL;
+	return wi->val[wi->level];
+}
+
+/*
+
+	web_default(): returns a void pointer to the defined "factory default"
+	value.  If no default is defined, a null pointer is returned.  Otherwise,
+	a pointer to the default value is returned.  The size of the default value
+	is the same as the variable size (i.e. web_size()).
+*/
+/*** BeginHeader web_default */
+void __far * web_default(WebIterator_t __far * wi);
+/*** EndHeader */
+_web_debug
+void __far * web_default(WebIterator_t __far * wi)
+{
+	int lvl;
+	WebMetadata_t __far * meta;
+	if (!wi || wi->phase > 1 || wi->level < 0)
+		return NULL;
+	for (lvl = wi->level; lvl >= 0; --lvl) {
+		meta = wi->wsmi[lvl]->meta;
+		if (meta && meta->factory_dflt)
+			return (char __far *)meta->factory_dflt +
+					((char __far *)wi->val[wi->level] - (char __far *)wi->val[lvl]);
+	}
+	return NULL;
+}
+
+
+/*
+
+	web_shadow(): returns a void pointer to the defined "shadow"
+	value.  If no shadow is defined, a null pointer is returned.  Otherwise,
+	a pointer to the shadow is returned.  The size of the shadow
+	is the same as the variable size (i.e. web_size()).
+*/
+/*** BeginHeader web_shadow */
+void __far * web_shadow(WebIterator_t __far * wi);
+/*** EndHeader */
+_web_debug
+void __far * web_shadow(WebIterator_t __far * wi)
+{
+	int lvl;
+	WebMetadata_t __far * meta;
+	if (!wi || wi->phase > 1 || wi->level < 0)
+		return NULL;
+	for (lvl = wi->level; lvl >= 0; --lvl) {
+		meta = wi->wsmi[lvl]->meta;
+		if (meta && meta->shadow)
+			return (char __far *)meta->shadow +
+					((char __far *)wi->val[wi->level] - (char __far *)wi->val[lvl]);
+	}
+	return NULL;
+}
+
+
+/*
+
+	web_fd(): returns a void pointer to the defined "factory default"
+	value.  If no FD is defined, a null pointer is returned.  Otherwise,
+	a pointer to the FD is returned.  The size of the FD
+	is the same as the variable size (i.e. web_size()).
+*/
+/*** BeginHeader web_fd */
+void __far * web_fd(WebIterator_t __far * wi);
+/*** EndHeader */
+_web_debug
+void __far * web_fd(WebIterator_t __far * wi)
+{
+	int lvl;
+	WebMetadata_t __far * meta;
+	if (!wi || wi->phase > 1 || wi->level < 0)
+		return NULL;
+	for (lvl = wi->level; lvl >= 0; --lvl) {
+		meta = wi->wsmi[lvl]->meta;
+		if (meta && meta->fd)
+			return (char __far *)meta->fd +
+					((char __far *)wi->val[wi->level] - (char __far *)wi->val[lvl]);
+	}
+	return NULL;
+}
+
+
+/*
+	Return true iff authentication method is acceptable for this variable.
+	Defaults to true.  This follows inheritance rule.
+
+*/
+/*** BeginHeader web_auth_ok */
+int web_auth_ok(WebIterator_t __far * wi, word auth);
+/*** EndHeader */
+_web_debug
+int web_auth_ok(WebIterator_t __far * wi, word auth)
+{
+	int lvl;
+	WebMetadata_t __far * meta;
+	if (!wi || wi->phase > 1 || wi->level < 0)
+		return 0;
+	for (lvl = wi->level; lvl >= 0; --lvl) {
+		meta = wi->wsmi[lvl]->meta;
+		if (meta && meta->auth) {
+			// Have auth requirement specified for this level
+			if (meta->auth & SERVER_AUTH_PK) {
+				if (!(auth & SERVER_AUTH_PK))
+					return 0;
+			}
+			if (meta->auth & SERVER_AUTH_DIGEST) {
+				// Basic authentication, protected by crypto, is considered
+				// as good as digest auth.
+				if (auth & SERVER_AUTH_PK && auth & SERVER_AUTH_BASIC)
+					return 1;
+				if (auth & SERVER_AUTH_DIGEST)
+					return 1;
+			}
+			if (meta->auth & SERVER_AUTH_BASIC) {
+				// Digest is acceptable substitute for basic.
+				if (auth & (SERVER_AUTH_BASIC|SERVER_AUTH_DIGEST))
+					return 1;
+			}
+			return 0;
+		}
+	}
+	return 1;
+}
+
+
+/*
+	Return true iff readable by the any of the given group(s).
+	Defaults to true.  This follows inheritance rule.
+
+	If group is 0, then test for anonymous access (i.e. rperm==0 && wperm==0)
+*/
+/*** BeginHeader web_readable */
+int web_readable(WebIterator_t __far * wi, word group);
+/*** EndHeader */
+_web_debug
+int web_readable(WebIterator_t __far * wi, word group)
+{
+	int lvl;
+	WebMetadata_t __far * meta;
+	if (!wi || wi->phase > 1 || wi->level < 0)
+		return 0;
+	for (lvl = wi->level; lvl >= 0; --lvl) {
+		meta = wi->wsmi[lvl]->meta;
+		if (meta && (!group || meta->groups & group)) {
+			// Have permissions specified for this group
+			if (group)
+				return (meta->rperm & group) != 0;
+			else
+				return meta->rperm == 0xFFFFu;
+		}
+	}
+	return 1;
+}
+
+
+/*
+	Return true iff writable by the any of the given group(s).
+	Defaults to true.  This follows inheritance rule.
+
+	If group is 0, then test for anonymous access (i.e. wperm==0 && rperm==0)
+*/
+/*** BeginHeader web_writable */
+int web_writable(WebIterator_t __far * wi, word group);
+/*** EndHeader */
+_web_debug
+int web_writable(WebIterator_t __far * wi, word group)
+{
+	int lvl;
+	WebMetadata_t __far * meta;
+	if (!wi || wi->phase > 1 || wi->level < 0)
+		return 0;
+	for (lvl = wi->level; lvl >= 0; --lvl) {
+		meta = wi->wsmi[lvl]->meta;
+		if (meta && (!group || meta->groups & group)) {
+			// Have permissions specified for this group
+			if (group)
+				return (meta->wperm & group) != 0;
+			else
+				return meta->wperm == 0xFFFFu;
+		}
+	}
+	return 1;
+}
+
+
+/*
+	Return true if access attributes for the given group(s) are
+	inherited from a higher level in the hierarchy.  This is mainly used
+	when generating descriptors, since we don't want to put access="ro"
+	in the descriptor when it is implied by inheritance rules.
+*/
+/*** BeginHeader web_access_inherited */
+int web_access_inherited(WebIterator_t __far * wi, word group);
+/*** EndHeader */
+_web_debug
+int web_access_inherited(WebIterator_t __far * wi, word group)
+{
+	WebMetadata_t __far * meta;
+	if (!wi || wi->phase > 1 || wi->level < 0)
+		return 0;
+	meta = wi->wsmi[wi->level]->meta;
+	return !meta || !(meta->groups & group);
+}
+
+
+/*
+	Return true iff passes conditional test.
+	Defaults to true.
+	Condition test parameter must be specified on the variable, however
+	the test function is obtained using inheritance.
+*/
+/*** BeginHeader web_test */
+int web_test(WebIterator_t __far * wi);
+/*** EndHeader */
+_web_debug
+int web_test(WebIterator_t __far * wi)
+{
+	WebIterator_t wii;
+	int lvl;
+	char __far * c;
+	WebMetadata_t __far * meta;
+	if (!wi || wi->phase > 1 || wi->level < 0)
+		return 0;
+	meta = wi->wsmi[wi->level]->meta;
+	if (!meta || !meta->c[0])
+		return 1;
+	c = meta->c;
+	for (lvl = wi->level; lvl >= 0; --lvl) {
+		meta = wi->wsmi[lvl]->meta;
+		if (meta && meta->cond && meta->cond->cond) {
+			// Have condition specified.  Copy cursor position
+			_f_memcpy(&wii, wi, sizeof(wii));
+			return meta->cond->cond(&wii, c);
+		}
+	}
+	return 1;
+}
+
+
+/*** BeginHeader web_key */
+char __far * web_key(WebIterator_t __far * wi);
+/*** EndHeader */
+_web_debug
+char __far * web_key(WebIterator_t __far * wi)
+{
+	WebMetadata_t __far * meta;
+	if (!wi || wi->phase > 1 || wi->level < 0)
+		return NULL;
+	meta = wi->wsmi[wi->level]->meta;
+	return meta && meta->key ? meta->key->name : NULL;
+}
+
+
+/*** BeginHeader web_key_value */
+// Set val cursor to point to the key value for the input cursor.
+// Returns NULL if no key, else returns the key field name (like web_key()).
+// If k is NULL, then the key field name is found using web_key(), otherwise
+// k is used as the key field name.
+const char __far * web_key_value(WebIterator_t __far * wi, WebIterator_t __far * val, const char __far * k);
+/*** EndHeader */
+_web_debug
+const char __far * web_key_value(WebIterator_t __far * wi, WebIterator_t __far * val, const char __far * k)
+{
+	const char __far * key = k ? k : web_key(wi);
+	int rc;
+
+	if (!key)
+		return NULL;
+	_f_memcpy(val, wi, sizeof(*val));
+   do {
+      rc = web_cursor_down(val, NULL, 0);
+      if (!rc && !web_cursor_find(val, key, 0)) {
+         return key;
+      }
+   } while (!rc);
+	return NULL;	// Shouldn't happen, since web_init checks that it exists.
+}
+
+
+/*
+
+	web_size(): returns size of variable instance data (size of one element
+	  if an array).
+*/
+/*** BeginHeader web_size */
+int web_size(WebIterator_t __far * wi);
+/*** EndHeader */
+_web_debug
+int web_size(WebIterator_t __far * wi)
+{
+	if (!wi || wi->phase > 1 || wi->level < 0)
+		return 0;
+	return wi->len[wi->level];
+}
+
+
+
+
+/*** BeginHeader web_dimension */
+int web_dimension(WebCursor_t __far * wc);
+/*** EndHeader */
+/*
+Return the number of elements at this array level, or 0 if not
+an array level.
+*/
+_web_debug
+int web_dimension(WebCursor_t __far * wc)
+{
+	int lvl = wc->level;
+	if (lvl < 0)
+		return 0;
+	return wc->arry[lvl];
+}
+
+
+
+/*** BeginHeader web_next_dimension */
+int web_next_dimension(WebCursor_t __far * wc);
+/*** EndHeader */
+/*
+Return the number of elements of the next level, or 0 if next level is not
+an array level.
+*/
+_web_debug
+int web_next_dimension(WebCursor_t __far * wc)
+{
+	int lvl = wc->level;
+	if (lvl >= wc->alevel)
+		return 0;
+	return wc->arry[lvl+1];
+}
+
+
+
+/*** BeginHeader web_index */
+int web_index(WebCursor_t __far * wc);
+/*** EndHeader */
+/*
+Return the current level index i.e. the field number (or array element number)
+with respect to the parent level.  0 if at root level.
+*/
+_web_debug
+int web_index(WebCursor_t __far * wc)
+{
+	int lvl = wc->level;
+	if (lvl < 0)
+		return 0;
+	return wc->idx[lvl];
+}
+
+
+
+/*** BeginHeader web_metadata */
+WebMetadata_t __far * web_metadata(WebCursor_t __far * wc);
+/*** EndHeader */
+/*
+Return the current metadata (if available), or NULL.
+*/
+_web_debug
+WebMetadata_t __far * web_metadata(WebCursor_t __far * wc)
+{
+	int lvl = wc->level;
+	if (lvl < 0)
+		return NULL;
+	return wc->wsmi[lvl]->meta;
+}
+
+
+
+/*** BeginHeader web_extrep */
+WebExtrep_t __far * web_extrep(WebCursor_t __far * wc, word options);
+#define _WXO_STANDARD 0x0001	// Use basic formatting (no special conversions)
+#define _WXO_NUMERIC  0x0002	// Use numbers instead of enum strings
+#define _WXO_SECURED  0x0004	// Channel is secured.  Don't obfuscate passwords
+/*** EndHeader */
+/*
+Return the current metadata (if available), or NULL.
+*/
+_web_debug
+WebExtrep_t __far * web_extrep(WebCursor_t __far * wc, word options)
+{
+	WebExtrep_t __far * wx = NULL;
+	WebMetadata_t __far * meta;
+	int t;
+
+	int lvl = wc->level;
+	if (lvl < 0)
+		return NULL;
+	meta = wc->wsmi[lvl]->meta;
+	if (!(options & _WXO_STANDARD) && meta && meta->extrep) {
+		wx = meta->extrep;
+		if (options & _WXO_SECURED && !strcmp(wx->name, "password"))
+			wx = _web_std_extreps[TSTRING];
+	}
+	// Otherwise, return default based on simple type
+	else if (web_leaf(wc)) {
+		t = web_type(wc);
+		// If standard==2, then do not want to translate enumerated vars to
+		// string.  Want to keep them as integers.
+		if (!(options & _WXO_NUMERIC) && meta && meta->select.ptr16)
+			return _web_std_extreps[6];
+		return _web_std_extreps[t];
+	}
+	return wx;
+}
+
+
+
+/*** BeginHeader web_info */
+int web_info(WebCursor_t __far * wc, WebInstInfo_t __far * info);
+/*** EndHeader */
+/*
+Fill in an info struct for the current position.
+*/
+_web_debug
+int web_info(WebCursor_t __far * wc, WebInstInfo_t __far * info)
+{
+	info->valptr = web_loc(wc);
+	if (!info->valptr)
+		return -EINVAL;
+	info->type.simple = web_type(wc);
+	info->dims = wc->wsmi[wc->level]->dims;
+	info->meta = web_metadata(wc);
+	return 0;
+}
+
+
+/*** BeginHeader web_cname */
+int web_cname(WebCursor_t __far * wc, char __far * cname);
+/*** EndHeader */
+_web_debug
+int web_cname(WebCursor_t __far * wc, char __far * cname)
+{
+	int lvl = wc->level;
+	int i;
+	char __far * c;
+
+	if (lvl < 0) {
+		*cname = 1;
+		return -EINVAL;
+	}
+	c = cname+1;
+	for (i = 0; i <= lvl; ++i) {
+		if ((word)wc->idx[i] < 255u)
+			*c++ = wc->idx[i];
+		else {
+			*c++ = 255;
+			*(int __far *)c = wc->idx[i];
+			c += 2;
+		}
+	}
+	*cname = (int)(c - cname);
+	return 0;
+}
+
+
+/*****************************************************************************
+******************************************************************************
+
+External (string) representations.
+
+These functions convert #web variables to strings.
+
+******************************************************************************
+*****************************************************************************/
+
+
+/*** BeginHeader _web_format, web_format */
+/*
+	Fundamental routine for converting from binary to string representation.
+	Handles actual conversion, plus any "escapes" required for safe use with
+	various protocols.  Currently, XML and JSON are supported.  The latter
+	also has a special "internal" mode which is more efficient but does not
+	conform to the official standard.
+
+	Operates in two stages.  First, the binary value is converted to string.
+	If this string would not fit in the buffer, this routine terminates early and
+	returns the required buffer size for the unescaped string, with a worst-case
+	bloat factor added to account for any possible escapes. Second, if the
+	initial string fits, then the amount of escape bloat is calculated.  If
+	this does not fit, the routine terminates early, otherwise it performs
+	the escaping and returns 0.
+
+	Since some conversions do not produce any characters requiring escaping,
+	some of the above steps are not required.
+*/
+int web_format(WebCursor_t __far * wc,
+			char __far *dest, int destlen, char __far *spec, void __far * bin);
+int _web_format(WebCursor_t __far * wc,
+			char __far *dest, int destlen, char __far *spec);
+/*** EndHeader */
+
+_web_debug
+int web_format(WebCursor_t __far * wc,
+			char __far *dest, int destlen, char __far *spec, void __far * bin)
+{
+	WebExtrep_t __far * wx;
+	int len;
+	int json = 0;
+	int xml = 0;
+	int add_bloat = 0;
+	int mul_bloat = 1;
+	int safe = 0;
+	int nesc, i;
+	char __far * p;
+	char __far * q;
+	int dflt = 0;
+	int shadow = 0;
+	int secured = 0;
+
+	if (!web_leaf(wc))
+		return -EINVAL;
+
+	if (*spec == 'S') {
+		++spec;
+		secured = _WXO_SECURED;
+	}
+	if (*spec == 'X') {
+		++spec;
+		wx = web_extrep(wc, secured);
+	}
+	else if (*spec == 'N') {
+		++spec;
+		wx = web_extrep(wc, _WXO_STANDARD|_WXO_NUMERIC|secured);
+	}
+	else
+		wx = web_extrep(wc, _WXO_STANDARD|secured);
+
+	while (*spec && *spec != '%') {
+		switch (*spec) {
+		case 'X':	// XML escapes (&lt; &gt; &amp;)
+			xml |= 1;
+			break;
+		case 'A':	// XML escapes including quotes (&lt; &gt; &amp; &quot;)
+						// Used when generating for an attribute value.
+			xml |= 3;
+			break;
+		case 'j':	// JSON internal escapes (\\ and \" only), and hex float format
+			json = 1;
+			break;
+		case 'J':	// JSON external (standard) escapes
+			json = 2;
+			break;
+		case 'd':
+			dflt = 1;	// Format the factory default value (else current)
+			break;
+		case 's':
+			shadow = 1;	// Format shadow value (else current)
+			break;
+		}
+		++spec;
+	}
+
+	safe = *spec != '%' &&
+	          (wx == _web_std_extreps[TINT] ||
+			     wx == _web_std_extreps[TUNSIGNED] ||
+			     wx == _web_std_extreps[TFLOAT]);
+
+	if (!bin) {
+	   if (dflt) {
+	      // First try the specific factory default
+	      bin = web_fd(wc);
+	      if (!bin)
+	         // ...and failing that, the descriptor default
+	         bin = web_default(wc);
+	   }
+	   else if (shadow)
+	      bin = web_shadow(wc);
+	   else
+	      bin = web_loc(wc);
+	}
+
+
+	if (!safe) {
+		if (json == 2 || xml == 3)
+			mul_bloat = 6;	// If all control chars (or quotes for XML)
+		else if (json == 1)
+	   	mul_bloat = 2; // If all backslashes
+		if (json)
+			add_bloat = 2;	// For the enclosing quotes
+		if (xml == 1 && mul_bloat < 5)
+			mul_bloat = 5;	// If all ampersands
+	}
+
+	if (json == 1 && wx == _web_std_extreps[TFLOAT]) {
+		// Special flag to make storing/getting floats more efficient
+		// and guarantee no loss of precision.  Stores as ".x" hex format.
+		// Obviously, this format must be confined to internal use only,
+		// since only our parser knows how to interpret it.
+      wx = _web_std_extreps[0];
+	}
+
+	if (*spec == '%') {
+		// Custom printf-type specification for format.  This does not need
+		// an extrep.  It is used by RabbitWeb ZHTML and is quite flexible,
+		// however it suffers from inability to perform more complex
+		// formatting e.g. for IP addresses.
+		len = _web_printf(wc, spec, dest, destlen, bin);
+	}
+	else {
+	   // We have an extrep available (maye a default one).  Generate unescaped
+	   // string.
+	   if (!wx || !wx->bin2str)
+	      return -EINVAL;
+
+	   len = wx->bin2str(wc, dest, destlen, bin);
+	}
+
+	if (len < 0)
+		return len;
+	if (len > 0)
+		return len * mul_bloat + add_bloat;
+	if (!add_bloat && mul_bloat == 1)
+		// Must be OK if no further escaping required
+		return 0;
+
+	// All OK, count escapes...
+	nesc = add_bloat;
+	len = strlen(dest);
+	for (i = 0, p = dest; i < len; ++i, ++p) {
+		switch (*p) {
+			case '&':
+				if (xml)
+					nesc += 4;
+				break;
+			case '<':
+			case '>':
+				if (xml)
+					nesc += 3;
+				break;
+			case '"':
+				if (xml == 3)
+					nesc += 5;
+			case '\\':
+				if (json)
+					++nesc;
+				break;
+			case '\b':
+			case '\f':
+			case '\n':
+			case '\r':
+			case '\t':
+				if (json == 2)
+					++nesc;
+				break;
+			default:
+				if (json == 2 && *p < ' ')
+					nesc += 5;
+		}
+	}
+
+	// If no escapes required, we're done!
+	if (!nesc)
+		return 0;
+
+	if (len + nesc + 1 > destlen)
+		return len + nesc + 1;
+
+	// Now insert string backward in same buffer, following same logic as
+	// above to insert escape chars as well.  Need to work backward
+	// since original string is at start of same buffer.
+	q = p + nesc;
+	*q-- = 0;
+	--p;
+	if (add_bloat)
+		*q-- = '"';
+
+	for (; i > 0; --i, --p, --q) {
+		switch (*p) {
+			case '&':
+				if (xml) {
+					_f_memcpy(q-4, "&amp;", 5);
+					q -= 4;
+					continue;
+				}
+				break;
+			case '<':
+				if (xml) {
+					_f_memcpy(q-3, "&lt;", 4);
+					q -= 3;
+					continue;
+				}
+				break;
+			case '>':
+				if (xml) {
+					_f_memcpy(q-3, "&gt;", 4);
+					q -= 3;
+					continue;
+				}
+				break;
+			case '\b':
+				if (json != 2) break;
+				*q = 'b';
+				goto _slash;
+			case '\f':
+				if (json != 2) break;
+				*q = 'f';
+				goto _slash;
+			case '\n':
+				if (json != 2) break;
+				*q = 'n';
+				goto _slash;
+			case '\r':
+				if (json != 2) break;
+				*q = 'r';
+				goto _slash;
+			case '\t':
+				if (json != 2) break;
+				*q = 't';
+				goto _slash;
+			case '"':
+				if (xml == 3) {
+					_f_memcpy(q-5, "&quot;", 6);
+					q -= 5;
+					continue;
+				}
+			case '\\':
+				if (!json)
+					break;
+				*q = *p;
+			_slash:
+				*--q = '\\';
+				continue;
+			default:
+				if (json == 2 && *p < ' ') {
+					*q = "0123456789ABCDEF"[*p&0x0F];
+					*--q = "0123456789ABCDEF"[*p>>4];
+					*--q = '0';
+					*--q = '0';
+					*--q = 'u';
+					goto _slash;
+				}
+		}
+		*q = *p;
+	}
+
+	if (add_bloat)
+		*q-- = '"';
+	_web_assert(q+1 == dest);
+
+   return 0;
+}
+
+
+_web_debug
+int _web_format(WebCursor_t __far * wc,
+			char __far *dest, int destlen, char __far *spec)
+{
+	return web_format(wc, dest, destlen, spec, NULL);
+}
+
+/*** BeginHeader web_intl_str */
+/*
+	This formats the addressed variable for internal storage in string format.
+	It does not use the extended metadata, since the internal storage format
+	is intended to be independent of this.  It is only for saving data in
+	a binary-independent manner.  See web_ext_str() for conversion to
+	external representations.
+
+	Returns 0 for success, negative for permanent error, or positive if
+	there was not sucfficient space in the dest buffer.  In the latter case,
+	the number is the required minimum buffer size which needs to be
+	available.
+*/
+int web_intl_str(WebCursor_t __far * wc, char __far *dest, int destlen, int numeric);
+/*** EndHeader */
+
+_web_debug
+int web_intl_str(WebCursor_t __far * wc, char __far *dest, int destlen, int numeric)
+{
+	// Secure, Numeric, json escapes
+	return _web_format(wc, dest, destlen, "Nj"+!numeric);
+}
+
+
+/*** BeginHeader web_ext_str */
+/*
+	This formats the addressed variable as an appropriate external
+	representation.  This makes use of metadata and the registered
+	external representation table.
+
+	Returns 0 for success, negative for permanent error, or positive if
+	there was not sucfficient space in the dest buffer.  In the latter case,
+	the number is the required minimum buffer size which needs to be
+	available.
+*/
+int web_ext_str(WebCursor_t __far * wc, char __far *dest, int destlen, int secure);
+/*** EndHeader */
+
+_web_debug
+int web_ext_str(WebCursor_t __far * wc, char __far *dest, int destlen, int secure)
+{
+	return _web_format(wc, dest, destlen, "SXX"+!secure);	// XML (or HTTP) escapes
+}
+
+/*** BeginHeader _web_grok_wte */
+WebTransEntry_t __far * _web_grok_wte(WebTransEntry_t __far * we,
+							int __far * * error_id,
+							int __far * * bin_len,
+							void __far * * bin);
+/*** EndHeader */
+
+_web_debug
+WebTransEntry_t __far * _web_grok_wte(WebTransEntry_t __far * we,
+							int __far * * error_id,
+							int __far * * bin_len,
+							void __far * * bin)
+{
+	// Set pointers to all the fields in the given WTE.  This is a variable sized
+	// struct, hence the math...
+	*error_id = (int __far *)((char __far *)we + we->cname[0]);
+	*bin_len = *error_id + 1;
+	*bin = (void __far *)((char __far *)*bin_len + (2*sizeof(int)+2*sizeof(char __far *)));
+
+	return (WebTransEntry_t __far *)((char __far *)*bin + **bin_len);
+}
+
+/*** BeginHeader _web_grok_wte_all */
+WebTransEntry_t __far * _web_grok_wte_all(WebTransEntry_t __far * we,
+							int __far * * error_id,
+							int __far * * bin_len,
+							void __far * * bin,
+							char __far * __far * * error_msg,
+							char __far * __far * * orig_str,
+							int __far * * orig_len);
+/*** EndHeader */
+
+_web_debug
+WebTransEntry_t __far * _web_grok_wte_all(WebTransEntry_t __far * we,
+							int __far * * error_id,
+							int __far * * bin_len,
+							void __far * * bin,
+							char __far * __far * * error_msg,
+							char __far * __far * * orig_str,
+							int __far * * orig_len)
+{
+	// Set pointers to all the fields in the given WTE.  This is a variable sized
+	// struct, hence the math...
+	*error_id = (int __far *)((char __far *)we + we->cname[0]);
+	*bin_len = *error_id + 1;
+	*error_msg = (char __far * __far *)(*bin_len + 1);
+	*orig_str = *error_msg + 1;
+	*orig_len = (int __far *)(*orig_str + 1);
+	*bin = *orig_len + 1;
+
+	return (WebTransEntry_t __far *)((char __far *)*bin + **bin_len);
+}
+
+/*** BeginHeader _web_compare */
+int _web_compare(WebCursor_t __far * wc, WebTransEntry_t __far * we);
+/*** EndHeader */
+
+
+_web_debug
+int _web_compare(WebCursor_t __far * wc, WebTransEntry_t __far * we)
+{
+	int __far * error_id;
+	int __far * bin_len;
+	void __far * newbin;
+
+	_web_grok_wte(we, &error_id, &bin_len, &newbin);
+	if (web_type(wc) == _DK_TSTRING)
+		return strncmp(newbin, web_loc(wc), *bin_len);
+	return memcmp(newbin, web_loc(wc), *bin_len);
+}
+
+
+/*** BeginHeader _web_commit */
+int _web_commit(WebCursor_t __far * wc, WebTransEntry_t __far * we);
+/*** EndHeader */
+
+// Copy the given value (in src) to the destination (in dest) given the type.
+// As a special case, strings are not copied--they are handled specially in the
+// calling function.
+//
+// dest -- Destination of the value.
+// src  -- Source of the value.
+// type -- Type of the variable.
+
+_web_debug
+int _web_commit(WebCursor_t __far * wc, WebTransEntry_t __far * we)
+{
+	int __far * error_id;
+	int __far * bin_len;
+	void __far * newbin;
+
+	_web_grok_wte(we, &error_id, &bin_len, &newbin);
+	if (web_type(wc) == _DK_TSTRING)
+		_f_strncpy(web_loc(wc), newbin, *bin_len);
+	else
+		_f_memcpy(web_loc(wc), newbin, *bin_len);
+	return 0;
+}
+
+
+
+/*** BeginHeader _web_commit_shadow */
+int _web_commit_shadow(WebCursor_t __far * wc, WebTransEntry_t __far * we);
+/*** EndHeader */
+
+// As for _web_commit(), except updates the shadow copy.
+
+_web_debug
+int _web_commit_shadow(WebCursor_t __far * wc, WebTransEntry_t __far * we)
+{
+	int __far * error_id;
+	int __far * bin_len;
+	void __far * newbin;
+	void __far * bin = web_shadow(wc);
+	if (!bin)
+		return -ENOENT;
+
+	_web_grok_wte(we, &error_id, &bin_len, &newbin);
+	if (web_type(wc) == _DK_TSTRING)
+		_f_strncpy((char __far *)bin, newbin, *bin_len);
+	else
+		_f_memcpy(bin, newbin, *bin_len);
+	return 0;
+}
+
+
+
+/*** BeginHeader _web_commit_fd */
+int _web_commit_fd(WebCursor_t __far * wc, WebTransEntry_t __far * we);
+/*** EndHeader */
+
+// As for _web_commit(), except updates the FD copy.
+
+_web_debug
+int _web_commit_fd(WebCursor_t __far * wc, WebTransEntry_t __far * we)
+{
+	int __far * error_id;
+	int __far * bin_len;
+	void __far * newbin;
+	void __far * bin = web_fd(wc);
+	if (!bin)
+		return -ENOENT;
+
+	_web_grok_wte(we, &error_id, &bin_len, &newbin);
+	if (web_type(wc) == _DK_TSTRING)
+		_f_strncpy((char __far *)bin, newbin, *bin_len);
+	else
+		_f_memcpy(bin, newbin, *bin_len);
+	return 0;
+}
+
+
+
+/*** BeginHeader _web_str2bin */
+int _web_str2bin(WebCursor_t __far * wc, char __far * str, int strlen,
+						void __far * bin, int binlen, char __far * spec,
+						int __far * error_id);
+/*** EndHeader */
+
+
+_web_debug
+int _web_str2bin(WebCursor_t __far * wc, char __far * str, int strlen,
+						void __far * bin, int binlen, char __far * spec,
+						int __far * error_id)
+{
+	// This routine assumes the string has already been unescaped according
+	// to the conventions of the markup medium.
+	WebExtrep_t __far * wx;
+	int reqlen = web_size(wc);
+	int rc;
+
+	if (!web_leaf(wc)) {
+		*error_id = RCIERR_FIELD_AGGREGATE;
+		return -EINVAL;
+	}
+	*error_id = 0;
+
+	if (binlen < reqlen)
+		return reqlen;
+
+	wx = web_extrep(wc, !spec || *spec != 'X' ? _WXO_STANDARD : 0);
+
+	if (!wx || !wx->str2bin) {
+		*error_id = RCIERR_SPEC;
+		return -EINVAL;
+	}
+
+	rc = wx->str2bin(wc, str, strlen, bin);
+	if (rc > 0) {
+		*error_id = rc;
+		return -EINVAL;
+	}
+	return rc;
+}
+
+
+
+
+/*****************************************************************************
+******************************************************************************
+
+Cursor functions.
+
+A "cursor" is a state machine that can be navigated through the RabbitWeb
+structure.  This is similar to iteration, although more powerful since the
+sequence of returned objects is under control of the caller.
+
+******************************************************************************
+*****************************************************************************/
+
+
+/*** BeginHeader web_cursor_start */
+int web_cursor_start(WebCursor_t __far * wc);
+/*** EndHeader */
+
+/*
+Initialize wc at the root of the RabbitWeb variable tree.  It is only possible
+to go down from here, since this is a "virtual" root structure which
+encompasses all actual root-level variables as "fields".
+*/
+_web_debug
+int web_cursor_start(WebCursor_t __far * wc)
+{
+
+	_f_memset(wc, 0, sizeof(*wc));
+	wc->level = -1;
+   wc->alevel = -1;
+	return 0;
+}
+
+/*** BeginHeader _web_cursor_fill_depth */
+int _web_cursor_fill_depth(WebCursor_t __far * wc);
+/*** EndHeader */
+_web_debug
+int _web_cursor_fill_depth(WebCursor_t __far * wc)
+{
+	WebStructMemInfo_t __far * wsmi;
+	int x, lvl, nd, sot, i;
+	int __far * d;
+	// Fill in the "static" information for the next levels.  This
+	// is usually much more efficient than recalculating at every change of level
+	// in the array, since the majority of cases will navigate all the way down
+	// to the leaves.
+	lvl = wc->level;
+	if (wc->alevel < lvl) {	// bumped to new, unfilled, level
+   	nd = _web_count_dims(wc->wsmi[lvl]);
+   	if (lvl+nd >= _WEB_MAX_X_NEST)
+   		return -ENOENT;
+		if (nd) {
+			// Have nd dimensions
+			d = wc->wsmi[lvl]->dims;
+			wsmi = wc->wsmi[lvl];
+			sot = wc->len[lvl];
+			for (x = 0; x < nd; ++x) {
+				++lvl;
+				wc->arry[lvl] = d[x];
+				wc->val[lvl] = wc->val[wc->level];
+				wc->len[lvl] = sot;
+				// Adjust sizes of upper levels, since stored size is only for
+				// single element.
+				for (i = wc->level; i < lvl; ++i)
+					wc->len[i] *= d[x];
+				wc->wsmi[lvl] = wsmi;
+			}
+		}
+		wc->alevel = lvl;
+	}
+	return 0;
+}
+
+/*** BeginHeader web_cursor_down */
+int web_cursor_down(WebCursor_t __far * wc, const char __far * name, int idx);
+/*** EndHeader */
+/*
+Go down in the hierarchy, selecting field name "name" if it is not NULL,
+else array index "idx".  Object levels require a name, but also accept an
+index which will indicate the Nth field.  Array levels require name to
+be NULL and use the index only.  If the cursor is at a leaf node (i.e. a
+simple type) then an error indicator is returned.
+
+When an error is returned, there will have been no change to the state.
+*/
+_web_debug
+int web_cursor_down(WebCursor_t __far * wc, const char __far * name, int idx)
+{
+	WebStructMemList_t __far * wsml;
+	WebStructMemInfo_t __far * wsmi;
+	int nlen, x, lvl;
+
+	lvl = wc->level;
+	if (lvl+1 >= _WEB_MAX_X_NEST)
+		// if would exceed depth, effectively prune it from tree.
+		return -ENOENT;
+
+	if (name)
+		nlen = strlen(name);
+
+   if (lvl >= wc->alevel) {
+      if (lvl >= 0) {
+      	wsmi = wc->wsmi[lvl];
+         if (wsmi->type.simple < _DK_TSTRUCT)
+            return -ENOENT;   // Already at leaf
+         wsml = wsmi->type.ptr;
+      }
+      else
+         wsml = _web_base;
+
+		if (name) {
+	      for (wsmi = wsml->ptr, x = 0; x < wsml->nmemb; ++wsmi, ++x) {
+            // Check for length match first
+            if (wsmi->name[nlen] && wsmi->name[nlen] != '[')
+               continue;
+            if (wc->case_insens) {
+               if (!strncmpi(name, wsmi->name, nlen))
+                  break;
+            }
+            else {
+               if (!memcmp(name, wsmi->name, nlen))
+                  break;
+            }
+	      }
+	      if (x == wsml->nmemb)
+	         return -ENOENT;
+      }
+      else {
+      	if (idx < 0 || idx >= wsml->nmemb)
+      		return -ENOENT;
+      	x = idx;
+      	wsmi = wsml->ptr + idx;
+      }
+
+      lvl = ++wc->level;
+      if (!lvl)
+         wc->val[0] = wsmi->valptr;
+      else
+         wc->val[lvl] = (char RWEB_FQ *)wc->val[lvl-1] + wsmi->offset;
+      wc->idx[lvl] = x;
+      wc->arry[lvl] = 0;
+      wc->len[lvl] = _web_gettypesize(&wsmi->type, wsmi->dims);
+      wc->wsmi[lvl] = wsmi;
+     	wc->leaf_flag = wsmi->type.simple < _DK_TSTRUCT;
+   }
+   else {
+      // Must be array level.  Use idx and require NULL name.
+      if (name || idx >= wc->arry[wc->level+1])
+         return -ENOENT;
+      lvl = ++wc->level;
+      wc->idx[lvl] = idx;
+      wc->val[lvl] = (char RWEB_FQ *)wc->val[lvl-1] + idx * wc->len[lvl];
+		wc->leaf_flag = 0;
+   }
+
+	if (_web_cursor_fill_depth(wc)) {
+		// This level is an array member which would exceed the nesting
+		// depth.  Unfortunately, this means this whole level is rejected,
+		// even though only this member may be excessively deep.  Best
+		// remedy is not to make the RabbitWeb tree too deep!
+		--wc->level;
+		return -ENOENT;
+	}
+	return 0;
+}
+
+
+/*** BeginHeader web_cursor_up */
+int web_cursor_up(WebCursor_t __far * wc);
+/*** EndHeader */
+/*
+Move back up the hierarchy.  If already at the root, it stays at the root and
+returns -ENOENT.
+*/
+_web_debug
+int web_cursor_up(WebCursor_t __far * wc)
+{
+	if (wc->level < 0)
+		return -ENOENT;
+	--wc->level;
+	if (wc->level < 0 || !wc->arry[wc->level+1])
+		wc->alevel = wc->level;
+	return 0;
+}
+
+
+/*** BeginHeader web_cursor_next */
+int web_cursor_next(WebCursor_t __far * wc);
+/*** EndHeader */
+/*
+Move cursor to next element at the current level.  If there are no more
+elements at this level (i.e. is already at the last field, or the last
+array index at this level) then returns -ENOENT.
+*/
+_web_debug
+int web_cursor_next(WebCursor_t __far * wc)
+{
+	WebStructMemList_t __far * wsml;
+	WebStructMemInfo_t __far * wsmi;
+	int lvl;
+
+	lvl = wc->level;
+	if (lvl < 0)
+		return -ENOENT;
+	if (!lvl) {
+		// Iterate root level variables
+		wsml = _web_base;
+		wsmi = wc->wsmi[0];
+		if (wc->idx[lvl]+1 >= wsml->nmemb)
+			return -ENOENT;
+		++wsmi;
+		++wc->idx[lvl];
+		wc->alevel = -1;
+		wc->val[0] = wsmi->valptr;
+		wc->len[0] = _web_gettypesize(&wsmi->type, wsmi->dims);
+		wc->wsmi[0] = wsmi;
+	}
+	else {
+		if (wc->arry[lvl]) {
+			if (wc->idx[lvl]+1 >= wc->arry[lvl])
+				return -ENOENT;
+			++wc->idx[lvl];
+			wc->val[lvl] = (char RWEB_FQ *)wc->val[lvl] + wc->len[lvl];
+		}
+		else {
+			wsml = wc->wsmi[lvl-1]->type.ptr;
+			wsmi = wc->wsmi[lvl] + 1;
+	      if (wc->idx[lvl]+1 >= wsml->nmemb)
+	         return -ENOENT;
+			++wc->idx[lvl];
+			wc->alevel = -1;
+			wc->wsmi[lvl] = wsmi;
+	      wc->val[lvl] = (char RWEB_FQ *)wc->val[lvl-1] + wsmi->offset;
+	      wc->len[lvl] = _web_gettypesize(&wsmi->type, wsmi->dims);
+		}
+	}
+
+	if (_web_cursor_fill_depth(wc)) {
+		// This level is an array member which would exceed the nesting
+		// depth.  Unfortunately, this means this whole level is rejected,
+		// even though only this member may be excessively deep.  Best
+		// remedy is not to make the RabbitWeb tree too deep!
+		return -ENOENT;
+	}
+	return 0;
+}
+
+
+
+/*** BeginHeader web_cursor_find */
+int web_cursor_find(WebCursor_t __far * wc, const char __far * name, int idx);
+/*** EndHeader */
+/*
+At the current level, "warp" to the specified field name or index (using
+similar rules to web_cursor_down()).  This is implemented as up then down,
+except that errors do not change any state.
+*/
+_web_debug
+int web_cursor_find(WebCursor_t __far * wc, const char __far * name, int idx)
+{
+	int oldx, rc;
+	if (web_cursor_up(wc) < 0)
+		return -ENOENT;
+	// Remember what we were on, in case of error
+	oldx = wc->idx[wc->level+1];
+	rc = web_cursor_down(wc, name, idx);
+	if (rc >= 0)
+		return rc;
+	// Error, go back where we were.  This is so we keep the rule that
+	// errors do not change cursor state.
+	web_cursor_down(wc, NULL, oldx);
+	return rc;
+}
+
+
+
+/*** BeginHeader web_cursor_set */
+int web_cursor_set(WebCursor_t __far * wc, char __far * cname);
+/*** EndHeader */
+_web_debug
+int web_cursor_set(WebCursor_t __far * wc, char __far * cname)
+{
+	char __far * c;
+	char __far * e;
+	int rc;
+	int x;
+
+	web_cursor_start(wc);
+	c = cname+1;
+	e = cname + cname[0];
+	while (c < e) {
+		if (*c < 255) {
+			rc = web_cursor_down(wc, NULL, *c);
+			++c;
+		}
+		else {
+			x = *(int __far *)(c+1);
+			c += 3;
+			rc = web_cursor_down(wc, NULL, x);
+		}
+		if (rc)
+			return rc;
+	}
+	return 0;
+}
+
+
+/*****************************************************************************
+******************************************************************************
+
+Debugging functions.
+
+Don't call in production programs.
+
+******************************************************************************
+*****************************************************************************/
+/*** BeginHeader web_cursor_print */
+void web_cursor_print(WebCursor_t __far * wc);
+/*** EndHeader */
+
+__nodebug
+void web_cursor_print(WebCursor_t __far * wc)
+{
+	int i;
+   if (wc->level < 0)
+      printf("<root object>\n");
+   else {
+      printf("name: %s", wc->wsmi[0]->name);
+      for (i = 1; i <= wc->level; ++i) {
+         if (wc->arry[i])
+            printf("[%d/%d]", wc->idx[i], wc->arry[i]);
+         else
+            printf(".%s", wc->wsmi[i]->name);
+      }
+      printf("\ntype = %d, level/alevel = %d/%d, index = %d, arry = %d\n",
+         web_type(wc), wc->level, wc->alevel,
+         web_index(wc), web_dimension(wc));
+      printf("  val = " RWEB_FQ_FORMAT ", len = %d\n",
+         web_loc(wc), web_size(wc));
+   }
+}
+
+
+/*** BeginHeader dump_rabbitweb, dump_vartype */
+void dump_vartype( int depth, char *name, int *dims, _Web_Var_Type *vartype,
+	void *valptr);
+void dump_rabbitweb();
+
+/*** EndHeader */
+__nodebug
+void dump_vartype( int depth, char *name, int *dims, _Web_Var_Type *vartype,
+	void *valptr)
+{
+	static const char * vartypes[] = {
+		"0", "CHAR", "INT", "WORD",
+		"LONG", "ULONG", "? 6 ?", "FLOAT", "? 8 ?", "STRING"
+	};
+
+	_Web_Struct_Mem_List *wsml;
+	_Web_Struct_Mem_Info *meminfo;
+	int *d;
+	char prefix[20];
+
+	// indentation prefix for printouts
+	memset( prefix, '\t', depth);
+	prefix[depth] = '\0';
+
+	printf( "%s%s", prefix, name);
+
+   if (dims)
+   {
+      while (*dims)
+      {
+         printf( "[%d]", *dims++);
+      }
+   }
+   if (vartype->simple < _DK_TSTRUCT)
+   {
+	   printf( " is a %s @ 0x%04x\n", vartypes[vartype->simple], valptr);
+   }
+   else
+   {
+   	wsml = vartype->ptr;
+	   printf( " is a %d-byte struct @ 0x%04x\n", wsml->strsize, valptr);
+	   for (meminfo = wsml->ptr; meminfo->name; ++meminfo)
+	   {
+	      dump_vartype( depth + 1, meminfo->name, meminfo->dims, &meminfo->type,
+	      	(char *)valptr + meminfo->offset);
+		}
+   }
+}
+
+__nodebug
+void dump_rabbitweb()
+{
+	_Web_Var_Info *varinfo;
+	_Web_Select16 * s16;
+	_Web_Select32 * s32;
+	int i, len;
+	int *d;
+
+	varinfo = &_web_var_info[0];
+	for (i = 0; varinfo->name; ++varinfo, ++i)
+	{
+		printf( "_web_var_info[%d]:\n", i);
+		dump_vartype( 1, varinfo->name, varinfo->dims, &varinfo->type,
+			varinfo->valptr);
+		len = _web_integer_len(varinfo->type.simple);
+	   if (len == 2 && varinfo->select.ptr16) {
+			for (s16 = varinfo->select.ptr16; s16->name; ++s16)
+				printf("\t   Option '%s' = %u\n", s16->name, s16->value);
+	   }
+	   else if (len == 4 && varinfo->select.ptr32) {
+			for (s32 = varinfo->select.ptr32; s32->name; ++s32)
+				printf("\t   Option '%s' = %lu\n", s32->name, s32->value);
+	   }
+
+
+
+		if (varinfo->guardptr)
+		{
+			printf( "\thas guards\n");
+		}
+		if (varinfo->updateptr)
+		{
+			printf( "\thas update functions\n");
+		}
+		printf( "\tauthentication: 0x%02x =%s%s%s%s%s\n", varinfo->auth,
+			varinfo->auth == 0 ? " default" : ""
+			,varinfo->auth & SERVER_AUTH_NONE ? " NONE" : ""
+			,varinfo->auth & SERVER_AUTH_BASIC ? " BASIC" : ""
+			,varinfo->auth & SERVER_AUTH_DIGEST ? " DIGEST" : ""
+			,varinfo->auth & SERVER_AUTH_PK ? " SSL" : ""
+			);
+		printf( "\tgroups: 0x%04x\n", varinfo->groups);
+		printf( "\tperm: 0x%04x\n", varinfo->perm);
+		//printf("\t  = %s\n", group_name_list(varinfo->groups, varinfo->perm));
+
+	}
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+
+
+

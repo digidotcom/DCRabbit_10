@@ -1,0 +1,1663 @@
+/*****************************************************************************
+ *  Copyright (c) 1996-2007 Digi International Inc., All Rights Reserved
+ *
+ *  This software contains proprietary and confidential information of Digi
+ *  International Inc.  By accepting transfer of this copy, Recipient agrees
+ *  to retain this software in confidence, to prevent disclosure to others,
+ *  and to make no use of this software other than that for which it was
+ *  delivered.  This is an unpublished copyrighted work of Digi International
+ *  Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+ *  prohibited.
+ *
+ *  Restricted Rights Legend
+ *
+ *  Use, duplication, or disclosure by the Government is subject to
+ *  restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+ *  Technical Data and Computer Software clause at DFARS 252.227-7031 or
+ *  subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+ *  Restricted Rights at 48 CFR 52.227-19, as applicable.
+ *
+ *  Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+ *
+ * This file contains the implementation of the USB Mass Storage Driver.
+ *
+ *************************************************************************/
+
+
+/*** BeginHeader */
+
+#ifndef __USBMASSTOR_
+#define __USBMASSTOR_
+
+#define USING_USB_MASS_STORAGE 1
+
+#ifndef USBMassStoreDebug
+	#define  USBMassStorDebug __nodebug
+#else
+	#define  USBMassStorDebug __debug
+#endif
+
+//* USB Mass Storage Interface Class
+#define USB_MS_INTF_CLASS    0x8
+
+//* USB Mass Storage Subclass Codes
+#define RBC                  0x1
+#define SFF_8020_MMC_2       0x2
+#define QIC_157              0x3
+#define UFI                  0x4
+#define SFF_8070             0x5
+#define SCSI_TRANSPARENT     0x6
+
+//* USB Mass Storage Transport Protocol
+#define CBI_CPI              0x00 // Control/Bulk/Interrupt Transport with command completion interrupt
+#define CBI_NCPI             0x01 // Control/Bulk/Interrupt Transport with no command completion interrupt
+#define BULK_ONLY            0x50 // Bulk ONLY Transport
+
+//* USB Mass Storage Class Device Requests
+#define RESET_BREQUEST       0xFF
+#define GET_MAX_LUN_BREQUEST 0xFE
+#define MAX_LUN              0x0F
+
+//* USB Mass Storage Class Bulk-Only Transport Specifications
+#define CSW_COMMAND_PASSED   0x00
+#define CSW_COMMAND_FAILED   0x01
+#define CSW_PHASE_ERROR      0x02
+
+#define CBW_SIGNATURE        0x43425355
+#define CSW_SIGNATURE        0x53425355
+#define CBW_TAG              0x4C49534E
+
+#define CBW_SIZE             0x1F
+#define CSW_SIZE             0x0D
+#define CB_SIZE              0x10
+#define CB_OFFSET            0x0F
+
+#ifdef USBMSSTOR_VERBOSE
+	#ifdef NDEBUG
+	  	#define USBMSSTOR_ASSERT(ignore)
+	#else
+		#define USBMSSTOR_ASSERT(exp)   \
+   		 ((exp) ? (void)0 :        \
+	    	_dc_assert(#exp, __FILE__, __LINE__))
+   #endif
+#else
+	#ifdef NDEBUG
+	  	#define USBMSSTOR_ASSERT(ignore)
+	#else
+		#define USBMSSTOR_ASSERT(exp)       \
+   		 if(exp){ } else {             \
+		   exception(-ERR_ASSERTFAILURE); \
+		   exit(-ERR_ASSERTFAILURE); }
+   #endif
+#endif
+
+
+#ifdef USBMSSTOR_VERBOSE
+   // This will save save a lot of const space over more specific messages
+   //  because the compiler will optimize all instances down to two
+   //  strings, __FILE__ and "result !=0 File: %s,Line %d\n\n"
+	#define USBMSSTOR_PRINTF_ERR printf("Error File: %s,Line %d\n\n",__FILE__, __LINE__)
+#else
+  	#define USBMSSTOR_PRINTF_ERR
+#endif
+
+#define USB_MS_SEMAPHORE_CREATE_FAILED          501
+#define USB_MS_SEMAPHORE_GET_FAILED             502
+#define USB_MS_SEMAPHORE_PUT_FAILED             503
+#define USB_MS_INVALID_CBW_SIZE                 504
+#define USB_MS_MALLOC_FAILED                    505
+#define USB_MS_FREE_FAILED                      506
+#define USB_MS_INVALID_CSW_SIGNATURE            507
+#define USB_MS_CSW_TAG_MISMATCH                 508
+#define USB_MS_CSW_COMMAND_FAILED               509
+#define USB_MS_CSW_PHASE_ERROR                  510
+#define USB_MS_NULL_POINTER                     511
+#define USB_MS_CURRENT_DEVICE_NULL              512
+#define USB_MS_EVENT_FLAGS_CREATE_FAILED        513
+
+//* Command block structure
+typedef struct usb_ms_cbw
+{
+    unsigned long sig;
+    unsigned long tag;
+    unsigned long len;
+    char flag;
+    char lun;
+    char cblen;
+    char cb[CB_SIZE];
+}USB_MS_CBW;
+
+//* Command status structure
+typedef struct usb_ms_csw
+{
+    unsigned long sig;
+    unsigned long tag;
+    unsigned long res;
+   char status;
+}USB_MS_CSW;
+
+//* Mass Storage device structure
+typedef struct usb_ms
+{
+    usbDevice __far *usb;
+    long subclass;
+    long protocol;
+    long bulkInEp;
+    long bulkInMaxPacketSize;
+    long bulkOutEp;
+    long bulkOutMaxPacketSize;
+    char __far *name;
+    void __far *dev;
+    char __far *devName;
+    USB_LIST_ENTRY list;
+    long dev_number;
+    char max_lun;
+    char current_lun;
+    long fat32_vol_numbers[MAX_LUN];
+    long fat32_vol_mounted[MAX_LUN];
+}USB_MS;
+
+
+#define USB_MS_DEV_NAME_FORMAT "usb_ms_%d"
+
+
+/*** EndHeader */
+
+
+// NDS note:  For NDS only, we have changed the meaning of the event flags slightly.  Setting
+// of a bit no longer means that the corresponding volume has been connected, but rather that
+// a connection event has occurred for that volume.  It is up to the client that waits on the
+// event flags to determine whether it was a disconnect or a connect.
+
+/* START FUNCTION DESCRIPTION ********************************************
+   usb_ms_init            <USBMASSSTORAGE.LIB>
+
+SYNTAX: int usb_ms_init();
+
+DESCRIPTION:
+	This function is called by the user application to initialize the USB Mass
+	Storage Driver.  This function is usually called in applicationStart() in
+	root.c after usb_host_init() is called.
+
+   When the mass storage device is enumerate and ready to be used
+   the event flag usb_ms_event_flags  will be posted. Tasks should pend the
+   flag to wait for the device:
+	     OSFlagPend(usb_ms_event_flags,
+   		 		                      1,
+         		   OS_FLAG_WAIT_SET_ANY,
+               		                0,
+		                 (char*)&errMess
+      		        );
+PARAMETER:
+
+RETURN VALUE:
+	 0  - Success
+   -1  - Failure
+
+END DESCRIPTION **********************************************************/
+
+
+
+/*** BeginHeader usb_ms_init */
+__xmem int usb_ms_init(OS_FLAGS *event_flags, int * error_code);
+__root long usb_ms_probe(usbDevice __far *device);
+
+extern USB_MS __far *current_ms_device;
+extern USB_LIST_ENTRY name;
+extern OS_FLAG_GRP  * usb_ms_event_flags;
+
+
+/*** EndHeader */
+
+
+const usbDriver usbMassStorageDriver = {
+    "USB Mass Storage",
+    usb_ms_probe,
+    usb_ms_disconnect,
+    { NULL, NULL }
+};
+
+
+USB_MS __far *current_ms_device;
+OS_FLAG_GRP  * usb_ms_event_flags;
+USB_LIST_ENTRY __far mslist;
+
+USBMassStorDebug
+__xmem int usb_ms_init(OS_FLAGS *event_flags, int * error_code)
+{
+    int result;
+
+	#GLOBAL_INIT { current_ms_device = NULL;
+						usb_ms_event_flags = NULL;
+						mslist.next = &mslist;
+						mslist.prev = &mslist;
+					}
+
+    // boilerplate to get USB started if not already.
+	 _usb_init();
+
+
+    result = 0;
+
+
+    // If event_flags is NULL, then there is no event notification when USB
+    // storage devices are attached and FAT32 volumes are created.  In this
+    // case, user application must poll using the FAT32 API functions
+    // f_get_volume() and  f_get_volume_list() to check for the FAT32
+    // volumes available
+    if (event_flags != NULL)
+    {
+//BPM moved uCOC event flag to after successful probe for now.
+/*        if (tx_event_flags_create(event_flags, "USB Mass Storage Event Flags"))
+        {
+            result = -1;
+            *error_code = USB_MS_EVENT_FLAGS_CREATE_FAILED;
+            goto usbmsinitexit;
+        }
+        else
+            usb_ms_event_flags = event_flags;
+*/
+// 		  if(NULL==(usb_ms_event_flags = OSFlagCreate (0, (char*)error_code)))
+//        {
+//        		USBMSSTOR_PRINTF_ERR;
+//        }
+    }
+    else
+    {
+        usb_ms_event_flags = NULL;
+    }
+    if (usb_register(&usbMassStorageDriver, error_code))
+    {
+        result = -1;
+    }
+
+usbmsinitexit:
+
+    return result;
+}
+
+#define USB_MS_PROBE_BUFFER_SIZE    128UL
+
+USBMassStorDebug
+__root long usb_ms_probe(usbDevice __far *device)
+{
+
+    static USB_MS __far *ms;
+    int i, k, result, error_code, nLanguageIds;
+    long bytes_transferred;
+    char __far *buffer;
+    char *subclassString, *protocolString;
+    usbInterfaceDescriptor __far *interface;
+    static unsigned short languageId[8];
+    USB_LIST_ENTRY  __far *tmp;
+    int  p;
+    int productStringIndex;
+    static char tempstr[sizeof(USB_MS_DEV_NAME_FORMAT)+16];
+    int free_volumes, f_initvolume_failed;
+    static char temps[32];
+
+    USB_MS __far *tmpms;
+
+    ms = (USB_MS __far *)NULL;
+    result = -1;
+    subclassString = "null"; protocolString = "null";buffer = NULL;
+
+    // No support for multiple configurations or multiple interfaces
+    if ((device->descriptor.bNumConfigurations != 1) ||
+        (device->config[0].bNumInterfaces != 1))
+    {
+        goto usbmsprbexit;
+    }
+
+    // check for mass storage device
+    interface = &device->config[0].interface[0];
+    if(interface->bInterfaceClass != USB_MS_INTF_CLASS)
+    {
+        goto usbmsprbexit;
+    }
+
+    switch(interface->bInterfaceSubClass)
+    {
+        	case RBC:
+            subclassString =
+              "Reduced Block Commands (RBC) T10 Project 1240-D";
+            break;
+        	case SFF_8020_MMC_2:
+            subclassString = "SFF-8020i, MMC-2 (ATAPI)";
+            break;
+        	case QIC_157:
+            subclassString = "QIC-157";
+            break;
+        	case UFI:
+            subclassString = "UFI";
+            break;
+        	case SFF_8070:
+            subclassString = "SFF-8070i";
+            break;
+        	case SCSI_TRANSPARENT:
+            subclassString = "SCSI Transparent";
+            break;
+		  	default:
+            goto usbmsprbexit;
+    }
+
+    switch(interface->bInterfaceProtocol)
+    {
+        	case CBI_CPI:
+            protocolString =
+               "Control/Bulk/Interrupt with command completion interrupt";
+            break;
+			case CBI_NCPI:
+            protocolString =
+               "Control/Bulk/Interrupt without command completion interrupt";
+            break;
+			case BULK_ONLY:
+            protocolString = "Bulk transport only";
+            break;
+			default:
+            goto usbmsprbexit;
+    }
+
+    // Mass storage device found
+    ms = pfcalloc(&usb_gen_list);
+    if (ms == NULL)
+    {
+        goto usbmsprbexit;
+    }
+    //_f_memset(ms, 0, sizeof(USB_MS));
+
+    // Search for bulk endpoint
+    for(i=0;i<interface->bNumEndpoints;i++)
+    {
+        if(interface->endpoint[i].bmAttributes == USB_BULK_ENDPOINT)
+        {
+            if(interface->endpoint[i].bEndpointAddress & 0x80)//IN
+            {
+                ms->bulkInEp = interface->endpoint[i].bEndpointAddress;
+                ms->bulkInMaxPacketSize =
+                    interface->endpoint[i].wMaxPacketSize;
+            }
+            else//OUT
+            {
+                ms->bulkOutEp = interface->endpoint[i].bEndpointAddress;
+                ms->bulkOutMaxPacketSize =
+                     interface->endpoint[i].wMaxPacketSize;
+            }
+        }
+    }
+    if(!ms->bulkOutEp)
+    {
+        USBMSSTOR_PRINTF_ERR;
+        //"usb_ms_probe: output endpoint invalid\n"
+        goto usbmsprbexit;
+    }
+
+#ifdef USBMSSTOR_VERBOSE
+    printf(
+     "usb_ms_probe: Found mass stor. dev. that supports %s protocol using %s\n",
+         subclassString, protocolString);
+#endif
+
+    device->driverData = (void __far *)ms;
+    ms->usb = device;
+    ms->subclass = interface->bInterfaceSubClass;
+    ms->protocol = interface->bInterfaceProtocol;
+
+#ifdef USBMSSTOR_VERBOSE
+    printf("usb_ms_probe: BULK OUT=%04x(%d) BULK IN=%04x(%d)\n",
+        (int)ms->bulkOutEp, (int)ms->bulkOutMaxPacketSize,
+        (int)ms->bulkInEp, (int)ms->bulkInMaxPacketSize);
+#endif
+
+
+    //buffer = fsmalloc(USB_MS_PROBE_BUFFER_SIZE);
+    buffer = (char __far *)(ms + 1);
+
+//BPM usb_get_string doesn't work on the Rabbit XD card reader because it isn't
+//   implemented, works on other OTS drives though
+//   Error recovery needs work and currently screws up subsequent operations,
+//   so skip past this stuff for now.
+goto usbmsprbskipstr; //BPM
+    //if(buffer==NULL)
+    //{
+    //    USBMSSTOR_PRINTF_ERR;
+    //}
+    //_f_memset(buffer, 0, USB_MS_PROBE_BUFFER_SIZE);
+    if(usb_get_string(device, 0, 0, buffer, USB_MS_PROBE_BUFFER_SIZE,
+      &bytes_transferred, &error_code))
+    {
+        USBMSSTOR_PRINTF_ERR;
+        // "usb_ms_probe: usb_get_string failed\n"
+        goto usbmsprbexit;
+    }
+    else
+    {
+        if ( !(bytes_transferred || (buffer[0] > 2)) )
+        {
+            USBMSSTOR_PRINTF_ERR;
+            //"usb_ms_probe: usb_get_string failed\n"
+           goto usbmsprbskipstr;
+        }
+    }
+
+    nLanguageIds = (buffer[0]-2)/2;
+    for(i = 0; i < nLanguageIds; i++)
+        languageId[i] = buffer[i*2+3]<<8 | buffer[i*2+2];
+
+    for(i = 0; i < nLanguageIds; i++)
+    {
+        productStringIndex = device->descriptor.iProduct;
+        _f_memset(buffer, 0, USB_MS_PROBE_BUFFER_SIZE);
+        if(usb_get_string(device, languageId[i], productStringIndex,
+                  buffer, USB_MS_PROBE_BUFFER_SIZE, &bytes_transferred,
+                  &error_code))
+        {
+            USBMSSTOR_PRINTF_ERR;
+            //"usb_ms_probe: usb_get_string failed\n"
+            goto usbmsprbexit;
+        }
+        for(p = 0; p < bytes_transferred/2 - 1;p++)
+            buffer[p] = buffer[p*2+2];
+
+        buffer[p]=0;
+//BPM        ms->name = fsmalloc(strlen(buffer)+1);
+        ms->name = _sys_malloc(32);
+        if(!ms->name)
+        {
+            USBMSSTOR_PRINTF_ERR;
+            //"usb_ms_probe: malloc failed\n"
+            goto usbmsprbexit;
+        }
+        else
+        {
+            _f_memcpy(ms->name, buffer,32);
+            xmem2root(temps,(UINT32)buffer,32);
+            for(k=0;k<31;k++)if(temps[k]<32)temps[k]=32; //BPM zeros to blanks
+            temps[31]=0;
+            printf("usb_ms_probe: %d language 0x%04x \n\tname = %s\n", i, languageId[i],temps);
+        }
+    }
+usbmsprbskipstr:  //BPM skipped to here for now
+    if(usb_set_configuration(device, device->config[0].bConfigurationValue, &error_code))
+    {
+        USBMSSTOR_PRINTF_ERR;
+        //"usb_ms_probe: usb_set_configuration failed\n"
+        goto usbmsprbexit;
+    }
+
+    _f_memset(buffer, 0, USB_MS_PROBE_BUFFER_SIZE);
+
+    // Get Max LUN
+    // USB flash drives usually have one logical unit
+    // If storage devices with multiple logical units are used,
+    // then multiple FAT32 volumes should be created
+    if (usb_ms_get_max_lun(device, interface->iInterface, buffer, 1,
+               &bytes_transferred, &error_code))
+    {
+        if (error_code != USBH_STALL)
+        {
+            USBMSSTOR_PRINTF_ERR;
+            //"usb_ms_probe: usb_ms_get_maxlun failed\n"
+            goto usbmsprbexit;
+        }
+        ms->max_lun = 0;
+    }
+    else
+    {
+        if (*buffer > MAX_LUN)
+        {
+            result = -1;
+            USBMSSTOR_PRINTF_ERR;
+            //"usb_ms_probe: invalid MAX LUN value\n"
+            goto usbmsprbexit;
+        }
+        ms->max_lun = *buffer;
+    }
+
+    //Choose correct storage device number
+    tmp = mslist.next;
+    ms->dev_number = 0;
+//    if(!CheckForEmptyList(&mslist))
+    {
+        while (tmp != &mslist)
+        {
+            tmpms = list_entry(tmp, USB_MS, list);
+            tmp = tmp->next;
+            USBMSSTOR_PRINTF_ERR;
+            //"usb_ms_probe: Try %s \n", (char*)ms->name)
+            if(tmpms->dev_number != ms->dev_number)
+                break;
+            ms->dev_number++;
+        }
+    }
+	/*
+    ms->devName = fsmalloc(strlen(USB_MS_DEV_NAME_FORMAT)+16);
+    if (ms->devName == NULL)
+    {
+        USBMSSTOR_PRINTF_ERR;
+        //"usb_ms_probe: malloc failed\n");
+        goto usbmsprbexit;
+    }
+	*/
+	ms->devName = (char __far *)(ms + 1) + sizeof(USB_MS_PROBE_BUFFER_SIZE);
+
+    sprintf(tempstr, USB_MS_DEV_NAME_FORMAT, ms->dev_number);
+    _f_memcpy(ms->devName, (char __far*)tempstr, sizeof(tempstr));
+    InsertHeadList(&mslist, &ms->list);
+
+   if((interface->bInterfaceSubClass == SCSI_TRANSPARENT) &&
+           (interface->bInterfaceProtocol == BULK_ONLY))
+    {
+        current_ms_device = ms;  f_initvolume_failed = 0;
+    }
+/*** //BPM   Hooks to Net Silicon's FAT system
+        if (DRVMGRget_free_volume_count(&free_volumes, &error_code))
+        {
+            USBMSSTOR_PRINTF_ERR;
+            //"usb_ms_probe: DRVMGRget_free_volume_count failed\n"
+            goto usbmsprbexit;
+        }
+        if ((ms->max_lun + 1) > free_volumes)
+        {
+            USBMSSTOR_PRINTF_ERR;
+            //"usb_ms_probe: Max FAT32 volumes exceeded\n"
+            goto usbmsprbexit;
+        }
+        for (i = 0; i <= ms->max_lun; i++)
+        {
+            ms->current_lun = i;
+            if  (0) //BPM (DRVMGRget_volume_number(&ms->fat32_vol_numbers[i], &error_code))
+            {
+                result = -1;
+	             USBMSSTOR_PRINTF_ERR;
+                //"usb_ms_probe: DRVMGRget_volume_number failed\n"
+                goto usbmsprbexit;
+            }
+#if 0 // FAT FS version 3.31 and later code
+            if (f_enterFS())
+            {
+	             USBMSSTOR_PRINTF_ERR;
+                //"usb_ms_probe: f_enterFS failed\n"
+                goto usbmsprbexit;
+            }
+#endif
+            if (0) //BPM (f_initvolume(ms->fat32_vol_numbers[i], usb_scsi_init, NULL))
+            {
+	             USBMSSTOR_PRINTF_ERR;
+                //"usb_ms_probe: unable to mount FAT32 volume, drive number %d\n", ms->fat32_vol_numbers[i]);
+                if  (0) //BPM (DRVMGRput_volume_number(ms->fat32_vol_numbers[i], &error_code))
+                {
+	   	           USBMSSTOR_PRINTF_ERR;
+                    //"usb_ms_probe: DRVMGRput_volume_number failed\n"
+                }
+                f_initvolume_failed++;
+            }
+            else
+            {
+                ms->fat32_vol_mounted[i] = TRUE;
+#ifdef USBMSSTOR_VERBOSE
+                printf(
+                    "usb_ms_probe: mounted FAT32 volume number %08lx\n",
+                    ms->fat32_vol_numbers[i]);
+#endif
+            }
+        }
+        if ((f_initvolume_failed) && ((f_initvolume_failed - 1) == ms->max_lun))
+        {
+            goto usbmsprbexit;
+        }
+    }
+    // We should done with mounting all the drives.
+    for (i = 0; i <= ms->max_lun; i++)
+    {
+        if (ms->fat32_vol_mounted[i] == TRUE)
+        {
+            if (usb_ms_event_flags)
+            {
+                // Event notification was requested when usb_ms_init() was called
+                // LSB of event flag is for volume 0, LSB + 1 is for volume 1 and so on
+//                if (tx_event_flags_set(usb_ms_event_flags, 1 << ms->fat32_vol_numbers[i], TX_OR))
+//                {
+//                    trace(USBHOST_TRACE, TRACE_CRITICAL, "usb_ms_probe: tx_event_flags_set failed for %d vol\n", ms->fat32_vol_numbers[i]);
+//                }
+					 OSFlagPost(usb_ms_event_flags, 1, OS_FLAG_SET, (char*)&error_code);
+                if((char)error_code != OS_NO_ERR)
+                {
+		             USBMSSTOR_PRINTF_ERR;
+                }
+            }
+        }
+    }
+*/
+
+	result = 0;	// function succeeded!!
+
+usbmsprbexit:
+    if (result == -1)
+    {
+		if (ms != NULL)
+		{
+			//if (ms->name != NULL) fsfree(ms->name);
+			if (ms->list.next != NULL)
+			{
+			    RemoveEntryList(&ms->list);
+			}
+			//if (ms->devName != NULL) fsfree(ms->devName);
+         pffree(&usb_gen_list, ms);
+		}
+    }
+	/*
+    if (buffer)
+    {
+        if (fsfree(buffer))
+        {
+  		   	result = -1;
+#ifdef USBMSSTOR_VERBOSE
+            USBMSSTOR_PRINTF_ERR;
+            //"usb_ms_probe: usb_ms_free failed\n"
+#endif
+        }
+    }
+	*/
+
+    if(!result){
+	    OSFlagPost(usb_ms_event_flags, 1, OS_FLAG_SET, (char*)&error_code);
+   	 if((char)error_code != OS_NO_ERR)
+	    {
+   	     USBMSSTOR_PRINTF_ERR;
+	    }
+   	 printf("INIT MS SUCCEEDED!\n");
+    }
+    return result;
+
+}
+/*****************************************************************************
+ * int usb_ms_disconnect(usbDevice * device);
+ *
+ * Description:
+ *
+ * This function is the disconnect routine that is registered with the USB host
+ * stack through usb_ms_init().  The USB host stack calls this function when a
+ * USB mass storage device is disconnected.  This function calls f_delvolume(),
+ * a FAT32 file system API function, to remove the FAT32 volume for the
+ * disconnected storage device.
+ *
+ * Arguments:
+ *
+ * device               The pointer to the usbDevice structure associated with
+ *                      the USB mass storage device.
+ *
+ * Return Values:
+ *
+ * None
+ *
+ *****************************************************************************/
+
+/*** BeginHeader usb_ms_disconnect */
+__root  void usb_ms_disconnect(usbDevice __far *device);
+/*** EndHeader */
+
+USBMassStorDebug
+__root  void usb_ms_disconnect(usbDevice __far *device)
+{
+    USB_MS __far *ms;
+    int i, error_code;
+
+    if (device == NULL)
+    {
+        USBMSSTOR_PRINTF_ERR;
+        //"usb_ms_disconnect: device is NULL\n"
+        goto usbmsdiscexit;
+    }
+    ms = (USB_MS __far *)device->driverData;
+    if (ms == NULL)
+    {
+        USBMSSTOR_PRINTF_ERR;
+        //"usb_ms_disconnect: ms is NULL\n"
+        goto usbmsdiscexit;
+    }
+
+#ifdef USBMSSTOR_VERBOSE
+    printf("usb_ms_disconnect: device->devnum = %d, ms = %08lx\n",device->devnum,
+          (void __far*)ms);
+#endif
+// BPM - unHooks to Net Silicon FAT here
+
+    OSFlagPost(usb_ms_event_flags, 1, OS_FLAG_CLR, (char*)&error_code);
+    RemoveEntryList(&ms->list);
+    //fsfree(ms->name);
+    //fsfree(ms->devName);
+    pffree(&usb_gen_list, ms);
+
+#ifdef USBMSSTOR_VERBOSE
+    printf("usb_ms_disconnect: USB storage device disconnected\n");
+#endif
+
+usbmsdiscexit:
+
+    return;
+}
+
+
+/***************************************************************************
+ * int usb_ms_get_max_lun(usbDevice *device, short int interface,
+ *                        unsigned char * buffer, int bytes_to_transfer,
+ *                        int * bytes_transferred, int *error_code);
+ *
+ * Description:
+ *
+ * This function performs a Get Max LUN device class specific request as
+ * specified in the USB Mass Storage Class Bulk-Only Transport Specification
+ * Revison 1.0.  A Get Max LUN request retrieves the number of logical units
+ * supported by a device.  The maximum number of logical units is 15.
+ *
+ * Arguments:
+ *
+ * device               The pointer to the usbDevice structure associated with
+ *                      the USB mass storage device.
+ * interface            The interface number in the USB storage device.
+ * error_code		The pointer to the variable that stores the error code.
+ *
+ * Return Values:
+ *
+ * 0			The driver initialization process completed.
+ * -1			The driver initialization process failed.
+ *
+ *
+****************************************************************************/
+
+/*** BeginHeader usb_ms_get_max_lun */
+
+__xmem int usb_ms_get_max_lun(usbDevice __far *device, short int interface,
+	char __far * buffer, long bytes_to_transfer, long * bytes_transferred,
+   int *error_code);
+
+/*** EndHeader */
+
+USBMassStorDebug
+__xmem int usb_ms_get_max_lun(usbDevice __far *device, short int interface,
+	char __far * buffer, long bytes_to_transfer, long * bytes_transferred,
+   int *error_code)
+{
+    devrequest request;
+    int result;
+
+    result = 0;
+
+    if (device == NULL || buffer == NULL || bytes_transferred == NULL)
+    {
+        result = -1;
+		  *error_code = USB_MS_NULL_POINTER;
+        goto usbmsgmlexit;
+    }
+
+    FORMAT_USB_DEVICE_REQUEST(
+                &request,                                   // Request pointer
+                USB_TYPE_CLASS           |                  // Request Type
+                USB_RECIP_INTERFACE      |
+                USB_DEVICE_TO_HOST_REQ,
+                GET_MAX_LUN_BREQUEST,                       // Request
+                0,                                          // Value
+                interface,                                  // Index
+                1);                         // Length
+              //  bytes_to_transfer);                         // Length
+
+    if (usb_device_request(device, FALSE, &request, buffer, 1,
+                bytes_transferred, TX_WAIT_FOREVER, error_code))
+    {
+       result = -1;
+       goto usbmsgmlexit;
+    }
+
+usbmsgmlexit:
+
+    return result;
+}
+
+/*******************************************************************************
+ * int usb_ms_transport(USB_MS *ms, int send_io, int lun, unsigned char *cmd,
+ *                      int cmd_size, unsigned char *buffer,
+ *                      int bytes_to_transfer, int * bytes_transferred,
+ *                      int *error_code);
+ *
+ * Description:
+ *
+ * This function is called by usb_ms_write() and usb_ms_read() to send a
+ * protocol command to transfer data to and from a USB storage device.
+ * Since usb_ms_write() and usb_ms_read() are wrapper functions for
+ * this function, the description of this function's arguments is identical
+ * to the wrapper functions.
+ *
+ * The send_io argument specifies whether the I/O transfer is a data read or
+ * a data write.
+ *
+ * The ms argument specifies the USB_MS device associated with the physical
+ * storage device.  The lun argument specifies the logical unit number in the
+ * USB storage device to write to.  Some USB storage devices can have multiple
+ * logical storage units (or volumes) within the same physical device.  The
+ * logical unit number specifies which of the logical units within the physical
+ * device to access.
+ *
+ * The cmd argument is a pointer to the buffer that contains the protocol
+ * command.  These protocol commands can include SCSI, SFF8070i, QIC-157 among
+ * others.  The cmd_size argument is the length of the protocol command in bytes.
+ *
+ * The bytes_to_transfer argument specifies the number of bytes transferred.
+ * The bytes_transferred argument is a pointer to a variable to store the
+ * actual number of bytes transferred.
+ *
+ * The error_code argument is a pointer to a variable to store the error code.
+ *
+ * Arguments:
+ *
+ * ms                   The USB_MS device associated with a USB storage device.
+ * send_io              Flag to indicate whether the I/O transfer is a data
+ *                      read or data write.
+ * lun                  The logical unit within the physical device to access.
+ * cmd                  The pointer to the buffer that stores the protocol
+ *                      command.
+ * cmd_size             The length of the protocol command in bytes.
+ * bytes_to_transfer    The number of bytes to send.
+ * bytes_transferred    The pointer to a variable to store the number of bytes
+ *                      sent.
+ * error_code           The pointer to the variable that stores the error code.
+ *
+ * Return Values:
+ *
+ * 0                    The I/O request was completed.
+ * -1                   The I/O request failed.
+ *
+******************************************************************************/
+/*** BeginHeader usb_ms_transport */
+
+__xmem int usb_ms_transport(USB_MS __far *ms, int send_io, int lun,
+      char __far *cmd, int cmdsize, char __far *buffer,
+      long bytes_to_transfer, long * bytes_transferred, int *error_code);
+
+/*** EndHeader */
+
+//USBMassStorDebug
+__xmem int usb_ms_transport(USB_MS __far *ms, int send_io, int lun,
+      char __far *cmd, int cmdsize,  char __far *buffer,
+      long bytes_to_transfer, long * bytes_transferred, int *error_code)
+{
+    auto int i, clear_stall_count, gotcsw, result;
+    auto long  datax, xferred;
+    static char __far *cw_buffer;
+    static __far USB_MS_CSW csw;
+    auto unsigned char endpoint;
+
+restart_usb_ms_transport:
+
+     i = 0; clear_stall_count = 0;
+     gotcsw = FALSE;  xferred = 0;
+     datax = 0; result = 0;
+
+    if(cmdsize > CBW_SIZE)
+    {
+        result = -1;
+        *error_code = USB_MS_INVALID_CBW_SIZE;
+        goto usbmstrnspexit;
+    }
+
+    // align buffer to 32 byte boundary
+    // NS code uses auto buffer of 63 bytes to align ptr.
+    //SJH - use pobe request area allocated after ms struct
+    cw_buffer = (char __far *)(ms+1);
+    /*
+    if(NULL==(cw_buffer=fsmalloc(32)))
+    {
+        result = -1;
+        *error_code = USB_MS_MALLOC_FAILED;
+        goto usbmstrnspexit;
+    }
+    */
+
+    _f_memset(cw_buffer, 0, CBW_SIZE); //BPM:COIO
+    //SJH - replace the following with something much more compact...
+    /*
+
+    cw_buffer[0] = (char)(CBW_SIGNATURE & 0xfful);
+    cw_buffer[1] = (char)((CBW_SIGNATURE & 0xff00ul)>>8);
+    cw_buffer[2] = (char)((CBW_SIGNATURE & 0xff0000ul)>>16);
+    cw_buffer[3] = (char)((CBW_SIGNATURE & 0xff000000ul)>>24);
+    cw_buffer[4] = (char)(CBW_TAG & 0xff);
+    cw_buffer[5] = (char)((CBW_TAG & 0xff00ul)>>8);
+    cw_buffer[6] = (char)((CBW_TAG & 0xff0000ul)>>16);
+    cw_buffer[7] = (char)((CBW_TAG & 0xff000000ul)>>24);
+    cw_buffer[8] = (char)(bytes_to_transfer & 0xff);
+    cw_buffer[9] = (char)((bytes_to_transfer & 0xff00ul)>>8);
+    cw_buffer[10] = (char)((bytes_to_transfer & 0xff0000ul)>>16);
+    cw_buffer[11] = (char)((bytes_to_transfer & 0xff000000ul)>>24);
+    */
+    _f_memcpy(cw_buffer, "\x55\x53\x42\x43\x4E\x53\x49\x4C", 8);
+    *(long __far *)(cw_buffer + 8) = bytes_to_transfer;
+
+    cw_buffer[12] = (char)(send_io ? 0 : 0x80);
+    cw_buffer[13] = (char)(lun);
+    cw_buffer[14] = cmdsize;
+    _f_memcpy(cw_buffer + CB_OFFSET, cmd, cmdsize);
+
+    if (result = usb_bulk_transfer(ms->usb,
+             TRUE,
+             ms->bulkOutEp,
+             cw_buffer, CBW_SIZE,
+             &xferred,
+             ms->bulkOutMaxPacketSize,
+             TX_WAIT_FOREVER,
+             error_code))
+    {
+        USBMSSTOR_PRINTF_ERR;
+        //"usb_ms_transport: usb_bulk_transfer failed\n"
+        result = -1;
+        if (*error_code == USBH_STALL)
+        {
+            if (usb_ms_reset_recovery(ms, error_code))
+            {
+			       USBMSSTOR_PRINTF_ERR;
+                //"usb_ms_transport: usb_ms_reset_recovery failed\n"
+            }
+        }
+        goto usbmstrnspexit;
+    }
+    //OSTimeDlyHMSM(0,0,0,MIN_SLEEP_INTERVAL_MS); //BPM
+
+    if(send_io)
+    {
+        result = usb_bulk_transfer(ms->usb, TRUE, ms->bulkOutEp, buffer,
+                         bytes_to_transfer, &xferred,
+                         ms->bulkOutMaxPacketSize, TX_WAIT_FOREVER,
+                         error_code);
+        endpoint = (char)ms->bulkOutEp;
+    }
+    else
+    {
+        result = usb_bulk_transfer(ms->usb, FALSE, ms->bulkInEp, buffer,
+                         bytes_to_transfer, &xferred, ms->bulkInMaxPacketSize,
+                         TX_WAIT_FOREVER, error_code);
+        endpoint = (char)ms->bulkInEp;
+    }
+    if(result)
+    {
+        USBMSSTOR_PRINTF_ERR;
+        //"usb_ms_transport: usb_bulk_transfer failed\n"
+        if (*error_code == USBH_STALL)
+        {
+            // Clear stall condition on endpoint
+            if (usb_clear_endpoint_feature(ms->usb, endpoint,
+                                   USB_FEATURE_ENDPOINT_HALT, error_code))
+            {
+                USBMSSTOR_PRINTF_ERR;
+                //"usb_ms_transport: usb_clear_endpoint_feature failed\n"
+                goto usbmstrnspexit;
+            }
+        }
+    }
+
+    datax = xferred;
+    if(xferred > bytes_to_transfer)
+    {
+#ifdef USBMSSTOR_VERBOSE
+        printf("usb_ms_transport: Got extra bytes %d/%d bytes\n",
+              xferred, bytes_to_transfer);
+#endif
+        // The extra bytes could be the CSW
+        if(xferred - bytes_to_transfer == CSW_SIZE)
+            gotcsw = TRUE;
+        else
+        {
+            result = -1;
+            goto usbmstrnspexit;
+        }
+		  datax -= CSW_SIZE;
+    }
+    // retrieve csw
+    _f_memset(cw_buffer, 0, CSW_SIZE);
+    if(gotcsw)
+        _f_memcpy(cw_buffer, buffer + bytes_to_transfer, CSW_SIZE);
+    else
+    {
+        for (i = 0; i < 2; i++)
+        {
+            result = usb_bulk_transfer(ms->usb, FALSE, ms->bulkInEp, cw_buffer,
+                                      CSW_SIZE, &xferred,
+                                      ms->bulkInMaxPacketSize,
+                                      TX_WAIT_FOREVER,
+                                      error_code);
+            if (!result)
+            {
+                //OSTimeDlyHMSM(0,0,0,70); //BPM  Writes need extra time to
+                break;
+            }
+            else
+            {
+                USBMSSTOR_PRINTF_ERR;
+                //"usb_ms_transport: usb_bulk_transfer failed\n");
+                if (*error_code == USBH_STALL)
+                {
+                    if (!clear_stall_count)
+                    {
+                        // Clear stall condition on endpoint
+                        if (usb_clear_endpoint_feature(ms->usb, endpoint,
+                                   USB_FEATURE_ENDPOINT_HALT, error_code))
+                        {
+                            USBMSSTOR_PRINTF_ERR;
+                            //"usb_ms_transport: usb_clear_endpoint_feature failed\n"
+                            goto usbmstrnspexit;
+                        }
+                        else
+                            clear_stall_count++;
+                    }
+                    else
+                    {
+                        if (usb_ms_reset_recovery(ms, error_code))
+                        {
+                            USBMSSTOR_PRINTF_ERR;
+                            //"usb_ms_transport: usb_ms_reset_recovery failed\n"
+                            goto restart_usb_ms_transport;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (i >= 2)
+    {
+        result = -1;
+        USBMSSTOR_PRINTF_ERR;
+        //"usb_ms_transport: read CSW failed\n"
+        goto usbmstrnspexit;
+    }
+
+    //BPM The original NS code snagged here because
+    //  of Endian-ness, which makes me believe that
+    //  code never ran on a little-Endian device.
+    csw.sig = *(UINT32 __far*)cw_buffer;
+    csw.tag = *(UINT32 __far*)(cw_buffer+4);
+    csw.res = *(UINT32 __far*)(cw_buffer+8);
+    csw.status = cw_buffer[12];
+
+    // parse csw
+    switch(csw.status)
+    {
+        case CSW_COMMAND_PASSED:
+            //printf("usb_ms_transport: CSW_COMMAND_PASSED\n");
+            break;
+
+        case CSW_COMMAND_FAILED:
+            result = -1;
+            USBMSSTOR_PRINTF_ERR;
+            //"usb_ms_transport: CSW_COMMAND_FAILED\n"
+            *error_code = USB_MS_CSW_COMMAND_FAILED;
+            goto usbmstrnspexit;
+
+        case CSW_PHASE_ERROR:
+            result = -1;
+            USBMSSTOR_PRINTF_ERR;
+            //"usb_ms_transport: CSW_COMMAND_FAILED\n"
+            *error_code = USB_MS_CSW_PHASE_ERROR;
+
+            if (usb_ms_reset_recovery(ms, error_code))
+            {
+                USBMSSTOR_PRINTF_ERR;
+                //"usb_ms_transport: usb_ms_reset_recovery failed\n"
+            }
+            goto usbmstrnspexit;
+
+        default:
+            //    0x03, 0x04 Reserved (Obsolete)
+            //    0x05 - 0xff Reserved
+	    break;
+    }
+    if(CSW_SIGNATURE != csw.sig)
+    {
+        result = -1;
+        *error_code = USB_MS_INVALID_CSW_SIGNATURE;
+         USBMSSTOR_PRINTF_ERR;
+        //"usb_ms_transport: invalid CSW signature!\n"
+
+// This error recovery screws up the next transfer,
+// comment out until it's fixed
+//        if (usb_ms_reset_recovery(ms, error_code))
+//        {
+//            USBMSSTOR_PRINTF_ERR;
+//            "usb_ms_transport: usb_ms_reset_recovery failed\n"
+//         }
+
+         goto usbmstrnspexit;
+    }
+    if(CBW_TAG != csw.tag)
+    {
+        result = -1;
+        *error_code = USB_MS_CSW_TAG_MISMATCH;
+        USBMSSTOR_PRINTF_ERR;
+        //"usb_ms_transport: CSW tag mismatch!\n"
+
+        if (usb_ms_reset_recovery(ms, error_code))
+        {
+            USBMSSTOR_PRINTF_ERR;
+            //"usb_ms_transport: usb_ms_reset_recovery failed\n"
+        }
+        goto restart_usb_ms_transport;
+    }
+
+    *bytes_transferred = datax;
+
+usbmstrnspexit:
+	/*
+    if(cw_buffer != NULL)
+    {
+         fsfree(cw_buffer);
+    }
+	*/
+    return result;
+}
+
+/*************************************************************************
+ * int usb_ms_reset_recovery(USB_MS *ms, int * error_code);
+ *
+ * Description:
+ *
+ * This function performs a reset recovery on the mass storage device to clear
+ * certain error conditions.  The USB host issues device requests in the
+ * following order:
+ *
+ * 1.  Bulk-Only Mass Storage Reset
+ * 2.  Clear Feature Halt to the bulk-in endpoint
+ * 3.  Clear Feature Halt to the bulk-ouy endpoint
+ *
+ * Arguments:
+ *
+ * ms                   The pointer to the USB_MS device associated with the
+ *                      storage device.
+ *
+ * Return Values:
+ *
+ * 0                    The reset recovery process completed.
+ * -1                   The reset recovery process failed.
+ ************************************************************************/
+
+/*** BeginHeader usb_ms_reset_recovery */
+__xmem int usb_ms_reset_recovery(USB_MS __far *ms, int * error_code);
+/*** EndHeader */
+
+USBMassStorDebug
+__xmem int usb_ms_reset_recovery(USB_MS __far *ms, int * error_code)
+{
+    auto int result;
+    auto usbDevice __far * device;
+    auto usbInterfaceDescriptor __far *interface;
+
+    result = -1;
+    if (ms == NULL)
+    {
+	     *error_code = USB_MS_NULL_POINTER;
+        goto usbmsrrecexit;
+    }
+
+    device = ms->usb;
+    interface = &device->config[0].interface[0];
+
+    //Bulk-Only Mass Storage Reset
+    if (usb_ms_reset(device, interface->iInterface, error_code))
+    {
+        USBMSSTOR_PRINTF_ERR;
+        //"usb_ms_reset_recovery: usb_ms_reset failed\n"
+        goto usbmsrrecexit;
+    }
+
+    // Clear Bulk In stall condition
+    if (usb_clear_endpoint_feature(device,(short)ms->bulkInEp,
+           USB_FEATURE_ENDPOINT_HALT, error_code))
+    {
+        USBMSSTOR_PRINTF_ERR;
+        //"usb_ms_reset_recovery: usb_clear_endpoint_feature failed\n"
+        goto usbmsrrecexit;
+    }
+
+    // Clear Bulk Out stall condition
+    if (usb_clear_endpoint_feature(device, (short)ms->bulkOutEp,
+            USB_FEATURE_ENDPOINT_HALT, error_code))
+    {
+        USBMSSTOR_PRINTF_ERR;
+        //"usb_ms_reset_recovery: usb_clear_endpoint_feature failed\n"
+    }
+    result = 0;
+
+usbmsrrecexit:
+
+    return result;
+}
+
+
+/************************************************************************
+ * int usb_ms_reset(usbDevice *device, short int interface, int *error_code);
+ *
+ * Description:
+ *
+ * This function performs a Bulk-Only Mass Storage Reset device class specific
+ * request as specified in the USB Mass Storage Class Bulk-Only Transport
+ * Specification Revison 1.0.  A Bulk-Only Mass Storage Reset request resets
+ * the mass storage device and its associated interface.
+ *
+ * Arguments:
+ *
+ * device               The pointer to the usbDevice structure associated with
+ *                      the USB mass storage device.
+ * interface            The interface number in the USB storage device.
+ * error_code       The pointer to the variable that stores the error code.
+ *
+ * Return Values:
+ *
+ * 0			The mass storage reset request was completed.
+ * -1			The mass storage reset request failed.
+ *
+ ***********************************************************************/
+
+/*** BeginHeader usb_ms_reset */
+__xmem int usb_ms_reset(usbDevice __far *device, short int interface,
+     int *error_code);
+/*** EndHeader */
+
+USBMassStorDebug
+__xmem int usb_ms_reset(usbDevice __far *device, short int interface,
+     int *error_code)
+{
+    auto devrequest request;
+    auto int result;
+
+    result = -1;
+
+    if (device == NULL)
+    {
+		  *error_code = USB_MS_NULL_POINTER;
+        goto usbmsresexit;
+    }
+
+    FORMAT_USB_DEVICE_REQUEST(
+                &request,                                // Request pointer
+                USB_TYPE_CLASS | USB_RECIP_INTERFACE,    // Request Type
+                RESET_BREQUEST,                          // Request
+                0,                                       // Value
+                interface,                               // Index
+                0);                                      // Length
+
+
+    if (usb_device_request(device, TRUE, &request, NULL, 0, NULL,
+                         TX_WAIT_FOREVER, error_code))
+    {
+       goto usbmsresexit;
+    }
+
+    result = 0;
+usbmsresexit:
+
+    return result;
+}
+
+/* START FUNCTION DESCRIPTION ********************************************
+   usb_ms_current_device    <USBMassStorage.LIB>
+
+SYNTAX: int usb_ms_current_device(USB_MS ** ms);
+
+DESCRIPTION: This function returns the address of the USB_MS device
+	associated with the USB storage device currently being enumerated.
+
+PARAMETER:
+	ms	-	The pointer to the pointer that stores the address of the
+			USB_MS device.
+
+RETURN VALUE:
+	  0 -  Success
+    -1 - Failure
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader usb_ms_current_device */
+__xmem int usb_ms_current_device(USB_MS __far ** ms, int * error_code);
+/*** EndHeader */
+
+USBMassStorDebug
+__xmem int usb_ms_current_device(USB_MS __far ** ms, int * error_code)
+{
+    auto int result;
+
+    result = -1;
+
+    if (ms == NULL)
+    {
+		  *error_code = USB_MS_NULL_POINTER;
+        goto exit_cd_function;
+    }
+    if (current_ms_device == NULL)
+    {
+		  *error_code = USB_MS_CURRENT_DEVICE_NULL;
+        goto exit_cd_function;
+    }
+    *ms = current_ms_device;
+
+    result = 0;
+exit_cd_function:
+
+    return result;
+}
+
+/* START FUNCTION DESCRIPTION ********************************************
+   usb_ms_write   <USBMassStorage.Lib>
+
+SYNTAX:  int usb_ms_write(USB_MS far *ms, int logical_unit_number,
+					char far *cmd, int cmd_size, char far *buffer,
+               long bytes_to_transfer, long * bytes_transferred);
+
+DESCRIPTION: This function sends a protocol command to send data to a USB
+				 storage device. The cmd argument is a pointer to the buffer
+             that contains the protocol command. These protocol commands
+             can include SCSI, SFF8070i, QIC-157 among others.
+
+PARAMETER1:
+	ms -  The USB_MS device associated with a USB storage device.
+PARAMETER2:
+	logical_unit_number -  The logical unit within the physical device to access.
+PARAMETER3:
+  cmd  - The pointer to the buffer that stores the protocol
+         command.
+PARAMETER4:
+	cmd_size -  The length of the protocol command in bytes.
+PARAMETER5:
+	bytes_to_transfer  -  The number of bytes to send.
+PARAMETER6:
+	bytes_transferred  -  The pointer to a variable to store the number of bytes
+                        sent.
+
+RETURN VALUE:
+	  0 -  Success
+    -1 - Failure
+
+END DESCRIPTION **********************************************************/
+
+/**************************************************************************
+ * int usb_ms_write(USB_MS *ms, int logical_unit_number, unsigned char *cmd,
+ *                  int cmd_size, unsigned char *buffer, int bytes_to_transfer,
+ *                  int * bytes_transferred, int *error_code);
+ *
+ * Description:
+ *
+ * This function sends a protocol command to send data to a USB storage device.
+ *
+ * The ms argument specifies the USB_MS device associated with the physical
+ * storage device.  The logical_unit_number argument specifies the logical unit
+ * number in the USB storage device to write to.  Some USB storage devices can
+ * have multiple logical storage units (or volumes) within the same physical
+ * device.  The logical unit number specifies which of the logical units within
+ * the physical device to access.
+ *
+ * The cmd argument is a pointer to the buffer that contains the protocol
+ * command.  These protocol commands can include SCSI, SFF8070i, QIC-157 among
+ * others.  The cmd_size argument is the length of the protocol command in bytes.
+ *
+ * The bytes_to_transfer argument specifies the number of bytes to send to the
+ * storage device.  The bytes_transferred argument is a pointer to a variable
+ * to store the actual number of bytes sent to the storage device.
+ *
+ * The error_code argument is a pointer to a variable to store the error code.
+ *
+ * Arguments:
+ *
+ * ms                   The USB_MS device associated with a USB storage device.
+ * logical_unit_number  The logical unit within the physical device to access.
+ * cmd                  The pointer to the buffer that stores the protocol
+ *                      command.
+ * cmd_size             The length of the protocol command in bytes.
+ * bytes_to_transfer    The number of bytes to send.
+ * bytes_transferred    The pointer to a variable to store the number of bytes
+ *                      sent.
+ * error_code           The pointer to the variable that stores the error code.
+ *
+ * Return Values:
+ *
+ * 0                    The I/O request was completed.
+ * -1                   The I/O request failed.
+ *
+ ****************************************************************************/
+/*** BeginHeader usb_ms_write */
+__xmem int usb_ms_write(USB_MS __far *ms, int logical_unit_number, char __far *cmd,
+                 int cmd_size, char __far *buffer,long bytes_to_transfer,
+                 long * bytes_transferred, int *error_code);
+/*** EndHeader */
+
+USBMassStorDebug
+__xmem int usb_ms_write(USB_MS __far *ms, int logical_unit_number, char __far *cmd,
+                 int cmd_size, char __far *buffer, long bytes_to_transfer,
+                 long * bytes_transferred, int *error_code)
+{
+    return usb_ms_transport(ms, TRUE, logical_unit_number, cmd, cmd_size,
+               buffer, bytes_to_transfer, bytes_transferred, error_code);
+}
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+   usb_ms_read   <USBMassStorage.Lib>
+
+SYNTAX:  usb_ms_read(USB_MS far *ms, int logical_unit_number,
+                 char far *cmd, int cmd_size, char far *buffer,
+                 long bytes_to_transfer, long * bytes_transferred);
+
+DESCRIPTION: This function sends a protocol command to send data to a USB
+				 storage device. The cmd argument is a pointer to the buffer
+             that contains the protocol command. These protocol commands
+             can include SCSI, SFF8070i, QIC-157 among others.
+
+PARAMETER1:
+	ms -  The USB_MS device associated with a USB storage device.
+PARAMETER2:
+	logical_unit_number -  The logical unit within the physical device to access.
+PARAMETER3:
+  cmd  - The pointer to the buffer that stores the protocol
+         command.
+PARAMETER4:
+	cmd_size -  The length of the protocol command in bytes.
+PARAMETER5:
+	bytes_to_transfer -  The number of bytes to read.
+PARAMETER6:
+	bytes_transferred -  The pointer to a variable to store the number of bytes
+                        read.
+
+RETURN VALUE:
+	  0 -  Success
+    -1 - Failure
+
+END DESCRIPTION **********************************************************/
+
+/*
+ * int usb_ms_read(USB_MS *ms, int logical_unit_number, unsigned char *cmd,
+ *                 int cmd_size, unsigned char *buffer, int bytes_to_transfer,
+ *                 int * bytes_transferred, int* error_code);
+ *
+ * Description:
+ *
+ * This function sends a protocol command to read data from a USB storage
+ * device.
+ *
+ * The ms argument specifies the USB_MS device associated with the physical
+ * storage device.  The logical_unit_number argument specifies the logical unit
+ * number in the USB storage device to write to.  Some USB storage devices can
+ * have multiple logical storage units (or volumes) within the same physical
+ * device.  The logical unit number specifies which of the logical units within
+ * the physical device to access.
+ *
+ * The cmd argument is a pointer to the buffer that contains the protocol
+ * command.  These protocol commands can include SCSI, SFF8070i, QIC-157 among
+ * others.  The cmd_size argument is the length of the protocol command in
+ * bytes.
+ *
+ * The bytes_to_transfer argument specifies the number of bytes to read from
+ * the storage device.  The bytes_transferred argument is a pointer to a
+ * variable to store the actual number of bytes sent to the storage device.
+ *
+ * The error_code argument is a pointer to a variable to store the error code.
+ *
+ * Arguments:
+ *
+ * ms                   The USB_MS device associated with a USB storage device.
+ * logical_unit_number  The logical unit within the physical device to access.
+ * cmd                  The pointer to the buffer that stores the protocol
+ *                      command.
+ * cmd_size             The length of the protocol command in bytes.
+ * bytes_to_transfer    The number of bytes to read.
+ * bytes_transferred    The pointer to a variable to store the number of bytes
+ *                      sent.
+ * error_code           The pointer to the variable that stores the error code.
+ *
+ * Return Values:
+ *
+ * 0                    The I/O request was completed.
+ * -1                   The I/O request failed.
+ *
+ ******************************************************************************/
+/*** BeginHeader usb_ms_read */
+__xmem int usb_ms_read(USB_MS __far *ms, int logical_unit_number,
+                 char __far *cmd, int cmd_size, char __far *buffer,
+                 long bytes_to_transfer, long * bytes_transferred,
+                 int *error_code);
+/*** EndHeader */
+
+USBMassStorDebug
+__xmem int usb_ms_read(USB_MS __far *ms, int logical_unit_number,
+                 char __far *cmd, int cmd_size, char __far *buffer,
+                 long bytes_to_transfer, long * bytes_transferred,
+                 int *error_code)
+{
+    return usb_ms_transport(ms, FALSE, logical_unit_number, cmd, cmd_size,
+       buffer, bytes_to_transfer, bytes_transferred, error_code);
+}
+
+
+/***************************************************************
+   FAT hook functions follow
+***************************************************************/
+
+/*** BeginHeader usbms_write_sector */
+__xmem int usbms_write_sector(usbms_device *usb,
+								 unsigned long  sector_number,
+                           char __far *data_buffer);
+/*** EndHeader */
+USBMassStorDebug
+__xmem int usbms_write_sector(usbms_device *usb,
+								 unsigned long  sector_number,
+                                char __far *data_buffer )
+{
+    int result, errMess;
+    long nbytes;
+    char cmd[10];
+
+  	cmd[0] =  0x2A  ;    // RCB Write command
+   cmd[1] =  0x08  ;    // FUA bit
+  	cmd[2] =  (char)(sector_number>>24UL);
+  	cmd[3] =  (char)(sector_number>>16UL);
+  	cmd[4] =  (char)(sector_number>>8UL);
+  	cmd[5] =  (char)sector_number;
+   cmd[6] =  0;
+   cmd[7] =  0;         // MSB of transfer length (1 block)
+   cmd[8] =  1;         // LSB of transfer len.
+   cmd[9] =  0;
+
+  	result = usb_ms_write(current_ms_device,
+                 0,
+                 cmd,
+                 10,
+                 data_buffer,
+                 512,
+                 &nbytes,
+                 &errMess
+                );
+   return result;
+}
+
+/*** BeginHeader usbms_read_sector */
+__xmem int usbms_read_sector(usbms_device *usb,
+								unsigned long  sector_number,
+                           char __far *data_buffer);
+/*** EndHeader */
+USBMassStorDebug
+__xmem int usbms_read_sector(usbms_device *usb,
+								unsigned long  sector_number,
+                               char __far *data_buffer)
+{
+   int result, errMess;
+   long nbytes;
+   char cmd[10];
+
+  	cmd[0] =  0x28  ;    // RCB Read command
+	cmd[1] =  0;
+  	cmd[2] =  (char)(sector_number>>24UL);
+  	cmd[3] =  (char)(sector_number>>16UL);
+  	cmd[4] =  (char)(sector_number>>8UL);
+  	cmd[5] =  (char)sector_number;
+	cmd[6] =  0;
+   cmd[7] =  0;
+	cmd[8] =  1;
+	cmd[9] =  0;
+
+   result = usb_ms_read(current_ms_device,
+   	                0, 		 // LUN
+                      cmd,     // RBC command,
+                      10,      // command size
+                      data_buffer, // destination to fill
+                      512,     // # bytes to read
+                      &nbytes, // # bytes read
+                      &errMess
+						   );
+   return result;
+}
+
+
+/*** BeginHeader usbms_initDev */
+__xmem int usbms_initDev(usbms_device *usb);
+
+
+extern char __far usbms_fscratch[512];
+extern char usbms_scratch[512];
+extern usbms_device USBMS[USBMS_MAX_DEVS];
+/*** EndHeader */
+char __far usbms_fscratch[512];
+char usbms_scratch[512];
+usbms_device USBMS[USBMS_MAX_DEVS];
+
+//USBMassStorDebug
+__xmem int usbms_initDev(usbms_device *usb)
+{
+   int result, errMess;
+   _fat_bpb  BPB;
+   long nbytes;
+
+   // Sector 1 should contain the Partition Boot Record (PBR)
+   //  We need the BIOS Parameter Block (BPB) at offset 0x0B
+   //  in this sector to determine capacity.
+   // Should also implement RCB read capacity command for unformatted
+   //  media, although it doesn't seem to be implemented in the Rabbit
+   //  xD card reader.
+   result = usbms_read_sector(usb, 1UL, usbms_fscratch);
+
+   // Verify signature word  @ PBR offset 0x1FE
+   if(0xAA55 != *(int __far*)(usbms_fscratch+0x1FE))
+   {
+     return -ENODEV;
+   }
+
+   usb->write_state = 0;
+   usb->write_sector = 0UL;
+   _f_memcpy(&BPB, usbms_fscratch, sizeof(_fat_bpb));
+   if(BPB.sec_cnt16){
+		usb->sectors = BPB.sec_cnt16;
+   }
+   else {
+		usb->sectors = BPB.sec_cnt32;
+   }
+   return result;
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+

@@ -1,0 +1,2004 @@
+/*** BeginHeader */
+#ifndef BOOTP_H
+#define BOOTP_H
+/*** EndHeader */
+/*
+ * bootp.lib
+ *
+ * Copyright (C) 2006  Rabbit Semiconductor, Inc. All rights reserved.
+ *
+ * Bootstrap Protocol (BOOTP) and Dynamic Host Configuration Protocol (DHCP)
+ * Based on RFCs:
+ *   951 'Bootstrap Protocol (BOOTP)'
+ *   2131 'Dynamic Host Configuration Protocol (DHCP)'
+ *   2132 'DHCP Options and BOOTP Vendor Extensions'
+ *   1534 'Interoperation between DHCP and BOOTP'
+ *
+ * Original BOOTP.LIB (Dynamic C up to 8.20) updated to support non-blocking
+ * operation.  DHCP now works in the "background" as a normal part of the
+ * interface tick function.  Any interface which has the IFF_DHCP flag
+ * set will use DHCP when the link layer comes up.  The interface will
+ * remain in a pending state until DHCP succeeds or times out.
+ *
+ * DHCP_USE_TFTP and automatic bootfile download have been removed.
+ * This facility was rarely used, not very flexible, and becomes
+ * overly complicated now that multiple interfaces are supported.
+ * You can still use TFTP after the interface comes up, in the
+ * conventional manner.
+ *
+ * The underlying implementation has been changed to not require any
+ * large stack buffers, xmem buffers or even a UDP socket structure.
+ * This greatly reduces the worst-case stack usage for tcp_tick().
+ * DHCP packets are handled specially by the library which is why a
+ * UDP socket is not required.  The only restriction is that
+ * ETH_MAXBUFS must include at least one entry for each interface which
+ * can possibly use DHCP, plus one for each PPP (serial) interface,
+ * plus one more.
+ *
+ * Note that DHCP now requires less than 1k bytes of stack,
+ * as opposed to the >2k required by the previous version.
+ */
+
+/* START LIBRARY DESCRIPTION *********************************************
+BOOTP.LIB
+	Copyright (c) 2006, Rabbit Semiconductor.
+
+DESCRIPTION:
+	Dynamic Host Configuration Protocol (DHCP); Bootstrap Protocol (BOOTP).
+
+	These standard protocols (internet RFC951 and RFC2131) are used to
+	provide host machines with important information about their network
+	identity, and their local network environment.  BOOTP is the older
+	protocol, and was originally used to assign a permanent IP address to
+	client hosts, as well as allow a kernel image (or similar) file to
+	be downloaded to diskless workstations.  DHCP is an enhancement to
+	BOOTP which allows IP addresses to be assigned for possibly limited
+	time (known as a 'lease').  Client machines need to periodically
+	renew their lease.  DHCP simplifies centralised administration of a
+	limited pool of IP addresses.
+
+	Both protocols allow a number of configuration parameters to be sent
+	to the client host, including the important information:
+
+	  . Client's IP address
+	  . Net mask
+	  . Host and default domain name
+	  . List of gateways
+	  . List of name servers (BIND)
+
+	plus some other inessential but useful data:
+
+	  . Various standard servers such as NTP, cookie etc.
+	  . A bootstrap server address
+	  . The name of a bootstrap file
+
+	This library is invoked by #defining the symbol USE_DHCP.  If defined,
+	then DHCP or BOOTP (depending on which type of server is installed
+	on the local network) may be used to obtain network parameters.
+
+   DHCP may be used on more than one interface, however it would normally
+   be used only on the main interface.  [If used on more than one i/f,
+   the application will need to resolve any conflicting options such as
+   differing timezones].
+
+	Note that BOOTP.LIB is automatically included when you #use DCRTCP.LIB
+	after #define USE_DHCP.
+
+	Control Macros
+	--------------
+
+	There are various macros which control use of DHCP.  Apart from
+	setting these macros before '#use dcrtcp.lib', there is typically
+	very little additional work that needs to be done to use DHCP/BOOTP
+	services.  Most of the work is done automatically when you call
+	sock_init() to initialise TCP/IP.  Note that initialisation may take
+	longer when using DHCP as opposed to static configuration, but this
+	depends on your server.
+
+   #define USE_DHCP
+
+   If defined, causes the target to use BOOTP and/or DHCP to configure
+   required parameters.  If not defined, then you must determine the
+   appropriate IP address by other means, as in static configuration,
+   or allow user configuration by front-panel.
+
+   #define NUM_DHCP_IF	1
+
+   Define number of interfaces which qualify for DHCP.  During initialization,
+   each interface (in numeric order) is scanned to determine whether it
+   qualifies for DHCP.  As soon as NUM_DHCP_IF interfaces are found to
+   qualify, then the scanning is halted (and any remaining interfaces
+   are not able to use DHCP).  When multiple interfaces are in use,
+   the ethernets get qualified first, followed by PPP serial, followed by
+   PPPoE.  PPP interfaces will only be qualified if the following macro(s)
+   are defined.  Ethernet (if any) is always qualified.
+
+   #define DHCP_ON_PPP
+   #define DHCP_ON_PPPOE
+
+   If defined, then also allow DHCP to be used on PPP interfaces.
+   (PPP is for serial interfaces, PPPOE if for PPP over Ethernet).
+   This is not defined by default, since DHCP is normally used on
+   Ethernet only.  Do not define unless it is really needed, since
+   additional root data space is required for the DHCP structures.
+   DHCP on PPP interfaces works slightly differently: since IPCP has
+   already defined an IP address, the DHCP server is only queried for
+   options using the INFORM request.  Any DNS servers override the ones which
+   may have been assigned by IPCP.
+
+   #define BOOTP_ONLY
+
+   If defined, the library is configured for BOOTP only, not DHCP.  This
+   cuts down on code size, but some of the DHCP options will not be
+   available (such as non-permanent leases).  The library reduces to
+   a BOOTP client only, as per RFCs 951 and 1048.
+
+   Note that this macro is incompatible with DHCP_ON_PPP/PPPOE.  A compile
+   time error will result if both are defined.
+
+   #define DHCP_CHECK
+
+   If this is defined, then the target will check for existence
+   of another host already using an offered IP address, using ARP.  If
+   the host exists, then the offer will be declined.  If this happened
+   most DHCP servers would log a message to the administrator, since it
+   may represent a misconfiguration.  If not defined, then the target
+   will request the first offered address without checking.  The check
+   is done via ARP by sending an ARP request then waiting up to 1 second
+   for a reply.  If a reply comes in, then current DHCP offer is
+   declined and the process is restarted.  Setting DHCP_CHECK introduces
+   an extra 1 second delay when starting the interface.
+
+   #define DHCP_MINRETRY 60
+
+   Minimum retry interval in seconds.  Defaults to the RFC2131 recommended
+   value of 60 seconds.  This is only used during REBIND and RENEW processing.
+
+   #define DHCP_DEFAULT_TIMEOUT 6
+
+   Default lease acquisition timeout, if the application does not
+   explicitly set a timeout using ifconfig(...IFS_DHCP_TIMEOUT...)
+   of if the timeout is set to zero seconds.
+
+   #define DHCP_CLASS_ID "Rabbit2000-TCPIP:Rabbit:Test:1.0.0"
+
+   Defines a class identifier by which the OEM can identify the type
+   of configuration parameters expected.  DHCP servers can use this
+   information to direct the target to the appropriate configuration
+   file.  Rabbit Semiconductor recommends the standard format "hardware:vendor:
+   product code:firmware version".  This should be the same string
+   for each "clone" of a particular product.
+
+   #define DHCP_CLIENT_ID      clientid_char_ptr
+   #define DHCP_CLIENT_ID_LEN  clientid_length
+
+   Define a client identifier string.  Since the client ID can contain
+   binary data, the length of this string must be specified as well.
+   This string MUST be unique amongst all clients in an administrative
+   domain, thus in practice the client ID must be individually set
+   for each client e.g. via front-panel configuration.  It is NOT
+   recommended to program a hard-coded string (as for class ID).
+   Note that RFC2132 recommends that the first byte of the string
+   should be zero if the client ID is not actually the hardware
+   type and address of the client (see next).
+
+   Note: if multiple interfaces use DHCP, then the same client ID
+   will be passed for each interface.
+
+   #define DHCP_CLIENT_ID_MAC
+
+   If defined, this overrides DHCP_CLIENT_ID, and automatically sets
+   the client ID string to be the hardware type (1 for ethernet) and
+   MAC address, as suggested by RFC2132.  If the interface is not in
+   fact an ethernet, then no client ID will be specified.  No released
+   Rabbit board has more than one ethernet, but if there was there would
+   be a unique client ID for each ethernet interface (since they each
+   have a unique MAC address).  The DHCP server would treat each
+   interface completely independently, unlike the above case where
+   fixed client IDs are used.
+
+   This macro has no effect for PPP interfaces.
+
+
+   #define DHCP_SEND_HOSTNAME
+
+   If defined, the local host name (set by using the sethostname()
+   function) is sent to the DHCP server using option 12.  Some DHCP
+   servers may be able to add the host name via dynamic DNS or some
+   other means so that third-party hosts can look up the assigned IP
+   address by name resolution.  Of course, this has no effect unless
+   the DHCP server can do something with it, but it probably doesn't
+   hurt to send it anyway.  See also the IFS_DHCP_DOMAIN flag in the
+   following section.
+
+
+   #define DHCP_NUM_ROUTERS   1
+   #define DHCP_NUM_DNS   1
+   #define DHCP_NUM_SMTP  0
+   #define DHCP_NUM_NTP   0
+   #define DHCP_NUM_QOTD  0
+
+	Define these macros to the number of various server IP addresses
+	to obtain from the DHCP server.  If set to zero, the corresponding
+	server addresses will not be available.  The default for routers and
+	DNS is 1, since these are commonly required.  The other server types
+	may be defined, but default to zero.
+
+   Any other options may be obtained from the server by specifying
+   ifconfig(...IFS_DHCP_OPTIONS...) and a suitable callback function.
+
+	#define DHCP_SET_BCAST
+
+	Define this to tell the DHCP server to send responses using IP
+	broadcast.  It should not be necessary to set this flag, and doing
+	so is undesirable.
+
+	#define DHCP_IFACE	IF_DEFAULT
+
+   This macro is for backward compatibility only.  DC8.20 and previous
+   only supported DHCP on a single interface.  Now DHCP is supported
+   on any (or all) interfaces, thus this macro is only for the use of
+   deprecated functions.
+
+	Define this to specify the interface which is to be controlled via
+	the (deprecated) functions dhcp_acquire() and dhcp_release().
+
+
+   Interface controls
+   ------------------
+
+	The previous library release (DC8.20 and before) relied on accessing
+   global variables for certain information.  This library has removed
+   these global variables, with their functionality replaced by
+   ifconfig() calls.
+
+   The following global variables are no longer available:
+     _bootpon, _survivebootp, _dhcphost, _bootphost, _dhcplife,
+     _dhcpt1, _dhcpt2, _bootptimeout, _smtpsrv
+
+	The following ifconfig() parameters are used to manipulate and
+   return information relating to DHCP:
+
+     IFS_DHCP <int>
+     IFG_DHCP <int *>
+
+       Whether to use DHCP on the specified interface.  The parameter
+       should be TRUE if DHCP/BOOTP is to be used.  IFG_DHCP returns
+       the current setting.  In order to use DHCP, the interface
+       must be qualified for it.  If the i/f is not qualified, then
+       IFS_DHCP (and the other DHCP settings) will cause an error
+       return from ifconfig().
+
+     IFG_DHCP_OK <int *>
+
+       Get whether DHCP/BOOTP is actually OK for this interface.  This
+       becomes TRUE only when the interface is up and the lease is
+       not expired.
+
+     IFS_DHCP_TIMEOUT <int>
+     IFG_DHCP_TIMEOUT <int *>
+
+       Set or get DHCP/BOOTP total timeout interval (seconds)
+
+     IFS_DHCP_QUERY <int>
+     IFG_DHCP_QUERY <int *>
+
+       Set or get whether this interface only queries the DHCP server
+       (using the INFORM message) to get network parameters.  This mode
+       is always set for PPP interfaces.  It can be set for Ethernet as
+       well, if the IP address is explicitly specified using IFS_IPADDR.
+       If there is no IP address configured, i.e. it is zero, then normal
+       DHCP is used regardless of this flag setting.
+
+     IFS_DHCP_DOMAIN <int>
+     IFG_DHCP_DOMAIN <int *>
+
+       Set or get whether this interface makes use of the domain and
+       host name options returned by the DHCP server.  If TRUE, then
+       the returned domain is set as the default domain to be appended
+       to any host name lookups using DNS, if the host name has no '.'
+       characters in it.  Only one interface should have this flag
+       set, since there is only one 'default domain' string.  The
+       host name assigned by the DHCP server is also stored.  Note that
+       this option may also be given to the server if the
+       DHCP_SEND_HOSTNAME macro is defined.  If the IFS_DHCP_DOMAIN
+       flag is set, then any returned host name will override the name
+       initially sent to the server (i.e. the old host name set by
+       sethostname() will be forgotten).
+
+       If this flag is set, then the option handling callback (if
+       any) will NOT see option codes 12 and 15.  12 is used for the
+       host name and 15 for the domain.
+
+
+     IFS_DHCP_FALLBACK <int>
+     IFG_DHCP_FALLBACK <int *>
+
+       Set or get whether DHCP falls back to static configuration if
+       it times out during acquisition.
+
+     IFG_DHCP_FELLBACK <int *>
+
+       Get whether DHCP actually fell back to static configuration if
+       it timed out during acquisition.
+
+     IFS_DHCP_OPTIONS <int> <char *> <int (*callback)()>
+     IFG_DHCP_OPTIONS <int *> <char **>
+
+       Set or get the DHCP options request list.  The request list
+       is an array of byte values which are taken from the
+       DHCP_VN_* macros defined in BOOTP.LIB.  The first parameter
+       indicates the length of the options list.  In order to use
+       the information returned by the DHCP server, it is necessary
+       to also provide a callback function to process the
+       returned data, since BOOTP.LIB does not automatically
+       handle arbitrary information.  Note that the following
+       options are always retrieved and MUST NOT be provided in
+       the options list:
+         All DHCP protocol options (50-61),
+      	DHCP_VN_SUBNET,
+      	DHCP_VN_TIMEOFF,
+      	DHCP_VN_ROUTER,    [1]
+      	DHCP_VN_DNS,       [1]
+      	DHCP_VN_SMTPSRV,   [1]
+      	DHCP_VN_NTPSRV,    [1]
+      	DHCP_VN_COOKIE     [1]
+         DHCP_VN_HOST       [2]
+         DHCP_VN_DOMAIN     [2]
+       [1] - only forbidden if DHCP_NUM_ROUTERS etc. are defined to be non-zero.
+       [2] - only forbidden if IFS_DHCP_DOMAIN set in ifconfig().
+		 The callback function has the following prototype:
+       int my_callback(int iface, DHCPInfo * di, int opt, int len, char * data)
+       where
+         iface: interface number.
+         di: DHCP information struct (see below).  Read only, except
+             you can modify the 'data' field if desired.
+         opt: DHCP option number (DHCP_VN_*).  Also may be '0' for boot file.
+         len: length of option data in bytes
+         data: pointer to data for this option.  Read only.
+       The callback is only invoked for options which were requested and
+       which were not handled internally (such as DHCP_VN_SUBNET).
+       The return value from the callback should be zero, for future
+       compatibility.  The callback should not make any long computations,
+       blocking calls, or call any other tcp/ip functions, since it would
+       delay the main application.  If uC/OS is in use, it should also be
+       re-entrant and definitely not call any tcp/ip functions.
+
+     IFG_DHCP_INFO <const DHCPInfo **>
+
+       Get a pointer to a DHCPInfo structure.  This struct contains
+       details about resources which were specified by the DHCP
+       server.  The pointer will be NULL if DHCP was never used on
+       this interface.  The contents of the structure should not be
+       altered by the caller except for the 'data' field.
+
+       The DHCPInfo struct contains the following fields:
+
+	      dhcp_server
+
+       		IP address of DHCP server last used.  0 if none.
+
+         bootp_host
+
+       		Address of BOOTP host (from siaddr field of
+       		DHCP packets) - usually same as DHCP server, it provides a
+       		boot file if required.
+
+         lease
+         t1
+         t2
+
+	          Lease expiration times (absolute SEC_TIMER values) of
+	          current lease.  First field is the "drop dead" time, or
+	          is DHCP_PERMANENT if the lease is permanent.  t1 is
+	          the time at which we try to renew the lease with the
+	          original DHCP server, t2 is the time at which
+	          we renew with any DHCP server.  If BOOTP was used (rather
+	          than DHCP) all values will be DHCP_PERMANENT.
+
+         timezone
+
+         	Seconds east of Greenwich.  May be DHCP_UNKNOWN_TIMEZONE
+            if server didn't provide this information.
+
+         router[]
+         dns[]
+         smtp[]
+         ntp[]
+         cookie[]
+
+            If the corresponding DHCP_NUM_ROUTERS etc. macro is defined,
+            then these fields will exist (with dimension as specified
+            by the corresponding macro) to contain the server IP address(es).
+            The address will be zero if not available.
+
+       	data
+
+            A void pointer for application use.
+
+
+   Functions
+   ---------
+
+   dhcp_release()
+
+   Relinquish the current lease.  IP is not usable after this, until
+   dhcp_acquire() is called.
+   This function is deprecated: it only works on the default interface.
+   Use ifconfig(...IFS_DOWN...) instead.
+
+   dhcp_acquire()
+
+   Acquire a new IP lease, nominating the previous IP address to the DHCP
+   server.  The IP address might be different on return.
+   This function is deprecated: it only works on the default interface.
+   Use ifconfig(...IFS_UP...) instead.
+
+   dhcp_get_timezone()
+
+   Return the timezone offset provided by the DHCP server on the default
+   interface.  See also ifconfig(...IFG_DHCP_INFO...) to see timezones
+   returned for different interfaces.
+
+   Example Code
+   ------------
+
+   The sample file DHCP.C demonstrates the use of DHCP.
+
+END DESCRIPTION **********************************************************/
+
+
+/*** BeginHeader */
+
+#ifdef BOOTP_DEBUG
+	#define _bootp_nodebug __debug
+#else
+	#define _bootp_nodebug __nodebug
+#endif
+
+#include <stddef.h>			// for offsetof() macro
+
+/*
+ * Maximum string lengths (including null term) of host and domain names
+ */
+#ifndef DHCP_MAXHOST
+	#define DHCP_MAXHOST			33
+#endif
+#ifndef DHCP_MAXDOMAIN
+	#define DHCP_MAXDOMAIN		65
+#endif
+
+/*
+ * Interface to use for DHCP - this is for backward compatibility only.
+ */
+#ifndef DHCP_IFACE
+	#define DHCP_IFACE	IF_DEFAULT
+#endif
+
+#define BOOTREQUEST 	1	/* bootp.bp_op */
+#define BOOTREPLY	   2
+
+#define VM_RFC1048 0x63538263L		/* Magic number (in reversed order from
+													network) */
+
+#define DHCP_PERMANENT 0xFFFFFFFFuL			// Special value for permanent leases
+#define DHCP_UNKNOWN_TIMEZONE 0x80000000L	// Special value for unknown timezone
+
+/* The following symbol is for testing only.  It should not be defined except
+ 	for Rabbit Semiconductor internal testing.  If defined, the library behaves as if it is
+ 	DHCP, but forces the DHCP server to think we are a BOOTP-only client.  This
+ 	tests the ability to fall back to BOOTP responses (in cases where in fact
+ 	the server is BOOTP-only).
+*/
+//#define DHCP_ELICIT_BOOTP
+
+/* The following symbol is for testing only.  It should not be defined except
+ 	for Rabbit Semiconductor internal testing.  If defined, the library pretends that there
+ 	was another host which is claiming the IP address leased to us by the DHCP
+ 	server.  This causes a DECLINE message to be sent to the server. */
+//#define DHCP_REFUSE_FIRST_ADDR
+
+#ifdef BOOTP_ONLY
+	#ifdef DHCP_ON_PPP
+   	#fatal "Cannot define BOOTP_ONLY and DHCP_ON_PPP"
+   #endif
+	#ifdef DHCP_ON_PPPOE
+   	#fatal "Cannot define BOOTP_ONLY and DHCP_ON_PPPOE"
+   #endif
+#endif
+
+// DHCP/BOOTP option tags (see RFC2132 for details).  The options which have a
+// non-null comment are understood by us.  If the comment contains "[OPT]",
+//	then the value can be configured in or out.
+#define DHCP_VN_SUBNET  1		// Subnet mask
+#define DHCP_VN_TIMEOFF 2		// Timezone offset from UTC, seconds
+#define DHCP_VN_ROUTER  3		// Router [OPT]
+#define DHCP_VN_TIMESRV 4		//
+#define DHCP_VN_NAMESRV 5		//
+#define DHCP_VN_DNS     6		// Domain name server [OPT]
+#define DHCP_VN_LOGSRV  7		//
+#define DHCP_VN_COOKIE  8		// Quote-of-the-day server [OPT]
+#define DHCP_VN_LPRSRV  9		//
+#define DHCP_VN_IMPSRV  10		//
+#define DHCP_VN_RLPSRV  11		//
+#define DHCP_VN_HOST    12		// Host name [OPT]
+#define DHCP_VN_BSIZE   13		//
+#define DHCP_VN_MERIT   14		//
+#define DHCP_VN_DOMAIN  15		// Domain name [OPT]
+#define DHCP_VN_SWAPSRV 16		//
+#define DHCP_VN_ROOT    17		//
+#define DHCP_VN_EXTN    18		//
+#define DHCP_VN_IPFWD   19		//
+#define DHCP_VN_NLSR    20		//
+#define DHCP_VN_POLICY  21		//
+#define DHCP_VN_REASSEM 22		//
+#define DHCP_VN_IPTTL   23		//
+#define DHCP_VN_MTUTO   24		//
+#define DHCP_VN_MTUPLAT 25		//
+#define DHCP_VN_IFMTU   26		//
+#define DHCP_VN_SUBLOCL 27		//
+#define DHCP_VN_BCAST   28		//
+#define DHCP_VN_MASKDIS 29		//
+#define DHCP_VN_MASKSUP 30		//
+#define DHCP_VN_RTDISC  31		//
+#define DHCP_VN_RTSOL   32		//
+#define DHCP_VN_STATIC  33		//
+#define DHCP_VN_TRAILER 34		//
+#define DHCP_VN_ARPTO   35		//
+#define DHCP_VN_ETHTYPE 36		//
+#define DHCP_VN_TCPTTL  37		//
+#define DHCP_VN_TCPKA   38		//
+#define DHCP_VN_TCPKAG  39		//
+#define DHCP_VN_NISDOM  40		//
+#define DHCP_VN_NISSRV  41		//
+#define DHCP_VN_NTPSRV  42		// Network Time Protocol [OPT]
+#define DHCP_VN_ENCAP   43		//
+#define DHCP_VN_NBNS    44		//
+#define DHCP_VN_NBDD    45		//
+#define DHCP_VN_NBNT    46		//
+#define DHCP_VN_NBSCOPE 47		//
+#define DHCP_VN_XFS     48		//
+#define DHCP_VN_XDM     49		//
+
+// Options 50-61 only available if BOOTP_ONLY not defined
+#define DHCP_VN_REQIP   50		// Requested IP address
+#define DHCP_VN_LEASE	51		// Lease time
+#define DHCP_VN_OVLOPTS	52		// Extension of options into sname and/or file
+										//		fields i.e. overloaded options
+#define DHCP_VN_TYPE    53		// Identifies DHCP requests/responses, to
+										//		distinguish from BOOTP
+#define DHCP_VN_SRVRID  54		// Server ID = IP address of DHCP server
+#define DHCP_VN_OPTS    55		// Option set for requesting configuration
+										//		parameters
+#define DHCP_VN_MESSAGE	56		// Error message etc.
+#define DHCP_VN_MSGLEN	57		// Maximum DHCP UDP packet length
+#define DHCP_VN_T1TIME  58		// Time at which to try to renew existing lease
+#define DHCP_VN_T2TIME  59		// Time at which to try to re-bind to server:
+										//		T1 < T2 < lease
+#define DHCP_VN_CLASSID	60		// Class ID (vendor specific)
+#define DHCP_VN_CLNTID	61		// Unique client ID (vendor specific)
+
+#define DHCP_VN_NISPDOM	64		//
+#define DHCP_VN_NISPSRV	65		//
+#define DHCP_VN_TFTP		66		//
+#define DHCP_VN_BOOTFILE 67	//
+#define DHCP_VN_MOBHA	68		//
+#define DHCP_VN_SMTPSRV	69		// Simple Mail Transport Protocol server [OPT]
+#define DHCP_VN_POP3SRV	70		//
+#define DHCP_VN_NNTPSRV	71		//
+#define DHCP_VN_WWWSRV	72		//
+#define DHCP_VN_FNGSRV	73		//
+#define DHCP_VN_IRCSRV	74		//
+#define DHCP_VN_STSRV	75		//
+#define DHCP_VN_STDASRV	76		//
+
+  // Protocol request/response types for VN_TYPE option
+#define DHCP_TY_DSC      1		// Discover
+#define DHCP_TY_OFR      2		// Offer
+#define DHCP_TY_REQ      3		// Request
+#define DHCP_TY_DCL      4		// Decline
+#define DHCP_TY_ACK      5		// +ve Ack
+#define DHCP_TY_NAK      6		// -ve Ack
+#define DHCP_TY_RLS      7		// Release
+#define DHCP_TY_INF      8		// Inform
+#define DHCP_TY_FRC      9		// Force renew (not implemented)
+
+#define DHCP_BOOTP		 255	// Pseudo type: received bootp packet (not dhcp)
+
+// Client DHCP state machine states, private to our implementation but mostly
+//	taken from RFC2131 suggestions.
+// Odd numbered states are 'transient'.
+#define DHCP_ST_IBOOT	0		// INIT_REBOOT (remember previous IP address over
+										//		reboot.  Not implemented)
+#define DHCP_ST_BOOT		2		// REBOOTING (as above, but sent initial request)
+#define DHCP_ST_INFORM_SEND 3	// Transient state, sending DHCP INFORM
+#define DHCP_ST_INFORM	4		// Waiting for INFORM response
+#define DHCP_ST_BOOTP_INIT	6	// Initial state for BOOTP
+#define DHCP_ST_BOOTP_SEND 7	// Transient state for sending BOOTP request
+#define DHCP_ST_BOOTP_WAIT 8	// Waiting for BOOTP response
+#define DHCP_ST_TOBINIT	10		// Timeout before INIT (after sent DECLINE)
+#define DHCP_ST_INIT		12		// INIT (normal initial state for DHCP) - may go
+										//		to INFORM_SEND or SEL_SEND.
+#define DHCP_ST_SEL_SEND 13    // Transient state, sending DISCOVER
+#define DHCP_ST_SEL		16		// SELECTING
+#define DHCP_ST_REQ_SEND 17    // Transient state, sending REQ after OFFER
+#define DHCP_ST_REQ		20		// REQUESTING
+#define DHCP_ST_ARP_SEND 23   // Start checking for address already in use
+										//		via ARP
+#define DHCP_ST_ARP     24    // Wait for ARP timeout
+#define DHCP_ST_BOUND	28		// BOUND		-- this state and greater indicate
+										//		DHCP OK
+#define DHCP_ST_RENEW_SEND 29 // Transient state, sending REQ (unicast)
+#define DHCP_ST_RENEW	32		// RENEWING
+#define DHCP_ST_REBIND_SEND 33 // Transient state, sending REQ (broadcast)
+#define DHCP_ST_REBIND	36		// REBINDING
+#define DHCP_ST_RELEASE	40		// Send DHCPRELEASE.
+#define DHCP_ST_TIMEOUT 101	// Transient state indicating overall timeout
+										//		during acquisition
+#define DHCP_ST_EXPIRED	103	// Transient state indicating lease expired and
+										//		could not rebind, or server NAK'd renew or
+										//		rebind.
+#define DHCP_ST_WRETRY   105	// Waiting to retry acquiring IP after timeout
+
+// Minimum retry interval (seconds) between successive renew or rebind
+// REQUEST packets.
+#ifndef DHCP_MINRETRY
+	#define DHCP_MINRETRY	60		// RFC2131 recommended value is 60secs.
+#endif
+
+#ifndef DHCP_DEFAULT_TIMEOUT
+	#define DHCP_DEFAULT_TIMEOUT	6		// Default acquisition timeout in seconds.
+#endif
+
+/*
+ * structure for send and receives
+ */
+typedef struct {
+   byte       bp_op;     /* packet op code / message type. */
+   byte       bp_htype;  /* hardware address type, 1 = ethernet */
+   byte       bp_hlen;   /* hardware address len, eg '6' for ethernet */
+   byte       bp_hops;   /* client sets to zero, optionally used by
+                             gateways in cross-gateway booting. */
+   longword   bp_xid;     /* transaction ID, a random number */
+   word       bp_secs;    /* filled in by client, seconds elapsed since
+                             client started trying to boot. */
+   word       bp_flags;   /* Flags as follows: (Network order settings,
+									  set others zero) */
+#define DHCP_F_BROADCAST		0x0080
+   longword   bp_ciaddr;  /* client IP address filled in by client if known*/
+   longword   bp_yiaddr;  /* 'your' (client) IP address
+                             filled by server if client doesn't know */
+   longword   bp_siaddr;    /* next server IP address returned in bootreply */
+   longword   bp_giaddr;    /* gateway IP address,
+                          used in optional cross-gateway booting. */
+   byte       bp_chaddr[16];  /* client hardware address, filled by client */
+   byte       bp_sname[64];   /* optional server host name, null terminated*/
+
+   byte       bp_file[128];   /* boot file name, null terminated string
+                             'generic' name or null in bootrequest,
+                             fully qualified directory-path
+                             name in bootreply. */
+   byte       bp_vend[312]; /* optional vendor-specific area.  May be more than
+									  312 bytes if MTU allows, but this is the minimum
+									  (and also the maximum we send). */
+} DHCPPkt;
+
+
+#ifndef BOOTP_ONLY
+   // Request options for various stages of the process:
+   static const char dhcp_opt_req[] = {	// DHCPREQUEST
+      DHCP_VN_OPTS
+         ,0						// Length field - filled in at runtime since other
+									//		options may be added
+      	,DHCP_VN_SUBNET
+      	,DHCP_VN_TIMEOFF
+      #if DHCP_NUM_ROUTERS
+      	,DHCP_VN_ROUTER
+      #endif
+      #if DHCP_NUM_DNS
+      	,DHCP_VN_DNS
+      #endif
+      #if DHCP_NUM_SMTP
+      	,DHCP_VN_SMTPSRV
+      #endif
+      #if DHCP_NUM_NTP
+      	,DHCP_VN_NTPSRV
+      #endif
+      #if DHCP_NUM_QOTD
+      	,DHCP_VN_COOKIE
+      #endif
+	};
+#endif
+
+
+
+
+/*
+ * UDP port numbers, server and client.
+ */
+#define	IPPORT_BOOTPS		67
+#define	IPPORT_BOOTPC		68
+
+/*** EndHeader */
+
+
+/*** BeginHeader dhcp_tick, dhcp_init, dhcp_handler, dhcp_handle_arp,
+ 	dhcp_check_lease, dhcp_getopts */
+// These are all bundled together, since if one is needed then all of them are.
+int dhcp_init(word iface);
+int dhcp_tick(word iface);
+int dhcp_handler(_udp_datagram_info * udi, ll_prefix __far * LL, in_Header * ip,
+	udp_Header * up, long data);
+void dhcp_handle_arp(word iface, longword his_ip);
+int dhcp_check_lease(void);
+word dhcp_getopts(int iface, DHCPInfo * di, DHCPPkt __far * pkt, word pktlen, int commit,
+	word next_state);
+#ifdef DHCP_REFUSE_FIRST_ADDR
+word _drfa;	// testing only.
+#endif
+/*** EndHeader */
+
+_bootp_nodebug int dhcp_init(word iface)
+{
+   auto DHCPInfo * di;
+	auto longword fallback;
+   auto word num_req_options;
+	auto byte *req_options;
+	auto int (*opt_callback)();
+
+   di = _if_tab[iface].dhcp;
+   if (!di)
+   	return IFCTL_OK;
+
+	//TT #81597
+	fallback = di->fallback_ip;
+
+   	// Vantive #35052
+	num_req_options = di->num_req_options;
+	req_options = di->req_options;
+	opt_callback = di->opt_callback;
+	memset(di, 0, sizeof(DHCPInfo));
+
+	//TT #81597
+	di->fallback_ip = fallback;
+
+   	// Vantive #35052
+	di->num_req_options = num_req_options;
+	di->req_options = req_options;
+	di->opt_callback = opt_callback;
+
+#ifdef USE_LINKLOCAL
+   if (IS_LINKLOCAL_ADDR( fallback))
+   {
+      // If fallback address is configured for link-local, try to acquire
+      // a link-local address while looking for a DHCP server.
+      linklocal_enable( iface, fallback);
+   }
+#endif
+
+#ifdef BOOTP_ONLY
+	di->state = DHCP_ST_BOOTP_INIT;
+#else
+   di->state = DHCP_ST_INIT;
+#endif
+#ifdef DHCP_REFUSE_FIRST_ADDR
+   _drfa &= ~(1u<<iface);
+#endif
+   _if_dhcp_lease &= ~(1u << iface);	// Reset lease checking bit
+   if (!di->overall_timeout)
+		di->overall_timeout = DHCP_DEFAULT_TIMEOUT;
+   if (!di->xid) {
+   	// First initialization
+      di->timezone = DHCP_UNKNOWN_TIMEZONE;
+      di->xid = (longword)iface << 28;	// Make unique to interface
+      di->xid |= SEC_TIMER;			// Make unique to date/time
+      di->xid ^= MS_TIMER & 0xFFuL;		// Scramble LSBs on finer timescale);
+      if (IF_PKT_ETH(iface))
+      {
+      	di->xid ^= (*(long*)&my_eth_addr[iface]->eaddr[2]);  //Scramble again with last 4 bytes of MAC addr.
+      }
+
+      // Hereafter, xid increments by 1 for each new transaction.
+      // All other fields start at NULL or 0, or their previous values if this
+      // is not first DHCP acquisition for this interface.
+   }
+   return dhcp_tick(iface);
+}
+
+_bootp_nodebug void dhcp_send(word iface, DHCPInfo * di, word dhcptype,
+	int bcast, word next_state)
+{
+	// Format and send a DHCP message
+   auto DHCPPkt _dp;
+   auto DHCPPkt * dp;		// This buffer (548 bytes) contains the packet
+									//		we are sending.
+   auto _udp_datagram_info udi;
+   auto int optsize;
+	auto char * p;
+	auto int len;
+
+   dp = &_dp;
+   memset(dp, 0, sizeof(*dp));
+   dp->bp_op = BOOTREQUEST;
+   dp->bp_htype = PD_ETHER;
+#ifndef BOOTP_ONLY
+   if (di->state == DHCP_ST_INFORM_SEND)
+   	dp->bp_ciaddr = intel(di->fallback_ip);
+   else
+#endif
+   // ciaddr must be zero unless in BOUND, RENEWING or REBINDING state.
+	dp->bp_ciaddr = 0L;
+
+   if (di->state >= DHCP_ST_BOUND) {
+   	// For rebind and renew, increment xid for each transmission and do
+		//	not count elapsed time.
+   	dp->bp_secs = 0;
+      di->starttime = SEC_TIMER;
+   	di->xid++;
+#ifndef BOOTP_ONLY
+   	dp->bp_ciaddr = intel(_if_tab[iface].ipaddr);
+#endif
+   }
+	else
+	   dp->bp_secs = intel16((word)(SEC_TIMER - di->starttime));
+
+   dp->bp_xid = di->xid;
+
+#ifdef DHCP_SET_BCAST
+	// This is now only done if specifically requested: changes to ARP now
+	// allow DHCP to work with unicast responses.
+   if (bcast)
+   	// Set broadcast flag, since we don't accept unicast responses when the
+   	// socket is not set up with the proper localhost address.
+   	dp->bp_flags = DHCP_F_BROADCAST;
+#endif
+   *(longword *)dp->bp_vend = VM_RFC1048;
+   if (!IF_PKT_ETH(iface))
+		dp->bp_hlen = 0;	// no HWA for PPP over serial
+   else {
+   	dp->bp_hlen = sizeof(eth_address);
+   	memcpy(dp->bp_chaddr, my_eth_addr[iface], sizeof(eth_address));
+   }
+
+	p = dp->bp_vend + 4;
+
+#ifdef DHCP_ELICIT_BOOTP
+	di->tent_ip = 0;
+#else
+#ifdef BOOTP_ONLY
+	di->tent_ip = 0;
+#else
+   if (dhcptype == DHCP_TY_DSC)
+   	di->tent_ip = _if_tab[iface].ipaddr;
+   if (dhcptype == DHCP_TY_RLS ||
+       dhcptype == DHCP_TY_INF ||
+       dhcptype == DHCP_BOOTP ||
+       dhcptype == DHCP_TY_REQ && di->state >= DHCP_ST_BOUND)
+   	di->tent_ip = 0;
+
+	if (dhcptype != DHCP_BOOTP) {
+	   // Set DHCP type
+	   *p++ = DHCP_VN_TYPE;
+	   *p++ = 1;
+	   *p++ = dhcptype;
+
+	   if (dhcptype != DHCP_TY_DCL && dhcptype != DHCP_TY_RLS) {
+	      // Set maximum message length (IP, UDP headers (28) plus UDP payload)
+	      if (576 < ifmtu(iface,0)) {
+	         *p++ = DHCP_VN_MSGLEN;
+	         *p++ = 2;
+	         *(word *)p = intel16(ifmtu(iface,0));
+	         p += 2;
+	      }
+
+	      // Set standard options
+	      memcpy(p, dhcp_opt_req, sizeof(dhcp_opt_req));
+	      // Add user-defined options if any
+	      if (di->num_req_options)
+	         memcpy(p + sizeof(dhcp_opt_req), di->req_options, di->num_req_options);
+	      optsize = sizeof(dhcp_opt_req) + di->num_req_options;
+	      p[1] = optsize-2; // Set in proper length
+	      p += optsize;
+	   }
+
+	   if (di->tent_ip) {
+	      // Already have an IP address from last time, or fallback, or have
+	      // tentative address during initial negotiation.  Request this address.
+			// Also must set for DECLINE.
+	      *p++ = DHCP_VN_REQIP;
+	      *p++ = 4;
+	      *(longword *)p = intel(di->tent_ip);
+	      p += 4;
+	   }
+
+	   if (dhcptype != DHCP_TY_DSC && dhcptype != DHCP_TY_INF &&
+	       (dhcptype != DHCP_TY_REQ || di->state < DHCP_ST_BOUND)) {
+	      // Insert the server that we are talking to
+	      *p++ = DHCP_VN_SRVRID;
+	      *p++ = 4;
+	      *(longword *)p = intel(di->dhcp_server);
+	      p += 4;
+	   }
+
+#ifdef DHCP_CLASS_ID
+	   if (dhcptype != DHCP_TY_DCL && dhcptype != DHCP_TY_RLS) {
+	      *p++ = DHCP_VN_CLASSID;
+	      len = strlen(DHCP_CLASS_ID);
+	      if (len > 255) len = 255;
+	      *p++ = len;
+	      memcpy(p, DHCP_CLASS_ID, len);
+	      p += len;
+	#ifdef DHCP_SEND_HOSTNAME
+   		if (_hostname[0]) {
+	         *p++ = DHCP_VN_HOST;
+	         len = strlen(_hostname);
+	         if (len > 255) len = 255;
+	         *p++ = len;
+	         memcpy(p, _hostname, len);
+	         p += len;
+         }
+   #endif
+	   }
+#endif
+#ifdef DHCP_CLIENT_ID_MAC
+	   if (dp->bp_hlen) {
+	      *p++ = DHCP_VN_CLNTID;
+	      *p++ = dp->bp_hlen + 1;      // 1-byte h/w type, 6-byte address
+	      *p++ = dp->bp_htype;      // H/W type
+	      memcpy(p, dp->bp_chaddr, dp->bp_hlen);
+	      p += dp->bp_hlen;
+	   }
+#else
+#ifdef DHCP_CLIENT_ID
+	   *p++ = DHCP_VN_CLNTID;
+	   len = DHCP_CLIENT_ID_LEN;
+	   if (len > 255) len = 255;
+	   *p++=len;
+	   memcpy(p, DHCP_CLIENT_ID, len);
+	   p += len;
+#endif
+#endif
+   }
+#endif	// BOOTP_ONLY
+#endif	// DHCP_ELICIT_BOOTP
+	*p++ = 255;
+
+	//23310 - ensure vendor field is padded to 64 bytes to avoid confusing
+	// some servers
+	len = p - dp->bp_vend;
+	if (len < 64) {
+		memset(p, 0, 64 - len);
+		p = dp->bp_vend + 64;
+	}
+
+   // Now send the packet.
+   memset(udi.hwa, 0xFF, sizeof(udi.hwa));	// Assume broadcast hardware
+   if (bcast)
+   	udi.remip = 0xFFFFFFFFuL;
+   else {
+   	udi.remip = di->dhcp_server;
+      memcpy(udi.hwa, di->dhcp_hwa, sizeof(udi.hwa));
+   }
+   udi.remport = IPPORT_BOOTPS;
+   udi.len = IPPORT_BOOTPC;	// Hack for socketless UDP
+   udi.iface = iface;
+   udi.flags = 0;		// Default TOS
+   // Socketless UDP send
+   udp_write(NULL, dp, p - (char *)dp, 0, &udi);
+
+   // next state and timeout
+   di->state = next_state;
+   if (next_state >= DHCP_ST_BOUND) {
+   	// Reverse exponential backoff in RENEW/REBIND state
+      if (next_state == DHCP_ST_RENEW)
+      	di->timeout = (di->t2 - SEC_TIMER) >> 1;
+      else
+      	di->timeout = (di->lease - SEC_TIMER) >> 1;
+      if (di->timeout > 0x7FFFFFFFuL/1000)
+      	di->timeout = 0x7FFFFFFFuL/1000;
+      if (di->timeout < DHCP_MINRETRY)
+      	di->timeout = DHCP_MINRETRY;
+	   di->timeout = _SET_TIMEOUT(di->timeout*1000);
+   }
+   else {
+   	// Exponential backoff in initial negotiation
+	   di->timeout = _SET_TIMEOUT(di->tointvl * 1000L);
+	   di->tointvl <<= 1;
+		if (di->tointvl > 64u)
+		{
+			di->tointvl = 64u;
+		}
+	}
+}
+
+
+_bootp_nodebug int dhcp_timeout(DHCPInfo * di, word retry_state)
+{
+	// Return 0 to continue, 1 if overall timeout.  May change state to
+   // 'retry_state' to retransmit last packet.
+   if (retry_state < DHCP_ST_BOUND &&
+       (word)(SEC_TIMER - di->starttime) > di->overall_timeout) {
+		di->state = DHCP_ST_TIMEOUT;
+#ifdef BOOTP_VERBOSE
+		printf("DHCP: overall timeout (%d sec)\n", di->overall_timeout);
+#endif
+      return 1;
+   }
+   if (chk_timeout(di->timeout)) {
+#ifdef BOOTP_VERBOSE
+		printf("DHCP: retransmit in state %u -> %u\n", di->state, retry_state);
+#endif
+   	// Special processing if BOOTP response to DISCOVER, while waiting for
+		// offers.
+      if (retry_state == DHCP_ST_SEL_SEND && di->pktlen) {
+			di->pktlen--;
+         if (!di->pktlen) {
+#ifdef BOOTP_VERBOSE
+				printf("DHCP: falling back to previous BOOTP\n");
+#endif
+         	retry_state = DHCP_ST_BOOTP_INIT;
+         }
+      }
+   	di->state = retry_state;
+   }
+   return 0;
+}
+
+_bootp_nodebug
+int dhcp_tick(word iface)
+{
+	// Called from ifctl_tick() when interface pending up.  Also called by
+	// other routines in this library to drive the state machine.
+	auto DHCPInfo * di;
+	auto IFTEntry * ie;
+	auto int retval;
+
+	ie = _if_tab + iface;
+	di = ie->dhcp;
+	if (!di)
+	{
+		return IFCTL_OK;
+	}
+
+	switch (di->state)
+	{
+	case DHCP_ST_BOOTP_INIT:
+		_if_dhcp_lease &= ~(1u << iface);
+		ie->flags &= ~(IFF_DHCP_FELLBACK|IFF_DHCP_OK);
+		di->starttime = SEC_TIMER;
+		di->tointvl = 1;		// initial timeout
+		//di->fallback_ip = _if_tab[iface].ipaddr;
+		ie->ipaddr = 0;
+		di->state = DHCP_ST_BOOTP_SEND;
+		// Fall thru
+	case DHCP_ST_BOOTP_SEND:
+		#ifdef BOOTP_VERBOSE
+		printf("DHCP: Sending BOOTP request on i/f %u\n", iface);
+		#endif
+		dhcp_send(iface, di, DHCP_BOOTP, 1, DHCP_ST_BOOTP_WAIT);
+		break;
+	case DHCP_ST_BOOTP_WAIT:
+		dhcp_timeout(di, DHCP_ST_BOOTP_SEND);
+		break;
+#ifndef BOOTP_ONLY
+	case DHCP_ST_INFORM_SEND:
+		#ifdef BOOTP_VERBOSE
+		printf("DHCP: Sending INFORM request on i/f %u\n", iface);
+		#endif
+		dhcp_send(iface, di, DHCP_TY_INF, 1, DHCP_ST_INFORM);
+		break;
+	case DHCP_ST_INFORM:
+		dhcp_timeout(di, DHCP_ST_INFORM_SEND);
+		break;
+	case DHCP_ST_TOBINIT:
+	case DHCP_ST_WRETRY:
+		if (chk_timeout(di->timeout))
+		{
+			di->state = DHCP_ST_INIT;
+			// immediately fall through to case DHCP_ST_INIT, below
+		}
+		else
+		{
+			break;
+		}
+	case DHCP_ST_IBOOT:
+	case DHCP_ST_BOOT:
+	case DHCP_ST_INIT:
+		_if_dhcp_lease &= ~(1u << iface);
+		ie->flags &= ~(IFF_DHCP_FELLBACK|IFF_DHCP_OK);
+		di->starttime = SEC_TIMER;
+		di->tointvl = 1;		// initial timeout
+		//di->fallback_ip = _if_tab[iface].ipaddr;
+		if (IF_P2P(iface) || ie->flags & IFF_DHCP_QUERY && di->fallback_ip)
+		{
+			di->state = DHCP_ST_INFORM_SEND;
+			break;
+		}
+		di->state = DHCP_ST_SEL_SEND;
+		di->pktlen = 0;
+		// fall through
+	case DHCP_ST_SEL_SEND:
+		#ifdef BOOTP_VERBOSE
+		printf("DHCP: Sending DISCOVER request on i/f %u\n", iface);
+		#endif
+		dhcp_send(iface, di, DHCP_TY_DSC, 1, DHCP_ST_SEL);
+		break;
+	case DHCP_ST_SEL:
+		dhcp_timeout(di, DHCP_ST_SEL_SEND);
+		break;
+	case DHCP_ST_REQ_SEND:
+		#ifdef BOOTP_VERBOSE
+		printf("DHCP: Sending REQUEST on i/f %u\n", iface);
+		#endif
+		dhcp_send(iface, di, DHCP_TY_REQ, 1, DHCP_ST_REQ);
+		break;
+	case DHCP_ST_REQ:
+		dhcp_timeout(di, DHCP_ST_REQ_SEND);
+		break;
+	#ifdef DHCP_CHECK
+	case DHCP_ST_ARP_SEND:
+		// Issue ARP request.  We can't use the usual function (arpresolve_start
+		// etc.) because we don't want ARP to try routers.
+		#ifdef BOOTP_VERBOSE
+		printf("DHCP: Sending ARP probe on i/f %u\n", iface);
+		#endif
+		_arp_request(di->tent_ip, 0, iface);
+		di->timeout = _SET_TIMEOUT(1000);	// 1 sec to answer
+		di->state = DHCP_ST_ARP;
+		break;
+	case DHCP_ST_ARP:
+		if (chk_timeout(di->timeout))
+		{
+			// No ARP response, which is good...  Commit the ACK results
+			dhcp_getopts(iface, di, (DHCPPkt __far *)di->dhcppkt, di->pktlen, 1,
+			             DHCP_ST_BOUND);
+			pkt_buf_release(di->pktpref);	// Release packet buffer we were holding
+		}
+		break;
+	#endif
+	case DHCP_ST_BOUND:
+		if ((long)(SEC_TIMER - di->t1) > 0)
+		{
+			#ifdef BOOTP_VERBOSE
+			printf("DHCP: time to renew i/f %u\n", iface);
+			#endif
+			di->state = DHCP_ST_RENEW_SEND;
+			// immediately fall through to case DHCP_ST_RENEW_SEND, below
+		}
+		else
+		{
+			return IFCTL_OK;
+		}
+	case DHCP_ST_RENEW_SEND:
+		#ifdef BOOTP_VERBOSE
+		printf("DHCP: Sending RENEW request on i/f %u\n", iface);
+		#endif
+		dhcp_send(iface, di, DHCP_TY_REQ, 0, DHCP_ST_RENEW);
+		break;
+	case DHCP_ST_RENEW:
+		if ((long)(SEC_TIMER - di->t2) > 0)
+		{
+			#ifdef BOOTP_VERBOSE
+			printf("DHCP: time to rebind i/f %u\n", iface);
+			#endif
+			di->state = DHCP_ST_REBIND_SEND;
+			// immediately fall through to case DHCP_ST_REBIND_SEND, below
+		}
+		else
+		{
+			dhcp_timeout(di, DHCP_ST_RENEW_SEND);
+			return IFCTL_OK;
+		}
+	case DHCP_ST_REBIND_SEND:
+		#ifdef BOOTP_VERBOSE
+		printf("DHCP: Sending REBIND request on i/f %u\n", iface);
+		#endif
+		dhcp_send(iface, di, DHCP_TY_REQ, 1, DHCP_ST_REBIND);
+		break;
+	case DHCP_ST_RELEASE:
+		#ifdef BOOTP_VERBOSE
+		printf("DHCP: Sending RELEASE request on i/f %u\n", iface);
+		#endif
+		dhcp_send(iface, di, DHCP_TY_RLS, 0, DHCP_ST_EXPIRED);
+		_if_dhcp_lease &= ~(1u << iface);
+		return IFCTL_OK;
+	case DHCP_ST_REBIND:
+		if ((long)(SEC_TIMER - di->lease) > 0)
+		{
+			#ifdef BOOTP_VERBOSE
+			printf("DHCP: expired i/f %u\n", iface);
+			#endif
+			di->state = DHCP_ST_EXPIRED;
+			// immediately fall through to case DHCP_ST_EXPIRED, below
+		}
+		else
+		{
+			dhcp_timeout(di, DHCP_ST_REBIND_SEND);
+			return IFCTL_OK;
+		}
+	case DHCP_ST_EXPIRED:
+		#ifdef BOOTP_VERBOSE
+		printf("DHCP: Couldn't renew/rebind lease on i/f %u\n", iface);
+		#endif
+		ie->flags &= ~IFF_DHCP_OK;
+		_if_dhcp_lease &= ~(1u << iface);
+		_abort_socks(NETERR_LEASE_EXPIRED, iface);
+	default:
+		#ifdef BOOTP_VERBOSE
+		printf("DHCP: 'default' state %d tick on i/f %u\n", di->state, iface);
+		#endif
+	case DHCP_ST_TIMEOUT:
+		#ifdef BOOTP_VERBOSE
+		printf("DHCP: Didn't acquire lease on i/f %u\n", iface);
+		#endif
+		di->state = DHCP_ST_WRETRY;
+		di->timeout = _SET_TIMEOUT(64000L);
+
+		if (ie->flags & IFF_DHCP_FALLBACK && di->fallback_ip)
+		{
+			// All is not lost; we have fallbacks.
+			ie->flags |= IFF_DHCP_FELLBACK;
+
+			#ifdef USE_LINKLOCAL
+			if (IS_LINKLOCAL_ADDR(di->fallback_ip))
+			{
+				goto _dhcp_fallback_linklocal;
+			}
+			// if not link-local address, fall through to normal behavior
+			#endif
+			#ifdef BOOTP_VERBOSE
+			printf("DHCP: Fallback to %08lx on i/f %u\n", di->fallback_ip, iface);
+			#endif
+			ie->ipaddr = di->fallback_ip;
+			return IFCTL_OK;
+		}
+
+		return IFCTL_FAIL;
+#else	// BOOTP_ONLY
+	case DHCP_ST_BOUND:
+		return IFCTL_OK;
+	default:
+		#ifdef BOOTP_VERBOSE
+		printf("DHCP: 'default' state %d tick on i/f %u\n", di->state, iface);
+		#endif
+	case DHCP_ST_TIMEOUT:
+		#ifdef BOOTP_VERBOSE
+		printf("DHCP: Didn't acquire lease on i/f %u\n", iface);
+		#endif
+		di->state = DHCP_ST_WRETRY;
+		di->timeout = _SET_TIMEOUT(64000L);
+
+		if (ie->flags & IFF_DHCP_FALLBACK && di->fallback_ip)
+		{
+			// All is not lost; we have fallbacks.
+			ie->flags |= IFF_DHCP_FELLBACK;
+
+			#ifdef USE_LINKLOCAL
+			if (IS_LINKLOCAL_ADDR(di->fallback_ip))
+			{
+				goto _dhcp_fallback_linklocal;
+			}
+			// if not link-local address, fall through to normal behavior
+			#endif
+			#ifdef BOOTP_VERBOSE
+			printf("DHCP: Fallback to %08lx on i/f %u\n", di->fallback_ip, iface);
+			#endif
+			ie->ipaddr = di->fallback_ip;
+			return IFCTL_OK;
+		}
+
+		return IFCTL_FAIL;
+#endif	// BOOTP_ONLY
+	}
+
+	return IFCTL_PEND;
+
+#ifdef USE_LINKLOCAL
+	// Common code for falling back on link-local address if lease expires and
+	// can't be renewed, or if DHCP server isn't available at startup.
+_dhcp_fallback_linklocal:
+	#ifdef BOOTP_VERBOSE
+	printf("DHCP: Falling back to link-local address on i/f %u\n", iface);
+	#endif
+
+	// make sure link-local is enabled for this interface
+	retval = linklocal_enable( iface, di->fallback_ip);
+	if (retval != IFCTL_FAIL)
+	{
+		// if enabled, let the link-local code provide the final address/status
+		retval = linklocal_tick( iface);
+	}
+	return retval;
+#endif
+}
+
+_bootp_nodebug int dhcp_handler(
+         _udp_datagram_info * udi, ll_prefix __far * LL,
+			in_Header * ip, udp_Header * up, long data)
+{
+	// Incoming DHCP packet.
+   auto DHCPInfo temp_di;	// Temporary info for grokking packet
+   auto DHCPInfo * di;		// The real info
+   auto word dhcptype;
+   auto byte c;
+   auto DHCPPkt __far * dpkt = (DHCPPkt __far *)data;
+#ifdef BOOTP_VERBOSE
+	printf("DHCP: incoming on i/f %d\n", udi->iface);
+#endif
+   di = _if_tab[udi->iface].dhcp;
+   // 236 bytes for the bootp header, 4 bytes for the DHCP cookie
+   if (!di || udi->len < 240) {
+#ifdef BOOTP_VERBOSE
+		printf("DHCP: not DHCP qualified, or too small (len=%d)\n", udi->len);
+#endif
+   	return 0;
+   }
+
+   if (di->xid != dpkt->bp_xid) {
+#ifdef BOOTP_VERBOSE
+		printf("DHCP: mismatch XID (got %08lX, expecting %08lX)\n",
+      	dpkt->bp_xid, di->xid);
+#endif
+      return 0;
+   }
+   else if(IF_PKT_ETH(udi->iface))
+   {
+      if(memcmp(dpkt->bp_chaddr, my_eth_addr[udi->iface]->eaddr,
+      	sizeof(eth_address)) )
+      {
+#ifdef BOOTP_VERBOSE
+			printf("DHCP: mismatch Client HW Address (expecting ");
+	      for (c = 0; c < 6; c++)
+	         printf(":%02X", my_eth_addr[udi->iface]->eaddr[c]);
+         printf(")\n");
+#endif
+        	return 0;
+      }
+   }
+
+   if (VM_RFC1048 != *(long __far *)dpkt->bp_vend) {
+#ifdef BOOTP_VERBOSE
+		printf("DHCP: wrong magic\n");
+#endif
+      return 0;
+   }
+
+	dhcptype = dhcp_getopts(udi->iface, &temp_di, dpkt, udi->len, 0, 0);
+   switch (di->state) {
+	case DHCP_ST_BOOTP_WAIT:
+   	if (dhcptype == DHCP_BOOTP)
+			dhcp_getopts(udi->iface, di, dpkt, udi->len, 1, DHCP_ST_BOUND);
+#ifdef BOOTP_VERBOSE
+		else
+			printf("DHCP: DHCP type (%d) when waiting for BOOTP\n", dhcptype);
+#endif
+   	break;
+#ifndef BOOTP_ONLY
+   case DHCP_ST_SEL:
+   	// Expecting offer.  We take first DHCP offer.
+      if (dhcptype != DHCP_TY_OFR) {
+      	if (dhcptype == DHCP_BOOTP && !di->pktlen) {
+         	// Remember that we got at least one BOOTP response.  If we get no
+            // DHCP offers after initial discover or first retransmit, then if
+            // there was a BOOTP response then redo using BOOTP.  Since the
+            // initial timeout is 1 second, and we allow one retry (with 2 sec
+            // timeout), then there will be an initial delay of 3 seconds if
+            // we are expecting DHCP but there is only a bootp server.
+            di->pktlen = 2;	// Change to bootp after 1st retry.
+	#ifdef BOOTP_VERBOSE
+				printf("DHCP: got BOOTP response while selecting\n");
+	#endif
+         }
+	#ifdef BOOTP_VERBOSE
+	  		else
+				printf("DHCP: DHCP type %d when waiting for OFFER\n", dhcptype);
+	#endif
+      	break;
+      }
+		// Good offer, copy just the relevant information
+	#ifdef BOOTP_VERBOSE
+		printf("DHCP: offered %08lX\n", temp_di.tent_ip);
+	#endif
+      di->tent_ip = temp_di.tent_ip;
+      di->dhcp_server = temp_di.dhcp_server;
+      di->state = DHCP_ST_REQ_SEND;
+      memcpy(di->dhcp_hwa, udi->hwa, sizeof(di->dhcp_hwa));
+      break;
+   case DHCP_ST_REQ:
+   	// Expecting ack/nak from specified server
+      if (temp_di.dhcp_server != di->dhcp_server) {
+	#ifdef BOOTP_VERBOSE
+			printf("DHCP: different server when REQ\n");
+	#endif
+      	break;	// Ignore other servers
+      }
+      if (dhcptype == DHCP_TY_NAK) {
+	#ifdef BOOTP_VERBOSE
+			printf("DHCP: NAK when requesting\n");
+	#endif
+			di->state = DHCP_ST_TOBINIT;
+         di->timeout = _SET_TIMEOUT(DHCP_MINRETRY * 1000L);
+         break;
+      }
+      if (dhcptype != DHCP_TY_ACK) {
+	#ifdef BOOTP_VERBOSE
+			printf("DHCP: DHCP type %d when waiting for ACK\n", dhcptype);
+	#endif
+      	break;
+      }
+   #ifdef DHCP_REFUSE_FIRST_ADDR
+   	if (!(_drfa & 1u<<udi->iface)) {
+      	_drfa |= 1u<<udi->iface;
+   		di->timeout = _SET_TIMEOUT(DHCP_MINRETRY * 1000L);
+	#ifdef BOOTP_VERBOSE
+			printf("DHCP: test DECLINE\n");
+	#endif
+			dhcp_send(udi->iface, di, DHCP_TY_DCL, 1, DHCP_ST_TOBINIT);
+         break;
+      }
+   #endif
+	#ifdef DHCP_CHECK
+		// Positive ACK, temporarily retain the buffer until ARP times out
+      di->dhcppkt = data;
+      di->pktlen = udi->len;
+      di->pktpref = LL;
+      di->state = DHCP_ST_ARP_SEND;
+      LL->ll_flags = LL_OUTBUF;	// Mark not to resubmit buffer
+      return 1;	// Special return code meaning retain packet buffer
+	#else
+		// If not doing ARP check, accept the ACK immediately.
+		dhcp_getopts(udi->iface, di, dpkt, udi->len, 1, DHCP_ST_BOUND);
+	#endif
+      break;
+   case DHCP_ST_RENEW:
+   	// Expecting ack from specified server
+      if (temp_di.dhcp_server != di->dhcp_server) {
+	#ifdef BOOTP_VERBOSE
+			printf("DHCP: different server when RENEWING\n");
+	#endif
+      	break;	// Ignore other servers
+      }
+      // else fall thru
+   case DHCP_ST_INFORM:
+   case DHCP_ST_REBIND:
+      if (dhcptype == DHCP_TY_NAK) {
+   #ifdef BOOTP_VERBOSE
+   		printf("DHCP: RENEW/REBIND/INFORM denied\n");
+   #endif
+			di->state = DHCP_ST_EXPIRED;
+      }
+      else if (dhcptype == DHCP_TY_ACK)
+			// Positive ACK, copy the relevant information again
+   	   dhcp_getopts(udi->iface, di, dpkt, udi->len, 1, DHCP_ST_BOUND);
+	#ifdef BOOTP_VERBOSE
+		else
+			printf("DHCP: DHCP type %d when RENEW/REBIND\n", dhcptype);
+	#endif
+      break;
+#endif
+   }
+   return 0;
+}
+
+
+_bootp_nodebug void dhcp_handle_arp(word iface, longword his_ip)
+{
+#ifndef BOOTP_ONLY
+#ifdef DHCP_CHECK
+	// Got ARP reply during DHCP when interface pending.  If this is a response to
+   // our ARP request on the tentative IP address, send a DECLINE to the server.
+   auto DHCPInfo * di;
+
+   di = _if_tab[iface].dhcp;
+   if (!di || di->state != DHCP_ST_ARP || his_ip != di->tent_ip)
+   	return;	// Ignore.
+   // Some other host claiming this address.  Decline, wait a bit, then
+	// send new DISCOVER.
+	#ifdef BOOTP_VERBOSE
+	printf("DHCP: somebody else has IP %08lX on i/f %d\n", his_ip, iface);
+	#endif
+   di->timeout = _SET_TIMEOUT(DHCP_MINRETRY * 1000L);
+	dhcp_send(iface, di, DHCP_TY_DCL, 1, DHCP_ST_TOBINIT);
+#endif
+#endif
+}
+
+_bootp_nodebug
+int dhcp_check_lease(void)
+{
+	/*
+	   This is called only once every 6 seconds or so by tcp_tick().
+	*/
+	#ifdef BOOTP_ONLY
+	return IFCTL_OK;
+	#else
+	auto int retval = IFCTL_OK;
+
+	/*
+	   For all interfaces which have a bit set in _if_dhcp_lease or which do not
+	   have a bit set in _if_dhcp_lease but do have the IFF_DHCP bit set in
+	   _if_tab[i].flags, drive the interface's DHCP state machine.
+	*/
+	auto int temp;
+	auto word m;
+	auto word i;
+	auto DHCPInfo * di;
+
+	for (m = 1, i = 0; i < IF_MAX; ++i, m <<= 1)
+	{
+		if ((_if_dhcp_lease & m) || (_if_tab[i].flags & IFF_DHCP))
+		{
+			#ifdef BOOTP_VERBOSE
+			printf("DHCP: driving state machine for i/f %d\n", i);
+			#endif
+			temp = dhcp_tick(i);
+		}
+		// retval is the last non-IFCTL_OK temp result, if any
+		retval = (temp == IFCTL_OK) ? retval : temp;
+	}
+	return retval;
+	#endif
+}
+
+_bootp_nodebug
+void dhcp_set_results(word iface, DHCPInfo * di)
+{
+	auto longword lease;
+	auto int i;
+
+	lease = di->lease;
+#ifdef BOOTP_VERBOSE
+	printf("DHCP: Setting results for i/f %d...\n", iface);
+	printf("      Lease is  %lu seconds\n", lease);
+#endif
+#ifndef BOOTP_ONLY
+	/*
+	   If the DHCP server gave values for T1 and T2, we trust the server's
+	   values. Otherwise, compute default T1 and T2 times according to RFC.
+	*/
+	if (lease != DHCP_PERMANENT)
+	{
+		if (!di->t1)
+		{
+			// Default is 0.5*lease
+			di->t1 = lease >> 1;
+		}
+		if (!di->t2)
+		{
+			// Default is 0.875*lease (=7/8)
+			di->t2 = (lease >> 1) + (lease >> 2) + (lease >> 3);
+		}
+		#ifdef BOOTP_VERBOSE
+		printf("      Renew in  %lu seconds\n", di->t1);
+		printf("      Rebind in %lu seconds\n", di->t2);
+		#endif
+		// Convert to absolute times
+		di->lease += di->starttime;
+		di->t1 += di->starttime;
+		di->t2 += di->starttime;
+	}
+	else
+	{
+		// di->lease == lease == DHCP_PERMANENT
+		if (!di->t1)
+		{
+			di->t1 = lease;
+		}
+		if (!di->t2)
+		{
+			di->t2 = lease;
+		}
+	}
+#endif
+
+#ifdef USE_LINKLOCAL
+	// we've grabbed an IP address, disable link-local for this interface
+	linklocal_disable( iface);
+#endif
+
+	// Set IP address and subnet mask
+	_if_tab[iface].ipaddr = di->tent_ip;
+
+	if (di->tent_subnet)
+	{
+		_if_tab[iface].mask = di->tent_subnet;
+	}
+#ifdef BOOTP_VERBOSE
+	printf("      IP=%08lX  mask=%08lX\n",
+	       _if_tab[iface].ipaddr, _if_tab[iface].mask);
+#endif
+#if DHCP_NUM_ROUTERS
+	if (di->router[0])
+	{
+		for (i = 0; i < DHCP_NUM_ROUTERS && di->router[i]; i++)
+		{
+			// IF_ANY is passed, since the DHCP server may be telling us about
+			// routers on our other interfaces (if any).  We set the current i/f's
+			// IP address and netmask above, so in the usual case of the router
+			// being on the DHCP interface, this will resolve correctly.
+			router_add(di->router[i], IF_ANY, 0 /*preference*/, 0, RTE_DHCP);
+		}
+	}
+#endif
+#if DHCP_NUM_DNS
+	#ifndef DISABLE_DNS
+	if (di->dns[0])
+	{
+		for (i = 0; i < DHCP_NUM_DNS && di->dns[i]; i++)
+		{
+			servlist_add(&_dns_server_table, di->dns[i], DNS_DHCP, NULL);
+		}
+	}
+   #endif
+#endif
+	/* add other servers here... */
+
+	// Set the bit to indicate non-permanent lease
+	if (lease != DHCP_PERMANENT)
+	{
+		_if_dhcp_lease |= 1u << iface;
+	}
+	_if_tab[iface].flags |= IFF_DHCP_OK;
+	_if_tab[iface].flags &= ~(IFF_ICMP_CONFIG|IFF_ICMP_CFG_OK);
+}
+
+
+_bootp_nodebug word dhcp_getopts(int iface, DHCPInfo * di, DHCPPkt __far * pkt,
+	word pktlen, int commit, word next_state)
+{
+	/* Given packet pkt, fill in parameter values in di.
+      pkt is the xmem (physical) address of the start of the DHCP UDP packet
+      payload, i.e. really points to a DHCPPkt.
+      Options which are not recognized are passed to the callback function,
+      if IFS_DHCP_OPTIONS specified one and the commit parameter is true.
+      The callback is only invoked for options which were in the registered
+		list.  The option data is copied into 'buf'.
+
+		If 'commit' is set, then this is a commit and we use the next_state parm.
+      */
+   auto char buf[256];	// Temp buffer for option data
+	auto char __far * p;
+	auto char __far * end;
+	auto longword * srv;
+	auto word numsrv;
+	auto word len, len2;
+	auto word ovlopt, nomore_ovlopt;
+   auto word key;
+   auto word dhcptype;
+   auto char * s;
+   auto word sureg;
+
+   dhcptype = DHCP_BOOTP;
+	ovlopt = 0;
+   nomore_ovlopt = 0;
+
+   memset(&di->tent_ip, 0, sizeof(*di) - offsetof(DHCPInfo, tent_ip));
+   di->timezone = DHCP_UNKNOWN_TIMEZONE;
+	di->tent_ip = intel(pkt->bp_yiaddr);
+	di->bootp_host = intel(pkt->bp_siaddr);
+   p = pkt->bp_vend + 4; /* Point just after vendor field */
+	end = (char __far *)pkt + pktlen;
+_bootp_more_opts:
+   while (p < end) {
+		key = *(int __far *)p;	// Low byte = option number, high byte = remaining length.
+      len = key >> 8;
+      key &= 0x00FF;
+      if (!key) {
+      	p++;
+         continue;
+      }
+      if (key == 0xFF)
+      	break;
+      _f_memcpy(buf, p+2, len);
+      buf[len] = 0;	// Null terminate, for callback convenience.
+      p += len+2;
+      if (end < p)
+      	// Server error
+      	break;
+      switch(key) {
+      case DHCP_VN_SUBNET: // Subnet Mask
+         di->tent_subnet = intel(*(longword *)buf);
+         break;
+      case DHCP_VN_TIMEOFF: // Time zone offset
+      	di->timezone = intel(*(longword *)buf);
+         break;
+      case DHCP_VN_HOST:	// Client Hostname.
+      	if (!(_if_tab[iface].flags & IFF_DHCP_DOMAIN))
+         	goto _do_callback;
+         if (!commit || next_state != DHCP_ST_BOUND)
+         	break;	// We only process when ready to commit
+         if (s = _n_strchr(buf, '.'))
+         	*s = 0;	// Truncate domain name appended by obsolete servers
+         sethostname(buf);
+         break;
+      case DHCP_VN_DOMAIN: 	// Client default domain
+      	if (!(_if_tab[iface].flags & IFF_DHCP_DOMAIN))
+         	goto _do_callback;
+         if (!commit || next_state != DHCP_ST_BOUND)
+         	break;	// We only process when ready to commit
+         if (len >= MAX_DOMAIN_LENGTH)
+         	len = MAX_DOMAIN_LENGTH-1;
+         buf[len] = 0;
+         strcpy(defaultdomain, buf);
+         def_domain = defaultdomain;
+         break;
+
+#if DHCP_NUM_ROUTERS > 0
+      case DHCP_VN_ROUTER: // router(s) a.k.a. gateways
+      	srv = di->router;
+      	numsrv = DHCP_NUM_ROUTERS*4;
+#endif
+      _bootp_loadsrv:
+         for(len2 = 0; len2 < len && len2 < numsrv; len2 += 4 )
+            srv[len2>>2] = intel(*(longword*)(buf+len2));
+         break;
+#if DHCP_NUM_DNS > 0
+      case DHCP_VN_DNS: // Domain Name Server(s) (BIND)
+      	srv = di->dns;
+      	numsrv = DHCP_NUM_DNS*4;
+      	goto _bootp_loadsrv;
+#endif
+#if DHCP_NUM_SMTP > 0
+      case DHCP_VN_SMTPSRV: // Mail server(s)
+      	srv = di->smtp;
+      	numsrv = DHCP_NUM_SMTP*4;
+      	goto _bootp_loadsrv;
+#endif
+#if DHCP_NUM_NTP > 0
+      case DHCP_VN_NTPSRV:		// Network time protocol servers (RFC1305)
+      	srv = di->ntp;
+      	numsrv = DHCP_NUM_NTP*4;
+      	goto _bootp_loadsrv;
+#endif
+#if DHCP_NUM_QOTD > 0
+      case DHCP_VN_COOKIE: // Quote-of-the-day server(s)
+      	srv = di->cookie;
+      	numsrv = DHCP_NUM_QOTD*4;
+      	goto _bootp_loadsrv;
+#endif
+
+#ifndef BOOTP_ONLY
+      case DHCP_VN_TYPE:
+         // handle DHCP type
+         dhcptype = buf[0];
+         break;
+      case DHCP_VN_OVLOPTS:
+      	// Overloaded options in other fields (bp_file for bit 0,
+			// bp_sname for bit 1)
+      	if (nomore_ovlopt)	// Don't do it if already processing them
+										// (otherwise loop forever!)
+      	  break;
+         ovlopt = buf[0];
+      	break;
+      case DHCP_VN_SRVRID:
+         // handle server id
+         di->dhcp_server = intel(*(longword*)buf);
+         break;
+
+      // handle lease expiration time, T1 and T2.
+      case DHCP_VN_LEASE:
+         di->lease = intel(*(longword*)buf);
+         break;
+      case DHCP_VN_T1TIME:
+         di->t1 = intel(*(longword*)buf);
+         break;
+      case DHCP_VN_T2TIME:
+         di->t2 = intel(*(longword*)buf);
+         break;
+#endif
+		default:
+      _do_callback:
+      	// invoke callback
+         if (commit &&
+             di->opt_callback &&
+             di->num_req_options &&
+             memchr(di->req_options, key, di->num_req_options))
+         {
+         	di->opt_callback(iface, di, key, len, buf);
+		   }
+         break;
+      } /* end of switch */
+   } /* end of while */
+
+   // Invoke callback for boot file if not overloaded
+   if (!nomore_ovlopt && !(ovlopt & 1) && commit && di->opt_callback) {
+   	_f_memcpy(buf, pkt->bp_file, 128);
+      buf[128] = 0;
+      di->opt_callback(iface, di, 0, 128, buf);
+   }
+
+#ifndef BOOTP_ONLY
+   nomore_ovlopt = 1;
+   // Handle overloaded options in order specified by RFC2131
+   if (ovlopt & 1) {
+   	p = pkt->bp_file;
+   	end = p + 128;
+   	ovlopt &= ~1;
+   	goto _bootp_more_opts;
+   }
+   if (ovlopt & 2) {
+   	p = pkt->bp_sname;
+   	end = p + 64;
+   	ovlopt &= ~2;
+   	goto _bootp_more_opts;
+   }
+#endif
+
+	if (dhcptype == DHCP_BOOTP || di->state == DHCP_ST_INFORM) {
+   	di->lease = DHCP_PERMANENT;	// Force permanent lease when not DHCP,
+												//	or for INFORM responses
+      if (di->state == DHCP_ST_INFORM)
+      	// For INFORM responses, do not change IP address
+         di->tent_ip = di->fallback_ip;
+   }
+
+	if (commit) {
+   	di->state = next_state;
+      if (next_state == DHCP_ST_BOUND) {
+      	// Moving to BOUND state.  Action the settings that were obtained.
+         dhcp_set_results(iface, di);
+      }
+   }
+
+#ifdef DHCP_ELICIT_BOOTP
+	return DHCP_BOOTP;	// Even if server somehow thought we were DHCP, pretend
+								// we got BOOTP response
+#else
+	return dhcptype;
+#endif
+}
+
+
+/*** BeginHeader dhcp_acquire */
+int dhcp_acquire( void );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+dhcp_acquire                       <BOOTP.LIB>
+
+SYNTAX: int dhcp_acquire( void );
+
+KEYWORDS:		tcpip dhcp bootp lease
+
+DESCRIPTION: 	This function acquires, or re-acquires, a DHCP lease
+               which has not yet been obtained, or has expired, or
+               was relinquished using dhcp_release().  Normally,
+               DHCP leases are renewed automatically, however if the
+               DHCP server is down for an extended period then it might
+               not be possible to renew the lease in time, in which case
+               the lease expires and TCP/IP should not be used.  At some
+               later time, this function can be called to try to obtain
+               an IP address.
+
+               This function is deprecated, since it only applies to
+               "the" DHCP interface (DHCP_IFACE).  Now it is recommended
+               simply to use ifup() and ifdown() in place of this
+               function and dhcp_release() respectively.
+
+               NOTE:
+
+               Versions of this function from DC8.20 and before would
+               block until the lease was acquired.  This function now
+               is non-blocking - the application should call tcp_tick()
+               until the interface comes up.
+
+               Because it is non-blocking, the result of the acquisition
+               process is not known until some time after the function
+               returns, hence the return value is now always zero.
+
+RETURN VALUE:  0: OK, acquisition process started for DHCP_IFACE.
+
+SEE ALSO:      dhcp_release, ifup, ifdown, ifconfig
+
+END DESCRIPTION **********************************************************/
+
+_bootp_nodebug int dhcp_acquire( void )
+{
+	ifup(DHCP_IFACE);
+	return 0;
+}
+
+/*** BeginHeader dhcp_release */
+int dhcp_release( void );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+dhcp_release                       <BOOTP.LIB>
+
+SYNTAX: int dhcp_release( void );
+
+KEYWORDS:		tcpip dhcp bootp lease
+
+DESCRIPTION: 	This function relinquishes a lease obtained from a DHCP
+               server.  This allows the server to re-use the IP address
+               which was allocated to this target.  After calling this
+               function, my_ip_address is set to 0, and it is not
+               possible to call any other TCP/IP function which requires
+               a valid IP address.  Normally, dhcp_release() would only
+               be used on networks where only a small number of IP
+               addresses are available, but there are a large number of
+               hosts which need sporadic network access.
+
+               This function is non-blocking since it only sends one
+               packet to the DHCP server and expects no response.
+
+               NOTE:
+
+               This function is deprecated.  It is equivalent to simply
+               bringing the interface down using ifdown(DHCP_IFACE).
+               See dhcp_acquire().
+
+               Unlike previous versions, the return code is always zero.
+
+RETURN VALUE:  0: OK, interface now down.
+
+SEE ALSO:      dhcp_acquire, ifup, ifdown, ifconfig
+
+END DESCRIPTION **********************************************************/
+
+_bootp_nodebug int dhcp_release( void )
+{
+	ifdown(DHCP_IFACE);
+	return 0;
+}
+/*** BeginHeader dhcp_get_timezone */
+int dhcp_get_timezone(long * seconds);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+dhcp_get_timezone                       <BOOTP.LIB>
+
+SYNTAX: int dhcp_get_timezone(long * seconds);
+
+KEYWORDS:		tcpip dhcp bootp time
+
+DESCRIPTION: 	This function returns the timezone offset provided by
+               the DHCP server, if any, or uses the fallback timezone
+               defined by the TIMEZONE macro.  Note that TIMEZONE is
+               expressed in hours, whereas the return result is in
+               seconds.
+
+               All interfaces that used a DHCP server are examined in
+               an arbitrary order until one which set a valid timezone
+               offset is found.
+
+PARAMETER1:    Pointer to result longword.  If the return value is 0 (OK),
+               then this will be set to the number of seconds offset from
+               Coordinated Universal Time (UTC).  The value will be
+               negative for west; positive for east of Greenwich.
+               If the return value is -1, then the result will be set
+               the the hard-coded value from the macro TIMEZONE (converted
+               to seconds by multiplying by 3600), or zero if this macro
+               is not defined.
+
+RETURN VALUE:  0 - timezone obtained from DHCP.
+               -1 - timezone not valid, or not yet obtained, or not using
+                 DHCP.
+
+END DESCRIPTION **********************************************************/
+
+_bootp_nodebug int dhcp_get_timezone(long * seconds)
+{
+#ifdef USE_DHCP
+	auto word i;
+   auto DHCPInfo * di;
+
+   for (i = 0; i < IF_MAX; i++)
+   	if (di = _if_tab[i].dhcp)
+      	if (di->timezone != DHCP_UNKNOWN_TIMEZONE) {
+         	*seconds = di->timezone;
+            return 0;
+         }
+#endif
+
+#ifdef TIMEZONE
+	*seconds = (long)(TIMEZONE * 3600L);
+#else
+	*seconds = 0;
+#endif
+	return -1;	// Used fallback
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

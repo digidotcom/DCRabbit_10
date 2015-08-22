@@ -1,0 +1,1201 @@
+/*** BeginHeader xmlSAXUserParseMemory */
+//
+// Copyright (c) 2009 Digi International Inc., All Rights Reserved
+//
+// This software contains proprietary and confidential information of Digi
+// International Inc.  By accepting transfer of this copy, Recipient agrees
+// to retain this software in confidence, to prevent disclosure to others,
+// and to make no use of this software other than that for which it was
+// delivered.  This is an unpublished copyrighted work of Digi International
+// Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+// prohibited.
+//
+// Restricted Rights Legend
+//
+// Use, duplication, or disclosure by the Government is subject to
+// restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+// Technical Data and Computer Software clause at DFARS 252.227-7031 or
+// subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+// Restricted Rights at 48 CFR 52.227-19, as applicable.
+//
+// Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+//
+
+/*
+	Rabbit note: the main parser routine, xmlSAXUserParseMemory, has been
+	changed from the original NDS code to be able to modify the data in-place.
+	This is done so that strings may be null-terminated without having
+	to allocate copies of element names, attributes etc.  The modification of
+	data is limited to splatting nulls at the end of relevant strings.  This
+	is always possible, since XML is profligate enough that there is always
+	a delimiter character which may be sacrificed once its job is done.
+
+	In doing this, the delete_attrs() and copy_attrs() functions were removed.
+
+	Also changed so that the element stack contains more than just the current
+	element name.  It is now a sub-structure that includes the element name
+	plus attributes, plus a set of handlers for that level.  This makes it
+	easier to maintain processing state
+*/
+#ifndef _SAX2_INCL
+#define _SAX2_INCL
+
+#ifndef MALLOC_H_Incl
+#use "malloc.lib"
+#endif
+
+#include "setjmp.h"
+
+#ifdef SAX2_DEBUG
+	#define _sax2_debug	__debug
+#else
+	#define _sax2_debug	__nodebug
+#endif
+
+
+// Following values reasonable for RCI.
+#ifndef MAX_ELEMENT_STACK_SIZE
+	#define MAX_ELEMENT_STACK_SIZE 10
+#endif
+#ifndef MAX_ATTRS
+	#define MAX_ATTRS 12		// Quite a lot of attributes for descriptors
+#endif
+
+// For XML generation, this allows a reserved portion before the start of the
+// actual XML document, for the purpose of inserting network headers etc.
+// Default value (6) is suitable for RCI over EDP.
+#ifndef XML_GEN_HEADER
+	#define XML_GEN_HEADER	6
+#endif
+
+// Error handling.  If default "printf" not suitable, define to a function
+// name of a function with prototype
+//    void UEfatalError(xmlCtx far * ctx, char far * msg)
+//#define UEfatalError ...
+struct _xmlSE;
+struct _xmlCtx;
+
+typedef void (*startElementCallback)(struct _xmlCtx __far * ctx, struct _xmlSE __far * se);
+typedef void (*endElementCallback)(struct _xmlCtx __far * ctx, struct _xmlSE __far * se);
+typedef void (*charactersCallback)(struct _xmlCtx __far * ctx, struct _xmlSE __far * se,
+   							char __far * ch, long len);
+
+// MAX_ATTRS * 2 because attributes are name, value pairs, + 1 so last
+// element contains terminator
+#define MAX_ATTR_ARRAY_SIZE (MAX_ATTRS * 2 + 1)
+
+// Stack Entry type
+typedef struct _xmlSE {
+	void __far * state;		// Arbitrary state data
+   const char __far * element;	// Current level element name
+   const char __far * attrArray[MAX_ATTR_ARRAY_SIZE];
+   										// Current attribute/value pairs
+   										// terminated by a NULL attribute name
+   long index;				// Special case: if attribute index="<integer>" is found,
+   							// then the index is parsed into this field.  Defaults to 1
+   							// if not found.  This is very handy for RCI.
+   long mark;				// Offset of '<' char of start element.
+   // startElement() is called when a new element (inside this element)
+   // is encountered.  endElement() is called when that element is ended.
+   // When called, the new stack entry has been added, and that level may
+   // install its own handlers for the *next* level, and so on.
+   // Any handler may be NULL, in which case the relevant element or data is
+   // ignored.  This implies that a null handler will skip all nested elements.
+   startElementCallback	startElement;
+   endElementCallback	endElement;
+   charactersCallback	characters;
+} xmlSE;
+
+// XML Context type
+typedef struct _xmlCtx {
+    void __far *	userData;
+    char __far *	buf;
+    long			len;
+    char __far *	end;
+    char __far *	cur;
+    int 			error;
+    jmp_buf * jb;			// If not NULL, longjmp here if insurmountable error
+    // Top Of Stack.  This is the index of the "deepest" valid entry
+    // (i.e. for the current element).  -1 for an empty stack, however
+    // the xmlSAXUserParseMemory() function adds an imaginary "outermost"
+    // level (at level 0) in order to install handlers.  One can imagine
+    // this as an invisible "wrapper" element.  Thus, for the purpose
+    // of checking the stack, tos==0 means empty.
+    int			tos;
+    xmlSE		stack[MAX_ELEMENT_STACK_SIZE];
+} xmlCtx;
+
+int xmlSAXUserParseMemory(void __far *userData,
+                          char __far *buf,
+                          long len,
+                          xmlSE __far * wrapper);
+void skipToElement(xmlCtx __far *ctx);
+void handleElementEnd(xmlCtx __far *ctx);
+void skipEndElement(xmlCtx __far *ctx);
+void handleNewElement(xmlCtx __far *ctx);
+
+// note attributes are stored in an array of strings that are dynamically allocated.
+// Attribute names are in even indices and values in odd.  The list ends on the first
+// occurrence of NULL or a zero length string in an even index.
+
+// Rabbit note: since we now use strings in-place, the attribute array is simply
+// an array of pointers, so we keep such an array in the context struct in
+// order to avoid having to malloc/free it.
+
+
+/*** EndHeader */
+
+#ifndef UEfatalError
+_sax2_debug
+void UEfatalError(xmlCtx __far * ctx, char __far * msg)
+{
+	printf("XML parser error: %ls\n", msg);
+}
+#endif
+
+
+_sax2_debug
+int xmlSAXUserParseMemory(void __far *userData,
+                          char __far *buf,
+                          long len,
+                          xmlSE __far * wrapper) {
+    auto xmlCtx __far * ctx;
+    auto word i;
+    auto int retval;
+
+    ctx = _sys_malloc(sizeof(*ctx));
+    if (!ctx)
+    	return -ENOMEM;
+
+    ctx->userData = userData;
+    ctx->buf = buf;
+    ctx->len = len;
+    ctx->end = buf + len - 1;
+    ctx->cur = buf;
+    ctx->error = 0;
+    ctx->tos = 0;	// Initial "empty"
+    _f_memset(ctx->stack, 0, sizeof(ctx->stack));
+    // Set "wrapper" stack level (which includes the base callbacks)...
+	_f_memcpy(ctx->stack, wrapper, sizeof(ctx->stack[0]));
+
+    do {
+
+        skipToElement(ctx);
+        if(ctx->cur >= ctx->end) break;
+
+        // skip over comments, encodings, doctyypes etc...
+        if(*ctx->cur == '!') {
+        		++ctx->cur;
+        		if (*ctx->cur == '-') {
+	            for( ; ctx->cur+2 <= ctx->end; ++ctx->cur) {
+	               if(!memcmp(ctx->cur, "-->", 3)) {
+	                  ctx->cur += 3;
+	                  break;
+	               }
+	            }
+	         }
+	         else if (!memcmp(ctx->cur, "[CDATA[", 7)) {
+	         	// We treat CDATA like a comment
+	         	ctx->cur += 7;
+	            for( ; ctx->cur+2 <= ctx->end; ++ctx->cur) {
+	               if(!memcmp(ctx->cur, "]]>", 3)) {
+	                  ctx->cur += 3;
+	                  break;
+	               }
+	            }
+	         }
+        } else if(*ctx->cur == '?') {
+        		// Processing instruction.  Ignore.
+            for( ; ctx->cur+1 <= ctx->end; ++ctx->cur) {
+               if(!memcmp(ctx->cur, "?>", 2)) {
+                  ctx->cur += 2;
+                  break;
+               }
+            }
+        } else if(*ctx->cur == '/') {
+            handleElementEnd(ctx);
+        } else {
+            // new element
+            handleNewElement(ctx);
+        }
+
+    } while (ctx->cur < ctx->end && ctx->error == 0);
+
+    if (!ctx->error && ctx->tos > 0) {
+         UEfatalError(ctx, "End element missing");
+         ctx->error = -1;
+    }
+
+
+    retval = ctx->error;
+    _sys_free(ctx);
+
+    return retval;
+}
+
+_sax2_debug
+long processCharEntities(char __far * p, long len)
+{
+	// Convert char entities (e.g. &amp;) to the corresponding char.  This
+	// never results in increase of string size, hence it is done in-place.
+	// The resulting length is returned (<= len).
+	char __far * s;	// source char
+	char __far * d;	// dest char
+	char __far * end;
+
+	end = p + len;
+	for (d = s = p; s < end; ++s, ++d) {
+		if (*s == '&') {
+			++s;
+			if (!memcmp(s, "amp;", 4)) {
+				s += 3;
+				*d = '&';
+			}
+			else if (!memcmp(s, "lt;", 3)) {
+				s += 2;
+				*d = '<';
+			}
+			else if (!memcmp(s, "gt;", 3)) {
+				s += 2;
+				*d = '>';
+			}
+			else {
+				*d = '?';	// Use this to mark unknown char entity
+				while (s < end && *s != ';') ++s;
+			}
+		}
+		else
+			*d = *s;
+	}
+	return d - p;
+}
+
+_sax2_debug
+void skipToElement(xmlCtx __far *ctx) {
+    char __far *oldCur;
+    char __far *startChar = NULL;
+    char __far *endChar = NULL;
+    charactersCallback cc;
+    long len;
+
+    if(ctx->error != 0) return;
+
+    startChar = ctx->cur;
+
+    oldCur = ctx->cur;
+    for( ; ctx->cur <= ctx->end; ++ctx->cur) {
+        if(*ctx->cur == '<') {
+            ++ctx->cur;
+            break;
+        }
+        if(*ctx->cur == '>') {
+            UEfatalError(ctx, "End element tag without begin tag");
+            ctx->error = -1;
+            return;
+        }
+    }
+
+    if(ctx->cur > ctx->end) ctx->cur = ctx->end;
+
+    endChar = ctx->cur;
+
+    if( ctx->cur == ctx->end) {
+        if(oldCur != ctx->cur) {
+            endChar = ctx->cur - 1;
+
+            cc = ctx->stack[ctx->tos-1].characters;
+            if (cc) {
+            	len = processCharEntities(oldCur, ctx->cur - oldCur);
+               cc(ctx, ctx->stack + ctx->tos, oldCur, len);
+            }
+        }
+    } else if( oldCur != ctx->cur - 1) {
+        endChar = ctx->cur - 2;
+
+        cc = ctx->stack[ctx->tos-1].characters;
+        if (cc) {
+        		len = processCharEntities(oldCur, ctx->cur - oldCur - 1);
+            cc(ctx, ctx->stack + ctx->tos, oldCur, len);
+        }
+    }
+
+}
+
+_sax2_debug
+void handleElementEnd(xmlCtx __far *ctx) {
+
+    auto char __far *startBracket = NULL;
+    auto char __far *endBracket = NULL;
+    auto char __far *end;
+    auto word len;
+    auto word index;
+    auto word found;
+    endElementCallback ec;
+
+    if (ctx->error) return;
+
+    // cur points to '/'.  go back one to point to '<'
+    startBracket = ctx->cur - 1;
+
+    // cur points at '/'.  shift one to beginning of name
+    ++ctx->cur;
+
+    //point this at the last char of the element tag
+
+    for(end=ctx->cur; end <= ctx->end; ++end) {
+        if(*end == '>') {
+            endBracket = end;
+            --end;
+            break;
+        }
+    }
+
+    // parse error if '>' not found...
+    if(end >= ctx->end) {
+        UEfatalError(ctx, "Missing end element tag");
+        ctx->error = -1;
+        return;
+    }
+    len = (word)(end - ctx->cur + 1);
+
+    if(len < 1) {
+        UEfatalError(ctx, "Missing element name");
+        ctx->error = -1;
+        return;
+    }
+
+    ctx->cur[len] = '\0';
+    if(ctx->tos < 1 || strcmp(ctx->stack[ctx->tos].element, ctx->cur)) {
+       UEfatalError(ctx, "Unexpected end element");
+       ctx->error = -1;
+       return;
+    }
+
+
+    ec = ctx->stack[ctx->tos-1].endElement;
+    if (ec)
+        ec(ctx, ctx->stack + ctx->tos);
+    --ctx->tos;
+
+    ctx->cur = end + 2;
+}
+
+_sax2_debug
+void skipEndElement(xmlCtx __far *ctx) {
+
+    if(ctx->error != 0) return;
+
+    for( ; ctx->cur <= ctx->end; ++ctx->cur) {
+        if(*ctx->cur == '>') {
+            ++ctx->cur;
+            break;
+        }
+        if(*ctx->cur == '<') {
+            UEfatalError(ctx, "Unexpected start element");
+            ctx->error = -1;
+            return;
+        }
+    }
+}
+
+// handle new element, attributes
+_sax2_debug
+void handleNewElement(xmlCtx __far *ctx) {
+
+    const char __far * __far * attrs;
+    char __far *startBracket = NULL;
+    char __far *endBracket = NULL;
+    char __far *end;
+    char __far *pos2;
+    word i;
+    int attrIndex;
+    word len;
+    int foundSpace;
+    int foundEqual;
+    char __far * aPos;
+    char __far * endMarker;
+    word index;
+    int found;
+    int isElemEnd;
+    startElementCallback sc;
+    endElementCallback ec;
+    xmlSE __far * top;
+    xmlSE __far * next;
+
+    if(ctx->error != 0) return;
+
+    // Check for stack full.
+    if(ctx->tos == MAX_ELEMENT_STACK_SIZE-1) {
+        UEfatalError(ctx, "Elements nested too deeply");
+        ctx->error = -1;
+        return;
+    }
+    top = ctx->stack + ctx->tos;
+    ++ctx->tos;
+    next = ctx->stack + ctx->tos;
+    next->index = 1;		// Default if no 'index="nnn"' attribute found.
+
+    attrs = next->attrArray;
+
+    // cur points to char after '<':
+    startBracket = ctx->cur - 1;
+
+    if(isspace(*ctx->cur)) {
+        UEfatalError(ctx, "Illegal white space in element tag");
+        ctx->error = -1;
+        return;
+    }
+    if(isdigit(*ctx->cur)) {
+        UEfatalError(ctx, "Illegal numeral in start of element name");
+        ctx->error = -1;
+        return;
+    }
+
+    // have end point to the char before the '>'
+    for(end = ctx->cur; end <= ctx->end; ++end) {
+        if(*end == '>') {
+            endBracket = end;
+            --end;
+            break;
+        }
+        if(*end == '<') {
+            UEfatalError(ctx, "Unexpected start element");
+            ctx->error = -1;
+            return;
+        }
+    }
+
+    // handle <> case
+    if(end < ctx->cur) {
+        UEfatalError(ctx, "Missing element name");
+        ctx->error = -1;
+        return;
+    }
+
+    // if we reach the end without finding '>', must be a parse error...
+    if(end == ctx->end) {
+        UEfatalError(ctx, "No end element tag found");
+        ctx->error = -1;
+        return;
+    }
+
+    // have pos2 point to the end of the element name
+    for(pos2 = ctx->cur; pos2 <= ctx->end; ++pos2) {
+        if(*pos2 == ' ' || *pos2 == '>' || *pos2 == '/') {
+            --pos2;
+            break;
+        }
+    }
+
+    // handle </>
+    if(end == ctx->cur && *end == '/') {
+        UEfatalError(ctx, "Missing element name");
+        ctx->error = -1;
+        return;
+    }
+
+    // this really should not happen...
+    if(pos2 >= ctx->end) {
+        UEfatalError(ctx, "Unexpected end element");
+        ctx->error = -1;
+        return;
+    }
+
+    //handle attributes
+    _f_memset(attrs, 0, sizeof(*attrs)*MAX_ATTR_ARRAY_SIZE);
+
+    if(pos2 + 1 < end) {
+
+        attrIndex = 0;
+        foundSpace= 0;
+        foundEqual= 0;
+        aPos = pos2 + 1;
+
+        // in this do loop, parse and handle name="value" pairs.
+        do {
+            if(aPos >= end) break;
+            if(isspace(*aPos)) continue;
+
+            else {
+                foundSpace=0;
+                foundEqual=0;
+                endMarker = aPos;
+                len = 0;
+
+                // parse name of attribute looking for '='
+                while(++endMarker) {
+                    if(endMarker >= end) {
+                        UEfatalError(ctx, "Malformed attribute name");
+                        ctx->error = -1;
+                        return;
+                    }
+                    if(*endMarker == '=') {
+                        if(!foundSpace) len = (word)(endMarker - aPos);
+                        foundEqual = 1;
+                    }
+                    if(*endMarker == '\"') {
+                        if(foundEqual) break;
+                        else {
+                            UEfatalError(ctx, "Unexpected quote character");
+                            ctx->error = -1;
+                            return;
+                        }
+                    }
+                    if(isspace(*endMarker)) {
+                        if(!foundEqual) {
+                            len = (word)(endMarker - aPos);
+                            foundSpace = 1;
+                        }
+                    } else if(foundSpace) { // unexpected char before = and after whitespace
+                        UEfatalError(ctx, "Malformed attribute");
+                        ctx->error = -1;
+                        return;
+                    }
+                } //while
+
+                if(attrIndex >= MAX_ATTR_ARRAY_SIZE - 1) {
+                    UEfatalError(ctx, "Too many attributes");
+                    ctx->error = -1;
+                    return;
+                }
+
+                // at this point, 'aPos' points to beginning of name
+                // 'len' holds the length of the name
+                // 'endMarker' points to the " character at the beginning of the value
+                attrs[attrIndex] = aPos;
+                aPos[len] = '\0';
+
+                endMarker++;
+                aPos = endMarker; // first character of value
+                len = 0;
+
+                do {
+                    if(endMarker > end) {
+                        UEfatalError(ctx, "Malformed attribute value");
+                        ctx->error = -1;
+                        return;
+                    }
+                    if(*endMarker == '\"') {
+                        len = (word)(endMarker - aPos);
+                        break;
+                    }
+                } while(++endMarker);
+
+                attrs[attrIndex+1] = aPos;
+                aPos[len] = 0;
+
+                if (!strcmp(attrs[attrIndex], "index"))
+                    next->index = _f_strtol(aPos, NULL, 0);
+
+                attrIndex += 2;
+                aPos = endMarker;
+            } // else
+        } while (aPos++ < end );
+
+    } // if(pos2 != end)
+
+
+    len = (word)(pos2 - ctx->cur + 1);
+
+    isElemEnd = *end == '/';
+
+    // add new element to stack
+    next->element = ctx->cur;
+    ctx->cur[len] = '\0';
+
+    // Null out other new stack entry fields.  The startElement callback
+    // (of 'top' level) is responsible for setting them.
+    next->state = NULL;
+    next->startElement = NULL;
+    next->endElement = NULL;
+    next->characters = NULL;
+
+    // Now make callback.
+    sc = top->startElement;
+    if (sc)
+        sc(ctx, next);
+
+    // handle end
+    if(isElemEnd) {
+        ec = top->endElement;
+        if (ec)
+            ec(ctx, next);
+        --ctx->tos;
+    }
+
+    ctx->cur = end + 2;
+
+}
+
+
+/*** BeginHeader xmlAttrValue */
+const char __far * xmlAttrValue(xmlSE __far * se, const char __far * attr);
+/*** EndHeader */
+_sax2_debug
+const char __far * xmlAttrValue(xmlSE __far * se, const char __far * attr)
+{
+	const char __far * __far * attrs;
+	for (attrs = se->attrArray; *attrs; attrs += 2)
+		if (!strcmp(attr, *attrs))
+			return attrs[1];
+	return NULL;
+}
+
+/*** BeginHeader xmlGenError */
+int xmlGenError(xmlCtx __far * ctx, int err);
+/*** EndHeader */
+_sax2_debug
+int xmlGenError(xmlCtx __far * ctx, int err)
+{
+	xmlFreeMemory(ctx);
+	if (ctx->jb)
+		longjmp(*ctx->jb, err);
+	return err;
+}
+
+/*** BeginHeader xmlGenMemory */
+
+/*
+	Call xmlGenMemory() with an uninitialized xmlCtx struct, and an initial guess
+	as to the eventual size of the document, which will be created in
+	malloc'd RAM.  If this turns out to be insufficient, it is reallocated
+	by a specified increment.  If too big, it is reallocated at end to the
+	required size.  xmlFinishMemory() must be called to finalize and return the
+	result (the buffer, which should then be freed by the callin xmlFreeMemory()).
+	Note that there will be an uninitialized area of XML_GEN_HEADER bytes at the
+	start of the returned area.  Thus, the document starts at this offset.
+
+	<NOTIMPLEMENTED>
+	If the resulting document may be too large to fit in memory, a callback
+	function can be specified to process the generated output.  The buffer is
+	then automatically reset for further data.  If the callback function is
+	specified, then a single buffer of guess_size+guess_increment is allocated,
+	and if the current document gets larger than guess_size then it is output.
+	Thus, guess_increment should reflect the largest expected atomic addition
+	to the buffer.  xmlFinishMemory() will simply call the callback then reset
+	the buffer.  xmlFreeMemory() is still required to free the buffer.
+	</NOTIMPLEMENTED>
+
+	Application calls xmlGenBeginElement() to create a new level of element with
+	the given name (and optional attributes).  The corresponding end element
+	is automatically inserted at xmlGenEndElement(), which pops the element stack
+	to the correct level.  xmlGenBeginEnd() combines begin and end like <foo/> or,
+	if char data specified, <foo>chardata</foo>.
+*/
+int xmlGenMemory(xmlCtx __far * ctx,
+						long guess_size,
+						long guess_increment,
+						void __far *userData,
+						xmlSE __far * wrapper,
+						jmp_buf * jb
+	 					);
+
+/*** EndHeader */
+_sax2_debug
+int xmlGenMemory(xmlCtx __far * ctx,
+						long guess_size,
+						long guess_increment,
+						void __far *userData,
+						xmlSE __far * wrapper,
+						jmp_buf * jb
+	 					)
+{
+	_f_memset(ctx, 0, sizeof(*ctx));
+	ctx->jb = jb;
+
+	if (guess_size < XML_GEN_HEADER ||
+	    guess_increment < 1)
+		return -EINVAL;
+
+	ctx->buf = _sys_malloc(guess_size);
+	if (!ctx->buf)
+		return xmlGenError(ctx, -ENOMEM);
+	ctx->end = ctx->buf + guess_size;
+	// len field always holds the *next* size should realloc be necessary.
+	ctx->len = guess_size + guess_increment;
+	ctx->cur = ctx->buf + XML_GEN_HEADER;
+
+	ctx->tos = -1;
+
+	if (wrapper)
+		_xmlPush(ctx, wrapper, 0);
+	return 0;
+}
+
+/*** BeginHeader _xmlPush */
+void _xmlPush(xmlCtx __far * ctx, xmlSE __far * se, int and_end);
+/*** EndHeader */
+_sax2_debug
+void _xmlPush(xmlCtx __far * ctx, xmlSE __far * se, int and_end)
+{
+	char ibuf[20];
+	word len, le, libuf;
+	const char __far * __far * attr;
+
+	++ctx->tos;
+	se->mark = xmlGenMark(ctx);
+	_f_memcpy(ctx->stack + ctx->tos, se, sizeof(*se));
+	if (se->index != 1)
+		libuf = sprintf(ibuf, " index=\"%ld\"", se->index);
+	else
+		libuf = 0;
+	// Compute length required
+	len = libuf + 2 + and_end + (le = strlen(se->element));	// extra 2 for <>
+	attr = se->attrArray;
+	while (*attr) {
+		// extra 4 for leading space and =""
+		len += 4 + strlen(attr[0]) + strlen(attr[1]);
+		attr += 2;
+	}
+
+	while (ctx->cur + len > ctx->end)
+		_xmlExpandBuf(ctx);
+
+	*ctx->cur = '<';
+	_f_memcpy(++ctx->cur, se->element, le);
+	ctx->cur += le;
+	if (libuf) {
+		_f_memcpy(ctx->cur, ibuf, libuf);
+		ctx->cur += libuf;
+	}
+	attr = se->attrArray;
+	while (*attr) {
+		*ctx->cur = ' ';
+		le = strlen(attr[0]);
+		_f_memcpy(++ctx->cur, attr[0], le);
+		ctx->cur += le;
+		*ctx->cur = '=';
+		*++ctx->cur = '"';
+		le = strlen(attr[1]);
+		_f_memcpy(++ctx->cur, attr[1], le);
+		ctx->cur += le;
+		*ctx->cur++ = '"';
+		attr += 2;
+	}
+	if (and_end) {
+		*ctx->cur++ = '/';
+		--ctx->tos;
+	}
+	*ctx->cur++ = '>';
+}
+
+
+/*** BeginHeader xmlFinishMemory */
+char __far * xmlFinishMemory(xmlCtx __far * ctx, long * len_ptr);
+/*** EndHeader */
+_sax2_debug
+char __far * xmlFinishMemory(xmlCtx __far * ctx, long * len_ptr)
+{
+	while (ctx->tos >= 0)
+		_xmlPop(ctx);
+	// Realloc to exact final size.  This might help with
+	// memory-constrained apps.
+	*len_ptr = ctx->cur - ctx->buf;
+	ctx->buf = _sys_realloc(ctx->buf, *len_ptr);	// making smaller, guaranteed to work
+	return ctx->buf;
+}
+
+
+/*** BeginHeader xmlFreeMemory */
+void xmlFreeMemory(xmlCtx __far * ctx);
+/*** EndHeader */
+_sax2_debug
+void xmlFreeMemory(xmlCtx __far * ctx)
+{
+	_sys_free(ctx->buf);
+	ctx->buf = NULL;
+}
+
+
+/*** BeginHeader _xmlExpandBuf */
+void _xmlExpandBuf(xmlCtx __far * ctx);
+/*** EndHeader */
+_sax2_debug
+void _xmlExpandBuf(xmlCtx __far * ctx)
+{
+	long incr;
+	long delta;
+	char __far * nbuf;
+
+	// Deduce the original guess_increment
+	incr = ctx->len - (ctx->end - ctx->buf);
+	nbuf = _sys_realloc(ctx->buf, ctx->len);
+	if (!nbuf) {
+		xmlGenError(ctx, -ENOMEM);
+		exit(-ENOMEM);	// exit if no longjmp available
+	}
+	delta = nbuf - ctx->buf;
+	ctx->buf = nbuf;
+	ctx->end = ctx->buf + ctx->len;
+	ctx->len += incr;
+	ctx->cur += delta;
+}
+
+/*** BeginHeader xmlGenMark */
+// Get position for possible future rewind (to discard generated elements)
+long xmlGenMark(xmlCtx __far * ctx);
+/*** EndHeader */
+_sax2_debug
+long xmlGenMark(xmlCtx __far * ctx)
+{
+	return ctx->cur - ctx->buf;
+}
+
+
+/*** BeginHeader xmlGenRewind */
+void xmlGenRewind(xmlCtx __far * ctx, long mark);
+/*** EndHeader */
+_sax2_debug
+void xmlGenRewind(xmlCtx __far * ctx, long mark)
+{
+	ctx->cur = ctx->buf + mark;
+}
+
+
+/*** BeginHeader xmlGenBuffer */
+int xmlGenBuffer(xmlCtx __far * ctx, char __far * __far * buf);
+/*** EndHeader */
+_sax2_debug
+int xmlGenBuffer(xmlCtx __far * ctx, char __far * __far * buf)
+{
+	long len = ctx->end - ctx->cur;
+	*buf = ctx->cur;
+	if (len > 32767)
+		return 32767;
+	return (int)len;
+}
+
+/*** BeginHeader _xmlPop */
+void _xmlPop(xmlCtx __far * ctx);
+/*** EndHeader */
+_sax2_debug
+void _xmlPop(xmlCtx __far * ctx)
+{
+	xmlSE __far * se;
+	word len, le;
+
+	se = ctx->stack + ctx->tos;
+	// Compute length required
+	len = 3 + (le = strlen(se->element));	// extra 3 for </>
+
+	while (ctx->cur + len > ctx->end)
+		_xmlExpandBuf(ctx);
+
+	*ctx->cur = '<';
+	*++ctx->cur = '/';
+	_f_memcpy(++ctx->cur, se->element, le);
+	ctx->cur += le;
+	*ctx->cur++ = '>';
+	--ctx->tos;
+}
+
+
+/*** BeginHeader xmlGenBeginElement */
+void xmlGenBeginElement(xmlCtx __far * ctx,
+						const char __far * element,
+						long index,
+						const char __far * attr_1,
+						...);
+/*** EndHeader */
+_sax2_debug
+void xmlGenBeginElement(xmlCtx __far * ctx,
+						const char __far * element,
+						long index,
+						const char __far * attr_1,
+						...)
+{
+	// NOTE: parameter strings must point to unchanging storage.  We
+	// store pointers, not copies of the strings.  Also, no check for
+	// stack overflow.
+	xmlSE se;
+	const char __far * * attrs;
+	const char __far * * p;
+
+	_f_memset(&se, 0, sizeof(se));
+	se.element = element;
+	se.index = index;
+	attrs = se.attrArray;
+	p = &attr_1;
+	while (*p) {
+		if (p[1]) {
+	      attrs[0] = p[0];
+	      attrs[1] = p[1];
+	      attrs += 2;
+		}
+      p += 2;
+	}
+	*attrs = NULL;
+
+	_xmlPush(ctx, &se, 0);
+}
+
+/*** BeginHeader xmlGenEndElement */
+void xmlGenEndElement(xmlCtx __far * ctx, char __far * element);
+/*** EndHeader */
+_sax2_debug
+void xmlGenEndElement(xmlCtx __far * ctx, char __far * element)
+{
+	// NULL element means just pop current level.
+	// If element is not actually on stack, everything is popped!
+	if (element)
+	   while (ctx->tos >= 0 && strcmp(element, ctx->stack[ctx->tos].element))
+	      _xmlPop(ctx);
+	if (ctx->tos >= 0)
+		_xmlPop(ctx);
+}
+
+
+/*** BeginHeader xmlGenDiscardElement */
+void xmlGenDiscardElement(xmlCtx __far * ctx, char __far * element);
+/*** EndHeader */
+_sax2_debug
+void xmlGenDiscardElement(xmlCtx __far * ctx, char __far * element)
+{
+	// This is similar to xmlGenEndElement(), except that instead of closing
+	// the element, it is completely discarded i.e. the buffer is rewound to
+	// the start of the start element.  This is used to discard elements which
+	// are unwanted in retrospect.
+	long mark;
+
+	if (element)
+	   while (ctx->tos >= 0 && strcmp(element, ctx->stack[ctx->tos].element))
+	      _xmlPop(ctx);
+	if (ctx->tos >= 0) {
+		mark = ctx->stack[ctx->tos].mark;
+		_xmlPop(ctx);
+		xmlGenRewind(ctx, mark);
+	}
+}
+
+
+/*** BeginHeader xmlGenCharacters */
+void xmlGenCharacters(xmlCtx __far * ctx, const char __far * characters);
+/*** EndHeader */
+_sax2_debug
+void xmlGenCharacters(xmlCtx __far * ctx, const char __far * characters)
+{
+	word len;
+	len = strlen(characters);
+
+	while (ctx->cur + len > ctx->end)
+		_xmlExpandBuf(ctx);
+	_f_memcpy(ctx->cur, characters, len);
+	ctx->cur += len;
+}
+
+/*** BeginHeader xmlGenBeginEnd */
+void xmlGenBeginEnd(xmlCtx __far * ctx,
+						const char __far * element,
+						long index,
+						const char __far * characters,
+						const char __far * attr_1,
+						...);
+/*** EndHeader */
+_sax2_debug
+void xmlGenBeginEnd(xmlCtx __far * ctx,
+						const char __far * element,
+						long index,
+						const char __far * characters,
+						const char __far * attr_1,
+						...)
+{
+	xmlSE se;
+	const char __far * * attrs;
+	const char __far * * p;
+
+	_f_memset(&se, 0, sizeof(se));
+	se.element = element;
+	se.index = index;
+	attrs = se.attrArray;
+	p = &attr_1;
+	while (*p) {
+		if (p[1]) {
+	      attrs[0] = p[0];
+	      attrs[1] = p[1];
+	      attrs += 2;
+		}
+      p += 2;
+	}
+	*attrs = NULL;
+
+	if (!characters) {
+		_xmlPush(ctx, &se, 1);
+		return;
+	}
+	_xmlPush(ctx, &se, 0);
+	xmlGenCharacters(ctx, characters);
+	_xmlPop(ctx);
+
+}
+
+/*** BeginHeader xmlGenBeginEndSimple */
+void xmlGenBeginEndSimple(xmlCtx __far * ctx,
+						const char __far * element,
+						const char __far * characters);
+/*** EndHeader */
+_sax2_debug
+void xmlGenBeginEndSimple(xmlCtx __far * ctx,
+						const char __far * element,
+						const char __far * characters)
+{
+	xmlGenBeginEnd(ctx, element, 1, characters, NULL);
+}
+
+/*** BeginHeader xmlGenBeginEndSimpleOnOff */
+void xmlGenBeginEndSimpleOnOff(xmlCtx __far * ctx,
+						const char __far * element,
+						int on);
+/*** EndHeader */
+_sax2_debug
+void xmlGenBeginEndSimpleOnOff(xmlCtx __far * ctx,
+						const char __far * element,
+						int on)
+{
+	xmlGenBeginEnd(ctx, element, 1, on ? "on" : "off", NULL);
+}
+
+/*** BeginHeader xmlGenBeginEndSimpleInt */
+void xmlGenBeginEndSimpleInt(xmlCtx __far * ctx,
+						const char __far * element,
+						long val);
+/*** EndHeader */
+_sax2_debug
+void xmlGenBeginEndSimpleInt(xmlCtx __far * ctx,
+						const char __far * element,
+						long val)
+{
+	char buf[20];
+	sprintf(buf, "%ld", val);
+	xmlGenBeginEnd(ctx, element, 1, buf, NULL);
+}
+
+/*** BeginHeader xmlGenBeginEndSimpleUInt */
+void xmlGenBeginEndSimpleUInt(xmlCtx __far * ctx,
+						const char __far * element,
+						unsigned long val);
+/*** EndHeader */
+_sax2_debug
+void xmlGenBeginEndSimpleUInt(xmlCtx __far * ctx,
+						const char __far * element,
+						unsigned long val)
+{
+	char buf[20];
+	sprintf(buf, "%lu", val);
+	xmlGenBeginEnd(ctx, element, 1, buf, NULL);
+}
+
+/*** BeginHeader xmlGenBeginEndSimple0xInt */
+void xmlGenBeginEndSimple0xInt(xmlCtx __far * ctx,
+						const char __far * element,
+						long val);
+/*** EndHeader */
+_sax2_debug
+void xmlGenBeginEndSimple0xInt(xmlCtx __far * ctx,
+						const char __far * element,
+						long val)
+{
+	char buf[20];
+	sprintf(buf, "0x%lX", val);
+	xmlGenBeginEnd(ctx, element, 1, buf, NULL);
+}
+
+/*** BeginHeader xmlDump */
+// This function for debug only.  Pretty-prints XML.  Normally takes a copy
+// first (since parser overwrites) however if the XML parameter is to be
+// discarded, then allow_overwrite will save having to take a copy.
+void xmlDump(char __far * xml, long xml_len, int allow_overwrite);
+/*** EndHeader */
+
+
+// XML parse callback data for xmlDump()
+typedef struct {
+	int level;
+	int chld[20];	// Child count at each level
+	char spaces[80];
+
+} PXData;
+
+void _xmlDump_chars(xmlCtx __far * ctx, xmlSE __far * se,
+   							char __far * ch, long len)
+{
+	PXData __far * pxd = (PXData __far *)ctx->userData;
+
+	printf("%.*ls", (int)len, ch);
+}
+
+void _xmlDump_end(xmlCtx __far * ctx, xmlSE __far * se)
+{
+	PXData __far * pxd = (PXData __far *)ctx->userData;
+
+	--pxd->level;
+	if (pxd->chld[pxd->level+1])
+		printf("\n%.*ls</%ls>", pxd->level*2, pxd->spaces, se->element);
+	else
+		printf("</%ls>", se->element);
+	if (!pxd->level)
+		printf("\n");
+}
+
+void _xmlDump_start(xmlCtx __far * ctx, xmlSE __far * se)
+{
+	char buf[192];
+	const char __far * __far * attr;
+	PXData __far * pxd = (PXData __far *)ctx->userData;
+
+	++pxd->chld[pxd->level];
+
+	sprintf(buf, "\n%.*ls<%ls", pxd->level*2, pxd->spaces, se->element);
+	for (attr = se->attrArray; *attr; attr += 2)
+		sprintf(buf+strlen(buf), " %ls=\"%ls\"", *attr, attr[1]);
+	printf("%s>", buf);
+
+	++pxd->level;
+	pxd->chld[pxd->level] = 0;
+
+	se->startElement = _xmlDump_start;
+	se->endElement = _xmlDump_end;
+	se->characters = _xmlDump_chars;
+
+}
+
+
+
+void xmlDump(char __far * xml, long xml_len, int allow_overwrite)
+{
+	xmlSE wrapper;
+	PXData pxd;
+	int rc;
+
+	if (!allow_overwrite) {
+		char __far * dup;
+		dup = malloc(xml_len);
+		if (!dup) {
+			printf("[Cannot print XML]\n");
+			return;
+		}
+		_f_memcpy(dup, xml, xml_len);
+		xml = dup;
+	}
+
+	pxd.level = 0;
+	pxd.chld[0] = 0;
+	memset(pxd.spaces, ' ', sizeof(pxd.spaces));
+
+	memset(&wrapper, 0, sizeof(wrapper));
+	wrapper.startElement = _xmlDump_start;
+	wrapper.endElement = _xmlDump_end;
+	wrapper.characters = _xmlDump_chars;
+	rc = xmlSAXUserParseMemory(&pxd, xml, xml_len, &wrapper);
+	printf("\n[XML parser return code %d]\n", rc);
+
+	if (!allow_overwrite)
+		free(xml);
+}
+
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+
+
+

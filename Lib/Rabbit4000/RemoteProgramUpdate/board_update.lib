@@ -1,0 +1,4937 @@
+/*
+	board_update.lib
+
+	Copyright (c)2008-2009 Digi International Inc., All Rights Reserved
+
+	This software contains proprietary and confidential information of Digi
+	International Inc.  By accepting transfer of this copy, Recipient agrees
+	to retain this software in confidence, to prevent disclosure to others,
+	and to make no use of this software other than that for which it was
+	delivered.  This is a published copyrighted work of Digi International
+	Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+	prohibited.
+
+	Restricted Rights Legend
+
+	Use, duplication, or disclosure by the Government is subject to
+	restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+	Technical Data and Computer Software clause at DFARS 252.227-7031 or
+	subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+	Restricted Rights at 48 CFR 52.227-19, as applicable.
+
+	Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+*/
+
+/* START LIBRARY DESCRIPTION ********************************************
+
+	Remote Program Update
+
+	Application Note 421 contains full documentation on using the Remote Program
+	Update library and samples.
+
+	This library contains functions for performing on-board firmware updates.
+	User code is responsible for getting new firmware onto the device, by using
+	a file on FAT filesystem or by writing to a temporary image using the
+	buTempCreate, buTempWrite and buTempClose API.
+
+   On boards with a serial boot flash, the temporary image can be stored on the
+   flash between the boot image and the userblock (BU_TEMP_USE_SBF).  As of
+   Dynamic C 10.62, those boards can also use BU_TEMP_USE_SECONDARY if the
+   macro BU_ENABLE_SECONDARY is defined in the Project Options.  In that case,
+   the serial boot flash holds two fully-functional copies of firmware and can
+   perform powerfail-safe firmware updates (by installing new firmware over the
+   non-booting image).
+
+	You can define the macro MAX_FIRMWARE_BINSIZE in the Project Options, to set
+	the upper size limit for firmware .BIN files.  Doing so frees up more space
+	on the serial boot flash for FAT or general data storage.
+
+	On boards with a non-boot serial flash (including the RCM4400W, which can
+	use 800KB of the 1MB serial flash shared with the FPGA firmware), the
+	temporary image can be stored directly on the flash pages
+	(BU_TEMP_USE_SFLASH), or on a FAT filesystem hosted on the flash
+	(BU_TEMP_USE_FAT).
+
+	The RCM4300 series boards can use the FAT filesystem on a mini-SD card
+	(BU_TEMP_USE_FAT).
+
+	On the RCM5600W, and other boards without a temporary staging area to store
+	downloaded firmware for verification before installation, it's possible to
+	write new firmware directly to the boot flash (BU_TEMP_USE_DIRECT_WRITE).
+	Updating in this manner is dangerous, since a loss of power or a hardware
+	reset during the transfer of the new firmware image will result in a
+	non-bootable board.
+
+	(The RCM5650W has enough space on its serial flash to download firmware
+	for verification before installation.)
+
+	On the RCM5750/60, it's possible to copy firmware from the serial data flash
+	(BU_TEMP_USE_SFLASH) to the parallel boot flash using a mini-loader that
+	board_update.lib copies to and then runs from RAM.  Use of the mini-loader
+	is necessary since the RCM5700 series runs its firmware from the parallel
+	flash instead of fast SRAM.
+
+   To select the storage location for temp files, define the following macros:
+
+	   // use FAT filesystem for temp firmware image
+	   #define BU_TEMP_USE_FAT
+	   // override default filename used for temp image ("a:firmware.bin")
+	   #define BU_TEMP_FILE "a:firmware.bin"
+
+	   // use extra space on serial boot flash for temp firmware image
+	   #define BU_TEMP_USE_SBF
+
+		// store two complete firmware images on serial boot flash; bios can boot
+		// from either image, and updates are written to the non-boot image
+		// --- only available on boards with serial boot flash and you must
+		// define the macro BU_ENABLE_SECONDARY in the Project Options to enable
+		#define BU_TEMP_USE_SECONDARY
+
+	   // use serial data flash for temp firmware image
+	   #define BU_TEMP_USE_SFLASH
+	   // override default starting page number on serial flash (0)
+	   #define BU_TEMP_PAGE_OFFSET 0
+
+	   // write image directly to boot flash (dangerous, serial only)
+	   #define BU_TEMP_USE_DIRECT_WRITE
+
+	This version does not support compressed or encrypted firmware images, but
+	the structures and API have been designed to support that in the future.
+
+	View the samples in the Samples/board_update directory for detailed examples
+	of how to use the functions in this library.  Here's a quick summary of the
+	functions you'd typically call to update the firmware on a board.
+
+	buOpenFirmwareXYZ		Open firmware file from one of many sources.  XYZ can
+								be Running, RAM, Boot, FAT, SFLash or Temp.  In the
+								case of buOpenFirmwareTemp, you may have used the
+								buTempCreate, buTempWrite and buTempClose functions to
+								save the new firmware at a temporary location before
+								installing.
+
+	buGetInfo				Get information (like version, build date, etc.) about
+								the new firmware image.
+
+	buVerifyFirmware		Check the CRC-32 on the firmware image to confirm that
+								it isn't corrupted.  Can also use the blocking version
+								of this function, buVerifyFirmwareBlocking.
+
+	buInstallFirmware		Copy the firmware image to the boot flash.
+
+	exit						Force the system to reboot.
+
+
+	Set the following macros in your Project Defines menu to have the
+	information embedded into the firmware, and accessible to this API.
+
+	_FIRMWARE_NAME_		String, up to 19 printable characters, null-terminated.
+
+	_FIRMWARE_VERSION_	16-bit word (0x0000).  In our sample projects, it's
+								treated as a BCD (binary-coded decimal) value and
+								printed as ("%u.%02x", VER >> 8, VER & 0xFF).
+
+	_FIRMWARE_TIMESTAMP_	32-bit value, # of seconds since 1/1/1980.  Defaults to
+								using the system time at compile time, can override to
+								get repeatable firmware images (same .BIN built from
+								project/source files regardless of compile date/time).
+
+	Set the following macros before [#use "board_update.lib"] to control
+	behavior of the library.
+
+	BU_FAT_TIMEOUT			Set from 1 to 32,000 milliseconds to set the amount
+								of time the board_update library functions will block
+								while waiting for FAT and flash libraries to complete
+								a call.  Defaults to 10.
+
+	BOARD_UPDATE_VERBOSE	If defined, library will print status messages to
+								STDOUT.
+
+	BOARD_UPDATE_DEBUG	If defined, functions will be debuggable (e.g., you can
+								set breakpoints and single-step into them).
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader */
+#include <string.h>
+
+// List of boards officially supported by this library.
+#ifndef BU_IGNORE_BOARD_TYPE
+	#if _BOARD_TYPE_ != RCM4200          \
+	    && ! RCM4300_SERIES              \
+	    && ! RCM4400W_SERIES             \
+	    && ! RCM5400W_SERIES             \
+	    && ! RCM5600W_SERIES             \
+	    && _BOARD_TYPE_ != RCM5750       \
+	    && ! BL4S100_SERIES              \
+	    && CPU_ID_MASK(_CPU_ID_) < R6000
+		#define BU_CANNOT_UPDATE_FW
+	#endif
+#endif
+
+#ifdef BOARD_UPDATE_VERBOSE
+	#define bu_errmsg(err, func) \
+		{ if (err) \
+			printf( "%s: error %d (%ls) calling %s at line %u\n", err, \
+				__FUNCTION__, strerror(err), func, __LINE__); }
+#else
+	#define bu_errmsg(err, func)
+#endif
+
+#ifdef BOARD_UPDATE_DEBUG
+	#define _bu_debug __debug
+#else
+	#define _bu_debug __nodebug
+#endif
+
+// some functions use ix as a frame pointer, but only on parallel boot flash
+#if _SERIAL_BOOT_FLASH_
+	#define _bu_useix
+#else
+	#define _bu_useix	__useix
+#endif
+
+#ifndef __BOOTDEV_SF_API__
+	#ifdef _SERIAL_BOOT_FLASH_
+	#use "bootdev_sf_api.lib"
+   #endif
+#endif
+
+// When using the mini-loader (RCM57xx), SFLASH is the only valid temp location
+// so automatically define it for the user.
+#ifdef BU_ENABLE_MINILOADER
+	#define BU_TEMP_USE_SFLASH
+#endif
+
+// Automatically include sflash.lib for user (requires that they define any
+// configuration macros BEFORE including board_update.lib).
+#ifdef BU_TEMP_USE_SFLASH
+	#use "sflash.lib"
+#endif
+
+// Define macros to identify whether sflash.lib and fat16.lib were #used before
+// #using board_update.lib.
+#ifdef __SFLASH_LIB__
+	#define _BU_ENABLE_SFLASH
+#endif
+#ifdef __FAT16_LIB
+	#define _BU_ENABLE_FAT
+#endif
+
+// Install/Restore functions allocate temporary xmem to use as a buffer for
+// calling the flash write routines.  4K seems to be a good balance between
+// efficient write sizes and memory usage.
+#define _BU_INSTALL_BLOCKSIZE 4096
+
+// All sources are treated as non-seekable, so in addition to the sources
+// we're using now, it would be possible to add HTTP, xmodem and other
+// data streams for use on devices without temporary storage.
+enum _bu_firmsrc {
+	_BU_FIRMSRC_INVALID = 0,	// source hasn't been set
+	_BU_FIRMSRC_BOOT,				// firmware on boot flash
+	_BU_FIRMSRC_RUNNING,			// currently-running firmware (SRAM)
+	_BU_FIRMSRC_RAM,				// firmware in data ram (far/xmem)
+	_BU_FIRMSRC_SFLASH,			// firmware stored raw on serial flash
+	_BU_FIRMSRC_SBF,				// firmware in second half of serial boot flash
+	_BU_FIRMSRC_IMAGE_A,			// firmware in secondary (non-boot) part of SBF
+	_BU_FIRMSRC_IMAGE_B,			// firmware in secondary (non-boot) part of SBF
+	_BU_FIRMSRC_TMPBOOT,			// "temp" firmware stored in boot portion of SBF
+	_BU_FIRMSRC_FAT,				// firmware stored on FAT filesystem
+};
+
+typedef struct {
+	enum _bu_firmsrc	source;			// source of image being read
+	word					flags;
+		// note that not all flags are supported in this release
+		#define BU_FLAG_USERSET		0x07FF	// bitmask for user-settable flags
+		#define BU_FLAG_NONE			0x0000	// no flags set
+		#define BU_FLAG_RESERVED	0x0008	// reserved user flag
+		#define BU_FLAG_NOVERIFY	0x0080	// skip pre-install verify (less safe)
+
+		#define BU_FLAG_COMPRESSED	0x0007	// bitmask for compression
+		#define BU_FLAG_LZ77			0x0001	// compressed with zcompress
+		#define BU_FLAG_DEFLATE		0x0002	// zlib/deflate format (RFC1950/1951)
+		#define BU_FLAG_GZIP			0x0003	// compressed with gzip (RFC1952)
+		// compression methods 0x0004 to 0x0007 unused
+
+		#define BU_FLAG_ENCRYPTED	0x0070	// bitmask for encryption
+		#define BU_FLAG_3DES			0x0010	// triple-DES-encrypted
+		#define BU_FLAG_AES			0x0020	// AES-encrypted
+		// encryption methods 0x0030 to 0x0070 unused
+
+		// flags related to BU_ENABLE_SECONDARY
+	   #define BU_FLAG_IMAGE_Z             0x0000
+	   #define BU_FLAG_IMAGE_A             0x0100
+	   #define BU_FLAG_IMAGE_B             0x0200
+	   #define BU_FLAG_IMAGE_MASK          0x0300
+	   #define BU_FLAG_UPDATE_CHECKSUM     0x0400
+	   // 0x0800 unused
+
+		#define BU_FLAG_OPEN			0x1000	// file has been opened
+		#define BU_FLAG_XFREE		0x2000	// call xfree() on src.ram.address
+														// before exit (nec. when caching
+														// decrypted copy during verify)
+		// 0x4000 unused
+		#define BU_FLAG_VERIFIED	0x8000	// firmware image has been verified
+
+	// we probably need to store an encryption key in this structure as well...
+
+	firmware_info_t	info;					// cached copy of image's fw info
+	unsigned long		file_crc32;			// CRC-32 read from end of firmware .BIN
+	struct {
+	   // function pointer to read stream
+	   int            (*read)( byte __far *dest, int bytes);
+		long				length;			// length of [compressed] firmware image
+												//  (currently unused)
+		long				offset;			// offset into stream (bytes read so far)
+	   byte           buffer[2048];  // buffer for decrypting and decompressing
+	   int            buf_head;      // buffer[buf_head] is insertion point
+	   int				buf_tail;		// buffer[buf_tail] is byte in stream
+	   										// if buf_head == buf_tail, buffer is empty
+	      // DEVNOTE: for efficiency, should we use a circular buffer and keep a
+	      // head and tail index?  Will 2K be enough of a buffer for efficient
+	      // block writing on boot flash?
+	      // ** use TBUF.LIB for circular buffer in stream and firmware?  More
+	      // difficult since underlying libs (sflash, fat, sbf) don't want a
+	      // tbuf.  Would need to split reads in many cases.
+	} stream;
+
+	// firmwarelength is available as info.length
+	struct {
+		long				offset;			// offset into decompressed firmware
+		unsigned long	calc_crc32;		// CRC-32 of firmware read so far
+		byte				buffer[2048];	// buffer for storing firmware during
+												// read/verify process
+	} firmware;
+
+	union {
+		// This union stores additional fields specific to the firmware source.
+		// There's nothing to store for BOOT so it doesn't have a struct defined.
+		struct {
+			const byte __far	*address;	// start of image in far memory
+		} ram;
+		struct {
+			int			org_tbl_index;	// current index into orgtable
+		} running;
+#ifdef _BU_ENABLE_SFLASH
+		struct {
+			sf_device	*device;		// serial flash device to read from
+			int			rambank;		// RAM bank on flash to use for reading (1, 2)
+			long			startpage;	// first page of file
+		} sflash;
+#endif
+#ifdef _BU_ENABLE_FAT
+		struct {
+			FATfile		*file;		// file on FAT filesystem
+		} fat;
+#endif
+		struct {
+			longword		offset;		// offset into SBF to read/write image
+		} sbf;
+	} src;
+} firmware_file_t;
+/*** EndHeader */
+
+/*** BeginHeader _bu_timer_report */
+#define _BU_TIMER_SET(x)			_SET_SHORT_TIMEOUT(x)
+// _BU_TIMER_NOT_EXPIRED() is functionally identical to (!_CHK_SHORT_TIMEOUT())
+#define _BU_TIMER_NOT_EXPIRED(x)	((int)((word)MS_TIMER - (x)) < 0)
+#ifndef BU_FAT_TIMEOUT
+	#define BU_FAT_TIMEOUT	10			// ms to block on -EBUSY before aborting
+#endif
+
+#ifdef BOARD_UPDATE_VERBOSE
+	#define _BU_TIMER_REPORT(timer, funcname)	_bu_timer_report(timer, funcname)
+#else
+	// Calls to _BU_TIMER_REPORT are ignored unless VERBOSE is on
+	#define _BU_TIMER_REPORT(timer, funcname)
+#endif
+
+void _bu_timer_report( word timer, const char *funcname);
+/*** EndHeader */
+// Function used when verbose output enabled, displays duration of FAT
+// function calls that exceed 25 milliseconds.  Used for finding slow FAT calls.
+_bu_debug
+void _bu_timer_report( word timer, const char *funcname)
+{
+   auto word ms;
+
+   ms = BU_FAT_TIMEOUT + (int)((word)MS_TIMER - (timer));
+   if (ms > 25)
+   {
+      printf( "bu: %ums calling %s\n", ms, funcname);
+   }
+}
+
+/*** BeginHeader _bu_firmfile */
+extern __far firmware_file_t _bu_firmfile;
+#ifdef _BU_ENABLE_FAT
+	extern FATfile _bu_FATfile;
+#endif
+/*** EndHeader */
+__far firmware_file_t	_bu_firmfile;	// data on firmware image being read
+#ifdef _BU_ENABLE_FAT
+	FATfile _bu_FATfile;					// FAT library requires FATfile in near mem
+#endif
+
+/*** BeginHeader */
+/*
+	In order to maintain backward compatability when making changes to this
+	structure, you cannot modify the overall size or positions of the version,
+	sequence number, flash offset or flash_cmd fields.  Remember that a
+	boot loader installed by DC 10.62 needs to be able to parse this structure.
+*/
+typedef struct {
+	char					version;			// set to 0x10 or higher if incompatible
+												// with original bootloader from DC 10.62.
+
+		#define BU_MARKER_VERSION	1	// current version number
+
+	word					sequence;		// number of installs done with RPU
+	long					address;			// serial flash offset to new image
+	long					flash_cmd;		// lower 3-bytes are address bytes to
+												// send to flash (put command byte in MSB)
+	byte					reserved1[24];	// reserved for future use, set to 0
+	firmware_info_t	firminfo;		// copy of firmware info from image
+	byte					reserved2[23];	// reserved for future use, set to 0
+	word					checksum;		// 8-bit Fletcher Checksum (RFC 1145)
+} firmware_marker_t;
+// BU_MARKER_SIZE is defined in StdBIOS.c
+#ifdef BU_MARKER_SIZE
+	#if sizeof(firmware_marker_t) != BU_MARKER_SIZE
+	   #fatal "Size of firmware_marker_t does not match BU_MARKER_SIZE"
+	#endif
+#endif
+/*** EndHeader */
+
+/*** BeginHeader _bu_fletcher8 */
+word _bu_fletcher8( const void __far *data, word len);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+_bu_fletcher8                                            <board_update.lib>
+
+SYNTAX:	word _bu_fletcher8( const byte far *data, word len)
+
+DESCRIPTION:	Calculate 8-bit Fletcher Checksum for given data.  See RFC 1145
+					for additional details on this algorithm.
+
+					board_update.lib uses it in the firmware_marker_t structure
+					written to the boot flash and read by the boot loader to choose
+					an image to run.
+
+PARAMETER 1:	Data to checksum.
+
+PARAMETER 2:	Number of bytes to checksum.
+
+RETURN VALUE:	16-bit checksum, with checkA in the high byte and checkB in the
+					low byte.
+
+					Note that checksumming 0 bytes results in a checksum of 0xFFFF.
+
+END DESCRIPTION **********************************************************/
+word _bu_fletcher8( const void __far *data, word len)
+{
+#asm _bu_debug
+	; expects pointer to data in px and length in hl
+;	ld		px, (sp+@SP+data)	; px is already loaded with <data>
+	ld		hl, (sp+@SP+len)
+	ld		bc, hl				; number of bytes to sum
+
+	test	hl						; make sure byte count is non-zero
+
+	clr	hl						; checksum starts at all 1's
+	dec	hl
+
+	jr		z, .done				; z flag still set from [test hl] above
+
+.loop:
+	ld		a, (px + 0)			; load byte and increment pointer
+	ld		px, px + 1
+
+	add	a, h					; update checksum
+	adc	a, 0
+	ld		h, a
+	add	a, l
+	adc	a, 0
+	ld		l, a
+	dwjnz	.loop
+
+.done:
+	; returns checksum in hl
+#endasm
+}
+
+/*** BeginHeader buMarkerChecksum */
+word buMarkerChecksum( const firmware_marker_t __far *marker);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+buMarkerChecksum                                       <board_update.lib>
+
+SYNTAX:	word buMarkerChecksum( const firmware_marker_t far *marker)
+
+DESCRIPTION:	Calculate the proper checksum for a given firmware_marker
+					structure.
+
+PARAMETER:	Marker to calculate checksum for.
+
+RETURN VALUE:	Checksum for given marker.  If marker is NULL, checksum is 0.
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+word buMarkerChecksum( const firmware_marker_t __far *marker)
+{
+	if (! marker)
+	{
+		return 0;
+	}
+	return _bu_fletcher8( marker, sizeof(*marker) - 2);
+}
+
+/*** BeginHeader buMarkerBuild */
+int buMarkerBuild( firmware_marker_t __far *marker, word sequence,
+	long flash_offset);
+/*** EndHeader */
+#if !_SERIAL_BOOT_FLASH_
+	#fatal "buMarkerBuild only works for boards with a serial boot flash."
+#endif
+/* START FUNCTION DESCRIPTION ********************************************
+buMarkerBuild                                          <board_update.lib>
+
+SYNTAX:	int buMarkerBuild( firmware_marker_t far *marker,
+															word sequence, long flash_offset)
+
+DESCRIPTION:	Build a firmware_marker structure for the firmware image stored
+					at a given flash offset.
+
+PARAMETER 1:	Buffer for storing the marker.
+
+PARAMETER 2:	Sequence number to embed in marker (usually the previous boot
+					image's sequence number, plus 1).  Note that the loader and
+					board_update.lib handle sequence number rollover correctly
+					(i.e., 0x0000 is considered newer than 0xFFFF).
+
+PARAMETER 3:	Flash offset of firmware to build a marker for.
+
+RETURN VALUE:	-EINVAL: <marker> is NULL or offset is negative
+
+
+END DESCRIPTION **********************************************************/
+__root
+long _bu_flash_cmd( long flash_offset);
+#asm __root
+	; Convert a flash offset to the serial SPI command to store in
+	; a firmware_marker_t.  Takes offset in BCDE, returns command in BCDE.
+_bu_flash_cmd::
+   call  _sbf_getPageAddr
+   call  _sbf_LdPageAddr
+   ; bytes for flash command are now in registers b, c, e
+   ld    d, c
+   ld    c, b
+   ld    b, 0           ; allow loader to select flash command (0x03, 0xE8)
+   ret
+#endasm
+
+_bu_debug
+int buMarkerBuild( firmware_marker_t __far *marker,
+														word sequence, long flash_offset)
+{
+	auto char buffer[516];
+	auto int addr, offset;
+	auto int err;
+	auto word timer;
+
+	if (! marker || flash_offset < 0)
+	{
+		return -EINVAL;
+	}
+
+   // default to a zeroed structure, unused fields should be 0
+   _f_memset( marker, 0, sizeof(*marker));
+
+   marker->version = BU_MARKER_VERSION;
+   marker->sequence = sequence;
+   marker->address = flash_offset;
+
+   // Flash command to load bytes from flash_offset -- much easier to calculate
+   // now (with the boot flash initialized) than in the loader.
+   marker->flash_cmd = _bu_flash_cmd( flash_offset);
+
+   // Fill in the firmware_info_t here.  Check second 512 bytes first.  Most
+   // likely since the coldloader is in the first 512 bytes.
+   for (offset = 512; offset >= 0; offset -= 512)
+   {
+	   timer = _BU_TIMER_SET( BU_FAT_TIMEOUT);
+	   do {
+	      // Reading extra 4 bytes in case struct is in last 64 bytes of buffer
+	      // (and its CRC-32 is hanging off the end).
+	      err = sbf_far_Read( buffer, flash_offset + offset, 516);
+	   } while ((err > 0) && _BU_TIMER_NOT_EXPIRED( timer));
+	   if (err > 0)
+	   {
+		   bu_errmsg( err, "sbf_far_Read");
+			return -EBUSY;
+	   }
+
+      addr = _buFindFirminfo( buffer, 516);
+      if (addr >= 0)
+      {
+         _f_memcpy( &marker->firminfo, &buffer[addr], sizeof(firmware_info_t));
+         break;
+      }
+   }
+
+   marker->checksum = buMarkerChecksum( marker);
+
+   return 0;
+}
+
+/*** BeginHeader _buMarkerWrite */
+int _buMarkerWrite( firmware_marker_t __far *marker, word flags);
+/*** EndHeader */
+#ifndef BU_ENABLE_SECONDARY
+	#fatal "_buMarkerWrite requires BU_ENABLE_SECONDARY to be defined."
+#endif
+/* START _FUNCTION DESCRIPTION ********************************************
+_buMarkerWrite                                          <board_update.lib>
+
+SYNTAX:	int _buMarkerWrite( firmware_marker_t far *marker, word flags)
+
+DESCRIPTION:	Write an updated firmware marker to either the A-valid or B-valid
+					marker positions.
+
+PARAMETER 1:	Marker to write.
+
+PARAMETER 2:	Either BU_FLAG_IMAGE_A or BU_FLAG_IMAGE_B must be set.  Optional
+					flag BU_FLAG_UPDATE_CHECKSUM to update the checksum before
+					writing.
+
+RETURN VALUE:	0 successfully wrote marker
+					-EINVAL: marker is NULL, or flags don't specify a valid image.
+					-EBUSY: serial flash is busy and write wasn't completed after
+								BU_FAT_TIMEOUT milliseconds.
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int _buMarkerWrite( firmware_marker_t __far *marker, word flags)
+{
+	auto int image;
+	auto word timer;
+	auto int retval;
+
+	// make sure that exactly one of IMAGE_A or IMAGE_B is set in flags
+	image = flags & BU_FLAG_IMAGE_MASK;
+	if (! marker || ((image != BU_FLAG_IMAGE_A) && (image != BU_FLAG_IMAGE_B)) )
+	{
+		return -EINVAL;
+	}
+
+	if (flags & BU_FLAG_UPDATE_CHECKSUM)
+	{
+		marker->checksum = buMarkerChecksum( marker);
+	}
+
+   timer = _BU_TIMER_SET( BU_FAT_TIMEOUT);
+   do {
+      retval = sbf_far_Write(
+      	(image == BU_FLAG_IMAGE_A) ? BU_MARKER_ADDR_A : BU_MARKER_ADDR_B,
+      	marker, sizeof(*marker) );
+   } while ((retval > 0) && _BU_TIMER_NOT_EXPIRED( timer));
+   bu_errmsg( retval, "sbf_far_Write");
+
+   _BU_TIMER_REPORT( timer, "sbf_far_Write");
+
+	if (retval > 0)
+   {
+      retval = -EBUSY;
+   }
+
+	return retval;
+}
+
+/*** BeginHeader buMarkerVerify */
+int buMarkerVerify( const firmware_marker_t __far *marker);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+buMarkerVerify                                          <board_update.lib>
+
+SYNTAX:  int buMarkerVerify( const firmware_marker_t far *marker)
+
+DESCRIPTION:	Verify the marker read from serial flash.  Checks the version
+					field, checksum and embedded firmware_info_t structure (which
+					has its own CRC-32).
+
+PARAMETER:		Marker to verify.
+
+RETURN VALUE:	 0: Information is valid.
+					-EINVAL: <marker> is NULL.
+					-EILSEQ: Not a valid marker.
+
+SEE ALSO: buMarkerRead
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int buMarkerVerify( const firmware_marker_t __far *marker)
+{
+	if (! marker)
+	{
+		return -EINVAL;
+	}
+
+	// As of this release, 1 is the only valid version.
+	if (marker->version == 0 || (marker->version > BU_MARKER_VERSION))
+	{
+		#ifdef BOARD_UPDATE_VERBOSE
+			printf( "%s: invalid marker version (0x%02x)\n", __FUNCTION__,
+				marker->version);
+		#endif
+		return -EILSEQ;
+	}
+
+	// Marker is only valid if embedded firmware_info is also valid.
+	if (fiValidate( &marker->firminfo))
+	{
+		return -EILSEQ;
+	}
+
+	if (marker->checksum != buMarkerChecksum( marker))
+	{
+		#ifdef BOARD_UPDATE_VERBOSE
+			printf( "%s: invalid marker checksum\n", __FUNCTION__);
+		#endif
+		return -EILSEQ;
+	}
+
+	return 0;
+}
+
+/*** BeginHeader buMarkerRead */
+int buMarkerRead( firmware_marker_t __far *dest, word flags);
+/*** EndHeader */
+#ifndef BU_ENABLE_SECONDARY
+	#fatal "buMarkerRead requires BU_ENABLE_SECONDARY to be defined."
+#endif
+/* START FUNCTION DESCRIPTION ********************************************
+buMarkerRead                                           <board_update.lib>
+
+SYNTAX:	int buMarkerRead( firmware_marker_t far *dest, word flags)
+
+DESCRIPTION:	Read the firmware marker for a given firmware image.
+
+PARAMETER 1:	Buffer for storing the marker.
+
+PARAMETER 2:	Either BU_FLAG_IMAGE_Z, BU_FLAG_IMAGE_A or BU_FLAG_IMAGE_B.
+
+RETURN VALUE:	0:	Read marker
+					-EINVAL: <dest> is NULL or <flags> is not a valid setting
+					-EBUSY: timeout trying to read serial boot flash
+
+SEE ALSO: buMarkerVerify
+
+Note that if BU_FLAG_IMAGE_Z is passed as parameter 2, the firmware_marker_t
+structure is manually assembled by reading image Z's firmware_info_t structure
+from flash and fleshing out the rest of the structure.
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int buMarkerRead( firmware_marker_t __far *dest, word flags)
+{
+	auto int err;
+	auto int image;
+	auto word timer;
+
+	image = flags & BU_FLAG_IMAGE_MASK;
+
+	if (! (dest &&
+		(image == BU_FLAG_IMAGE_A
+		|| image == BU_FLAG_IMAGE_B
+		|| image == BU_FLAG_IMAGE_Z)) )
+	{
+		return -EINVAL;
+	}
+
+	if (image == BU_FLAG_IMAGE_Z)
+	{
+		// Fake the marker for this image, since the marker isn't on the flash.
+		err = buMarkerBuild( dest, 0, 0);
+		bu_errmsg( err, "buMarkerBuild");
+	}
+	else
+	{
+	   timer = _BU_TIMER_SET( BU_FAT_TIMEOUT);
+	   do {
+		   err = sbf_far_Read( dest,
+		      (image == BU_FLAG_IMAGE_A) ? BU_MARKER_ADDR_A : BU_MARKER_ADDR_B,
+		      sizeof(firmware_marker_t));
+	   } while ((err > 0) && _BU_TIMER_NOT_EXPIRED( timer));
+	   if (err > 0)
+	   {
+		   bu_errmsg( err, "sbf_far_Read");
+			err = -EBUSY;
+	   }
+	}
+
+	return err;
+}
+
+/*** BeginHeader buMarkerReadBoot */
+int buMarkerReadBoot( firmware_marker_t __far *dest);
+/*** EndHeader */
+#ifndef BU_ENABLE_SECONDARY
+	#fatal "buMarkerReadBoot requires BU_ENABLE_SECONDARY to be defined."
+#endif
+/* START FUNCTION DESCRIPTION ********************************************
+buMarkerReadBoot                                       <board_update.lib>
+
+SYNTAX:	buMarkerReadBoot( firmware_marker_t far *dest)
+
+DESCRIPTION:	Read the firmware_marker_t structure for the firmware image that
+					will boot on next reset.  This isn't necessarily the same as
+					the firmware that is currently running.
+
+PARAMETER 1:	Buffer for storing the marker or NULL if the caller just needs
+					to know which image will boot.
+
+RETURN VALUE:	BU_FLAG_IMAGE_Z, BU_FLAG_IMAGE_A, BU_FLAG_IMAGE_B: marker saved
+								to <dest> is for image Z, A or B.
+					-EBUSY: timeout trying to read serial boot flash
+
+Note that if this function returns BU_FLAG_IMAGE_Z, the firmware_marker_t
+structure is manually assembled by reading image Z's firmware_info_t structure
+from flash and fleshing out the rest of the structure.
+
+SEE ALSO:	_buMarkerCompare
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int buMarkerReadBoot( firmware_marker_t __far *dest)
+{
+	auto firmware_marker_t a_marker, b_marker;
+	auto firmware_marker_t __far *source;
+	auto int error;
+
+	error = buMarkerRead( &a_marker, BU_FLAG_IMAGE_A);
+	bu_errmsg( error, "buMarkerRead");
+	if (! error)
+	{
+		error = buMarkerRead( &b_marker, BU_FLAG_IMAGE_B);
+		bu_errmsg( error, "buMarkerRead");
+	}
+
+	if (! error)
+	{
+		error = _buMarkerCompare( &a_marker, &b_marker);
+		if (dest)
+		{
+			// copy marker to caller's buffer
+			if (error == BU_FLAG_IMAGE_Z)
+			{
+				error = buMarkerRead( dest, BU_FLAG_IMAGE_Z);
+			}
+			else if (error == BU_FLAG_IMAGE_A)
+			{
+            _f_memcpy( dest, &a_marker, sizeof(*dest));
+			}
+			else if (error == BU_FLAG_IMAGE_B)
+			{
+            _f_memcpy( dest, &b_marker, sizeof(*dest));
+			}
+		}
+	}
+
+	return error;
+}
+
+/*** BeginHeader _buMarkerCompare */
+int _buMarkerCompare(	const firmware_marker_t __far *a_marker,
+								const firmware_marker_t __far *b_marker);
+/*** EndHeader */
+#ifndef BU_ENABLE_SECONDARY
+	#fatal "_buMarkerCompare requires BU_ENABLE_SECONDARY to be defined."
+#endif
+/* START _FUNCTION DESCRIPTION ********************************************
+_buMarkerCompare                                        <board_update.lib>
+
+SYNTAX:  int _buMarkerCompare(	const firmware_marker_t far *a_marker,
+											const firmware_marker_t far *b_marker)
+
+DESCRIPTION:	Compare the A-valid and B-valid markers (usually read by
+					buMarkerReadBoot).
+
+PARAMETER 1:	Copy of A-valid marker read from flash.
+
+PARAMETER 2:	Copy of B-valid marker read from flash.
+
+RETURN VALUE:	BU_FLAG_IMAGE_Z, BU_FLAG_IMAGE_A, BU_FLAG_IMAGE_B:
+							Boot image based on contents of A and B markers.
+					-EINVAL: NULL parameter passed to function.
+
+	This function is only called from _buMarkerBoot and only exists as a
+	separate function to allow for unit testing.
+
+SEE ALSO:	buMarkerReadBoot
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int _buMarkerCompare(	const firmware_marker_t __far *a_marker,
+								const firmware_marker_t __far *b_marker)
+{
+	auto int a_invalid, b_invalid;
+	auto int error;
+
+	if (! (a_marker && b_marker))
+	{
+		return -EINVAL;
+	}
+
+   a_invalid = buMarkerVerify( a_marker);
+   b_invalid = buMarkerVerify( b_marker);
+
+   if (a_invalid)
+   {
+      if (b_invalid)
+      {
+         // Neither marker is valid, so the Z-image will boot.
+         #ifdef BOARD_UPDATE_VERBOSE
+            printf( "%s: would boot from %c-image\n", __FUNCTION__, 'Z');
+         #endif
+         return BU_FLAG_IMAGE_Z;
+      }
+   }
+   else        // A is valid
+   {
+   	// Sequence numbers will roll over after a lot of installs, or if user
+   	// code manually sets a high sequence number.  A is newer than B if
+   	// (A - B) < (B - A) -- the "(A - B) < 0x8000u" tests that.
+      if (b_invalid || a_marker->sequence - b_marker->sequence < 0x8000u)
+      {
+         // A-image will boot (B-valid was invalid, or older than A-valid)
+         #ifdef BOARD_UPDATE_VERBOSE
+            printf( "%s: would boot from %c-image\n", __FUNCTION__, 'A');
+         #endif
+         return BU_FLAG_IMAGE_A;
+      }
+   }
+
+   // B-image will boot
+   #ifdef BOARD_UPDATE_VERBOSE
+      printf( "%s: would boot from %c-image\n", __FUNCTION__, 'B');
+   #endif
+   return BU_FLAG_IMAGE_B;
+}
+
+/*** BeginHeader buMarkerDump */
+void buMarkerDump( const firmware_marker_t __far *marker);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+buMarkerDump                                           <board_update.lib>
+
+SYNTAX:	void buMarkerDump( const firmware_marker_t far *marker)
+
+DESCRIPTION:	Debugging tool that dumps the contents of a firmware marker
+					to STDOUT.
+
+PARAMETER:	Marker to display on STDOUT.
+
+RETURN VALUE:	none
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+void buMarkerDump( const firmware_marker_t __far *marker)
+{
+	printf( "version: %d\nsequence: %u\naddress: %lu\n" \
+		"flash cmd: 0x%08lx\nchecksum: 0x%04x\n",
+		marker->version, marker->sequence, marker->address,
+		marker->flash_cmd, marker->checksum);
+	fiDump( &marker->firminfo);
+}
+
+/*** BeginHeader buGetInfo */
+int buGetInfo (__far firmware_info_t *fi);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+buGetInfo 		                 								<board_update.lib>
+
+SYNTAX: int buGetInfo (far firmware_info_t *fi)
+
+DESCRIPTION:	Get a copy of the firmware info from the last firmware image
+					opened with one of the following functions:
+
+buOpenFirmwareRunning:	Image of the currently-executing program.
+buOpenFirmwareRAM:		Firmware stored at an arbitrary location in RAM.
+buOpenFirmwareBoot:		Firmware stored on the boot flash (serial or parallel).
+buOpenFirmwareFAT:		Firmware stored in a FAT file.
+buOpenFirmwareSFlash:	Firmware stored on serial flash (read with sflash.lib).
+buOpenFirmwareTemp:		Firmware stored in temporary location.
+
+PARAMETER 1:	Buffer to receive copy of firmware info retrieved from last
+					opened firmware image.
+
+RETURN VALUE:	Error codes shared with fiValidate:
+					 0: Information is valid.
+					-EINVAL: <fi> is NULL.
+					-EILSEQ: Not a valid firmware_info_t struct (bad marker bytes
+								or unsupported version of structure).
+					-EBADMSG: Bad CRC (structure has been corrupted).
+
+					Additional error codes:
+					-EPERM: Source not open, need to call buOpenFirmwareXYZ first.
+					-ENODATA: Firmware info not found in source.
+					-EBUSY: Still reading first 1KB from source, call again.
+
+					Firmware opened with buOpenFirmwareFAT
+					-EEOF: File length smaller than firmware length read from
+							header (only for uncompressed files).
+
+SEE ALSO:		firmware_info_t, fiValidate, fiDump, fiProgramInfo,
+					buOpenFirmwareRunning, buOpenFirmwareRAM, buOpenFirmwareBoot,
+					buOpenFirmwareFAT, buOpenFirmwareSFlash, buOpenFirmwareTemp
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int buGetInfo (__far firmware_info_t *fi)
+{
+	auto int error;
+
+	if (! fi)
+	{
+		return -EINVAL;
+	}
+
+   if (! (_bu_firmfile.flags & BU_FLAG_OPEN))
+   {
+      // firmware file isn't open yet
+      error = buReadFirmware( NULL, 0);
+      if (error < 0)
+      {
+         return error;
+      }
+   }
+
+	// we upcast NULL to a far pointer to avoid a compiler bug (V28877)
+	return _fiCopyInfo( fi,
+		_bu_firmfile.stream.read ? &_bu_firmfile.info : (__far void *) NULL);
+}
+
+/*** BeginHeader _bu_tempfirmware */
+enum {
+	BU_TEMP_LOC_UNDEFINED,
+	BU_TEMP_LOC_FAT,
+	BU_TEMP_LOC_SBF,
+	BU_TEMP_LOC_SFLASH,
+	BU_TEMP_LOC_DIRECT,
+	BU_TEMP_LOC_SECONDARY
+};
+
+
+#ifdef BU_TEMP_LOCATION
+	// Only board_update.lib can set this macro -- public interface is to make
+	// use of BU_TEMP_USE_FOO macros.
+	#undef BU_TEMP_LOCATION
+#endif
+
+#ifdef BU_TEMP_USE_DIRECT_WRITE
+   #if !_SERIAL_BOOT_FLASH_
+      #fatal "BU_TEMP_USE_DIRECT_WRITE only valid for serial boot flash."
+   #endif
+   #define BU_TEMP_LOCATION BU_TEMP_LOC_DIRECT
+#endif
+
+#ifdef BU_TEMP_USE_FAT
+	#ifdef BU_TEMP_LOCATION
+		#fatal "Multiple BU_TEMP_USE_XYZ macros defined, only one allowed."
+	#endif
+   #define BU_TEMP_LOCATION BU_TEMP_LOC_FAT
+#endif
+
+#ifdef BU_TEMP_USE_SBF
+   #if !_SERIAL_BOOT_FLASH_
+      #fatal "BU_TEMP_USE_SBF only valid for serial boot flash."
+   #endif
+	#ifdef BU_TEMP_LOCATION
+		#fatal "Multiple BU_TEMP_USE_XYZ macros defined, only one allowed."
+	#endif
+   #define BU_TEMP_LOCATION BU_TEMP_LOC_SBF
+#endif
+
+#ifdef BU_TEMP_USE_SECONDARY
+	// Note that StdBIOS.C ensures that BU_ENABLE_SECONDARY is only available on
+	// hardware with serial boot flash.
+	#ifdef BU_TEMP_LOCATION
+		#fatal "Multiple BU_TEMP_USE_XYZ macros defined, only one allowed."
+	#endif
+	#ifndef BU_ENABLE_SECONDARY
+		#fatal "BU_TEMP_USE_SECONDARY only valid if BU_ENABLE_SECONDARY defined."
+	#endif
+	#define BU_TEMP_LOCATION BU_TEMP_LOC_SECONDARY
+#endif
+
+#ifdef BU_TEMP_USE_SFLASH
+	#ifdef BU_TEMP_LOCATION
+		#fatal "Multiple BU_TEMP_USE_XYZ macros defined, only one allowed."
+	#endif
+   #define BU_TEMP_LOCATION BU_TEMP_LOC_SFLASH
+#endif
+
+#ifdef BU_ENABLE_SECONDARY
+   // Make sure BU_ENABLE_SECONDARY was in project defines so loader code is
+   // compiled into BIOS.
+	#ifndef BU_MARKER_SIZE
+		#fatal "If defined, BU_ENABLE_SECONDARY must be in the project defines."
+	#endif
+	#ifndef BU_TEMP_LOCATION
+		#define BU_TEMP_LOCATION BU_TEMP_LOC_SECONDARY
+	#elif BU_TEMP_LOCATION != BU_TEMP_LOC_SECONDARY
+		#fatal "Only BU_TEMP_USE_SECONDARY allowed if BU_ENABLE_SECONDARY defined"
+	#endif
+#endif
+
+#ifndef BU_TEMP_LOCATION
+	#define BU_TEMP_LOCATION BU_TEMP_LOC_UNDEFINED
+#endif
+
+// Done checking BU_TEMP_USE_XYZ macros
+
+#if BU_TEMP_LOCATION == BU_TEMP_LOC_SFLASH
+	#ifndef BU_TEMP_PAGE_OFFSET
+		#define BU_TEMP_PAGE_OFFSET 0
+	#elif BU_TEMP_PAGE_OFFSET < 0
+		#fatal "BU_TEMP_PAGE_OFFSET must be non-negative."
+	#endif
+#endif
+
+typedef struct {
+#if BU_TEMP_LOCATION == BU_TEMP_LOC_FAT
+	#ifdef _BU_ENABLE_FAT
+		FATfile file;
+	#endif
+#elif BU_TEMP_LOCATION == BU_TEMP_LOC_SFLASH
+	#ifdef _BU_ENABLE_SFLASH
+		sf_device	dev;
+	#endif
+#endif
+	// offset and max_offset only used when writing to serial boot flash
+	long offset;
+	long max_offset;
+	long written;
+	int error;
+} _bu_tempfirmware_t;
+
+extern _bu_tempfirmware_t _bu_tempfirmware;
+/*** EndHeader */
+
+#ifdef BU_CANNOT_UPDATE_FW
+	#fatal "buTempCreate/Write/Close are not compatible with this hardware."
+#endif
+#if (! _RUN_FROM_RAM) && (BU_TEMP_LOCATION != BU_TEMP_LOC_SFLASH)
+   #fatal "BU_TEMP_USE_SFLASH is the only supported option for this board"
+#endif
+#if BU_TEMP_LOCATION == BU_TEMP_LOC_UNDEFINED
+	#error "You must define BU_TEMP_USE_SBF, _FAT, _SFLASH or _DIRECT_WRITE"
+	#fatal "in order to use buTempCreate/Write/Close and buDownloadInit/Tick."
+#endif
+
+// only fatal if the temp firmware APIs are used
+#if BU_TEMP_LOCATION == BU_TEMP_LOC_FAT
+	#ifndef _BU_ENABLE_FAT
+		#fatal "To use TempFirmware API, you must #use \"FAT16.LIB\" first."
+	#endif
+#elif BU_TEMP_LOCATION == BU_TEMP_LOC_DIRECT \
+	|| BU_TEMP_LOCATION == BU_TEMP_LOC_SBF		\
+	|| BU_TEMP_LOCATION == BU_TEMP_LOC_SECONDARY
+	// no additional libraries to load
+#elif BU_TEMP_LOCATION == BU_TEMP_LOC_SFLASH
+	#ifndef _BU_ENABLE_SFLASH
+		#fatal "To use buTemp API, you must #use \"SFLASH.LIB\" first."
+	#endif
+#else
+	#fatal "Invalid BU_TEMP_LOCATION setting"
+#endif
+
+// _bu_tempfirmware in near mem, because FAT library requires near FATfile
+// and serial flash library requires near sf_device
+_bu_tempfirmware_t _bu_tempfirmware;
+
+/*** BeginHeader buTempCreate */
+int buTempCreate();
+
+#ifndef BU_TEMP_FILE
+	#define BU_TEMP_FILE "a:firmware.bin"
+#endif
+
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+buTempCreate			                 							<board_update.lib>
+
+SYNTAX: int buTempCreate()
+
+DESCRIPTION:	Prepare to write to the temporary firmware image.
+
+	            On boards with a serial boot flash, the temporary image can be
+	            stored on the flash between the boot image and the userblock.
+
+	            On boards with a serial data flash, the temporary image can
+	            be stored directly on the flash pages, or on a FAT filesystem
+	            hosted on the flash.
+
+	            On the RCM4400W, the temporary image can be stored on a portion
+	            of the 1MB serial data flash shared with the FPGA firmware for
+	            the Wi-Fi interface.
+
+					To set the storage location, use the following macros:
+
+					// use FAT filesystem for temp firmware image
+					#define BU_TEMP_USE_FAT
+					// override filename used for temp image (def. "a:firmware.bin")
+					#define BU_TEMP_FILE "a:firmware.bin"
+
+					// use serial boot flash for temp firmware image
+					#define BU_TEMP_USE_SBF
+
+					// use serial data flash for temp firmware image
+					#define BU_TEMP_USE_SFLASH
+					// override default starting page number on serial flash (0)
+					#define BU_TEMP_PAGE_OFFSET 0
+
+	            // write image directly to boot flash (dangerous, serial only)
+	            #define BU_TEMP_USE_DIRECT_WRITE
+
+					// store two copies of firmware on serial boot flash, for
+					// powerfail-safe firmware updates
+					#define BU_TEMP_USE_SECONDARY
+
+	            Valid temp locations for various board types:
+
+	            RCM4200, RCM4400W, RCM5400W, BL5S220:
+	            	BU_TEMP_USE_SFLASH, BU_TEMP_USE_FAT (serial data flash)
+
+	            RCM43xx, BL4S200:
+	            	BU_TEMP_USE_FAT (SD card), BU_TEMP_USE_SECONDARY,
+	            	BU_TEMP_USE_SBF, BU_TEMP_USE_DIRECT_WRITE (not recommended)
+
+					BL4S1xx:
+						BU_TEMP_USE_SBF, BU_TEMP_USE_FAT (serial boot flash),
+						BU_TEMP_USE_SFLASH, BU_TEMP_USE_SECONDARY,
+						BU_TEMP_USE_DIRECT_WRITE (not recommended)
+
+					RCM5600W:
+						BU_TEMP_USE_DIRECT_WRITE, BU_TEMP_USE_SECONDARY (firmware
+						limited to 512KB)
+
+					RCM5650W:
+						BU_TEMP_USE_SBF, BU_TEMP_USE_SFLASH, BU_TEMP_USE_SECONDARY,
+						BU_TEMP_USE_DIRECT_WRITE (not recommended)
+
+					RCM5750:
+						BU_TEMP_USE_SFLASH
+
+RETURN VALUE:	0: Successfully opened temp firmware image for writing.
+					-EPERM: Not supported on this hardware.
+					-ENODEV: Couldn't read from serial flash.
+					-EBUSY: Timeout waiting for FAT filesystem.
+					<0: Error opening FAT file, see fat_Open for full list of
+						 error codes and their meanings.
+
+SEE ALSO:		buTempWrite, buTempClose, fat_Open
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int buTempCreate()
+{
+#if BU_TEMP_LOCATION == BU_TEMP_LOC_FAT
+	auto int			error;
+	auto fat_part	*part;
+	auto char		*localfn;
+	auto word		timer;
+#elif BU_TEMP_LOCATION == BU_TEMP_LOC_SECONDARY
+	auto int						boot, target;
+	auto firmware_marker_t	marker;
+#endif
+
+	memset( &_bu_tempfirmware, 0, sizeof(_bu_tempfirmware));
+	_bu_tempfirmware.offset = -1;			// marker that tempfirmware is closed
+
+   #if BU_TEMP_LOCATION == BU_TEMP_LOC_FAT
+      // use BU_TEMP_FILE (default a:firmware.bin) on FAT as temp
+      error = fat_GetPartition( &part, (const char **)&localfn, BU_TEMP_FILE);
+
+		if (! error)
+		{
+			timer = _BU_TIMER_SET( BU_FAT_TIMEOUT);
+      	do {
+	         error = fat_Open( part, localfn, FAT_FILE,
+	         	FAT_CREATE | FAT_SEQUENTIAL, &_bu_tempfirmware.file, NULL);
+	      } while (error == -EBUSY && _BU_TIMER_NOT_EXPIRED( timer));
+	      _BU_TIMER_REPORT( timer, "fat_Open");
+		}
+		if (error)
+		{
+			#ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%s: error %d opening %s\n", __FUNCTION__, error,
+	            BU_TEMP_FILE);
+			#endif
+			return error;
+		}
+      _bu_tempfirmware.offset = 0;
+   #elif BU_TEMP_LOCATION == BU_TEMP_LOC_SBF
+		// Store temp image betweeen end of boot firmware (.offset) and start
+		// of user block (.max_offset).
+		_bu_tempfirmware.offset = MAX_FIRMWARE_BINSIZE;
+		// store max_offset, since SBF_USERBLOCK_BEGIN is calculated at runtime
+		// (and we should just calculate it once)
+		_bu_tempfirmware.max_offset = SBF_USERBLOCK_BEGIN;
+	#elif BU_TEMP_LOCATION == BU_TEMP_LOC_SECONDARY
+		// determine which image is "boot image", if B, use A, otherwise use B
+		boot = buMarkerReadBoot( NULL);
+		if (boot < 0)
+		{
+			// error (typically -EBUSY) trying to read the marker
+			return boot;
+		}
+		target = (boot == BU_FLAG_IMAGE_B) ? BU_FLAG_IMAGE_A : BU_FLAG_IMAGE_B;
+
+		// If the existing marker for the image we're about to write to is valid,
+		// we need to erase the marker before we overwrite the firmware image.
+		if (buMarkerRead( &marker, target) == 0
+														&& buMarkerVerify( &marker) == 0)
+		{
+			#ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%s: erasing valid marker\n", __FUNCTION__);
+			#endif
+			_sbf_ErasePage(
+				(target == BU_FLAG_IMAGE_A) ? BU_MARKER_ADDR_A : BU_MARKER_ADDR_B);
+		}
+
+		if (target == BU_FLAG_IMAGE_A)
+		{
+			_bu_tempfirmware.offset = BU_IMAGE_ADDR_A;
+			_bu_tempfirmware.max_offset = BU_IMAGE_ADDR_B;
+		}
+		else
+		{
+			_bu_tempfirmware.offset = BU_IMAGE_ADDR_B;
+			_bu_tempfirmware.max_offset =
+				(SBF_USERBLOCK_BEGIN < BU_PROTECT_BYTES)
+												? SBF_USERBLOCK_BEGIN : BU_PROTECT_BYTES;
+		}
+      #ifdef BOARD_UPDATE_VERBOSE
+         printf( "%s: writing to secondary image %c @ 0x%06lx\n",
+         	__FUNCTION__, (target == BU_FLAG_IMAGE_A) ? 'A' : 'B',
+         	_bu_tempfirmware.offset);
+      #endif
+   #elif BU_TEMP_LOCATION == BU_TEMP_LOC_DIRECT
+		// Store temp image directly to boot portion of serial boot flash.
+		// Be careful not to overwrite the user block (.max_offset).
+		_bu_tempfirmware.offset = 0;
+		// store max_offset, since SBF_USERBLOCK_BEGIN is calculated at runtime
+		// (and we should just calculate it once)
+		_bu_tempfirmware.max_offset = SBF_USERBLOCK_BEGIN;
+	#elif BU_TEMP_LOCATION == BU_TEMP_LOC_SFLASH
+		sfspi_init();
+	   if (sf_initDevice(&_bu_tempfirmware.dev, SF_SPI_CSPORT, &SF_SPI_CSSHADOW,
+	   	SF_SPI_CSPIN) < 0 )
+	   {
+			#ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%s: didn't find sflash on pin %u of port 0x%x",
+	            __FUNCTION__, SF_SPI_CSPIN, SF_SPI_CSPORT);
+			#endif
+	      return -ENODEV;
+	   }
+
+		_bu_tempfirmware.offset =
+			_bu_tempfirmware.dev.pagesize * (long) BU_TEMP_PAGE_OFFSET;
+		_bu_tempfirmware.max_offset =
+			_bu_tempfirmware.dev.pagesize * (long) _bu_tempfirmware.dev.pages;
+	#endif
+
+   return 0;
+}
+/*** BeginHeader buTempWrite */
+int buTempWrite( const char __far *buffer, int writebytes);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+buTempWrite				                 							<board_update.lib>
+
+SYNTAX: int buTempWrite( const char far *buffer, int writebytes)
+
+DESCRIPTION:	Write data to temporary firmware image, previously opened with
+					buTempCreate.
+
+					View the function help for buTempCreate for details on
+					where the temporary firmware image is stored on various
+					hardware types.
+
+PARAMETER 1:	Source buffer for write.
+
+PARAMETER 2:	Number of bytes to write.
+
+RETURN VALUE:	0 to <writebytes>: Number of bytes written.  It is possible for
+											less than <writebytes> to be written.
+					-EINVAL: <buffer> is NULL or <writebytes> is less than 0.
+					-EPERM: Temporary firmware image is not open.
+					-ENOSPC: Out of space for image.
+					-EFBIG: Image is larger than max size for this hardware.
+					-EIO: Error trying to write to image.
+					-EBUSY: Timeout waiting for FAT or serial boot flash driver;
+											call buTempWrite again with same parameters.
+
+				Possible error value when using DIRECT_WRITE or SECONDARY locations
+				where the first write contains at least 1KB of data:
+					-ENODATA: Aborted write without storing data -- first 1KB of
+											firmware does not contain a valid firmware
+											info structure for this device.
+
+					<0: Some other error trying to write to temporary firmware image.
+
+					If buTempWrite returns a value less than zero, it will
+					automatically close the temporary firmware image.
+
+SEE ALSO:		buTempCreate, buTempClose
+
+END DESCRIPTION **********************************************************/
+/* DEVNOTE:
+	Need to update this function to buffer the first 1KB in the DIRECT_WRITE
+	and SECONDARY cases, and then check it for a valid firmware_info_t structure.
+	The HTTP upload and TFTP samples can never make use of the -ENODATA feature
+	since they aren't going to write the first 1KB in a big chunk.
+
+	Maybe the sample user-code could demonstrate buffering the first 1KB?
+*/
+_bu_debug
+int buTempWrite( const char __far *buffer, int writebytes)
+{
+	auto int		retval;
+	auto word	offset;
+#if BU_TEMP_LOCATION == BU_TEMP_LOC_FAT
+	auto word	timer;
+#elif BU_TEMP_LOCATION == BU_TEMP_LOC_SBF \
+	|| BU_TEMP_LOCATION == BU_TEMP_LOC_SECONDARY \
+	|| BU_TEMP_LOCATION == BU_TEMP_LOC_DIRECT
+	auto word	timer;
+#elif BU_TEMP_LOCATION == BU_TEMP_LOC_SFLASH
+	auto long	page;
+	auto int		block;
+	auto int		partial;
+#endif
+
+	#GLOBAL_INIT { _bu_tempfirmware.offset = -1; }
+
+	if (_bu_tempfirmware.offset < 0)
+	{
+		// temp firmware "image" isn't open
+		return -EPERM;
+	}
+	if (! buffer || (writebytes < 0))
+	{
+		return -EINVAL;
+	}
+	if (! writebytes)
+	{
+		// nothing to write
+		return 0;
+	}
+	if (! _bu_tempfirmware.error)
+	{
+	   if (_bu_tempfirmware.written + writebytes > MAX_FIRMWARE_BINSIZE)
+	   {
+	      // firmware should never be larger than the fast SRAM size
+	      _bu_tempfirmware.error = -EFBIG;
+	   }
+	   if (_bu_tempfirmware.max_offset &&
+	      _bu_tempfirmware.offset + writebytes > _bu_tempfirmware.max_offset)
+	   {
+	      // write would extend into userblock of SBF, or off end of SFLASH
+	      _bu_tempfirmware.error = -ENOSPC;
+	   }
+	}
+
+	// There was an error on the last call to buTempWrite and we need to
+	// finish closing the firmware file.
+	if (_bu_tempfirmware.error)
+	{
+		return (buTempClose() == -EBUSY) ? -EBUSY : _bu_tempfirmware.error;
+	}
+
+   offset = 0;
+   retval = 0;
+   #if BU_TEMP_LOCATION == BU_TEMP_LOC_FAT
+      timer = _BU_TIMER_SET( BU_FAT_TIMEOUT);
+      do {
+         retval = fat_xWrite( &_bu_tempfirmware.file,
+            (long) paddr_far( &buffer[offset]), writebytes);
+      } while ((retval == -EBUSY || !retval) && _BU_TIMER_NOT_EXPIRED( timer));
+      _BU_TIMER_REPORT( timer, "fat_xWrite");
+
+      if (retval > 0)
+      {
+         // retval is # of bytes written
+         writebytes -= retval;
+         offset += retval;
+         retval = 0;
+      }
+	#elif BU_TEMP_LOCATION == BU_TEMP_LOC_SBF \
+	   || BU_TEMP_LOCATION == BU_TEMP_LOC_SECONDARY \
+	   || BU_TEMP_LOCATION == BU_TEMP_LOC_DIRECT
+
+	   #if BU_TEMP_LOCATION == BU_TEMP_LOC_DIRECT \
+	   	|| BU_TEMP_LOCATION == BU_TEMP_LOC_SECONDARY
+			// In the case of writing a boot firmware image, and this is
+			// the first write, and it is at least 1024 bytes, verify that it
+			// contains a valid firmware_info_t structure.
+			if (_bu_tempfirmware.written == 0 && writebytes >= 1024)
+			{
+				const firmware_info_t __far *fi;
+
+	         retval = _buFindFirminfo( buffer, 1024);
+	         if (retval >= 0)
+	         {
+	         	fi = (const firmware_info_t __far *) &buffer[retval];
+	            retval = fiValidate( fi);
+	            if (retval != 0
+	            	|| fi->board_type != _BOARD_TYPE_
+	            	|| fi->mb_type != _DC_MB_TYPE_)
+	            {
+	            	retval = -ENODATA;
+	            }
+	         }
+			}
+	   #endif
+		if (retval == 0)
+		{
+	      // serial boot flash, only runs if fiValidate didn't fail from above
+	      timer = _BU_TIMER_SET( BU_FAT_TIMEOUT);
+	      do {
+	         #if BU_TEMP_LOCATION != BU_TEMP_LOC_SBF
+	            // use sbf_far_Write since we might write to the boot area of SBF
+	            retval = sbf_far_Write (_bu_tempfirmware.offset, buffer,
+	               writebytes);
+	         #else
+	            // sbf_far_WriteFlash protects boot portion of SBF
+	            retval = sbf_far_WriteFlash (_bu_tempfirmware.offset, buffer,
+	               writebytes);
+	         #endif
+	      } while ((retval == -EBUSY || retval > 0)
+	                                          && _BU_TIMER_NOT_EXPIRED( timer));
+	      #if BU_TEMP_LOCATION != BU_TEMP_LOC_SBF
+	         _BU_TIMER_REPORT( timer, "sbf_far_Write");
+	      #else
+	         _BU_TIMER_REPORT( timer, "sbf_far_WriteFlash");
+	      #endif
+
+	      if (retval == -1)
+	      {
+	         retval = -EPERM;
+	      }
+	      else if (retval > 0)
+	      {
+	         retval = -EBUSY;
+	      }
+	      else if (! retval)
+	      {
+	         offset = writebytes;       // write was successful
+	      }
+		}
+	#elif BU_TEMP_LOCATION == BU_TEMP_LOC_SFLASH
+		page = _bu_tempfirmware.offset / _bu_tempfirmware.dev.pagesize;
+      if (page < BU_TEMP_PAGE_OFFSET)
+      {
+			#ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%s: error, attempt to write to protected page %lu\n",
+	            __FUNCTION__, page);
+			#endif
+         return -EPERM;
+      }
+
+		// DEVIDEA:
+		// Instead of writing a partial page, keep it in a buffer somewhere
+		// and just add to it on the next pass.  If Close is called when there's
+		// data outstanding, write it out and then close.
+		// Requires a far buffer, of _bu_tempfirmware.dev.pagesize bytes
+		// ALSO, could just rely on the serial flash's RAM buffer not being
+		// changed while we're working (dangerous)
+		partial = (int) (_bu_tempfirmware.offset % _bu_tempfirmware.dev.pagesize);
+		while (!retval && writebytes)
+		{
+         block = _bu_tempfirmware.dev.pagesize - partial;
+         if (block > writebytes)
+         {
+            block = writebytes;
+         }
+
+         // must wait for last write to finish
+         if (sf_isWriting( &_bu_tempfirmware.dev))
+         {
+				retval = -EBUSY;
+				break;
+         }
+
+			if (partial)
+         {
+            // writing an incomplete page; preserve first <partial> bytes
+            retval = sf_readPage( &_bu_tempfirmware.dev, 1, page);
+         }
+
+	      if (!retval)
+	      {
+	         retval = sf_writeDeviceRAM( &_bu_tempfirmware.dev,
+	         	(long) paddr_far( &buffer[offset]), partial, block, SF_RAMBANK1);
+			}
+	      if (!retval)
+	      {
+	      	// Since max_offset is on a page boundary, we don't need to worry
+	      	// about ending with a partial write (which overwrites the rest of
+	      	// the page with different data).
+	         retval = sf_writePage( &_bu_tempfirmware.dev, 1, page);
+			}
+
+			if (!retval)
+			{
+	         page++;
+	         writebytes -= block;
+	         offset += block;
+	         partial = 0;            // only first page can be a partial write
+			}
+		}
+		// convert serial flash error (-1) to -EIO
+		if (retval == -1)
+		{
+			retval = -EIO;
+		}
+	#endif
+
+	if (!retval || retval == -EBUSY)
+	{
+	   // record number of bytes written (may have been partial, due to -EBUSY)
+	   _bu_tempfirmware.offset += offset;
+	   _bu_tempfirmware.written += offset;
+	   return offset;
+	}
+
+   // hard error attempting to write firmware, store it and start trying to
+   // close the temp file
+   bu_errmsg( retval, "(n/a)");
+   _bu_tempfirmware.error = retval;
+   return -EBUSY;    // force caller to call again until we finish closing
+}
+
+/*
+	DEVIDEA for buTempWrite when using BU_TEMP_LOC_DIRECT:
+
+	Buffer the first 1KB of data, and search for the firmware info structure
+	before writing it out to the SBF.  If no structure, or structure CRC-32
+	is bad, or it's for the wrong board type, abort the download without
+	actually writing to serial flash.
+
+	If it's good, keep a copy of the firmware info and write the first 1KB
+	out to SBF.  Keep a running CRC-32 as the file streams in and compare it
+	to the end-of-file CRC-32.  If the CRC-32 does not match, return an error
+	so the caller can immediately restore the firmware.
+
+	Update user samples to skip verification (for DIRECT only), and indicate
+	that if the close returned success, the file was already verified.
+
+	Note that we can't do this for other targets, since the user may be
+	downloading compressed or encrypted firmware to the temp location.  Direct
+	downloads must be uncompressed and decrypted.
+*/
+
+/*** BeginHeader buTempClose */
+int buTempClose();
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+buTempClose				                 							<board_update.lib>
+
+SYNTAX: int buTempClose()
+
+DESCRIPTION:	Close temporary firmware image.
+
+					View the function help for buTempCreate for details on
+					where the temporary firmware image is stored on various
+					hardware types.
+
+RETURN VALUE:	0: Successfully closed.
+					-EPERM: Temporary firmware image is not open.
+					-EBUSY: Operation took longer than BU_FAT_TIMEOUT milliseconds.
+							Call buTempClose again to complete operation.
+					-EIO: Error trying to truncate or close FAT file.  Temp file
+							deleted.
+
+SEE ALSO:		buTempCreate, buTempWrite
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int buTempClose()
+{
+	auto int error;
+#if BU_TEMP_LOCATION == BU_TEMP_LOC_FAT
+	auto fat_part	*part;
+	auto char		*localfn;
+	auto word 		timer;
+#endif
+
+	if (_bu_tempfirmware.offset < 0)
+	{
+		// temp firmware image isn't open
+		return -EPERM;
+	}
+
+	error = 0;
+   #if BU_TEMP_LOCATION == BU_TEMP_LOC_FAT
+      // using FAT file for temp storage
+   	if (_bu_tempfirmware.offset < _bu_tempfirmware.file.de.fileSize)
+   	{
+			#ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%s: truncate at %lu/%lu bytes\n", __FUNCTION__,
+	            _bu_tempfirmware.offset, _bu_tempfirmware.file.de.fileSize);
+			#endif
+	      timer = _BU_TIMER_SET( BU_FAT_TIMEOUT);
+	      do {
+	         error = fat_Truncate( &_bu_tempfirmware.file, _bu_tempfirmware.offset);
+	      } while (error == -EBUSY && _BU_TIMER_NOT_EXPIRED( timer));
+	      _BU_TIMER_REPORT( timer, "fat_Truncate");
+	      bu_errmsg( error, "fat_Truncate");
+	      if (error == -EBUSY)
+	      {
+				return error;
+	      }
+		}
+		if (!error)
+		{
+	      timer = _BU_TIMER_SET( BU_FAT_TIMEOUT);
+	      do {
+	         error = fat_Close( &_bu_tempfirmware.file);
+	      } while (error == -EBUSY && _BU_TIMER_NOT_EXPIRED( timer));
+	      _BU_TIMER_REPORT( timer, "fat_Close");
+	      bu_errmsg( error, "fat_Close");
+	      if (error == -EBUSY)
+	      {
+				return -EBUSY;
+	      }
+	   }
+	   if (error)
+	   {
+			// Error on truncate or close.  Delete file, ignoring any errors, and
+         // return the original error from calling fat_Truncate or fat_Close.
+	      if (! fat_GetPartition( &part, (const char **)&localfn, BU_TEMP_FILE))
+	      {
+	         timer = _BU_TIMER_SET( BU_FAT_TIMEOUT);
+	         while (fat_Delete( part, FAT_FILE, localfn) == -EBUSY
+	         	&& _BU_TIMER_NOT_EXPIRED( timer));
+		      _BU_TIMER_REPORT( timer, "fat_Delete");
+	      }
+	   }
+	   fat_SyncPartition( _bu_tempfirmware.file.part);
+
+	#elif BU_TEMP_LOCATION == BU_TEMP_LOC_SBF			\
+		|| BU_TEMP_LOCATION == BU_TEMP_LOC_SECONDARY	\
+		|| BU_TEMP_LOCATION == BU_TEMP_LOC_DIRECT
+		// serial boot flash, nothing extra necessary to "close" temp file
+
+	#elif BU_TEMP_LOCATION == BU_TEMP_LOC_SFLASH
+		// wait for last write to complete, then consider it closed
+		if (sf_isWriting( &_bu_tempfirmware.dev))
+		{
+			return -EBUSY;
+		}
+	#endif
+
+	// code common to all targets
+   _bu_tempfirmware.offset = -1;
+   return error;
+}
+
+/*** BeginHeader _bu_reset */
+void _bu_reset();
+/*** EndHeader */
+// Internal API: _bu_reset
+// clear _bu_firmfile, global used to track current firmware file being read
+_bu_debug
+void _bu_reset()
+{
+	_f_memset (&_bu_firmfile, 0, sizeof (_bu_firmfile));
+}
+
+/*** BeginHeader buOpenFirmwareFAT */
+int buOpenFirmwareFAT (const char *filepath, word firmflags);
+/*** EndHeader */
+
+#ifndef _BU_ENABLE_FAT
+	#fatal "For FAT filesystem support, you must #use \"fat16.lib\" before " \
+		"#use \"board_update.lib.\""
+#endif
+
+/* START FUNCTION DESCRIPTION ********************************************
+buOpenFirmwareFAT		                 							<board_update.lib>
+
+SYNTAX: int buOpenFirmwareFAT (const char *filepath, word firmflags)
+
+DESCRIPTION:	Access a firmware image stored on the FAT filesystem.  If you
+					are going to use this function, you need to #use "FAT16.LIB"
+					in your program before you #use "board_update.lib".
+
+					After opening a firmware image, use the buGetInfo function to
+					examine the info structure in its header; buVerifyFirmware to
+					validate its CRC-32 and then buInstallFirmware to install it
+					to the boot flash.
+
+PARAMETER 1:	Full filepath, in one of the following formats:
+						a:/path/firmware.bin
+						a:firmware.bin
+						/a/path/firmware.bin
+						firmware.bin		(defaults to partition A)
+
+PARAMETER 2:	Bitmask combination of the following flags:
+	               BU_FLAG_NONE      Not compressed or encrypted.
+	               BU_FLAG_NOVERIFY  Skip pre-install verify (dangerous).
+
+	               Compression Options (currently unsupported):
+	               BU_FLAG_LZ77      zcompress format
+	               BU_FLAG_DEFLATE   zlib/deflate format (RFC1950/RFC1951)
+	               BU_FLAG_GZIP      gzip format (RFC1952)
+
+	               Encryption Options (currently unsupported):
+	               BU_FLAG_3DES      3DES (Triple-DES)
+	               BU_FLAG_AES       AES (Advanced Encryption Standard)
+
+RETURN VALUE:	0: Successfully opened firmware image.
+					-EINVAL: Couldn't parse <filepath>.
+					-ENOENT: File <filepath> does not exist.
+					-EMFILE: Too many open files.
+
+SEE ALSO:		buOpenFirmwareRunning, buOpenFirmwareRAM, buOpenFirmwareBoot,
+					buOpenFirmwareSFlash, buOpenFirmwareTemp, buGetInfo,
+					buVerifyFirmware, buVerifyFirmwareBlocking, buInstallFirmware
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int buOpenFirmwareFAT (const char *filepath, word firmflags)
+{
+	auto int				error;
+	auto fat_part		*part;
+	auto char			*filename;
+	auto fat_dirent	de;
+	auto word			timer;
+
+	_bu_reset();
+
+	// use FAT API to open file and return error if invalid
+	_bu_firmfile.src.fat.file = &_bu_FATfile;
+	memset (&_bu_FATfile, 0, sizeof(_bu_FATfile));
+
+	error = fat_GetPartition (&part, (const char **)&filename, filepath);
+   bu_errmsg( error, "fat_GetPartition");
+
+	if (!error)
+	{
+		// Due to the way fat_Open works in non-blocking mode, and the fact that
+		// we're resetting the _bu_FATfile structure at the start of this
+		// function, we must block on fat_Open until the file opens.
+		do {
+	      error = fat_Open( part, filename, FAT_FILE,
+	      	FAT_READONLY | FAT_SEQUENTIAL, &_bu_FATfile, NULL);
+	   } while (error == -EBUSY);
+	   bu_errmsg( error, "fat_Open");
+	}
+
+	if (!error)
+	{
+	   // succesfully opened file, tie it to the firmware_file_t structure
+	   _bu_firmfile.source = _BU_FIRMSRC_FAT;
+	   _bu_firmfile.flags = firmflags & BU_FLAG_USERSET;
+      _bu_firmfile.stream.read = _buReadFirmware_FAT;
+
+	   if (!fat_Status( part, filename, &de))
+	   {
+	      // Use FAT API to get file's length and set _bu_firmfile.stream.length.
+			_bu_firmfile.stream.length = de.fileSize;
+		}
+	}
+
+	if (error)
+	{
+		_bu_reset();
+	}
+
+   return error;
+}
+
+/*** BeginHeader buOpenFirmwareSFlash */
+#ifdef _BU_ENABLE_SFLASH
+int buOpenFirmwareSFlash (sf_device *dev, int bank, long page,
+	unsigned long bytesinfile, word firmflags);
+#endif
+/*** EndHeader */
+#ifndef _BU_ENABLE_SFLASH
+	#fatal "For serial flash support, you must #use \"sflash.lib\" before " \
+		"#use \"board_update.lib.\""
+#endif
+/* START FUNCTION DESCRIPTION ********************************************
+buOpenFirmwareSFlash	                 							<board_update.lib>
+
+SYNTAX: int buOpenFirmwareSFlash (sf_device *dev, int bank, long page,
+											unsigned long bytesinfile, word firmflags)
+
+DESCRIPTION:	Access a firmware image stored on the serial flash.  If you
+					are going to use this function, you need to #use "SFLASH.LIB" in
+					your program before you #use "board_update.lib".
+
+					After opening a firmware image, use the buGetInfo function to
+					examine the info structure in its header; buVerifyFirmware to
+					validate its CRC-32 and then buInstallFirmware to install it
+					to the boot flash.
+
+PARAMETER 1:	Pointer to sf_device structure for the flash chip, populated by
+					sf_initDevice.
+
+PARAMETER 2:	RAM bank to use when reading the data (set to 1 or 2).
+
+PARAMETER 3:	Serial flash page with first byte of firmware image.
+
+PARAMETER 4:	Number of bytes used on serial flash for firmware image.  Set to
+					zero if length is unknown.
+
+PARAMETER 5:	Bitmask combination of the following flags:
+	               BU_FLAG_NONE      Not compressed or encrypted.
+	               BU_FLAG_NOVERIFY  Skip pre-install verify (dangerous).
+
+	               Compression Options (currently unsupported):
+	               BU_FLAG_LZ77      zcompress format
+	               BU_FLAG_DEFLATE   zlib/deflate format (RFC1950/RFC1951)
+	               BU_FLAG_GZIP      gzip format (RFC1952)
+
+	               Encryption Options (currently unsupported):
+	               BU_FLAG_3DES      3DES (Triple-DES)
+	               BU_FLAG_AES       AES (Advanced Encryption Standard)
+
+RETURN VALUE:	0: Successfully opened firmware image.
+					-EINVAL: Invalid parameter passed in.
+
+SEE ALSO:		buOpenFirmwareRunning, buOpenFirmwareRAM, buOpenFirmwareBoot,
+					buOpenFirmwareFAT, buOpenFirmwareTemp, sf_initDevice, buGetInfo,
+					buVerifyFirmware, buVerifyFirmwareBlocking, buInstallFirmware
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int buOpenFirmwareSFlash (sf_device *dev, int bank, long page,
+	unsigned long bytesinfile, word firmflags)
+{
+	_bu_reset();
+
+	// validate parameters (make sure dev, bank and page are all valid)
+   if (dev->addressbytes > 4)
+   {
+   	return -EINVAL;	// too many address bytes
+   }
+
+	if (bank != 1 && bank != 2)
+	{
+		return -EINVAL;	// invalid bank
+	}
+
+	if (bytesinfile)
+	{
+		// last page to load from is page + (bytesinfile - 1) / dev->pagesize
+	   if (page < 0 || page + (bytesinfile - 1) / dev->pagesize >= dev->pages)
+	   {
+	      // invalid starting page, or flash too small for <bytesinfile>
+	      return -EINVAL;
+	   }
+	}
+
+	// tie file info to the firmware_file_t structure
+	_bu_firmfile.source = _BU_FIRMSRC_SFLASH;
+	_bu_firmfile.flags = firmflags & BU_FLAG_USERSET;
+	_bu_firmfile.src.sflash.device = dev;
+	_bu_firmfile.src.sflash.rambank = bank;
+	_bu_firmfile.src.sflash.startpage = page;
+	_bu_firmfile.stream.length = bytesinfile;
+   _bu_firmfile.stream.read = _buReadFirmware_SFlash;
+
+	return 0;
+}
+
+/*** BeginHeader buOpenFirmwareTemp */
+int buOpenFirmwareTemp (word firmflags);
+/*** EndHeader */
+#ifdef BU_CANNOT_UPDATE_FW
+	#fatal "buOpenFirmwareTemp is not compatible with this hardware."
+#endif
+#if BU_TEMP_LOCATION == BU_TEMP_LOC_UNDEFINED
+	#error "You must define BU_TEMP_USE_SBF, _FAT, _SFLASH or _DIRECT_WRITE"
+	#fatal "in order to use buOpenFirmwareTemp."
+#endif
+
+/* START FUNCTION DESCRIPTION ********************************************
+buOpenFirmwareTemp	                 							<board_update.lib>
+
+SYNTAX: int buOpenFirmwareTemp (word firmflags)
+
+DESCRIPTION:	Read from a firmware image in temporary storage.  Use the
+					buTempCreate, ...Write, ...Close API to write to
+					the temporary firmware image.
+
+					View the function help for buTempCreate for further information
+					on temporary firmware images (such as storage location).
+
+					After opening a firmware image, use the buGetInfo function to
+					examine the info structure in its header; buVerifyFirmware to
+					validate its CRC-32 and then buInstallFirmware to install it
+					to the boot flash.
+
+PARAMETER 1:	Bitmask combination of the following flags:
+	               BU_FLAG_NONE      Not compressed or encrypted.
+	               BU_FLAG_NOVERIFY  Skip pre-install verify (dangerous).
+
+	               Compression Options (currently unsupported):
+	               BU_FLAG_LZ77      zcompress format
+	               BU_FLAG_DEFLATE   zlib/deflate format (RFC1950/RFC1951)
+	               BU_FLAG_GZIP      gzip format (RFC1952)
+
+	               Encryption Options (currently unsupported):
+	               BU_FLAG_3DES      3DES (Triple-DES)
+	               BU_FLAG_AES       AES (Advanced Encryption Standard)
+
+RETURN VALUE:	0: Successfully opened firmware image.
+					-ENODATA: Firmware info not found in source.
+					-EBUSY: Timeout trying to open temp firmware.
+
+					Error codes when using a FAT file for temporary storage:
+					-EINVAL: Couldn't parse BU_TEMP_FILE.
+					-ENOENT: File BU_TEMP_FILE does not exist.
+					-EMFILE: Too many open files.
+
+					Error codes when using the serial flash for temporary storage:
+					-ENODEV: Can't find/read the serial flash.
+
+					Error codes when storing direct to boot firmware (RCM5600W)
+					or a secondary boot image:
+					-EINVAL: Compressed and encrypted options not supported.
+
+SEE ALSO:		buOpenFirmwareRunning, buOpenFirmwareRAM, buOpenFirmwareBoot,
+					buOpenFirmwareFAT, buOpenFirmwareSFlash, buGetInfo,
+					buVerifyFirmware, buVerifyFirmwareBlocking, buInstallFirmware,
+					buTempCreate, buTempWrite, buTempClose
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int buOpenFirmwareTemp (word firmflags)
+{
+	#if BU_TEMP_LOCATION == BU_TEMP_LOC_SECONDARY
+		auto int boot;
+	#endif
+
+	_bu_reset();
+
+	#if BU_TEMP_LOCATION == BU_TEMP_LOC_FAT
+      // use BU_TEMP_FILE (default a:firmware.bin) on FAT as temp
+      return buOpenFirmwareFAT( BU_TEMP_FILE, firmflags);
+	#elif BU_TEMP_LOCATION == BU_TEMP_LOC_SBF
+	   _bu_firmfile.flags = firmflags & BU_FLAG_USERSET;
+	   _bu_firmfile.source = _BU_FIRMSRC_SBF;
+	   _bu_firmfile.stream.read = _buReadFirmware_sbf;
+	   _bu_firmfile.stream.length = SBF_USERBLOCK_BEGIN - MAX_FIRMWARE_BINSIZE;
+	   _bu_firmfile.src.sbf.offset = MAX_FIRMWARE_BINSIZE;
+
+	   return 0;
+	#elif BU_TEMP_LOCATION == BU_TEMP_LOC_SECONDARY
+		if (firmflags & (BU_FLAG_ENCRYPTED | BU_FLAG_COMPRESSED))
+		{
+			return -EINVAL;
+		}
+	   _bu_firmfile.flags = firmflags & BU_FLAG_USERSET;
+	   _bu_firmfile.stream.read = _buReadFirmware_sbf;
+
+		// Use buMarkerReadBoot to determine which image is the current boot
+		// image.  Pass NULL since we don't actually need a copy of the marker.
+		boot = buMarkerReadBoot( NULL);
+		if (boot < 0)
+		{
+			return boot;
+		}
+		if (boot == BU_FLAG_IMAGE_B)
+		{
+			// new temp firmware is waiting in slot A
+			#ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%s: opening new secondary firmware in slot %c @ 0x%06lx\n",
+	         	__FUNCTION__, 'A', BU_IMAGE_ADDR_A);
+			#endif
+	      _bu_firmfile.source = _BU_FIRMSRC_IMAGE_A;
+	      _bu_firmfile.src.sbf.offset = BU_IMAGE_ADDR_A;
+	      _bu_firmfile.stream.length = BU_IMAGE_ADDR_B - BU_IMAGE_ADDR_A;
+		}
+		else
+		{
+			// new temp firmware is waiting in slot B
+			#ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%s: opening new secondary firmware in slot %c @ 0x%06lx\n",
+	         	__FUNCTION__, 'B', BU_IMAGE_ADDR_B);
+			#endif
+	      _bu_firmfile.source = _BU_FIRMSRC_IMAGE_B;
+	      _bu_firmfile.src.sbf.offset = BU_IMAGE_ADDR_B;
+			_bu_firmfile.stream.length =
+				( (SBF_USERBLOCK_BEGIN < BU_PROTECT_BYTES)
+												? SBF_USERBLOCK_BEGIN : BU_PROTECT_BYTES )
+				- BU_IMAGE_ADDR_B;
+		}
+
+	   return 0;
+	#elif BU_TEMP_LOCATION == BU_TEMP_LOC_SFLASH
+		sfspi_init();
+	   if ( sf_initDevice(&_bu_tempfirmware.dev, SF_SPI_CSPORT, &SF_SPI_CSSHADOW,
+	   	SF_SPI_CSPIN) )
+	   {
+			#ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%s: Can't find/read serial flash\n", __FUNCTION__);
+			#endif
+	      return -ENODEV;
+	   }
+		return buOpenFirmwareSFlash( &_bu_tempfirmware.dev, 1,
+			BU_TEMP_PAGE_OFFSET, 0, firmflags);
+	#elif BU_TEMP_LOCATION == BU_TEMP_LOC_DIRECT
+		if (firmflags & (BU_FLAG_ENCRYPTED | BU_FLAG_COMPRESSED))
+		{
+			return -EINVAL;
+		}
+	   _bu_firmfile.flags = firmflags & BU_FLAG_USERSET;
+	   _bu_firmfile.source = _BU_FIRMSRC_TMPBOOT;
+	   _bu_firmfile.stream.read = _buReadFirmware_sbf;
+	   _bu_firmfile.stream.length = SBF_USERBLOCK_BEGIN;
+	   _bu_firmfile.src.sbf.offset = 0;
+
+	   return 0;
+   #endif
+}
+
+/*** BeginHeader buOpenFirmwareSecondary */
+int buOpenFirmwareSecondary( word firmflags);
+/*** EndHeader */
+#if defined(BU_CANNOT_UPDATE_FW) || !_SERIAL_BOOT_FLASH_
+	#fatal "buOpenFirmwareSecondary is not compatible with this hardware."
+#endif
+#ifndef BU_ENABLE_SECONDARY
+	#fatal "You must define BU_ENABLE_SECONDARY to use buOpenFirmwareSecondary."
+#endif
+/* START FUNCTION DESCRIPTION ********************************************
+buOpenFirmwareSecondary                                 <board_update.lib>
+
+SYNTAX:	int buOpenFirmwareSecondary( word firmflags)
+
+DESCRIPTION:	Access the secondary firmware image stored on the boot flash
+					as the A-image or B-image.
+
+PARAMETER 1:	Bitmask combination of the following flags:
+	               BU_FLAG_NONE      Not compressed or encrypted.
+	               BU_FLAG_NOVERIFY  Skip pre-install verify (dangerous).
+
+					And one of the following flags:
+						BU_FLAG_IMAGE_A	Open the A-image.
+						BU_FLAG_IMAGE_B	Open the B-image.
+
+					Note that since bootable firmware can't possibly be
+					encrypted or compressed, the compression and encryption
+					flags are not valid.
+
+					After opening a firmware image, use the buGetInfo function to
+					examine the info structure in its header; buVerifyFirmware to
+					validate its CRC-32.
+
+RETURN VALUE:	0: Successfully opened firmware image.
+					-EBUSY: Timeout trying to read marker.
+					-ENOENT: Flash does not have a valid marker for the requested
+							firmware image (A-image or B-image).
+					-EINVAL: Invalid flag set in <firmflags>.
+
+SEE ALSO:		buOpenFirmwareRunning, buOpenFirmwareRAM, buOpenFirmwareFAT,
+					buOpenFirmwareSFlash, buOpenFirmwareTemp, buGetInfo,
+					buVerifyFirmware, buVerifyFirmwareBlocking, buInstallFirmware
+
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int buOpenFirmwareSecondary( word firmflags)
+{
+	auto firmware_marker_t		marker;
+	auto int							image;
+	auto int							err;
+
+   _bu_reset();
+
+   if (firmflags & (BU_FLAG_COMPRESSED | BU_FLAG_ENCRYPTED))
+   {
+      return -EINVAL;
+   }
+
+	// make sure that exactly one of IMAGE_A or IMAGE_B is set in flags
+	image = firmflags & BU_FLAG_IMAGE_MASK;
+	if (image == 0 || image == BU_FLAG_IMAGE_MASK)
+	{
+		return -EINVAL;
+	}
+
+	err = buMarkerRead( &marker, image);
+	if (err)
+	{
+		return err;
+	}
+	if (buMarkerVerify( &marker))
+	{
+		return -ENOENT;
+	}
+
+   _bu_firmfile.flags = firmflags & BU_FLAG_USERSET;
+   _bu_firmfile.stream.read = _buReadFirmware_sbf;
+   _bu_firmfile.source =
+   	(image == BU_FLAG_IMAGE_A) ? _BU_FIRMSRC_IMAGE_A : _BU_FIRMSRC_IMAGE_B;
+   _bu_firmfile.stream.length = marker.firminfo.length;
+   _bu_firmfile.src.sbf.offset = marker.address;
+
+   return 0;
+}
+
+/*** BeginHeader buOpenFirmwareBoot */
+int buOpenFirmwareBoot( word firmflags);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+buOpenFirmwareBoot	                 							<board_update.lib>
+
+SYNTAX:	int buOpenFirmwareBoot( word firmflags)
+
+DESCRIPTION:	Access the boot firmware image.  This is the image that the
+					board will boot from on reset, and isn't necessarily the image
+					used when the currently running program booted.
+
+PARAMETER 1:	Bitmask combination of the following flags:
+	               BU_FLAG_NONE      Not compressed or encrypted.
+	               BU_FLAG_NOVERIFY  Skip pre-install verify (dangerous).
+
+					Note that since the boot firmware can't possibly be
+					encrypted or compressed, the compression and encryption
+					flags are not valid.
+
+					After opening a firmware image, use the buGetInfo function to
+					examine the info structure in its header; buVerifyFirmware to
+					validate its CRC-32.
+
+RETURN VALUE:	0: Successfully opened firmware image.
+					-EINVAL: Compression or encryption flag passed in <firmflags>
+
+SEE ALSO:		buOpenFirmwareRunning, buOpenFirmwareRAM, buOpenFirmwareFAT,
+					buOpenFirmwareSFlash, buOpenFirmwareTemp, buGetInfo,
+					buVerifyFirmware, buVerifyFirmwareBlocking, buInstallFirmware
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int buOpenFirmwareBoot( word firmflags)
+{
+	#ifdef BU_ENABLE_SECONDARY
+		auto firmware_marker_t		marker;
+		auto int							err;
+	#endif
+
+	_bu_reset();
+
+	if (firmflags & (BU_FLAG_COMPRESSED | BU_FLAG_ENCRYPTED))
+	{
+	   return -EINVAL;
+	}
+
+	#ifdef BU_ENABLE_SECONDARY
+		err = buMarkerReadBoot( &marker);
+		if (err < 0)
+		{
+			return err;
+		}
+
+	   _bu_firmfile.stream.read = _buReadFirmware_sbf;
+	   _bu_firmfile.stream.length = marker.firminfo.length;
+	   _bu_firmfile.src.sbf.offset = marker.address;
+	#else
+	   // Set stream length to flash size so _buReadFirmware_checkparams can
+	   // check for EOF.
+	   #if _SERIAL_BOOT_FLASH_==0
+	      // parallel flash
+	      _bu_firmfile.stream.read = _buReadFirmware_pbf;
+	      _bu_firmfile.stream.length = _FLASH_SIZE_ * 4096UL;
+	   #else
+	      _bu_firmfile.stream.read = _buReadFirmware_sbf;
+	      _bu_firmfile.stream.length = MAX_FIRMWARE_BINSIZE;
+	      _bu_firmfile.src.sbf.offset = 0;
+	   #endif
+	#endif
+
+	_bu_firmfile.flags = firmflags & BU_FLAG_USERSET;
+   _bu_firmfile.source = _BU_FIRMSRC_BOOT;
+   return 0;
+}
+
+/*** BeginHeader buOpenFirmwareRunning */
+int buOpenFirmwareRunning( word firmflags);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+buOpenFirmwareRunning		                 						<board_update.lib>
+
+SYNTAX:	int buOpenFirmwareRunning( word firmflags)
+
+DESCRIPTION:	Access the currently-running firmware image in RAM.  On boards
+					without fast SRAM for program execution, this is the same as
+					calling buOpenFirmwareBoot (and will read the firmware from the
+					parallel boot flash).
+
+PARAMETER 1:	Bitmask combination of the following flags:
+	               BU_FLAG_NONE      Not compressed or encrypted.
+	               BU_FLAG_NOVERIFY  Skip pre-install verify (dangerous).
+
+					Note that since the running firmware can't possibly be
+					encrypted or compressed, the compression and encryption
+					flags are not valid.
+
+					After opening a firmware image, use the buGetInfo function to
+					examine the info structure in its header; buVerifyFirmware to
+					validate its CRC-32 and then buInstallFirmware to install it
+					to the boot flash.
+
+RETURN VALUE:	0: Successfully opened firmware image.
+					-EINVAL: Compression or encryption flag passed in <firmflags>
+
+SEE ALSO:		buOpenFirmwareRAM, buOpenFirmwareBoot, buOpenFirmwareFAT,
+					buOpenFirmwareSFlash, buOpenFirmwareTemp, buGetInfo,
+					buVerifyFirmware, buVerifyFirmwareBlocking, buInstallFirmware
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int buOpenFirmwareRunning( word firmflags)
+{
+	#if !_RUN_FROM_RAM
+		// If running from the parallel boot flash, just open the boot firmware
+		return buOpenFirmwareBoot( firmflags);
+	#else
+	   _bu_reset();
+
+	   if (firmflags & (BU_FLAG_COMPRESSED | BU_FLAG_ENCRYPTED))
+	   {
+	      return -EINVAL;
+	   }
+
+	   _bu_firmfile.flags = firmflags & BU_FLAG_USERSET;
+	   _bu_firmfile.source = _BU_FIRMSRC_RUNNING;
+	   _bu_firmfile.stream.read = _buReadFirmware_running;
+	   _bu_firmfile.stream.length = _firmware_info.length;
+
+	   _bu_firmfile.src.running.org_tbl_index = 0;
+
+	   return 0;
+	#endif
+}
+
+/*** BeginHeader buOpenFirmwareRAM */
+int buOpenFirmwareRAM (const byte __far *address, unsigned long length,
+	word firmflags);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+buOpenFirmwareRAM		                 							<board_update.lib>
+
+SYNTAX: int buOpenFirmwareRAM (const byte far *address, unsigned long length,
+																					word firmflags)
+
+DESCRIPTION:	Access a firmware image stored at a given memory location
+					(either in RAM or memory-mapped parallel flash).
+
+					After opening a firmware image, use the buGetInfo function to
+					examine the info structure in its header; buVerifyFirmware to
+					validate its CRC-32 and then buInstallFirmware to install it
+					to the boot flash.
+
+PARAMETER 1:	Start address of image.
+
+PARAMETER 2:	Total bytes in image.  Set to zero if length is unknown.
+
+PARAMETER 3:	Bitmask combination of the following flags:
+	               BU_FLAG_NONE      Not compressed or encrypted.
+	               BU_FLAG_NOVERIFY  Skip pre-install verify (dangerous).
+
+	               Compression Options (currently unsupported):
+	               BU_FLAG_LZ77      zcompress format
+	               BU_FLAG_DEFLATE   zlib/deflate format (RFC1950/RFC1951)
+	               BU_FLAG_GZIP      gzip format (RFC1952)
+
+	               Encryption Options (currently unsupported):
+	               BU_FLAG_3DES      3DES (Triple-DES)
+	               BU_FLAG_AES       AES (Advanced Encryption Standard)
+
+RETURN VALUE:	0: Successfully opened firmware image.
+					-EINVAL: Invalid parameters passed to function.
+
+SEE ALSO:		buOpenFirmwareRunning, buOpenFirmwareBoot, buOpenFirmwareFAT,
+					buOpenFirmwareSFlash, buOpenFirmwareTemp, buGetInfo,
+					buVerifyFirmware, buVerifyFirmwareBlocking, buInstallFirmware
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int buOpenFirmwareRAM (const byte __far *address, unsigned long length,
+	word firmflags)
+{
+	_bu_reset();
+
+	/*
+		DEVNOTE: Could possibly look at macro MSB_BIT to determine valid address
+		space and return an error if address + length is outside of that space.
+	*/
+
+	if (! address)
+	{
+		return -EINVAL;
+	}
+
+	_bu_firmfile.source = _BU_FIRMSRC_RAM;
+	_bu_firmfile.stream.read = _buReadFirmware_RAM;
+	_bu_firmfile.stream.length = length;
+	_bu_firmfile.flags = firmflags & BU_FLAG_USERSET;
+	_bu_firmfile.src.ram.address = address;
+
+	return 0;
+}
+
+/*** BeginHeader _buReadFirmware_checkparams */
+int _buReadFirmware_checkparams (const byte __far *dest, int bytes);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+_buReadFirmware_checkparams	                 				<board_update.lib>
+
+SYNTAX: int _buReadFirmware_checkparams (const byte far *dest, int bytes)
+
+DESCRIPTION:	Validate parameters to a _buReadFirmware_xxxx function, and
+					check stream for EOF.
+
+PARAMETER 1:	Destination buffer.
+
+PARAMETER 2:	Number of bytes to read.
+
+RETURN VALUE:	>=0: Updated number of bytes read (based on bytes left in stream)
+					-EINVAL:	Error with parameters passed to function.
+					-EEOF: No bytes left in image to read.
+
+SEE ALSO:		_buReadFirmware_xxxx
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int _buReadFirmware_checkparams (const byte __far *dest, int bytes)
+{
+	auto long streambytes;
+
+	if (! dest || bytes < 0)
+	{
+		return -EINVAL;
+	}
+
+	if (_bu_firmfile.stream.length)
+	{
+	   // calculate number of bytes left in the firmware
+	   streambytes = _bu_firmfile.stream.length - _bu_firmfile.stream.offset;
+
+	   if (streambytes <= 0)
+	   {
+	      return -EEOF;
+	   }
+
+	   if (bytes > streambytes)
+	   {
+	      return (int) streambytes;
+	   }
+	}
+
+	return bytes;
+}
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_buReadFirmware_xyz	                 							<board_update.lib>
+
+Common API for all internal _buReadFirmware_xyz functions.
+
+SYNTAX: int _buReadFirmware_xyz (byte far *dest, int bytes)
+
+DESCRIPTION:	Read from firmware image opened with buOpenFirmwareXYZ API.
+					These functions don't know anything about the data they're
+					reading -- it could be compressed and/or encrypted.
+
+PARAMETER 1:	Destination buffer.
+
+PARAMETER 2:	Number of bytes to read.
+
+RETURN VALUE:	>=0: Number of bytes read.
+					-EINVAL:	Error with parameters passed to function.
+					-EEOF: No bytes left in image to read.
+					-EIO: I/O error reading image.
+					-EBUSY: Another device is using the serial boot flash's
+								shared SPI port.
+					<0: Function-specific error, probably passed up from underlaying
+							function used to read (e.g., sbfRead, fat_xRead).
+
+SEE ALSO:		buOpenFirmwareRunning, buOpenFirmwareRAM, buOpenFirmwareBoot,
+					buOpenFirmwareFAT, buOpenFirmwareSFlash, buOpenFirmwareTemp,
+					buReadFirmware
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader _buReadFirmware_running */
+int _buReadFirmware_running (byte __far *dest, int bytes);
+/*** EndHeader */
+// For function help, see _buReadFirmware_xxxx
+_bu_debug
+int _buReadFirmware_running (byte __far *dest, int bytes)
+{
+	auto long hi;					// upper address of current block from orgtable
+	auto int block;				// number of bytes to copy in this pass
+	auto int copied;				// total bytes copied so far
+	auto int i;						// temp variable
+	auto int crcoffset;			// offset into CRC-32 (special copy operation)
+	auto int copy;					// 1 = copy, 0 = fill with 0xFF
+
+	if ((bytes = _buReadFirmware_checkparams( dest, bytes)) <= 0)
+	{
+		return bytes;
+	}
+
+   // We're copying the running firmware, so we need to convert non-code spaces
+   // in the orgtable to 0xFF to match the original binary image.  Those areas
+   // have been modified since booting, and now contain program data.
+
+	i = _bu_firmfile.src.running.org_tbl_index;
+
+	copied = 0;
+	while (bytes)
+	{
+	   // find correct entry in orgtable
+	   for (; i < _orgtablesize; i++)
+	   {
+			if (  _orgtable[i].type == RCODORG
+				|| _orgtable[i].type == XCODORG
+				|| _orgtable[i].type == RCONORG)
+			{
+	         hi = _orgtable[i].paddr + _orgtable[i].usedbytes;
+	         if (hi > _bu_firmfile.stream.offset)
+	         {
+	            copy = 1;
+	            break;
+	         }
+			}
+
+	      if (	_orgtable[i].type == RVARORG
+	      	|| _orgtable[i].type == XVARORG
+	      	|| _orgtable[i].type == WVARORG)
+	      {
+	      	// paddr is in middle of page, + .usedbytes is top of memory area
+	      	hi = _orgtable[i].paddr + _orgtable[i].usedbytes;
+	      }
+	      else
+	      {
+	      	// paddr is at bottom of page, + .totalbytes is top of memory area
+	      	hi = _orgtable[i].paddr + _orgtable[i].totalbytes;
+	      }
+	      if (hi > _bu_firmfile.stream.offset)
+	      {
+	      	// We're in a "fill" area of the orgtable, or we're in the gap
+	      	// between usedbytes and totalbytes in a "copy" area.
+	      	// this area is always filled with 0xFF
+	      	copy = 0;
+	         break;
+	      }
+	   }
+
+		if (hi - _bu_firmfile.stream.offset > bytes)
+		{
+			block = bytes;
+		}
+		else
+		{
+			block = (int) (hi - _bu_firmfile.stream.offset);
+		}
+
+      if (copy)
+      {
+			#ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%6lx: copy %d bytes from entry %d in orgtable\n",
+	            _bu_firmfile.stream.offset, block, i);
+			#endif
+         // copy from RAM into destination
+	      _f_memcpy (dest, (char __far *) _bu_firmfile.stream.offset, block);
+	      if (! _bu_firmfile.stream.offset)
+	      {
+				// First read, may need to fix values for some variables
+				// embedded in BIOS.
+				#ifdef BU_ENABLE_SECONDARY
+					dest[(int)&bu_loadapp_64k] = 0;
+				#endif
+				#if FAST_RAM_COMPILE
+	            dest[(int)FastRAM_InRAM] = 0;
+				#endif
+				#if ENABLE_CLONING == 1
+					dest[(int)I_am_a_clone] = 0;
+					dest[(int)I_am_a_sterile_clone] = 0;
+				#endif
+	      }
+      }
+      else if (_bu_firmfile.stream.offset >= _firmware_info.length - 4)
+      {
+			#ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%6lx: copy %d bytes of the end-of-file crc32\n",
+	            _bu_firmfile.stream.offset, bytes);
+			#endif
+			// The CRC-32 isn't included in the orgtable, and is therefore
+			// overwritten with data shortly after startup.  The BIOS has
+			// saved a copy of the CRC-32 from boot time, and stored it in
+			// a variable called _bu_boot_crc32.  We copy our bytes from there.
+
+			// There is a chance that we'll read this CRC-32 in two passes,
+			// depending on how it aligns with our paged reads.  Therefore,
+			// we need to calculate which bytes of the CRC-32 we're copying.
+			crcoffset = (int) (_bu_firmfile.stream.offset
+													- (_firmware_info.length - 4));
+			_f_memcpy (dest, (char __far *) &_bu_boot_crc32 + crcoffset, bytes);
+      }
+      else
+      {
+			#ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%6lx: fill %d bytes of 0xFF (entry %d in orgtable)\n",
+	            _bu_firmfile.stream.offset, block, i);
+			#endif
+         // copy 0xFF into destination
+	      _f_memset (dest, 0xFF, block);
+      }
+      _bu_firmfile.stream.offset += block;
+      copied += block;
+      dest += block;
+      bytes -= block;
+	}
+
+	_bu_firmfile.src.running.org_tbl_index = i;
+
+	return copied;
+}
+
+/*** BeginHeader _buReadFirmware_RAM */
+int _buReadFirmware_RAM (byte __far *dest, int bytes);
+/*** EndHeader */
+// For function help, see _buReadFirmware_xxxx
+_bu_debug
+int _buReadFirmware_RAM (byte __far *dest, int bytes)
+{
+	if ((bytes = _buReadFirmware_checkparams( dest, bytes)) <= 0)
+	{
+		return bytes;
+	}
+
+   // We're copying something other than the running firmware from RAM.
+   _f_memcpy (dest,
+      _bu_firmfile.src.ram.address + _bu_firmfile.stream.offset, bytes);
+   _bu_firmfile.stream.offset += bytes;
+
+	return bytes;
+}
+
+/*** BeginHeader _buReadFirmware_pbf */
+int _buReadFirmware_pbf (byte __far *dest, int bytes);
+
+// Macros to map in upper 512KB and lower 512KB of parallel boot flash.
+// On boards with 512KB, there's only one "half" to map in, so use null macros.
+// ! Functions using these macros must be compiled to "useix" since the extra
+// PUSH IP in _BU_PBF_LOWER() changes the stack in a way that the compiler
+// misses. !
+#if !_RUN_FROM_RAM || _FLASH_SIZE_ <= 512/4
+	#define _BU_PBF_LOWER()
+	#define _BU_PBF_UPPER()
+#elif _FLASH_SIZE_ == 1024/4
+	#define _BU_PBF_LOWER()	asm push ip $ ipset 3 $ ld hl,MB3CR $ ioi set 4,(hl)
+	#define _BU_PBF_UPPER()	asm ld hl,MB3CR $ ioi res 4,(hl) $ pop ip
+#elif _SERIAL_BOOT_FLASH_ == 0
+	#fatal "Library not designed for parallel flash sizes other than 512K/1MB."
+#endif
+/*** EndHeader */
+// For function help, see _buReadFirmware_xxxx
+// This function must be declared with "useix" since the PUSH IP in
+// _BU_PBF_LOWER() breaks all stack references (C or assembly) using SP.
+_bu_debug _bu_useix
+int _buReadFirmware_pbf (byte __far *dest, int bytes)
+{
+	auto long block;
+	auto int copy;
+	auto int copied;
+
+	if ((bytes = _buReadFirmware_checkparams( dest, bytes)) <= 0)
+	{
+		return bytes;
+	}
+
+#if !_RUN_FROM_RAM
+	// Boards running from flash are very easy -- PBF is mapped to 0x000000.
+	_f_memcpy( dest, (char __far *)_bu_firmfile.stream.offset, bytes);
+   _bu_firmfile.stream.offset += bytes;
+
+	return bytes;
+#else
+	#if _RUN_FROM_RAM && (MSB_BIT != 20)
+		#error "This code was written on the assumption that memory is mapped"
+		#error "in 512KB blocks.  Any change to that assumption should result"
+		#fatal "in changes to this code."
+	#endif
+
+	// If reading from parallel flash, it's mapped in at MB3CR.
+	// On RCM5450W and other devices with 1MB of program flash, need to flip a
+	// bit in MB3CR to get at the lower 512KB of the flash.
+
+	copied = 0;
+
+	// Are there any bytes left to read in the lower 512KB of flash?
+   block = 512ul * 1024 - _bu_firmfile.stream.offset;
+	if (block > 0)
+	{
+		copy = (block > bytes) ? bytes : (int) block;
+		_BU_PBF_LOWER();		// map in lower 512KB of parallel flash
+	   // 0x180000 = 1.5MB, the physical address of MB3.
+	   _f_memcpy (dest,
+	      (char __far *) (0x180000 + _bu_firmfile.stream.offset), copy);
+		_BU_PBF_UPPER();		// map upper half of parallel flash back
+	   _bu_firmfile.stream.offset += copy;
+	   copied += copy;
+	   dest += copy;
+	   bytes -= copy;
+	}
+
+	// if the parallel flash is larger than 512KB, check for bytes to read
+   #if _FLASH_SIZE_ > 512/4
+	   if (bytes)
+	   {
+			// still have bytes to copy, from upper 512KB of parallel flash
+			block = 1024ul * 1024 - _bu_firmfile.stream.offset;
+			if (bytes > block)
+			{
+				bytes = (int) block;
+			}
+	      // When reading upper 512KB of flash, use 0x100000 as offset since
+	      // we've mapped the upper 512KB of the 1MB flash in at 0x180000.
+	      // In this code, _bu_firmfile.stream.offset >= 0x080000
+	      _f_memcpy (dest,
+	         (char __far *) (0x100000 + _bu_firmfile.stream.offset), bytes);
+	      _bu_firmfile.stream.offset += bytes;
+	      copied += bytes;
+		}
+   #endif
+	return copied ? copied : -EEOF;
+#endif
+}
+
+/*** BeginHeader _buReadFirmware_sbf */
+int _buReadFirmware_sbf (byte __far *dest, int bytes);
+/*** EndHeader */
+// For function help, see _buReadFirmware_xxxx
+_bu_debug
+int _buReadFirmware_sbf (byte __far *dest, int bytes)
+{
+	auto int retval;
+	auto unsigned long base;
+	auto word timer;
+
+	if ((bytes = _buReadFirmware_checkparams( dest, bytes)) <= 0)
+	{
+		return bytes;
+	}
+
+	base = _bu_firmfile.src.sbf.offset + _bu_firmfile.stream.offset;
+   if (base + bytes > SBF_USERBLOCK_BEGIN)
+   {
+		#ifdef BOARD_UPDATE_VERBOSE
+	      printf( "%s: error, read extends into userblock\n", __FUNCTION__);
+		#endif
+		return -EPERM;
+   }
+
+   // call sbf_far_Read multiple times, to have it wait for shared SPI port
+   timer = _BU_TIMER_SET( BU_FAT_TIMEOUT);
+	do {
+      retval = sbf_far_Read( dest, base, bytes);
+   } while (retval > 0 && _BU_TIMER_NOT_EXPIRED( timer));
+	_BU_TIMER_REPORT( timer, "sbf_far_Read");
+
+	if (retval > 0)
+	{
+		retval = -EBUSY;
+	}
+   if (retval < 0)
+   {
+      bu_errmsg( retval, "sbf_far_Read");
+      return retval;
+   }
+
+   _bu_firmfile.stream.offset += bytes;
+
+	return bytes;
+}
+
+/*** BeginHeader _buReadFirmware_SFlash */
+int _buReadFirmware_SFlash (byte __far *dest, int bytes);
+/*** EndHeader */
+// For function help, see _buReadFirmware_xxxx
+_bu_debug
+int _buReadFirmware_SFlash (byte __far *dest, int bytes)
+{
+	#define _bu_sfdev _bu_firmfile.src.sflash.device
+	auto int block;
+	auto int partial;
+	auto int copied;
+	auto long page;
+	auto int retval;
+
+	if ((bytes = _buReadFirmware_checkparams( dest, bytes)) <= 0)
+	{
+		return bytes;
+	}
+
+	copied = 0;
+   page = _bu_firmfile.stream.offset / _bu_sfdev->pagesize
+   	+ _bu_firmfile.src.sflash.startpage;
+   partial = (int) (_bu_firmfile.stream.offset % _bu_sfdev->pagesize);
+
+	while (bytes)
+	{
+      block = _bu_sfdev->pagesize - partial;
+      if (block > bytes)
+      {
+         block = bytes;
+      }
+
+		if (sf_readPage( _bu_sfdev, _bu_firmfile.src.sflash.rambank, page))
+		{
+			return -EIO;
+		}
+		if (sf_readDeviceRAM( _bu_sfdev, (long) paddr_far( &dest[copied]),
+			partial, block,
+			(_bu_firmfile.src.sflash.rambank == 1) ? SF_RAMBANK1 : SF_RAMBANK2))
+		{
+			return -EIO;
+		}
+
+      partial = 0;			// only first read will be a partial page
+		page++;
+		bytes -= block;
+		copied += block;
+		_bu_firmfile.stream.offset += block;
+	}
+
+	return copied;
+}
+
+/*** BeginHeader _buReadFirmware_FAT */
+int _buReadFirmware_FAT (byte __far *dest, int bytes);
+/*** EndHeader */
+// For function help, see _buReadFirmware_xxxx
+_bu_debug
+int _buReadFirmware_FAT (byte __far *dest, int bytes)
+{
+	auto int retval;
+	auto int block;
+	auto int bytesleft;
+
+	if (! dest || bytes < 0)
+	{
+		return -EINVAL;
+	}
+
+   bytesleft = bytes;
+   // copy file from FAT to far memory in 16KB chunks
+   while (bytesleft)
+   {
+      block = (int) ((bytesleft > 16384) ? 16384 : bytesleft);
+      // call fat_xRead multiple times, to have it wait for shared SPI port
+      do {
+         retval = fat_xRead (&_bu_FATfile, dest, block);
+      } while (retval == 0 || retval == -ESHAREDBUSY);
+      if (retval < 0)
+      {
+	      bu_errmsg( retval, "fat_xRead");
+         return retval;
+      }
+      dest += retval;
+      bytesleft -= retval;
+      _bu_firmfile.stream.offset += retval;
+   }
+
+	return bytes;
+}
+
+/*** BeginHeader buReadFirmware, _buFindFirminfo */
+int buReadFirmware( byte __far *dest, int bytes);
+// expose _buFindFirminfo API for unit testing
+int _buFindFirminfo( const byte __far *buffer, int bufsize);
+/*** EndHeader */
+// This is the only function in board_update.lib that uses crc32.lib
+#use "crc32.lib"
+
+// Internal API: _buFindFirminfo
+// Helper function for buReadFirmware.  Search first 1024 bytes of the opened
+// firmware for the 4-byte marker indicating a firminfo structure.  Note that
+// the entire 68-byte structure must fit into 1024 bytes (so highest possible
+// starting address is 896).
+_bu_debug
+int _buFindFirminfo( const byte __far *buffer, int bufsize)
+{
+	auto int addr;
+	auto int maxaddr;
+
+	maxaddr = bufsize - sizeof(firmware_info_t);
+	for (addr = 0; addr <= maxaddr; addr += 64)
+	{
+		if ((*(__far unsigned long *)(buffer + addr)) == _FIRMINFO_MAGIC_NUMBER)
+		{
+			return addr;
+		}
+	}
+
+	// couldn't find the firminfo structure
+	return -ENODATA;
+}
+
+/* START FUNCTION DESCRIPTION ********************************************
+buReadFirmware			                 							<board_update.lib>
+
+SYNTAX: int buReadFirmware (byte far *dest, int bytesrequested)
+
+DESCRIPTION:	Read the next <bytesrequested> of the unencrypted, uncompressed
+					firmware into the buffer <dest>.  Must open the firmware first,
+					using one of the buOpenFirmwareXYZ functions listed in
+					SEE ALSO below.
+
+PARAMETER 1:	Destination buffer.  If NULL and this is our first read, loads
+					a buffer with first 1024 bytes of the image and populates
+					_bu_firmfile.info.
+
+					If dest is NULL for all reads, this function is being called
+					by buVerifyFirmware and it just needs to calculate the CRC-32
+					of the decrypted, uncompressed firmware.
+
+PARAMETER 2:	Decrypted, uncompressed firmware bytes to read.
+
+RETURN VALUE:	0 to <bytesrequested>: Number of bytes read.
+					-EPERM: Source not open, need to call buOpenFirmwareXYZ first.
+					-ENODATA: Firmware info not found in source.
+					-EINVAL: Must specify a non-NULL <dest> if <bytesrequested> > 0.
+					-EEOF: On the first read, stream isn't large enough to contain
+							entire firmware image.  On subsequent reads, we have
+							already read the entire firmware image
+
+SEE ALSO:		buOpenFirmwareRunning, buOpenFirmwareRAM, buOpenFirmwareBoot,
+					buOpenFirmwareFAT, buOpenFirmwareSFlash, buOpenFirmwareTemp,
+					buVerifyFirmware, buVerifyFirmwareBlocking, buRewindFirmware,
+					buInstallFirmware, buCloseFirmware, buRestoreFirmware
+
+END DESCRIPTION **********************************************************/
+/*					[When we finally support encrypted and/or compressed firmware
+					images, this function will be responsible for decrypting
+					and uncompressing the data read with _buReadFirmware_xyz().]
+*/
+_bu_debug
+int buReadFirmware (byte __far *dest, int bytesrequested)
+{
+	auto int addr;
+	auto int error;
+	auto int bytesread;
+	auto int bytesinbuf;
+	auto long bytesleftinfw;
+	auto int copybytes;
+	auto int crcbytes, crcoffset;
+	auto int bytestocrc;
+
+	// this function will handle decrypting and decompressing firmware, and
+	// possibly caching the results in far memory
+
+	if (! _bu_firmfile.stream.read)
+	{
+		// don't have a function set to read from the stream
+		return -EPERM;
+	}
+
+	// is this the first call, to open the file?
+	if (! (_bu_firmfile.flags & BU_FLAG_OPEN))
+	{
+      bytesread = _bu_firmfile.stream.read (
+         &_bu_firmfile.stream.buffer[_bu_firmfile.stream.buf_head],
+         1024 - _bu_firmfile.stream.buf_head);
+      if (bytesread < 0)
+      {
+         return bytesread;
+      }
+      _bu_firmfile.stream.buf_head += bytesread;
+
+		// Return -EBUSY until we've read the first 1024 bytes of the image
+		if (_bu_firmfile.stream.buf_head < 1024)
+		{
+			return -EBUSY;
+		}
+
+		// DEVNOTE: We don't support compression and encryption yet, but if we
+		// did, it would be necessary to decrypt and uncompress it here.
+
+	   addr = _buFindFirminfo( _bu_firmfile.stream.buffer, 1024);
+	   if (addr < 0)
+	   {
+	      error = addr;
+	   }
+		else
+		{
+	      error = fiValidate(
+	         (__far firmware_info_t *) &_bu_firmfile.stream.buffer[addr] );
+	      bu_errmsg( error, "fiValidate");
+		}
+
+		if (!error)
+		{
+	      // make a copy of the firmware's firmware_info
+	      _f_memcpy (&_bu_firmfile.info, &_bu_firmfile.stream.buffer[addr],
+	         sizeof(_bu_firmfile.info));
+
+	      // if not compressed, and we know the stream length, return EOF if the
+	      // stream isn't big enough for the firmware image.
+	      if (! (_bu_firmfile.flags & BU_FLAG_COMPRESSED)
+	         && _bu_firmfile.stream.length > 0
+	         && _bu_firmfile.stream.length < _bu_firmfile.info.length)
+	      {
+	         error = -EEOF;
+	      }
+		}
+
+	   if (error)
+	   {
+			_bu_reset();
+			return error;
+	   }
+
+	   _bu_firmfile.flags |= BU_FLAG_OPEN;
+	}
+
+	if (!bytesrequested)
+	{
+		// nothing to read, probably the call to open the file and read firminfo
+		return 0;
+	}
+
+	if (!dest)
+	{
+		// not good -- can't read <bytesrequested> bytes without a destination
+		return -EINVAL;
+	}
+
+	bytesleftinfw = _bu_firmfile.info.length - _bu_firmfile.firmware.offset;
+	if (bytesleftinfw <= 0)
+	{
+		return -EEOF;
+	}
+
+	if (bytesrequested > bytesleftinfw)
+	{
+		bytesrequested = (int) bytesleftinfw;
+	}
+
+	bytesread = 0;
+	// Note that we haven't actually implemented a circular buffer (yet) using
+	// buf_head and buf_tail.  If it was a circular buffer, this code wouldn't
+	// work.  Consider replacing with tbuf.lib.
+   bytesinbuf = _bu_firmfile.stream.buf_head - _bu_firmfile.stream.buf_tail;
+   if (bytesinbuf)
+   {
+      // bytes already in buffer that we can hand off to caller
+      copybytes = (bytesrequested > bytesinbuf) ? bytesinbuf : bytesrequested;
+      _f_memcpy (&dest[bytesread],
+      	&_bu_firmfile.stream.buffer[_bu_firmfile.stream.buf_tail], copybytes);
+      _bu_firmfile.stream.buf_tail += copybytes;
+      bytesread += copybytes;
+      bytesrequested -= copybytes;
+   }
+
+	while (bytesrequested)
+	{
+		// still bytes left, copy direct from stream.read() function
+		copybytes = _bu_firmfile.stream.read (&dest[bytesread], bytesrequested);
+		if (copybytes < 0)
+		{
+	      bu_errmsg( copybytes, "_buReadFirmware_xxxx");
+			return copybytes;
+		}
+      bytesread += copybytes;
+      bytesrequested -= copybytes;
+	}
+
+	bytesleftinfw -= bytesread;
+
+	// If there are less than 4 bytes left in the firmware, some of the bytes
+	// we just read were part of the CRC-32 at the end of the file.  In this
+	// case, <bytesleftinfw> is the number of CRC-32 bytes yet to read.
+	crcbytes = (bytesleftinfw < 4) ? (4 - (int) bytesleftinfw) : 0;
+
+	if (crcbytes > bytesread)
+	{
+		crcbytes = bytesread;
+	}
+
+	// read <crcbytes> of the CRC-32 in this pass
+
+	// Don't include the CRC-32 bytes when calculating CRC-32 of firmware.
+	bytestocrc = bytesread - crcbytes;
+	if (bytestocrc)
+	{
+	   // update CRC-32
+	   _bu_firmfile.firmware.calc_crc32 = crc32_calc( (__far uint8 *) dest,
+	   	bytestocrc, _bu_firmfile.firmware.calc_crc32);
+	}
+
+	// If we read CRC-32 bytes, need to store them in .file_crc32.
+	if (crcbytes)
+	{
+		// Part of our read was the end-of-file CRC.  Since it's possible to
+		// have an incomplete read of those 4 bytes, we need to keep a copy
+		// of the bytes read so far, and then compare the CRCs later.
+
+		// We've read up to (4 - bytesleftinfw) of the crc32.
+		// Going to copy (crcbytes) in, so write at that offset into file_crc32
+
+		crcoffset = 4 - (int) bytesleftinfw - crcbytes;
+
+		_f_memcpy ((char __far *) &_bu_firmfile.file_crc32 + crcoffset,
+			&dest[bytestocrc], crcbytes);
+	}
+
+	_bu_firmfile.firmware.offset += bytesread;
+
+	return bytesread;
+}
+
+/*** BeginHeader buRewindFirmware */
+int buRewindFirmware();
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+buRewindFirmware		                 							<board_update.lib>
+
+SYNTAX: int buRewindFirmware()
+
+DESCRIPTION:	Rewind the firmware source back to the beginning.  Necessary
+					when using buVerifyFirmware before calling buInstallFirmware.
+
+RETURN VALUE:	0: Firmware source already rewound, or successfully rewound.
+					-EPERM: Source not open, need to call buOpenFirmwareXYZ first.
+					-EBUSY: Timeout waiting for FAT filesystem.
+					-EIO: Can't rewind source.
+
+SEE ALSO:		buOpenFirmwareRunning, buOpenFirmwareRAM, buOpenFirmwareBoot,
+					buOpenFirmwareFAT, buOpenFirmwareSFlash, buOpenFirmwareTemp,
+					buReadFirmware, buVerifyFirmware, buVerifyFirmwareBlocking,
+					buInstallFirmware, buCloseFirmware, buRestoreFirmware
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int buRewindFirmware()
+{
+	auto int error;
+#ifdef _BU_ENABLE_FAT
+	auto word timer;
+#endif
+
+	if (! _bu_firmfile.firmware.offset)
+	{
+		// Firmware already rewound, necessary to check here to avoid getting
+		// -EIO error on non-seekable sources.
+		return 0;
+	}
+
+	switch (_bu_firmfile.source)
+	{
+		case _BU_FIRMSRC_SBF:
+		case _BU_FIRMSRC_IMAGE_A:
+		case _BU_FIRMSRC_IMAGE_B:
+		case _BU_FIRMSRC_TMPBOOT:
+		case _BU_FIRMSRC_BOOT:
+		case _BU_FIRMSRC_RUNNING:
+		case _BU_FIRMSRC_RAM:
+		case _BU_FIRMSRC_SFLASH:
+			// nothing special to rewind -- just reset the common variables below
+			break;
+
+	#ifdef _BU_ENABLE_FAT
+		case _BU_FIRMSRC_FAT:
+	      timer = _BU_TIMER_SET( BU_FAT_TIMEOUT);
+			do {
+				error = fat_Seek (&_bu_FATfile, 0, SEEK_SET);
+			} while (error == -EBUSY && _BU_TIMER_NOT_EXPIRED( timer));
+	      _BU_TIMER_REPORT( timer, "fat_Seek");
+			if (error)
+			{
+				bu_errmsg( error, "fat_Seek");
+				return error;
+			}
+			break;
+	#endif
+
+		// if a source can't be rewound, return -EIO
+
+		default:
+			#ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%s: invalid source %d\n", __FUNCTION__,
+	         	_bu_firmfile.source);
+			#endif
+			return -EPERM;
+	}
+
+   _bu_firmfile.firmware.calc_crc32 = 0;
+   _bu_firmfile.stream.offset = 0;
+   _bu_firmfile.stream.buf_head = _bu_firmfile.stream.buf_tail = 0;
+   _bu_firmfile.firmware.offset = 0;
+
+   return 0;
+}
+
+/*** BeginHeader buCloseFirmware */
+int buCloseFirmware();
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+buCloseFirmware		                 							<board_update.lib>
+
+SYNTAX: int buCloseFirmware()
+
+DESCRIPTION:	Close the firmware source stream, previously opened with
+					a buOpenFirmwareXYZ call.
+
+					If temporary memory was allocated to cache a copy of the
+					firmware during the verification process, buCloseFirmware
+					will also release that memory.
+
+RETURN VALUE:	0: Closed firmware source stream.
+					-EPERM: Source already closed.
+					-EBUSY: Timeout waiting for FAT filesystem.
+
+SEE ALSO:		buOpenFirmwareRunning, buOpenFirmwareRAM, buOpenFirmwareBoot,
+					buOpenFirmwareFAT, buOpenFirmwareSFlash, buOpenFirmwareTemp,
+					buReadFirmware, buVerifyFirmware, buVerifyFirmwareBlocking,
+					buRewindFirmware, buInstallFirmware, buRestoreFirmware
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int buCloseFirmware()
+{
+	auto int retval;
+#ifdef _BU_ENABLE_FAT
+	auto word timer;
+#endif
+
+	retval = 0;
+	switch (_bu_firmfile.source)
+	{
+		case _BU_FIRMSRC_RAM:
+			if (_bu_firmfile.flags & BU_FLAG_XFREE)
+			{
+				// Need to release temporary memory used to hold the decrypted
+				// (and possibly decompressed) firmware image.
+				xrelease( (long)_bu_firmfile.src.ram.address,
+					_bu_firmfile.stream.length);
+			}
+			break;
+
+		case _BU_FIRMSRC_SBF:
+		case _BU_FIRMSRC_IMAGE_A:
+		case _BU_FIRMSRC_IMAGE_B:
+		case _BU_FIRMSRC_TMPBOOT:
+		case _BU_FIRMSRC_BOOT:
+		case _BU_FIRMSRC_RUNNING:
+		case _BU_FIRMSRC_SFLASH:
+			// nothing necessary to close, just reset the firmfile structure
+			break;
+
+	#ifdef _BU_ENABLE_FAT
+		case _BU_FIRMSRC_FAT:
+			// close underlying FAT file
+	      timer = _BU_TIMER_SET( BU_FAT_TIMEOUT);
+			do {
+				retval = fat_Close( &_bu_FATfile);
+			} while (retval == -EBUSY && _BU_TIMER_NOT_EXPIRED( timer));
+	      _BU_TIMER_REPORT( timer, "fat_Close");
+			break;
+	#endif
+
+		default:
+			retval = -EPERM;
+	}
+
+	// reset the _bu_firmfile structure
+	if (retval != -EBUSY)
+	{
+		_bu_reset();
+	}
+	return retval;
+}
+
+/*** BeginHeader buVerifyFirmware */
+int buVerifyFirmware( int __far *progress);
+/*** EndHeader */
+/*
+	DEVNOTE:
+
+	When verifying firmware, check to see if there's enough xmem available to
+	allocate a chunk and store a decrypted copy of the firmware there.  If we
+	have a ton of space, we could even store an uncompressed copy.
+
+	This will speed up the actual installation of the firmware to the boot
+	device.
+*/
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+buVerifyFirmware		                 							<board_update.lib>
+
+SYNTAX: int buVerifyFirmware( int far *progress)
+
+DESCRIPTION:   Verify that the currently selected firmware image is OK to
+               install on this device.  Verifies CRC-32 of firmware image
+               (to detect corruption) and confirms that the firmware was
+               compiled for this target hardware.
+
+               Because validating firmware can take a significant amount of
+               time, especially with encrypted or compressed firmware, this
+               is a non-blocking function.
+
+               Use buVerifyFirmwareBlocking to block until verification is
+               complete or an error is detected.
+
+PARAMETER 1:   Address of an integer to store a progress indicator.  On a
+               return of -EAGAIN, *progress is set to a value from 0 to 10,000,
+               representing the percent complete in .01% increments
+               (1234 = 12.34%).  On a return of 0, *progress is set to 10,000.
+
+RETURN VALUE:  0: Verification complete, firmware image is OK to install.
+               -EAGAIN: Verification partially complete, call function again.
+               -ENODATA: Source not open, or firmware info not found in source.
+               -EEOF: Stream isn't large enough to contain entire firmware
+                     image.
+               -EPERM: Firmware was compiled for a different target.
+               -EBADDATA: CRC-32 mismatch, firmware image corrupted.
+
+SEE ALSO:      buOpenFirmwareRunning, buOpenFirmwareRAM, buOpenFirmwareBoot,
+               buOpenFirmwareFAT, buOpenFirmwareSFlash, buOpenFirmwareTemp,
+               buReadFirmware, buVerifyFirmwareBlocking, buRewindFirmware,
+               buInstallFirmware, buCloseFirmware, buRestoreFirmware
+END DESCRIPTION **********************************************************/
+_bu_debug
+int buVerifyFirmware( int __far *progress)
+{
+	// just verify, don't copy to secondary location
+	return buVerifyToSecondary( progress, 0);
+}
+
+
+/*** BeginHeader buCopyToSecondary */
+int buCopyToSecondary( int __far *progress);
+/*** EndHeader */
+#ifndef BU_ENABLE_SECONDARY
+	#fatal "This function is only available if BU_ENABLE_SECONDARY is defined."
+#endif
+/* START FUNCTION DESCRIPTION ********************************************
+buCopyToSecondary		                 							<board_update.lib>
+
+SYNTAX: int buCopyToSecondary( int far *progress)
+
+DESCRIPTION:	Simple wrapper for buVerifyToSecondary( progress, 1).
+					See that function's help for additional details.
+
+SEE ALSO:	buVerifyFirmware, buVerifyToSecondary
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int buCopyToSecondary( int __far *progress)
+{
+	// verify firmware and copy to secondary location
+	return buVerifyToSecondary( progress, 1);
+}
+
+/*** BeginHeader buVerifyToSecondary */
+int buVerifyToSecondary( int __far *progress, int copy);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+buVerifyToSecondary		                 					<board_update.lib>
+
+SYNTAX: int buVerifyToSecondary( int far *progress, int copy)
+
+DESCRIPTION:	Verify that the currently selected firmware image is OK to
+					install on this device while optionally copying it to the
+					secondary firmware location if available.  Verifies CRC-32 of
+					firmware image (to detect corruption) and confirms that the
+					firmware was compiled for this target hardware.
+
+					Because validating firmware can take a significant amount of
+					time, especially with encrypted or compressed firmware, this
+					is a non-blocking function.
+
+					Use buVerifyFirmwareBlocking to block (without copying) until
+					verification is complete or an error is detected.
+
+PARAMETER 1:	Address of an integer to store a progress indicator.  On a
+					return of -EAGAIN, *progress is set to a value from 0 to 10,000,
+					representing the percent complete in .01% increments
+					(1234 = 12.34%).  On a return of 0, *progress is set to 10,000.
+
+PARAMETER 2:	Set to 0 to verify only, or 1 to copy to secondary location
+					while verifying.  Note that this parameter is ignored unless
+					BU_ENABLE_SECONDARY is defined.
+
+RETURN VALUE:	0: Verification (and copy) complete, firmware image is ready to
+							be installed.
+					-EAGAIN: Verification (and copy) partially complete, call
+							function again.
+					-ENODATA: Source not open, or firmware info not found in source.
+					-EEOF: Stream isn't large enough to contain entire firmware
+							image.
+					-EPERM: Firmware was compiled for a different target.
+					-EBADDATA: CRC-32 mismatch, firmware image corrupted.
+					-EIO:	Error trying to write image to secondary location.
+
+SEE ALSO:		buOpenFirmwareRunning, buOpenFirmwareRAM, buOpenFirmwareBoot,
+					buOpenFirmwareFAT, buOpenFirmwareSFlash, buOpenFirmwareTemp,
+					buReadFirmware, buVerifyFirmwareBlocking, buRewindFirmware,
+					buInstallFirmware, buCloseFirmware, buRestoreFirmware,
+					buVerifyFirmware, buCopyToSecondary
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int buVerifyToSecondary( int __far *progress, int copy)
+{
+	auto long bytes;
+	auto int check;
+	auto int retval;
+	auto int complete;
+	auto int error;
+	#ifdef BU_ENABLE_SECONDARY
+		auto int offset;
+	#endif
+
+	if (! _bu_firmfile.firmware.offset)
+	{
+		// first time through, verify other settings
+	   if (! _bu_firmfile.stream.read)
+	   {
+	      // don't have a function set to read from the stream
+			#ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%s: nothing to read\n", __FUNCTION__);
+			#endif
+	      return -ENODATA;
+	   }
+
+	   if (! (_bu_firmfile.flags & BU_FLAG_OPEN))
+	   {
+	      // firmware file isn't open yet
+	      error = buReadFirmware( NULL, 0);
+	      if (error == -EBUSY)
+	      {
+				if (progress)
+				{
+					*progress = 0;
+				}
+				return -EAGAIN;
+	      }
+	      if (error < 0)
+	      {
+				return error;
+	      }
+	   }
+
+	   if (_bu_firmfile.info.board_type != _BOARD_TYPE_)
+	   {
+			#ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%s: boardtype mismatch (0x%04x != 0x%04x)\n",
+	            __FUNCTION__, _bu_firmfile.info.board_type,
+	            _BOARD_TYPE_);
+			#endif
+	      return -EPERM;
+	   }
+
+	   if (_bu_firmfile.info.mb_type != _DC_MB_TYPE_)
+	   {
+			#ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%s: MB type mismatch (0x%08x != 0x%08x)\n",
+	            __FUNCTION__, _bu_firmfile.info.mb_type, _DC_MB_TYPE_);
+			#endif
+	      return -EPERM;
+	   }
+
+	   if (_bu_firmfile.info.flags & _FIRMINFO_FLAG_RAM_COMPILE)
+	   {
+			#ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%s: Can't install 'Store Program in RAM' firmware\n",
+	            __FUNCTION__);
+			#endif
+	      return -EPERM;
+	   }
+
+	   if (_bu_firmfile.info.length > MAX_FIRMWARE_BINSIZE)
+	   {
+			#ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%s: firmware too big (%ul > %ul)\n",
+	         	__FUNCTION__, _bu_firmfile.info.length, MAX_FIRMWARE_BINSIZE);
+			#endif
+			return -EPERM;
+	   }
+
+	   #ifdef BU_ENABLE_SECONDARY
+         if (copy)
+         {
+	         if (! (_bu_firmfile.info.flags & _FIRMINFO_FLAG_CAN_BE_SECONDARY))
+	         {
+	            #ifdef BOARD_UPDATE_VERBOSE
+	               printf( "%s: Can't install firmware to secondary location.\n",
+	                  __FUNCTION__);
+	            #endif
+	            return -EPERM;
+	         }
+
+	         if (_bu_firmfile.source  == _BU_FIRMSRC_IMAGE_A
+	         	|| _bu_firmfile.source == _BU_FIRMSRC_IMAGE_B)
+	         {
+	            #ifdef BOARD_UPDATE_VERBOSE
+	               printf( "%s: Can't copy to secondary from secondary.\n",
+	                  __FUNCTION__);
+	            #endif
+	            return -EPERM;
+	         }
+
+				// for BU_ENABLED_SECONDARY, buTempCreate always succeeds
+	         buTempCreate();
+
+	      }
+	   #endif
+	}
+
+	// DEVNOTE: this code shouldn't be using firmware.buffer in its reads,
+	// consider using xalloc to get some far memory, or use the stack...
+	// It might be necessary to use something other than firmware.buffer when
+	// we start handling encryption and compression.
+
+	// read through the firmware, calculating CRC-32
+	bytes = _bu_firmfile.info.length - _bu_firmfile.firmware.offset;
+	if (bytes)
+	{
+	   check = (bytes > sizeof(_bu_firmfile.firmware.buffer))
+	   							? sizeof(_bu_firmfile.firmware.buffer) : (int) bytes;
+
+	   retval = buReadFirmware( _bu_firmfile.firmware.buffer, check);
+	   if (retval < 0)
+	   {
+	      bu_errmsg( retval, "buReadFirmware");
+	      return retval;
+	   }
+
+	   bytes -= retval;
+	   #ifdef BU_ENABLE_SECONDARY
+			if (copy)
+			{
+				// Have to write out all of the bytes in this pass, even if it
+				// results in blocking.  No easy way to continue write on next call.
+				offset = 0;
+				while (retval > offset)
+				{
+					do {
+	               error = buTempWrite(
+	                  &_bu_firmfile.firmware.buffer[offset], retval - offset);
+	            } while (error == -EBUSY);
+					if (error < 0)
+					{
+						bu_errmsg( error, "buTempWrite");
+						return -EIO;
+					}
+					offset += error;
+				}
+
+				if (! bytes)
+				{
+					// copy is complete, close secondary image
+					do {
+						error = buTempClose();
+					} while (error == -EBUSY);
+				}
+			}
+	   #endif
+	}
+
+	if (bytes)
+	{
+		// Verification is incomplete, set progress indicator and return -EAGAIN.
+	   if (progress)
+	   {
+	      if (_bu_firmfile.firmware.offset < (0xFFFFFFFFul / 10000))
+	      {
+	         *progress = (int) (_bu_firmfile.firmware.offset * 10000ul
+	            / _bu_firmfile.info.length);
+	      }
+	      else
+	      {
+	      	// big offset, use non-overflowing calculation
+	         *progress = (int) (_bu_firmfile.firmware.offset /
+	            (_bu_firmfile.info.length / 10000));
+	      }
+	   }
+
+	   return -EAGAIN;
+	}
+	else
+	{
+		// have read entire file, compare checksums
+		if (_bu_firmfile.file_crc32 == _bu_firmfile.firmware.calc_crc32)
+		{
+			_bu_firmfile.flags |= BU_FLAG_VERIFIED;
+			if (progress)
+			{
+				*progress = 10000;		// set progress indicator to 100.00%
+			}
+			return 0;
+		}
+		else
+		{
+			#ifdef BOARD_UPDATE_VERBOSE
+	         printf( "CRC-32 mis-match, (file=0x%08lx, calculated=0x%08lx)\n",
+	            _bu_firmfile.file_crc32, _bu_firmfile.firmware.calc_crc32);
+			#endif
+	      return -EBADDATA;
+		}
+	}
+
+	// DEVNOTES:
+
+	// if there's enough xmem, the verification process should store a decrypted
+	// and possibly uncompressed copy of the firmware in RAM to speed the
+	// installation process (which would otherwise require a second pass of
+	// decryption and decompression).
+
+	// If verification failed, and we allocated xmem for a temp copy of a
+	// decrypted version of the file, be sure to xfree() that memory.
+}
+
+/*** BeginHeader buVerifyFirmwareBlocking */
+int buVerifyFirmwareBlocking ();
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+buVerifyFirmwareBlocking											<board_update.lib>
+
+SYNTAX: int buVerifyFirmwareBlocking()
+
+DESCRIPTION:	Verify that the currently selected firmware image is OK to
+					install on this device.  Verifies CRC-32 of firmware image
+					(to detect corruption) and confirms that the firmware was
+					compiled for this target hardware.
+
+					Because validating firmware can take a significant amount of
+					time, especially with encrypted or compressed firmware, consider
+					using buVerifyFirmware, the non-blocking version of this
+					function.
+
+RETURN VALUE:	0: Firmware is ready to install.
+					-ENODATA: Source not open, or firmware info not found in source.
+					-EPERM: Firmware was compiled for a different target.
+					-EBADDATA: CRC-32 mismatch, firmware image corrupted.
+
+SEE ALSO:		buOpenFirmwareRunning, buOpenFirmwareRAM, buOpenFirmwareBoot,
+					buOpenFirmwareFAT, buOpenFirmwareSFlash, buOpenFirmwareTemp,
+					buReadFirmware, buVerifyFirmware, buRewindFirmware,
+					buInstallFirmware, buCloseFirmware, buRestoreFirmware
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int buVerifyFirmwareBlocking ()
+{
+	auto int error;
+	auto int progress;
+
+	progress = 0;
+	do {
+		#ifdef BOARD_UPDATE_VERBOSE
+	      printf( "\r verify %u.%02u%%\r", progress / 100, progress % 100);
+		#endif
+		error = buVerifyToSecondary( &progress, 0);
+	} while (error == -EAGAIN);
+
+   if (error)
+   {
+      #ifdef BOARD_UPDATE_VERBOSE
+         printf( "\n verify error %d\n", error);
+      #endif
+      return error;
+   }
+
+	#ifdef BOARD_UPDATE_VERBOSE
+	   printf( " verify complete (CRC-32 = %08lx)\n", _bu_firmfile.file_crc32);
+	#endif
+	return 0;
+}
+
+/*** BeginHeader _bu_erase_pbf */
+int _bu_erase_pbf( unsigned long count);
+/*** EndHeader */
+// Erase <count> bytes of parallel boot flash, return -EINVAL if trying to
+// erase too many bytes.  Calling function assumes that flash was not modified
+// if an error was returned (i.e., errors only occur from parameter checking).
+// This function must be declared with "useix" since the PUSH IP in
+// _BU_PBF_LOWER() breaks all stack references (C or assembly) using SP.
+_bu_debug _bu_useix
+int _bu_erase_pbf( unsigned long count)
+{
+	#if _FLASH_SIZE_ == 1024/4
+	   auto unsigned long bytes;
+	   auto unsigned int sector, stop_sector;
+	   auto unsigned long sector_address;
+	#endif
+
+	// make sure this erase won't affect the user block area
+	if (count > MAX_FIRMWARE_BINSIZE)
+	{
+		return -EINVAL;
+	}
+
+   #if _FLASH_SIZE_ == 512/4
+   	// full 512KB of flash is mapped to quadrant 3 (0x180000, 1.5MB)
+	   #ifdef BOARD_UPDATE_VERBOSE
+         printf( "%s: erase parallel flash, %lu bytes, sector %u to %u\n",
+            __FUNCTION__, count, _LongToSector( 0x180000),
+            _LongToSector( 0x180000 + count - 1));
+	   #endif
+	   _EraseFlashRange( 0x180000, 0x180000 + count - 1);
+	#elif _FLASH_SIZE_ == 1024/4
+		// With a 1MB flash, we need to map in half of it at a time to do the
+		// erase.  Since _BU_PBF_LOWER() disables interrupts on boards
+	   // with > 512KB, we must make multiple calls to _EraseFlashSector() and
+	   // re-enable interrupts between each call (done in _BU_PBF_UPPER).
+
+		bytes = (count > 512 * 1024UL) ? 512 * 1024UL : count;
+
+	   stop_sector = _LongToSector( 0x100000 + bytes - 1) + 1;
+		sector = _LongToSector( 0x100000);
+	   #ifdef BOARD_UPDATE_VERBOSE
+         printf( "%s: erase parallel flash, %lu bytes, sector %u to %u\n",
+            __FUNCTION__, bytes, sector, stop_sector - 1);
+	   #endif
+
+      // Erase sector-by-sector (with interrupts disabled to prevent other
+      // code from running that assumes the upper 512KB is still mapped in).
+	   for (; sector < stop_sector; ++sector)
+	   {
+			// turn of watchdog timer, the erase function can take awhile
+			Disable_HW_WDT();
+
+			// map in lower 512KB of parallel flash, disable interrupts
+ 	      _BU_PBF_LOWER();
+
+ 	      // re-initialize flash driver so it knows first 512KB is mapped to Q3
+ 	      _InitFlashDriver((1ul << (MSB_BIT + 1)) - (1ul << (MSB_BIT - 1)),
+ 	      	(1ul << (MSB_BIT + 1)) - (1ul << (MSB_BIT - 1)));
+
+	      #asm
+	      	; use frame pointer to load sector (sp altered by _BU_PBF_LOWER())
+	      	ld		hl, (ix+sector)
+	      	push	hl						; param1 (HL), sector
+				call	_SectorToLong		; return (BCDE), 32-bit address of sector
+				add	sp, 2
+
+				ld		py, bcde				; param1 (py), destination flash address
+	         call _EraseFlashSector	; no return value
+	      #endasm
+
+	      // re-initialize flash driver back to original setting
+	      _InitFlashDriver((1ul << (MSB_BIT + 1)) - (1ul << (MSB_BIT - 1)),
+	      	(1ul << (MSB_BIT + 1)) - _FLASH_SIZE_ * 0x1000ul);
+
+			// map in upper 512KB of parallel flash, re-enable interrupts
+	      _BU_PBF_UPPER();
+
+			// re-enable watchdog timer, at least until the next pass of the loop
+			Enable_HW_WDT();
+	   }
+
+		// erase bytes between 512KB and 1MB
+		if (count > 512 * 1024UL)
+		{
+			bytes = count - 512 * 1024UL;
+	      #ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%s: erase parallel flash, %lu bytes, sector %u to %u\n",
+	            __FUNCTION__, bytes, _LongToSector( 0x180000),
+	            _LongToSector( 0x180000 + bytes - 1));
+	      #endif
+	      _EraseFlashRange( 0x180000, 0x180000 + bytes - 1);
+		}
+	#else
+		#fatal "Incompatible with flash sizes other than 512KB and 1MB."
+   #endif
+
+	return 0;
+}
+
+/*** BeginHeader _buInstallSecondary */
+int _buInstallSecondary( word flags);
+/*** EndHeader */
+#ifdef BU_CANNOT_UPDATE_FW
+	#fatal "_buInstallSecondary is not compatible with this hardware."
+#endif
+#ifndef BU_ENABLE_SECONDARY
+	#fatal "_buInstallSecondary requires BU_ENABLE_SECONDARY to be defined."
+#endif
+/* START _FUNCTION DESCRIPTION ********************************************
+_buInstallSecondary                                     <board_update.lib>
+
+SYNTAX:	int _buInstallSecondary( word flags)
+
+DESCRIPTION:	Update the A- or B-valid marker so that the its firmware is live.
+					Assumes that the firmware has already been verified --
+					DO NOT INSTALL SECONDARY FIRMWARE THAT HAS NOT BEEN VERIFIED!
+
+					Note that this function is only called from buInstallFirmware.
+
+PARAMETER:	Either BU_FLAG_IMAGE_A or BU_FLAG_IMAGE_B, indicating which image
+				should be the new boot image.
+
+RETURN VALUE:	-EINVAL: invalid <flags> passed to function
+					-EPERM: Firmware does not have CAN_BE_SECONDARY flag set in its
+							firmware_info (and cannot boot from a non-zero flash
+							address).
+					-EBUSY: Timeout waiting for serial boot flash.
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int _buInstallSecondary( word flags)
+{
+	auto firmware_marker_t marker;
+	auto int install_image;
+	auto int boot_image;
+	auto int old_sequence;
+	auto int err;
+
+	if (flags != BU_FLAG_IMAGE_A && flags != BU_FLAG_IMAGE_B)
+	{
+		// invalid flags setting passed in, must be IMAGE_A or IMAGE_B only
+		return -EINVAL;
+	}
+
+	install_image = flags & BU_FLAG_IMAGE_MASK;
+
+	boot_image = buMarkerReadBoot( &marker);
+	if (boot_image < 0)
+	{
+		return boot_image;
+	}
+
+	// create new marker with an incremented sequence number
+   err = buMarkerBuild( &marker, marker.sequence + 1,
+   	(install_image == BU_FLAG_IMAGE_A)
+   											? BU_IMAGE_ADDR_A : BU_IMAGE_ADDR_B);
+   bu_errmsg( err, "buMarkerBuild");
+
+	if (! err)
+	{
+		if (! (marker.firminfo.flags & _FIRMINFO_FLAG_CAN_BE_SECONDARY))
+		{
+			#ifdef BOARD_UPDATE_VERBOSE
+				printf( "%s: Can't install non-relocatable firmware as secondary\n",
+					__FUNCTION__);
+				buMarkerDump( &marker);
+			#endif
+			return -EPERM;
+		}
+
+		// new marker is good
+		#ifdef BOARD_UPDATE_VERBOSE
+			printf( "%s: writing new %c-valid marker...\n", __FUNCTION__,
+				(install_image == BU_FLAG_IMAGE_A) ? 'A' : 'B');
+			buMarkerDump( &marker);
+		#endif
+
+		err = _buMarkerWrite( &marker, install_image);
+		bu_errmsg( err, "_buMarkerWrite");
+	}
+
+	return err;
+}
+
+/*** BeginHeader buInstallFirmware */
+int buInstallFirmware();
+/*** EndHeader */
+#ifdef BU_CANNOT_UPDATE_FW
+	#fatal "buInstallFirmware is not compatible with this hardware."
+#endif
+/* START FUNCTION DESCRIPTION ********************************************
+buInstallFirmware		                 							<board_update.lib>
+
+SYNTAX: int buInstallFirmware()
+
+DESCRIPTION:	Copy the previously opened and (possibly) verified firmware to
+					the boot flash.  If there is a problem copying the firmware,
+					this function calls buRestoreFirmware() to copy a copy of the
+					running firmware back to the boot flash.
+
+					If the firmware hasn't already been verified with
+					buVerifyFirmware (or buVerifyFirmwareBlocking), this function
+					will verify the firmware before installing it.
+
+					To skip the verification process (something that could result
+					in installing non-bootable firmware on the device), use the
+					BU_FLAG_NOVERIFY option when opening the firmware source.
+
+					If the installation was successful, the caller will probably
+					want to reboot using the exit() function.
+
+					buInstallFirmware will always close the firmware image (if one
+					was open) before returning.
+
+RETURN VALUE:	0: Firmware installed (running in debugger, so reboot skipped).
+					-ENODATA: Source not open, or firmware info not found in source.
+					-EPERM: Attempting to install boot firmware on top of itself,
+						or firmware too large for boot flash
+						or non-relocatable firmware to a non-zero flash address
+						or some other failure
+					-EIO: Can't rewind source.
+					-EBADMSG: CRC-32 mismatch after installing.
+					-ENOMEM: Couldn't allocate buffer to copy firmware.
+
+SEE ALSO:		buOpenFirmwareRunning, buOpenFirmwareRAM, buOpenFirmwareBoot,
+					buOpenFirmwareFAT, buOpenFirmwareSFlash, buOpenFirmwareTemp,
+					buReadFirmware, buVerifyFirmware, buVerifyFirmwareBlocking,
+					buRewindFirmware, buCloseFirmware, buRestoreFirmware
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int buInstallFirmware()
+{
+	auto long bytes;
+	auto long allocbytes;
+	auto long wrote;
+	auto long overwrote;
+	auto long dest;
+	auto int read, block;
+	auto int error;
+	auto char __far *buffer;
+
+#ifdef BOARD_UPDATE_VERBOSE
+	unsigned long start;			// time duration of flash writing activity
+#endif
+
+	#if ! _RUN_FROM_RAM
+	   if (_bu_firmfile.source != _BU_FIRMSRC_SFLASH)
+	   {
+	      // Serial flash is the only valid source for the mini-loader used when
+	      // running from flash.
+	      #ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%s: invalid firmware source\n", __FUNCTION__);
+	      #endif
+	      return -ENODATA;
+	   }
+	#endif
+
+	if (! _bu_firmfile.stream.read)
+	{
+		// don't have a function set to read from the stream
+		#ifdef BOARD_UPDATE_VERBOSE
+	      printf( "%s: nothing to read\n", __FUNCTION__);
+		#endif
+		return -ENODATA;
+	}
+	if (! (_bu_firmfile.flags & BU_FLAG_OPEN))
+	{
+		// firmware file isn't open, call buReadFirmware until we get firminfo
+		do
+		{
+			error = buReadFirmware( NULL, 0);
+		} while (error == -EBUSY);
+
+		if (error)
+		{
+			return error;
+		}
+	}
+
+	error = 0;
+
+	if (_bu_firmfile.source == _BU_FIRMSRC_BOOT)
+	{
+		#ifdef BOARD_UPDATE_VERBOSE
+	      printf( "%s: can't install boot firmware on itself!\n", __FUNCTION__);
+		#endif
+		error = -EPERM;
+	}
+   else if (_bu_firmfile.info.length > MAX_FIRMWARE_BINSIZE)
+   {
+      #ifdef BOARD_UPDATE_VERBOSE
+         printf( "%s: firmware too big (%ul > %ul)\n", __FUNCTION__,
+            _bu_firmfile.info.length, MAX_FIRMWARE_BINSIZE);
+      #endif
+      error = -EPERM;
+   }
+   #ifdef BU_ENABLE_SECONDARY
+   	// Do the secondary-related tests here, copying firmware to IMAGE_A or
+   	// IMAGE_B (and verifying as we go) before continuing.
+      else if (_bu_firmfile.info.flags & _FIRMINFO_FLAG_CAN_BE_SECONDARY == 0)
+      {
+	      #ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%s: can't install non-relocatable firmware as secondary\n",
+	            __FUNCTION__);
+	      #endif
+         error = -EPERM;
+      }
+      else if (_bu_firmfile.info.flags & _FIRMINFO_FLAG_WRAPPED_BIN)
+      {
+	      #ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%s: can't install wrapped firmware as secondary\n",
+	            __FUNCTION__);
+	      #endif
+         error = -EPERM;
+      }
+      else if (_bu_firmfile.source != _BU_FIRMSRC_IMAGE_A &&
+         		_bu_firmfile.source != _BU_FIRMSRC_IMAGE_B)
+      {
+	      // If BU_ENABLE_SECONDARY enabled and source is not IMAGE_A or IMAGE_B,
+	      // we should copy it to the secondary location here, open the secondary
+	      // image and recursively call back into buInstallFirmware.
+         #ifdef BOARD_UPDATE_VERBOSE
+            printf( "%s: copying firmware to secondary location\n",
+               __FUNCTION__);
+         #endif
+         // rewind to start of firmware, in case user just completed a verify
+         do {
+         	error = buRewindFirmware();
+         } while (error == -EBUSY);
+         bu_errmsg( error, "buRewindFirmware");
+
+         if (! error)
+         {
+	         do {
+	            error = buVerifyToSecondary( NULL, 1);
+	         } while (error == -EAGAIN);
+	         bu_errmsg( error, "buVerifyToSecondary");
+			}
+
+         if (! error)
+         {
+            // close the original source
+	         #ifdef BOARD_UPDATE_VERBOSE
+	            printf( "%s: closing original source\n", "buInstallFirmware");
+	         #endif
+            do {
+               error = buCloseFirmware();
+            } while (error == -EBUSY);
+            bu_errmsg( error, "buCloseFirmware");
+         }
+
+         if (! error)
+         {
+            // open copy of firmware at temp location to complete copy
+	         #ifdef BOARD_UPDATE_VERBOSE
+	            printf( "%s: opening from secondary location\n",
+	            	__FUNCTION__);
+	         #endif
+            error = buOpenFirmwareTemp( BU_FLAG_NONE);
+         }
+
+         if (! error)
+         {
+            // call again, this time with IMAGE_A or IMAGE_B as the source
+	         #ifdef BOARD_UPDATE_VERBOSE
+	            printf( "%s: installing from secondary location\n",
+	            	__FUNCTION__);
+	         #endif
+            return buInstallFirmware();
+         }
+      }
+   #endif
+
+   // verify firmware (if no errors up to this point)
+   else if (_bu_firmfile.flags & BU_FLAG_NOVERIFY)
+   {
+      #ifdef BOARD_UPDATE_VERBOSE
+         printf( "%s: skip verification -- live dangerously!\n",
+            __FUNCTION__);
+      #endif
+   }
+   else if ( _bu_firmfile.flags & BU_FLAG_VERIFIED)
+   {
+      #ifdef BOARD_UPDATE_VERBOSE
+         printf( "%s: already verified\n", __FUNCTION__);
+      #endif
+   }
+   else if ( (error = buVerifyFirmwareBlocking()) )
+   {
+      bu_errmsg( error, "buVerifyFirmwareBlocking");
+   }
+
+   // rewind firmware if not at a 0 offset
+	if ( !error && _bu_firmfile.firmware.offset )
+	{
+		if ( (error = buRewindFirmware()) )
+		{
+			bu_errmsg( error, "buRewindFirmware");
+		}
+	}
+
+	if (error)
+	{
+		// error during pre-flight check, close the firmware image and return
+		while (buCloseFirmware() == -EBUSY);
+		return error;
+	}
+
+   #ifdef BU_ENABLE_SECONDARY
+      // New firmware checks out OK, just need to update markers.
+      if (_bu_firmfile.source == _BU_FIRMSRC_IMAGE_A)
+      {
+         return _buInstallSecondary( BU_FLAG_IMAGE_A);
+      }
+      else if (_bu_firmfile.source == _BU_FIRMSRC_IMAGE_B)
+      {
+         return _buInstallSecondary( BU_FLAG_IMAGE_B);
+      }
+      else
+      {
+         // Earlier code block should have ensured that we're installing A or B.
+         return -EPERM;
+      }
+	#elif ! _RUN_FROM_RAM
+      // This will NOT return. We assume all error checking on
+      // the FW has been successfully done now. Once this starts overwriting
+      // the FW in parallel flash, it must finish or all bets are off.
+      // This is NOT power failure safe!
+		buMiniLoader( (unsigned)_bu_firmfile.src.sflash.startpage,
+																	_bu_firmfile.info.length);
+	#else
+		#if BU_TEMP_LOCATION == BU_TEMP_LOC_DIRECT
+	      if (_bu_firmfile.source == _BU_FIRMSRC_TMPBOOT)
+	      {
+	         // At this point, we're done.  The firmware is already where it
+	         // needs to be.
+	         #ifdef BOARD_UPDATE_VERBOSE
+	            printf( "%s: going live with temp firmware, exit SUCCESS\n",
+	               __FUNCTION__);
+	         #endif
+	         buCloseFirmware();
+	         return 0;
+	      }
+		#endif
+
+	   #ifdef BOARD_UPDATE_VERBOSE
+	      start = SEC_TIMER;
+	   #endif
+
+	   if (xavail( NULL) < _BU_INSTALL_BLOCKSIZE)
+	   {
+	      while (buCloseFirmware() == -EBUSY);
+	      return -ENOMEM;
+	   }
+	   allocbytes = _BU_INSTALL_BLOCKSIZE;
+ 	   buffer = (char __far *) _xalloc( &allocbytes, 0, XALLOC_MAYBBB);
+
+	   error = 0;
+	   wrote = 0;
+
+	   #if _SERIAL_BOOT_FLASH_ == 0
+	      // Erase enough of parallel boot flash to write new firmware.  No need
+	      // to erase pages on serial boot flash before writing new data.
+	      if ( (error = _bu_erase_pbf( _bu_firmfile.info.length)) )
+	      {
+	         bu_errmsg( error, "_bu_erase_pbf");
+	      }
+	   #endif
+
+	   #ifdef BOARD_UPDATE_VERBOSE
+	      printf( "%s: writing %ld bytes to boot flash, please wait...\n",
+	         __FUNCTION__, _bu_firmfile.info.length);
+	   #endif
+		while (!error &&
+		 		 (bytes = _bu_firmfile.info.length - _bu_firmfile.firmware.offset))
+		{
+	   	block = (bytes > _BU_INSTALL_BLOCKSIZE)
+	   											? _BU_INSTALL_BLOCKSIZE : (int) bytes;
+
+			// store current offset, as buReadFirmware will advance it
+			dest = _bu_firmfile.firmware.offset;
+	   	read = buReadFirmware (buffer, block);
+	      error = (read == block) ? 0 : (read < 0) ? read : -EIO;
+		   if (! error)
+	   	{
+		      bytes -= read;
+		      error = buWriteFirmwareBoot( dest, buffer, block);
+	   	   bu_errmsg( error, "buWriteFirmwareBoot");
+	      	wrote += read;
+		   }
+		}
+	   xrelease( (long) buffer, allocbytes);
+
+	   #if _SERIAL_BOOT_FLASH_ == 0
+	      overwrote = _bu_firmfile.info.length;
+	   #else
+	      overwrote = wrote;
+	   #endif
+
+	   if (error)
+	   {
+	      while (buCloseFirmware() == -EBUSY);
+	      if (overwrote)
+	      {
+	          // Boot flash is at least partially overwritten, restore boot
+	          // firmware from running firmware in fast SRAM.
+	          buRestoreFirmware( overwrote);
+	      }
+	      return error;
+	   }
+
+	   if (_bu_firmfile.file_crc32 != _bu_firmfile.firmware.calc_crc32)
+	   {
+	      #ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%s: crc-32 mismatch (file %08lx != calc %08lx)\n",
+	            __FUNCTION__,
+	            _bu_firmfile.file_crc32, _bu_firmfile.firmware.calc_crc32);
+	      #endif
+	      while (buCloseFirmware() == -EBUSY);
+	      buRestoreFirmware( overwrote);
+	      return -EBADMSG;
+	   }
+	   #ifdef BOARD_UPDATE_VERBOSE
+	      printf( "%s: done copying after %u seconds\n", __FUNCTION__,
+	         (word) (SEC_TIMER - start));
+	      printf( "%s: install complete, exit SUCCESS\n", __FUNCTION__);
+	   #endif
+
+	   while (buCloseFirmware() == -EBUSY);
+	   return 0;
+	#endif
+
+	// DEVNOTE: if reading an uncompressed, unencrypted image from RAM (source
+	// is _BU_FIRMSRC_RAM), this function could bypass
+	// buReadFirmware and just copy directly from RAM to boot flash
+
+	// If the firmware_info_t structure from the firmware to install matches
+	// the currently installed firmware, should we compare each block before
+	// writing, to save time?  Maybe we're just restoring a partially corrupted
+	// image, and only need to write out a small portion of the blocks.
+
+	// Note that a shortcut for copying unencrypted, uncompressed firmware stored
+	// directly on a serial flash device is to read from a sector to RAM on
+	// the serial flash, and then immediately write it to another sector without
+	// bothering to copy it to the Rabbit.  Only works if sectors are aligned.
+}
+
+/*** BeginHeader buRestoreFirmware */
+int buRestoreFirmware (long bytestoerase);
+/*** EndHeader */
+#if defined(BU_CANNOT_UPDATE_FW) || ! _RUN_FROM_RAM
+	#fatal "buRestoreFirmware is not compatible with this hardware."
+#endif
+#ifdef BU_ENABLE_SECONDARY
+	#fatal "buRestoreFirmware not supported when BU_ENABLE_SECONDARY enabled."
+#endif
+/* START FUNCTION DESCRIPTION ********************************************
+buRestoreFirmware		                 							<board_update.lib>
+
+SYNTAX: int buRestoreFirmware (long bytestoerase)
+
+DESCRIPTION:	Copy the running firmware image back to the boot flash.
+					This is typically only done when a firmware update fails for
+					some reason, and it's necessary to get back to a bootable state.
+
+PARAMETER 1:	Bytes of boot flash device to erase before copying.  Pass 0 to
+					use the running firmware image's length.
+
+RETURN VALUE:	0: Successfully copied running firmware back to boot flash.
+					-EIO: I/O error trying to read running firmware.
+					-ENOMEM: Unable to allocate buffer for copying data.
+
+SEE ALSO:		buOpenFirmwareRunning, buOpenFirmwareRAM, buOpenFirmwareBoot,
+					buOpenFirmwareFAT, buOpenFirmwareSFlash, buOpenFirmwareTemp,
+					buReadFirmware, buVerifyFirmware, buVerifyFirmwareBlocking,
+					buRewindFirmware, buCloseFirmware, buRestoreFirmware
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int buRestoreFirmware (long bytestoerase)
+{
+	auto long bytes, offset;
+	auto long allocbytes;
+	auto int block, read;
+	auto int error;
+	auto char __far *buffer;
+
+	// special verion of buInstallFirmware for fast restore of RunningFirmware
+	// to boot flash device
+
+	if (bytestoerase <= 0 || bytestoerase > _firmware_info.length)
+	{
+		bytestoerase = _firmware_info.length;
+	}
+
+	if (_firmware_info.flags & _FIRMINFO_FLAG_RAM_COMPILE)
+	{
+		#ifdef BOARD_UPDATE_VERBOSE
+			printf( "%s: Can't restore, image compiled to RAM and not flash.\n",
+				__FUNCTION__);
+		#endif
+		return -EIO;
+	}
+
+	#if _SERIAL_BOOT_FLASH_ == 0
+		// erase enough of boot flash to write new firmware
+		if ( (error = _bu_erase_pbf( bytestoerase)) )
+		{
+	      bu_errmsg( error, "_bu_erase_pbf");
+	      return error;
+		}
+	#endif
+
+	error = buOpenFirmwareRunning(BU_FLAG_NONE);
+	if (error)
+	{
+      bu_errmsg( error, "buOpenFirmwareRunning");
+      return error;
+	}
+
+	if (xavail( NULL) < _BU_INSTALL_BLOCKSIZE)
+	{
+		return -ENOMEM;
+	}
+	allocbytes = _BU_INSTALL_BLOCKSIZE;
+	buffer = (char __far *) _xalloc( &allocbytes, 0, XALLOC_MAYBBB);
+
+	offset = 0;
+	bytes = _firmware_info.length;
+	while (bytes)
+	{
+      block = (bytes > _BU_INSTALL_BLOCKSIZE)
+                                    ? _BU_INSTALL_BLOCKSIZE : (int) bytes;
+      read = _buReadFirmware_running (buffer, block);
+      error = (read == block) ? 0 : (read < 0) ? read : -EIO;
+      bu_errmsg( error, "_buReadFirmware_running");
+      if (!error)
+      {
+         error = buWriteFirmwareBoot (offset, buffer, block);
+         bu_errmsg( error, "buWriteFirmwareBoot");
+      }
+      if (error)
+      {
+      	break;
+      }
+		offset += block;
+		bytes -= block;
+	}
+
+	xrelease( (long) buffer, allocbytes);
+	return error;
+}
+
+/*** BeginHeader buWriteFirmwareBoot */
+int buWriteFirmwareBoot (long offset, const byte __far *buffer, long bytes);
+/*** EndHeader */
+#if defined(BU_CANNOT_UPDATE_FW) || ! _RUN_FROM_RAM
+	#fatal "buWriteFirmwareBoot is not compatible with this hardware."
+#endif
+#ifdef BU_ENABLE_SECONDARY
+	#fatal "buWriteFirmwareBoot not supported when BU_ENABLE_SECONDARY enabled."
+#endif
+/* START _FUNCTION DESCRIPTION ********************************************
+buWriteFirmwareBoot		                 						<board_update.lib>
+
+SYNTAX: int buWriteFirmwareBoot (long offset, const byte far *buffer,
+																						long bytes)
+
+DESCRIPTION:	Write directly to the boot flash device.
+
+PARAMETER 1:	Offset to write to.
+
+PARAMETER 2:	Source buffer.
+
+PARAMETER 3:	Bytes to write.
+
+RETURN VALUE:	0: Successfully copied buffer to boot flash.
+					-EINVAL: Tried to write to an invalid portion of boot flash
+								(either the reserved user block area, or beyond the
+								largest program size).
+
+SEE ALSO:		buOpenFirmwareRunning, buOpenFirmwareRAM, buOpenFirmwareBoot,
+					buOpenFirmwareFAT, buOpenFirmwareSFlash, buOpenFirmwareTemp,
+					buReadFirmware, buVerifyFirmware, buVerifyFirmwareBlocking,
+					buRewindFirmware, buCloseFirmware, buRestoreFirmware
+
+NOTE: On boards with a parallel boot flash, this function assumes that all
+	necessary sectors have already been erased.
+
+END DESCRIPTION **********************************************************/
+// This function must be declared with "useix" since the PUSH IP in
+// _BU_PBF_LOWER() breaks all stack references (C or assembly) using SP.
+_bu_debug _bu_useix
+int buWriteFirmwareBoot (long offset, const byte __far *buffer, long bytes)
+{
+	auto int error;
+	auto word block;
+#if !_SERIAL_BOOT_FLASH_
+	auto unsigned long pbf;
+#endif
+
+	if (offset < 0 || bytes < 0 || (offset + bytes > MAX_FIRMWARE_BINSIZE) )
+	{
+		return -EINVAL;
+	}
+
+	// write to serial or parallel flash, depending on device
+   while (bytes)
+   {
+   	// write up to 32KB at a time
+   	block = (bytes > 0x8000) ? 0x8000 : (word) bytes;
+	   #if _SERIAL_BOOT_FLASH_ == 0
+	      // _ProgramFlashBlock only returns non-zero when using 16-bit memory
+	      // and source address and number of bytes to copy are not even numbers.
+			if (offset < 512ul * 1024)
+			{
+				// make sure block won't exceed number of bytes left on lower flash
+				pbf = 512ul * 1024 - offset;
+				if (block > pbf)
+				{
+					block = (word) pbf;
+				}
+
+	         // V30363: Make sure watchdog timer doesn't expire while interrupts
+	         // are disabled during write.
+	         hitwd();
+
+				_BU_PBF_LOWER();		// map in lower 512KB of parallel flash
+	         error = _ProgramFlashBlock( 0x180000 + offset, buffer, block);
+				_BU_PBF_UPPER();		// map in upper 512KB of parallel flash
+			}
+			else
+			{
+				#if _FLASH_SIZE_ > 512/4
+	            // copying to upper 512KB of flash
+	            // note that offset >= 0x080000 here, hence the use of a starting
+	            // address of 0x100000 instead of 0x180000.
+	            error = _ProgramFlashBlock( 0x100000 + offset, buffer, block);
+				#else
+					// 512KB boot flash, user trying to write past 512KB boundary
+					return -EINVAL;
+				#endif
+			}
+
+         if (error)
+         {
+            return -EINVAL;
+         }
+	   #else
+	   	// sbf_far_Write returns -ETIME if it can't get the semaphoer
+	      do {
+	         error = sbf_far_Write (offset, buffer, block);
+	      } while (error > 0);
+	      if (error)
+	      {
+				return error;
+	      }
+	   #endif
+      offset += block;
+      buffer += block;
+      bytes -= block;
+   }
+   return 0;
+}
+
+/*** BeginHeader buDownloadInit, buDownloadTick */
+
+/* START FUNCTION DESCRIPTION ********************************************
+bu_download_t															<board_update.lib>
+
+	Structure used to store state information for buDownloadTick.  Initialized
+	by buDownloadInit.  Useful elements the caller of buDownloadTick can use:
+
+	unsigned long filesize		Set to 0 if size isn't known, or the size of the
+										file being downloaded.
+
+	unsigned long bytesread		Number of bytes read so far.
+
+SEE ALSO:		buDownloadInit, buDownloadTick
+
+END DESCRIPTION **********************************************************/
+enum {
+	BU_DL_IDLE = 0,
+	BU_DL_OPEN_FTP,
+	BU_DL_OPEN_HTTP,
+	BU_DL_FTP,
+	BU_DL_HTTP,
+	BU_DL_CLOSE
+};
+
+typedef struct {
+	// private elements that may change in future versions
+	int				state;
+	int				retval;			// return value after close is complete
+#ifdef __HTTPC_LIB
+	httpc_Socket	hsock;
+#endif
+
+	// public elements that should not change
+	unsigned long	filesize;		// size of file, or 0 if unknown
+	unsigned long	bytesread;		// bytes of the file read and saved to temp
+} bu_download_t;
+
+#ifdef NET_H
+int buDownloadInit (bu_download_t *bu_dl, tcp_Socket *sock, const char *url);
+int buDownloadTick (bu_download_t *bu_dl);
+#endif
+/*** EndHeader */
+#ifdef BU_CANNOT_UPDATE_FW
+	#fatal "buDownloadInit/buDownloadTick are not compatible with this hardware."
+#endif
+#ifndef NET_H
+	#error "You must #use \"dcrtcp.lib\" before #use \"board_update.lib\" in"
+	#fatal "order to use the buDownloadInit/buDownloadTick API."
+#endif
+
+_bu_debug
+void _bu_dl_cleanup( bu_download_t *bu_dl, int error)
+{
+#ifdef __HTTPC_LIB
+   if (bu_dl->hsock.state != HTTPC_STATE_CLOSED)
+   {
+      httpc_close (&bu_dl->hsock);
+   }
+#endif
+
+	bu_dl->retval = error;
+	bu_dl->state = BU_DL_CLOSE;
+}
+
+#ifdef FTP_CLIENT_H
+// Datahandler registerd with ftp_client.lib to receive file and store
+// in temp location.
+_bu_debug
+int _bu_dl_ftpdh (const char * data, int readlen, longword readoffset,
+                   int flags, bu_download_t *bu_dl)
+{
+	auto int writebytes;
+	auto int offset;
+	auto int error;
+
+	switch (flags)
+	{
+		case FTPDH_IN:
+			if (! bu_dl )
+			{
+				#ifdef BOARD_UPDATE_VERBOSE
+	            printf( "%s: error bu_dl not set\n", __FUNCTION__);
+				#endif
+				return -1;
+			}
+
+         // write it out
+         writebytes = readlen;
+         offset = 0;
+         error = 0;
+         while (!error && (writebytes > 0))
+         {
+         	error = buTempWrite( &data[offset], writebytes);
+         	if (error == -EBUSY)
+         	{
+         		// try again, since FTP data handlers can't return BUSY
+					error = 0;
+         	}
+            else if (error < 0)
+            {
+            	bu_errmsg( error, "buTempWrite");
+               return -1;
+            }
+            else if (error > 0)
+            {
+            	// error is # of bytes written
+               writebytes -= error;
+               offset += error;
+               error = 0;
+            }
+         }
+			bu_dl->filesize = ftp.filesize;
+			return readlen;
+
+		case FTPDH_OUT:
+			#ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%s: ERROR!  Should only get data in\n", __FUNCTION__);
+			#endif
+			break;
+
+		case FTPDH_END:
+			#ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%s: END OK\n", __FUNCTION__);
+			#endif
+			return 0;
+
+		case FTPDH_ABORT:
+			#ifdef BOARD_UPDATE_VERBOSE
+	         printf( "%s: ABORTED\n", __FUNCTION__);
+			#endif
+			return 0;
+	}
+	return -1;
+}
+
+_bu_debug
+int _buDownloadInit_ftp( bu_download_t *bu_dl, const char *url)
+{
+	auto int error;
+
+	error = ftp_client_setup_url( url, FTP_MODE_DOWNLOAD | FTP_MODE_PASSIVE,
+		NULL, 0);
+   bu_errmsg( error, "ftp_client_setup_url");
+
+	if (!error)
+	{
+		// register data handler, and pass bu_dl to it
+		ftp_data_handler (_bu_dl_ftpdh, bu_dl, 0);
+		bu_dl->state = BU_DL_OPEN_FTP;
+	}
+
+	return error;
+}
+#endif		// FTP_CLIENT_H defined
+
+#ifdef __HTTPC_LIB
+_bu_debug
+int _buDownloadInit_http (bu_download_t *bu_dl, tcp_Socket *sock,
+	const char *url)
+{
+	auto int error;
+
+	#ifdef BOARD_UPDATE_VERBOSE
+	   printf( "%s: connecting to web server\n", __FUNCTION__);
+	#endif
+   error = httpc_init (&bu_dl->hsock, sock);
+   bu_errmsg( error, "httpc_init");
+   if (!error)
+   {
+      error = httpc_get_url (&bu_dl->hsock, url);
+		bu_errmsg( error, "httpc_get_url");
+   }
+   if (!error)
+   {
+      error = httpc_skip_headers (&bu_dl->hsock);
+      if (error > 0)
+      {
+         // Not an error, return value is number of bytes in headers.
+         // But, if response wasn't 200 (HTTP status code for OK),
+         // consider it an error response (maybe not found, or password
+         // required, etc.)
+         error = (bu_dl->hsock.response == 200) ? 0 : -EIO;
+      }
+      else
+      {
+      	bu_errmsg( error, "httpc_skip_headers");
+      }
+   }
+	if (!error)
+	{
+		bu_dl->filesize = bu_dl->hsock.filesize;
+		bu_dl->state = BU_DL_OPEN_HTTP;
+	}
+
+	return error;
+}
+#endif
+
+/* START FUNCTION DESCRIPTION ********************************************
+buDownloadInit															<board_update.lib>
+
+SYNTAX:			int buDownloadInit (bu_download_t *bu_dl, tcp_Socket *sock,
+												const char *url)
+
+DESCRIPTION: 	Initiate FTP or HTTP (web) connection and initialize status
+					structure to pass to buDownloadTick, in order to download a file
+					from a server and save it to the temporary location used by
+					buOpenFirmwareTemp.
+
+PARAMETER 1:   Pointer to status structure.
+
+PARAMETER 2:	Pointer to TCP socket to use for making HTTP connections.  For
+					FTP connections, the ftp_client.lib library uses its own sockets
+					and this parameter is ignored (and can be set to NULL).
+
+PARAMETER 3:   URL of file to download, in one of the following formats
+					(items in [] are optional):
+						http://[user:pass@]hostname[:port]/filename
+						ftp://[user:pass@]hostname[:port]/filename
+						www.hostname[:port]/filename (assumes http://)
+						ftp.hostname[:port]/filename (assumes ftp://)
+
+					HTTP defaults to port 80 and no credentials (username/password).
+					FTP defaults to port 21 and anonymous FTP.
+
+RETURN VALUE:  Integer code as follows:
+						 0: Success, connection established.  Can pass <bu_dl> to
+						 		buDownloadTick to continue download.
+					   -EINVAL: Error parsing <url> or <localfile>.
+					   -EBUSY: Timeout opening connection, call buDownloadTick
+					   			to continue.
+					   -NETERR_DNSERROR: Unable to resolve hostname from <url>.
+					   -NETERR_INACTIVE_TIMEOUT: timed out due to inactivity
+					   -NETERR_HOST_REFUSED: Unable to connect to FTP server.
+
+SEE ALSO:		buDownloadTick, buOpenFirmwareTemp
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int buDownloadInit (bu_download_t *bu_dl, tcp_Socket *sock, const char *url)
+{
+	auto int error;				// return code
+
+	if (!bu_dl)
+	{
+		return -EINVAL;
+	}
+
+	memset (bu_dl, 0, sizeof(*bu_dl));
+
+   #ifdef BOARD_UPDATE_VERBOSE
+      printf( "%s: downloading %s\n", __FUNCTION__, url);
+   #endif
+
+   #ifdef __HTTPC_LIB
+      bu_dl->hsock.state = HTTPC_STATE_CLOSED;
+      if (! strncmp( url, "http://", 7) || !strncmp( url, "www.", 4))
+      {
+         error = _buDownloadInit_http( bu_dl, sock, url);
+      }
+      else
+   #endif
+   #ifdef FTP_CLIENT_H
+      if (! strncmp( url, "ftp://", 6) || !strncmp( url, "ftp.", 4))
+      {
+         error = _buDownloadInit_ftp( bu_dl, url);
+      }
+      else
+   #endif
+      {
+         error = -EINVAL;
+      }
+
+	if (error)
+	{
+		return error;
+	}
+
+   #ifdef BOARD_UPDATE_VERBOSE
+      // open the file and pre-request the number of bytes needed
+      if ( bu_dl->filesize )
+      {
+         printf( "%s: Preparing to download %lu bytes...\n",
+            __FUNCTION__, bu_dl->filesize);
+      }
+      else
+      {
+         printf( "%s: Downloading file of unknown size...\n",
+            __FUNCTION__);
+      }
+   #endif
+
+	return 0;
+}
+
+/* START FUNCTION DESCRIPTION ********************************************
+buDownloadTick															<board_update.lib>
+
+SYNTAX:			int buDownloadTick (bu_download_t *bu_dl);
+
+DESCRIPTION: 	Read more data from HTTP or FTP server, and write it out to
+					the temporary location (see buTempCreate for details).
+
+PARAMETER 1:   Pointer to status structure, set up by buDownloadInit.
+
+RETURN VALUE:  Integer code as follows:
+						 0: Success, file download complete.
+						-ENODATA: Server sent a 0-byte file.
+					   -EBUSY: Download in progress.
+					   -EINVAL: Invalid structure passed as parameter 1.
+						Any other negative value: I/O error when updating the
+							directory entry.
+
+						Errors for HTTP connections:
+					   -ENOTCONN: Connection closed, can't read from socket.
+
+					   Errors for FTP connections:
+	               FTPC_ERROR: General error, call ftp_last_code() for details.
+	               FTPC_NOHOST: Couldn't connect to server.
+	               FTPC_NOBUF: No buffer or data handler.
+	               FTPC_TIMEOUT: Timed out on close: data may or may not be OK.
+	               FTPC_DHERROR: Data handler error in FTPDH_END operation.
+	               FTPC_CANCELLED: FTP control socket was aborted (reset)
+	                 by the server.
+
+NOTES:			You can monitor download progress via the bu_dl->filesize and
+					bu_dl->bytesread (both unsigned long).
+
+SEE ALSO:		buDownloadInit, buOpenFirmwareTemp
+
+END DESCRIPTION **********************************************************/
+_bu_debug
+int buDownloadTick (bu_download_t *bu_dl)
+{
+	auto int 	error;
+	auto int		writebytes;
+	auto int		offset;
+   auto byte   buffer[1024];   // copy 1024-byte chunks
+
+	if (!bu_dl)
+	{
+		return -EINVAL;
+	}
+
+	error = 0;
+	switch (bu_dl->state)
+	{
+		case BU_DL_IDLE:
+			// error condition, state shouldn't be idle (user didn't call Init?)
+			return -EINVAL;
+
+		case BU_DL_OPEN_FTP:
+		case BU_DL_OPEN_HTTP:
+	      if ( (error = buTempCreate()) )
+	      {
+	         bu_errmsg( error, "buTempCreate");
+	         if (error != -EBUSY)
+	         {
+	         	_bu_dl_cleanup( bu_dl, error);
+					bu_dl->state = BU_DL_IDLE;
+	         }
+	      }
+			else
+			{
+				// successful open, can move on to next state
+				bu_dl->state = (bu_dl->state == BU_DL_OPEN_FTP)
+																		? BU_DL_FTP : BU_DL_HTTP;
+				return -EBUSY;
+			}
+         return error;
+
+		case BU_DL_CLOSE:
+			error = buTempClose();
+			if (error == -EBUSY)
+			{
+				return -EBUSY;
+			}
+			else
+			{
+				// Download is finally complete, and we can return the stored
+				// return value.
+				bu_dl->state = BU_DL_IDLE;
+
+				// If there was an error that triggered the close, return that
+				// error.  Otherwise, return the result of buTempClose.
+				return bu_dl->retval ? bu_dl->retval : error;
+			}
+
+#ifdef __HTTPC_LIB
+		case BU_DL_HTTP:
+	      // read from socket, write to temp
+	      if (bu_dl->hsock.state == HTTPC_STATE_BODY)
+	      {
+	         error = httpc_read_body( &bu_dl->hsock, buffer, sizeof(buffer));
+	         if (error < 0)
+	         {
+	         	bu_errmsg( error, "httpc_read_body");
+	         }
+	         else if (error > 0)
+	         {
+	            // error holds # of bytes read
+	            writebytes = error;
+	            bu_dl->bytesread += writebytes;
+	            error = 0;
+	            // write it out
+	            offset = 0;
+	            while (!error && (writebytes > 0))
+	            {
+						error = buTempWrite( &buffer[offset], writebytes);
+	               if (error > 0)
+	               {
+	                  // error holds # of bytes written
+	                  writebytes -= error;
+	                  offset += error;
+	                  error = 0;
+	               }
+	               else if (error == -EBUSY)
+	               {
+	               	// ignore BUSY errors and finish writing bytes out
+							error = 0;
+	               }
+	               else
+	               {
+	                  bu_errmsg( error, "buTempWrite");
+	               }
+	            }
+	         }
+	      }
+
+	      if (!error)
+	      {
+	         if (bu_dl->hsock.state == HTTPC_STATE_BODY)
+	         {
+	            // file is incomplete
+	            return -EBUSY;
+	         }
+
+	         // if here, we've completely read the file and can wrap up
+				// return -ENODATA for 0-byte download, otherwise return 0 (success)
+				error = bu_dl->bytesread ? 0 : -ENODATA;
+	      }
+			break;
+#endif	// __HTTPC_LIB defined
+
+#ifdef FTP_CLIENT_H
+		case BU_DL_FTP:
+	      error = ftp_client_tick();
+	      bu_dl->bytesread = ftp_client_xfer();
+
+	      if (error == FTPC_AGAIN)
+	      {
+	         // download still in progress
+	         return -EBUSY;
+	      }
+
+	      // download complete, remove data handler
+	      ftp_data_handler (NULL, NULL, 0);
+
+	      if (error == FTPC_OK)
+	      {
+	      	// Note that current (Nov 2009) ftp_client_tick() will return
+	      	// FTPC_ERROR for a 0-byte file and we'll error out instead of
+	      	// executing this code.  If that changes at some point, we'll
+	      	// need the ternary below that returns -ENODATA for 0-byte file.
+
+				// return -ENODATA for 0-byte download, otherwise return 0 (success)
+				error = bu_dl->bytesread ? 0 : -ENODATA;
+	      }
+			#ifdef BOARD_UPDATE_VERBOSE
+	         else
+	         {
+	            printf( "%s: download failed, status=%d, last code=%d\n",
+	               __FUNCTION__, error, ftp_last_code());
+	         }
+			#endif
+
+			break;
+#endif		// FTP_CLIENT_H defined
+
+		default:
+			return -EINVAL;
+	}
+
+	// If we fall out of the case, it's because we're done with the download
+	// or need to return a hard error.  We need to close the open temp file
+	// so call _bu_dl_cleanup and return -EBUSY.  The cleanup function sets
+	// the state to BU_DL_CLOSE, where we call buTempClose until it returns
+	// something other than -EBUSY.  At that point, we send our return code.
+
+   #ifdef BOARD_UPDATE_VERBOSE
+	   if (!error)
+	   {
+         printf( "\n%s: downloaded %lu bytes\n", __FUNCTION__,
+            bu_dl->bytesread);
+	   }
+   #endif
+
+   _bu_dl_cleanup( bu_dl, error);
+   return -EBUSY;       // still need additional calls to close file
+}
+
+
+
+
+
+

@@ -1,0 +1,880 @@
+/*** Beginheader */
+#ifndef __SLAVE_PORT_LIB
+#define __SLAVE_PORT_LIB
+
+//interrupt priority level for slave port ISR
+#ifndef SLAVE_PORT_IP
+#define SLAVE_PORT_IP 1
+#endif
+
+//slave port driver modes
+#define SP_POLLING 0
+#define SP_INTERRUPT 1
+#define SP_FASTINTERRUPT 2
+
+//for serial port handlers
+#define SP_7BITS 0x04
+#define SP_FLOWCONTROL 0x08
+
+
+/*** EndHeader */
+
+/* START LIBRARY DESCRIPTION ******************************************
+SLAVE_PORT.LIB
+
+OVERVIEW
+	Base driver for slave port
+
+
+END DESCRIPTION **********************************/
+
+
+/*** Beginheader SPinit */
+int SPinit(int mode);
+void slave_init();
+void slave_isr();
+extern int sp_mode;
+extern int (*sp_handler_table[])(); //array of handler functions
+extern void *sp_param_table[];
+
+char slave_test_char;
+void slave_isr_init();
+
+/*** endheader */
+
+int sp_mode;
+int (*sp_handler_table[256])();
+void *sp_param_table[256];
+
+/* START FUNCTION DESCRIPTION ********************************************
+SPinit                     <SLAVE_PORT.LIB>
+
+SYNTAX:	      int SPinit(int mode);
+
+DESCRIPTION:	Initializes the slave port and loads the ISR if necessary.
+					The slave port driver can either run by being polled
+					periodicaly, or it can be interrupt driven. With interrupts
+					there is the option of leaving inerrupts disabled while
+					executing handler functions, or reenabling interrupts
+					for the handler functions.
+
+PARAMETER1:    mode - 0 if polling mode will be used(see Sptick())
+							 1 for interrupt mode(interruptible handlers)
+							 2 for interrupt mode(non-interruptible handlers)
+
+RETURN VALUE:	1 returned for success
+               0 returned if initialization failed
+
+END DESCRIPTION **********************************************************/
+
+__nodebug int SPinit(int mode)
+{
+	int i;
+
+	slave_test_char = 0;
+
+	//setup the tables
+	for(i = 0; i < 256;i++)
+	{
+		sp_handler_table[i] = NULL;
+		sp_param_table[i] = NULL;
+	}
+	sp_mode = mode;
+	if(sp_mode > 0)
+	{
+		//setup interrupt
+		slave_isr_init();
+	}
+	else
+	{
+		//enable slave port without interupts
+		WrPortI(SPCR, NULL, 0x88);
+	}
+	return 1;
+}
+
+#asm __root
+
+;
+; interrupt routine to be copied into interrupt table
+;
+
+slave_isr_init::
+         ;setup interrupt vector
+         ld      a, 0xC3           						;JP command
+         ld      (INTVEC_BASE + SLAVE_OFS), a
+         ld      hl, slave_isr
+         ld      (INTVEC_BASE + SLAVE_OFS+1), hl	;ISR address
+         ;enable interrupt
+         ld      a, 0x88 + SLAVE_PORT_IP
+ioi ld   (SPCR), a
+         ret
+
+slave_isr::
+	 push	 af					; 7,
+	 push	 bc					; 7
+	 push	 de					; 7
+	 push	 hl					; 7
+    ld	 hl, lxpc
+    push	 hl
+	 push	 iy
+	 push	 ix
+
+ioi ld	 (SPSR), a			;clear interrupt
+
+	 ;check if address has handler
+ioi ld	 a, (SPD1R)
+	 bool	 hl
+	 ld	 L, a
+	 add	 hl, hl				;offset = index*2
+	 ld	 ix, sp_handler_table
+	 ld	 iy, sp_param_table
+	 ex	 de, hl				;now de holds offset
+	 add	 ix, de
+	 add	 iy, de
+	 ld	 hl, (ix)
+	 ld	 ix, hl				;put actual handler address into ix
+	 bool	 hl					;check handler address
+	 jr	 z, _spisr_no_handler
+
+	 ex	 af, af'			;save everything for C call
+	 push	 af
+	 exx
+	 push	 bc
+	 push	 de
+	 push	 hl
+
+	 ld	 a, (sp_mode)
+	 dec	 a
+	 jr	 nz, _spisr_setup_args		;interrupts not reenabled
+
+#ifdef MCOS
+	 ld	 hl, bios_intnesting
+	 inc	 (hl)
+#endif
+
+	 ipset 0				;handler can now be interrupted
+
+_spisr_setup_args:
+	 ld	 hl, (iy)	;get parameter
+	 push	 hl			;param pointer is last arg to handler
+	 bool	 hl
+ioi ld	 a, (SPD2R)
+	 ld	 L, a
+	 push	 hl
+ioi ld	 a, (SPD0R)
+	 ld	 L, a
+	 push	 hl			;data is first arg to handler
+
+	 ld	 de, _spisr_handler_return
+	 push	 de			;return address
+	 jp	 (ix)
+_spisr_handler_return:
+	 ld	 a, (sp_mode)
+	 dec	 a
+	 jr	 nz, _spisr_get_response	;skip the ip restore
+	 ipres 									;get interrupt priority back
+_spisr_get_response:
+	 add	 sp, 6		;unwind argument stack
+	 ld	 a, H
+ioi ld	 (SPD2R), a	;load up data register
+	 ld	 a, L
+ioi ld	 (SPD0R), a	;load up command response register
+
+	 ld	 a, (sp_mode)
+	 dec	 a
+	 jr	 nz, _spisr_cleanup	;no uCOS stuff
+
+#ifdef MCOS
+	 ld	 a, (OSRunning)
+	 or	 a
+	 jr	 z, _spisr_decnesting
+	 call	 OSIntExit
+_spisr_decnesting:
+	 ld	 a, (bios_intnesting)
+	 dec	 a
+	 jr	 z, _spisr_intexit
+_spisr_setnesting:
+	 ld	 (bios_intnesting), a
+	 jr	 _spisr_cleanup
+
+_spisr_intexit:
+	 ld	 a, (bios_swpend)
+	 or	 a
+	 jr	 z, _spisr_setnesting
+	 lcall bios_intexit
+#endif
+
+_spisr_cleanup:
+	 pop	 hl
+	 pop	 de
+	 pop	 bc
+	 exx
+	 pop	 af
+	 ex	 af, af'
+	 jr	 _spisr_done
+
+_spisr_no_handler:
+	 ld	 a, 0xff		;respond with error code
+ioi ld	 (SPD0R), a
+
+_spisr_done:
+	 pop	 ix
+	 pop	 iy
+    pop	 hl
+    ld	 lxpc, hl
+    pop   hl            ; 7, 	restore registers needed by isr
+    pop   de            ; 7
+    pop   bc            ; 7
+    pop   af            ; 7
+    ipres               ; 4
+    ret                 ; 13
+
+#endasm
+
+/*** Beginheader SPclose */
+__root void SPclose();
+/*** endheader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+SPclose                   <SLAVE_PORT.LIB>
+
+SYNTAX:		   void SPclose();
+
+DESCRIPTION:   Disables the slave port. Unloads the ISR if necessary
+
+END DESCRIPTION **********************************************************/
+
+#asm __root
+
+SPclose::
+    ld    a,0xc9        ; ret in first byte
+    ipset 1
+    ld    (INTVEC_BASE + SLAVE_OFS),a
+
+    ld    a,0x80        ; disable interrupts for port
+    ld    (SPCRShadow),a
+ioi ld    (SPCR),a
+    ipres
+    ret
+
+#endasm
+
+/*** BeginHeader SPsetHandler */
+int SPsetHandler(char address, int (*handler)(), void *param);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+SPsetHandler                  <SLAVE_PORT.LIB>
+
+SYNTAX:		   void SPsetHandler(char address, int (*handler(), void *param);
+
+DESCRIPTION:   assigns a handler function to a particular channel on the
+					slave port.
+
+PARAMETER1:		address - slave port channel address
+PARAMETER2:		handler - pointer to the handler function. The function must
+					be of the form: int handler(char command,
+														 char data_in,
+														 void *param)
+PARAMETER3:		param - a pointer to arbitrary data. This pointer will be
+					stored and passed to the handler function every time it is
+					called.
+
+RETURN VALUE: 1 if handler was added successfully
+				 0 if there was an error(not currently possible)
+END DESCRIPTION **********************************************************/
+
+__nodebug int SPsetHandler(char address, int (*handler)(), void *param)
+{
+	sp_handler_table[address] = handler;
+	sp_param_table[address] = param;
+	return 1;
+}
+
+/*** BeginHeader SPtick */
+void SPtick();
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+SPtick                  <SLAVE_PORT.LIB>
+
+SYNTAX:		   void SPtick();
+
+DESCRIPTION:   polls the state of the slave port and processes an incoming
+					command from the master if necessary. This function must
+					be called periodically if the slave port is being used in
+					polling mode.
+
+END DESCRIPTION **********************************************************/
+
+__nodebug void SPtick()
+{
+	char address, command, datain;
+	void *param;
+	int handler_return;
+
+	if(RdPortI(SPSR) & 0x80)
+	{
+		//got command
+		WrPortI(SPSR, NULL, 0); //clear it
+		address = RdPortI(SPD1R);
+		if(sp_handler_table[address] != NULL)
+		{
+			command = RdPortI(SPD0R);
+			datain = RdPortI(SPD2R);
+			param = sp_param_table[address];
+			handler_return =
+				(*(sp_handler_table[address]))(command, datain, param);
+			//set response (data in high byte, response in low byte)
+			WrPortI(SPD2R, NULL, (handler_return >> 8) & 0xff);
+			WrPortI(SPD0R, NULL, handler_return & 0xff);
+		}
+		else
+		{
+			//no handler for this address, respond with error
+			WrPortI(SPD0R, NULL, 0xff);
+		}
+	}
+}
+
+/*********
+Some sample handlers
+***********/
+
+/*** BeginHeader SPserAhandler */
+int SPserAhandler(char command, char datain, void *param);
+/*** EndHeader */
+
+unsigned int sp_sera_baudfactor;
+char sp_sera_flags;
+
+//locked high bytes of buffer state variables
+char sp_sera_wrfree_high;
+char sp_sera_rdfree_high;
+char sp_sera_wrused_high;
+char sp_sera_rdused_high;
+
+
+
+__nodebug int SPserAhandler(char command, char datain, void *param)
+{
+	int temp;
+	char response;
+	char return_data;
+
+	switch(command)
+	{
+		case 1:	response = serAputc(datain);
+					break;
+
+		case 2:	temp = serAgetc();
+					if(temp >= 0)
+					{
+						return_data = temp & 0xff;
+						response = 2;
+					}
+					else
+					{
+						response = 0;
+					}
+					break;
+
+		case 3:	response = serAputc(datain);
+					temp = serAgetc();
+					if(temp >= 0)
+					{
+						return_data = temp & 0xff;
+						response |= 2;
+					}
+					break;
+
+		case 4:	sp_sera_baudfactor &= 0xff00;
+					sp_sera_baudfactor |= datain;
+					response = 1;
+					break;
+
+		case 5:	sp_sera_baudfactor &= 0x00ff;
+					sp_sera_baudfactor |= datain << 8;
+					response = 1;
+					break;
+
+		case 6:	sp_sera_flags = datain;
+					response = 1;
+					break;
+
+		case 7:	response = serAopen(sp_sera_baudfactor * 300);
+					if(sp_sera_flags & SP_7BITS)
+					{
+						serAdatabits(PARAM_7BIT);
+					}
+					if(sp_sera_flags & SP_FLOWCONTROL)
+					{
+						serAflowcontrolOn();
+					}
+					serAparity(sp_sera_flags & 0x03);
+					break;
+
+		case 8:	serAclose();
+					response = 1;
+					break;
+
+		case 9:	return_data = serAgetError();
+					response = 1;
+					break;
+
+		case 10:	temp = serAwrFree();
+					//save high byte
+					sp_sera_wrfree_high = (temp >> 8) & 0xff;
+					return_data = temp & 0xff;
+					response = 1;
+					break;
+
+		case 11:	return_data = sp_sera_wrfree_high;
+					response = 1;
+					break;
+
+		case 12:	temp = serArdFree();
+					//save high byte
+					sp_sera_rdfree_high = (temp >> 8) & 0xff;
+					return_data = temp & 0xff;
+					response = 1;
+					break;
+
+		case 13:	return_data = sp_sera_rdfree_high;
+					response = 1;
+					break;
+
+		case 14:	temp = serAwrUsed();
+					//save high byte
+					sp_sera_wrused_high = (temp >> 8) & 0xff;
+					return_data = temp & 0xff;
+					response = 1;
+					break;
+
+		case 15:	return_data = sp_sera_wrused_high;
+					response = 1;
+					break;
+
+		case 16:	temp = serArdUsed();
+					//save high byte
+					sp_sera_rdused_high = (temp >> 8) & 0xff;
+					return_data = temp & 0xff;
+					response = 1;
+					break;
+
+		case 17:	return_data = sp_sera_rdused_high;
+					response = 1;
+					break;
+
+		default:	response = 0xfe;
+	}
+	return 256*return_data + response;
+}
+
+/*** BeginHeader SPserBhandler */
+int SPserBhandler(char command, char datain, void *param);
+/*** EndHeader */
+
+unsigned int sp_serb_baudfactor;
+char sp_serb_flags;
+
+//locked high bytes of buffer state variables
+char sp_serb_wrfree_high;
+char sp_serb_rdfree_high;
+char sp_serb_wrused_high;
+char sp_serb_rdused_high;
+
+__nodebug int SPserBhandler(char command, char datain, void *param)
+{
+	int temp;
+	char response;
+	char return_data;
+
+	switch(command)
+	{
+		case 1:	response = serBputc(datain);
+					break;
+
+		case 2:	temp = serBgetc();
+					if(temp >= 0)
+					{
+						return_data = temp & 0xff;
+						response = 2;
+					}
+					else
+					{
+						response = 0;
+					}
+					break;
+
+		case 3:	response = serBputc(datain);
+					temp = serBgetc();
+					if(temp >= 0)
+					{
+						return_data = temp & 0xff;
+						response |= 2;
+					}
+					break;
+
+		case 4:	sp_serb_baudfactor &= 0xff00;
+					sp_serb_baudfactor |= datain;
+					response = 1;
+					break;
+
+		case 5:	sp_serb_baudfactor &= 0x00ff;
+					sp_serb_baudfactor |= datain << 8;
+					response = 1;
+					break;
+
+		case 6:	sp_serb_flags = datain;
+					response = 1;
+					break;
+
+		case 7:	response = serBopen(sp_serb_baudfactor * 300);
+					if(sp_serb_flags & SP_7BITS)
+					{
+						serBdatabits(PARAM_7BIT);
+					}
+					if(sp_serb_flags & SP_FLOWCONTROL)
+					{
+						serBflowcontrolOn();
+					}
+					serBparity(sp_serb_flags & 0x03);
+					break;
+
+		case 8:	serBclose();
+					response = 1;
+					break;
+
+		case 9:	return_data = serBgetError();
+					response = 1;
+					break;
+
+		case 10:	temp = serBwrFree();
+					//save high byte
+					sp_serb_wrfree_high = (temp >> 8) & 0xff;
+					return_data = temp & 0xff;
+					response = 1;
+					break;
+
+		case 11:	return_data = sp_serb_wrfree_high;
+					response = 1;
+					break;
+
+		case 12:	temp = serBrdFree();
+					//save high byte
+					sp_serb_rdfree_high = (temp >> 8) & 0xff;
+					return_data = temp & 0xff;
+					response = 1;
+					break;
+
+		case 13:	return_data = sp_serb_rdfree_high;
+					response = 1;
+					break;
+
+		case 14:	temp = serBwrUsed();
+					//save high byte
+					sp_serb_wrused_high = (temp >> 8) & 0xff;
+					return_data = temp & 0xff;
+					response = 1;
+					break;
+
+		case 15:	return_data = sp_serb_wrused_high;
+					response = 1;
+					break;
+
+		case 16:	temp = serBrdUsed();
+					//save high byte
+					sp_serb_rdused_high = (temp >> 8) & 0xff;
+					return_data = temp & 0xff;
+					response = 1;
+					break;
+
+		case 17:	return_data = sp_serb_rdused_high;
+					response = 1;
+					break;
+
+		default:	response = 0xfe;
+	}
+	return 256*return_data + response;
+}
+
+/*** BeginHeader SPserChandler */
+int SPserChandler(char command, char datain, void *param);
+/*** EndHeader */
+
+unsigned int sp_serc_baudfactor;
+char sp_serc_flags;
+
+//locked high bytes of buffer state variables
+char sp_serc_wrfree_high;
+char sp_serc_rdfree_high;
+char sp_serc_wrused_high;
+char sp_serc_rdused_high;
+
+#define SP_7BITS 0x04
+#define SP_FLOWCONTROL 0x08
+
+__nodebug int SPserChandler(char command, char datain, void *param)
+{
+	int temp;
+	char response;
+	char return_data;
+
+	switch(command)
+	{
+		case 1:	response = serCputc(datain);
+					break;
+
+		case 2:	temp = serCgetc();
+					if(temp >= 0)
+					{
+						return_data = temp & 0xff;
+						response = 2;
+					}
+					else
+					{
+						response = 0;
+					}
+					break;
+
+		case 3:	response = serCputc(datain);
+					temp = serCgetc();
+					if(temp >= 0)
+					{
+						return_data = temp & 0xff;
+						response |= 2;
+					}
+					break;
+
+		case 4:	sp_serc_baudfactor &= 0xff00;
+					sp_serc_baudfactor |= datain;
+					response = 1;
+					break;
+
+		case 5:	sp_serc_baudfactor &= 0x00ff;
+					sp_serc_baudfactor |= datain << 8;
+					response = 1;
+					break;
+
+		case 6:	sp_serc_flags = datain;
+					response = 1;
+					break;
+
+		case 7:	response = serCopen(sp_serc_baudfactor * 300);
+					if(sp_serc_flags & SP_7BITS)
+					{
+						serCdatabits(PARAM_7BIT);
+					}
+					if(sp_serc_flags & SP_FLOWCONTROL)
+					{
+						serCflowcontrolOn();
+					}
+					serCparity(sp_serc_flags & 0x03);
+					break;
+
+		case 8:	serCclose();
+					response = 1;
+					break;
+
+		case 9:	return_data = serCgetError();
+					response = 1;
+					break;
+
+		case 10:	temp = serCwrFree();
+					//save high byte
+					sp_serc_wrfree_high = (temp >> 8) & 0xff;
+					return_data = temp & 0xff;
+					response = 1;
+					break;
+
+		case 11:	return_data = sp_serc_wrfree_high;
+					response = 1;
+					break;
+
+		case 12:	temp = serCrdFree();
+					//save high byte
+					sp_serc_rdfree_high = (temp >> 8) & 0xff;
+					return_data = temp & 0xff;
+					response = 1;
+					break;
+
+		case 13:	return_data = sp_serc_rdfree_high;
+					response = 1;
+					break;
+
+		case 14:	temp = serCwrUsed();
+					//save high byte
+					sp_serc_wrused_high = (temp >> 8) & 0xff;
+					return_data = temp & 0xff;
+					response = 1;
+					break;
+
+		case 15:	return_data = sp_serc_wrused_high;
+					response = 1;
+					break;
+
+		case 16:	temp = serCrdUsed();
+					//save high byte
+					sp_serc_rdused_high = (temp >> 8) & 0xff;
+					return_data = temp & 0xff;
+					response = 1;
+					break;
+
+		case 17:	return_data = sp_serc_rdused_high;
+					response = 1;
+					break;
+
+		default:	response = 0xfe;
+	}
+	return 256*return_data + response;
+}
+
+/*** BeginHeader SPserDhandler */
+int SPserDhandler(char command, char datain, void *param);
+/*** EndHeader */
+
+unsigned int sp_serd_baudfactor;
+char sp_serd_flags;
+
+//locked high bytes of buffer state variables
+char sp_serd_wrfree_high;
+char sp_serd_rdfree_high;
+char sp_serd_wrused_high;
+char sp_serd_rdused_high;
+
+__nodebug int SPserDhandler(char command, char datain, void *param)
+{
+	int temp;
+	char response;
+	char return_data;
+
+	switch(command)
+	{
+		case 1:	response = serDputc(datain);
+					break;
+
+		case 2:	temp = serDgetc();
+					if(temp >= 0)
+					{
+						return_data = temp & 0xff;
+						response = 2;
+					}
+					else
+					{
+						response = 0;
+					}
+					break;
+
+		case 3:	response = serDputc(datain);
+					temp = serDgetc();
+					if(temp >= 0)
+					{
+						return_data = temp & 0xff;
+						response |= 2;
+					}
+					break;
+
+		case 4:	sp_serd_baudfactor &= 0xff00;
+					sp_serd_baudfactor |= datain;
+					response = 1;
+					break;
+
+		case 5:	sp_serd_baudfactor &= 0x00ff;
+					sp_serd_baudfactor |= datain << 8;
+					response = 1;
+					break;
+
+		case 6:	sp_serd_flags = datain;
+					response = 1;
+					break;
+
+		case 7:	response = serDopen(sp_serd_baudfactor * 300);
+					if(sp_serd_flags & SP_7BITS)
+					{
+						serDdatabits(PARAM_7BIT);
+					}
+					if(sp_serd_flags & SP_FLOWCONTROL)
+					{
+						serDflowcontrolOn();
+					}
+					serDparity(sp_serd_flags & 0x03);
+					break;
+
+		case 8:	serDclose();
+					response = 1;
+					break;
+
+		case 9:	return_data = serDgetError();
+					response = 1;
+					break;
+
+		case 10:	temp = serDwrFree();
+					//save high byte
+					sp_serd_wrfree_high = (temp >> 8) & 0xff;
+					return_data = temp & 0xff;
+					response = 1;
+					break;
+
+		case 11:	return_data = sp_serd_wrfree_high;
+					response = 1;
+					break;
+
+		case 12:	temp = serDrdFree();
+					//save high byte
+					sp_serd_rdfree_high = (temp >> 8) & 0xff;
+					return_data = temp & 0xff;
+					response = 1;
+					break;
+
+		case 13:	return_data = sp_serd_rdfree_high;
+					response = 1;
+					break;
+
+		case 14:	temp = serDwrUsed();
+					//save high byte
+					sp_serd_wrused_high = (temp >> 8) & 0xff;
+					return_data = temp & 0xff;
+					response = 1;
+					break;
+
+		case 15:	return_data = sp_serd_wrused_high;
+					response = 1;
+					break;
+
+		case 16:	temp = serDrdUsed();
+					//save high byte
+					sp_serd_rdused_high = (temp >> 8) & 0xff;
+					return_data = temp & 0xff;
+					response = 1;
+					break;
+
+		case 17:	return_data = sp_serd_rdused_high;
+					response = 1;
+					break;
+
+		default:	response = 0xfe;
+	}
+	return 256*return_data + response;
+}
+
+
+/*** BeginHeader SPstatusHandler */
+int SPstatusHandler(char command, char datain, void *param);
+/*** EndHeader */
+
+__nodebug int SPstatusHandler(char command, char datain, void *param)
+{
+	char *status_ptr;
+
+	status_ptr = (char *)param;
+	return (*status_ptr)<<8 + 1;
+}
+
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+
+

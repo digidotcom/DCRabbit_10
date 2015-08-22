@@ -1,0 +1,1206 @@
+/*
+* Copyright (C) 2002-2007 by Tom Logic LLC, All Rights Reserved
+* Copyright © 2010 Digi International Inc., All Rights Reserved
+*
+* This software contains proprietary and confidential information of Digi
+* International Inc.  By accepting transfer of this copy, Recipient agrees
+* to retain this software in confidence, to prevent disclosure to others,
+* and to make no use of this software other than that for which it was
+* delivered.  This is a published copyrighted work of Digi International
+* Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+* prohibited.
+*
+* Restricted Rights Legend
+*
+* Use, duplication, or disclosure by the Government is subject to
+* restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+* Technical Data and Computer Software clause at DFARS 252.227-7031 or
+* subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+* Restricted Rights at 48 CFR 52.227-19, as applicable.
+*
+* Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+*/
+
+/*
+	dhcpd.lib - a simple DHCP server
+
+	Updated February 2007 to support multiple hosts and reduce root
+	memory usage by keeping dhcp packet on the stack and reusing the
+	inbound packet for the outbound response.
+
+	Requires BOOTP.LIB for typedefs and #defines.
+
+	#defines for dhcpd.lib:
+
+	dhcpd.lib uses a macro IPADDR for easier entry of dotted quads.  Use
+	function help (Ctrl+H) on IPADDR for more information.
+
+	If you want to set an unsigned long to the IP address 192.168.1.100,
+	you can just do "ip = IPADDR(192,168,1,100);" -- note the use of commas
+	instead of dots to separate the octets.
+
+	DHCPD_HOST_BITS (defaults to 4, providing a DHCP pool for up to 13 hosts):
+		Determines the maximum number of clients served by the DHCP server.
+		Must be between 2 (1 host) and 8 (253 hosts).  Number of hosts is
+		2 ^ DHCPD_HOST_BITS - 3.
+
+	DHCPD_NETWORK (defaults to IPADDR(192,168,1,0)):
+		Address space to use for server and clients.  DHCP server will change
+		the last DHCPD_HOST_BITS of DHCPD_NETWORK to create the broadcast
+		address, network address, server address and client addresses.
+
+	DHCPD_LEASE_SECONDS (defaults to 1 day (60UL*60*24)):
+		How long a DHCP client can use an address before it must be renewed.
+
+	DHCPD_BROADCAST:
+		Set by the library, based on DHCPD_NETWORK and DHCPD_HOST_BITS.  Can
+		be used to send packets to all hosts on the network.
+
+	DHCPD_ADDRESS:
+		Set by the library, based on DHCPD_NETWORK and DHCPD_HOST_BITS.  The
+		IP address of the DHCP server.
+
+	DHCPD_NETMASK:
+		Set by the library, based on DHCPD_HOST_BITS.  The subnet mask used
+		by the DHCP server.
+
+	DHCPD_MAX_HOST:
+		Set by the library, based on DHCPD_HOST_BITS.  The maximum number of
+		clients that can be on the network.
+
+	DHCPD_RABBIT_ONLY (defaults to not defined):
+		If defined, server will only reply to requests from Rabbit hardware
+		(MAC addresses starting with 00:90:c2).
+
+	An example of starting the DHCP server on IF_ETH0:
+
+		sock_init();
+
+		ifconfig(IF_ETH0,
+		         IFS_DHCP, 0,
+		         IFS_IPADDR, DHCPD_ADDRESS,
+		         IFS_NETMASK, DHCPD_NETMASK,
+		         IFS_UP,
+		         IFS_END);
+
+		printf("Starting the dhcp server (v%s)\n", DHCPD_VER_STR);
+		if (dhcpd_init(IF_ETH0))
+		{
+			printf("dhcpd_init failed\n");
+		}
+
+
+	Version History:
+
+	2010-09-15 1.04   Added support for IP request by host. Initial release with
+	                  Dynamic C.
+
+	2007-11-19 1.03   Added dhcpd_add_permanent() for permanently assigning
+	                  one of the DHCP server's IP address to a particular
+	                  MAC address.  Main program should set up permanent
+	                  addresses between calls to dhcpd_init() and the first
+	                  call to dhcpd_tick().
+
+	                  dhcpd_init() now returns non-zero if unable to open
+	                  its UDP socket.
+
+	                  Verify dhcpd_init() has run when dhcpd_tick() is called.
+
+	                  Removed unused root variable _dhcpd_pack_out.
+
+	                  Added define dhcpd_printf for verbose messages instead
+	                  of wrapping each printf in #ifdef DHCPD_VERBOSE/#endif.
+
+	2007-11-18        If user has NAT library as well, call nat_purge_masq_ip()
+	                  when a client releases an IP address.
+
+	2007-06-12 1.02   Added documentation, fixed define of DHCPD_LEASE_SECONDS.
+
+	2007-06-11 1.01	Added DHCPD_RABBIT_ONLY option to only respond to
+	                  Rabbit hardware (MAC 00:90:C2:xx:xx:xx).
+
+	                  Corrected bug related to sending two DNS server entries.
+	                  (previously sent incorrectly).
+
+
+	TODO:
+
+	Check library for compliance with RFC 2131.
+
+	Reply to DHCPINFORM messages.
+
+	Consider writing a function to do an ARP scan and pre-populate the table
+	with addresses already in use by hosts on the network.
+
+	Simple table for hostnames to assign to each IP (or possibly store hostname
+	provided by the device).  Maybe a user-defined callback with ip, MAC,
+	and client-provided hostname.  Callback could deny an IP address as well
+	for access control?
+
+ */
+
+/*** BeginHeader */
+#ifndef DHCPD_H
+#define DHCPD_H
+
+#ifndef BOOTP_H
+	#use "bootp.lib"
+#endif
+
+#define DHCPD_VER 0x0104
+#define DHCPD_VER_STR "1.04"
+
+#ifdef DHCPD_DEBUG
+	#define _dhcpd_nodebug __debug
+#else
+	#define _dhcpd_nodebug __nodebug
+#endif
+
+#ifdef DHCPD_VERBOSE
+	#define dhcpd_printf(x) printf x
+#else
+	#define dhcpd_printf(x)
+#endif
+
+/*** EndHeader */
+
+/*** BeginHeader dhcpd_init, dhcpd_tick, dhcpd_stop, dhcpd_send,
+                 dhcpd_mac_table, _dhcpd_init_done */
+int dhcpd_tick(void);
+int dhcpd_init(int iface);
+void dhcpd_stop(void);
+void dhcpd_send(DHCPPkt *pack_out, int broadcast);
+
+/*
+	Rabbit hosts at most (2**DHCPD_HOST_BITS)-3 DHCP clients, where
+	DHCPD_HOST_BITS must be in the range [2,8]. This permits hosting DHCP pools
+	of varying sizes, from just 1 DHCP client up to 253 DHCP clients, inclusive.
+	The -3 DHCP clients is due to reserved addresses as follows:
+	   network address A.B.C.0
+	   Rabbit's DHCP host address A.B.C.((2**n)-2)
+	   broadcast address A.B.C.((2**n)-1)
+*/
+#ifndef DHCPD_HOST_BITS
+	#define DHCPD_HOST_BITS 4	// e.g. n = 4 host bits ==> 2**4 - 3 = 13 clients
+#endif
+#if DHCPD_HOST_BITS < 2 || DHCPD_HOST_BITS > 8
+	#fatal "DHCPD_HOST_BITS must be in the range 2 through 8, inclusive."
+#endif
+
+#ifndef DHCPD_NETWORK
+	#define DHCPD_NETWORK IPADDR(192,168,1,0)
+#endif
+
+#define DHCPD_BROADCAST (DHCPD_NETWORK | ((1 << DHCPD_HOST_BITS) - 1))
+#define DHCPD_ADDRESS   (DHCPD_NETWORK | ((1 << DHCPD_HOST_BITS) - 2))
+
+#define DHCPD_NETMASK   (IPADDR(255,255,255,255) << DHCPD_HOST_BITS)
+#define DHCPD_MAX_HOST  ((1 << DHCPD_HOST_BITS) - 3)
+
+#ifndef DHCPD_LEASE_SECONDS
+	// default lease is 1 day
+	#define DHCPD_LEASE_SECONDS (60UL*60*24)
+#endif
+
+#define DHCPD_LEASE_PERMANENT 0xFFFFFFFFUL
+
+typedef struct {
+	eth_address   mac;
+	unsigned long lease_exp;
+} DHCPD_MAC_ENTRY;
+
+// The .0 (i.e. network) IP address MAC entry is allocated, but is reserved to
+//  ease the valid client IP address range test logic throughout this library.
+extern DHCPD_MAC_ENTRY __far dhcpd_mac_table[DHCPD_MAX_HOST + 1];
+extern int _dhcpd_init_done;
+
+#ifndef dhcpd_sock
+	// the User hasn't defined a custom dhcpd_sock macro for their own udp_Socket
+	extern udp_Socket dhcpd_sock;
+#endif
+
+/*** EndHeader */
+
+DHCPD_MAC_ENTRY __far dhcpd_mac_table[DHCPD_MAX_HOST + 1];
+int _dhcpd_init_done = 0;
+
+#ifndef dhcpd_sock
+	// the User hasn't defined a custom dhcpd_sock macro for their own udp_Socket
+	udp_Socket dhcpd_sock;
+#endif
+
+byte _dhcpd_iface;
+
+/* START FUNCTION DESCRIPTION ********************************************
+dhcpd_send                    <DHCPD.LIB>
+
+SYNTAX:
+   void dhcpd_send(DHCPPkt *pack_out, int broadcast);
+
+DESCRIPTION:
+   Sends a simple DHCP response packet out to the network.
+
+PARAMETER1:
+   pack_out - A pointer to the DHCP response packet.
+
+PARAMETER2:
+   broadcast - A boolean flag; nonzero to broadcast the DHCP response
+   packet on the simple DHCP server's subnet.
+
+RETURN VALUE:
+   None.
+
+SEE ALSO:
+   dhcpd_init, dhcpd_tick, dhcpd_stop
+END DESCRIPTION *********************************************************/
+
+_dhcpd_nodebug
+void dhcpd_send(DHCPPkt *pack_out, int broadcast)
+{
+	int len, rc;
+#ifdef DHCPD_VERBOSE
+	byte ipbuf[16];
+#endif
+
+	// note that we could send a smaller packet...
+	len = sizeof *pack_out;
+
+	/* rules for sending:
+	if giaddr, sends return message to BOOTPS port at giaddr
+	if DHCPNAK, broadcast to 0xFFFFFFFF
+	if ciaddr, unicast to client
+	if broadcast bit is set (in flags field) broadcast to 0xFFFFFFFF
+	else unicast using client's hw address and yiaddr address
+	*/
+	#define DHCPD_NAK (pack_out->bp_vend[6] == DHCP_TY_NAK)
+	udp_bypass_arp(&dhcpd_sock, NULL);	// Don't bypass ARP
+	dhcpd_sock.iface = _dhcpd_iface;		// reset interface on socket
+	if (pack_out->bp_giaddr)
+	{
+		rc = udp_sendto(&dhcpd_sock, pack_out, len, intel(pack_out->bp_giaddr),
+		                IPPORT_BOOTPS);
+		dhcpd_printf(("dhcpd: Relayed response via %s\n",
+		              inet_ntoa(ipbuf, intel(pack_out->bp_giaddr))));
+	}
+	else if (!DHCPD_NAK && pack_out->bp_ciaddr)
+	{
+		udp_bypass_arp(&dhcpd_sock, (eth_address *)pack_out->bp_chaddr);
+		dhcpd_sock.iface = _dhcpd_iface;		// reset interface on socket
+		rc = udp_sendto(&dhcpd_sock, pack_out, len, intel(pack_out->bp_ciaddr),
+		                IPPORT_BOOTPC);
+		dhcpd_printf(("dhcpd: Sent response to %s\n",
+		              inet_ntoa(ipbuf, intel(pack_out->bp_ciaddr))));
+	}
+	else if (DHCPD_NAK || broadcast)
+	{
+		rc = udp_sendto(&dhcpd_sock, pack_out, len, ~0UL, IPPORT_BOOTPC);
+		dhcpd_printf(("dhcpd: Broadcast response\n"));
+	}
+	else
+	{
+		udp_bypass_arp(&dhcpd_sock, (eth_address *)pack_out->bp_chaddr);
+		dhcpd_sock.iface = _dhcpd_iface;		// reset interface on socket
+		rc = udp_sendto(&dhcpd_sock, pack_out, len, intel(pack_out->bp_yiaddr),
+		                IPPORT_BOOTPC);
+		dhcpd_printf(("dhcpd: Sent response to %s\n",
+		              inet_ntoa(ipbuf, intel(pack_out->bp_yiaddr))));
+	}
+#ifdef DHCPD_VERBOSE
+	dump_bootp(pack_out);
+	if (rc != len)
+	{
+		printf("dhcpd: error on send -- incomplete packet (%d of %d bytes)\n",
+		       rc, len);
+	}
+#endif
+}
+
+/* START FUNCTION DESCRIPTION ********************************************
+dhcpd_tick                    <DHCPD.LIB>
+
+SYNTAX:
+   int dhcpd_tick(void);
+
+DESCRIPTION:
+   Similar in nature to the tcp_tick() function. When Rabbit's simple DHCP
+   server is used, dhcpd_tick() should be called regularly to drive DHCP
+   server functionality.
+
+RETURN VALUE:
+   Nonzero: The message type of the just-processed DHCP request packet.
+   0: DHCP request packet not processed (or none to process).
+
+SEE ALSO:
+   dhcpd_init, dhcpd_stop
+END DESCRIPTION *********************************************************/
+
+_dhcpd_nodebug
+int dhcpd_tick(void)
+{
+	int len, optlen;
+	longword remote_ip, reqip;
+	word remote_port;
+	byte msgtype;
+	byte *p;
+	byte ipbuf[18];
+	eth_address mac;
+
+	int empty, expired, host;
+	int i;
+	unsigned long hisip;
+
+	int ipmatch;
+	int broadcast;
+
+	DHCPPkt *pack_in;
+	DHCPPkt *pack_out;
+
+	DHCPPkt _dhcpd_pack;
+
+	// dhcpd_init() hasn't been called yet
+	if (!_dhcpd_init_done)
+	{
+		dhcpd_printf(("dhcpd: dhcpd_tick() called before dhcpd_init()\n"));
+		return 0;
+	}
+
+	pack_in = pack_out = &_dhcpd_pack;
+
+	len = udp_recvfrom(&dhcpd_sock, pack_in, sizeof *pack_in, &remote_ip,
+	                   &remote_port);
+
+	if (len < 0)
+	{
+		return 0;
+	}
+
+	dhcpd_printf(("dhcpd: received packet of %d bytes.\n", len));
+
+	optlen = len - (sizeof *pack_in - 312);
+	if (optlen < 0)
+	{
+		dhcpd_printf(("dhcpd: short request discarded\n"));
+		return 0;
+	}
+	reqip = intel(pack_in->bp_ciaddr);
+	memcpy(mac.eaddr, pack_in->bp_chaddr, sizeof mac.eaddr);
+
+#ifdef DHCPD_VERBOSE
+	dump_bootp(pack_in);
+	inet_ethtoa(ipbuf, (char *) &mac);
+#endif
+
+#ifdef DHCPD_RABBIT_ONLY
+	if (memcmp(mac.eaddr, "\x00\x90\xc2", 3))
+	{
+		dhcpd_printf(("dhcpd: packet from non-Rabbit ignored (%s)\n", ipbuf));
+		return 0;
+	}
+#endif
+
+	dhcpd_printf(("dhcpd: packet from %s\n", ipbuf));
+
+	empty = expired = host = 0;
+
+	// try to match the MAC address, or find an unused slot
+	for (i = 1; i <= DHCPD_MAX_HOST; ++i)
+	{
+		if (!memcmp(&dhcpd_mac_table[i].mac, &mac, sizeof (eth_address)))
+		{
+			host = i;
+			break;
+		}
+
+		if (_IsZero_eth_address(&dhcpd_mac_table[i].mac))
+		{
+			if (!empty)
+			{
+				empty = i;
+			}
+		}
+		else if (!expired && dhcpd_mac_table[i].lease_exp < SEC_TIMER)
+		{
+			expired = i;
+		}
+	}
+
+	msgtype = 0;
+	p = pack_in->bp_vend + 4;
+	while (*p != 255)
+	{
+		switch (*p)
+		{
+		case 0:
+			++p;
+			continue;
+
+		case DHCP_VN_TYPE:
+			msgtype = p[2];
+			break;
+
+		case DHCP_VN_REQIP:
+			reqip = intel(*(longword *) &p[2]);
+			break;
+		}
+		p += p[1]+2;
+	}
+
+	if (!host && !(DHCPD_NETWORK ^ reqip & DHCPD_NETMASK))
+	{
+		host = (int) (DHCPD_NETWORK ^ reqip);
+
+		if (0 < host && DHCPD_MAX_HOST >= host &&
+		    _IsZero_eth_address(&dhcpd_mac_table[host].mac))
+		{
+			_f_memcpy(&dhcpd_mac_table[host].mac, &mac, sizeof (eth_address));
+			// give host 15 seconds to obtain lease
+			dhcpd_mac_table[host].lease_exp = SEC_TIMER + 15;
+		}
+		else
+		{
+			host = 0;
+		}
+	}
+
+	// if we don't already have a matching record for this MAC, pick
+	// an empty (preferred) or expired slot for it
+	if (!host)
+	{
+		host = empty ? empty : expired;
+
+		if (!host)
+		{
+			dhcpd_printf(("dhcpd: host table full, ignoring request\n"));
+			return 0;
+		}
+
+		_f_memcpy(&dhcpd_mac_table[host].mac, &mac, sizeof (eth_address));
+		// give host 15 seconds to obtain lease
+		dhcpd_mac_table[host].lease_exp = SEC_TIMER + 15;
+	}
+
+	// at this point, `host` is the last bits of the IP for this MAC
+
+	hisip = DHCPD_NETWORK | host;
+	ipmatch = (reqip == hisip);
+	broadcast = (pack_in->bp_flags & DHCP_F_BROADCAST);
+
+	switch (msgtype)
+	{
+	case 0:
+		dhcpd_printf(("dhcpd: No message type in packet!\n"));
+		break;
+
+	case DHCP_TY_DSC:
+		dhcpd_printf(("dhcpd: Sending offer...\n"));
+		dhcpd_fillpkt(pack_out, intel(hisip));
+		pack_out->bp_vend[6] = DHCP_TY_OFR;
+		dhcpd_send(pack_out, broadcast);
+		break;
+
+	case DHCP_TY_REQ:
+		dhcpd_printf(("dhcpd: Client requests IP (%s)...\n",
+		              inet_ntoa(ipbuf, reqip)));
+		dhcpd_fillpkt(pack_out, intel(hisip));
+		if (ipmatch)
+		{
+			if (dhcpd_mac_table[host].lease_exp != DHCPD_LEASE_PERMANENT)
+			{
+				dhcpd_mac_table[host].lease_exp = SEC_TIMER + DHCPD_LEASE_SECONDS;
+			}
+			pack_out->bp_vend[6] = DHCP_TY_ACK;
+			dhcpd_printf(("dhcpd: Responding with ACK\n"));
+		}
+		else
+		{
+			pack_out->bp_vend[6] = DHCP_TY_NAK;
+			dhcpd_printf(("dhcpd: Responding with NAK\n"));
+		}
+		dhcpd_send(pack_out, broadcast);
+		break;
+
+	case DHCP_TY_DCL:
+		dhcpd_printf(("dhcpd: Client declines offer...\n"));
+		break;
+
+	case DHCP_TY_RLS:
+		dhcpd_printf(("dhcpd: DHCPRELEASE...\n"));
+		if (ipmatch)
+		{
+			if (dhcpd_mac_table[host].lease_exp != DHCPD_LEASE_PERMANENT)
+			{
+				dhcpd_mac_table[host].lease_exp = 0;
+			}
+#ifdef NAT_H
+ #if NAT_VER > 0x0203
+			// nat_purge_masq_ip() first appeared in v2.04 of NAT-FULL.LIB
+			dhcpd_printf(("dhcpd: delete masq entries for .%u...\n", host));
+			nat_purge_masq_ip(host);
+ #endif
+#endif
+		}
+		break;
+
+	case DHCP_TY_INF:
+		/* from RFC 2131:
+			The server responds to a DHCPINFORM message by sending a DHCPACK
+			message directly to the address given in the 'ciaddr' field of
+			the DHCPINFORM message. The server MUST NOT send a lease
+			expiration time to the client and SHOULD NOT fill in 'yiaddr'.
+			The server includes other parameters in the DHCPACK message as
+			defined in section 4.3.1.
+		*/
+
+		dhcpd_printf(("dhcpd: Ignoring DHCPINFORM...\n"));
+		break;
+
+	case DHCP_TY_OFR:
+	case DHCP_TY_ACK:
+	case DHCP_TY_NAK:
+		dhcpd_printf(("dhcpd: Received a server-to-client packet (%d)!\n",
+		              msgtype));
+		break;
+
+	default:
+		dhcpd_printf(("dhcpd: Unknown message type (%d)!\n", msgtype));
+	}
+
+	return msgtype;
+}
+
+/* START FUNCTION DESCRIPTION ********************************************
+dhcpd_init                    <DHCPD.LIB>
+
+SYNTAX:
+   int dhcpd_init(int iface);
+
+DESCRIPTION:
+   Initializes Rabbit's simple DHCP server on the specified network
+   interface. Can be called at any time by the application to reset the
+   socket and clear the existing table of leases.
+
+   The User may define a macro, dhcpd_sock, which is the name of a custom
+   udp_Socket type to be used for the simple DHCP server's UDP socket. If
+   a dhcpd_sock macro is not defined then storage (named dhcpd_sock) is
+   declared automatically.
+
+PARAMETER1:
+   iface - The network interface of the simple DHCP server, e.g. IF_ETH0
+   or IF_WIFI0.
+
+RETURN VALUE:
+   0: Success.
+   -1: Error, couldn't open the DHCP server's UDP socket.
+
+SEE ALSO:
+   dhcpd_tick, dhcpd_stop, dhcpd_send, dhcpd_getmac, dhcpd_fillpkt,
+   dhcpd_dump_leases, dhcpd_add_permanent, dhcpd_del_permanent
+END DESCRIPTION *********************************************************/
+
+_dhcpd_nodebug
+int dhcpd_init(int iface)
+{
+	_dhcpd_iface = iface;
+
+	// note that if socket is already open, udp_extopen will close it first
+	if (!udp_extopen(&dhcpd_sock, _dhcpd_iface, IPPORT_BOOTPS, ~0UL,
+	    IPPORT_BOOTPC, NULL, 0, 0))
+	{
+		dhcpd_printf(("dhcpd: init failed, couldn't open udp socket\n"));
+		_dhcpd_init_done = 0;	// mark init failed (in case of previous init)
+		return -1;
+	}
+
+	_f_memset(dhcpd_mac_table, 0, sizeof dhcpd_mac_table);
+	_dhcpd_init_done = 1;	// mark init completed
+
+	return 0;
+}
+
+/* START FUNCTION DESCRIPTION ********************************************
+dhcpd_stop                    <DHCPD.LIB>
+
+SYNTAX:
+   void dhcpd_stop(void);
+
+DESCRIPTION:
+   Stops Rabbit's simple DHCP server by closing its UDP socket.
+
+RETURN VALUE:
+   None.
+
+SEE ALSO:
+   dhcpd_init, dhcpd_tick
+END DESCRIPTION *********************************************************/
+
+_dhcpd_nodebug
+void dhcpd_stop(void)
+{
+	sock_close(&dhcpd_sock);
+}
+
+/*** BeginHeader dhcpd_getmac */
+int dhcpd_getmac(unsigned long ip, eth_address *mac);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+dhcpd_getmac                  <DHCPD.LIB>
+
+SYNTAX:
+   int dhcpd_getmac(unsigned long ip, eth_address *mac);
+
+DESCRIPTION:
+   Reports the MAC address of the DHCP client (host) with the specified IP
+   address.
+
+PARAMETER1:
+   ip - The IP address of a DHCP client (host) in Rabbit's simple DHCP
+   server subnet.
+
+PARAMETER2:
+   mac - A pointer to storage for the specified DHCP client's MAC address.
+
+RETURN VALUE:
+   0: Success (and the DHCP client's MAC address is copied to *mac).
+   -1: Specified IP is not in the simple DHCP server's subnet.
+   -2: Specified IP is invalid (either network, broadcast or DHCP server).
+
+SEE ALSO:
+   dhcpd_init, dhcpd_tick, dhcpd_stop
+END DESCRIPTION *********************************************************/
+
+_dhcpd_nodebug
+int dhcpd_getmac(unsigned long ip, eth_address *mac)
+{
+	int host;
+
+	if ((ip & DHCPD_NETMASK) != (DHCPD_NETWORK & DHCPD_NETMASK))
+	{
+		// ip not on my subnet
+		return -1;
+	}
+
+	host = (int) (ip & ~DHCPD_NETMASK);
+	if (host == 0 || host > DHCPD_MAX_HOST)
+	{
+		// invalid host (either network, broadcast, or Rabbit's address)
+		return -2;
+	}
+
+	if (dhcpd_mac_table[ip].lease_exp > SEC_TIMER)
+	{
+		_f_memcpy(mac, &dhcpd_mac_table[ip].mac, sizeof (eth_address));
+		return 0;
+	}
+
+	// lease expired
+	return -3;
+}
+
+/*** BeginHeader dhcpd_fillpkt */
+void dhcpd_fillpkt(DHCPPkt *pack_out, unsigned long yiaddr);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+dhcpd_fillpkt                 <DHCPD.LIB>
+
+SYNTAX:
+   void dhcpd_fillpkt(DHCPPkt *pack_out, unsigned long yiaddr);
+
+DESCRIPTION:
+   Fills a simple DHCP server response packet with information.
+
+PARAMETER1:
+   pack_out - A pointer to the DHCP response packet.
+
+PARAMETER2:
+   yiaddr - "Your IP Address," i.e. the IP address being offered to a
+   prospective DHCP client.
+
+RETURN VALUE:
+   None.
+
+SEE ALSO:
+   dhcpd_init, dhcpd_tick, dhcpd_stop
+END DESCRIPTION *********************************************************/
+
+_dhcpd_nodebug
+void dhcpd_fillpkt(DHCPPkt *pack_out, unsigned long yiaddr)
+{
+	byte *p, *p2;
+	int i, j;
+
+	pack_out->bp_op = 2;
+	pack_out->bp_htype = 1;
+	pack_out->bp_hops = 0;
+	pack_out->bp_flags = 0;
+	pack_out->bp_siaddr = 0;
+	pack_out->bp_yiaddr = yiaddr;
+	memset(pack_out->bp_sname, 0, sizeof pack_out->bp_sname);
+	memset(pack_out->bp_file, 0, sizeof pack_out->bp_file);
+	memset(pack_out->bp_vend, 0, sizeof pack_out->bp_vend);
+
+	// build vendor options
+	p = pack_out->bp_vend;
+	*(longword *) p = VM_RFC1048;
+	p += 4;
+
+	// DHCP Message Type at position 6
+	*p++ = DHCP_VN_TYPE;
+	*p++ = 1;
+	*p++ = DHCP_TY_OFR;
+
+#define DHCPD_ADDLONG(l) *p++ = 4; *(longword *)p = intel(l); p+= 4;
+#define DHCPD_ADDSTR(s)  j = strlen(s); *p++ = j; memcpy(p, s, j); p+= j;
+
+	// Server ID
+	*p++ = DHCP_VN_SRVRID;
+	DHCPD_ADDLONG(DHCPD_ADDRESS)
+
+	// Subnet mask
+	*p++ = DHCP_VN_SUBNET;
+	DHCPD_ADDLONG(DHCPD_NETMASK)
+
+	// Default gateway
+	*p++ = DHCP_VN_ROUTER;
+#ifdef DHCPD_GATEWAY
+	DHCPD_ADDLONG(DHCPD_GATEWAY)
+#else
+	DHCPD_ADDLONG(DHCPD_ADDRESS)
+#endif
+
+	// Host name
+#ifdef DHCPD_HOSTNAME
+	*p++ = DHCP_VN_HOST;
+	DHCPD_ADDSTR(DHCPD_HOSTNAME)
+#endif
+
+	// Domain Name
+#ifdef DHCPD_DOMAINNAME
+	*p++ = DHCP_VN_DOMAIN;
+	DHCPD_ADDSTR(DHCPD_DOMAINNAME)
+#endif
+
+	// Broadcast address
+	*p++ = DHCP_VN_BCAST;
+	DHCPD_ADDLONG(DHCPD_BROADCAST)
+
+	if (DHCPD_DNS_PRIMARY || DHCPD_DNS_SECONDARY)
+	{
+		*p++ = DHCP_VN_DNS;
+		if (DHCPD_DNS_PRIMARY && DHCPD_DNS_SECONDARY)
+		{
+			*p++ = 8;		// two servers, 4 bytes each
+		}
+		else
+		{
+			*p++ = 4;
+		}
+		if (DHCPD_DNS_PRIMARY)
+		{
+			*(longword *) p = intel(DHCPD_DNS_PRIMARY);
+			p += 4;
+		}
+		if (DHCPD_DNS_SECONDARY)
+		{
+			*(longword *) p = intel(DHCPD_DNS_SECONDARY);
+			p += 4;
+		}
+	}
+
+	// Lease time
+	// Note that even permanent leases need to be renewed by the client every
+	// DHCPD_LEASE_SECONDS seconds, but the IP address remains permanently
+	// reserved for that IP.
+	*p++ = DHCP_VN_LEASE;
+	DHCPD_ADDLONG(DHCPD_LEASE_SECONDS)
+
+	// END of options
+	*p = 255;
+}
+
+/*** BeginHeader dhcpd_dump_leases */
+void dhcpd_dump_leases(int dumpAll);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+dhcpd_dump_leases             <DHCPD.LIB>
+
+SYNTAX:
+   void dhcpd_dump_leases(int dumpAll);
+
+DESCRIPTION:
+   DHCPD debug / information function. Dumps DHCP table information to
+   STDIO in a human-readable format.
+
+PARAMETER1:
+   dumpAll - A boolean flag; nonzero specifies that all DHCP table entries
+   should be dumped, zero to dump only current (unexpired) lease entries.
+
+RETURN VALUE:
+   None.
+
+SEE ALSO:
+   dhcpd_init, dhcpd_tick, dhcpd_stop, dump_bootp
+END DESCRIPTION *********************************************************/
+
+_dhcpd_nodebug
+void dhcpd_dump_leases(int dumpAll)
+{
+	int i;
+	char macbuf[18];
+	char ipbuf[16];
+	char duration[30];
+	eth_address mac;
+
+	printf("dhcpd leases:\n");
+	for (i = 1; i <= DHCPD_MAX_HOST; ++i)
+	{
+		// if non-zero MAC address then print the entry
+		if (dumpAll || !_IsZero_eth_address(&dhcpd_mac_table[i].mac))
+		{
+			if (dhcpd_mac_table[i].lease_exp == 0)
+			{
+				strcpy(duration, "released");
+			}
+			else if (dhcpd_mac_table[i].lease_exp == DHCPD_LEASE_PERMANENT)
+			{
+				strcpy(duration, "permanent");
+			}
+			else
+			{
+				sprintf(duration, "%ld seconds",
+				        (long) (dhcpd_mac_table[i].lease_exp - SEC_TIMER));
+			}
+			// copy MAC address to accessible place for inet_ethtoa()
+			_f_memcpy(&mac, &dhcpd_mac_table[i].mac, sizeof (eth_address));
+			printf("%20s %s %s\n",
+			       inet_ntoa(ipbuf, DHCPD_NETWORK | i),
+			       inet_ethtoa(macbuf, mac.eaddr), duration);
+		}
+	}
+	printf("---- end of table\n");
+}
+
+/*** BeginHeader dhcpd_add_permanent */
+int dhcpd_add_permanent(int ip, void *mac);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+dhcpd_add_permanent           <DHCPD.LIB>
+
+SYNTAX:
+   int dhcpd_add_permanent(int ip, eth_address *mac);
+
+DESCRIPTION:
+   Permanently leases (reserves), within Rabbit's simple DHCP server
+   subnet, the given IP address for the client (host) with the specified
+   MAC address.
+
+PARAMETER1:
+   ip - The within-subnet-only IP address (i.e. in the range of 1 through
+   DHCPD_MAX_HOST, inclusive) to be reserved for a DHCP client (host) in
+   Rabbit's simple DHCP server subnet.
+
+PARAMETER2:
+   mac - A pointer to the specified DHCP client's MAC address.
+
+RETURN VALUE:
+   0: Success.
+   -1: The given IP is not in the simple DHCP server's subnet.
+   -2: The given IP is already in use by a different DHCP client (host).
+
+SEE ALSO:
+   dhcpd_init, dhcpd_tick, dhcpd_stop
+END DESCRIPTION *********************************************************/
+
+/* use this to make sure a particular host always gets the same IP */
+_dhcpd_nodebug
+int dhcpd_add_permanent(int ip, void *mac)
+{
+	if ((ip <= 0) || (ip > DHCPD_MAX_HOST))
+	{
+		return -1;
+	}
+
+	// if it's not a blank entry, see if the MAC already matches
+	if (dhcpd_mac_table[ip].lease_exp)
+	{
+		if (memcmp(mac, &dhcpd_mac_table[ip].mac, sizeof (eth_address)) != 0)
+		{
+			return -2;
+		}
+	}
+
+	_f_memcpy(&dhcpd_mac_table[ip].mac, mac, sizeof (eth_address));
+	dhcpd_mac_table[ip].lease_exp = DHCPD_LEASE_PERMANENT;
+
+	return 0;
+}
+
+/*** BeginHeader dhcpd_del_permanent */
+int dhcpd_del_permanent(int ip);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+dhcpd_del_permanent           <DHCPD.LIB>
+
+SYNTAX:
+   int dhcpd_del_permanent(int ip);
+
+DESCRIPTION:
+   Converts a permanently leased (reserved) IP address to a regular leased
+   IP address within Rabbit's simple DHCP server subnet.
+
+PARAMETER1:
+   ip - The within-subnet-only permanently leased IP address (i.e. in
+   the range of 1 through DHCPD_MAX_HOST, inclusive) of a DHCP client
+   (host) in Rabbit's simple DHCP server subnet.
+
+RETURN VALUE:
+   0: Success.
+   -1: The given IP is not in the simple DHCP server's subnet.
+   -2: The given IP is not permanently leased (reserved).
+
+SEE ALSO:
+   dhcpd_init, dhcpd_tick, dhcpd_stop
+END DESCRIPTION *********************************************************/
+
+// I don't recommend using this function.  Once a dhcpd client gets a lease
+// for an address, it can use it for the duration of the lease (and switching
+// it from permanent to not won't affect that).
+_dhcpd_nodebug
+int dhcpd_del_permanent(int ip)
+{
+	if ((ip <= 0) || (ip > DHCPD_MAX_HOST))
+	{
+		return -1;
+	}
+
+	if (dhcpd_mac_table[ip].lease_exp != DHCPD_LEASE_PERMANENT)
+	{
+		return -2;
+	}
+
+	// Even though it's no longer permanent, there's a chance the address
+	// is still in use and can't be reassigned immediately.
+	dhcpd_mac_table[ip].lease_exp = SEC_TIMER + DHCPD_LEASE_SECONDS;
+
+	return 0;
+}
+
+/*** BeginHeader dump_bootp */
+void dump_bootp(DHCPPkt *);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+dump_bootp                    <DHCPD.LIB>
+
+SYNTAX:
+   void dump_bootp(DHCPPkt *bootp);
+
+DESCRIPTION:
+   DHCPD debug-only function. When DHCPD_DEBUG is defined, dumps bootp /
+   dhcp packet content to STDIO in a human-readable format.
+
+PARAMETER1:
+   bootp - A pointer to the bootp / dhcp packet to be dumped.
+
+RETURN VALUE:
+   None.
+
+SEE ALSO:
+   dhcpd_init, dhcpd_tick, dhcpd_stop, dhcpd_dump_leases
+END DESCRIPTION *********************************************************/
+
+char * const dhcp_types[] = { "?", "DISCOVER", "OFFER", "REQUEST", "DECLINE",
+                              "ACK", "NAK", "RELEASE", "INFORM" };
+
+// dump a bootp packet
+_dhcpd_nodebug
+void dump_bootp(DHCPPkt *bootp)
+{
+#ifdef DHCPD_DEBUG
+	byte buf[256];
+	byte b, option;
+	unsigned int i, j;
+	unsigned long *w;
+	byte *p, *t, *u, *end;
+	int len;
+
+	printf("BOOTP Packet Dump:\n");
+	printf(" op=0x%02X htype=%d hlen=%d hops=%d\n",
+	       bootp->bp_op, bootp->bp_htype, bootp->bp_hlen, bootp->bp_hops);
+	printf(" xid=0x%08lX secs=%u flags=0x%04X\n", bootp->bp_xid,
+	       (unsigned int) bootp->bp_secs, (unsigned int) bootp->bp_flags);
+	printf(" ciaddr=%-20s", inet_ntoa(buf, intel(bootp->bp_ciaddr)));
+	printf(" yiaddr=%s\n", inet_ntoa(buf, intel(bootp->bp_yiaddr)));
+	printf(" siaddr=%-20s", inet_ntoa(buf, intel(bootp->bp_siaddr)));
+	printf(" giaddr=%s\n", inet_ntoa(buf, intel(bootp->bp_giaddr)));
+	j = (bootp->bp_hlen < 16 ? bootp->bp_hlen : 16);
+	printf(" chaddr=");
+	for (i = 0; i < j; ++i)
+	{
+		printf("%02x ", bootp->bp_chaddr[i]);
+	}
+	printf("\n");
+	if (bootp->bp_sname[0])
+	{
+		printf(" sname=%s\n", bootp->bp_sname);
+	}
+	if (bootp->bp_file[0])
+	{
+		printf(" file=%s\n", bootp->bp_file);
+	}
+	w = (unsigned long *) bootp->bp_vend;
+	if (*w == VM_RFC1048)
+	{
+		printf(" Options (cookie is good):\n");
+	}
+	else
+	{
+		printf(" Options (cookie %08lX != %08lX):\n",
+		       intel(*w), intel(VM_RFC1048));
+	}
+	i = 4;
+#define IPBUF(x) inet_ntoa(buf, intel(*(longword *) &p[x]))
+	p = (byte *) &bootp->bp_vend[4];
+	do
+	{
+		switch (*p)
+		{
+		case 255:
+			printf(" [End of Options]\n");
+			// Continue 'while': 255 and 0 are only options which don't have
+			//  following length field.
+			continue;
+		case 0: /* Nop Pad character */
+			p++;
+			// Continue 'while': 0 and 255 are only options which don't have
+			//  following length field.
+			continue;
+		case DHCP_VN_SUBNET: // Subnet Mask
+			printf("  Option Subnet: %s\n", IPBUF(2));
+			break;
+		case DHCP_VN_BCAST:  // Broadcast address
+			printf("  Option Broadcast Addr: %s\n", IPBUF(2));
+			break;
+		case DHCP_VN_TIMEOFF: // Time zone offset
+			printf("  Option Timezone: %d\n", intel16(*(word *)(&p[2])));
+			break;
+		case DHCP_VN_ROUTER: // router(s) a.k.a. gateways
+			printf("  Option Gateway:");
+_bootp_printsrv:
+			for (len = 0; len < *(p + 1); len += 4)
+			{
+				printf(" %s", IPBUF(2+len));
+			}
+			printf("\n");
+			break;
+		case DHCP_VN_DNS: // Domain Name Server(s) (BIND)
+			printf("  Option DNS:");
+			goto _bootp_printsrv;
+		case DHCP_VN_SMTPSRV: // Mail server(s)
+			printf("  Option SMTP:");
+			goto _bootp_printsrv;
+		case DHCP_VN_NTPSRV:		// Network time protocol servers (RFC1305)
+			printf("  Option NTP:");
+			goto _bootp_printsrv;
+		case DHCP_VN_COOKIE: // Quote-of-the-day server(s)
+			printf("  Option Cookie:");
+			goto _bootp_printsrv;
+		case DHCP_VN_HOST:	// Client Hostname. Server should use option 15 for
+		                  	//  domain name, but it can be supplied with hostname
+		                  	//  (deprecated).
+			printf("  Option Hostname: ");
+_bootp_printstr:
+			len = p[1];
+			strncpy(buf, &p[2], len);
+			buf[len] = 0;
+			printf("%s\n", buf);
+			break;
+		case DHCP_VN_DOMAIN: 	// Client default domain
+			printf("  Option Domain: ");
+			goto _bootp_printstr;
+		case DHCP_VN_CLASSID:
+			printf("  Option Vendor Class: ");
+			goto _bootp_printstr;
+		case DHCP_VN_MESSAGE:
+			printf("  Option Message: ");
+			goto _bootp_printstr;
+		case DHCP_VN_MSGLEN:
+			printf("  Option Max DHCP Packet: %u\n",
+			       (unsigned int) p[2] << 8 | p[3]);
+			break;
+		case DHCP_VN_TYPE:
+			if (p[2] > 8)
+			{
+				printf("  Option DHCP Type: %d\n", p[2]);
+			}
+			else
+			{
+				printf("  Option DHCP Type: %s\n", dhcp_types[p[2]]);
+			}
+			break;
+		case DHCP_VN_OVLOPTS:
+			printf("  Option Overload: %02X\n", p[2]);
+			break;
+		case DHCP_VN_SRVRID:
+			printf("  Option Server ID: %s\n", IPBUF(2));
+			break;
+		case DHCP_VN_REQIP:
+			printf("  Option Request IP: %s\n", IPBUF(2));
+			break;
+		case DHCP_VN_LEASE:	// handle lease expiration time, T1 and T2.
+			printf("  Option Lease: %lu secs\n", intel(*(longword*)(&p[2])));
+			break;
+		case DHCP_VN_T1TIME:
+			printf("  Option T1 time: %lu secs\n", intel(*(longword*)(&p[2])));
+			break;
+		case DHCP_VN_T2TIME:
+			printf("  Option T2 time: %lu secs\n", intel(*(longword*)(&p[2])));
+			break;
+		default:
+			len = p[1];
+			if (len < 11)
+			{
+				printf("  Option %d (%d bytes):", p[0], len);
+			}
+			else
+			{
+				printf("  Option %d (%d bytes):\n", p[0], len);
+			}
+			j = 0;
+			while (j < len)
+			{
+				printf(" %02x", p[j+2]);
+				++j;
+				if (j % 16 == 0)
+				{
+					printf("\n");
+				}
+			}
+			if (j == 0 || j % 16)
+			{
+				printf("\n");
+			}
+		} /* end of switch */
+		p += p[1] + 2;
+	} while (*p != 255);
+#endif
+}
+
+/*** BeginHeader _IsZero_eth_address */
+int _IsZero_eth_address(const eth_address __far *mac);
+/*** EndHeader */
+_dhcpd_nodebug
+int _IsZero_eth_address(const eth_address __far *mac)
+{
+	const eth_address zeroMAC = { { 0, 0, 0, 0, 0, 0 } };
+
+	return !memcmp(&zeroMAC, mac, sizeof (eth_address));
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

@@ -1,0 +1,730 @@
+/*
+* Copyright (c) 2008 Digi International Inc., All Rights Reserved
+*
+* This software contains proprietary and confidential information of Digi
+* International Inc.  By accepting transfer of this copy, Recipient agrees
+* to retain this software in confidence, to prevent disclosure to others,
+* and to make no use of this software other than that for which it was
+* delivered.  This is a published copyrighted work of Digi International
+* Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+* prohibited.
+*
+* Restricted Rights Legend
+*
+* Use, duplication, or disclosure by the Government is subject to
+* restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+* Technical Data and Computer Software clause at DFARS 252.227-7031 or
+* subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+* Restricted Rights at 48 CFR 52.227-19, as applicable.
+*
+* Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+*/
+
+/*******
+pppoe.lib
+
+PPP bundled with Dynamic C.
+
+Replaces PPPLINK.LIB for doing PPP over Ethernet.  All functions herein
+are called by PPP.LIB etc.  There are no application-callable functions.
+
+Based on RFC2516 "Method for transmitting PPP over Ethernet"
+
+*********/
+
+/*** BeginHeader _PPPoEController */
+
+#if CC_VER < 0xA20
+#fatal "This PPP module must be used with Dynamic C version 10.21 or later."
+#endif
+
+#ifndef __PPPOE_LIB
+#define __PPPOE_LIB
+
+#ifdef PPPOE_DEBUG
+	#define pppoe_debug __debug
+#else
+	#define pppoe_debug __nodebug
+#endif
+
+
+
+// Error codes (distinct from PPP and PPPSerial codes)
+#define PPPOE_BADETHTYPE 		-101
+#define PPPOE_DISCOVERYERROR	-102
+#define PPPOE_BADSTATE			-103
+#define PPPOE_WRONGVERSION		-104
+#define PPPOE_WRONGSESSION		-105
+#define PPPOE_BADLENGTH			-106
+#define PPPOE_SENDERROR			-107
+
+// Errors in PADS etc tags.  Must keep these numbers contiguous and ascending...
+#define PPPOE_SERVICE_NAME_ERROR	-199
+#define PPPOE_AC_SYSTEM_ERROR		-198
+#define PPPOE_GENERIC_ERROR		-197
+
+#ifndef PPPOE_MAX_ACNAME
+	#define PPPOE_MAX_ACNAME	30			// Max access concentrator name length
+#endif
+
+#ifndef PPPOE_TIMEOUT
+	#define PPPOE_TIMEOUT		20000000		// Timeout in milliseconds
+#endif
+
+#ifndef PPPOE_RETRIES
+	#define PPPOE_RETRIES		10			// Number of retries for discovery phase
+#endif
+
+typedef struct
+{
+	const NetControllerDevice * ncd;
+   word		iface;			// Interface number
+	int		nicnum;			// Ethernet controller interface (0 for IF_PPPOE0, or 1 for IF_PPPOE1).  This
+   								// is currently iface-2.
+	char		acaddress[6];	// Ethernet address of Access Concentrator
+	word		session_id;		// Session ID in use
+	int		state;			// Current state.  One of:
+#define PPPOE_IDLE 		0			// Initial state
+#define PPPOE_GOTOFFER	1			// Got an offer
+#define PPPOE_SENTDISC	2			// Sent a discovery packet
+#define PPPOE_READY		3			// Connected to access concentrator - able to proceed with PPP etc.
+#define PPPOE_READY_1	5			// As for ready, but start PPP negotiations.  Drops back to PPPOE_READY.
+#define PPPOE_SENTTERM	6			// Sent PADT packet
+	longword	timeout;			// Timeouts for discovery/termination phases.
+	word		retries;			// Retry count for discovery phase
+	int		acnamelen;		// Name and length of access concentrator
+	char		acname[PPPOE_MAX_ACNAME+1];	// Additional byte for null terminator
+	struct _PPPState *	ppp;		// PPP stuff.  PPPState::state points back to this struct.
+
+} _PPPoEConfig;
+
+_PPPoEConfig _pppoe_conf[USING_PPPOE];
+
+// These macros are used by net.lib to properly initialize all instances.  Each macro is a C initializer
+// (with trailing comma if not null).  First element points to NetControllerDevice, second is a void
+// pointer which points to the specific state structure for the instance, third field is instance number.
+#if USING_PPPOE >= 1
+	#define PPPOE_TABLE1  { &_PPPoEController, (void *)_pppoe_conf, 0 },
+#else
+	#define PPPOE_TABLE1
+#endif
+#if USING_PPPOE >= 2
+	#define PPPOE_TABLE2  { &_PPPoEController, (void *)(_pppoe_conf+1), 1 },
+#else
+	#define PPPOE_TABLE2
+#endif
+
+
+extern const NetControllerDevice _PPPoEController;
+
+// Mapping of PPPoE header.  This follows the ethernet header.  All fields in network order.
+typedef struct
+{
+	byte		vertype;			// Version/type - currently must be 0x11
+   byte		code;				// Code field when eth type is 0x8863 (except for PPPOE_PPP):
+#define PPPOE_PADI		0x09		// PPPoE Active Discovery Initiation
+#define PPPOE_PADO		0x07		// Discovery Offer
+#define PPPOE_PADR		0x19		// Discovery Request
+#define PPPOE_PADS		0x65		// Session confirmation
+#define PPPOE_PPP			0x00		// Normal session data (eth type is 0x8864)
+#define PPPOE_PADT		0xA7		// Discovery Termination
+	word		session_id;		// Session ID
+   word		length;			// Length of following payload data, not including this header or eth header.
+} PPPoEHeader;
+
+// Tag types - these are byte-reversed in order to map directly to packet fields
+#define PPPOE_TAG_EOL		0x0000	// End of list
+#define PPPOE_TAG_SRVNAME	0x0101	// Service name
+#define PPPOE_TAG_ACNAME	0x0201	// Access concentrator name
+#define PPPOE_TAG_ACCOOKIE	0x0401	// AC cookie
+#define PPPOE_TAG_RELAYID	0x1001	// Relay ID
+#define PPPOE_TAG_SNE		0x0102	// Service name error
+#define PPPOE_TAG_ACSE		0x0202	// AC system error
+#define PPPOE_TAG_GENE		0x0302	// Generic error
+
+/*** EndHeader */
+
+// Pointer to this is stored in IFTEntry.ncd field - basically, pointers to specific driver functions.
+const NetControllerDevice _PPPoEController =
+{
+	sizeof(_PPPoEConfig)			// sizeof_state
+  ,NCD_P2P					  		// flags.  No polling required, since underlying eth interface does this
+  ,6									// sizeof_hwa - same as ethernet
+  ,USING_PPPOE						// instances
+  ,NULL			 					// receive() - none needed; no polling.
+  ,pppoe_sendpacket				// sendpacket()
+  #pragma nowarn warns
+  ,pppoe_ioctl						// ioctl()
+  #pragma nowarn warns
+  ,NULL								// print regs - none for pppoe, use ethernet i/f
+  #pragma nowarn warns
+  ,pppoe_ifctl						// ifctl()
+  #pragma nowarn warns
+};
+
+
+
+
+/*** BeginHeader PPPOE_process */
+int PPPOE_process(ll_prefix __far * p, byte * hdrbuf);
+/*** EndHeader */
+
+pppoe_debug int PPPOE_process(ll_prefix __far * p, byte * hdrbuf)
+{
+	// Called from IP.LIB::pkt_received() when PPPoE type seen in ethernet header.
+	// Caller only checks that high-order type byte is 0x88.
+	// This function needs to set the offset to the IP or LCP header in p->net_offs.
+	// iface is the PPPoE interface (IF_PPPOE0 or IF_PPPOE1) on which received.
+	// This function invokes PPP_process for common PPP processing of LCP, PAP, IPCP
+	// control messages.  In this case the offset points to the PPP protocol field
+	// e.g. the C021 for LCP packets.
+	auto byte * new_packet;
+	auto int length;
+	auto int iface;
+	auto PPPState * ppp;
+	auto _PPPoEConfig * pes;
+   auto PPPoEHeader * ph;
+   auto IFTEntry * ifte;
+
+	iface = p->iface;			// The PPPoE interface (Ethernet + 2)
+   ph = (PPPoEHeader *)(hdrbuf + p->net_offs);
+   _pkt_buf2root(p, ph, sizeof(PPPoEHeader), p->net_offs);
+   p->net_offs += sizeof(PPPoEHeader);
+   ifte = _if_tab + iface;
+	pes = (_PPPoEConfig *)ifte->state;
+	//ppp = (PPPState *)ifte->u.ppp.ppp_state;
+   ppp = pes->ppp;
+
+	length = intel16(ph->length);
+	if (length < 1 || length > (int)p->len - 20) {
+#ifdef PPPOE_VERBOSE
+		printf("PPPOE: length bad, is %d > %d i/f %d\n", length, p->len - 20, iface);
+#endif
+		return PPPOE_BADLENGTH;
+	}
+
+	switch (hdrbuf[13]) {		// Switch on the LSB of the ethernet header protocol field
+		case 0x63:
+			return pppoe_discoverypkt(pes, p, hdrbuf, ph);
+		case 0x64:
+			if (pes->state < PPPOE_READY) {
+#ifdef PPPOE_VERBOSE
+				printf("PPPOE: PPP received when not ready i/f %d\n", iface);
+#endif
+				return PPPOE_BADSTATE;
+			}
+			if (ph->vertype != 0x11) {
+#ifdef PPPOE_VERBOSE
+				printf("PPPOE: version/type is 0x%02X not 0x11 i/f %d\n", ph->vertype, iface);
+#endif
+				return PPPOE_WRONGVERSION;
+			}
+			if (ph->session_id != pes->session_id) {
+#ifdef PPPOE_VERBOSE
+				printf("PPPOE: session id is 0x%04X not 0x%04X i/f %d\n", ph->session_id, pes->session_id, iface);
+#endif
+				return PPPOE_WRONGSESSION;
+			}
+
+			// p->net_offs points past PPPoE header, to PPP protocol field.
+			return PPP_process(p, hdrbuf);
+		default:
+#ifdef PPPOE_VERBOSE
+			printf("PPPOE: eth type is 0x88%02X i/f %d\n", hdrbuf[13], iface);
+#endif
+			return PPPOE_BADETHTYPE;
+	}
+}
+
+
+/*** BeginHeader PPPOEACAddress */
+int PPPOEACAddress(int iface, byte * ethaddr);
+/*** EndHeader */
+
+pppoe_debug int PPPOEACAddress(int iface, byte * ethaddr)
+{
+	// Copy access concentrator ethernet address to *ethaddr (assumed to be 6 btes).
+	// If not available, stores nulls and returns 1.  Else returns 0.
+   // Currently, this is only called from IP.LIB::pkt_make_ip()
+	_PPPoEConfig * pes;
+
+	pes = (_PPPoEConfig *)_if_tab[iface].state;
+	if (pes->state >= PPPOE_READY) {
+		memcpy(ethaddr, pes->acaddress, 6);
+		return 0;
+	}
+	memset(ethaddr, 0, 6);
+	return 1;
+}
+
+
+/*** BeginHeader pppoe_sendpacket */
+int pppoe_sendpacket(_PPPoEConfig * pes, ll_Gather * g);
+/*** EndHeader */
+
+pppoe_debug int pppoe_sendpacket(_PPPoEConfig * pes, ll_Gather * g)
+{
+	auto eth_Packet __far * e;
+	auto word send_size;
+   auto IFTEntry * ifte;
+
+	// Point to header partially constructed by pkt_reply_ip() or pkt_make_ip(), and PPP.
+	e = (eth_Packet __far *)((char __far *)g->data1 - 1);
+
+	// Fill in uninitialized PPPoE header fields
+	e->u.pppoe.ver = 0x11;
+	e->u.pppoe.code = PPPOE_PPP;
+	e->u.pppoe.session_id = pes->session_id;
+	send_size = g->len1 + g->len2 + g->len3;
+	e->u.pppoe.len = intel16(send_size - 20);
+	e->u.pppoe.protocol = 0x2100;		// 0x0021 in network order
+
+   ifte = _if_tab + pes->nicnum;
+	return ifte->ncd->sendpacket(ifte->state, g);
+}
+
+/*** BeginHeader pppoe_sendctl */
+// This function is basically an interface to pppoe_sendpacket().
+// This function is intended for transmission of PPP link layer messages,
+// not normal IP data or PPPoE link establishment messages.
+int pppoe_sendctl(_PPPoEConfig * pes, char * buf, word len);
+/*** EndHeader */
+
+pppoe_debug int pppoe_sendctl(_PPPoEConfig * pes, char * buf, word len)
+{
+	auto ll_Gather g;
+	auto byte hdr[20];	// Ethernet + pppoe header (not protocol, already added by caller)
+
+	g.iface = pes->iface;
+	g.data1 = hdr;
+	g.len1 = sizeof(hdr);
+	memcpy(hdr, pes->acaddress, 6);
+	memcpy(hdr+6, my_eth_addr[pes->nicnum], 6);
+	*(word *)(hdr+12) = PPPOE_TYPE;
+	// Note: truncate the first 2 bytes (which will be 0xFF03) because PPPoE does not
+	// use address/control field.
+	g.data2 = (char __far *)paddr(buf+2);
+	g.len2 = len-2;
+	g.len3 = 0;
+	return pppoe_sendpacket(pes, &g);
+}
+
+/*** BeginHeader PPPOESendPPPOE */
+// This function is intended for transmission of PPPoE link layer establishment messages,
+// not normal IP data or PPP messages.
+int PPPOESendPPPOE(_PPPoEConfig * pes, char * buf, word len);
+/*** EndHeader */
+
+pppoe_debug int PPPOESendPPPOE(_PPPoEConfig * pes, char * buf, word len)
+{
+	auto ll_Gather g;
+	auto byte hdr[14];	// We only set up ethernet header
+   auto IFTEntry * ifte;
+
+	g.iface = pes->iface;
+	g.data1 = hdr;
+	g.len1 = sizeof(hdr);
+	if (pes->state == PPPOE_IDLE)
+		memset(hdr, 0xFF, 6);				// Broadcast address in initial state
+	else
+		memcpy(hdr, pes->acaddress, 6);	// Else use current access concentrator address
+	memcpy(hdr+6, my_eth_addr[pes->nicnum], 6);
+	*(word *)(hdr+12) = PPPOE_DISC;		// PPPoE link-control type
+	g.data2 = (char __far *)paddr(buf);
+	g.len2 = len;
+	g.len3 = 0;
+#ifdef PPPOE_VERBOSE
+	printf("PPPOE: sending DISC code=0x%02X id=0x%04X len=%u/%u state=%d i/f %d\n",
+		buf[1], *(word *)(buf+2), intel16(*(word *)(buf+4)), len, pes->state, g.iface);
+#endif
+   ifte = _if_tab + pes->nicnum;
+	return ifte->ncd->sendpacket(ifte->state, &g);
+}
+
+/*** BeginHeader pppoe_discoverypkt */
+// Must return non-zero to avoid confusion by caller.
+int pppoe_discoverypkt(_PPPoEConfig * pes, ll_prefix __far * p, byte * hdrbuf, PPPoEHeader * ph);
+/*** EndHeader */
+
+pppoe_debug int pppoe_discoverypkt(_PPPoEConfig * pes, ll_prefix __far * p, byte * hdrbuf, PPPoEHeader * ph)
+{
+	auto int send_size;
+	auto int iface;
+	auto int result;
+
+	iface = p->iface;
+
+	if (ph->vertype != 0x11)
+		return PPPOE_DISCOVERYERROR;
+
+	switch (ph->code) {	// Switch on code field
+		case PPPOE_PADI:	// PADI init packet, must be someone else
+		case PPPOE_PADR:	// Same for PADR
+			break;
+		case PPPOE_PADO: // PADO offer, take it if we need one
+#ifdef PPPOE_VERBOSE
+			printf("PPPOE: got offer id=0x%04X i/f %d\n", ph->session_id, iface);
+#endif
+			if (pes->state == PPPOE_SENTDISC) {
+				// Grab the AC address
+				memcpy(pes->acaddress, hdrbuf+6, 6);
+				if (!(result = pppoe_sendrequest(pes, p, intel16(ph->length), 1))) {
+					pes->state = PPPOE_GOTOFFER;
+					pes->timeout = _SET_TIMEOUT(PPPOE_TIMEOUT);
+				}
+				else
+					return result;		// Error tag or bad packet; remain in this state until timeout
+											// or another offer.
+			}
+			break;
+		case PPPOE_PADS:
+			// PADS session confirmation packet
+#ifdef PPPOE_VERBOSE
+			printf("PPPOE: got session confirm id=0x%04X i/f %d\n", ph->session_id, iface);
+#endif
+			if (pes->state == PPPOE_GOTOFFER &&
+			    !(result = pppoe_sendrequest(pes, p, intel16(ph->length), 0))) {
+				//set the session id and we're done
+				pes->session_id = ph->session_id;
+				pes->state = PPPOE_READY_1;
+				PPPLinkStatus(iface, 1); 	// Link is up!
+			}
+			break;
+		case PPPOE_PADT:
+			// PADT term packet
+#ifdef PPPOE_VERBOSE
+			printf("PPPOE: got termination id=0x%04X i/f %d\n", ph->session_id, iface);
+#endif
+			if (pes->state == PPPOE_IDLE || ph->session_id != pes->session_id)
+				break;
+			pes->state = PPPOE_IDLE;
+			pes->session_id = 0;
+			//PPP session is also cancelled (link is down)
+			PPPLinkStatus(iface, 0);
+			break;
+		default:
+#ifdef PPPOE_VERBOSE
+			printf("PPPOE: got unknown discovery packet code=0x%02X i/f %d\n", ph->code, iface);
+#endif
+			return PPPOE_DISCOVERYERROR;
+	}
+	return 1;
+}
+
+
+/*** BeginHeader pppoe_sendinit */
+int pppoe_sendinit(_PPPoEConfig * pes);
+/*** EndHeader */
+
+pppoe_debug int pppoe_sendinit(_PPPoEConfig * pes)
+{
+	auto byte pppoe_tempbuffer[10];
+
+	pes->state = PPPOE_IDLE;
+   // Set PPPOE_PADI
+	memcpy(pppoe_tempbuffer, "\x11\x09\x00\x00\x00\x04\x01\x01\x00\x00", 10);	// Init packet, any service
+	return PPPOESendPPPOE(pes, pppoe_tempbuffer, sizeof(pppoe_tempbuffer)) ? PPPOE_SENDERROR : 0;
+}
+
+/*** BeginHeader pppoe_sendrequest */
+int pppoe_sendrequest(_PPPoEConfig * pes, ll_prefix __far * p, word offer_size, int respond);
+/*** EndHeader */
+
+pppoe_debug int pppoe_sendrequest(_PPPoEConfig * pes, ll_prefix __far * p, word offer_size, int respond)
+{
+	auto byte offer[128];
+	auto byte pppoe_tempbuffer[128];
+	auto word tag_size;
+	auto word tag_type;
+	auto int send_size;
+	auto int service_flag;
+   auto byte * offer_tags;
+
+   offer_tags = offer;
+
+   // Set PPPOE_PADR
+	memcpy(pppoe_tempbuffer, "\x11\x19\x00\x00", 4);  // request packet, sess id = 0000
+	send_size = 6;		// Length field to be filled in later
+   offer_size += p->net_offs;
+
+	service_flag = 0; // No service picked yet
+
+	while (p->net_offs+4 <= offer_size) {
+   	_pkt_buf2root(p, offer, 4, p->net_offs);
+      p->net_offs += 4;
+		tag_type = *(word *)offer;
+		tag_size = intel16(*(word *)(offer + 2));
+
+		// Sanity check...
+		if (tag_size > sizeof(offer)-4)
+			return PPPOE_BADLENGTH;
+   	_pkt_buf2root(p, offer+4, tag_size, p->net_offs);
+      p->net_offs += tag_size;
+
+		switch(tag_type) {
+			case PPPOE_TAG_SRVNAME:
+				if (!service_flag) {
+					//no service picked yet
+					if (send_size + tag_size + 4 > sizeof(pppoe_tempbuffer))
+						return PPPOE_DISCOVERYERROR;
+					pppoe_addtag(pppoe_tempbuffer + send_size,
+									 PPPOE_TAG_SRVNAME,
+									 offer+4,
+									 tag_size);
+					send_size += tag_size + 4;
+					service_flag = 1;
+				}
+				break;
+			case PPPOE_TAG_ACNAME:
+				// AC-Name
+				pes->acnamelen = tag_size;
+				if (pes->acnamelen > PPPOE_MAX_ACNAME)
+					pes->acnamelen = PPPOE_MAX_ACNAME;
+				memcpy(pes->acname, offer+4, pes->acnamelen);
+				pes->acname[pes->acnamelen] = 0;	// null term it
+				break;
+			case PPPOE_TAG_ACCOOKIE:
+			case PPPOE_TAG_RELAYID:
+				// AC-Cookie or relay tag, copy back
+				if (send_size + tag_size + 4 > sizeof(pppoe_tempbuffer))
+					return PPPOE_DISCOVERYERROR;
+				pppoe_addtag(pppoe_tempbuffer + send_size,
+								 tag_type,
+								 offer+4,
+								 tag_size);
+				send_size += tag_size + 4;
+				break;
+			case PPPOE_TAG_SNE:
+			case PPPOE_TAG_ACSE:
+			case PPPOE_TAG_GENE:
+#ifdef PPPOE_VERBOSE
+				printf("PPPOE: a/c error tag %04x: '%*.*s' i/f %d\n",
+					tag_type, tag_size, tag_size, offer+4, pes->iface);
+#endif
+				return PPPOE_SERVICE_NAME_ERROR + (intel16(tag_type) - 0x201);
+			default:
+				break; // Ignore other tag types
+
+		}
+	}
+
+	// Set length
+	*(word *)(pppoe_tempbuffer + 4) = intel16(send_size-6);
+	if (service_flag)
+		return respond && PPPOESendPPPOE(pes, pppoe_tempbuffer, send_size) ? PPPOE_SENDERROR : 0;
+	else
+		return PPPOE_DISCOVERYERROR;
+}
+
+/*** BeginHeader pppoe_addtag */
+int pppoe_addtag(char *buffer, word tag_type, char *tag_value, int tag_size);
+/*** EndHeader */
+
+pppoe_debug int pppoe_addtag(char *buffer,
+								 word tag_type,
+								 char *tag_value,
+								 int tag_size )
+{
+	*(word *)buffer = tag_type;
+	*(word *)(buffer+2) = intel16(tag_size);
+	memcpy(buffer + 4, tag_value, tag_size);
+}
+
+
+/*** BeginHeader pppoe_open */
+// amap parameter is ignored, since PPPoE requires no control char escaping.
+// iface is the IP interface number to assign to this port (IF_PPPOEx)
+// Returns 0 if OK, non-zero if error.
+int pppoe_open(_PPPoEConfig * pes);
+/*** EndHeader */
+
+pppoe_debug int pppoe_open(_PPPoEConfig * pes)
+{
+	auto int result;
+
+	if (result = pppoe_sendinit(pes))
+		return result;
+	pes->timeout = _SET_TIMEOUT(PPPOE_TIMEOUT);
+	pes->state = PPPOE_SENTDISC;
+	return 0;
+}
+
+
+
+/*** BeginHeader pppoe_close  */
+void pppoe_close(_PPPoEConfig * pes);
+/*** EndHeader */
+
+pppoe_debug void pppoe_close(_PPPoEConfig * pes)
+{
+	auto byte pppoe_tempbuffer[6];
+
+	if (pes->state != PPPOE_GOTOFFER && pes->state < PPPOE_READY) {
+		pes->state = PPPOE_IDLE;
+		return;
+	}
+	memset(pppoe_tempbuffer, 0, sizeof(pppoe_tempbuffer));
+	memcpy(pppoe_tempbuffer, "\x11\xA7\x00\x00\x00\x00", 6);	// PPPOE_PADT (term) packet
+	*(word *)(pppoe_tempbuffer + 2) = pes->session_id;
+	PPPOESendPPPOE(pes, pppoe_tempbuffer, sizeof(pppoe_tempbuffer));
+	pes->state = PPPOE_SENTTERM;
+	pes->timeout = _SET_TIMEOUT(PPPOE_TIMEOUT);
+}
+
+/*** BeginHeader pppoe_resetinterface */
+int pppoe_resetinterface(_PPPoEConfig * ppplink, word instance, int iface);
+/*** EndHeader */
+
+static const _PPPoEConfig _pppoe_config[USING_PPPOE] =
+{
+#if USE_PPPOE & 0x01
+	{
+	   &_PPPoEController        		// ncd
+	  ,IF_PPPOE0                     // iface
+	  ,IF_ETH0             				// real interface (underlying ethernet)
+	}
+#endif
+#if USE_PPPOE & 0x02
+	{
+	   &_PPPoEController        		// ncd
+	  ,IF_PPPOE1                     // iface
+	  ,IF_ETH1             				// real interface (underlying ethernet)
+	}
+#endif
+};
+
+const LCPOptions ppp_default_local_LCP_for_PPPoE = {
+	0x00000000,
+	ETH_MTU - 8,
+	0,
+	0
+	};
+const LCPOptions ppp_default_remote_LCP_for_PPPoE = {
+	0x00000000,
+	ETH_MTU - 8,
+	0,
+	0
+	};
+
+
+pppoe_debug int pppoe_resetinterface(_PPPoEConfig * pppoe, word instance, int iface)
+{
+   if (instance >= USING_PPPOE)
+   	return -6;	// No such instance
+
+	memcpy(pppoe, _pppoe_config + instance, sizeof(*pppoe));
+
+   // Use an appropriate PPP state
+   pppoe->ppp = _pppoe_states + instance;
+   // Also required that we store the PPP state in the interface table
+   _if_tab[iface].u.ppp.ppp_state = pppoe->ppp;
+   PPPinitialize(pppoe->ppp, pppoe, iface, pppoe->ncd,
+      &ppp_default_local_LCP_for_PPPoE, &ppp_default_remote_LCP_for_PPPoE);
+
+   return 0;
+}
+
+
+/*** BeginHeader pppoe_ioctl */
+int pppoe_ioctl(_PPPoEConfig* nic, int cmd, ...);
+/*** EndHeader */
+
+pppoe_debug int pppoe_ioctl(_PPPoEConfig * nic, int cmd, ...)
+{
+	auto char * stack;
+   auto word mask;
+   auto IFTEntry * ifte;
+
+   stack = (char *)(&cmd + 1);
+	switch (cmd) {
+   case PD_HASFEATURE:
+		cmd = *(int *)stack;
+      return cmd >= PD_HASFEATURE && cmd <= PD_HAVELINK || cmd == PD_GETHWA ||
+      		 cmd >= PD_PPP_SENDCTL && cmd <= PD_PPP_SENDINGCTL;
+   case PD_INITIALIZE:
+   	return pppoe_resetinterface(nic, *(word *)stack, *(int *)(stack+sizeof(word)));
+   case PD_HAVELINK:
+   	return nic->state >= PPPOE_READY;
+   case PD_GETHWA:
+   	ifte = _if_tab + nic->nicnum;	// Refer to underlying interface
+		return ifte->ncd->ioctl(ifte->state, PD_GETHWA, *(char ***)stack);
+   case PD_PPP_SENDCTL:
+   	return pppoe_sendctl(nic, *(char **)stack, *(word *)(stack+sizeof(char *)));
+   case PD_PPP_SENDING:
+   	return 0;
+   case PD_PPP_SENDINGCTL:
+   	return 0;
+   }
+   return 0;
+}
+
+
+/*** BeginHeader pppoe_ifctl */
+int pppoe_ifctl(_PPPoEConfig * pes, int up, int change);
+/*** EndHeader */
+
+
+_ppp_nodebug int pppoe_ifctl(_PPPoEConfig * pes, int up, int change)
+{
+	auto PPPState *ppp;
+	auto word iface;
+
+#ifdef PPP_VERBOSE
+	if (change)
+		printf("PPP: bringing %s PPPoE interface %d\n", up ? "up" : "down", iface);
+#endif
+
+	ppp = pes->ppp;
+   iface = pes->iface;
+
+	if (up) {
+		// For PPPoE, we do the access concentrator discovery phase first.
+		if (change || pes->state == PPPOE_IDLE) {
+			if (pppoe_open(pes))
+				return IFCTL_FAIL;
+			if (change)
+				pes->retries = 0;
+		}
+
+		if (pes->state == PPPOE_READY)
+			return ifctl_ppp(ppp, iface, up, change);
+		else if (pes->state == PPPOE_READY_1) {
+			pes->state = PPPOE_READY;
+			return ifctl_ppp(ppp, iface, up, 1);	// Force "change", to get LCP going properly.
+		}
+
+		if (chk_timeout(pes->timeout)) {
+			pes->state = PPPOE_IDLE;
+			pes->retries++;
+			if (pes->retries > PPPOE_RETRIES) {
+#ifdef PPPOE_VERBOSE
+				printf("PPPOE: discovery phase retry count exceeded i/f %d\n", iface);
+#endif
+				return IFCTL_FAIL;
+			}
+		}
+		return IFCTL_PEND;
+	}
+	else {
+		if (pes->state == PPPOE_READY && ifctl_ppp(ppp, iface, up, change) == IFCTL_PEND)
+			return IFCTL_PEND;
+		if (pes->state == PPPOE_SENTTERM) {
+			if (chk_timeout(pes->timeout)) {
+				// Don't wait forever for term ack.  OK to just assume cleaned up.
+				pes->state = PPPOE_IDLE;
+				return IFCTL_OK;
+			}
+			else
+				return IFCTL_PEND;
+		}
+		else if (pes->state != PPPOE_IDLE) {
+			pppoe_close(pes);
+			return IFCTL_PEND;
+		}
+	}
+	return IFCTL_OK;
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

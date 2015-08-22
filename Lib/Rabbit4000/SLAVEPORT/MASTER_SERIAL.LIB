@@ -1,0 +1,744 @@
+/********
+master_serial.lib
+
+
+
+***************/
+
+/*** BeginHeader */
+#ifndef __MASTER_SERIAL_LIB
+#define __MASTER_SERIAL_LIB
+
+int ms_iobase;
+
+#ifndef MS_PORTWAIT
+//1 second for slave response
+#define MS_PORTWAIT 1000
+#endif
+
+/*** EndHeader */
+
+
+/* START LIBRARY DESCRIPTION ******************************************
+MASTER_SERIAL.LIB
+
+OVERVIEW
+	interface to serial channel on a slave processor
+
+END DESCRIPTION **********************************/
+
+
+/*** BeginHeader MSinit */
+int MSinit(int io_bank);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+MSinit             <MASTER_SERIAL.LIB>
+
+SYNTAX:	      int MSinit(int io_bank);
+
+DESCRIPTION:	sets up connection to slave device
+
+PARAMETER1:    io_bank (0-7) the IO bank and chip select pin
+						number for the slave device
+
+RETURN VALUE:	1 if everything is OK
+END DESCRIPTION **********************************************************/
+
+__nodebug int MSinit(int io_bank)
+{
+#ifdef PORTA_AUX_IO
+	WrPortI(SPCR, &SPCRShadow, SPCRShadow | 0x0C); //config for alt I/O bus
+   BitWrPortI(PBDDR, &PBDDRShadow, 1, 2);
+   BitWrPortI(PBDDR, &PBDDRShadow, 1, 3); //set address lines to output
+#endif
+	BitWrPortI(PEFR, &PEFRShadow, 1, io_bank);
+	BitWrPortI(PEDDR, &PEDDRShadow, 1, io_bank);
+	WrPortI(IB0CR + io_bank, NULL, 0xC8);	//1 wait state
+	ms_iobase = io_bank << 13;
+	return 1;
+}
+
+
+/*** BeginHeader MSsendCommand */
+int MSsendCommand(char address,
+						char command,
+						char data,
+						char *data_returned,
+						unsigned long timeout);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+MSsendCommand             <MASTER_SERIAL.LIB>
+
+SYNTAX:	      int MSsendCommand(char address,
+											char command,
+											char data,
+											char *data_returned,
+											unsigned long timeout);
+
+DESCRIPTION:	sends a single command to the slave and retreives a response
+
+PARAMETER1:    address - slave channel address to send command to
+					command - command to be sent
+					data - data to be sent
+					data_returned - location to put returned data byte into
+					timeout - time in milliseconds to wait for a response
+						0 indicates wait forever
+
+RETURN VALUE:	response code or error if negative
+					-1 timeout occured before response
+					-2 nothing at that address (response = 0xff)
+END DESCRIPTION **********************************************************/
+
+
+__nodebug int MSsendCommand(char address,
+						char command,
+						char data,
+						char *data_returned,
+						unsigned long timeout)
+{
+	unsigned long t;
+	char response;
+
+	WrPortE(ms_iobase + 3, NULL, 0); //clear out any old responses
+	WrPortE(ms_iobase + 1, NULL, address);
+	WrPortE(ms_iobase + 2, NULL, data);
+	WrPortE(ms_iobase, NULL, command);
+	t = MS_TIMER + timeout;
+	while((RdPortE(ms_iobase + 3) & 0x08) == 0)
+	{
+		if(timeout && (long) (MS_TIMER - t) > 0)
+		{
+			return -1;
+		}
+	}
+	WrPortE(ms_iobase + 3, NULL, 0); //clear status bit
+	response = RdPortE(ms_iobase);
+	if(response == 0xff)
+	{
+		return -2;
+	}
+	if(data_returned)
+	{
+		*data_returned = RdPortE(ms_iobase + 2);
+	}
+	return response;
+}
+
+/*** BeginHeader MSopen */
+int MSopen(char address, unsigned long baud);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+MSopen             <MASTER_SERIAL.LIB>
+
+SYNTAX:	      int MSopen(char address, unsigned long baud)
+
+DESCRIPTION:	opens a serial port on the slave at the specified baud rate
+
+PARAMETER1:    address - slave channel address of serial handler
+					baud - baudrate of serial port on slave
+
+RETURN VALUE:	1: The baud set on the slave is the same as the input baud
+               0: The baud set on the slave does not match the input baud
+              -1: an error occured while communicating with the slave
+END DESCRIPTION **********************************************************/
+
+__nodebug int MSopen(char address, unsigned long baud)
+{
+	int response;
+	unsigned int baud_factor;
+
+	baud_factor = ((unsigned int)(baud / 300L)) & 0xffff;
+	if(MSsendCommand(address, 4, baud_factor & 0xff, NULL, MS_PORTWAIT) != 1)
+	{
+		return -1;
+	}
+	if(MSsendCommand(address, 5, baud_factor >> 8, NULL, MS_PORTWAIT) != 1)
+	{
+		return -1;
+	}
+	if(MSsendCommand(address, 6, 0, NULL, MS_PORTWAIT) != 1)
+	{
+		return -1;
+	}
+	response = MSsendCommand(address, 7, 0, NULL, MS_PORTWAIT);
+	if(response < 0)
+	{
+		return -1;
+	}
+	else
+	{
+		return response;
+	}
+}
+
+/*** BeginHeader MSclose */
+int MSclose(char address);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+MSclose             <MASTER_SERIAL.LIB>
+
+SYNTAX:	      int MSclose(char address)
+
+DESCRIPTION:	closes a serial port on the slave
+
+PARAMETER1:    address - slave channel address of serial handler
+
+RETURN VALUE:	0: closed successfully
+              -1: an error occured while communicating with the slave
+END DESCRIPTION **********************************************************/
+
+__nodebug int MSclose(char address)
+{
+	int response;
+
+	response = MSsendCommand(address, 8, 0, NULL, MS_PORTWAIT);
+	if(response < 0)
+	{
+		return -1;
+	}
+	else
+	{
+		return 0;
+	}
+}
+
+/*** BeginHeader MSgetc */
+int MSgetc(char address);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+MSgetc             <MASTER_SERIAL.LIB>
+
+SYNTAX:	      int MSgetc(char address)
+
+DESCRIPTION:	Receives a character from the serial port
+
+PARAMETER1:    address - slave channel address of serial handler
+
+RETURN VALUE:	value of the receved character OR
+              -1: if no character was available
+              -2: if a communications error occured
+END DESCRIPTION **********************************************************/
+
+__nodebug int MSgetc(char address)
+{
+	int response;
+	char received_char;
+
+	response = MSsendCommand(address, 2, 0, &received_char, MS_PORTWAIT);
+	if(response < 0)
+	{
+		return -2;
+	}
+	else if(response == 0)
+	{
+		return -1;
+	}
+	else
+	{
+		return received_char;
+	}
+}
+
+/*** BeginHeader cof_MSgetc */
+__scofunc int cof_MSgetc(char address);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+cof_MSgetc             <MASTER_SERIAL.LIB>
+
+SYNTAX:	      int cof_MSgetc(char address)
+
+DESCRIPTION:	Yields to other tasks until a byte is received from
+					the serial port on the slave.
+
+PARAMETER1:    address - slave channel address of serial handler
+
+RETURN VALUE:	value of the receved character OR
+              -1: if an error occured
+END DESCRIPTION **********************************************************/
+
+__nodebug __scofunc int cof_MSgetc(char address)
+{
+	int response;
+	char received_char;
+
+	while(1)
+	{
+		response = MSsendCommand(address, 2, 0, &received_char, MS_PORTWAIT);
+		if(response < 0)
+		{
+			return -1;
+		}
+		else if(response == 2)
+		{
+			return received_char;
+		}
+		else
+		{
+			__yield;
+		}
+	}
+}
+
+/*** BeginHeader MSputc */
+int MSputc(char address, char ch);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+MSputc             <MASTER_SERIAL.LIB>
+
+SYNTAX:	      int MSputc(char address, char ch)
+
+DESCRIPTION:	Sends a character to the serial port
+
+PARAMETER1:    address - slave channel address of serial handler
+PARAMETER2:		ch - character to send
+
+RETURN VALUE: 	0 if buffer is locked or full
+				  	1 if character was sent
+				  	-1 if a comm error occured
+END DESCRIPTION **********************************************************/
+
+__nodebug int MSputc(char address, char ch)
+{
+	int response;
+
+	response = MSsendCommand(address, 1, ch, NULL, MS_PORTWAIT);
+	if(response < 0)
+	{
+		return -1;
+	}
+	else
+	{
+		return response;
+	}
+}
+
+/*** BeginHeader cof_MSputc */
+__scofunc int cof_MSputc(char address, char ch);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+cof_MSputc             <MASTER_SERIAL.LIB>
+
+SYNTAX:	      void cof_MSputc(char address, char ch)
+
+DESCRIPTION:	Sends a character to the serial port. Yields until
+					character is sent.
+
+PARAMETER1:    address - slave channel address of serial handler
+PARAMETER2:		ch - character to send
+
+RETURN VALUE:	0 if character was sent, -1 if an error occured
+
+END DESCRIPTION **********************************************************/
+
+__nodebug __scofunc int cof_MSputc(char address, char ch)
+{
+	int response;
+
+	while(1)
+	{
+		response = MSsendCommand(address, 1, ch, NULL, MS_PORTWAIT);
+		if(response < 0)
+		{
+			return -1;
+		}
+		else if(response == 1)
+		{
+			return 0;
+		}
+		else
+		{
+			__yield;
+		}
+	}
+}
+
+
+/*** BeginHeader MSread */
+int MSread(	char address,
+				char *buffer,
+				int length,
+				unsigned long timeout);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+MSread             <MASTER_SERIAL.LIB>
+
+SYNTAX:	      int MSread(	char address,
+									char *buffer,
+									int length,
+									unsigned long timeout)
+
+DESCRIPTION:	Reads bytes from the serial port on the slave into
+					the provided buffer. Returns imeediately if there is
+					nothing to receive. Otherwise, returns after buffer is full,
+					or timeout has expired between reading bytes.
+
+PARAMETER1:    address - slave channel address of serial handler
+PARAMETER2:		buffer - buffer to store received bytes
+PARAMETER3:		length - size of buffer
+PARAMETER4:		timeout - time to wait between bytes before giving up
+						on receiving anymore
+
+RETURN VALUE: 	bytes read, or -1 if error
+END DESCRIPTION **********************************************************/
+
+__nodebug int MSread(char address, char *buffer, int length, unsigned long timeout)
+{
+	int response;
+	int i;
+	unsigned long t;
+
+	i = 0;
+	t = MS_TIMER + timeout;
+	while(i < length)
+	{
+		response = MSsendCommand(address, 2, 0, buffer + i, MS_PORTWAIT);
+		if(response < 0)
+		{
+			return -1;
+		}
+		else if(response == 2)
+		{
+			i++;
+			t = MS_TIMER + timeout;
+		}
+		else if(i == 0 && response == 0)
+		{
+			return 0; //nothing to read
+		}
+		if( (long) (MS_TIMER - t) > 0 )
+		{
+			return i; //timed out between bytes
+		}
+	}
+	return i;
+}
+
+/*** BeginHeader cof_MSread */
+__scofunc int cof_MSread(	char address,
+								char *buffer,
+								int length,
+								unsigned long timeout);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+cof_MSread             <MASTER_SERIAL.LIB>
+
+SYNTAX:	      int cof_MSread(	char address,
+									char *buffer,
+									int length,
+									unsigned long timeout)
+
+DESCRIPTION:	Reads bytes from the serial port on the slave into
+					the provided buffer. Waits until at least one character has
+					been read. Returns after buffer is full,
+					or timeout has expired between reading bytes.
+					Yields to other tasks while waiting for data.
+
+PARAMETER1:    address - slave channel address of serial handler
+PARAMETER2:		buffer - buffer to store received bytes
+PARAMETER3:		length - size of buffer
+PARAMETER4:		timeout - time to wait between bytes before giving up
+						on receiving anymore
+
+RETURN VALUE: 	bytes read, or -1 if error
+END DESCRIPTION **********************************************************/
+
+__nodebug __scofunc int cof_MSread(	char address,
+								char *buffer,
+								int length,
+								unsigned long timeout)
+{
+	int response;
+	int i;
+	unsigned long t;
+
+	i = 0;
+	t = MS_TIMER + timeout;
+	while(i < length)
+	{
+		response = MSsendCommand(address, 2, 0, buffer + i, MS_PORTWAIT);
+		if(response < 0)
+		{
+			return -1;
+		}
+		else if(response == 2)
+		{
+			i++;
+			t = MS_TIMER + timeout;
+		}
+		else if( (long) (MS_TIMER - t) > 0 && i > 0)
+		{
+			return i; //timed out between bytes
+		}
+		else
+		{
+			__yield;
+		}
+	}
+	return i;
+}
+
+/*** BeginHeader MSwrite */
+int MSwrite( char address, char *data, int length);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+MSwrite             <MASTER_SERIAL.LIB>
+
+SYNTAX:	      int MSwrite(char address, char *data, int length)
+
+DESCRIPTION:	transmits an array of bytes from the serial port on the
+					slave
+
+PARAMETER1:    address - slave channel address of serial handler
+PARAMETER2:		data - array to be transmitted
+PARAMETER3:		length - size of array
+
+RETURN VALUE: 	number of bytes actually written, -1 if error
+END DESCRIPTION **********************************************************/
+
+__nodebug int MSwrite(char address, char *data, int length)
+{
+	int response;
+	int i;
+
+	i = 0;
+	while(i < length)
+	{
+		response = MSsendCommand(address, 1, data[i], NULL, MS_PORTWAIT);
+		if(response < 0)
+		{
+			return -1;
+		}
+		else if(response == 1)
+		{
+			i++;
+		}
+		else
+		{
+			return i; //can't write any more for the time being
+		}
+	}
+	return i;
+}
+
+/*** BeginHeader cof_MSwrite */
+__scofunc int cof_MSwrite( char address, char *data, int length);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+cof_MSwrite             <MASTER_SERIAL.LIB>
+
+SYNTAX:	      int cof_MSwrite(char address, char *data, int length)
+
+DESCRIPTION:	transmits an array of bytes from the serial port on the
+					slave. Yields to other tasks while waiting for write
+					buffer to clear.
+
+PARAMETER1:    address - slave channel address of serial handler
+PARAMETER2:		data - array to be transmitted
+PARAMETER3:		length - size of array
+
+RETURN VALUE: 	number of bytes actually written, -1 if error
+END DESCRIPTION **********************************************************/
+
+__nodebug __scofunc int cof_MSwrite(char address, char *data, int length)
+{
+	int response;
+	int i;
+
+	i = 0;
+	while(i < length)
+	{
+		response = MSsendCommand(address, 1, data[i], NULL, MS_PORTWAIT);
+		if(response < 0)
+		{
+			return -1;
+		}
+		else if(response == 1)
+		{
+			i++;
+		}
+		else
+		{
+			__yield;
+		}
+	}
+	return i;
+}
+
+/*** BeginHeader MSgetError */
+int MSgetError(char address);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+MSgetError             <MASTER_SERIAL.LIB>
+
+SYNTAX:	      int MSgetError(char address)
+
+DESCRIPTION:	gets bitfield with any current error from the specified
+					serial port on the slave
+					Error codes are:
+						SER_PARITY_ERROR	0x01
+						SER_OVERRUN_ERROR 0x02
+
+PARAMETER1:    address - slave channel address of serial handler
+
+RETURN VALUE: 	number of bytes free, -1 if error
+END DESCRIPTION **********************************************************/
+
+__nodebug int MSgetError(char address)
+{
+	char return_data;
+
+	if(MSsendCommand(address, 9, 0, &return_data, MS_PORTWAIT) != 1)
+	{
+		return -1;
+	}
+	return return_data;
+}
+
+/*** BeginHeader MSwrFree */
+int MSwrFree(char address);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+MSwrFree             <MASTER_SERIAL.LIB>
+
+SYNTAX:	      int MSwrFree(char address)
+
+DESCRIPTION:	gets the number of bytes available in the specified
+					serial port write buffer on the slave.
+
+PARAMETER1:    address - slave channel address of serial handler
+
+RETURN VALUE: 	number of bytes free, -1 if error
+END DESCRIPTION **********************************************************/
+
+__nodebug int MSwrFree(char address)
+{
+	char return_data[2];
+
+	if(MSsendCommand(address, 10, 0, return_data, MS_PORTWAIT) != 1)
+	{
+		return -1;
+	}
+	if(MSsendCommand(address, 11, 0, return_data + 1, MS_PORTWAIT) != 1)
+	{
+		return -1;
+	}
+
+	return 256*return_data[1] + return_data[0];
+}
+
+/*** BeginHeader MSrdFree */
+int MSrdFree(char address);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+MSrdFree             <MASTER_SERIAL.LIB>
+
+SYNTAX:	      int MSrdFree(char address)
+
+DESCRIPTION:	gets the number of bytes available in the specified
+					serial port read buffer on the slave.
+
+PARAMETER1:    address - slave channel address of serial handler
+
+RETURN VALUE: 	number of bytes free, -1 if error
+END DESCRIPTION **********************************************************/
+
+__nodebug int MSrdFree(char address)
+{
+	char return_data[2];
+
+	if(MSsendCommand(address, 12, 0, return_data, MS_PORTWAIT) != 1)
+	{
+		return -1;
+	}
+	if(MSsendCommand(address, 13, 0, return_data + 1, MS_PORTWAIT) != 1)
+	{
+		return -1;
+	}
+
+	return 256*return_data[1] + return_data[0];
+}
+
+/*** BeginHeader MSwrUsed */
+int MSwrUsed(char address);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+MSwrUsed             <MASTER_SERIAL.LIB>
+
+SYNTAX:	      int MSwrUsed(char address)
+
+DESCRIPTION:	gets the number of bytes currently in the specified
+					serial port write buffer on the slave.
+
+PARAMETER1:    address - slave channel address of serial handler
+
+RETURN VALUE: 	number of bytes in buffer, -1 if error
+END DESCRIPTION **********************************************************/
+
+__nodebug int MSwrUsed(char address)
+{
+	char return_data[2];
+
+	if(MSsendCommand(address, 14, 0, return_data, MS_PORTWAIT) != 1)
+	{
+		return -1;
+	}
+	if(MSsendCommand(address, 15, 0, return_data + 1, MS_PORTWAIT) != 1)
+	{
+		return -1;
+	}
+
+	return 256*return_data[1] + return_data[0];
+}
+
+/*** BeginHeader MSrdUsed */
+int MSrdUsed(char address);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+MSrdUsed             <MASTER_SERIAL.LIB>
+
+SYNTAX:	      int MSrdUsed(char address)
+
+DESCRIPTION:	gets the number of bytes currently in the specified
+					serial port read buffer on the slave.
+
+PARAMETER1:    address - slave channel address of serial handler
+
+RETURN VALUE: 	number of bytes in buffer, -1 if error
+END DESCRIPTION **********************************************************/
+
+__nodebug int MSrdUsed(char address)
+{
+	char return_data[2];
+
+	if(MSsendCommand(address, 16, 0, return_data, MS_PORTWAIT) != 1)
+	{
+		return -1;
+	}
+	if(MSsendCommand(address, 17, 0, return_data + 1, MS_PORTWAIT) != 1)
+	{
+		return -1;
+	}
+
+	return 256*return_data[1] + return_data[0];
+}
+
+/*** Beginheader */
+#endif
+/*** EndHeader */

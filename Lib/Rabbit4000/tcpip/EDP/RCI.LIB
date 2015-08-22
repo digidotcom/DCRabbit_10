@@ -1,0 +1,2274 @@
+/*** BeginHeader _rci_dct_table, _rci_find_target */
+/*
+* Copyright (c) 2011 Digi International Inc., All Rights Reserved
+*
+* This software contains proprietary and confidential information of Digi
+* International Inc.  By accepting transfer of this copy, Recipient agrees
+* to retain this software in confidence, to prevent disclosure to others,
+* and to make no use of this software other than that for which it was
+* delivered.  This is an published copyrighted work of Digi International
+* Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+* prohibited.
+*
+* Restricted Rights Legend
+*
+* Use, duplication, or disclosure by the Government is subject to
+* restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+* Technical Data and Computer Software clause at DFARS 252.227-7031 or
+* subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+* Restricted Rights at 48 CFR 52.227-19, as applicable.
+*
+* Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+
+	Rabbit implementation of RCI (Remote Command Interface).
+*/
+#ifndef _RCI_INCL
+#define _RCI_INCL
+
+#ifdef RCI_DEBUG
+	#define _rci_debug	__debug
+#else
+	#define _rci_debug	__nodebug
+#endif
+
+#include "setjmp.h"
+
+// Currently, iDigi server requires a complete descriptor tree to be
+// returned; dscr_avail=true is not allowed since it won't submit further
+// queries.  Thus, set the recursion level reasonably deep.  When iDigi is
+// improved, reduce this to '2' to reduce dynamic memory allocation requirements.
+#define _RCI_QD_RECURSE		6
+
+#ifndef IDIGI_MAX_TARGETS
+	#define IDIGI_MAX_TARGETS	10
+#endif
+
+#define HAVE_RCI
+
+#ifndef HAVE_EDP
+	#define EDP void
+#endif
+
+#use "rweb_json.lib"
+#use "rweb_xml.lib"
+
+#ifdef IDIGI_USE_XBEE
+	// Main header required for Simple XBee API
+	#include "xbee/sxa.h"
+
+	// Load configuration settings for board's serial port.
+	#include "xbee_config.h"
+#endif
+
+#use "rci_data.lib"
+
+
+#ifndef RCI_VERBOSE
+	#define RCI_VERBOSE 0
+#endif
+
+#define RCI_COMMAND_REQ_START		0x01
+#define RCI_COMMAND_REQ_DATA		0x02
+#define RCI_COMMAND_REQ_END		0x03
+#define RCI_COMMAND_REPLY_START	0x04
+#define RCI_COMMAND_REPLY_DATA	0x05
+#define RCI_COMMAND_REPLY_END		0x06
+#define RCI_ERROR_DETECTED			0xE0
+	#define RCI_ERROR_FATAL				0x01
+	#define RCI_ERROR_TIMEOUT			0x02
+	#define RCI_ERROR_COMPR				0x03
+	#define RCI_ERROR_DECOMPR			0x04
+	#define RCI_ERROR_SEQUENCE			0x05
+#define RCI_ANNOUNCE_COMPR			0xB0
+	#define RCI_COMPR_NONE				0x00
+	#define RCI_COMPR_ZLIB				0x01	// Not actually specified as yet
+
+struct rciRequest;	// Forward
+
+typedef int (*rci_docmd_callback_t)(
+		struct rciRequest __far * rr,
+      xmlSE __far * se,
+      int type);
+
+// Values for type parameter of rci_docmd_callback_t
+enum {
+	RCIDCT_START,			// Start of request, after starting the transaction
+   							// but before parsing the request XML
+	RCIDCT_END,				// End of reply, before generating the reply XML
+   RCIDCT_ASK_REQUEST,	// Used to query the callback as to whether the
+   							// normal #web variable update transaction is
+                        // to be generated.  The callback returns 1 to go
+                        // ahead, or 0 if the callback will perform all
+                        // necessary request XML processing for this command.
+   RCIDCT_ASK_REPLY,		// Used to query the callback as to whether to generate
+   							// the reply XML automatically from the #web var.
+                        // The callback returns 1 to go
+                        // ahead, or 0 if the callback will perform all
+                        // necessary reply XML generation for this command.
+};
+
+typedef struct RCIDCT {
+	/* The standard way that iDigi do_commands are procesed is that the
+      request XML gets parsed and a transaction is generated which loads
+      the 'request' RabbitWeb variable.  The RabbitWeb update functions
+      are then responsible for loading a reply struct, also a RabbitWeb
+      variable indicated by 'reply'.  This reply is sent back as the
+      XML response to the command.  If reply is NULL, then no response
+      data is sent.  If there is no request data (i.e. the do_command is
+      simply a command with no parameters) then 'request' must still be
+      set to a dummy integer #web variable, which is set to zero in
+      order to trigger the #web_update function (otherwise, no action
+      would be possible!).  'request' may be NULL, in which case there must
+      be a req_callback, otherwise nothing can happen.
+
+      If the above structure-based method is not sufficient, then
+      callback functions can be registered instead, or in addition to
+      the default processing.
+   */
+	const char __far * name;			// Target name (from target attribute)
+	const char __far * request;		// #web registered variable name for request to set
+	const char __far * reply;			// #web registered variable name for reply
+
+   const char __far * desc;			// Optional description string for query_descriptor
+   									// Set using rci_set_target_desc()
+
+   rci_docmd_callback_t req_callback;	// Callback function for this target
+} RCIDCT_t;
+
+// This is the data parsed from the RCI request from the server.
+typedef struct rciRequest {
+	// First field must be a WPX, since the generic XML parser callbacks
+	// in RWEB_XML.LIB expect this as the user data.
+	WebParseX_t	wpx;
+
+	// 2nd level RCI command being processed:
+	enum {
+		RR_QUERY_SETTING = 1,
+		RR_QUERY_STATE,
+		RR_QUERY_DESCRIPTOR,
+		RR_SET_SETTING,
+		RR_SET_STATE,
+		RR_SET_FACTORY_DEFAULT,
+		RR_REBOOT,
+		RR_DO_COMMAND,
+		RR_DISCOVER,		// used for do_command target=zigbee
+		RR_FW_UPDATE,		// used for do_command target=zigbee
+	} type;				// RCI command (2nd level element under <rci_request>)
+	const char * varname;	// Global variable name for the above
+	const char * desc;		// Description of command
+
+	//NOTE: as of initial release, no distinction between internal defaults and
+	// "customer" defaults.  Thus, the *IDEFAULTS enums won't be used.
+	enum {
+		RR_SOURCE_NONE,		// no source specified (defaults to current)
+		RR_SOURCE_CURRENT,	// source="current" (default)
+		RR_SOURCE_DEFAULTS,	// source="defaults"
+		RR_SOURCE_IDEFAULTS,	// source="internal_defaults"
+		RR_SOURCE_STORED,		// source="stored" (saved in non-volatile storage)
+	} source;
+	char * spec;				// Format conversion spec
+	enum {
+		RR_COMPARE_NONE,		// no compare_to atribute
+		RR_COMPARE_CURRENT,	// only return deltas from current
+		RR_COMPARE_DEFAULTS,	// only return deltas from customer defaults
+		RR_COMPARE_IDEFAULTS,	// only return deltas from factory defaults
+		RR_COMPARE_STORED,	// only return deltas from stored settings
+	} compare_to;
+	enum {
+		RR_ACTION_IMMEDIATE,	// For set_setting
+		RR_ACTION_DEFERRED,	// For set_setting
+		RR_ACTION_FACTORY,	// For set_factory_default
+		RR_ACTION_REVERT,		// For set_factory_default
+	} action;
+
+	xmlCtx gen;						// Reply XML generator context
+	WebCursor_t	wc;				// Navigation cursor
+	WebIteratorFilter_t wif;	// Filter for parser callbacks
+	WebTrans_t wtp;				// Built-up transaction
+	int error_count;				// Error count accumulator.  First group with
+											// error count halts entire request.
+	word set_change;				// Bit 0 set if current settings changed
+										// Bit 1 set if stored settings changed
+	#define RCI_CHANGED_CURRENT	0x0001
+	#define RCI_CHANGED_STORED		0x0002
+	const char __far * element;		// Innermost request element currently being procesed
+	const char __far * target;		// do_command target attribute
+	RCIDCT_t __far * dct;		// do_command target table entry
+
+	int qd_level;				// Set to the query descriptor XML element level
+   								// of the deepest "child".  i.e. if nothing inside
+                           // <query_descriptor/>, then is zero;
+                           // if <query_descriptor><set_setting/> then is 1,
+                           // if <query_descriptor><set_setting><foobar/>
+                           // then is 2.
+	int grp_level;
+
+	int save_backup;			// Change to settings requires backup to last-known-good
+	int done_backup;			// Set when backup made.
+
+#ifdef IDIGI_USE_XBEE
+   // Following stuff to support do_command target=zigbee:
+   long	zb_start;			// start attribute for discover
+   long	zb_size;				// size attribute for discover
+	xbee_command_list_context_t clc;	// A command list context
+   sxa_node_t __far * sxa;	// Node being queried/set
+   unsigned	zb_mask;			// Mask to match with CXV value (based on ATDD etc.)
+	const struct _xbee_reg_descr_t __far * zb;
+   								// Pointer to entry (in _rci_zb_table[]) being done
+   unsigned zb_nchild;		// Number of query_* or set_* child elements encountered
+
+	unsigned zb_nqueued;		// Number of queued cache update requests in
+   								// zb_queued and (for settings) clist.
+	const struct _xbee_reg_descr_t __far * __far * zb_queued;
+   								// Pointer to array of queued query updates
+	struct xbee_atcmd_reg_t __far * clist;
+   								// Array of AT commands for set requests.  The
+                           // relevant base address will be the following struct.
+                           // Max _SXA_MAX_QUEUED entries
+   #ifndef RCI_ZIGBEE_MAX_UPDATE_DATA
+   	// Max associated (binary) data for AT update commands.  Assumes a
+      // (conservative) average of 4 - most commands are single byte.
+   	#define RCI_ZIGBEE_MAX_UPDATE_DATA  (4*_SXA_MAX_QUEUED)
+   #endif
+   // Base data for command list.  1st pointer refers back to this (rr)
+   // struct, so that the SXA can be located, and hence the current
+   // cached values for each command.  Following the pointer is the
+   // new (updated) binary data for each command.  Entries in above clist
+   // point to this data via the offset fields.
+	struct rciZBData_t __far * ubase;
+#endif
+
+} rciRequest;
+
+#ifdef IDIGI_USE_XBEE
+typedef struct rciZBData_t {
+   rciRequest __far * rr;
+   unsigned ndata;	// Amount used in following
+   char data[RCI_ZIGBEE_MAX_UPDATE_DATA];
+} rciZBData_t;
+#endif
+
+
+extern __far RCIDCT_t _rci_dct_table[IDIGI_MAX_TARGETS];
+RCIDCT_t __far * _rci_find_target(const char __far * name);
+
+#ifdef IDIGI_USE_XBEE
+	#use "rci_zigbee.lib"
+#endif
+
+
+/*** EndHeader  */
+__far RCIDCT_t _rci_dct_table[IDIGI_MAX_TARGETS] = {{NULL}};
+_rci_debug
+RCIDCT_t __far * _rci_find_target(const char __far * name)
+{
+	int i;
+	for (i = 0; i < IDIGI_MAX_TARGETS; ++i) {
+		if (!_rci_dct_table[i].name)
+			return NULL;
+		if (!strcmp(name, _rci_dct_table[i].name))
+			return _rci_dct_table + i;
+	}
+	return NULL;
+}
+
+/*** BeginHeader rci_set_target_desc */
+RCIDCT_t __far * rci_set_target_desc(char __far * name, char __far * desc);
+/*** EndHeader  */
+_rci_debug
+RCIDCT_t __far * rci_set_target_desc(char __far * name, char __far * desc)
+{
+	RCIDCT_t __far * dct = _rci_find_target(name);
+   if (dct)
+   	dct->desc = desc;
+   return dct;
+}
+
+/*** BeginHeader rci_process_request */
+// s may be NULL for testing, in which case the macro
+//   _RCI_DONE_REQUEST is invoked (if it is defined).
+void rci_process_request(EDP __far * s, char __far * data, longword len);
+/*** EndHeader  */
+_rci_debug
+void rci_process_request(EDP __far * s, char __far * data, longword len)
+{
+	auto jmp_buf jb;	// longjmp used by xmlGenMemory
+	auto xmlSE wrapper;
+	auto rciRequest __far * rr;
+	auto int rc;
+	auto char __far * response;
+	auto long resp_len;
+
+	// Here's where we get to use that fancy SAX parser.
+	// data and len describe a buffer which should contain well-formed
+	// XML.  We process this in one hit; no doubt to the chagrin
+	// of applications which don't want randomly large delays when
+	// calling edp_tick().  Can't do much about this except to have
+	// such apps run edp_tick() from a separate thread.
+#if RCI_VERBOSE
+	printf("RCI: got request length %lu\n", len);
+	#if RCI_VERBOSE > 2
+	mem_dump(data, (word)len);
+	#endif
+#endif
+
+	// This should be a registered #web variable.  It is set to '1' if
+	// <reboot> element present.
+	_RCI_Reboot = 0;
+
+	rr = (rciRequest __far *)_sys_calloc(sizeof(rciRequest));
+	if (!rr)
+		// No memory, can't do anything (not even an error reply!)
+		return;
+
+
+	// Set up for RWEB_XML tracker/parser
+	rr->wpx.wif = &rr->wif;
+	rr->wpx.wtp = &rr->wtp;
+	rr->wpx.cursor = &rr->wc;
+
+	rr->error_count = 0;
+
+	memset(&wrapper, 0, sizeof(wrapper));
+	wrapper.element = "rci_reply";
+	wrapper.attrArray[0] = "version";
+	wrapper.attrArray[1] = "1.1";
+	wrapper.index = 1;
+
+	/*
+	 * NOTE: the response must be generated by the SAX parser callbacks,
+	 * since we finish the reply immediately on return.
+	 */
+	// Allocate 1000 bytes, increment by 4000 if runs out.
+	if (!setjmp(jb)) {
+	   xmlGenMemory(&rr->gen, 1000, 4000, &rr, &wrapper, &jb);
+	   wrapper.startElement = rci_in_wrapper; // Initial callback
+	   #ifdef RCI_VERBOSE_XML
+	   printf("\x1b[34m==== RCI request ====\n");
+	   xmlDump(data, len, 0);
+	   printf("\x1b[0m\n");
+	   #endif
+	   rc = xmlSAXUserParseMemory(rr, data, len, &wrapper);
+	   if (rc)
+	      rci_base_error(rr,
+	         rc == -ENOMEM ? RCIERR_TEMP_RESOURCE : RCIERR_NOT_XML, 1, NULL, NULL);
+	   else {
+	      // XML parsed OK.  Do post-processing for *all* commands.
+	   }
+   	response = xmlFinishMemory(&rr->gen, &resp_len);
+	}
+	else {
+		// xmlGenMemory ran out of memory.  Try generating a 'temp resource'
+		// error.  If this too fails, then we're USCWOaP.
+	   if (!setjmp(jb)) {
+	      xmlGenMemory(&rr->gen, 256, 128, &rr, &wrapper, &jb);
+	      rci_base_error(rr, RCIERR_TEMP_RESOURCE, 1, NULL, NULL);
+   		response = xmlFinishMemory(&rr->gen, &resp_len);
+	   }
+		else {
+	#if RCI_VERBOSE
+   		printf("RCI: not enough memory even for error response!\n");
+	#endif
+			goto _bailout;
+		}
+	}
+
+
+   #ifdef RCI_VERBOSE_XML
+   printf("\x1b[32m==== RCI reply ====\n");
+   xmlDump(response + XML_GEN_HEADER, (word)(resp_len - XML_GEN_HEADER), 0);
+   printf("\x1b[0m\n");
+   #endif
+#if RCI_VERBOSE
+   printf("Request parsed OK, response length %ld\n", resp_len - XML_GEN_HEADER);
+   #if RCI_VERBOSE > 2
+   mem_dump(response + XML_GEN_HEADER, (word)(resp_len - XML_GEN_HEADER));
+   #endif
+   if (_RCI_Reboot)
+      printf("***** REBOOT! ******\n");
+#endif
+
+#ifdef HAVE_EDP
+   if (s) {
+      rci_send_response(s, response + XML_GEN_HEADER, resp_len - XML_GEN_HEADER);
+      if (_RCI_Reboot)
+         // Abort connection.  -1 code signals through to caller of edp_tick()
+         // that reboot requested (edp_tick return code will be  -NETERR_ABORT)
+         edp_close(s, -1);
+   }
+   else
+#endif
+#ifdef _RCI_DONE_REQUEST
+      _RCI_DONE_REQUEST(rr, response + XML_GEN_HEADER, resp_len - XML_GEN_HEADER);
+#else
+      ;
+#endif
+
+#if RCI_VERBOSE
+	printf("RCI: freeing response buffer at %08lX\n", response);
+#endif
+   _sys_free(response);
+_bailout:
+#ifdef IDIGI_USE_XBEE
+	if (rr->clist) {
+	#if RCI_VERBOSE
+		printf("RCI: freeing clist at %08lX\n", rr->clist);
+	#endif
+   	_sys_free(rr->clist);
+   }
+   if (rr->zb_queued) {
+	#if RCI_VERBOSE
+		printf("RCI: freeing zb_queued at %08lX\n", rr->zb_queued);
+	#endif
+   	_sys_free(rr->zb_queued);
+	}
+#endif
+	#if RCI_VERBOSE
+	printf("RCI: freeing rr at %08lX\n", rr);
+	#endif
+	_sys_free(rr);
+	#if RCI_VERBOSE
+	printf("RCI: done!\n");
+	#endif
+
+}
+
+
+/*** BeginHeader rci_in_wrapper */
+void rci_in_wrapper(xmlCtx __far * ctx, xmlSE __far * se);
+/*** EndHeader  */
+_rci_debug
+void rci_in_wrapper(xmlCtx __far * ctx, xmlSE __far * se)
+{
+	rciRequest __far * rr = (rciRequest __far *)ctx->userData;
+
+	if (!strcmp(se->element, "rci_request")) {
+#if RCI_VERBOSE
+		printf("RCI: got <rci_request>\n");
+#endif
+		// We should check the version, but let the chips fall where they may.
+		se->startElement = rci_in_rci_request;
+		se->endElement = rci_end_rci_command;
+	}
+	else
+		rci_base_error(rr, RCIERR_BAD_REQ, 1, NULL, NULL);
+
+}
+
+
+
+/*** BeginHeader _rci_get_rr_type */
+int _rci_get_rr_type(rciRequest __far * rr, xmlSE __far * se);
+
+#define _RCI_COMMANDS 8
+static const struct {
+	char * name;
+	int type;
+	char * desc;
+	char * varname;
+} _rci_commands[_RCI_COMMANDS] =
+{
+	{ "query_setting", RR_QUERY_SETTING, "Query setting command", "_RCI_Settings" },
+	{ "query_state", RR_QUERY_STATE, "Query state command", "_RCI_State" },
+	{ "query_descriptor", RR_QUERY_DESCRIPTOR, "Query descriptor command", NULL },
+	{ "set_setting", RR_SET_SETTING, "Set setting command", "_RCI_Settings" },
+	{ "set_state", RR_SET_STATE, "Set state command", "_RCI_State" },
+	{ "set_factory_default", RR_SET_FACTORY_DEFAULT, "Set factory default", "_RCI_Settings" },
+	{ "reboot", RR_REBOOT, "Reboot", "_RCI_Reboot" },
+	{ "do_command", RR_DO_COMMAND, "Execute function", NULL }
+};
+
+/*** EndHeader  */
+_rci_debug
+int _rci_get_rr_type(rciRequest __far * rr, xmlSE __far * se)
+{
+	int i;
+
+	for (i = 0; i < _RCI_COMMANDS; ++i)
+		if (!strcmp(se->element, _rci_commands[i].name)) {
+			rr->varname = _rci_commands[i].varname;
+			rr->desc = _rci_commands[i].desc;
+			return _rci_commands[i].type;
+		}
+	return 0;
+}
+
+
+/*** BeginHeader rci_in_rci_request */
+void rci_in_rci_request(xmlCtx __far * ctx, xmlSE __far * se);
+/*** EndHeader  */
+_rci_debug
+void rci_in_rci_request(xmlCtx __far * ctx, xmlSE __far * se)
+{
+	int rc;
+	rciRequest __far * rr = (rciRequest __far *)ctx->userData;
+	const char __far * av;
+
+#if RCI_VERBOSE
+	printf("RCI: got <%ls>\n", se->element);
+#endif
+
+	rr->type = _rci_get_rr_type(rr, se);
+
+	if (!rr->type) {
+		rci_base_error(rr, RCIERR_BAD_CMD, 1, NULL, se->element);
+		return;
+	}
+
+   if (rr->type == RR_REBOOT)
+      // Special case: set this flag (since reboot command has no data
+      // otherwise, and we don't have a means of simply detecting
+      // presence of an XML element)
+      _RCI_Reboot = 1;
+
+   // Get ready for generic parser
+   rr->wpx.start_level = -1;
+   rr->wpx.level = -1;
+	web_cursor_start(&rr->wc);
+
+	if (rr->varname) {
+		// Position cursor to start navigating appropriate struct.  We get a
+		// varname for all commands except query_descriptor.
+		rc = web_cursor_down(&rr->wc, rr->varname, 0);
+		if (rc) {
+			// This shouldn't happen unless #web declaration is missing
+			rci_base_error(rr, RCIERR_SPEC, 1, NULL, NULL);
+			return;
+		}
+	   rr->spec = "XX";	// eXternal, XML format
+	   if (rr->type == RR_QUERY_SETTING ||
+	       rr->type == RR_QUERY_STATE) {
+	   	rr->wif.parser_callback = _rci_rweb_xml_query;
+	      rr->source = RR_SOURCE_CURRENT;
+	   	if (rr->type == RR_QUERY_SETTING) {
+	         // Get "source" and "compare_to" attributes
+	         av = xmlAttrValue(se, "source");
+	         if (av) {
+	            if (!strcmp(av, "defaults") || !strcmp(av, "internal_defaults")) {
+	               rr->source = RR_SOURCE_DEFAULTS;
+	               rr->spec = "XXd";
+	            }
+	            else if (!strcmp(av, "stored")) {
+	               rr->source = RR_SOURCE_STORED;
+	               rr->spec = "XXs";
+	            }
+	         }
+	         av = xmlAttrValue(se, "compare_to");
+	         if (av) {
+	            if (!strcmp(av, "defaults") || !strcmp(av, "internal_defaults"))
+	               rr->compare_to = RR_COMPARE_DEFAULTS;
+	            else if (!strcmp(av, "stored"))
+	               rr->compare_to = RR_COMPARE_STORED;
+	            else if (!strcmp(av, "current"))
+	               rr->compare_to = RR_COMPARE_CURRENT;
+	            // Else assume to be non-compare.
+	         }
+			}
+			else {
+				// Is query state.  This is dynamic, so call updater function
+				_rci_data_update_state();
+			}
+	   }
+	   else {
+	   	if (rr->type == RR_SET_FACTORY_DEFAULT) {
+	   		// Set factory operates with similar semantics to query (i.e.
+	   		// empty elements are "filled in", and the request cannot fail
+	   		// for valid elements).
+            // Flag to save a backup of current config if not
+            // already running on backup.
+            rr->save_backup = !_RCI_State.device_stats.configUsed;
+	   		rr->wif.parser_callback = _rci_rweb_xml_query;
+	         rr->action = RR_ACTION_FACTORY;
+	         if (av = xmlAttrValue(se, "action")) {
+	            if (!strcmp(av, "revert"))
+	               rr->action = RR_ACTION_REVERT;
+	            // Else assume to be 'factory'.
+	         }
+	   	}
+	   	else {
+	   		rr->wif.parser_callback = _rci_rweb_xml_set;
+	   		if (rr->type == RR_SET_SETTING) {
+	   			// Flag to save a backup of current config if not
+	   			// already running on backup.
+	   			rr->save_backup = !_RCI_State.device_stats.configUsed;
+	   			rr->action = RR_ACTION_IMMEDIATE;
+	            if (av = xmlAttrValue(se, "action")) {
+	               if (!strcmp(av, "deferred"))
+	                  rr->action = RR_ACTION_DEFERRED;
+	               // Else assume to be 'immediate'.
+	            }
+	   		}
+	   	}
+	   }
+		se->startElement = _web_xml_start;
+		se->endElement = _web_xml_end;
+		se->characters = _web_xml_chars;
+	}
+	else {
+		// Must be query_descriptor or do_command.
+		// These are slightly irregular, so process with special routines.
+		if (rr->type == RR_DO_COMMAND) {
+      	_rci_exec_docmd(rr, se);
+   		return;
+		}
+		else {
+	      se->startElement = rci_in_query_descriptor;
+	      se->endElement = rci_end_query_descriptor;
+	      rr->qd_level = 0;
+	   }
+	}
+
+
+	// All of these create reply with same element name...
+	// We also echo the index, even though this should always default to '1'
+   xmlGenBeginElement(&rr->gen, se->element, se->index, (char __far *)NULL);
+}
+
+
+/*** BeginHeader _rci_exec_docmd */
+int _rci_exec_docmd(rciRequest __far * rr, xmlSE __far * se);
+/*** EndHeader  */
+int _rci_exec_docmd(rciRequest __far * rr, xmlSE __far * se)
+{
+	int rc;
+
+   // do_command is processed like a combination of set and query.
+   // The target is used to look up a table of registered targets.
+   // If found, then the table entry indicates a "request" and a
+   // "reply" web variable.  The request XML inside the do_command
+   // element is used to set the request variable using a normal
+   // transaction.  The update functions are expected to do the actual
+   // work of the command, including setting values in the reply
+   // variable.  On success, the reply variable is used to construct
+   // the response XML.
+   rr->target = xmlAttrValue(se, "target");
+   xmlGenBeginElement(&rr->gen, se->element, se->index,
+      (char __far *)"target", rr->target,
+      (char __far *)NULL);
+   rr->dct = _rci_find_target(rr->target);
+   if (rr->dct) {
+      // Found target
+      if (rr->dct->req_callback)
+         rc = rr->dct->req_callback(rr, se, RCIDCT_ASK_REQUEST);
+      else
+      	rc = 1;
+      if (rc && rr->dct->request) {
+         // Have request struct, navigate cursor to start point for request
+         rc = web_getvarinfo(rr->dct->request, &rr->wc, NULL, 0);
+         if (rc < 0 && rc != -EISDIR)
+            rci_base_error(rr, RCIERR_SPEC, 1, NULL, rr->dct->request);
+         else {
+            web_transaction_start(&rr->wtp);
+            web_transaction_set_group(&rr->wtp, RCI_GROUP);
+            rr->grp_level = 0;   // Don't exec transaction until end
+
+            rr->wif.parser_callback = _rci_rweb_xml_set;
+            se->startElement = _web_xml_start;
+            se->endElement = _web_xml_end;
+            se->characters = _web_xml_chars;
+         }
+      }
+      if (rr->dct->req_callback) {
+         rc = rr->dct->req_callback(rr, se, RCIDCT_START);
+         if (rc < 0)
+            rci_base_error(rr, RCIERR_DOCMD_ERR, 1, NULL,
+                  rr->target ? rr->target : (char __far *)"");
+      }
+   }
+   else
+      rci_base_error(rr, RCIERR_BAD_DOCMD, 1, NULL, rr->target);
+}
+
+
+
+/*** BeginHeader _rci_gen_element */
+void _rci_gen_element(rciRequest __far * rr);
+/*** EndHeader  */
+_rci_debug
+void _rci_gen_element(rciRequest __far * rr)
+{
+	char kbuf[198];
+	WebCursor_t wci;
+	WebCursor_t __far * wc = rr->wpx.cursor;
+	char __far * key;
+	int idx, len;
+
+	//web_name(wc, buf, sizeof(buf));
+	if (web_dimension(wc)) {
+		// Check if parent level is 'keyed'.  Remember current index,
+		// go up, check, then come back here.
+		idx = wc->idx[wc->level];
+		web_cursor_up(wc);
+		key = web_key(wc);
+		web_cursor_down(wc, NULL, idx);
+		if (key && web_key_value(wc, &wci, key) &&
+		    _web_format(&wci, kbuf, sizeof(kbuf), "XA") <= sizeof(kbuf))
+         xmlGenBeginElement(&rr->gen, wc->wsmi[wc->level]->name,
+            1, key, (char __far *)kbuf, (char __far *)NULL);
+		else
+	   	xmlGenBeginElement(&rr->gen, wc->wsmi[wc->level]->name,
+	   		wc->idx[wc->level]+1, (char __far *)NULL);
+	}
+	else
+	   xmlGenBeginElement(&rr->gen, wc->wsmi[wc->level]->name,
+	   	1, (char __far *)NULL);
+
+}
+
+
+/*** BeginHeader _rci_rweb_xml_query */
+int _rci_rweb_xml_query(WebParseX_t __far * wpj, int event,
+										const char __far * key, long idx);
+/*** EndHeader  */
+/* This callback called by the generic RWEB_XML parser for query-type commands.
+   The rule here is that we return everything in the hierarchy which is under
+   each element in the request, unless at least one child of that element was
+   asked for.
+*/
+_rci_debug
+int _rci_rweb_xml_query(WebParseX_t __far * wpj, int event,
+										const char __far * key, long idx)
+{
+	char name[_WEB_MAX_FQNLEN];
+	rciRequest __far * rr = (rciRequest __far *)wpj;	// This works because
+												 // WebParseX_t is first field of rciRequest
+	WebCursor_t __far * wc = wpj->cursor;
+	int rc;
+
+	switch (event) {
+	case WPJ_START_OBJECT :
+		if (wc->level > 0)
+			_rci_gen_element(rr);
+      if (wc->level == 0 && rr->type == RR_SET_FACTORY_DEFAULT) {
+#if RCI_VERBOSE
+         printf("==== Start SFD ====\n");
+#endif
+         web_transaction_start(&rr->wtp);
+         web_transaction_set_group(&rr->wtp, RCI_GROUP);
+      }
+
+		break;
+	case WPJ_END_OBJECT :
+		if (wc->level > 0)
+			xmlGenEndElement(&rr->gen, NULL);
+		break;
+	case WPJ_END_LEAF :
+		if (!wpj->skip) {
+			if (rr->type == RR_SET_FACTORY_DEFAULT)
+				_rci_set_factory(rr, 0);
+			else
+				_rci_gen_query_resp(rr);
+		}
+		break;
+	case WPJ_STRING :
+		// Shouldn't get char data.  Ignore it if given in query.
+		break;
+	case WPJ_KEY_IDX :
+      web_fqname(wc, name, sizeof(name));
+   	#if RCI_VERBOSE
+      printf("~~~~~~ tracked to %s\n", name);
+      #endif
+		break;
+	case WPJ_BAD_KEY :
+   	#if RCI_VERBOSE
+      printf("~~~~~~ BAD_KEY key=%ls\n", key);
+      #endif
+      rci_base_error(rr, RCIERR_FIELD_NOT_EXIST, 1, key, NULL);
+		break;
+	case WPJ_BAD_KEY_IDX :
+   	#if RCI_VERBOSE
+      printf("~~~~~~ BAD_KEY_IDX key=%ls idx=%ld\n", key, idx);
+      #endif
+      rci_base_error(rr, RCIERR_NO_INDEX, 1, key, NULL);
+		break;
+	case WPJ_BAD_KEY_MATCH:
+   	#if RCI_VERBOSE
+      printf("~~~~~~ BAD_KEY_MATCH key=%ls\n", key);
+      #endif
+      rci_base_error(rr, RCIERR_FIELD_NOT_EXIST, 1, key, NULL);
+		break;
+	}
+	return WPI_CONTINUE;
+}
+
+
+/*** BeginHeader _rci_rweb_xml_set */
+int _rci_rweb_xml_set(WebParseX_t __far * wpj, int event,
+										const char __far * key, long idx);
+/*** EndHeader  */
+/* This callback called by the generic RWEB_XML parser for set-type commands.
+   Since the entire transaction must be performed atomically, we cannot
+   build up the reply as we are parsing, since error cannot be determined
+   at this point.
+*/
+_rci_debug
+int _rci_rweb_xml_set(WebParseX_t __far * wpj, int event,
+										const char __far * key, long idx)
+{
+	char name[_WEB_MAX_FQNLEN];
+	rciRequest __far * rr = (rciRequest __far *)wpj;	// This works because
+												 // WebParseX_t is first field of rciRequest
+	WebCursor_t __far * wc = wpj->cursor;
+	int rc, d;
+	int wlvl = wpj->level;
+	char __far * grp_name;
+	char __far * msg;
+
+	switch (event) {
+	case WPJ_START_OBJECT :
+		if (wc->level > 0) {
+
+			d = web_next_dimension(wc);
+	      if (!d)
+				_rci_gen_element(rr);
+			if (!rr->wtp) {
+#if RCI_VERBOSE
+				printf("==== Processing group %ls (key=%ls)====\n", rr->element, key);
+#endif
+	   		web_transaction_start(&rr->wtp);
+         	web_transaction_set_group(&rr->wtp, RCI_GROUP);
+         	rr->grp_level = wc->level;
+			}
+		}
+		break;
+	case WPJ_END_OBJECT :
+		if (wc->level > 0) {
+			if (wc->level == rr->grp_level) {
+#if RCI_VERBOSE
+				printf("==== End of group (total errors %d) ====\n", rr->error_count);
+#endif
+	         // End of a set group
+	         if (!rr->error_count) {
+	         	if (rr->save_backup && !rr->done_backup) {
+                  // Save current as backup, since it's known good
+                  rci_save_stored(1);
+#if RCI_VERBOSE
+						printf("****** Saved stored to LKG  *******\n");
+#endif
+                  rr->done_backup = 1;
+	         	}
+	            rc = web_transaction_execute(&rr->wtp,
+	            		WTE_SET_SHADOW |
+	            		 (rr->action == RR_ACTION_DEFERRED ? WTE_NO_CURRENT : 0));
+	            if (rc) {
+#if RCI_VERBOSE
+						printf("### transaction failed rc=%d\n", rc);
+#endif
+						// Generate "post mortem" XML structure to indicate
+						// fields in error.
+						_rci_trans_trace(rr);
+	            }
+	            else {
+	            	if (rr->action == RR_ACTION_DEFERRED)
+	            		rr->set_change |= RCI_CHANGED_STORED;
+	            	else
+	            		rr->set_change |= RCI_CHANGED_CURRENT | RCI_CHANGED_STORED;
+	            }
+	         }
+	         web_transaction_free(&rr->wtp);
+			}
+			xmlGenEndElement(&rr->gen, NULL);
+		}
+		break;
+	case WPJ_END_LEAF :
+		if (wc->leaf_flag != 1)
+			break;
+		// If no string data seen before, then treat this as empty string.
+		// If not for this code, it would not be possible to set string values
+		// to empty.
+		idx = 0;	// zero length string
+		key = "";
+		// Fall through
+	case WPJ_STRING :
+		wc->leaf_flag = 2;	// Mark leaf as having been processed
+#if RCI_VERBOSE > 1
+	   if (web_parse_state2name(wpj, name, sizeof(name)) > 0)
+			printf("(%s=\"%.*ls\")\n", name, (int)idx, key);
+		else
+			printf("(%s=\"%.*ls\")\n", "???", (int)idx, key);
+#endif
+
+      if (!web_leaf(wc)) {
+      	// Spaces OK
+      	while (idx) {
+      		if (!isspace(*key)) {
+      #if RCI_VERBOSE
+               printf("#### attempted to assign data to non-scalar %ls\n", rr->element);
+      #endif
+               rci_base_error(rr, RCIERR_FIELD_AGGREGATE, 0, rr->element, NULL);
+               return WPI_CONTINUE;
+      		}
+      		--idx;
+      		++key;
+      	}
+         break;
+      }
+
+#if RCI_VERBOSE > 1
+      web_fqname(wc, name, sizeof(name));
+      printf("\nRCI set %s = %.*ls\n\n", name, (int)idx, key);
+#endif
+      rc = web_transaction_add(&rr->wtp, wc, key, 0, (int)idx);
+      if (rc) {
+#if RCI_VERBOSE
+			printf("  transaction add error code %d for %ls\n", rc, rr->element);
+#endif
+			_rci_gen_element(rr);
+			if (rc == -EINVAL) {
+				msg = web_transaction_message(&rr->wtp, wc, &rc, &grp_name);
+				rci_base_error(rr, rc, 1, NULL, NULL);
+			}
+			else
+				rci_base_error(rr, rc == -EACCES ? RCIERR_PERMISSION_DENIED
+				           : RCIERR_TEMP_RESOURCE, 1, NULL, NULL);
+			xmlGenEndElement(&rr->gen, NULL);
+      }
+
+		break;
+	case WPJ_KEY_IDX :
+#if RCI_VERBOSE > 1
+      web_fqname(wc, name, sizeof(name));
+      printf("~~~~~~ KEY_IDX key=%ls idx=%ld (tracked to %s)\n", key, idx, name);
+#endif
+      rr->element = key;
+		break;
+	case WPJ_BAD_KEY :
+#if RCI_VERBOSE
+      printf("~~~~~~ BAD_KEY key=%ls\n", key);
+#endif
+      rci_base_error(rr, RCIERR_FIELD_NOT_EXIST, 1, key, NULL);
+		break;
+	case WPJ_BAD_KEY_IDX :
+#if RCI_VERBOSE
+      printf("~~~~~~ BAD_KEY_IDX key=%ls idx=%ld\n", key, idx);
+#endif
+      rci_base_error(rr, RCIERR_NO_INDEX, 1, key, NULL);
+		break;
+	case WPJ_BAD_KEY_MATCH:
+#if RCI_VERBOSE
+      printf("~~~~~~ BAD_KEY_MATCH key=%ls\n", key);
+#endif
+      rci_base_error(rr, RCIERR_FIELD_NOT_EXIST, 1, key, NULL);
+		break;
+	}
+	return WPI_CONTINUE;
+}
+
+
+/*** BeginHeader _rci_trans_trace */
+void _rci_trans_trace(rciRequest __far * rr);
+/*** EndHeader  */
+_rci_debug
+void _rci_trans_trace(rciRequest __far * rr)
+{
+	// Generated XML position is inside <set_*><group> element.  We go through
+	// the transaction entries and generate error messages for any which
+	// failed.  To simplify the code, we don't optimize the XML: each error
+	// will create its own hierarchy.  The XML bloat is not so bad since
+	// errors should be relatively uncommon.
+	WebCursor_t wc;
+   WebTransEntry_t __far * we;
+	int __far * error_id;
+	int __far * bin_len;
+	void __far * newbin;
+	char __far * __far * error_msg;
+	char __far * __far * orig_str;
+	int __far * orig_len;
+	char __far * c;
+	char __far * e;
+	int rc, x;
+	int nest;
+	xmlCtx __far * gen = &rr->gen;
+
+   for (we = _web_trans_first(rr->wtp); we; we = _web_trans_next(rr->wtp, we)) {
+      _web_grok_wte_all(we, &error_id, &bin_len, &newbin,
+							&error_msg, &orig_str, &orig_len);
+      if (!*error_id || *error_id == -1)
+      	continue;
+      // We know we're already 2 levels down (group level) so traverse them
+      // quietly.
+      web_cursor_start(&wc);
+	   c = we->cname+1;
+	   e = we->cname + we->cname[0];
+	   while (c < e && wc.level < 1) {
+	      if (*c < 255)
+	      	x = *c++;
+	      else {
+	         x = *(int __far *)(c+1);
+	         c += 3;
+	      }
+         web_cursor_down(&wc, NULL, x);
+	   }
+
+		// Now keep going down, emitting XML elements
+		nest = 0;
+		while (c < e) {
+	      if (*c < 255)
+	      	x = *c++;
+	      else {
+	         x = *(int __far *)(c+1);
+	         c += 3;
+	      }
+         web_cursor_down(&wc, NULL, x);
+	      if (!web_next_dimension(&wc)) {
+				_rci_gen_element(rr);
+         	++nest;
+	      }
+
+		}
+
+		if (*error_id > 0) {
+			// Registered message
+			rci_registered_error(rr, *error_id, 1, &wc, NULL);
+		}
+		else {
+			// Was a custom message
+			rci_base_error(rr, *error_id, 1, NULL,
+				*error_id == -2 ? *error_msg : NULL);
+		}
+
+		// Close the elements
+		while (nest--)
+			xmlGenEndElement(gen, NULL);
+
+   }
+}
+
+/*** BeginHeader rci_end_rci_command */
+void rci_end_rci_command(xmlCtx __far * ctx, xmlSE __far * se);
+/*** EndHeader  */
+_rci_debug
+void rci_end_rci_command(xmlCtx __far * ctx, xmlSE __far * se)
+{
+	rciRequest __far * rr = (rciRequest __far *)ctx->userData;
+	WebCursor_t __far * wc = rr->wpx.cursor;
+	xmlCtx __far * gen = &rr->gen;
+	int i, rc;
+
+#if RCI_VERBOSE
+	printf("RCI: end of RCI command %ls\n", se->element);
+#endif
+	// Post-processing of command.
+	if (rr->type == RR_QUERY_SETTING ||
+	    rr->type == RR_QUERY_STATE) {
+		// Query command.  If there were no child elements, is a "give me
+		// everything" request.
+		if (!rr->wpx.chld[0]) {
+			// cursor will be back at starting level
+			_rci_gen_query_resp(rr);
+		}
+	}
+	else if (rr->type == RR_DO_COMMAND) {
+		// This was processed like a "set" command.  The request transaction
+		// has already been performed.  If successful, we now generate the
+		// equivalent of a query response.
+		if (!rr->error_count) {
+      	if (rr->wtp) {
+	         if (!rr->wpx.chld[0]) {
+	            // add dummy setting of presumed int variable to 0.
+	            web_transaction_add_by_name(&rr->wtp,
+	               rr->dct->request, NULL, WTA_BINARY, 0);
+	         }
+	         rc = web_transaction_execute(&rr->wtp, WTE_APPLY_UNCHANGED);
+         }
+         else
+         	rc = 0;
+         if (rc) {
+#if RCI_VERBOSE
+            printf("### transaction failed rc=%d\n", rc);
+#endif
+            _rci_trans_trace(rr);
+         }
+			else {
+         	if (rr->dct->req_callback) {
+            	rc = rr->dct->req_callback(rr, se, RCIDCT_END);
+               if (rc < 0)
+						rci_base_error(rr, RCIERR_DOCMD_ERR, 1, NULL, rr->target);
+            }
+	         if (rr->dct->req_callback)
+	            rc = rr->dct->req_callback(rr, se, RCIDCT_ASK_REPLY);
+	         else
+	            rc = 1;
+	         if (rc && rr->dct->reply) {
+	            rc = web_getvarinfo(rr->dct->reply, &rr->wc, NULL, 0);
+	            if (rc < 0 && rc != -EISDIR)
+	               rci_base_error(rr, RCIERR_SPEC, 1, NULL, rr->dct->reply);
+	            else
+	               _rci_gen_query_resp(rr);
+	         }
+         }
+		}
+      web_transaction_free(&rr->wtp);
+	}
+	else if (rr->type == RR_SET_FACTORY_DEFAULT) {
+		if (!rr->wpx.chld[0]) {
+   		web_transaction_start(&rr->wtp);
+	      web_transaction_set_group(&rr->wtp, RCI_GROUP);
+			_rci_set_factory(rr, 0);
+		}
+#if RCI_VERBOSE
+      printf("==== End of SFD (total errors %d) ====\n", rr->error_count);
+#endif
+      // End of a set group
+      if (!rr->error_count) {
+         if (rr->save_backup && !rr->done_backup) {
+            // Save current as backup, since it's known good
+            rci_save_stored(1);
+#if RCI_VERBOSE
+	 			printf("****** Saved stored to LKG  *******\n");
+#endif
+            rr->done_backup = 1;
+         }
+         // Don't execute guards when setting defaults, since defaults
+         // must be correct.  Because of this, no errors are possible.
+         web_transaction_execute(&rr->wtp, WTE_NO_GUARD_FUNC | WTE_SET_SHADOW |
+         		(rr->action == RR_ACTION_FACTORY ? WTE_NO_CURRENT : 0)
+         	);
+         if (rr->action == RR_ACTION_FACTORY)
+	      	rr->set_change |= RCI_CHANGED_STORED;
+	      else
+	      	rr->set_change |= RCI_CHANGED_CURRENT | RCI_CHANGED_STORED;
+			if (rr->action == RR_ACTION_FACTORY)
+				// This implies a reboot
+				_RCI_Reboot = 1;
+      }
+      web_transaction_free(&rr->wtp);
+	}
+	else if (rr->type == RR_QUERY_DESCRIPTOR) {
+		if (!rr->qd_level) {
+			// No children, so we are being asked for descriptor from the
+			// outermost (rci_request element) level.  In this level, we
+			// generate the base level error group, plus teaser descriptors
+			// for query_setting, set_state etc.
+	      xmlGenBeginElement(gen, "descriptor", 1,
+	      	(char __far *)"element", (char __far *)"rci_request",
+	      	(char __far *)"desc", (char __far *)"Remote Command Interface request",
+	      	(char __far *)NULL);
+
+	      _rci_gen_error_descriptor(gen, _web_base_errors);
+
+			for (i = 0; i < _RCI_COMMANDS; ++i) {
+				if (_rci_commands[i].type != RR_QUERY_DESCRIPTOR)
+	            xmlGenBeginEnd(gen, "descriptor", 1, NULL,
+	               (char __far *)"element", (char __far *)_rci_commands[i].name,
+	               (char __far *)"desc", (char __far *)_rci_commands[i].desc,
+	               (char __far *)"dscr_avail", (char __far *)"true",
+	               (char __far *)NULL);
+	      }
+
+			xmlGenEndElement(gen, NULL);
+		}
+	}
+
+	// Finally, action any changes
+	if (rr->set_change & RCI_CHANGED_STORED) {
+		// Stored settings updated, save to flash
+#ifdef HAVE_IDIGI
+		rci_save_stored(0);
+#endif
+#if RCI_VERBOSE
+		printf("****** Stored settings changed  *******\n");
+#endif
+	}
+	if (rr->set_change & RCI_CHANGED_CURRENT) {
+		// Current updated, notify network change
+#ifdef HAVE_IDIGI
+		idigi_notify_update_network();
+#endif
+#if RCI_VERBOSE
+		printf("****** Current settings changed *******\n");
+#endif
+	}
+}
+
+
+
+/*** BeginHeader _rci_gen_error_descriptor */
+void _rci_gen_error_descriptor(xmlCtx __far * gen, WebErrorList_t __far * elist);
+/*** EndHeader  */
+_rci_debug
+void _rci_gen_error_descriptor(xmlCtx __far * gen, WebErrorList_t __far * elist)
+{
+	int i;
+	char buf[20];
+
+   xmlGenBeginElement(gen, "error_group", 1,
+      (char __far *)"name", elist->group_name,
+      (char __far *)NULL);
+
+	for (i = 0; i < elist->n_msgs; ++i) {
+		sprintf(buf, "%d", elist->id + i);
+	   xmlGenBeginEnd(gen, "error_descriptor", 1, NULL,
+	      (char __far *)"id", (char __far *)buf,
+	      (char __far *)"desc", elist->msgs[i],
+	      (char __far *)NULL);
+	}
+
+	xmlGenEndElement(gen, NULL);
+}
+
+
+/*** BeginHeader _rci_rweb_xml_qd */
+int _rci_rweb_xml_qd(WebParseX_t __far * wpj, int event,
+										const char __far * key, long idx);
+/*** EndHeader  */
+/* This callback called by the generic RWEB_XML parser for query_descriptor commands.
+*/
+_rci_debug
+int _rci_rweb_xml_qd(WebParseX_t __far * wpj, int event,
+										const char __far * key, long idx)
+{
+	char name[_WEB_MAX_FQNLEN];
+	rciRequest __far * rr = (rciRequest __far *)wpj;	// This works because
+												 // WebParseX_t is first field of rciRequest
+	WebCursor_t __far * wc = wpj->cursor;
+	int rc;
+
+	rr->qd_level = 2;
+
+	switch (event) {
+	case WPJ_START_OBJECT :
+		if (wc->level > 0) {
+			xmlGenBeginElement(&rr->gen, "descriptor", 1,
+				(char __far *)"element", key,
+				(char __far *)"access", _rci_get_access(wc),
+				(char __far *)NULL);
+		}
+		break;
+	case WPJ_END_OBJECT :
+		if (wc->level > 0)
+			xmlGenEndElement(&rr->gen, NULL);
+		break;
+	case WPJ_END_LEAF :
+		if (!wpj->skip)
+			_rci_gen_qd_resp(rr, 0, _RCI_QD_RECURSE);
+		break;
+	case WPJ_STRING :
+		// Shouldn't get char data.  Ignore it if given in query.
+		break;
+	case WPJ_KEY_IDX :
+      web_fqname(wc, name, sizeof(name));
+      #if RCI_VERBOSE
+      printf("~~~~~~ tracked to %s\n", name);
+      #endif
+		break;
+	case WPJ_BAD_KEY :
+      #if RCI_VERBOSE
+      printf("~~~~~~ BAD_KEY key=%ls\n", key);
+      #endif
+      rci_base_error(rr, RCIERR_FIELD_NOT_EXIST, 1, key, NULL);
+		break;
+	case WPJ_BAD_KEY_IDX :
+      #if RCI_VERBOSE
+      printf("~~~~~~ BAD_KEY_IDX key=%ls idx=%ld\n", key, idx);
+      #endif
+      rci_base_error(rr, RCIERR_NO_INDEX, 1, key, NULL);
+		break;
+	case WPJ_BAD_KEY_MATCH:
+      #if RCI_VERBOSE
+      printf("~~~~~~ BAD_KEY_MATCH key=%ls\n", key);
+      #endif
+      rci_base_error(rr, RCIERR_FIELD_NOT_EXIST, 1, key, NULL);
+		break;
+	}
+	return WPI_CONTINUE;
+}
+
+
+
+
+/*** BeginHeader rci_in_query_descriptor */
+void rci_in_query_descriptor(xmlCtx __far * ctx, xmlSE __far * se);
+/*** EndHeader  */
+_rci_debug
+void rci_in_query_descriptor(xmlCtx __far * ctx, xmlSE __far * se)
+{
+	rciRequest __far * rr = (rciRequest __far *)ctx->userData;
+	int rep = _rci_get_rr_type(rr, se);
+	xmlCtx __far * gen = &rr->gen;
+	int rc;
+	int i;
+   const char __far * target;
+   int dim;
+
+	// First element level inside <query_descriptor>.  Must be an RCI command
+	// (except QD itself not allowed, to prevent recursion).
+	rr->qd_level = 1;
+
+	if (!rep || rep == RR_QUERY_DESCRIPTOR) {
+		rci_base_error(rr, RCIERR_BAD_CMD, 1, NULL, se->element);
+		return;
+	}
+
+   if (rep != RR_DO_COMMAND) {
+	   rc = web_cursor_down(&rr->wc, rr->varname, 0);
+	   if (rc) {
+	      // This shouldn't happen unless #web declaration is missing
+	      rci_base_error(rr, RCIERR_SPEC, 1, NULL, rr->varname);
+	   }
+	   else {
+	      xmlGenBeginElement(gen, "descriptor", 1,
+	         (char __far *)"element", (char __far *)se->element,
+	         (char __far *)"desc", (char __far *)rr->desc,
+	         (char __far *)"access", _rci_get_access(&rr->wc),
+	         (char __far *)NULL);
+
+	   	_rci_qs_attrs(rr, rep);
+
+	      rr->wif.parser_callback = _rci_rweb_xml_qd;
+	      se->startElement = _web_xml_start;
+	      se->endElement = _web_xml_end;
+	      se->characters = _web_xml_chars;
+	   }
+	}
+	else {
+   	target = xmlAttrValue(se, "target");
+      if (target) {
+      	// Have <query_descriptor><do_command target=...> i.e. want
+         // specific target descriptor.  Can supply this if request and
+         // reply are the same variable (hence conform to QD ability).
+         rr->dct = _rci_find_target(target);
+         if (rr->dct && (rr->dct->request || rr->dct->reply)) {
+	         xmlGenBeginElement(gen, (char __far *)se->element, 1,
+	            (char __far *)"target", target,
+	            (char __far *)NULL);
+            // For QD do_command with child element, the QD will only be
+            // successful if the child element is part of the request
+            // side of the do command.  The reply side can only be
+            // obtained with a more generic QD.  To fix this, would need to
+            // defer selecting the request or reply side until inside
+            // _rci_rweb_xml_qd(), since we don't yet know what the
+            // child QD element is.
+            if (rr->dct->request) {
+	            rc = web_cursor_down(&rr->wc, rr->dct->request, 0);
+	            if (rc) {
+	               // This shouldn't happen unless #web declaration is missing
+	               rci_base_error(rr, RCIERR_SPEC, 1, NULL, rr->dct->request);
+	            }
+	            else {
+	               rr->wif.parser_callback = _rci_rweb_xml_qd;
+	               se->startElement = _web_xml_start;
+	               se->endElement = _web_xml_end;
+	               se->characters = _web_xml_chars;
+	            }
+            }
+	      	rr->qd_level = 3;
+      /*
+            // Send back the request structure followed by the reply
+            // (unless request and reply are the same).
+            if (dct->request) {
+	            rc = web_cursor_down(&rr->wc, dct->request, 0);
+	            if (rc) {
+	               // This shouldn't happen unless #web declaration is missing
+	               rci_base_error(rr, RCIERR_SPEC, 1, NULL, dct->request);
+	            }
+	            else {
+	               rc = web_cursor_down(&rr->wc, NULL, 0);
+                  if (!rc) {
+	                  dim = web_dimension(&rr->wc);
+	                  do {
+	                     _rci_gen_qd_resp(rr, 0, _RCI_QD_RECURSE); // set to 0 when iDigi works
+	                  } while (!dim && !web_cursor_next(&rr->wc));
+	                  web_cursor_up(&rr->wc);
+                  }
+	               web_cursor_up(&rr->wc); // Back to root
+	            }
+            }
+            if (dct->reply && (!dct->request || strcmp(dct->reply, dct->request))) {
+	            rc = web_cursor_down(&rr->wc, dct->reply, 0);
+	            if (rc) {
+	               // This shouldn't happen unless #web declaration is missing
+	               rci_base_error(rr, RCIERR_SPEC, 1, NULL, dct->reply);
+	            }
+	            else {
+	               rc = web_cursor_down(&rr->wc, NULL, 0);
+                  if (!rc) {
+	                  dim = web_dimension(&rr->wc);
+	                  do {
+	                     _rci_gen_qd_resp(rr, 0, _RCI_QD_RECURSE); // set to 0 when iDigi works
+	                  } while (!dim && !web_cursor_next(&rr->wc));
+	                  web_cursor_up(&rr->wc);
+                  }
+	               web_cursor_up(&rr->wc); // Back to root
+	            }
+            }
+	      	xmlGenEndElement(gen, (char __far *)se->element);
+	      	rr->qd_level = 2;
+      */
+         }
+         else {
+         	// QD of a target not found or not applicable
+				rci_base_error(rr, RCIERR_DOCMD_NO_QD, 1, NULL, target);
+	      	rr->qd_level = 2;
+         }
+      }
+		else {
+      	// Have general <query_descriptor><do_command>
+			// do_command is irregular, generate descriptor "manually".
+	      xmlGenBeginElement(gen, "descriptor", 1,
+	         (char __far *)"element", (char __far *)se->element,
+	         (char __far *)"desc", (char __far *)rr->desc,
+	         (char __far *)NULL);
+	      xmlGenBeginElement(gen, "attr", 1,
+	         (char __far *)"name", (char __far *)"target",
+	         (char __far *)"desc", (char __far *)"Target function name",
+	         (char __far *)"type", (char __far *)"string",
+	         (char __far *)NULL);
+	      // Add generic '*' entry since other targets can be registered
+	      // at run-time.
+	      xmlGenBeginEnd(gen, "value", 1, NULL,
+	         (char __far *)"value", (char __far *)"*",
+	         (char __far *)"desc", (char __far *)"Command sent to dynamically registered target by this name",
+	         (char __far *)NULL);
+	      // Loop through targets which are registered at this time, adding
+	      // "value" elements for each.  It is best to have all targets registered
+	      // before query_descriptor commands can be processed, so the user
+	      // interface has the best possible information.
+	      for (i = 0; i < IDIGI_MAX_TARGETS; ++i) {
+         	rr->dct = _rci_dct_table + i;
+	         if (!rr->dct->name)
+	            continue;
+	         xmlGenBeginEnd(gen, "value", 1, NULL,
+	            (char __far *)"value", rr->dct->name,
+	            (char __far *)"desc", rr->dct->desc,
+	            // Descriptor only available where request or reply are specified
+	            (char __far *)"dscr_avail",
+	               rr->dct->request || rr->dct->reply ?
+	                  (char __far *)"true" : (char __far *)NULL,
+	            (char __far *)NULL);
+
+	      }
+	      xmlGenEndElement(gen, "descriptor");
+	      rr->qd_level = 2;
+      }
+	}
+}
+
+
+/*** BeginHeader rci_end_query_descriptor */
+void rci_end_query_descriptor(xmlCtx __far * ctx, xmlSE __far * se);
+/*** EndHeader  */
+_rci_debug
+void rci_end_query_descriptor(xmlCtx __far * ctx, xmlSE __far * se)
+{
+	rciRequest __far * rr = (rciRequest __far *)ctx->userData;
+	xmlCtx __far * gen = &rr->gen;
+	RCIDCT_t __far * dct;
+	int rc;
+	int dim;
+
+	if (rr->qd_level == 1) {
+		// There were no children of outermost QD command request.
+		// We just got e.g. <qd><query_setting/></qd>
+   	rc = web_cursor_down(&rr->wc, NULL, 0);
+   	dim = web_dimension(&rr->wc);
+   	if (!rc) {
+	      do {
+	         _rci_gen_qd_resp(rr, 0, _RCI_QD_RECURSE);	// set to 0 when iDigi works
+	      } while (!dim && !web_cursor_next(&rr->wc));
+	      web_cursor_up(&rr->wc);
+		}
+	   web_cursor_up(&rr->wc);	// Back to root (in case another top-level request follows)
+	}
+   else if (rr->dct && rr->qd_level == 3) {
+   	// No children under <qd><do_command target=...>
+      dct = rr->dct;
+      if (dct && (dct->request || dct->reply)) {
+         xmlGenBeginElement(gen, "do_command", 1,
+            (char __far *)"target", dct->name,
+            (char __far *)NULL);
+         // Send back the request structure followed by the reply
+         // (unless request and reply are the same).
+         if (dct->request) {
+            /* rc = web_cursor_down(&rr->wc, dct->request, 0);
+            if (rc) {
+               // This shouldn't happen unless #web declaration is missing
+               rci_base_error(rr, RCIERR_SPEC, 1, NULL, dct->request);
+            }
+            else */ {
+               rc = web_cursor_down(&rr->wc, NULL, 0);
+               if (!rc) {
+                  dim = web_dimension(&rr->wc);
+                  do {
+                     _rci_gen_qd_resp(rr, 0, _RCI_QD_RECURSE); // set to 0 when iDigi works
+                  } while (!dim && !web_cursor_next(&rr->wc));
+                  web_cursor_up(&rr->wc);
+               }
+               web_cursor_up(&rr->wc); // Back to root
+            }
+         }
+         if (dct->reply && (!dct->request || strcmp(dct->reply, dct->request))) {
+            rc = web_cursor_down(&rr->wc, dct->reply, 0);
+            if (rc) {
+               // This shouldn't happen unless #web declaration is missing
+               rci_base_error(rr, RCIERR_SPEC, 1, NULL, dct->reply);
+            }
+            else {
+               rc = web_cursor_down(&rr->wc, NULL, 0);
+               if (!rc) {
+                  dim = web_dimension(&rr->wc);
+                  do {
+                     _rci_gen_qd_resp(rr, 0, _RCI_QD_RECURSE); // set to 0 when iDigi works
+                  } while (!dim && !web_cursor_next(&rr->wc));
+                  web_cursor_up(&rr->wc);
+               }
+               web_cursor_up(&rr->wc); // Back to root
+            }
+         }
+         xmlGenEndElement(gen, NULL);
+      }
+   }
+
+   xmlGenEndElement(&rr->gen, NULL);
+}
+
+
+/*** BeginHeader rci_in_do_command */
+void rci_in_do_command(xmlCtx __far * ctx, xmlSE __far * se);
+/*** EndHeader  */
+_rci_debug
+void rci_in_do_command(xmlCtx __far * ctx, xmlSE __far * se)
+{
+}
+
+/*** BeginHeader rci_end_do_command */
+void rci_end_do_command(xmlCtx __far * ctx, xmlSE __far * se);
+/*** EndHeader  */
+_rci_debug
+void rci_end_do_command(xmlCtx __far * ctx, xmlSE __far * se)
+{
+}
+
+/*** BeginHeader _rci_gen_attrs */
+void _rci_gen_attrs(rciRequest __far * rr);
+/*** EndHeader  */
+_rci_debug
+void _rci_gen_attrs(rciRequest __far * rr)
+{
+	char buf[33];
+	int rc;
+	int have_strx = 0;
+	WebMetadata_t __far * meta;
+
+	if (web_dimension(&rr->wc)) {
+      // In general, for arrays of struct we support using the first string
+      // member's name as an attribute, to allow string-matching selection
+      // as well as indexing.  (We actually are more general than this, but
+      // only advertise a limited subset for QD).
+      // If we have such an "indexing string", then the default for the
+      // index attribute becomes "" (otherwise it is "1").
+      //DEVIDEA: could require a special metadata flag to enable this for
+      // a field, however this simple rule works OK for now.
+      if (!web_cursor_down(&rr->wc, NULL, 0)) {
+         if (web_type(&rr->wc) == _DK_TSTRING) {
+            web_name(&rr->wc, buf, sizeof(buf));
+            meta = web_metadata(&rr->wc);
+            xmlGenBeginEnd(&rr->gen, "attr", 1, NULL,
+               (char __far *)"name", (char __far *)buf,
+               (char __far *)"desc", meta && meta->desc ? meta->desc :
+               				(char __far *)"Item name key",
+               (char __far *)"type", meta && meta->extrep ? meta->extrep->name :
+               				(char __far *)"string",
+               (char __far *)"default", (char __far *)"",
+               (char __far *)NULL);
+            have_strx = 1;
+         }
+      	web_cursor_up(&rr->wc);
+	   }
+
+		sprintf(buf, "%d", web_dimension(&rr->wc));
+      xmlGenBeginEnd(&rr->gen, "attr", 1, NULL,
+         (char __far *)"name", (char __far *)"index",
+         (char __far *)"desc", (char __far *)"List entry selector",
+         (char __far *)"type", (char __far *)"uint32",
+         (char __far *)"min", (char __far *)"1",
+         (char __far *)"max", (char __far *)buf,
+         (char __far *)"default", have_strx ? (char __far *)"" : (char __far *)"1",
+         (char __far *)NULL);
+
+	}
+}
+
+
+/*** BeginHeader rci_send_response */
+void rci_send_response(EDP __far * s, char __far * data, longword len);
+/*** EndHeader  */
+_rci_debug
+void rci_send_response(EDP __far * s, char __far * data, longword len)
+{
+	// Send response in min(TCP segment size,buffer size) - 16 chunks.
+	// Unfortunately, this blocks until the entire message is sent.
+	// ***NOTE*** : data[-6] must be accessible, since we need to add
+	// a header.  Also, we trash some of the rest of the buffer when
+	// we need to add header opcodes.
+	word chunk;
+	word a;
+	int rc;
+	int done;
+
+	chunk = u_min(s->tport->mss, s->tport->app_wr->maxlen) - 16;
+
+	// Construct RCI response header
+	data[-6] = RCI_COMMAND_REPLY_START;
+	data[-5] = 0;	// no compression
+	*(longword __far *)(data-4) = htonl(len);
+	a = (word)ulong_min(len, chunk);
+	do {
+   	idigi_block_tick();
+		rc = edp_send_fac(s, EDP_FACILITY_RCI, data-6, a+6);
+	} while (rc == -EAGAIN);
+	if (rc)
+		return;
+	done = (longword)a == len;
+	while (!done) {
+		data += a;
+		len -= a;
+		a = (word)ulong_min(len, chunk);
+		done = (longword)a == len;
+		data[-1] = done ? RCI_COMMAND_REPLY_END : RCI_COMMAND_REPLY_DATA;
+	   do {
+   		idigi_block_tick();
+	      rc = edp_send_fac(s, EDP_FACILITY_RCI, data-1, a+1);
+	   } while (rc == -EAGAIN);
+	   if (rc)
+	      return;
+	}
+
+}
+
+/*** BeginHeader _rci_iface_type_conditional */
+int _rci_iface_type_conditional(WebCursor_t __far * wc, char __far * c);
+/*** EndHeader  */
+_rci_debug
+int _rci_iface_type_conditional(WebCursor_t __far * wc, char __far * c)
+{
+	char __far * name;
+	int eth, wln, ppp;
+	// Conditions are
+	//  "A" : any interface name
+	//  "a" : eth or wln
+	//  "e" : eth<x>
+	//  "w" : wln<x>
+	//  "p" : ppp<x>
+	//  "U" : wln with WEP enabled
+	//  "V" : wln with EAP enabled
+	//  "W" : wln with WPA PSK enabled
+
+	// Locate name field
+	web_cursor_up(wc);
+	web_cursor_down(wc, "name", 0);
+	name = web_loc(wc);
+	eth = !memcmp(name, "eth", 3);
+	wln = !memcmp(name, "wln", 3);
+	ppp = !memcmp(name, "ppp", 3);
+	switch (*c) {
+		case 'A' : return *name != 0;
+		case 'a' : return eth || wln;
+		case 'e' : return eth;
+		case 'p' : return ppp;
+		case 'U' : // currently always get WEP, so fall through
+		#ifdef WIFI_USE_WPA
+		case 'W' :
+		#endif
+		#ifdef WPA_USE_EAP
+		case 'V' :
+		#endif
+		case 'w' : return wln;
+		default : return 0;
+	}
+}
+
+/*** BeginHeader _rci_hide_conditional */
+int _rci_hide_conditional(WebCursor_t __far * wc, char __far * c);
+/*** EndHeader  */
+_rci_debug
+int _rci_hide_conditional(WebCursor_t __far * wc, char __far * c)
+{
+	char __far * name;
+	// Conditions are
+	//  "p" : have PPP
+	//  "r" : have router
+	//  "k" : have TCP keepalives
+	//  "z" : have Zigbee/XBee
+	//  "f" : have filesystem
+	// etc.
+#ifdef IDIGI_PPP_IFACE
+	if (!strcmp(c, "p"))
+		return 1;
+#endif
+#ifdef IDIGI_USE_XBEE
+	if (!strcmp(c, "z"))
+		return 1;
+#endif
+#ifdef IDIGI_USE_FAT
+	if (!strcmp(c, "f"))
+		return 1;
+#endif
+	// Nothing else exists yet
+	return 0;
+}
+
+/*** BeginHeader rci_init */
+int rci_init(void);
+/*** EndHeader  */
+_rci_debug
+int rci_init(void)
+{
+	int rc;
+
+	web_register_conditional("iface_type", _rci_iface_type_conditional);
+	web_register_conditional("hide", _rci_hide_conditional);
+
+	web_register_metadata(RCI_json);
+#ifdef CUSTOM_RCI_SETTINGS
+	web_register_metadata(RCI_custom_settings_json);
+#endif
+#ifdef CUSTOM_RCI_STATE
+	web_register_metadata(RCI_custom_state_json);
+#endif
+
+#ifdef IDIGI_USE_XBEE
+	rc = _rci_xbee_init();
+	#if RCI_VERBOSE
+	if (rc)
+		printf("rci_init: _rci_xbee_init() failed, rc=%d\n", rc);
+	#endif
+	if (rc)
+		return rc;
+#endif
+
+	rc = web_init();
+#if RCI_VERBOSE
+	if (rc)
+		printf("rci_init: web_init() failed, rc=%d\n", rc);
+#endif
+	if (rc)
+		return rc;
+	rc = rci_data_init();
+#if RCI_VERBOSE
+	if (rc)
+		printf("rci_init: rci_data_init() failed, rc=%d\n", rc);
+#endif
+	return rc;
+}
+
+/*** BeginHeader rci_base_error */
+void rci_base_error(rciRequest __far * rr, int error_id,
+				int send_desc, const char __far * wrapped_in, const char __far * hint);
+/*** EndHeader  */
+_rci_debug
+void rci_base_error(rciRequest __far * rr, int error_id,
+				int send_desc, const char __far * wrapped_in, const char __far * hint)
+{
+	char num[10];
+	int hint_num;
+	int send_hint_num = 0;
+	xmlCtx __far * gen = &rr->gen;
+
+	++rr->error_count;
+
+	if (error_id < 1 ||
+			error_id >= _web_base_errors->id+_web_base_errors->n_msgs) {
+		hint_num = error_id;
+		send_desc = 1;
+		if (error_id == -2)
+			error_id = RCIERR_CUST_STRING;
+		else {
+			error_id = RCIERR_CUST_ID;
+			send_hint_num = 1;
+		}
+	}
+	sprintf(num, "%d", error_id);
+	if (wrapped_in)
+		xmlGenBeginElement(gen, wrapped_in, 1, (char __far *)NULL);
+	xmlGenBeginElement(gen, "error", 1,
+			(char __far *)"id", (char __far *)num,
+			(char __far *)"from", _web_base_errors->group_name,
+			(char __far *)NULL);
+	if (send_desc)
+		xmlGenBeginEndSimple(gen, "desc",
+			_web_base_errors->msgs[error_id - _web_base_errors->id]);
+	if (send_hint_num)
+		xmlGenBeginEndSimpleInt(gen, "hint", hint_num);
+	if (hint)
+		xmlGenBeginEndSimple(gen, "hint", hint);
+	xmlGenEndElement(gen, "error");
+	if (wrapped_in)
+		xmlGenEndElement(gen, NULL);
+}
+
+
+/*** BeginHeader rci_registered_error */
+void rci_registered_error(rciRequest __far * rr, int error_id,
+				int send_desc, WebCursor_t __far * wc, char __far * hint);
+/*** EndHeader  */
+_rci_debug
+void rci_registered_error(rciRequest __far * rr, int error_id,
+				int send_desc, WebCursor_t __far * wc, char __far * hint)
+{
+	char num[10];
+	char __far * msg;
+	char __far * grp;
+	xmlCtx __far * gen = &rr->gen;
+
+
+	if (error_id >= 1 &&
+	    error_id < _web_base_errors->id+_web_base_errors->n_msgs) {
+		rci_base_error(rr, error_id, 0, NULL, hint);
+		return;
+	}
+
+	msg = web_error_string(wc, error_id, &grp);
+	if (!msg) {
+		// Not a registered error, turn into custom.
+		rci_base_error(rr, error_id, 0, NULL, hint);
+		return;
+	}
+
+	++rr->error_count;
+
+	sprintf(num, "%d", error_id);
+
+	xmlGenBeginElement(gen, "error", 1,
+			(char __far *)"id", (char __far *)num,
+			(char __far *)"from", grp,
+			(char __far *)NULL);
+	if (send_desc)
+		xmlGenBeginEndSimple(gen, "desc", msg);
+	if (hint)
+		xmlGenBeginEndSimple(gen, "hint", hint);
+	xmlGenEndElement(gen, "error");
+}
+
+/*** BeginHeader _rci_set_factory */
+void _rci_set_factory(rciRequest __far * rr, int idx);
+/*** EndHeader  */
+_rci_debug
+void _rci_set_factory(rciRequest __far * rr, int idx)
+{
+	int rc, i, d;
+	WebCursor_t __far * wc = rr->wpx.cursor;
+	xmlCtx __far * gen = &rr->gen;
+
+	// Note that only fields which are writable by RCI will be set back to
+	// defaults.
+
+	if (web_leaf(wc)) {
+		if (web_writable(wc, RCI_GROUP)) {
+	      rc = web_transaction_add(&rr->wtp, wc, web_default(wc), WTA_BINARY, 0);
+	      if (rc)
+	         rci_base_error(rr, RCIERR_TEMP_RESOURCE, 1, NULL, NULL);
+		}
+	}
+	else if (d = web_next_dimension(wc)) {
+		web_cursor_down(wc, NULL, 0);
+		for (i = 0; i < d; ++i) {
+			_rci_set_factory(rr, i);
+			web_cursor_next(wc);
+		}
+		web_cursor_up(wc);
+	}
+	else {
+		if (wc->level) {
+			// First level is exceptional because of the name mangling
+			// e.g. query_state corresponds to _RCI_State
+			_rci_gen_element(rr);
+		}
+		web_cursor_down(wc, NULL, 0);
+		do {
+			_rci_set_factory(rr, 0);
+		} while (!web_cursor_next(wc));
+		web_cursor_up(wc);
+		if (wc->level)
+			xmlGenEndElement(gen, NULL);
+	}
+}
+
+/*** BeginHeader _rci_gen_query_resp */
+int _rci_gen_query_resp(rciRequest __far * rr);
+/*** EndHeader  */
+_rci_debug
+int _rci_gen_query_resp(rciRequest __far * rr)
+{
+	char __far * buf2;
+	void __far * vs;
+	void __far * vc;
+	int i, d, len, nc;
+	WebCursor_t __far * wc = rr->wpx.cursor;
+	xmlCtx __far * gen = &rr->gen;
+
+	if (!web_test(wc))
+		return 0;
+
+	if (web_leaf(wc)) {
+		if (!web_readable(wc, RCI_GROUP))
+			return 0;
+		len = web_size(wc);
+		if (rr->compare_to && rr->compare_to != rr->source) {
+			// Only return if different from comparand
+			switch (rr->source) {
+	         case RR_SOURCE_DEFAULTS:
+	         case RR_SOURCE_IDEFAULTS: vs = web_default(wc); break;
+	         case RR_SOURCE_STORED: vs = web_shadow(wc); break;
+	         default: vs = web_loc(wc); break;
+			}
+			switch (rr->compare_to) {
+	         case RR_COMPARE_DEFAULTS:
+	         case RR_COMPARE_IDEFAULTS: vc = web_default(wc); break;
+	         case RR_COMPARE_STORED: vc = web_shadow(wc); break;
+	         default: vc = web_loc(wc); break;
+			}
+			if (!vc && !vs)
+				// No source or compare value.  Both are considered to be
+				// zeros, hence must be equal!
+				return 0;
+			else if (!vc) {
+				// No compare value, so compare to binary zeros
+				for (i = 0; i < len; ++i)
+					if (((char __far *)vs)[i])
+						break;
+				if (i == len)
+					return 0;
+			}
+			else if (!vs) {
+				// No source, so consider it to be all zeros
+				for (i = 0; i < len; ++i)
+					if (((char __far *)vc)[i])
+						break;
+				if (i == len)
+					return 0;
+			}
+			else {
+				if (!memcmp(vs, vc, len))
+					return 0;
+			}
+		}
+		_rci_gen_element(rr);
+	   len = xmlGenBuffer(gen, &buf2);
+		i = _web_format(wc, buf2, len, rr->spec);
+		while (i > len) {
+			_xmlExpandBuf(gen);
+	   	len = xmlGenBuffer(gen, &buf2);
+			i = _web_format(wc, buf2, len, rr->spec);
+		}
+		gen->cur += strlen(gen->cur);
+		xmlGenEndElement(gen, NULL);
+		return 1;
+	}
+
+	nc = 0;
+	if (d = web_next_dimension(wc)) {
+		web_cursor_down(wc, NULL, 0);
+		for (i = 0; i < d; ++i) {
+			nc += _rci_gen_query_resp(rr);
+			web_cursor_next(wc);
+		}
+		web_cursor_up(wc);
+	}
+	else {
+		if (wc->level) {
+			// 0th level is exceptional because of the name mangling
+			// e.g. query_state corresponds to _RCI_State.
+			// Only generate the wrapper elements for inner levels...
+			_rci_gen_element(rr);
+
+		}
+		web_cursor_down(wc, NULL, 0);
+		do {
+			nc += _rci_gen_query_resp(rr);
+		} while (!web_cursor_next(wc));
+		web_cursor_up(wc);
+		if (wc->level) {
+			if (nc)
+				xmlGenEndElement(gen, NULL);
+			else
+				xmlGenDiscardElement(gen, NULL);
+		}
+	}
+	return nc;
+}
+
+
+/*** BeginHeader _rci_get_access */
+char __far * _rci_get_access(WebCursor_t __far * wc);
+/*** EndHeader  */
+_rci_debug
+char __far * _rci_get_access(WebCursor_t __far * wc)
+{
+	int w, r;
+   if (web_access_inherited(wc, RCI_GROUP))
+      return NULL;
+   w = web_writable(wc, RCI_GROUP);
+   r = web_readable(wc, RCI_GROUP);
+   if (w && r)
+      return "read_write";
+   if (r)
+      return "read_only";
+   if (w)
+      return "write_only";
+   return "none";
+}
+
+/*** BeginHeader _rci_gen_qd_resp */
+void _rci_gen_qd_resp(rciRequest __far * rr, int dim, int lev_ctr);
+/*** EndHeader  */
+_rci_debug
+void _rci_gen_qd_resp(rciRequest __far * rr, int dim, int lev_ctr)
+{
+	char buf[33];
+	char minbuf[20];
+	char maxbuf[20];
+	int i, d, stride, dscr_avail;
+	_Web_Select16 * sel;
+	WebCursor_t __far * wc = rr->wpx.cursor;
+	xmlCtx __far * gen = &rr->gen;
+	WebMetadata_t __far * meta;
+	char __far * dflt;
+	char __far * type;
+	char __far * access;
+
+	meta = web_metadata(wc);
+   // If there is a custom callback, and the callback returns success,
+   // then skip the following processing since the callback is responsible
+   // for generating the XML for this branch.
+	if (meta && meta->cond && meta->cond->cust &&
+   		!meta->cond->cust(wc, RR_QUERY_DESCRIPTOR, gen))
+   	return;
+
+	if (web_leaf(wc)) {
+		web_name(wc, buf, sizeof(buf));
+
+		if (meta) {
+			if (dim)
+				type = "list";
+			else if (meta->extrep)
+				type = meta->extrep->name;
+			else
+				type = NULL;
+			dflt = _rci_format_default(wc);
+			access = _rci_get_access(wc);
+			if (access && *access=='n')
+				return;	// No access at all, don't indicate in descriptor.
+							//DEVIDEA: in this case, should remove parent elements
+							// which end up having no accessible children.
+	      xmlGenBeginElement(gen, meta->flags & WM_ATTRIBUTE ? "attr" : "element", 1,
+	         (char __far *)"name", (char __far *)buf,
+	         (char __far *)"type", type,
+	         (char __far *)"desc", meta->desc,
+	         (char __far *)"min", _rci_format_minmax(meta, minbuf,
+	         							meta->flags & WM_HAVE_MIN_F, meta->min.l),
+	         (char __far *)"max", _rci_format_minmax(meta, maxbuf,
+	         							meta->flags & WM_HAVE_MAX_F, meta->max.l),
+	         (char __far *)"access", access,
+	         (char __far *)"default", dflt,
+	         (char __far *)NULL);
+	      if (dflt)
+	      	_web_free(dflt);
+	      if (meta->select.ptr16) {
+	      	// Assume extrep is enum or enum_multi...
+				stride = web_size(wc) < 3 ? sizeof(_Web_Select16) : sizeof(_Web_Select32);
+				for (sel = meta->select.ptr16; sel->name;
+						sel = (_Web_Select16 *)((char *)sel + stride))
+					xmlGenBeginEnd(gen, "value", 1, NULL,
+						(char __far *)"value", (char __far *)sel->name,
+	         		(char __far *)NULL);
+
+	      }
+			_rci_gen_attrs(rr);
+			if (meta->errs)
+	      	_rci_gen_error_descriptor(gen, meta->errs);
+
+	      xmlGenEndElement(gen, NULL);
+
+		}
+	}
+	else if (d = web_next_dimension(wc)) {
+		web_cursor_down(wc, NULL, 0);
+		_rci_gen_qd_resp(rr, d, lev_ctr);
+		web_cursor_up(wc);
+	}
+	else {
+		d = web_dimension(wc);
+		dscr_avail = lev_ctr <= 0;
+		if (wc->level) {
+			// First level is exceptional because of the name mangling
+			// e.g. query_state corresponds to _RCI_State
+	      web_name(wc, buf, sizeof(buf));
+			meta = web_metadata(wc);
+			// For now, we use this heuristic to decide whether to use a descriptor
+			// level, or an element level.  The difference is that a descriptor
+			// creates a new data entry panel in the iDigi UI, whereas an element
+			// with nested elements simply creates a set of fields in the parent
+			// panel.
+			// The heuristic is that we use elements on levels deeper than the 2nd.
+			// (Previous version used descriptors for all non-leaf nodes, however
+			// this made the UI ugly).
+			// This should really be controlled by a metadata item.
+			//printf(">>>>>>> At level %d generating '%s' <<<<<<<\n", wc->level, buf);
+			if (wc->level > 1 + (dim != 0))
+	         xmlGenBeginElement(gen, "element", 1,
+	            (char __far *)"name", (char __far *)buf,
+	            (char __far *)"desc", meta ? meta->desc : (char __far *)NULL,
+	            (char __far *)"access", _rci_get_access(wc),
+	            (char __far *)"dscr_avail", dscr_avail ? (char __far *)"true" : (char __far *)NULL,
+	            (char __far *)"type", dim ? (char __far *)"list" : (char __far *)NULL,
+	            (char __far *)NULL);
+			else
+	         xmlGenBeginElement(gen, "descriptor", 1,
+	            (char __far *)"element", (char __far *)buf,
+	            (char __far *)"desc", meta ? meta->desc : (char __far *)NULL,
+	            (char __far *)"access", _rci_get_access(wc),
+	            (char __far *)"dscr_avail", dscr_avail ? (char __far *)"true" : (char __far *)NULL,
+	            (char __far *)NULL);
+		}
+		if (!dscr_avail)
+			_rci_gen_attrs(rr);
+		if (lev_ctr > 0) {
+	      web_cursor_down(wc, NULL, 0);
+	      do {
+	         _rci_gen_qd_resp(rr, 0, lev_ctr-1);
+	      } while (!web_cursor_next(wc));
+	      web_cursor_up(wc);
+		}
+		if (wc->level)
+			xmlGenEndElement(gen, NULL);
+	}
+}
+
+
+/*** BeginHeader _rci_format_minmax */
+char __far * _rci_format_minmax(WebMetadata_t __far * meta, char __far * buf,
+										word flags, long val);
+/*** EndHeader  */
+_rci_debug
+char __far * _rci_format_minmax(WebMetadata_t __far * meta, char __far * buf,
+										word flags, long val)
+{
+	if (!flags)
+		return NULL;
+	if (flags == WM_HAVE_MIN_F || flags == WM_HAVE_MAX_F)
+		sprintf(buf, "%g", val);
+	else if (flags & (WM_HAVE_MIN_L|WM_HAVE_MAX_L))
+		sprintf(buf, "%ld", val);
+	else
+		sprintf(buf, "%lu", val);
+	return buf;
+}
+
+/*** BeginHeader _rci_format_default */
+// Note that caller must free the returned buffer using _web_free()
+char __far * _rci_format_default(WebCursor_t __far * wc);
+/*** EndHeader  */
+_rci_debug
+char __far * _rci_format_default(WebCursor_t __far * wc)
+{
+	char __far * buf;
+	int rc;
+	WebExtrep_t __far * wx = web_extrep(wc, 0);
+
+	// Don't advertise defaults for password type fields.
+	if (!strcmp(wx->name, "password"))
+		return NULL;
+
+	buf = _web_malloc(256);
+	rc = _web_format(wc, buf, 256, "XAd");	// eXternal rep, attribute escapes, default value
+	if (rc) {
+		_web_free(buf);
+		return NULL;	// Forget it if very long
+	}
+	return buf;
+}
+
+/*** BeginHeader _rci_qs_attrs */
+void _rci_qs_attrs(rciRequest __far * rr, int qtype);
+/*** EndHeader  */
+_rci_debug
+void _rci_qs_attrs(rciRequest __far * rr, int qtype)
+{
+	int i;
+
+	if (qtype != RR_QUERY_SETTING)
+		return;
+
+	// Bit of irregular code to specify the source= and compare_to=
+	// attributes of query_setting.
+	for (i = 0; i < 2; ++i) {
+	   xmlGenBeginElement(&rr->gen, "attr", 1,
+	      (char __far *)"name", i ? (char __far *)"compare_to" :
+	      								(char __far *)"source",
+	      (char __far *)"desc", i ? (char __far *)"Comparison data source: "\
+	      	"If given, results returned only for data different than this" :
+	      								(char __far *)"Query data source",
+	      (char __far *)"type", (char __far *)"enum",
+	      (char __far *)"default", i ? (char __far *)"" : (char __far *)"current",
+	      (char __far *)NULL);
+	   xmlGenBeginEnd(&rr->gen, "value", 1, NULL,
+			(char __far *)"value", (char __far *)"current",
+			(char __far *)"desc", (char __far *)"Active data set",
+	      (char __far *)NULL);
+	   //NOTE: we currently don't advertise the "internal_defaults" attribute.
+	   xmlGenBeginEnd(&rr->gen, "value", 1, NULL,
+			(char __far *)"value", (char __far *)"defaults",
+			(char __far *)"desc", (char __far *)"Default data set",
+	      (char __far *)NULL);
+	   xmlGenBeginEnd(&rr->gen, "value", 1, NULL,
+			(char __far *)"value", (char __far *)"stored",
+			(char __far *)"desc", (char __far *)"Data set last saved in non-volatile storage",
+	      (char __far *)NULL);
+	   xmlGenEndElement(&rr->gen, NULL);
+   }
+}
+
+
+/*** BeginHeader _rci_register_target */
+int _rci_register_target(char __far * name, char __far * request,
+								char __far * reply, rci_docmd_callback_t req_callback);
+/*** EndHeader  */
+_rci_debug
+int _rci_register_target(char __far * name, char __far * request,
+								char __far * reply, rci_docmd_callback_t req_callback)
+{
+	int i;
+	RCIDCT_t __far * t = _rci_find_target(name);
+	if (!t) {
+		for (i = 0; i < IDIGI_MAX_TARGETS; ++i)
+			if (!_rci_dct_table[i].name)
+				break;
+		if (i == IDIGI_MAX_TARGETS)
+			return -ENOMEM;
+		t = _rci_dct_table + i;
+		t->name = name;
+	}
+	t->request = request;
+	t->reply = reply;
+   t->req_callback = req_callback;
+	return 0;
+}
+
+
+/*** BeginHeader rci_register_target */
+int rci_register_target(char __far * name, char __far * request, char __far * reply);
+/*** EndHeader  */
+_rci_debug
+int rci_register_target(char __far * name, char __far * request, char __far * reply)
+{
+	return _rci_register_target(name, request, reply, NULL);
+}
+
+
+/*** BeginHeader rci_register_target_callback */
+int rci_register_target_callback(char __far * name,
+											rci_docmd_callback_t req_callback);
+/*** EndHeader  */
+_rci_debug
+int rci_register_target_callback(char __far * name,
+											rci_docmd_callback_t req_callback);
+{
+	return _rci_register_target(name, NULL, NULL, req_callback);
+}
+
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+

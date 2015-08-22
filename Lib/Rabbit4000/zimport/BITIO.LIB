@@ -1,0 +1,681 @@
+/*** BeginHeader  ********************************************/
+#ifndef __BITIO_LIB
+#define __BITIO_LIB
+/*** EndHeader ***********************************************/
+
+/* START _LIBRARY DESCRIPTION *********************************************
+BITIO.LIB
+	Copyright (c) 2002, Rabbit Semiconductor.
+
+DESCRIPTION:
+	Single bit file I/O.
+
+	The single-bit I/O routines utilize a mask and a rack for output,
+	defined in the BIT_FILE struct. When a bit is to be written, it is
+	added to the rack at the position defined by the mask. The mask is
+	then adjusted to represent a new position. Once the rack	is full, it
+	is written as a single character to the file, then the rack is cleared
+	and the mask reset. Input is done similarly. In order for the routines
+	to work, a single-character I/O routine is needed (for example, getc
+	and putc for input and output, respectively). This file implements
+	_ximgetc for xmem (#ximport/#zimport) files (which are considered
+   read-only).
+
+	This file also defines the compressed file structure ZFILE, which
+	defines the state for compression algorithms.
+
+	This library is thread-safe.
+
+	Note: This file is currently only used internally by the #zimport
+	support libraries. If it is ever released, the API for this library
+	consists of the following functions:
+		OpenInputBitFile			- Open a file for single-bit input
+		OpenOutputBitFile			- Open a file for single-bit output
+		OutputBit					- Output a single bit to a file
+		OutputBits					- Output a number of bits to a file
+		InputBit						- Input a single bit from a file
+		InputBits					- Input a number of bits from a file
+	See the function descriptions for each of these for more information.
+
+SUPPORT LIB'S:
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader */
+
+// Uncomment the following macro to enable debugging
+// A function fatal_error(char *) which handles an error
+// string must be defined for debugging purposes if this
+// macro is defined.
+// #define __BITIO_DEBUG
+
+// If the FAT16 filesystem library is included, then enable FAT support
+#ifdef __FAT16_LIB
+#define __LZ_USE_FAT__    // FAT always uses unbuffered input (has cache)
+#endif
+
+// Macros and data structures for single bit IO routines
+#ifndef EOF
+#define EOF             (-1)			// End of file marker
+#endif
+
+#define BITIO_READ_FLAGS (_FILE_FLAG_OPEN_READ|_FILE_FLAG_OPEN_BINARY\
+								|_FILE_FLAG_CAN_READ|_FILE_FLAG_USED|_FILE_FLAG_OPEN)
+#define BITIO_WRITE_FLAGS (_FILE_FLAG_OPEN_WRITE|_FILE_FLAG_OPEN_BINARY\
+								|_FILE_FLAG_CAN_WRITE|_FILE_FLAG_USED|_FILE_FLAG_OPEN)
+
+#ifndef UBYTE
+#define UBYTE   unsigned char		// Define an unsigned byte
+#endif
+
+typedef int (*PFI)();				// Pointer to a function type
+
+// Binary file structure for ximport and filesystem files. This structure
+// defines the required state for single-bit I/O files.
+typedef struct bit_file
+{
+    UBYTE   mask;				// Mask for current output bit
+    int     rack;				// Store bits until we fill a byte
+    char __far *fileloc;	// Current location pointer (for ximport)
+    long    rems;
+} BIT_FILE;
+
+// Include lzss.lib, which defines the ZFILE structure.
+#use "lzss.lib"
+
+/*** EndHeader */
+
+
+/*** Beginheader init_bitfile_struct */
+void init_bitfile_struct ( ZFILE *xx );
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+init_bitfile_struct        <BITIO.LIB>
+
+SYNTAX: void init_bitfile_struct(ZFILE *xx);
+
+PARAMETER1: File descriptor to a bit file.
+
+KEYWORDS: bitio, compression, zimport
+
+DESCRIPTION: Initialize the bitfile structure for a particular file. This
+function initializes a ZFILE struct, and sets the default bit mask
+and current position.
+
+RETURN VALUE:	None.
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void init_bitfile_struct ( ZFILE *xx )
+{
+    memset( xx, 0, sizeof(ZFILE) );  // zap the structure
+  	 xx->bf.mask = 0x80;                    // set the mask
+    xx->CurrPos = 1;                    // and the current position
+}
+
+/*** Beginheader AttachOutputBitFile */
+#ifdef __LZ_USE_FAT__
+int AttachOutputBitFile( ZFILE *bfp, FILE __far *fsp );
+#endif
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+AttachOutputBitFile          <BITIO.LIB>
+
+SYNTAX: int AttachOutputBitFile(ZFILE *bfp, FILE __far *fsp);
+
+PARAMETER1: File descriptor to a bit file.
+
+PARAMETER2: File stream to use as output file.
+
+KEYWORDS: bitio, compression, zimport
+
+DESCRIPTION: Attach an output file stream. The first parameter is a
+  pointer to a bitfile descriptor. The second parameter is the file stream
+  to send output to.  The stream must be opened in Binary mode and be
+  capable of being written to. This function initializes the ZFILE struct.
+
+RETURN VALUE:	true - success
+					false - failure
+END DESCRIPTION **********************************************************/
+
+#ifdef __LZ_USE_FAT__
+__nodebug
+int AttachOutputBitFile( ZFILE *bfp, FILE __far *fsp )
+{
+auto int stt;
+    init_bitfile_struct( bfp );
+    stt = (fsp->flags & BITIO_WRITE_FLAGS) ^ BITIO_WRITE_FLAGS;
+
+#ifdef __BITIO_DEBUG
+    if (stt) {
+        fatal_error("Error attaching compressed output file");
+    }
+#endif
+
+    return( !stt );
+}
+#endif
+
+/*** Beginheader OpenOutputBitStream */
+int OpenOutputBitStream( ZFILE *bfp, PFI func );
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+OpenOutputBitStream        <BITIO.LIB>
+
+SYNTAX: int OpenOutputBitStream(ZFILE *bfp, PFI func);
+
+PARAMETER1: File descriptor to a bit file.
+
+PARAMETER2: Pointer to a function (must return int).
+
+KEYWORDS: bitio, compression, zimport
+
+DESCRIPTION: Setup a ZFILE for an output stream defined by func.
+A bit stream allows for user-defined I/O to be used with the bitio
+library. The first parameter is a bitfile descriptor to which the
+output is written. The second parameter is a pointer to an output
+function defined by the user. This function must have an integer
+return type, and is assumed to perform single-character output to the
+file. The function may perform formatting, encryption, or any other
+functionality needed when the character is written.
+
+RETURN VALUE:	true - success
+					false - failure
+END DESCRIPTION **********************************************************/
+__nodebug
+int OpenOutputBitStream( ZFILE *bfp, PFI func )
+{
+    init_bitfile_struct( bfp );
+    bfp->oneCharIO = func;
+    return( TRUE );
+}
+
+/*** BeginHeader AttachInputBitFile */
+int AttachInputBitFile( ZFILE *ifp, FILE __far *fsp );
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+AttachInputBitFile          <BITIO.LIB>
+
+SYNTAX: int AttachInputBitFile(ZFILE *ifp, FILE __far *fsp);
+
+PARAMETER1: File descriptor to a bit file.
+
+PARAMETER2: File "name" parameter for filesystem file, or location of
+an ximport file.
+
+KEYWORDS: bitio, compression, zimport
+
+DESCRIPTION: Open a bitfile for input. This file may be formatted for
+the filesystem, or an ximport file. The file is assumed to be an FS
+file if the second parameter is <= 255, implying a file descriptor.
+If it is > 255, it is assumed to be the location of a #ximport or
+#zimport. This function sets up the ZFILE struct, and sets up the
+file fn for single-bit input.
+
+RETURN VALUE:	true - success
+					false - failure
+END DESCRIPTION **********************************************************/
+__nodebug
+int AttachInputBitFile( ZFILE *ifp, FILE __far *fsp )
+{
+auto    int       stt;
+
+    init_bitfile_struct( ifp );  // this sets xmbool to false
+
+    stt = (fsp->flags & BITIO_READ_FLAGS) ^ BITIO_READ_FLAGS;
+
+#ifdef __BITIO_DEBUG
+    if (stt) {
+        fatal_error("Error attaching compressed input file");
+    }
+#endif
+
+    return( !stt );
+}
+
+/*** BeginHeader OpenInputBitFile */
+int OpenInputBitFile( ZFILE *ifp, long fn );
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+OpenInputBitFile          <BITIO.LIB>
+
+SYNTAX: int OpenInputBitFile(ZFILE *ifp, long fn);
+
+PARAMETER1: File descriptor to a bit file.
+
+PARAMETER2: Address of an ximport file.
+
+KEYWORDS: bitio, compression, zimport
+
+DESCRIPTION: Open a bitfile for input. The second parameter is the
+location of a #ximport or #zimport file. This function sets up the
+ZFILE struct, and sets up the ximport file for single-bit input.
+
+RETURN VALUE:	true - success
+					false - failure
+END DESCRIPTION **********************************************************/
+__nodebug
+int OpenInputBitFile( ZFILE *ifp, long fn )
+{
+auto    int       stt;
+
+    init_bitfile_struct( ifp );     // this sets xmbool to false
+
+	 ifp->xmBool = TRUE;             // show it is ximported data
+	 stt = openXimFile ( ifp, (char __far *)fn );  // do the correct open stuff
+
+    return( stt );
+}
+
+/*** BeginHeader openXimFile */
+int openXimFile ( ZFILE *ifp, char __far* floc );
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+openXimFile                <BITIO.LIB>
+
+SYNTAX: int openXimFile ( ZFILE *ifp, char __far floc )
+
+PARAMETER1: File descriptor to a bit file.
+
+PARAMETER2: Location of a #ximport file.
+
+KEYWORDS: bitio, compression, zimport
+
+DESCRIPTION: Open a bitfile for input from an #ximport location.
+Masks out the #zimport flag bit for determining file length. If
+the compression flag bit is set, this function also extracts the
+compression type identifier byte, and sets the Compressed
+field of the ZFILE (ZFILE) structure.
+
+RETURN VALUE:	true - success
+					false - failure
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int openXimFile ( ZFILE *ifp, char __far *floc ) {
+
+	 ifp->fsz = *((long __far *)floc);
+    if(ifp->fsz) {
+        // See if the file is compressed
+		  ifp->Compressed = ((ifp->fsz & (~ZIMPORT_MASK)) != 0);
+
+		  // Set the initial file location to the address right after
+		  // the 32-bit length value
+        ifp->bf.fileloc = floc+4;
+
+   	  // Mask out the #zimport compression bit
+		  ifp->bf.rems = ifp->fsz = (ifp->fsz & ZIMPORT_MASK);
+
+		  return(TRUE);
+    }
+    return(FALSE);
+}
+
+/*** BeginHeader _ximgetc */
+int _ximgetc( BIT_FILE *bf );
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_ximgetc                    <BITIO.LIB>
+
+SYNTAX: _ximgetc(BIT_FILE *bf);
+
+PARAMETER1: BIT_FILE File descriptor
+
+KEYWORDS: bitio, compression, zimport
+
+DESCRIPTION: Get a single character from a #ximport bit file. This
+function utilizes the buffered input (if enabled) to extract a single
+character from an ximported (zimported) file. The file read position
+is also updated. The return value is the extracted character.
+
+RETURN VALUE:	The next charater in the file.
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int _ximgetc( BIT_FILE *bf )
+{
+auto    int ch;
+auto    int szin;
+
+    if ( bf->rems )
+    {
+        ch = *bf->fileloc++;
+        bf->rems--;
+    }
+    else {
+        ch = EOF;
+    }
+
+    return(ch);
+}
+
+/*** BeginHeader CloseOutputBitFile */
+void CloseOutputBitFile( ZFILE *ifp );
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+CloseOutputBitFile         <BITIO.LIB>
+
+SYNTAX: void CloseOutputBitFile(ZFILE *ifp);
+
+PARAMETER1: File descriptor to a bit file.
+
+KEYWORDS: bitio, compression, zimport
+
+DESCRIPTION: Close an output bitfile, first flushing the bit buffers to
+the file. With single-bit I/O, an internal buffer is filled a bit at a
+time. Using single-character I/O, this single byte buffer is flushed to
+the target file whenever the byte fills up. If there are an odd number
+of bits at the end of output, the buffer will not be flushed, leaving
+unwritten data. This function MUST be called after writing to an output
+bitfile to ensure that the buffer is flushed.
+
+RETURN VALUE:	None.
+END DESCRIPTION **********************************************************/
+__nodebug
+void CloseOutputBitFile( ZFILE *ofp )
+{
+    if ( ofp->bf.mask != 0x80 )
+        if (fputc(ofp->bf.rack, ofp->fsp ) == EOF) {
+#ifdef __BITIO_DEBUG
+            fatal_error( "Fatal error in CloseBitFile!\n" );
+#endif
+				return;
+    }
+    fclose( ofp->fsp );       // file, close it
+}
+
+/*** Beginheader CloseInputBitFile */
+void CloseInputBitFile( ZFILE *ifp );
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+CloseInputBitFile          <BITIO.LIB>
+
+SYNTAX: void CloseInputBitFile(ZFILE *ifp);
+
+PARAMETER1: File descriptor to a bit file.
+
+KEYWORDS: bitio, compression, zimport
+
+DESCRIPTION: Close an input bitfile. This function is only needed by
+streamed bitfiles, but should be called for all input bitfiles once
+reading is finished.
+
+RETURN VALUE:	None.
+END DESCRIPTION **********************************************************/
+
+__nodebug
+void CloseInputBitFile( ZFILE *ifp )
+{
+#ifdef __LZ_USE_FAT__
+    if ( !ifp->xmBool ) {
+       fclose( ifp->fsp );
+    }
+#endif
+}
+
+/*** Beginheader OutputBit */
+void OutputBit( ZFILE *ofp, int bit );
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+OutputBit                  <BITIO.LIB>
+
+SYNTAX: void OutputBit(ZFILE *ofp, int bit);
+
+PARAMETER1: File descriptor to a bit file.
+
+PARAMETER2: The bit to be added to the file.
+
+KEYWORDS: bitio, compression, zimport
+
+DESCRIPTION: Output a single bit to a bitfile. The first parameter is
+a bitfile descriptor, and the second is an integer which is either zero
+or non-zero. If zero, a 0 bit is written to the file. If non-zero, a
+1 bit is written to the file.
+
+RETURN VALUE:	None.
+END DESCRIPTION **********************************************************/
+__nodebug
+void OutputBit( ZFILE *ofp, int bit )
+{
+auto    BIT_FILE    *bit_file;
+auto    int			stt;
+
+    bit_file = &ofp->bf;
+
+    if ( bit ) {
+        bit_file->rack |= bit_file->mask;
+    }
+    bit_file->mask >>= 1;
+    if ( bit_file->mask == 0 )
+    {
+        if ( fputc(bit_file->rack, ofp->fsp) == EOF ) {
+#ifdef __BITIO_DEBUG
+            fatal_error( "Fatal error in OutputBit!\n" );
+#endif
+				return;
+        }
+
+        bit_file->rack = 0;
+        bit_file->mask = 0x80;
+    }
+}
+
+/*** Beginheader OutputBits */
+void OutputBits( ZFILE *ofp, unsigned long code, int count );
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+OutputBits                 <BITIO.LIB>
+
+SYNTAX: void OutputBits(ZFILE *ofp, unsigned long code, int count);
+
+PARAMETER1: File descriptor to a bit file.
+
+PARAMETER2: The bits to be added to the file.
+
+PARAMETER2: The number of bits to be added to the file.
+
+KEYWORDS: bitio, compression, zimport
+
+DESCRIPTION: Output a number of bits to a bitfile. The first parameter is
+a bitfile descriptor. The second parameter is an unsigned long value which
+contains the bits to be written. The third parameter is the number of bits
+to be written, and has a maximum value of sizeof(unsigned long)*8 (number
+of bits in an unsigned long). The input bit field is ordered such that the
+most significant bit (the bit at position (1 << (count-1)) in the field)
+is the first output. The bits are output in order, the least significant
+bit last. The I/O function used to output the entire rack is the oneCharIO
+function pointer associated with the output file.
+
+RETURN VALUE:	None.
+END DESCRIPTION **********************************************************/
+__nodebug
+void OutputBits( ZFILE *ofp, unsigned long code, int count )
+{
+auto    unsigned long mask;
+auto    BIT_FILE    *bit_file;
+
+    bit_file = &ofp->bf;
+    mask = 1L << ( count - 1 );
+    while ( mask != 0)
+    {
+        if ( mask & code )
+            bit_file->rack |= bit_file->mask;
+        bit_file->mask >>= 1;
+        if ( bit_file->mask == 0 )
+        {
+	         if ( fputc(bit_file->rack, ofp->fsp) == EOF ) {
+#ifdef __BITIO_DEBUG
+                fatal_error( "Fatal error in OutputBit!\n" );
+#endif
+						return;
+            }
+
+            bit_file->rack = 0;
+            bit_file->mask = 0x80;
+        }
+        mask >>= 1;
+    }
+}
+
+/*** Beginheader InputBit */
+int InputBit( ZFILE *ifp );
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+InputBit                   <BITIO.LIB>
+
+SYNTAX: int InputBit(ZFILE *ifp);
+
+PARAMETER1: File descriptor to a bit file.
+
+KEYWORDS: bitio, compression, zimport
+
+DESCRIPTION: Input a single bit from a bitfile, using the current location.
+The current state of the file's bit mask is used to extract a single bit
+from the file. The mask is then updated. If the rack is used up (mask
+is 0), then a new character is read into the rack from the file using
+the associated oneCharIO function. The return value is either 1 or 0
+depending on the value of the bit.
+
+RETURN VALUE:	An integer containing the value of the bit.
+END DESCRIPTION **********************************************************/
+__nodebug
+int InputBit( ZFILE *ifp )
+{
+auto    int value;
+auto    BIT_FILE    *bit_file;
+
+    bit_file = &ifp->bf;
+    if ( bit_file->mask == 0x80 )
+    {
+#ifdef __LZ_USE_FAT__
+	     if ( ifp->xmBool ) {
+#endif
+	         bit_file->rack = _ximgetc( bit_file );
+#ifdef __LZ_USE_FAT__
+        }
+	     else {
+        		bit_file->rack = fgetc(ifp->fsp);
+        }
+#endif
+#ifdef __BITIO_DEBUG
+        if ( bit_file->rack == EOF ) {
+            fatal_error( "Fatal error in InputBit!\n" );
+				return 0;
+        }
+#endif
+    }
+    value = (bit_file->rack & bit_file->mask) ? 1 : 0;
+
+    // Shift mask and compare
+    bit_file->mask >>= 1;
+    if ( bit_file->mask == 0 ) {
+        bit_file->mask = 0x80;
+    }
+    return( value );
+}
+
+/*** Beginheader InputBits */
+unsigned int InputBits( ZFILE *ifp, int bit_count );
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+InputBits                  <BITIO.LIB>
+
+SYNTAX: unsigned int InputBits(ZFILE *ifp, int bit_count);
+
+PARAMETER1: File descriptor to a bit file.
+
+PARAMETER2: Number of bits to retrieve.
+
+KEYWORDS: bitio, compression, zimport
+
+DESCRIPTION: Input a number of bits from a bitfile from the current
+location. The second parameter bit_count is the number of bits
+to be extracted from the bitfile ifp. Using the bit mask and
+rack associated with the file, the bits are extracted into an
+unsigned long, ordered so the first bit read is the most significant
+bit of the long. Once the rack has been completely read then a new
+byte is read into the rack using the file's oneCharIO function, and
+the mask is reset. The return value is the unsigned long containing
+the extracted bits.
+
+NOTE: This version of InputBits is optimized. Currently, bit_count
+can be a maximum of 16 (sizeof(unsigned int)*8 bits/byte). The
+"mask" local variable and function signature may be changed to
+unsigned longs to allow up to 32 bit to be read at time. Currently,
+this function is only used by the LZ compression algorithm, which
+reads a maximum of 12 bits at a time (for a 12-bit index bit count).
+
+RETURN VALUE:	An unsigned long containing the extracted bits.
+END DESCRIPTION **********************************************************/
+
+__nodebug
+unsigned int InputBits( ZFILE *ifp, int bit_count )
+{
+   auto unsigned int mask; // This can be changed to unsigned long to get up to 32 bits
+   auto unsigned int tmp_rack, tmp_mask;
+   auto unsigned int return_value;
+   auto BIT_FILE     *bit_file;
+
+	// Extract bit file, initialize masks
+   bit_file = &ifp->bf;
+   return_value = 0;
+
+   // Use these in place of pointer dereference
+   // in main loop
+	tmp_rack = bit_file->rack;
+	tmp_mask = bit_file->mask;
+
+    mask = 1 << ( bit_count - 1 );
+    return_value = 0;
+    while ( mask != 0)
+    {
+        if ( tmp_mask == 0x80 )
+        {
+#ifdef __LZ_USE_FAT__
+		      if ( ifp->xmBool ) {
+#endif
+		          tmp_rack = _ximgetc( bit_file );
+#ifdef __LZ_USE_FAT__
+	         }
+	         else {
+	             tmp_rack = fgetc(ifp->fsp);
+	         }
+#endif
+
+#ifdef __BITIO_DEBUG
+            if ( tmp_rack == EOF ) {
+                fatal_error( "Fatal error in InputBits!\n" );
+					 return 0;
+            }
+#endif
+        }
+        if ( tmp_rack & tmp_mask ) {
+                return_value |= mask;
+        }
+        mask >>= 1;
+        tmp_mask >>= 1;
+        if ( tmp_mask == 0 )
+            tmp_mask = 0x80;
+    }
+
+    // Restore file mask and rack
+    bit_file->rack = tmp_rack;
+	 bit_file->mask = tmp_mask;
+    return( return_value );
+}
+
+/*** BeginHeader  ********************************************/
+#endif
+/*** EndHeader ***********************************************/

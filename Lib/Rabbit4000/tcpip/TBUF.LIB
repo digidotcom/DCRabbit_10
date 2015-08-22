@@ -1,0 +1,612 @@
+/*
+ *    tbuf.lib
+ *-----------------------------------------------------------------------------
+ * Copyright (c) 2008 Digi International Inc., All Rights Reserved
+ *
+ * This software contains proprietary and confidential information of Digi
+ * International Inc.  By accepting transfer of this copy, Recipient agrees
+ * to retain this software in confidence, to prevent disclosure to others,
+ * and to make no use of this software other than that for which it was
+ * delivered.  This is an published copyrighted work of Digi International
+ * Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+ * prohibited.
+ *
+ * Restricted Rights Legend
+ *
+ * Use, duplication, or disclosure by the Government is subject to
+ * restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+ * Technical Data and Computer Software clause at DFARS 252.227-7031 or
+ * subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+ * Restricted Rights at 48 CFR 52.227-19, as applicable.
+ *
+ * Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+ *-----------------------------------------------------------------------------
+ *
+ * The following functions (_tbuf_xread, _tbuf_xwrite, _tbuf_ref
+ * _tbuf_delete, _tbuf_findchar etc.) support circular read
+ * and write buffers.
+ */
+
+/*** BeginHeader */
+
+#ifndef _TBUF_H
+#define _TBUF_H
+
+#ifdef TBUF_DEBUG
+	#define _tbuf_debug __debug
+#else
+	#define _tbuf_debug __nodebug
+#endif
+
+/*
+ * "Gather" struct.  This is a remapping of the _tbuf data (usually
+ * in sections 2 and 3) which is used primarily by TCP/IP, but also
+ * used in some non-networking code such as generic TLS.
+ *
+ * All unused sections must have their length field set to zero.
+ */
+typedef struct ll_Gather {
+	byte	iface;			// Dest interface
+	byte	flags;
+   // These flags indicate the sections which need to be copied to the packet
+   // transmit buffer.  Copy can be avoided for TCP sockets, since the data is
+   // not going to move or disappear.  The headers (in root) will generally need
+   // to be copied since they are usually in auto variables.
+#define	LLG_STAT_DATA1		0x01		// data1 static, no need to copy
+#define	LLG_STAT_DATA2		0x02		// data2 static, no need to copy
+#define	LLG_STAT_DATA3		0x04		// data3 static, no need to copy
+#define  LLG_STAT_MASK		0x07		// Mask of all the above
+	// Note: the only combinations above which are allowed are:
+   //   data1   data2   data3
+   //   ------- ------- -------
+   //   copy    static  static    (used for TCP - data1 must be <= 512 bytes)
+   //   copy    copy    static    (used for non-TCP, data3 not actually used.
+   //											data1+data2 must be <= 1024 bytes if data3
+   //											area is used.  If data3 not used,
+   //											data1+data2 can total up to 1536 bytes)
+   //   copy    copy    copy      (not currently used - total up to 1536 bytes)
+   // Data sections which are not used must be set to 'static'.
+   // The division into "header" and "payload" extents is somewhat arbitrary.
+   // In many cases, the first extent will contain header and payload.
+	word	len1;				// Length of "header" section
+	char __far * data1;		// Header data (e.g. link, IP and transport headers)
+	word	len2;				// Length of first "payload" section
+	char __far * data2;		// First data extent
+	word	len3;				// Length of second "payload" section
+	char __far * data3;		// Second data extent
+} ll_Gather;
+
+/*
+ * Circular buffer definition.
+ * Manipulation routines are:
+ *  _tbuf_xread()
+ *  _tbuf_xwrite()
+ *  _tbuf_delete()
+ *  _tbuf_init()
+ *  _tbuf_ref()
+ *  _tbuf_findchar()
+ */
+
+typedef struct {
+	char __far *	buf;		// Base addr. of buffer
+	word		len;			// Current total data length
+	word		maxlen;		// Size of buffer
+	word		begin;		// Offset of start of data (circular wrap-around)
+} _tbuf;
+
+#define _tbuf_remain(cb) ((cb)->maxlen - (cb)->len)
+
+
+/*** EndHeader */
+
+
+
+/*** BeginHeader _tbuf_xread, _tbuf_extract */
+// Note that 'xread' does not delete what is read; that requires separate call
+// to _tbuf_delete.  'extract' assumes a zero offset, and deletes the data
+// which is read.
+word _tbuf_xread(void __far * dest, _tbuf __far * cb, word offset, word len);
+word _tbuf_extract(void __far * dest, _tbuf __far * cb, word len);
+/*** EndHeader */
+
+_tbuf_debug
+word _tbuf_xread(void __far * dest, _tbuf __far * cb, word offset, word len)
+{
+	auto word bytes;
+	auto word start;
+
+	start = offset + cb->begin;
+  	if (start >= cb->maxlen)
+  		start -= cb->maxlen;
+
+	if (len > (bytes = cb->maxlen - start)) {
+		_f_memcpy((char __far *)dest, cb->buf + start, bytes);
+		_f_memcpy((char __far *)dest + bytes, cb->buf, len - bytes);
+	}
+	else
+		_f_memcpy((char __far *)dest, cb->buf + start, len);
+	return len;
+}
+
+_tbuf_debug
+word _tbuf_extract(void __far * dest, _tbuf __far * cb, word len)
+{
+	_tbuf_xread(dest, cb, 0, len);
+	return _tbuf_delete(cb, len);
+}
+
+
+/*** BeginHeader _tbuf_xwrite, _tbuf_append */
+// These routines update the total length in the buffer, but only if the
+// new data wrote past the previous end.  Thus, if offset < current data length,
+// then total length may not be changed.
+word _tbuf_xwrite(_tbuf __far * cb, word offset, void __far * src, word len);
+word _tbuf_append(_tbuf __far * cb,              void __far * src, word len);
+/*** EndHeader */
+
+_tbuf_debug
+word _tbuf_xwrite(_tbuf __far * cb, word offset, void __far * src, word len)
+{
+	auto word bytes;
+	auto word start;
+
+	start = offset + cb->begin;
+  	if (start >= cb->maxlen)
+  		start -= cb->maxlen;
+
+	if (len > (bytes = cb->maxlen - start)) {
+		_f_memcpy(cb->buf + start, src, bytes);
+		_f_memcpy(cb->buf, (char __far *)src + bytes, len - bytes);
+	}
+	else
+		_f_memcpy(cb->buf + start, src, len);
+	bytes = offset + len;
+	if (bytes > cb->len)
+		cb->len = bytes;
+	return len;
+}
+
+_tbuf_debug
+word _tbuf_append(_tbuf __far * cb, void __far * src, word len)
+{
+	return _tbuf_xwrite(cb, cb->len, src, len);
+}
+
+/*** BeginHeader _tbuf_bxwrite, _tbuf_bxwrite_noadj, _tbuf_bappend */
+#ifdef __NET_DEFS_LIB__
+// Only useful if tcp/ip networking
+//NOTE: these routines are going away soon.  Use _tbuf_gappend etc.
+struct ll_prefix_t;
+word _tbuf_bxwrite(_tbuf __far * cb, word offset, struct ll_prefix_t __far * LL,
+														word src, word len);
+word _tbuf_bxwrite_noadj(_tbuf __far * cb, word offset, struct ll_prefix_t __far * LL,
+														word src, word len);
+word _tbuf_bappend(_tbuf __far * cb,              struct ll_prefix_t __far * LL,
+														word src, word len);
+#endif
+/*** EndHeader */
+
+_tbuf_debug
+word _tbuf_bxwrite_noadj(_tbuf __far * cb, word offset, struct ll_prefix_t __far * LL,
+														word src, word len)
+{
+	// This is same as _tbuf_xwrite(), except source is in a packet xmem buffer
+	auto word bytes;
+	auto word start;
+
+	start = offset + cb->begin;
+  	if (start >= cb->maxlen)
+  		start -= cb->maxlen;
+
+	if (len > (bytes = cb->maxlen - start)) {
+		_pkt_buf2xmem(LL, cb->buf + start, bytes, src);
+		_pkt_buf2xmem(LL, cb->buf, len - bytes, src + bytes);
+	}
+	else
+		_pkt_buf2xmem(LL, cb->buf + start, len, src);
+	return len;
+}
+
+
+_tbuf_debug
+word _tbuf_bxwrite(_tbuf __far * cb, word offset, struct ll_prefix_t __far * LL,
+														word src, word len)
+{
+	// This is same as _tbuf_xwrite(), except source is in a packet xmem buffer
+	auto word bytes;
+
+	_tbuf_bxwrite_noadj(cb, offset, LL, src, len);
+
+	bytes = offset + len;
+	if (bytes > cb->len)
+		cb->len = bytes;
+	return len;
+}
+
+_tbuf_debug
+word _tbuf_bappend(_tbuf __far * cb, struct ll_prefix_t __far * LL,
+														word src, word len)
+{
+	return _tbuf_bxwrite(cb, cb->len, LL, src, len);
+}
+
+/*** BeginHeader _tbuf_gwrite, _tbuf_gwrite_noadj, _tbuf_gappend */
+// These routines copy data from an ll_Gather (second and possibly 3rd
+// data extents) to a tbuf.  1st extent is assumed to be header data,
+// which we don't want to copy.
+word _tbuf_gwrite(_tbuf __far * cb, word offset, ll_Gather __far * g,
+														word src, word len);
+word _tbuf_gwrite_noadj(_tbuf __far * cb, word offset, ll_Gather __far * g,
+														word src, word len);
+word _tbuf_gappend(_tbuf __far * cb,              ll_Gather __far * g,
+														word src, word len);
+/*** EndHeader */
+
+_tbuf_debug
+word _tbuf_gwrite_noadj(_tbuf __far * cb, word offset, ll_Gather __far * g,
+														word src, word len)
+{
+	// This is same as _tbuf_xwrite(), except source is in
+   // g->data2 and g->data3.
+   // src is offset in g to start at, len is length to copy.
+   // offset is offset in destination tbuf at which to start copying.
+   // Apart from the data copy, no other changes to tbuf are made.
+	auto word bytes;
+	auto word start;
+   auto word glen1, glen2;
+   auto char __far * gd1;
+   auto char __far * gd2;
+
+
+	start = offset + cb->begin;
+  	if (start >= cb->maxlen)
+  		start -= cb->maxlen;
+   if (len > cb->maxlen)
+   	len = cb->maxlen;
+
+   if (src < g->len2) {
+   	gd1 = g->data2 + src;
+      glen1 = g->len2 - src;
+      gd2 = g->data3;
+      glen2 = g->len3;
+   }
+   else {
+   	src -= g->len2;
+      gd1 = g->data3 + src;
+      glen1 = g->len3 - src;
+      glen2 = 0;
+   }
+   if (glen1 > len) {
+   	glen1 = len;
+      glen2 = 0;
+   }
+   else if (glen1 + glen2 > len)
+   	glen2 = len - glen1;
+
+
+	if (glen1 > (bytes = cb->maxlen - start)) {
+   	_f_memcpy(cb->buf + start, gd1, bytes);
+      _f_memcpy(cb->buf, gd1 + bytes, glen1 - bytes);
+	}
+	else
+   	_f_memcpy(cb->buf + start, gd1, glen1);
+   start += glen1;
+	if (glen2 > (bytes = cb->maxlen - start)) {
+   	_f_memcpy(cb->buf + start, gd2, bytes);
+      _f_memcpy(cb->buf, gd2 + bytes, glen2 - bytes);
+	}
+	else if (glen2)
+   	_f_memcpy(cb->buf + start, gd2, glen2);
+	return len;
+}
+
+
+_tbuf_debug
+word _tbuf_gwrite(_tbuf __far * cb, word offset, ll_Gather __far * g,
+														word src, word len)
+{
+	// This is same as _tbuf_xwrite(), except source is in
+   // g->data2 and g->data3.
+	auto word bytes;
+
+	_tbuf_gwrite_noadj(cb, offset, g, src, len);
+
+	bytes = offset + len;
+	if (bytes > cb->len)
+		cb->len = bytes;
+	return len;
+}
+
+_tbuf_debug
+word _tbuf_gappend(_tbuf __far * cb,              ll_Gather __far * g,
+														word src, word len)
+{
+	return _tbuf_gwrite(cb, cb->len, g, src, len);
+}
+
+/*** BeginHeader _tbuf_delete */
+word _tbuf_delete(_tbuf __far * cb, word len);
+/*** EndHeader */
+
+_tbuf_debug
+word _tbuf_delete(_tbuf __far * cb, word len)
+{
+	auto word bufremain;
+
+	bufremain = cb->maxlen - cb->begin;
+	if (len >= bufremain)
+		cb->begin = len - bufremain;
+	else
+		cb->begin += len;
+
+	cb->len -= len;
+
+	return len;
+}
+
+/*** BeginHeader _tbuf_reset */
+void _tbuf_reset(_tbuf __far * cb);
+/*** EndHeader */
+
+_tbuf_debug
+void _tbuf_reset(_tbuf __far * cb)
+{
+	cb->len = 0;
+	cb->begin = 0;
+}
+
+/*** BeginHeader _tbuf_findchar */
+int _tbuf_findchar(_tbuf __far * cb, char ch, word len, word ioffs);
+/*** EndHeader */
+
+/*
+	Find a character in the circular buffer.
+     ch: character to find
+     len: number of chars in buffer to scan
+     ioffs: initial offset (from first char in buffer) to start scanning.
+   Must have:
+     ioffs+len < cb->len.
+     len > 0
+     ioffs >= 0
+   Returns offset of char from 1st char in buffer, or -1 if not found.
+ */
+_tbuf_debug
+int _tbuf_findchar(_tbuf __far * cb, char ch, word len, word ioffs)
+{
+	auto word bufremain;
+	auto __far char * addr, * begin;
+
+	bufremain = cb->maxlen - cb->begin;
+	begin = cb->buf + cb->begin;
+	if (len+ioffs <= bufremain) {
+   	// Only need to search first part of buffer
+		if (addr = _f_memchr(begin+ioffs, ch, len))
+			return (int)(addr - begin);
+	}
+   else if (ioffs >= bufremain) {
+   	// Only search second part of buffer
+      ioffs -= bufremain;
+      if (addr = _f_memchr(cb->buf + ioffs, ch, len))
+         return (int)((word)(addr - cb->buf) + bufremain);
+   }
+	else {
+   	// Need to search both parts
+		if (addr = _f_memchr(begin+ioffs, ch, bufremain-ioffs))
+			return (int)(addr - begin);
+		else if (addr = _f_memchr(cb->buf, ch, len - (bufremain-ioffs)))
+			return (int)((word)(addr - cb->buf) + bufremain);
+	}
+   return -1;
+}
+
+
+/*** BeginHeader _tbuf_findmem */
+int _tbuf_findmem(_tbuf __far * cb, char __far * str,
+						word __far * slenp, word len, word ioffs);
+/*** EndHeader */
+
+_tbuf_debug
+int _tbuf_findmem(_tbuf __far * cb, char __far * str,
+						word __far * slenp, word len, word ioffs)
+{
+	auto word slen, ltc, bufremain, ltc1;
+   auto int o;
+
+   slen = *slenp;
+	bufremain = cb->maxlen - cb->begin;
+	while ((int)len > 0 && (o = _tbuf_findchar(cb, str[0], len, ioffs)) >= 0) {
+   	if (slen == 1)
+      	return o;
+		if (slen > cb->len - o)
+      	ltc = *slenp = cb->len - o;
+      else
+      	ltc = slen;
+		if (o < bufremain && o+ltc > bufremain) {
+      	// Split over wrap-around point
+         ltc1 = bufremain - o;
+         if (!memcmp(cb->buf + cb->begin + o, str, ltc1) &&
+             !memcmp(cb->buf, str + ltc1, ltc - ltc1))
+         	return o;
+      }
+      else {
+      	// Not split
+         if (o < bufremain && !memcmp(cb->buf + cb->begin + o, str, ltc))
+         	return o;
+         else if (o >= bufremain && !memcmp(cb->buf + (o - bufremain),
+         													str, ltc))
+         	return o;
+      }
+      len -= o + 1 - ioffs;
+      ioffs = o + 1;
+   }
+	return -1;
+}
+
+
+/*** BeginHeader _tbuf_ref */
+void _tbuf_ref(_tbuf __far * cb, ll_Gather __far * g, word offset, word len);
+/*** EndHeader */
+
+// This is similar to _tbuf_xread, except does not copy the data,
+// but returns the physical address of the data extent(s) in fields 2 and 3
+// of a gather struct.  This is used to reduce data copy when writing to
+// ethernet packet driver, since the driver can now send directly from
+// xmem buffers.
+_tbuf_debug
+void _tbuf_ref(_tbuf __far * cb, ll_Gather __far * g, word offset, word len)
+{
+	auto word bytes;
+	auto word start;
+
+	start = offset + cb->begin;
+  	if (start >= cb->maxlen)
+  		start -= cb->maxlen;
+
+	g->data2 = cb->buf + start;
+   g->flags |= LLG_STAT_DATA2|LLG_STAT_DATA3; // Optimization: no copy required
+	if (len > (bytes = cb->maxlen - start)) {
+		g->len2 = bytes;
+		g->data3 = cb->buf;
+		g->len3 = len - bytes;
+	}
+	else {
+		g->len2 = len;
+		g->len3 = 0;
+	}
+}
+
+/*** BeginHeader _tbuf_writeref */
+void _tbuf_writeref(_tbuf __far * cb, ll_Gather __far * g);
+/*** EndHeader */
+
+// This returns references to the free space in the buffer (if any).  If the
+// caller then writes data to this area, then cb->len should be incremented
+// as appropriate.
+_tbuf_debug
+void _tbuf_writeref(_tbuf __far * cb, ll_Gather __far * g)
+{
+	auto word bytes;
+	auto word start;
+
+	g->len2 = 0;
+	g->len3 = 0;
+	start = cb->begin + cb->len;
+  	if (start >= cb->maxlen)
+  		start -= cb->maxlen;
+	g->data2 = cb->buf + start;
+	if (start < cb->begin)
+		g->len2 = cb->begin - start;
+	else if (start == cb->begin) {
+		if (!cb->len) {
+			g->len2 = cb->maxlen - start;
+			g->data3 = cb->buf;
+			g->len3 = cb->begin;
+		}
+		// else is full
+	}
+	else {
+      g->len2 = cb->maxlen - start;
+      g->data3 = cb->buf;
+      g->len3 = cb->begin;
+	}
+}
+
+/*** BeginHeader _tbuf_move */
+// Move data from cb_src to cb_dst.  That is, extract from source and
+// append to dest.  If 'copy' is true, then data is not deleted from source.
+// Offset indicates starting offset in source.
+void _tbuf_move(_tbuf __far * cb_dst, _tbuf __far * cb_src, word len,
+						int copy, word offset);
+/*** EndHeader */
+_tbuf_debug
+void _tbuf_move(_tbuf __far * cb_dst, _tbuf __far * cb_src, word len,
+						int copy, word offset)
+{
+
+	auto word bytes;
+	auto word start;
+	auto __far char * s1, * s2;
+	auto word l1, l2;
+
+	start = cb_src->begin + offset;
+  	if (start >= cb_src->maxlen)
+  		start -= cb_src->maxlen;
+
+	if (len > (bytes = cb_src->maxlen - start)) {
+		_tbuf_append(cb_dst, cb_src->buf + start, bytes);
+		_tbuf_append(cb_dst, cb_src->buf, len - bytes);
+	}
+	else
+		_tbuf_append(cb_dst, cb_src->buf + start, len);
+	if (!copy) {
+		if (offset)
+			_tbuf_remove(cb_src, offset, len);
+		else
+			_tbuf_delete(cb_src, len);
+	}
+}
+
+/*** BeginHeader _tbuf_remove */
+// Remove a section of data from cb, starting at offset,
+// for the specified length.
+// Any data beyond the end of the removed section will be copied down.
+// This can be expensive, so avoid if possible.  Simply removing the last
+// part of the data is cheap, since no copy is required.
+void _tbuf_remove(_tbuf __far * cb, word offset, word len);
+/*** EndHeader */
+_tbuf_debug
+void _tbuf_remove(_tbuf __far * cb, word offset, word len)
+{
+	auto word end;
+	auto _tbuf to, from;
+
+	end = offset + len;
+	if (end >= cb->len) {
+		// Truncating data, easy!
+		cb->len = offset;
+		return;
+	}
+	// At least 1 byte needs to be shifted.  Use the 'move' function with
+	// modified copies of the same buffer.  This is acceptable, since we
+	// are shifting data down in memory, or the areas will not overlap.
+	_f_memcpy(&to, cb, sizeof(to));
+	to.len = offset;
+	_f_memcpy(&from, cb, sizeof(from));
+	from.begin += end;
+	if (from.begin >= from.maxlen)
+		from.begin -= from.maxlen;
+	from.len -= end;
+	_tbuf_move(&to, &from, cb->len - end, 0, 0);
+	cb->len -= len;
+}
+
+/*** BeginHeader _tbuf_overlay */
+// Overlay one tbuf on another, possibly changing the start and length.
+// This is useful for "cloning" a tbuf to another temporary one, for the
+// purpose of subsetting the original data.  If 'len' is greater than
+// Old->maxlen, then New->len is set so that the end of data in New is
+// the same as end of data in Old, or zero if not possible.
+void _tbuf_overlay(_tbuf __far * New, _tbuf __far * Old, word offset, word len);
+/*** EndHeader */
+_tbuf_debug
+void _tbuf_overlay(_tbuf __far * New, _tbuf __far * Old, word offset, word len)
+{
+	_f_memcpy(New, Old, sizeof(*New));
+	New->begin += offset;
+	if (New->begin >= New->maxlen)
+		New->begin -= New->maxlen;
+	if (len > New->maxlen) {
+		New->len -= offset;
+		if (New->len > New->maxlen)
+			New->len = 0;
+	}
+	else
+		New->len = len;
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+
+
+

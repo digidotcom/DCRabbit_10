@@ -1,0 +1,742 @@
+/*
+* Copyright (c) 2008 Digi International Inc., All Rights Reserved
+*
+* This software contains proprietary and confidential information of Digi
+* International Inc.  By accepting transfer of this copy, Recipient agrees
+* to retain this software in confidence, to prevent disclosure to others,
+* and to make no use of this software other than that for which it was
+* delivered.  This is a published copyrighted work of Digi International
+* Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+* prohibited.
+*
+* Restricted Rights Legend
+*
+* Use, duplication, or disclosure by the Government is subject to
+* restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+* Technical Data and Computer Software clause at DFARS 252.227-7031 or
+* subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+* Restricted Rights at 48 CFR 52.227-19, as applicable.
+*
+* Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+*/
+
+/**************************************************************************
+CHAT.LIB
+
+PPP bundled with Dynamic C.
+
+Structure and interface definitions for general-purpose send/expect
+string processing.  This is used by PPP.LIB for setting up modem
+parameters and dialing in to an ISP.  It may be used for other
+applications which need to "talk" to some data streaming device.
+
+**************************************************************************/
+
+/*** BeginHeader */
+
+#if CC_VER < 0xA20
+#fatal "This PPP module must be used with Dynamic C version 10.21 or later."
+#endif
+
+#ifndef __CHAT_LIB
+#define __CHAT_LIB
+
+#ifdef CHAT_DEBUG
+	#define chat_debug __debug
+#else
+	#define chat_debug __nodebug
+#endif
+
+#ifndef CHAT_MAXLEN
+	#define CHAT_MAXLEN		30
+#endif
+
+#ifndef CHAT_MAXSENDLEN
+	#define CHAT_MAXSENDLEN 128
+#endif
+
+#ifndef CHAT_MAX_PAR
+	#define CHAT_MAX_PAR		8
+#endif
+
+// Return codes from chat_tick()
+#define CHAT_AGAIN 0
+#define CHAT_SEND 1
+#define CHAT_OK 2
+#define CHAT_ERROR (-2)
+#define CHAT_TIMEOUT (-1)
+
+
+typedef struct {
+	char *	next;						// Pointer to next script action (i.e. token after string, in script)
+	char *	pos;						// Current position in str (next char to match)
+	char *   end;						// End of str, plus 1.
+	char		str[CHAT_MAXLEN];		// String to compare.
+} CSString;
+
+typedef struct {
+	CSString css;
+	char *	script;					// Points to start of provided script
+	long		otime;					// Overall timeout (ms)
+	long		ptime;					// Pause timeout (ms)
+	long		timeout;					// Overall script timeout (ms rel. MS_TIMER)
+	long		ptimeout;				// Timout when pausing (ms rel. MS_TIMER)
+	char *	send;						// String to send
+	char *	sendend;					// End of string to send, plus 1
+	word		flags;					// Flags as follows:
+#define CHS_SEND		0x0001			// Send the string send/sendlen
+#define CHS_PAUSE		0x0002			// Doing pause timeout
+#define CHS_EXPECT	0x0004			// Expecting something
+#define CHS_NOCRLF	0x0008			// Suppress CRLF after current send token
+#define CHS_INSENS	0x0010			// Case-insensitive expect string comparison
+#define CHS_WAIT		0x0020			// No timeout for expect: wait indefinitely
+	char *   subst[10];				// Substitution strings for %n constructs.  NULL if no
+												// substitutions.
+} ChatState;
+
+/*** EndHeader */
+
+
+/*** BeginHeader chat_init */
+/* START FUNCTION DESCRIPTION ********************************************
+chat_init                          <CHAT.LIB>
+
+SYNTAX: int chat_init(ChatState * chs, const char * script, ...)
+
+KEYWORDS:		chat
+
+DESCRIPTION: 	Initialize the chat state structure, to prepare it for
+               calls to the chat_tick() function.  The chat script,
+               passed in 'script', has the following syntax.  Note
+               that []... means the enclosed syntax may be given
+               zero or more times.
+
+               All the chat_* functions are thread-safe since no static
+               data areas are used; however the caller should obviously
+               not use static areas for ChatState structure or data
+               buffers.  The script and substitution strings may be
+               shared, since they are not altered by any chat function.
+
+   Script Syntax:
+
+     [ send expect ]...
+
+     where 'send' is a token to send, and 'expect' is a token to expect
+     in return, before the next send/expect pair is executed.  Either
+     'send' or 'expect' may be omitted; use empty single quotes as a
+     place-holder.
+
+     If an expect token starts with an '&' character, this has special
+     meaning: the '&' is stripped off the expect token, and no timeout
+     is applied.  This is useful for 'auto answer' scripts where there
+     is an indefinite wait time.
+
+     If a send token is prefixed with '#' then the CRLF which is
+     normally appended to the token, when sent, is suppressed.  To
+     send just a CRLF, specify '#\r\n' as the send token.
+
+     If an expect token is prefixed with '#' (after the '&', if any)
+     then the comparison is performed in a case-insensitive manner,
+     otherwise the expect token must be matched exactly.  No CRLF is
+     expected, unless you explicitly specify it e.g. 'login:\r\n'.
+
+     Either a send or expect token may be prefixed with '@' (after the
+     '&' or '#', if any).  This sets a pause timer (default 1.5 seconds)
+     which has to time out before the send token is sent, or before
+     incoming data are examined for matching the expect token.  Incoming
+     data are discarded during the pause interval, so this feature
+     should be used with caution when prefixing an expect token, since
+     the expected data may be discarded during the pause!
+
+     The sequence '%n' inside a send or expect token indicates that
+     one of the strings passed to this function is to be substituted
+     for the %n at that point.  The substitution is only performed if
+     a non-null parameter was provided.  Otherwise, the %n is included
+     literally.
+
+     The token sequence is separated by white space.  If it is desired
+     to include whitespace in a token, then the token should be wrapped
+     in single quote characters.
+
+     A backslash (\) character in a token denotes an 'escape sequence'
+     for inserting special characters, as follows:
+
+     \nnn    From 1 to 3 octal digits (0-7).  This sequence represents
+             the octal value of a character e.g. \377 represents the
+             decimal character number 255; \1 represents control-A.
+             If fewer than 3 octal digits are intended, then the next
+             character must not be an octal digit.
+
+     \r\n    represents carriage return followed by newline.  Other
+             special characters modelled after C syntax:
+             \r CR; \n NL; \b BS; \t TAB; \f FF.
+
+     Any other character following the backslash stands for itself
+     e.g. \\ specifies a single backslash, \' stands for a single
+     quote.  An escape backslash at the end of a token is a syntax
+     error.
+
+     Example:
+
+       chat_init(&chs, // State structure
+         "ATDT5551234 #login: @%0 word: @%1 PPP",  // Script
+         "myUserid",	  // %0 substitution
+         "myPassword", // %1 substitution
+         NULL          // End of substitutions
+         );
+
+     send dialout command, wait for 'login:', 'LOGIN:' etc., send
+     user ID, wait for 'word:', send password, wait for 'PPP' then
+     finish.  The leading '@' characters indicate that there is a
+     1.5 second pause before sending the userid/password strings.
+
+
+   String sizes:
+
+     Send strings may be of practically any length, however the 'out'
+     buffer passed to chat_tick() must be large enough to hold the
+     entire send string at any point.  CHAT_MAXSENDLEN is a macro
+     which specifies the maximum number of characters which will be
+     put in this buffer.  The default is 128.  Any further data
+     are quietly discarded.  If you dimension out[] to this size,
+     then no memory overwrites will occur.
+
+     Expect strings are limited in size to CHAT_MAXLEN characters
+     (default 30, but may be overridden).  This size is counted after
+     performing any escape sequences and string substitutions.  You
+     must be careful not to exceed this limit, especially when using
+     substitutions; since there is no indication of exceeding this
+     limit: any extra data are quietly discarded and only the first
+     CHAT_MAXLEN characters will be matched.
+
+   Timeouts:
+
+     The initial overall script timeout is set to 60 seconds.  You can
+     change this after calling this function, by calling chat_timeout().
+     The timer starts running when chat_init() is called, thus you
+     should not call chat_init() until ready to perform the chat
+     script.  chat_timeout() also resets the timer.
+
+     The pause timer (@ prefix) is also set using chat_timeout(), and
+     defaults to 1.5 seconds.  During the pause interval, any incoming
+     data is discarded.
+
+   Error handling:
+
+     If the script has syntax errors, they may not be discovered until
+     chat_tick() is called.  Current syntax errors are unbalanced quotes
+     and trailing unescaped backslash.
+
+PARAMETER1: 	Pointer to ChatState structure, which must be allocated by
+               the caller, but may be left uninitialized.  The structure
+               will be initialized by his function, and must be passed
+               without changes to other chat_*() functions.
+PARAMETER2: 	Chat script to parse, as a null-terminated string.
+               After this function is called, the chat script will still
+               be required, and should not be moved or altered while
+               the returned *chs structure is in use.
+PARAMETER3:    Substitution strings for '%' construct.  The list is
+               terminated by a NULL pointer.  If provided, these
+               parameters should be char pointers.  As many non-NULL
+               parameters should be supplied as the highest digit
+               following any '%' substitution, +1.  The first parameter
+               corresponds to %0, the next to %1 etc. up to %9.
+               The strings pointed to by these pointers should not be
+               altered until the script is complete.  Each string must
+               be null terminated.  Each string may be of arbitrary
+               length, however if the substitution is used for an
+               'expect' string, then you must be careful that the total
+               expect string length does not exceed CHAT_MAXLEN; if used
+               for a 'send' string, then the total length should not
+               exceed CHAT_MAXSENDLEN.  See above note on string sizes.
+
+RETURN VALUE:  CHAT_AGAIN (0): OK, ready to continue with chat_tick().
+               CHAT_ERROR (-2): Syntax error in script
+               CHAT_OK (2): Script was empty i.e. nothing to expect or
+                  send.
+
+SEE ALSO:      chat_tick, chat_timeout, chat_reset
+
+END DESCRIPTION **********************************************************/
+
+int chat_init(ChatState * chs, /*const*/ char * script, ...);
+/*** EndHeader */
+
+chat_debug int chat_init(ChatState * chs, /*const*/ char * script, ...)
+{
+	auto char ** ss;
+	auto word i;
+	static const char * pct[10] = {
+	  "%0", "%1", "%2", "%3", "%4", "%5", "%6", "%7", "%8", "%9"
+	};
+
+	memset(chs, 0, sizeof(*chs));
+	for (i = 0, ss = &script + 1; i < 10; i++, ss++)
+		if (!*ss) break;
+		else chs->subst[i] = *ss;
+	for (; i < 10; i++)
+		chs->subst[i] = (char*)pct[i];	// Literal substitution if no arg specified
+
+	chs->css.next = script;
+	chs->script = script;
+	chs->ptime = 1500;		// Default pause time
+	chs->timeout = _SET_TIMEOUT(chs->otime = 60000);	// Initial default 60s
+	return _chat_getsend(chs);
+}
+
+
+/*** BeginHeader chat_reset */
+/* START FUNCTION DESCRIPTION ********************************************
+chat_reset                          <CHAT.LIB>
+
+SYNTAX: int chat_reset(ChatState * chs)
+
+KEYWORDS:		chat
+
+DESCRIPTION: 	Reset the chat state structure to the starting position,
+               as if chat_init() was called again (but without the
+               necessity to pass all the same parameters).  Any timeout
+               intervals set by chat_timeout() will not be changed, but
+               the overall timeout is reset.
+
+PARAMETER1: 	Pointer to ChatState structure, which must have been
+               initialized by a previous call to chat_init().
+
+RETURN VALUE:  CHAT_AGAIN (0): OK, ready to continue with chat_tick().
+               CHAT_ERROR (-2): Syntax error in script
+               CHAT_OK (2): Script was empty i.e. nothing to expect or
+                  send.
+
+SEE ALSO:      chat_tick, chat_timeout, chat_init
+
+END DESCRIPTION **********************************************************/
+
+int chat_reset(ChatState * chs);
+/*** EndHeader */
+
+chat_debug int chat_reset(ChatState * chs)
+{
+	chs->css.next = chs->script;
+	chs->timeout = _SET_TIMEOUT(chs->otime);
+	return _chat_getsend(chs);
+}
+
+
+/*** BeginHeader _chat_getsend */
+int _chat_getsend(ChatState * chs);
+/*** EndHeader */
+
+chat_debug int _chat_getsend(ChatState * chs)
+{
+	auto char * p;
+	auto int c, quoted;
+	// chs->css.next points to 'send' token (maybe preceded by whitespace, '#' or '@')
+	p = chs->css.next;
+	while (isspace(c = *p)) p++;
+	if (quoted = (c == '\'')) {
+		c = *++p;
+		if (!c) {
+#ifdef CHAT_VERBOSE
+			printf("CHAT: unbalanced quote\n");
+#endif
+			return CHAT_ERROR;
+		}
+	}
+	if (c == '#') {
+		chs->flags |= CHS_NOCRLF;
+		c = *++p;
+	}
+	else
+		chs->flags &= ~CHS_NOCRLF;
+	if (c == '@') {
+		chs->flags |= CHS_PAUSE;
+		chs->ptimeout = _SET_TIMEOUT(chs->ptime);
+		c = *++p;
+	}
+	chs->send = p;
+	if (!c) {
+#ifdef CHAT_VERBOSE
+		printf("CHAT: end of script\n");
+#endif
+		return CHAT_OK;
+	}
+	chs->sendend = _chat_eos(p, quoted, &chs->css.next);
+	if (!chs->sendend)
+		return CHAT_ERROR;
+	chs->flags |= CHS_SEND;
+#ifdef CHAT_VERBOSE
+	if (chs->sendend-p)
+		printf("CHAT: sending '%*.*s'\n", chs->sendend-p, chs->sendend-p, p);
+	else
+		printf("CHAT: not sending anything\n");
+#endif
+	return CHAT_AGAIN;
+}
+
+
+/*** BeginHeader _chat_parsestring */
+int _chat_parsestring(ChatState * chs, char * out, char * p, char * end);
+/*** EndHeader */
+
+chat_debug int _chat_parsestring(ChatState * chs, char * out, char * p, char * end)
+{
+	// Parse string p into buffer at out.  end points to last char of string + 1.
+	// Returns number of chars in string.  It is assumed that out[] has enough
+	// space for the parsed string or, if EXPECT flag is set, that out[] is exactly
+	// CHAT_MAXLEN long - if this size is exceeded, the rest of the string is
+	// quietly discarded.
+	// The following escape sequences are recognized:
+	//  \ddd Octal character code: 1 to 3 octal digits, followed by a non-octal-digit.
+	//  \r \n \b \t \f  Ascii CR, LF, BS, TAB, FF.
+	//  \x   Anything else following the '\' is treated as an ordinary char (the backslash is removed).
+	// In addition, '%n' will get substituted with the appropriate string.
+	auto char * start, * ss;
+	auto int c, d;
+	auto word len, ssl;
+
+	if (chs->flags & CHS_EXPECT)
+		len = CHAT_MAXLEN;
+	else
+		len = CHAT_MAXSENDLEN;
+	start = out;
+	while (len && p != end) {
+		c = *p++;
+		if (c == '\\') {
+			c = *p++;
+			if (c >= '0' && c < '8') {
+				c -= '0';
+				if (p != end) {
+					d = *p;
+					if (d >= '0' && d < '8') {
+						c = c << 3 | d - '0';
+						p++;
+						if (p != end) {
+							d = *p;
+							if (d >= '0' && d < '8') {
+								c = c << 3 | d - '0';
+								p++;
+							}
+						}
+					}
+				}
+			}
+			else switch (c) {
+			case 'r': c = '\r'; break;
+			case 'n': c = '\n'; break;
+			case 'b': c = '\b'; break;
+			case 't': c = '\t'; break;
+			case 'f': c = '\f'; break;
+			}
+		}
+		else if (c == '%' && p != end && isdigit(*p)) {
+			ss = chs->subst[*p++ - '0'];
+			if (ss) {
+				ssl = strlen(ss);
+				if (ssl > len)
+					ssl = len;
+				memcpy(out, ss, ssl);
+				out += ssl;
+				len -= ssl;
+			}
+			continue;
+		}
+		*out++ = (char)c;
+		len--;
+	}
+	return out - start;
+}
+
+
+/*** BeginHeader _chat_eos */
+char * _chat_eos(char * p, int quoted, char ** next);
+/*** EndHeader */
+
+chat_debug char * _chat_eos(char * p, int quoted, char ** next)
+{
+	// Find end of token string starting at *p.  If quoted is true, p points past the
+	// opening quote, and the string is scanned to find ending quote.  Returns position of
+	// last char in token, plus 1.  *next is updated to point the the first char of the
+	// next token, or to the null terminator if there is no next token.  Returns NULL
+	// if syntax error.  The same escape sequences as in _char_parsestring() are recognized.
+	auto int esc;
+	auto int c;
+
+	while (c = *p) {
+		if (c == '\\') {
+			c = *++p;
+			if (!c)
+				return NULL;
+			if (c >= '0' && c < '8') {
+				c = p[1];
+				if (c >= '0' && c < '8') {
+					p++;
+					c = p[1];
+					if (c >= '0' && c < '8')
+						p++;
+				}
+			}
+		}
+		else if (quoted && c == '\'') {
+			*next = p+1;
+			break;
+		}
+		else if (!quoted && isspace(c)) {
+			*next = p;
+			break;
+		}
+		p++;
+	}
+	if (!*p)
+		*next = p;
+	else
+		while (isspace(**next)) (*next)++;
+	return p;
+}
+
+
+/*** BeginHeader _chat_getexpect */
+int _chat_getexpect(ChatState * chs);
+/*** EndHeader */
+
+chat_debug int _chat_getexpect(ChatState * chs)
+{
+	// Return 1 if end of script, -1 if other error, 0 if OK.
+	auto char * p;
+	auto int c, pc, quoted;
+	// chs->css.next points to 'expect' token (maybe preceded by whitespace, '&', '#' or '@')
+	p = chs->css.next;
+	while (isspace(c = *p)) p++;
+	if (quoted = (c == '\'')) {
+		c = *++p;
+		if (!c) {
+#ifdef CHAT_VERBOSE
+			printf("CHAT: unbalanced quote\n");
+#endif
+			return CHAT_ERROR;
+		}
+	}
+	if (c == '&') {
+		chs->flags |= CHS_WAIT;
+		c = *++p;
+	}
+	else if (chs->flags & CHS_WAIT) {
+		chs->flags &= ~CHS_WAIT;
+		chs->timeout = _SET_TIMEOUT(chs->otime);
+	}
+	if (c == '#') {
+		chs->flags |= CHS_INSENS;
+		c = *++p;
+	}
+	else
+		chs->flags &= ~CHS_INSENS;
+	if (c == '@') {
+		chs->flags |= CHS_PAUSE;
+		chs->ptimeout = _SET_TIMEOUT(chs->ptime);
+		c = *++p;
+	}
+	if (!*p) {
+#ifdef CHAT_VERBOSE
+		printf("CHAT: end of script\n");
+#endif
+		return CHAT_OK;
+	}
+	chs->css.end = _chat_eos(p, quoted, &chs->css.next);
+#ifdef CHAT_VERBOSE
+	if (chs->css.end-p)
+		printf("CHAT: expecting '%*.*s'\n", chs->css.end-p, chs->css.end-p, p);
+	else
+		printf("CHAT: not expecting anything\n");
+#endif
+	chs->flags |= CHS_EXPECT;
+	chs->css.pos = chs->css.str;
+	chs->css.end = chs->css.str + _chat_parsestring(chs, chs->css.str, p, chs->css.end);
+	if (chs->flags & CHS_INSENS)
+		// Fold to uppercase
+		for (p = chs->css.str; p < chs->css.end; p++)
+			*p = toupper(*p);
+	return CHAT_AGAIN;
+}
+
+
+/*** BeginHeader chat_tick */
+/* START FUNCTION DESCRIPTION ********************************************
+chat_tick                          <CHAT.LIB>
+
+SYNTAX: int chat_tick(ChatState * chs, const char ** in, word * inlen,
+                      char * out, word * outlen)
+
+KEYWORDS:		chat
+
+DESCRIPTION: 	This function should be called regularly to drive the
+               chat script state machine.  This function should be
+               called even when there is no new incoming data, since
+               it needs to check timeouts and possibly generate data.
+
+PARAMETER1: 	Pointer to ChatState structure, which must have been
+               initialized using the chat_init() function.
+PARAMETER2: 	Pointer to address of next set of input
+               characters to process.  On return, *in is updated to
+               point to the first character that was _not_ processed
+               in the stream.  If all characters were processed,
+               *in will point past the end of the data.  This will
+               always be the case for return codes 0 and 1.  Other
+               return codes may leave some unprocessed characters,
+               which may be passed to the rest of the application.
+PARAMETER3: 	Pointer to length of the above input data.  It is OK to
+               pass zero for this value if there is
+               no new incoming data.  On return, *inlen is updated to
+               indicate the number of characters that were _not_
+               processed from in[].
+PARAMETER4:    A buffer into which this function can place some data
+               to send.  This buffer should be large enough to contain
+               the longest send string (after substitutions, if any).
+               A maximum of CHAT_MAXSENDLEN bytes will be written to
+               this buffer (default 128).  Any further data is
+               quietly discarded.
+PARAMETER5:    Pointer to a word in which the length of the returned
+               data in placed.  This value is set only if CHAT_SEND
+               is returned.
+
+RETURN VALUE:  CHAT_AGAIN (0): OK, script is not yet finished.
+               CHAT_SEND (1): *outlen was set to non-zero i.e. there
+                  is some data in out[] which should be sent to the
+                  device.  This does not necessarily mean the script
+                  has completed.
+               CHAT_OK (2): script completed execution, successfully.
+               CHAT_ERROR (-2): syntax error
+               CHAT_TIMEOUT (-1): script timed out.
+
+SEE ALSO:      chat_tick, chat_timeout
+
+END DESCRIPTION **********************************************************/
+
+int chat_tick(ChatState * chs, /*const*/ char ** in, word * inlen,
+					char * out, word * outlen);
+/*** EndHeader */
+
+chat_debug int chat_tick(ChatState * chs, /*const*/ char ** in, word * inlen,
+					char * out, word * outlen)
+{
+	auto int rc;
+	auto char * p;
+	auto word len;
+
+	if (!(chs->flags & CHS_WAIT) && chk_timeout(chs->timeout)) {
+#ifdef CHAT_VERBOSE
+		printf("CHAT: timed out\n");
+#endif
+		return CHAT_TIMEOUT;
+	}
+
+#ifdef CHAT_VERBOSE_STRINGS
+	if (*inlen) {
+		printf("CHAT: got %u chars:\n", *inlen);
+		mem_dump(*in, *inlen);
+	}
+#endif
+
+try_send:
+	if (chs->flags & CHS_PAUSE) {
+		// Currently pausing.  Input is discarded.
+		if (!chk_timeout(chs->ptimeout)) {
+			*in += *inlen;
+			*inlen = 0;
+			return CHAT_AGAIN;
+		}
+		chs->flags &= ~CHS_PAUSE;
+	}
+	if (chs->flags & CHS_SEND) {
+		// Currently sending.  Discard input, because we cannot expect a response to data that we
+		// have not yet sent.  The caller may need to assist in discarding data that was received
+		// while the send data was e.g. queued for transmission.  We want to pay respect to
+		// causality!
+		*in += *inlen;
+		*inlen = 0;
+		*outlen = _chat_parsestring(chs, out, chs->send, chs->sendend);
+		//memcpy(out, chs->send, *outlen = chs->sendend - chs->send);
+		if (*outlen && !(chs->flags & CHS_NOCRLF)) {
+			memcpy(out + *outlen, "\r\n", 2);
+			*outlen += 2;
+		}
+		chs->flags &= ~CHS_SEND;
+		if (rc = _chat_getexpect(chs))
+      	if(*outlen)
+         {
+         	return CHAT_SEND;
+         }
+         else
+         {
+				return rc;
+         }
+		return *outlen != 0 ? CHAT_SEND : CHAT_AGAIN;
+	}
+	// If not SEND, must be EXPECT
+	p = *in;
+	len = *inlen;
+	if (chs->css.pos == chs->css.end)
+		goto _found_it;
+	while (len) {
+		if ((chs->flags & CHS_INSENS ? toupper(*p) : *p) == *chs->css.pos) {
+			chs->css.pos++;
+			if (chs->css.pos == chs->css.end) {
+#ifdef CHAT_VERBOSE
+				printf("CHAT: found it!\n");
+#endif
+				*in = p+1;
+				*inlen = len-1;
+			_found_it:
+				chs->flags &= ~CHS_EXPECT;
+				if (rc = _chat_getsend(chs))
+					return rc;
+				goto try_send;
+			}
+		}
+		else
+			chs->css.pos = chs->css.str;
+		p++;
+		len--;
+	}
+	*in = p;
+	*inlen = len;
+	return CHAT_AGAIN;
+}
+
+/*** BeginHeader chat_timeout */
+/* START FUNCTION DESCRIPTION ********************************************
+chat_timeout                          <CHAT.LIB>
+
+SYNTAX: void chat_timeout(ChatState * chs, long overall, long pause)
+
+KEYWORDS:		chat
+
+DESCRIPTION: 	This function sets chat script timeout parameters.
+
+PARAMETER1: 	Pointer to ChatState structure, which must have been
+               initialized using the chat_init() function.  A non-
+               positive value leaves the current overall timeout
+               unchanged.
+PARAMETER2: 	Overall script timeout, in milliseconds.  This timeout
+               acts from the point at which this function is called.
+               A non-positive value leaves the pause timeout unchanged.
+PARAMETER3: 	Pause timeout, in milliseconds.  This timeout only acts
+               when the next send or expect token prefixed with '@'
+               is encountered.
+
+SEE ALSO:      chat_tick, chat_init
+
+END DESCRIPTION **********************************************************/
+
+void chat_timeout(ChatState * chs, long overall, long pause);
+/*** EndHeader */
+
+chat_debug void chat_timeout(ChatState * chs, long overall, long pause)
+{
+	if (overall > 0)
+		chs->timeout = _SET_TIMEOUT(chs->otime = overall);
+	if (pause > 0)
+		chs->ptime = pause;
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

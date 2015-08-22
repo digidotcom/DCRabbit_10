@@ -1,0 +1,356 @@
+/*** BeginHeader */
+#ifndef __DKTCBASE_LIB
+#define __DKTCBASE_LIB
+/*** EndHeader */
+
+/*** BeginHeader
+	dkInitDebugKernelComs, dkRegisterCallback, dkBuildResponse, dkBuildResponseF,
+	dkGetBuffer, dkReturnBuffer, dkSendPacket, dkCallbackHook, dkSendDone */
+__xmem void dkInitDebugKernelComs(void);
+__xmem void dkRegisterCallback(void);
+__root void dkBuildResponse(void);
+__root void dkBuildResponseF(void);
+__xmem void dkGetBuffer(void);
+__root void dkReturnBuffer(void);
+__root void dkSendPacket(void);
+extern long dkBufferPool;
+extern int  dkRxQPtr;
+extern unsigned int  dkCallbackHook;
+extern char dkSendDone;
+#define DK_MAX_TX_BUFFERS	5
+#define DK_MAX_RX_BUFFERS	5
+
+
+#define TC_DEBUG_RESET		0x0f
+/*** EndHeader */
+
+__xmem void dkSetBuffers(void);
+__root void dkBIOSLevelCallback(int flags, char type, char subtype, int length, long buffer, long userdata);
+long dkBufferPool;
+int  dkRxQPtr;
+unsigned int  dkCallbackHook;
+char dkSendDone;
+
+#asm __xmem
+dkInitDebugKernelComs::
+	clr	hl
+	ld		(dkCallbackHook),hl
+	call	dkRegisterCallback
+
+	ld		hl,TCState+[TCState]+RXBufferList; ix has pointer to buffer list
+	ld		hl,(hl)
+	ld		ix,hl
+	ld		bc,sizeof(long)						; put sizeof buffer into bc
+	ld		de,TC_TYPE_DEBUG						; debug offset into de
+	mul												; offset is in bc
+	add	ix,bc										; ix has addr of offset into buffer list
+	ld		hl,ix										; move offset to hl
+	ld		(dkRxQPtr),hl
+
+	lcall	dkSetBuffers
+
+	lret
+#endasm
+
+#asm __xmem
+dkRegisterCallback::
+	; register the debug kernel callback
+	ld		hl,TCState+[TCState]+CallbackList; hl has pointer to callback list
+	ld		hl,(hl)									; deference to get base callback list addr
+	ld		ix,hl										; move base addr to ix
+	ld		bc,sizeof(int)							; put sizeof callback into bc
+	ld		de,TC_TYPE_DEBUG						; debug offset into de
+	mul												; offset is in hl
+	add	ix,bc										; ix has addr of offset into callback list
+	ld		hl,dkBIOSLevelCallback				; hl has address of callback
+	ld		(ix),hl									; put callback address into list
+	lret
+#endasm
+
+#asm __xmem
+dkSetBuffers::
+; build rx buffer queue
+	exx
+	ld		b,DK_MAX_RX_BUFFERS			; get maximum number of receive buffers
+__dk_sbrxloop:
+	push	bc									; save djnz counter
+	exx
+
+	call	dkcGetSystemBuffer			; get sys buf into bc,de
+	jr		nz,__dk_sbrxcont				; if no buf, continue
+
+	ld		hl,(dkRxQPtr)
+	call	dkReturnBuffer
+
+__dk_sbrxcont:
+	exx
+	jr __decrementandjump
+__jumptoloop:
+	jp	__dk_sbrxloop
+__decrementandjump:						; restore the b counter
+	pop	bc
+	djnz  __jumptoloop
+	exx
+
+; build rx buffer tx buffer queue
+	clr	hl
+	ld		(dkBufferPool),hl
+	ld		(dkBufferPool+2),hl
+
+	exx
+	ld		b,DK_MAX_TX_BUFFERS			; get maximum number of transmit buffers
+__dk_sbtxloop:
+	push	bc									; save djnz counter
+	exx
+
+	call	dkcGetSystemBuffer			; get sys buf into bc,de
+
+	jr		nz,__dk_sbtxcont				; if no buf, continue
+
+	ld		hl,dkBufferPool
+	call	dkReturnBuffer
+
+__dk_sbtxcont:
+	jr		__dk_sbtxcheckloop
+__dk_sbtxdoloop:
+	jp		__dk_sbtxloop
+__dk_sbtxcheckloop:
+	exx
+	pop	bc									; restore the b counter
+	djnz	__dk_sbtxdoloop
+	exx
+
+	lret
+#endasm
+
+#asm __root
+; expects -
+; jk: source lxpc
+; hl: pointer to root data buffer
+; bc: length of data
+; e : subtype of packet
+dkBuildResponse::
+	; convert address in jk:hl (lxpc:root) to a physical address in px
+   ex		jk',hl						; save hl in jk'
+	ld		hl,lxpc
+   push	hl								; preserve current lxpc
+   push	bcde							; preserve parameters
+
+   ex		jk,hl
+   ld		lxpc, hl						; switch to lxpc passed to function
+   ex		jk',hl						; restore root address passed in
+	xor 	a								; Checking for D space
+	ld		c, 0							; default to no A16, A19 inversions in xor mask
+	call  dkcLogicalToPhysical
+	ld		px, bcde						; source address now in px
+
+	pop	bcde							; restore parameters
+
+	pop	hl								; restore lxpc
+   ld		lxpc,hl
+
+; entry point for parameters passed in px, bc and e
+dkBuildResponseF::
+	exx											; save passed parameters
+	lcall	dkGetBuffer							; get buffer for response (in bcde)
+	jr		z,__dk_brbuf						; build response if buf available
+	exx											; restore registers
+	jr		__dk_brdone							; drop response - no buf available
+
+__dk_brbuf:
+	ld		py, bcde								; py has physical address for buf
+
+   ; might be able to set lxpc here and use dkcLogicalToPhysical to get
+   ; physical address of source, can then restore lxpc and continue
+   ; with far addresses only
+
+	push	bcde									; save copy of physical address
+
+	clr	hl										; clear hl
+
+	ld		(py+TC_HEADER_USERDATA),hl		; no user data
+	ld		(py+TC_HEADER_USERDATA+2),hl
+	ld		(py+TC_HEADER_FLAGS),hl			; no flags
+
+	exx											; restore passed parameters
+	ld		a, TC_TYPE_DEBUG
+	ld		(py+TC_HEADER_TYPE), a			; load type of packet
+	ld		a, e
+	ld		(py+TC_HEADER_SUBTYPE),a		; load subtype of packet
+	ld		(py+TC_HEADER_LENGTH),bc		; load length of packet
+
+	ld		py,py+TC_HEADER_RESERVE			; increment pointer past reserve
+
+	test	bc
+   jr		z,__dk_brsendpacket				; if zero, no copy nec
+
+	copy											; do { (py++) = (px++) } while (--bc);
+
+__dk_brsendpacket:
+	pop	bcde									; restore physical address
+
+	xor	a
+   ld		(dkSendDone),a
+	call	dkSendPacket						; send the packet
+
+__dk_brdone:
+	ret
+#endasm
+
+#asm __xmem
+; Use the tc system buffers -
+; Get a buffer into bc,de if one is available
+; z is set on success, nz if no buffer was available
+dkGetBuffer::
+__dk_gbagain:
+	ld		hl,dkBufferPool
+	call	dkcGetBuffer
+;	jr		nz,__dk_gbagain
+	lret
+#endasm
+
+#asm __root
+; Returns a system buffer to the available pool
+; Assumes:
+;	 bc,de == the buffer to re-queue
+;   hl == root pointer to queue
+;	 CurQPtr == root pointer to queue
+
+dkReturnBuffer::
+	ex		jk',hl                                 ; save hl
+   ld		hl,lxpc
+   push	hl                                     ; push lxpc
+	ex		jk',hl                                 ; restore hl
+	push	hl                                     ; push original hl
+	call	dkcPhysicalToLogical
+	ex		jk',hl
+	ex		jk,hl
+   ld		lxpc,hl
+	ex		jk',hl
+	ld		ix,hl
+	ld		hl,TC_SYSBUF_SIZE-TC_HEADER_RESERVE		; store the length of the buffer
+	ld		(ix+TC_HEADER_LENGTH),hl
+	clr	hl
+	ld		(ix+TC_HEADER_FLAGS),hl
+
+	pop	hl                                     ; pop original hl
+	call	dkcQueueBuffer
+	pop	hl                                     ; pop lxpc
+   ld		lxpc,hl
+	ret
+
+dkSendPacket::
+	call dkcSystemSendPacket
+	ret
+#endasm
+
+#asm __root
+
+dkBIOSLevelCallback::
+	ld		hl,(sp+2)					; get the flags
+
+   bit	0,l							; check for TC_RECEIVE set
+	jr		nz,__dk_cbrx
+	bit	1,l							; check for TC_TXDONE set
+	jr		nz,__dk_cbtx
+	; error - shouldn't ever get here!!
+	jp		__dk_blcbdone
+
+__dk_cbtx:
+	; buffer has been transmitted - get the buffer address
+	; off of the stack and return it
+	ld		hl,(sp+10)						; get the high 16 bits of the buffer's address
+	ex		de,hl								; de has high 16 bits
+	ld		hl,(sp+12)						; get low 16 bits of buffer's address
+	ld		bc,hl								; bc,de has the buffer's address
+
+	ld		hl,dkBufferPool
+	call	dkReturnBuffer
+
+	ld		hl,(sp+6)						; get the subtype
+	ld		a, TC_ACK | TC_NAK
+	cpl
+	and	l									; subtype in a (ack masked out)
+   cp		TC_DEBUG_RESET					; check for reset ack
+   jr		nz,__dk_cbnotreset
+
+#if RAM_COMPILE
+   ld    a,1
+   ld    (dkcstartuserprog),a
+   ljp      InRAMNow
+#else
+   jp    dkInit
+#endif
+__dk_cbnotreset:
+	jp		__dk_blcbdone
+
+__dk_cbrx:
+;      0              2           4          6            8            10           14
+; int  dkCallback(int flags, char type, char subtype, int length, long buffer, long userdata);
+	ld		hl,(sp+10)						; get high 16 bits of buffer's address
+	ex		de,hl								; de has high 16 bits
+	ld		hl,(sp+12)						; get low 16 bits of buffer's address
+	ld		bc,hl								; bc,de has the system-buffer's address
+	call	dkcPhysicalToLogical			; a:hl has logical address after return
+	push	hl									; push buffer offset onto stack
+   ex		jk,hl                      ; lxpc in jk after dkcPhysicalToLogical
+   push	hl									; push lxpc value onto stack
+
+   ld		hl,(sp+12)						; get length into hl
+   push	hl									; push length onto stack
+
+	ld		hl,(sp+12)						; get the subtype
+	ld		a,TC_ACK
+	cpl
+	and	l									; subtype in a (ack masked out)
+	clr	hl									; clear h
+	ld		l,a								; subtype in l (ack masked out)
+   push	hl									; push subtype onto stack
+
+;      0               2            4           6        8
+; void dkCallback(char subtype, int length, int lxpc, int buffer);
+;   call	dkCallback
+	xor	a
+   ld		hl,(dkCallbackHook)
+   or		h
+   or		l
+   jr		z,__dk_blcbnocallback
+   ld		ix,__dk_blcbreturn
+   push	ix
+   jp		(hl)
+
+__dk_blcbnocallback:
+	pop	hl									; get subtype into hl
+	ld		a,TC_NAK
+	or		l
+	ld		e,a
+	ld		bc,0
+	call	dkBuildResponse
+   add	sp,6
+   jr		__dk_blcbdone
+
+
+__dk_blcbreturn:
+	ld		hl,(sp+18)						; get the high 16 bits of the buffer's address
+	ex		de,hl								; de has high 16 bits
+	ld		hl,(sp+20)						; get low 16 bits of buffer's address
+	ld		bc,hl
+	ld		hl,(sp+18)						; get the high 16 bits of the buffer's address
+	ex		de,hl								; de has high 16 bits
+	ld		hl,(sp+20)						; get low 16 bits of buffer's address
+	ld		bc,hl
+   call	bioshitwd
+	add	sp,8
+  	ld		hl,(dkRxQPtr)
+	call	dkReturnBuffer
+
+__dk_blcbdone:
+	clr	hl									; return (int)0
+	ret
+
+#endasm
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+

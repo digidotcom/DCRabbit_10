@@ -1,0 +1,397 @@
+/*
+	http2fat.lib
+	Copyright (c) 2008 Digi International Inc., All Rights Reserved
+
+	This software contains proprietary and confidential information of Digi
+	International Inc.  By accepting transfer of this copy, Recipient agrees
+	to retain this software in confidence, to prevent disclosure to others,
+	and to make no use of this software other than that for which it was
+	delivered.  This is a published copyrighted work of Digi International
+	Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+	prohibited.
+
+	Restricted Rights Legend
+
+	Use, duplication, or disclosure by the Government is subject to
+	restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+	Technical Data and Computer Software clause at DFARS 252.227-7031 or
+	subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+	Restricted Rights at 48 CFR 52.227-19, as applicable.
+
+	Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+*/
+/* START LIBRARY DESCRIPTION ************************************************
+
+	Download a file from a web server and store it in the FAT filesystem.
+
+	Requires FAT16.LIB and HTTP_CLIENT.LIB to be #used first.
+
+	Macros:
+
+	HTTP2FAT_VERBOSE - If defined, library will print status messages to STDOUT.
+
+	HTTP2FAT_DEBUG - If defined, functions will be debuggable (i.e., you can set
+				breakpoints and single-step into them).
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader http2fat_init, http2fat_tick */
+#if ((!(defined __FAT16_LIB) && !(defined __FAT_LIB)) || !(defined __HTTPC_LIB))
+	#warns "When using http2fat.lib, you must #use http_client.lib and either"
+	#fatal "fat16.lib or fat.lib libraries before you #use http2fat.lib library."
+#endif
+
+#ifdef HTTP2FAT_DEBUG
+	#define _http2fat_debug __debug
+#else
+	#define _http2fat_debug __nodebug
+#endif
+
+/* START FUNCTION DESCRIPTION ********************************************
+http2fat_t																	<http2fat.lib>
+
+	Structure used to store state information for http2fat_tick.  Initialized
+	by http2fat_init.  Useful elements the caller of http2fat_tick can use:
+
+	char *localfn					Full path (without partition) of destination file.
+
+	unsigned long filesize		Set to 0 if size isn't known, or the size of the
+										file being downloaded.
+
+	unsigned long bytesread		Number of bytes read so far.
+
+SEE ALSO:		http2fat_init, http2fat_tick
+
+END DESCRIPTION **********************************************************/
+
+// Note that since that FAT library requires FATfile to be in near memory, the
+// API for this library requires the http2fat_t object to be in near as well.
+typedef struct {
+	httpc_Socket	hsock;
+	FATfile			fatfile;
+	char				localfn[128];	// FAT file
+	unsigned long	filesize;		// size of HTTP file, or 0 if unknown
+	unsigned long	bytesread;		// bytes of the file read and saved to FAT
+} http2fat_t;
+
+int http2fat_init (http2fat_t *h2f, tcp_Socket *sock, const char *url,
+	const char *localfile);
+int http2fat_tick (http2fat_t *h2f);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_http2fat_cleanup															<http2fat.lib>
+
+SYNTAX:			void _http2fat_cleanup( http2fat_t *h2f, int delete)
+
+DESCRIPTION: 	Close network socket and optionally delete FAT file (if open).
+
+PARAMETER 1:   Pointer to status structure.
+
+PARAMETER 2:	Flag set to 1 if the FAT file should be deleted (incomplete
+					download) or 0 to ignore it.
+
+END DESCRIPTION **********************************************************/
+_http2fat_debug
+void _http2fat_cleanup( http2fat_t *h2f, int delete)
+{
+   auto fat_part *part;
+
+   if (h2f->hsock.state != HTTPC_STATE_CLOSED)
+   {
+      httpc_close (&h2f->hsock);
+   }
+   // if fatfile is not closed, the download failed and we need to clean up
+   if (delete)
+   {
+#ifdef HTTP2FAT_VERBOSE
+   	printf ("%s: download failed, deleting %s\n", "http2fat", h2f->localfn);
+#endif
+
+		if (fat_IsOpen( &h2f->fatfile))
+		{
+	      part = h2f->fatfile.part;
+	      while (fat_Close( &h2f->fatfile) == -EBUSY);
+	      while (fat_Delete( part, FAT_FILE, h2f->localfn) == -EBUSY);
+	   }
+   }
+}
+
+/* START FUNCTION DESCRIPTION ********************************************
+http2fat_init																	<http2fat.lib>
+
+SYNTAX:			int http2fat_init (http2fat_t *h2f, tcp_Socket *sock,
+											const char *url, const char *localfile)
+
+DESCRIPTION: 	Open FAT file, initiate HTTP connection and initialize status
+					structure to pass to http2fat_tick, in order to download a file
+					from an HTTP server and save it to a FAT file.
+
+PARAMETER 1:   Pointer to status structure.
+
+PARAMETER 2:	Pointer to TCP socket to use for making the HTTP connection.
+
+PARAMETER 3:   HTTP URL of file to download, in the following format (items in
+					[] are optional): [http://][user:pass@]hostname[:port]/filename
+
+PARAMETER 4:	FAT pathname to store downloaded file.  In the format of
+					"a:filename.ext" or "/a/filename.ext".
+
+					Filename must be less than
+
+RETURN VALUE:  Integer code as follows:
+						 0: Success, connection established.  Can pass <h2f> to
+						 		http2fat_tick to continue download.
+					   -EINVAL: Error parsing <url> or <localfile>.
+					   -E2BIG: FAT pathname is too long, must be < 128 characters.
+					   -NETERR_DNSERROR: Unable to resolve hostname from <url>.
+					   -NETERR_INACTIVE_TIMEOUT: timed out due to inactivity
+						<0: See fat_Open for additional error codes.
+
+SEE ALSO:		http2fat_t, http2fat_tick, fat_Open
+
+END DESCRIPTION **********************************************************/
+_http2fat_debug
+int http2fat_init (http2fat_t *h2f, tcp_Socket *sock, const char *url,
+	const char *localfile)
+{
+	auto int		error;				// return code
+	auto int		i;
+	auto fat_part *part;
+	auto char		*filepath;
+	auto long		filelen;
+
+	if (! h2f)
+	{
+		return -EINVAL;
+	}
+
+	memset (h2f, 0, sizeof(*h2f));
+
+	h2f->hsock.state = HTTPC_STATE_CLOSED;
+
+#ifdef HTTP2FAT_VERBOSE
+	printf ("%s: downloading %s\n", "http2fat", url);
+	printf ("\t to %s\n", localfile);
+#endif
+
+	error = fat_GetPartition (&part, (const char **)&filepath, localfile);
+	if (error)
+	{
+#ifdef HTTP2FAT_VERBOSE
+		printf ("%s: error %d calling %s\n", "http2fat", error,
+			"fat_GetPartition");
+#endif
+		return error;
+	}
+
+	// copy filepath to h2f (if there's enough room)
+	i = strlen( filepath);
+	if (i > (sizeof(h2f->localfn) - 1))
+	{
+#ifdef HTTP2FAT_VERBOSE
+	   printf ("%s: file path too big (%u characters)\n", "http2fat", i);
+#endif
+		return -E2BIG;
+	}
+	// add 1 to include null terminator (not included in strlen return)
+	memcpy( h2f->localfn, filepath, i + 1);
+
+#ifdef HTTP2FAT_VERBOSE
+   printf ("http2fat: connecting to web server\n");
+#endif
+   error = httpc_init (&h2f->hsock, sock);
+#ifdef HTTP2FAT_VERBOSE
+   if (error)
+   {
+      printf ("%s: error %d calling %s\n", "http2fat", error, "httpc_init");
+   }
+#endif
+
+	if (!error)
+	{
+	   error = httpc_get_url (&h2f->hsock, url);
+#ifdef HTTP2FAT_VERBOSE
+	   if (error)
+	   {
+	      printf ("%s: error %d calling %s\n", "http2fat", error,
+	      	"httpc_get_url");
+	   }
+#endif
+	}
+
+	if (!error)
+	{
+	   error = httpc_skip_headers (&h2f->hsock);
+	   if (error > 0)
+	   {
+	   	// not an error, return value is number of bytes in headers
+	   	// if response from the server wasn't 200 (HTTP OK) though,
+	   	// consider it an error
+
+	   	error = (h2f->hsock.response == 200) ? 0 : -EIO;
+	   }
+#ifdef HTTP2FAT_VERBOSE
+	   else if (error)
+	   {
+	      printf ("%s: error %d calling %s\n", "http2fat", error,
+	      	"httpc_skip_headers");
+	   }
+#endif
+	}
+
+	if (!error)
+	{
+	   // open the file and pre-request the number of bytes needed
+		filelen = h2f->filesize = h2f->hsock.filesize;
+#ifdef HTTP2FAT_VERBOSE
+	   if ( filelen )
+	   {
+	      printf ("%s: Preparing to download %lu bytes...\n", "http2fat",
+	      	filelen);
+	   }
+	   else
+	   {
+	      printf ("%s: Downloading file of unknown size...\n", "http2fat");
+	   }
+	   printf ("%s: creating file %s on FAT filesystem\n", "http2fat",
+	   	h2f->localfn);
+#endif
+
+	   do {
+	      // !!! do we need to add a timeout of some sort, to break out of loop?
+	      error = fat_Open (part, h2f->localfn, FAT_FILE,
+	      	FAT_CREATE | FAT_SEQUENTIAL, &h2f->fatfile, &filelen);
+	   } while (error == -EBUSY);
+
+#ifdef HTTP2FAT_VERBOSE
+	   if (error)
+	   {
+	      printf ("%s: error %d calling %s\n", "http2fat", error, "fat_Open");
+	   }
+#endif
+	}
+
+	if (error)
+	{
+		// Clean up on error.  Note that we couldn't successfully open the
+		// file, so we don't have to try deleting it during cleanup.
+		_http2fat_cleanup( h2f, 0);
+	}
+
+	return error;
+}
+
+/* START FUNCTION DESCRIPTION ********************************************
+http2fat_tick																<http2fat.lib>
+
+SYNTAX:			int http2fat_tick (http2fat_t *h2f);
+
+DESCRIPTION: 	Read more data from HTTP server, and write it out to FAT file.
+
+PARAMETER 1:   Pointer to status structure, set up by http2fat_init.
+
+RETURN VALUE:  Integer code as follows:
+						 0: Success, file download complete.
+					   -EBUSY:	Download in progress.
+					   -EINVAL: Invalid structure passed as parameter 1.
+					   -ENOTCONN: Connection closed, can't read from socket.
+						Any other negative value: I/O error when updating the
+							directory entry.
+
+						For errors other than -EBUSY and -EINVAL, the incomplete
+						FAT file is deleted.
+
+NOTES:			You can monitor download progress via the h2f->filesize and
+					h2f->bytesread elements (both unsigned long) from http2fat_t.
+
+SEE ALSO:		http2fat_t, http2fat_init
+
+END DESCRIPTION **********************************************************/
+_http2fat_debug
+int http2fat_tick (http2fat_t *h2f)
+{
+	auto int 	error;
+	auto int		writebytes;
+	auto int		offset;
+	auto byte	buffer[512];		// copy 512-byte chunks from socket to FAT
+
+	// if h2f isn't valid (or completed), return immediately
+	if (!h2f || fat_IsClosed( &h2f->fatfile))
+	{
+		return -EINVAL;
+	}
+
+	error = 0;
+   // read from socket, write to FAT
+   if (h2f->hsock.state == HTTPC_STATE_BODY)
+   {
+      error = httpc_read_body (&h2f->hsock, buffer, sizeof(buffer));
+      if (error > 0)
+      {
+      	// error holds # of bytes read
+         writebytes = error;
+         h2f->bytesread += writebytes;
+         error = 0;
+         // write it to the FAT file
+         offset = 0;
+         while (!error && (writebytes > 0))
+         {
+            do {
+               error = fat_Write (&h2f->fatfile, &buffer[offset], writebytes);
+            } while (error == -EBUSY);
+            if (error > 0)
+            {
+            	// error holds # of bytes written
+               writebytes -= error;
+               offset += error;
+               error = 0;
+            }
+#ifdef HTTP2FAT_VERBOSE
+            else if (error < 0)
+            {
+               printf ("%s: error %d calling %s\n", "http2fat", error,
+               	"fat_Write");
+            }
+#endif
+         }
+      }
+#ifdef HTTP2FAT_VERBOSE
+      else if (error < 0)
+      {
+         printf ("%s: error %d reading from HTTP server\n", "http2fat", error);
+      }
+#endif
+   }
+
+	if (!error)
+	{
+		if (h2f->hsock.state == HTTPC_STATE_BODY)
+		{
+			// file is incomplete
+			return -EBUSY;
+		}
+
+		// if here, we've completely read the file and can wrap up
+#ifdef HTTP2FAT_VERBOSE
+		printf ("%s: downloaded %lu bytes\n", "http2fat", h2f->bytesread);
+#endif
+	   do {
+	      error = fat_Close(&h2f->fatfile);
+	   } while (error == -EBUSY);
+
+#ifdef HTTP2FAT_VERBOSE
+	   if (error)
+	   {
+	      printf("%s: error %d calling %s\n", "http2fat", error, "fat_Close");
+	   }
+#endif
+	}
+
+	// Either done or exiting due to an error.  Cleanup and possibly delete file.
+	_http2fat_cleanup( h2f, error ? 1 : 0);
+
+	return error;
+}
+
+

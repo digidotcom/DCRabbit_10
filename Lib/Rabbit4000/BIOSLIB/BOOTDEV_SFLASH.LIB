@@ -1,0 +1,2469 @@
+/******************************************************************************
+BOOTDEV_SFLASH.LIB
+
+   Copyright (c) 2008 Digi International Inc., All Rights Reserved
+
+   This software contains proprietary and confidential information of Digi
+   International Inc.  By accepting transfer of this copy, Recipient agrees
+   to retain this software in confidence, to prevent disclosure to others,
+   and to make no use of this software other than that for which it was
+   delivered.  This is a published copyrighted work of Digi International
+   Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+   prohibited.
+
+   Restricted Rights Legend
+
+   Use, duplication, or disclosure by the Government is subject to
+   restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+   Technical Data and Computer Software clause at DFARS 252.227-7031 or
+   subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+   Restricted Rights at 48 CFR 52.227-19, as applicable.
+
+   Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+
+
+DESCRIPTION:
+
+  ATMEL AT45DB series are the only devices currently supported.
+
+  The functions below are internal. Some are only for use from
+  assembly code, and some are only for BIOS and pilot usage.
+     _sfInit() - Initialize serial boot flash device.
+    _sbf_command() - Write a serial flash command, and read back
+                    the response, if any. This for application
+                    APIs, and includes protection for shared
+                    SPI lines and times out. All API functions
+                    accessing the SF will go through this.
+    _sbf_bios_initSF() - Initialize the serial flash for BIOS
+                         and Pilot usage.
+    _sbf_wr_rd() - Like _sbf_command but assumes no shared
+                   devices. For BIOS and Pilot usage.
+    _sbf_IsRDY() - Returns true is SF RDY pin asserted.
+                   No multi-tasking protection!
+    _sbf_BusyWaitRDY() - Busy waits until  SF RDY pin asserted.
+                         Not for API usage.
+    _sbf_BIOSreadf() - Read BC bytes from serial flash
+                       starting at address JKHL into RAM
+                       address DE.
+    _sbf_BIOSwritef() - Write BC bytes to serial flash
+                       starting at address JKHL from RAM
+                       address DE.
+*******************************************************************************/
+
+/*** BeginHeader _FlashInfo, _sfb_dev, _serFlashComBuffer, \
+                 sbf_cs_enable, sbf_cs_disable, sbf_cs_configure, \
+                 sbf_spi_control_value */
+
+#ifndef __BOOTDEV_SFLASH__
+#define __BOOTDEV_SFLASH__
+
+#define WriteFlash(x,y,z) _sbfWrite(x,y,z)
+// uncomment line below to debug
+//#define BOOTDEV_SFLASHDEBUG
+
+#ifdef BOOTDEV_SFLASHDEBUG
+   #define _bootdev_debug __debug
+#else
+   #define _bootdev_debug __nodebug
+#endif
+
+// defines for a #if statement below
+#ifdef PILOT_BIOS
+   #define PILOT_BIOS_BOOL 1
+#else
+   #define PILOT_BIOS_BOOL 0
+#endif
+
+#ifndef DEFSPIDIVISOR
+   #define DEFSPIDIVISOR 0
+#endif
+
+#if (CPU_ID_MASK(_CPU_ID_) >= R6000) && !defined SFDIVISOR_R6K_PLL_ON
+   // Byte rate divisor when not in the pilot BIOS on Rabbit 6000 products.
+   #ifdef USE_TIMERA_PRESCALE
+      // Timer A uses peripheral clock
+      #define SFDIVISOR_R6K_PLL_ON  21
+   #else
+      // Timer A uses peripheral clock / 2
+      #define SFDIVISOR_R6K_PLL_ON  10
+   #endif
+#endif
+
+#ifndef SBF_DR
+   #define SBF_DR SBDR
+#endif
+
+#define SFDIVISOR             DEFSPIDIVISOR
+#define _SF_TIMEOUT           5010
+#define SF_SPI_ECONTROL_VALUE 0x08
+#define _AR_OFFS              1
+#define _SR_OFFS              3
+#define _CR_OFFS              4
+#define _ER_OFFS              5
+#define SPI_RXMASK            0x40
+#define SPI_TXMASK            0x80
+
+#define SBFMAXPAGESIZE        528
+#define _SF_MEM2BUFF2  asm ld a,0x55 $ ld bc,4 $ call _sbf_sendOnlycomm
+#define _SF_BUFF22MEM  asm ld a,0x89 $ ld bc,4 $ call _sbf_sendOnlycomm
+#define _SF_ERASEBLOCK asm ld a,0x50 $ ld bc,4 $ call _sbf_sendOnlycomm
+#define _SF_ERASECHIP  asm ld a,0xC0 $ ld bc,4 $ call _sbf_sendOnlycomm
+#define _SF_COMPBUFF1  asm ld a,0x60 $ ld bc,4 $ call _sbf_sendOnlycomm
+#define _SF_ERASEPAGE  asm ld a,0x81 $ ld bc,4 $ call _sbf_sendOnlycomm
+
+// The industry standard 0x03 continuous read command followed by three address
+// bytes will not work for boards equipped with Atmel serial flash devices with
+// revision levels earlier than "D" (i.e. revisions prior to AT45DB041D,
+// AT45DB081D, AT45DB161D, AT45DB321D, AT45DB642D). The 0x03 command is also
+// limited to 33 MHz operation, maximum. In contrast, the Atmel-specific
+// "legacy" 0xE8 continuous read command is supported for all AT45DBxxxx serial
+// flash device revisions to date, at up to 66 MHz operation, maximum.
+#define SBF_CONTREAD_COMMAND 0xE8	// Atmel-specific continuous read command
+#define SBF_CONTREAD_BYTES   8		// command + 3 address + 4 don't care bytes
+
+//*** Macros for serial flash chip select
+#ifdef PILOT_BIOS
+   #define SFCSCONFIGURE   asm ld iy,(sbf_cs_configure) $ call (iy)
+   #define SFCSENABLE      asm ld iy,(sbf_cs_enable) $ call (iy)
+   #define SFCSDISABLE     asm ld iy,(sbf_cs_disable) $ call (iy)
+   #define SBF_SPI_CONTROL (sbf_spi_control_value)
+
+#elif RCM4300_SERIES
+   //  disable SD chip select
+   #define SFCSCONFIGURE   asm push AF $\
+                               ioi ld a, (NAPCR) $\
+                               set 4, a $\
+                               ioi ld (NAPCR), a $\
+                               ld (NAPCRShadow), a $\
+                               pop AF
+   // set TxD++ to enable sbf cs
+   #define SFCSENABLE      asm push AF $\
+                               ioi ld a, (NAPCR) $\
+                               set 5, a $\
+                               ioi ld (NAPCR), a $\
+                               ld (NAPCRShadow), a $\
+                               pop AF
+   // reset TxD++ to disable sbf cs
+   #define SFCSDISABLE     asm push AF $\
+                               ioi ld a, (NAPCR) $\
+                               res 5, a $\
+                               ioi ld (NAPCR), a $\
+                               ld (NAPCRShadow), a $\
+                               pop AF
+   #define SBF_SPI_CONTROL 0x0C
+#elif BL4S100_SERIES
+   // set PE4 CS as output
+   #define SFCSCONFIGURE   asm push AF $\
+                               ioi ld a, (PEDDR) $\
+                               set 4, a $\
+                               ioi ld (PEDDR), a $\
+                               ld (PEDDRShadow), a $\
+                               pop AF
+   // reset PE4 to enable sbf cs
+   #define SFCSENABLE      asm push AF $\
+                               ioi ld a, (PEDR) $\
+                               res 4, a $\
+                               ioi ld (PEDR), a $\
+                               ld (PEDRShadow), a $\
+                               pop AF
+   // set PE4 to disable sbf cs
+   #define SFCSDISABLE     asm push AF $\
+                               ioi ld a, (PEDR) $\
+                               set 4, a $\
+                               ioi ld (PEDR), a $\
+                               ld (PEDRShadow), a $\
+                               pop AF
+   #define SBF_SPI_CONTROL 0x0C
+#elif (CPU_ID_MASK(_CPU_ID_) >= R5000)
+   // set PD6 CS as output
+   #define SFCSCONFIGURE   asm push AF $\
+                               ioi ld a, (PDDDR) $\
+                               set 6, a $\
+                               ioi ld (PDDDR), a $\
+                               ld (PDDDRShadow), a $\
+                               pop AF
+   // reset PD6 to enable sbf cs
+   #define SFCSENABLE      asm push AF $\
+                               ld a, TRUE $\
+                               ld (_sf_spi_busy), a $\
+                               ioi ld a, (PDDR) $\
+                               res 6, a $\
+                               ioi ld (PDDR), a $\
+                               ld (PDDRShadow), a $\
+                               pop AF
+   // set PD6 to disable sbf cs
+   #define SFCSDISABLE     asm push AF $\
+                               ioi ld a, (PDDR) $\
+                               set 6, a $\
+                               ioi ld (PDDR), a $\
+                               ld (PDDRShadow), a$\
+                               ld a, FALSE $\
+                               ld (_sf_spi_busy), a $\
+                               pop AF
+   #define SBF_SPI_CONTROL 0x1C
+#else
+   #fatal "Do not recognize serial flash board type!"
+#endif
+
+
+typedef struct _sfb_dev_tag {
+  unsigned pagesize;
+  unsigned binPagesize;
+  char     pAddrShift;
+  unsigned npages;
+  char     pagesPerBlock;
+  unsigned pagesPerSector;
+  char     binaryMode;
+} _sfb_dev_type;
+
+// This should match the struct in FlashInfoType, which isn't used
+// when using serial boot flash.
+typedef struct {
+   char  flashXPC;         // XPC used to access flash via XMEM (E000-FFFF)
+   int   sectorSize;       // sector size in bytes (=128 for large-sector flash)
+   int   numSectors;       // number of sectors on the flash
+   int   flashSize;        // size of the flash in 4KB blocks
+   char  writeMode;        // method of data-writing (currently only 1-3, 0x1X)
+   void * writePtr;        // pointer to write flash sector function in RAM
+   void * getIDPtr;        // pointer to getID function in RAM
+   void * eraseSectPtr;    // pointer to sector erase function in RAM
+#ifdef _ENABLE_16BIT_FLASH_
+   void * writeCmd;        // pointer to write command sequence
+   char  flash1619;        // upper address nibble for linear access (16bit flash)
+#endif
+} _FlashInfoType;
+
+extern _FlashInfoType _FlashInfo;
+
+extern _sfb_dev_type _sfb_dev;
+extern char _serFlashComBuffer[8];
+
+// used as function pointers for assembly code
+#ifdef PILOT_BIOS
+extern int sbf_cs_enable;
+extern int sbf_cs_disable;
+extern int sbf_cs_configure;
+extern char sbf_spi_control_value;
+#endif
+
+// number of bytes on the serial boot flash
+#define SBF_FLASH_BYTES		((uint32) _sfb_dev.pagesize * _sfb_dev.npages)
+
+// The "scratch" area of the serial boot flash begins at the end of the
+// boot firmware image.  If firmware for a given product will ALWAYS be
+// less than a certain size, override this macro using the Project Defines.
+#if defined SBF_SCRATCH_BEGIN
+	#warnt "SBF_SCRATCH_BEGIN is deprecated, use MAX_FIRMWARE_BINSIZE instead."
+	#warnt "Defining MAX_FIRMWARE_BINSIZE to SBF_SCRATCH_BEGIN."
+	#define MAX_FIRMWARE_BINSIZE     SBF_SCRATCH_BEGIN
+#endif
+
+/*
+	SBF_USERBLOCK_BEGIN is NOT the address for the userblock, it is the starting
+	address on the serial boot flash that's reserved for the userblock (and
+	System ID block and macro table, etc.).
+
+	UserBlockAddr is set at startup by the BIOS.
+*/
+#define SBF_USERBLOCK_BEGIN		UserBlockAddr
+
+/*** EndHeader */
+
+_FlashInfoType _FlashInfo;
+
+_sfb_dev_type _sfb_dev;
+
+char _serFlashComBuffer[8];
+
+#ifdef PILOT_BIOS
+int sbf_cs_enable;
+int sbf_cs_disable;
+int sbf_cs_configure;
+char sbf_spi_control_value;
+
+#asm
+_RCM4300_cs_configure::
+   ld iy,NAPCR
+   ioi set 4,(iy) ; disable SD chip select
+   ret
+
+_RCM4300_cs_enable::
+   ld iy,NAPCR
+   ioi set 5,(iy) ; set TxD++ to enable sbf cs
+   ret
+
+_RCM4300_cs_disable::
+   ld iy,NAPCR
+   ioi res 5,(iy) ; reset TxD++ to disable sbf cs
+   ret
+
+_BL4S1xx_cs_configure::
+   ld iy,PEDDR
+   ioi set 4,(iy)  ; set CS as output
+   ret
+
+_BL4S1xx_cs_enable::
+   ld iy,PEDR
+   ioi res 4,(iy) ; reset PE4 to enable sbf cs
+   ret
+
+_BL4S1xx_cs_disable::
+   ld iy,PEDR
+   ioi set 4,(iy) ; set PE4 to disable sbf cs
+   ret
+
+_RCM5xxx_cs_configure::
+   ld iy,PDDDR
+   ioi set 6,(iy) ; set PD6 CS as output
+   ret
+
+_RCM5xxx_cs_enable::
+   ld iy,PDDR
+   ioi res 6,(iy) ; reset PD6 to enable sbf cs
+   ret
+
+_RCM5xxx_cs_disable::
+   ld iy,PDDR
+   ioi set 6,(iy) ; set PD6 to disable sbf cs
+   ret
+#endasm
+#endif
+
+/*** BeginHeader _sbfReadUsr */
+int _sbfReadUsr(void* dest, unsigned long  src,  unsigned len);
+/*** EndHeader */
+// This is for use only in initialization before
+//  multiple devices need SPI lines. Internal use only.
+__nodebug
+int _sbfReadUsr(void* dest, unsigned long  src,  unsigned len)
+{
+#asm
+   call     _sbf_BusyWaitRDY
+   ld    hl,(sp+@SP+len)
+   ex    bc,hl
+   ld    hl,(sp+@SP+dest)
+   ex    de,hl
+   ld    jkhl,(sp+@SP+src)
+   call _sbf_BIOSreadf
+#endasm
+}
+
+/*** BeginHeader _sbf_far_ReadUsr */
+int _sbf_far_ReadUsr(void __far * dest, unsigned long  src,  unsigned len);
+/*** EndHeader */
+// This is for use only in initialization before
+//  multiple devices need SPI lines. Internal use only.
+__nodebug
+int _sbf_far_ReadUsr(void __far * dest, unsigned long  src,  unsigned len)
+{
+#asm
+   call     _sbf_BusyWaitRDY
+   ld    hl,(sp+@SP+len)
+   ex    bc,hl
+   ld    px,(sp+@SP+dest)
+   ld    jkhl,(sp+@SP+src)
+   call _sbf_far_BIOSreadf
+#endasm
+}
+
+/*** BeginHeader _sbf_ErasePage */
+int _sbf_ErasePage( unsigned long offset);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+_sbf_ErasePage                                         <bootdev_sflash.lib>
+
+SYNTAX:	int _sbf_ErasePage( unsigned long offset)
+
+DESCRIPTION:	Erase the page containing the given address.
+
+PARAMETER:	Address on the page to erase.
+
+RETURN VALUE:
+         0 - Successful completion.
+         2 - The SD card owns the semaphore. (RCM4300-series only)
+         3 - The ADC owns the semaphore. (RCM4300-series only)
+
+END DESCRIPTION **********************************************************/
+_bootdev_debug
+int _sbf_ErasePage( unsigned long offset)
+{
+#asm _bootdev_debug
+		ld		bcde, (sp+@SP+offset)
+		; flash offset in BCDE
+      call  _sbf_getPageAddr  ; expects flash address in BCDE, returns BCDE
+      ; BC = page#, DE = offset
+      call  _sbf_LdPageAddr
+      ; com buffer loaded with address bytes for a command
+      call  _sbf_BusyWaitRDY
+      SFCSENABLE
+      _SF_ERASEPAGE
+      SFCSDISABLE
+      call  _sbf_BusyWaitRDY
+#endasm
+
+   return 0;
+}
+
+/*** BeginHeader _sbfWrite, _sbf_far_Write, _sbf_far_WriteVerify */
+int _sbfWrite(unsigned long offset, const void* src, unsigned len);
+int _sbf_far_Write(unsigned long offset, const __far void* src, unsigned len);
+int _sbf_far_WriteVerify(unsigned long offset, const __far void* src,
+                                               unsigned len, int verify);
+/*** EndHeader */
+/**********************************************************************
+   _sbfWrite - Wrapper for backwards compatibility with near calls to _sbfWrite
+   Simply calls the far version of this function with verification disabled.
+
+   See comment for _sbf_far_WriteVerify for details.
+
+   offset - address in serial flash
+   src    - near ptr to data to write
+   len    - number of bytes
+
+   Returns
+         0 - Successful completion.
+         2 - The SD card owns the semaphore.
+         3 - The ADC owns the  semaphore.
+**********************************************************************/
+
+_bootdev_debug
+int _sbfWrite(unsigned long offset, const void* src, unsigned len)
+{
+   return _sbf_far_WriteVerify(offset, src, len, FALSE);
+}
+
+
+/**********************************************************************
+   _sbf_far_Write - Far version of _sbfWrite.  Calls _sbf_far_WriteVerify
+   with verification disabled.
+
+   See comment for _sbf_far_WriteVerify for details.
+
+   offset - address in serial flash
+   src    - far ptr to data to write
+   len    - number of bytes
+
+   Returns
+         0 - Successful completion.
+         2 - The SD card owns the semaphore.
+         3 - The ADC owns the  semaphore.
+**********************************************************************/
+
+_bootdev_debug
+int _sbf_far_Write(unsigned long offset, const __far void* src, unsigned len)
+{
+   return _sbf_far_WriteVerify(offset, src, len, FALSE);
+}
+
+
+/**********************************************************************
+   _sbf_far_WriteVerify - Internal function to write to serial flash when
+   using cooperative multi-tasking. Must be called repeatedly.
+
+   Used internally by user block write routines.
+   The difference between this function and sbfWriteFlash() is that
+   that sbfWriteFlash() yields execution (not the semaphore) while
+   the flash device is busy erasing or writing, and this function
+   doesn't.
+
+   offset - address in serial flash
+   src    - far ptr to data to write
+   len    - number of bytes
+   verify - if not FALSE, verify that the contents of flash are correct
+
+
+   Returns
+         0 - Successful completion.
+        -1 - Verification of write failed (only when verify is not FALSE).
+**********************************************************************/
+
+_bootdev_debug
+int _sbf_far_WriteVerify(unsigned long offset, const __far void* src,
+                                         unsigned len, int verify)
+{
+
+#asm _bootdev_debug
+      ld    hl, (sp+@SP+len)
+      ld    bc, hl
+      ld    px, (sp+@SP+src)
+      ld    jkhl, (sp+@SP+offset)
+      call  _sbf_far_BIOSwritef
+
+      ld    hl, (sp+@SP+verify)
+      test  hl
+      jp    z, .verification_success  ;don't check if verify == FALSE
+      //verify that the write is correct
+      ld    hl, (sp+@SP+len)
+      test  hl
+      jp    z, .verification_success   ;don't bother checking if len == 0
+      ld    bcde, (sp+@SP+offset)
+      push  ix
+      ld    ix, SBF_DR
+ioi   ld    a, (ix)     ;clear serial port
+      //send continuous read command
+      call  _sbf_getPageAddr  ;expects flash address in BCDE
+      call  _sbf_LdPageAddr
+      ld    hl,_serFlashComBuffer
+      ld    a, SBF_CONTREAD_COMMAND ;continuous read command
+      ld    (hl),a
+      ld    bc, SBF_CONTREAD_BYTES  ; Command + addr. bytes
+      SFCSENABLE
+      call  _sbfStreamOut        ;send read command to flash
+      //compare input array against actual flash contents
+      ld    hl, (sp+@SP+len+2)     ;compare this many bytes
+      ld    bc, hl
+      ld    px, (sp+@SP+src+2)     ;compare against this array
+.verify_outer_loop:
+      ld    a, SBF_SPI_CONTROL	; i.e. (sbf_spi_control_value) in Pilot Bios
+      or    SPI_RXMASK
+ioi   ld    (ix+_CR_OFFS), a  ; load RX control value
+.verify_inner_loop:
+ioi   bit   7, (ix+_SR_OFFS)  ;test receiver bit
+      jr    z, .verify_inner_loop   ;spin if not done yet
+ioi   ld    d, (ix)           ;get the byte from serial port
+      ld    a, (px)           ;get the byte from the array
+      cp    a, d
+      jr    nz, .verification_failure
+      ld    px, px+1          ;move on to next byte
+      dwjnz .verify_outer_loop
+      SFCSDISABLE
+      pop   ix
+      jp    .verification_success
+.verification_failure:
+      pop   ix
+#endasm
+     return   -1;
+
+#asm _bootdev_debug
+.verification_success:
+#endasm
+
+   return 0;
+}
+
+
+/*** BeginHeader  _sbfRead, _sbf_far_Read */
+   int _sbfRead(void *dest, unsigned long offset, unsigned nbytes);
+   int _sbf_far_Read(__far void *dest, unsigned long offset, unsigned nbytes);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+_sbfRead                    <BOOTDEV_SFLASH.LIB>
+
+SYNTAX:  _sbfRead(void *dest, unsigned long offset, unsigned nbytes);
+
+DESCRIPTION:  Read up to 64K bytes from anywhere on the serial
+              boot flash.
+
+PARAMETER1:  pointer (near) to the destination buffer
+PARAMETER2:  the physical offset into the serial flash.
+PARAMETER3:  number of bytes to read
+
+NOTES:
+      THIS FUNCTION SHOULD BE CALLED UNTIL IT RETURNS ZERO OR A NEGATIVE
+      ERROR CODE. A POSITIVE RETURN VALUE INDICATES THAT THE SPI PORT OF
+      THE SERIAL FLASH IS IN USE BY ANOTHER DEVICE. HOWEVER, IF USING
+      uC/OS-II AND _SPI_USE_UCOS_MUTEX is #defined, IT CAN JUST BE CALLED
+      ONCE.
+
+     IF MORE THAN _SPI_MAXTIME MILLISECONDS ELAPSE WAITING FOR THE
+     SPI PORT TO FREE UP, A RUN TIME ERROR: ERR_SPI_MUTEX_ERROR (if using
+     uCOS-II), OR -ETIME (if not using uCOS-II) WILL OCCUR.
+
+RETURN VALUE:  0 - success
+
+END DESCRIPTION *********************************************************/
+
+_bootdev_debug
+int _sbfRead(void *dest, unsigned long offset, unsigned nbytes)
+{
+   return _sbf_far_Read(dest, offset, nbytes);
+}
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+_sbf_far_Read                    <BOOTDEV_SFLASH.LIB>
+
+SYNTAX:  _sbf_far_Read(far void *dest, unsigned long offset, unsigned nbytes);
+
+DESCRIPTION:  Read up to 64K bytes from anywhere on the serial
+              boot flash. This function supports both blocking mode
+              for use with uC/OS-II and a mutex for preemptive
+              multitasking, and non-blocking mode for cooperative
+              multitasking.
+
+PARAMETER1:  pointer (far) to the destination buffer
+PARAMETER2:  the physical offset into the serial flash.
+PARAMETER3:  number of bytes to read
+
+NOTES:
+      THIS FUNCTION SHOULD BE CALLED UNTIL IT RETURNS ZERO OR A NEGATIVE
+      ERROR CODE.
+
+RETURN VALUE:  0 - success
+
+
+END DESCRIPTION *********************************************************/
+
+_bootdev_debug
+int _sbf_far_Read(__far void *dest, unsigned long offset, unsigned nbytes)
+{
+
+#asm
+      ld hl,(sp+@SP+nbytes)
+      ld bc,hl
+      ld px,(sp+@SP+dest)
+      ld jkhl,(sp+@SP+offset)
+      call _sbf_far_BIOSreadf ;expects count in BC, source in JKHL, dest in PX
+#endasm
+
+   return 0;
+}
+
+/************************************************************
+*
+*  The functions that follow are for use in the BIOS
+*  and pilot BIOS. They assume no other devices are
+*  sharing the SPI lines
+*
+************************************************************/
+/*** BeginHeader  _sbf_bios_initSF */
+int _sbf_bios_initSF(void);
+extern char sfcombuf[8];
+/*** EndHeader */
+
+
+/***********************************************************
+
+  Initialize ATML serial flash.
+
+  Trashes all general registers and alternates.
+
+  Returns 1 if an error occurred, 0 if no errors.
+
+************************************************************/
+char sfcombuf[8];
+
+#asm __root
+_sbf_bios_initSF::
+
+      call     _sbf_bios_initSPIB
+
+      ld       bc, 100  ; Maximum number of status reads, should be > 2
+.sbf_getstatus_loop:
+      //Read status of serial flash.
+      push     bc             ; Preserve value of BC around call
+      call     _sbf_getStatus
+      pop      bc
+
+      // Msb low == busy, msb high == ready
+      and      0x80
+      jr       nz,.sbfBInoError
+
+      // Repeat until status is good, or the loop counter runs out
+      dwjnz    .sbf_getstatus_loop
+
+      // Return 1 on error
+      ld       hl,1
+      ret
+
+.sbfBInoError:
+      call     _sbf_ldDevStruct
+
+      //*** Fill buffer 1 with FFs for erase comparisons
+      ld       e, 0xFF
+      push     ix
+      ld       ix,SBF_DR
+      ld       bc,(_sfb_dev+[_sfb_dev_type]+pagesize)
+      call     _sbf_memset
+      clr      hl
+      pop      ix
+      ret
+#endasm
+
+/*** BeginHeader  _sbf_bios_initSPIB */
+int _sbf_bios_initSPIB(void);
+/*** EndHeader */
+
+#asm __root
+_sbf_bios_initSPIB::
+/****************************************************************
+   SPI SCLK init for BIOS and pilot.
+
+   * If Rabbit 4000, assumes Serial Port B using PB0, PC4, PC5, TAT5R
+   * If Rabbit 5000, assumes PB0, PD4, PD5, TAT5R instead.
+   * Assumes no other device is using the SPI lines.
+
+     Trashes B, AF.
+****************************************************************/
+
+#ifndef PILOT_BIOS
+// compile time macros can be called now:
+//  Using SFCSDISABLE before SFCSCONFIGURE prevents any possible output glitch!
+SFCSDISABLE
+SFCSCONFIGURE
+#endif
+
+// do a runtime check of CPU ID if this is the pilot bios
+#ifdef PILOT_BIOS
+ioi   ld    a,(GCPU)    ; Look up which Rabbit Core this is
+      and   a,0x1F      ; Mask out CPU identifier
+      cp    2           ; 2 == R4000 series
+      jr    z,.IsRabbit4000   ; jump if Rabbit4000
+
+// enable the function pointers for the pilot bios
+.IsRabbit5000orHigher:
+// Calling _RCM5xxx_cs_disable before _RCM5xxx_cs_configure prevents any
+//  possible output glitch!
+      call  _RCM5xxx_cs_disable
+      call  _RCM5xxx_cs_configure               ;disable chip select
+      ld    iy, _RCM5xxx_cs_enable
+      ld    (sbf_cs_enable), iy  ;load function pointers
+      ld    iy, _RCM5xxx_cs_disable
+      ld    (sbf_cs_disable), iy
+      ld    iy, _RCM5xxx_cs_configure
+      ld    (sbf_cs_configure), iy
+      ld    a, 0x1C
+      ld    SBF_SPI_CONTROL, a	; i.e. (sbf_spi_control_value) in Pilot Bios
+#endif
+
+// both runtime and compile configuration of serial port
+#if PILOT_BIOS_BOOL || (CPU_ID_MASK(_CPU_ID_) >= R5000)
+ioi   ld    a, (PBDR)
+      or    a, 1
+   #if !defined PILOT_BIOS
+      ld    (PBDRShadow),a
+   #endif
+ioi   ld    (PBDR), a         ; Raise Port B bit 0 in Data Register
+   #if PILOT_BIOS_BOOL || (CPU_ID_MASK(_CPU_ID_) == R5000)
+      ld    a, SFDIVISOR
+   #else    // Safest to assume running fast with PLL on R6000
+            //  since the PLL could be toggled while Serial Flash
+            //  I/O is in progress. All program loading is done
+            //  through the pilot BIOS.
+      ld    a, SFDIVISOR_R6K_PLL_ON
+   #endif
+ioi   ld    (TAT5R),a   ; For SCLCK divisor
+      xor   a
+ioi   ld    (PDDCR),a   ; Set TXB to push-pull
+ioi   ld    (PDFR), a
+      inc   a           ; A = 0x01
+ioi   ld    (TACSR),a   ; Start clock
+
+ioi   ld    a, (PDAHR)
+      and   0xFC
+ioi   ld    (PDAHR), a  ; Set Serial B as alternate TxB register
+
+ioi   ld    a, (PDFR)
+      or    0x10
+      and   ~0x20
+ioi   ld    (PDFR), a       ; & set Target comm bits
+
+      // Initialize clocked serial port. Rabbit 5000 appears to require
+      // setting of SxER before SxCR; Rabbit 6000 permits either ordering.
+      ld    a, SF_SPI_ECONTROL_VALUE
+ioi   ld    (SBER),  a
+      ld    a, SBF_SPI_CONTROL	; i.e. (sbf_spi_control_value) in Pilot Bios
+ioi   ld    (SBCR),  a         ; SPI, and use parallel port D
+
+      ;; Set up PB0 (CLKB), PD4 (alt TXB) as outputs and PD5 (alt RXB) as input
+      ;;  after all other set up is done to prevent any possible output glitch!
+ioi   ld    a, (PBDDR)
+      or    0x01
+ioi   ld    (PBDDR), a			; set PB0 to output for serial CLKB
+ioi   ld    a, (PDDDR)
+      or    0x10					; set bit 4 to output for serial alt TXB
+      and   ~0x20					; reset bit 5 to input for serial alt RXB
+ioi   ld    (PDDDR), a			; set up PD4, PD5 for alt TXB, alt RXB
+      ret
+#endif
+
+// enable function pointers for run time on pilot bios
+#if PILOT_BIOS_BOOL
+.IsRabbit4000:
+// Calling _RCM4300_cs_disable before _RCM4300_cs_configure prevents any
+//  possible output glitch!
+      call  _RCM4300_cs_disable
+      call  _RCM4300_cs_configure      ; test if it is a RCM43xx first
+      ld    iy, _RCM4300_cs_enable
+      ld    (sbf_cs_enable), iy  ;load function pointers
+      ld    iy, _RCM4300_cs_disable
+      ld    (sbf_cs_disable), iy
+      ld    iy, _RCM4300_cs_configure
+      ld    (sbf_cs_configure), iy
+      ld    a, 0x0C     ; SPI, control register value
+      ld    SBF_SPI_CONTROL, a	; i.e. (sbf_spi_control_value) in Pilot Bios
+
+      //**** Software restart doesn't reset PE4 as an input
+      ld iy,PEDDR
+ioi   res 4,(iy)
+#endif
+
+// enable serial port on both run time and compile time
+#if PILOT_BIOS_BOOL || (CPU_ID_MASK(_CPU_ID_) == R4000)
+      ld    a, SFDIVISOR
+ioi   ld    (TAT5R),a   ; For SCLCK divisor
+      xor   a
+ioi   ld    (PCDCR),a   ; Set TXB to push-pull
+ioi   ld    (PDFR), a
+      inc   a           ; A = 0x01
+ioi   ld    (TACSR),a   ; Start clock
+
+ioi   ld    a, (PCFR)
+      or    0x10
+      and   ~0x20
+ioi   ld    (PCFR), a       ; & set Target comm bits
+
+      //**** Initialize clocked serial port
+      ld    a, SF_SPI_ECONTROL_VALUE
+ioi   ld    (SBER),  a
+      ld    a, SBF_SPI_CONTROL ; i.e. (sbf_spi_control_value) in Pilot Bios
+ioi   ld    (SBCR),  a         ; SPI, and use parallel port C
+
+      ;; Set up PB0 (CLKB), PD4 (alt TXB) as outputs and PD5 (alt RXB) as input
+      ;;  after all other set up is done to prevent any possible output glitch!
+ioi   ld    a, (PBDDR)
+      or    0x01
+ioi   ld    (PBDDR), a			; set PB0 to output for serial CLKB
+ioi   ld    a, (PCDDR)
+      or    0x10					; set bit 4 to output for serial alt TXB
+      and   ~0x20					; reset bit 5 to input for serial alt RXB
+ioi   ld    (PCDDR), a			; set up PC4, PC5 for TXB, RXB
+#endif
+
+// final run time checks and function pointer configuration
+#ifdef PILOT_BIOS
+      //**** check if RCM43xx
+      call  _sbf_getStatus
+      cp    0xFF           ; pulled high by resistor
+      jr    z,.IsBL4S1xx
+      ret
+
+.IsBL4S1xx:
+      xor   a              ; a = 0
+ioi   ld    (NAPCR), a     ; reset Ethernet output
+// Calling _BL4S1xx_cs_disable before _BL4S1xx_cs_configure prevents any
+//  possible output glitch!
+      call  _BL4S1xx_cs_disable
+      call  _BL4S1xx_cs_configure
+      ld    iy, _BL4S1xx_cs_enable
+      ld    (sbf_cs_enable), iy  ;load function pointers
+      ld    iy, _BL4S1xx_cs_disable
+      ld    (sbf_cs_disable), iy
+      ld    iy, _BL4S1xx_cs_configure
+      ld    (sbf_cs_configure), iy
+#endif
+      ret
+#endasm
+
+
+/*** BeginHeader  _sbf_wr_rd, _sbf_far_wr_rd */
+__root int _sbf_wr_rd(void);
+__root int _sbf_far_wr_rd(void);
+/*** EndHeader */
+
+/*******************************************************
+   Wrapper for backwards compatibility with near calls
+   to wr_rd.  Just loads PX and calls the far version.
+
+     HL  = source of bytes to send (read command)
+     BC  = out length (read command)
+     DE  = destination for received bytes
+     BC' = in length
+     IX  = base serial register (SxDR)
+
+*******************************************************/
+#asm __root
+_sbf_wr_rd::
+      push  px
+      ldl   px, de
+      call  _sbf_far_wr_rd
+      pop   px
+      ret
+#endasm
+
+/*******************************************************
+  Fast  write/read for BIOS and pilot
+
+   * Assumes Serial Port B using PB0, PC4, PC5, TAT5R
+   * Assumes no other device is using the SPI lines.
+   * Assumes prior setup of CS pin
+
+  Before entry:
+     HL  = source of bytes to send (read command)
+     BC  = out length (read command)
+     PX  = destination for received bytes
+     BC' = in length
+     IX  = base serial register (SxDR)
+
+     Trashes PX,HL,BC,BC',AF
+*******************************************************/
+#asm __root
+_sbf_far_wr_rd::
+		SFCSENABLE
+		call	_sbfStreamOut			; send read command
+
+;******** Now receive *****************
+		exx								; "move" receive count into BC
+		test	bc							; receive zero bytes?
+		jr		z, .sffwrDone			; yes, go return now . . .
+
+ioi	ld		a, (ix+_AR_OFFS)		; trigger a receive operation (discard byte)
+.sffwrRxLoop:
+ioi	bit	7, (ix+_SR_OFFS)		; test receiver not empty bit
+		jr		z, .sffwrRxLoop		; spin if receiver empty . . .
+
+ioi	ld		a, (ix+_AR_OFFS)		; get the byte, start a new receive operation
+		ld		(px), a					; store the byte
+		ld		px, px+1					; point to next byte
+		dwjnz	.sffwrRxLoop
+
+		;; Optimization Note:
+		;;   Because the last byte read from SxAR in the above loop triggered a
+		;;   final read, wait for the final read to complete and discard the byte.
+.sffwrRxLoop2:							; wait for the final receive to complete
+ioi	bit	7, (ix+_SR_OFFS)		; test receiver status bit
+		jr		z, .sffwrRxLoop2		; spin if no receive data yet
+
+ioi	ld		a, (ix)					; discard the final byte (no new SPI transfer)
+.sffwrDone:
+		exx								; "restore" regular BC, DE, HL registers
+		SFCSDISABLE
+		ret
+#endasm
+
+/*** BeginHeader  _sbf_memset */
+__root int _sbf_memset(void);
+/*** EndHeader */
+
+/*******************************************************
+  Fast  write single char to fill buffer 1 for
+  BIOS and pilot.
+
+   * Assumes Serial Port B using PB0, PC4, PC5, TAT5R
+     initialized.
+   * Assumes no other device is using the SPI lines.
+   * Assumes prior set up of CS port
+
+  Before entry:
+     E   = fill byte
+     BC  = out length
+     IX  = base serial register (SxDR)
+
+     Trashes BC,BC',AF
+*******************************************************/
+#asm __root
+_sbf_memset::
+; Wait for serial flash communication to be idle, discarding unexpected Rx bytes
+;  as necessary to achieve the idle state, before attempting to transmit a
+;  serial flash command and receive a response.
+		push	bc
+		ld		bc, 0x0004				; maximum 4 loop iterations (R6000 FIFO size)
+.sfmsDropDataLp:
+		ld		a, _cexpr(SF_SPI_ECONTROL_VALUE | 0x03)	; set both Tx and Rx stops
+ioi	ld		(ix+_ER_OFFS), a		; ensure both Tx and Rx operations are stopped
+		ld		a, _cexpr(SF_SPI_ECONTROL_VALUE)
+ioi	ld		(ix+_ER_OFFS), a		; restore the usual SxER content
+ioi	ld		a, (ix)					; clear receive data buffer / FIFO
+ioi	ld		a, (ix+_SR_OFFS)		; check status register, is more data waiting?
+		and	0xAC						; test Rx full/overrun, Tx full/sending bits
+		jr		z, .sfmsDropDataDone
+		dwjnz	.sfmsDropDataLp
+
+.sfmsDropDataDone:
+		pop	bc
+
+		SFCSENABLE
+		ld		a, 0x84					; buffer 1 write command
+		exx								; "save" fill count into BC'
+		ld		b, 4						; command plus 3 address bytes
+.sfmsComLoop:
+ioi	ld		(ix), a					; send command or address byte
+;; The Rabbit's SPI transmitter idle status bit is actually set 1/2 bit-time
+;; early. To compensate for this, we start a simultaneous receive plus transmit
+;; operation and wait for the receive operation to complete. We discard the
+;; received byte before proceeding.
+#ifdef PILOT_BIOS
+		ld		a, SBF_SPI_CONTROL	; i.e. (sbf_spi_control_value) in Pilot Bios
+		or		SPI_RXMASK | SPI_TXMASK
+#else
+		ld		a, SBF_SPI_CONTROL | SPI_RXMASK | SPI_TXMASK
+#endif
+ioi	ld		(ix+_CR_OFFS), a		; start simultaneous receive+transmit operation
+.sfmsTxWait0:
+ioi	bit	7, (ix+_SR_OFFS)		; wait for receive not empty status bit set
+		jr		z, .sfmsTxWait0
+
+ioi	ld		a, (ix)					; clear Rx buffer not empty flag (discard byte)
+		xor	a							; address bytes are always zero
+		djnz	.sfmsComLoop
+
+		exx								; "recover" fill count into BC
+.sfmsWrite:
+ioi	ld		(ix), e					; send fill byte
+;; The Rabbit's SPI transmitter idle status bit is actually set 1/2 bit-time
+;; early. To compensate for this, we start a simultaneous receive plus transmit
+;; operation and wait for the receive operation to complete. We discard the
+;; received byte before proceeding.
+#ifdef PILOT_BIOS
+		ld		a, SBF_SPI_CONTROL	; i.e. (sbf_spi_control_value) in Pilot Bios
+		or		SPI_RXMASK | SPI_TXMASK
+#else
+		ld		a, SBF_SPI_CONTROL | SPI_RXMASK | SPI_TXMASK
+#endif
+ioi	ld		(ix+_CR_OFFS), a		; start simultaneous receive+transmit operation
+.sfmsTxWait1:
+ioi	bit	7, (ix+_SR_OFFS)		; wait for receive not empty status bit set
+		jr		z, .sfmsTxWait1
+
+ioi	ld		a, (ix)					; clear Rx buffer not empty flag (discard byte)
+		dwjnz	.sfmsWrite
+
+		SFCSDISABLE
+		ret
+#endasm
+
+
+/*** BeginHeader  _sbf_ldDevStruct */
+   __root int _sbf_ldDevStruct(int statusByte);
+   extern const struct _sfb_dev_tag _SF_devTable[5];
+/*** EndHeader */
+
+/*******************************************************************************
+ This function is used by both the application API and the BIOSes to fill the
+ global struct _SF_dev from the status byte, which contains the device density
+ and the page mode.
+
+ This function is ATMEL specific and will only work on size 0.5 Mbyte - 8 Mbyte.
+ Other sizes of ATMEL use different bit patterns in the density code. A case-
+ like code structure is used here instead of a possibly quicker const table
+ method to avoid having consts above 0x2000 which simplifies cloning.
+*******************************************************************************/
+#asm
+_sbf_ldDevStruct::
+		ld		a, 8						; default block size, may be overridden later
+		ld		(_sfb_dev+[_sfb_dev_type]+pagesPerBlock), a	; for block erase
+		ld		a, 1
+		and	L							; set / reset binary mode bit
+		ld		(_sfb_dev+[_sfb_dev_type]+binaryMode), a
+		ld		a, L
+		and	0x3c						; device density bits mask
+		cp		0x10
+		jp		z, .sbf_16MBps1056	; AT45DB(CS)1282
+		cp		0x1C
+		jr		z, .sbf_halfMBps264	; AT45DB041
+		cp		0x24
+		jr		z, .sbf_1MBps264		; AT45DB081
+		cp		0x2C
+		jr		z, .sbf_2MBps528		; AT45DB161
+		cp		0x34
+		jr		z, .sbf_4MBps528		; AT45DB321
+		cp		0x3C
+		jp		z, .sbf_8MBps1056		; AT45DB642
+
+		; unknown serial flash (fill struct with zeros)
+		xor	a
+		ld		bcde, 0
+		ld		jkhl, 0
+		ld		(_sfb_dev+[_sfb_dev_type]+pagesPerBlock), a		; for block erase
+		ld		(_sfb_dev+[_sfb_dev_type]+binaryMode), a
+.sbfLoadDevType:
+		ld		(_sfb_dev+[_sfb_dev_type]+pagesize), hl
+		ld		(_sfb_dev+[_sfb_dev_type]+binPagesize), de
+		ld		(_sfb_dev+[_sfb_dev_type]+pAddrShift), a
+		ld		(_sfb_dev+[_sfb_dev_type]+npages), bc
+		ld		(_sfb_dev+[_sfb_dev_type]+pagesPerSector), jk	; for sector erase
+.sbfLoadDevTypeExit:
+		ret
+
+.sbf_halfMBps264:
+		; 0.5 Mbyte with 264 byte page size
+		ld		hl, 264					; pagesize
+		ld		de, 256					; binPagesize
+		ld		a, 1						; pAddrShift
+		ld		bc, 2048					; npages
+		ld		jk, 256					; pagesPerSector (for sector erase)
+		jr		.sbfLoadDevType
+
+.sbf_1MBps264:
+		; 1 Mbyte with 264 byte page size
+		ld		hl, 264					; pagesize
+		ld		de, 256					; binPagesize
+		ld		a, 1						; pAddrShift
+		ld		bc, 4096					; npages
+		ld		jk, 256					; pagesPerSector (for sector erase)
+		jr		.sbfLoadDevType
+
+.sbf_2MBps528:
+		; 2 Mbyte with 528 byte page size
+		ld		hl, 528					; pagesize
+		ld		de, 512					; binPagesize
+		ld		a, 2						; pAddrShift
+		ld		bc, 4096					; npages
+		ld		jk, 256					; pagesPerSector (for sector erase)
+		jr		.sbfLoadDevType
+
+.sbf_4MBps528:
+		; 4 Mbyte with 528 byte page size
+		ld		hl, 528					; pagesize
+		ld		de, 512					; binPagesize
+		ld		a, 2						; pAddrShift
+		ld		bc, 8192					; npages
+		ld		jk, 128					; pagesPerSector (for sector erase)
+		jr		.sbfLoadDevType
+
+.sbf_8MBps1056:
+		; 8 Mbyte with 1056 byte page size
+		ld		hl, 1056					; pagesize
+		ld		de, 1024					; binPagesize
+		ld		a, 3						; pAddrShift
+		ld		bc, 8192					; npages
+		ld		jk, 256 					; pagesPerSector (for sector erase)
+		jp		.sbfLoadDevType
+
+.sbf_16MBps1056:
+		; 16 Mbyte with 1056 byte page size
+		xor	a							; block erase not supported, override default
+		ld		(_sfb_dev+[_sfb_dev_type]+pagesPerBlock), a		; for block erase
+		ld		hl, 1056					; pagesize
+		ld		de, 1024					; binPagesize
+		ld		a, 3						; pAddrShift
+		ld		bc, 16384				; npages
+		ld		jk, 256 					; pagesPerSector (for sector erase)
+		jp		.sbfLoadDevType
+#endasm
+
+/*** BeginHeader  _sbf_getPageAddr */
+   __root long _sbf_getPageAddr (long addr);
+/*** EndHeader */
+
+/***************************************************
+   Expects physical Address in BC:DE. Should be C-callable
+   as long as the compiler keeps putting long arguments in
+   BC:DE, but don't anticipate calling it from C except
+   possibly for testing.
+
+   If the flash mode is binary, this function just
+   returns the with argument in BC:DE intact and
+   trashes AF, so calling is unnecessary in binary mode.
+
+   If the flash mode is standard (the page size includes
+   spare bytes), it returns the page number in BC and
+   the offset into the page in DE.
+
+   We want this to be very fast. To avoid using divison or
+   floating point, the algorithm is tricky enough to merit
+   extra explanation.
+
+   Addr = physical address in serial flash
+   Ps   = the std. page # of Addr (to be computed)
+   Pb   = bin. page # (easily computed by shifting Addr right)
+   S    = Std. page size
+   B    = Bin. page size
+   R    = Bit size of Std page offset, the difference between
+          this value and 8 is stored in the structure
+          member _sfb_dev.pAddrShift for convenience.
+   r    = bits in B  (Always = R-1)
+
+   offs   = Addr - SPs
+
+   let K  =  S/B = 256/264 = 512/528 = 1024/1056 = 32/33
+
+   S,B and R are device specific and are loaded into the
+   global struct _sfb_dev upon device initialization.
+
+     Addr = S*Ps + offs = B*Pb + offb,
+     so  S*Pb ~= B*Pb,
+     and   Ps ~= K*Pb
+
+   so we approximate (32/33) with a fraction with a
+   power-of-two denominator large enough to give us the
+   precision we need:
+
+      F83Eh/10000h
+
+   so we can multiply and shift right the easily-computed
+   binary page number to get the standard page number:
+
+      Ps ~= (F83Eh*Pb) / 10000h
+         ~= [F83Eh*(Addr>>r)] >> 16
+
+   Now a simple subtraction gives offs:
+
+      offs = Addr -(S*Ps)
+
+   S*Ps+offs from this MUST give Addr exactly, but Ps is really
+   an approximation. It can be shown that Ps as computed above
+   can be one page too few and offs can be S too many for some
+   addresses, so a check is made for offs > (S-1), and the
+   values adjusted if they are off. (This could be done in a
+   loop if future algorithm changes give worse approximations.)
+
+   The std. algorithm trashes everything except
+   IX, IY, and AF'
+
+   Since the results must be exact for any address,
+   testing must be complete, here's a program to test
+   all addresses in all modes:
+
+#define DEBUG_PILOTS
+#define MAXSBFTYPE 5
+#use "bootdev_sflash.lib"
+int i, mode;
+unsigned long ps,offs,j,addr;
+
+main(void){
+  _sbf_bios_initSF();
+  for(mode=0; mode<2; mode++){
+    for(i=0; i<MAXSBFTYPE ; i++){
+       memcpy(&_sfb_dev, &_SF_devTable[i], sizeof(_sfb_dev));
+       if(mode)_sfb_dev.binaryMode  = 1;
+       for(j=0; j < (long)_sfb_dev.pagesize*(long)_sfb_dev.npages; j++){
+          addr = _sbf_getPageAddr(j);
+          if(!mode){
+              ps = addr>>16;
+              offs = addr & 0x0000FFFFul;
+              addr = ps * _sfb_dev.pagesize + offs;
+          }
+          if(j != addr || (!mode && ps != addr/_sfb_dev.pagesize )){
+             printf("Ps = %04x, offs = %04x, addr-ac = %04x, m=%d\n",
+                  (int)ps, (int)offs, (int)(j-addr), mode);
+          }
+       }
+       printf(
+           "%08lx addresses tested for configuration %d in mode %d\n",
+           (long)_sfb_dev.pagesize*_sfb_dev.npages,i,mode);
+  }
+}
+
+ _K_APPROX 0xF83E is the approx. numerator for a  64K denom.
+ equivalent to 32/33. We could scale down to 32K since this
+ is even, but using 16  bits saves a shift - may have to use
+ fewer bits for bigger than 8 Mbyte parts. 4M is the
+ biggest contemplated for now. To avoid having to iterate
+ the last adjustment, keep
+
+      Pm * | 32/33 - Kn/Db |  < 1
+
+     where Pm is the maximum number of possible pages,
+     and Db is the power-of-2 denominator.
+**************************************************/
+#define _Kn_APPROX 0xF83E   // Use of 16 bit denom saves shifting
+
+#asm
+_sbf_getPageAddr::
+      ld       a,(_sfb_dev+[_sfb_dev_type]+binaryMode)
+      bit      0,a
+      ret      nz                      ; Just return if bin. mode
+
+      //*** Standard mode ***
+.sbfStdMode:
+      ld       hl,(_sfb_dev+[_sfb_dev_type]+pAddrShift)
+      push     bcde                    ; Save Addr
+      rrc      8,bcde                  ; R always > 8, work with 3 bytes
+      ld       b,0
+.sbfLoop1:
+      dec      L                       ; dec. & test 1rst since r=R-1
+      jr       z,.sbfSadrrDone
+      srl      1,bcde                  ; Shift the rest of the way
+      jr       .sbfLoop1
+.sbfSadrrDone:                         ; DE = Addr>>r = Pb,(BC=0)
+      ld       bc,_Kn_APPROX
+      mulu                             ; HL:BC = (Addr>>r)*0xF83E
+                                       ; HL = (Addr>>r)*0xF83E >> 16 = K*Pb
+      ld       de,hl                   ; DE  = K*Pb = Ps
+      ld       bc',hl                  ; BC' = Ps
+      ld       bc,(_sfb_dev+[_sfb_dev_type]+pagesize)  ; BC = S
+      mulu                             ; HL:BC = S*Ps
+      ld       d,b
+      ld       e,c
+      ex       bc,hl                   ; BC:DE = S*Ps
+      pop      jkhl                    ; JKHL = Addr
+      sub      jkhl,bcde               ; HL = Offs, (JK = 0)
+      ex       de',hl                  ; DE' = Offs
+      exx                              ; BC = Ps, DE = Offs
+
+      //*** Adjust for offs too big  ***
+      ld       hl,(_sfb_dev+[_sfb_dev_type]+pagesize)
+      dec      hl
+      cp       hl,de
+      jr       nc,.sbfOffsetOK        ; Jump iff offs <= (S-1)
+      inc      bc                     ; Increment Ps,
+      inc      hl
+      ex       de,hl                  ;     and
+      sub      hl,de                  ; Decrease offs by S
+      ex       de,hl
+.sbfOffsetOK:
+      ret
+#endasm
+
+/*** BeginHeader  _sbf_LdPageAddr */
+   __root long _sbf_LdPageAddr (long addr);
+/*** EndHeader */
+/*******************************************************
+_sbf_LdPageAddr
+
+  ATMEL specific for Std. mode, but will work
+  in binary mode for 3 byte addresses for other brands.
+
+  Call _sbf_getPageAddr first to load BC:DE
+
+  Loads command buffer with page address and offset
+  into page. Works with binary or standard mode.
+  Loads starting at second byte of the buffer since
+  first byte will always be a command.
+
+  Expects:
+     Bin mode: BCDE       = page address
+     Std mode: BC = page#, DE = offset, (can be loaded
+      by _sbf_getPageAddr in either case)
+
+     _sfb_dev = initialized
+
+  Should be C-callable as long as the compiler keeps
+  putting long arguments in BC:DE, but don't anticipate
+  calling it from C except possibly for testing.
+
+  Trashes AF (and BC in Std. mode)
+
+  Warning:
+
+  Code exists that assumes DE is still offset on exit
+  (_sbf_write_AT45DB) and that registers B, C and E are
+  the bytes to send to the flash (board_update.lib).
+*******************************************************/
+#asm
+_sbf_LdPageAddr::
+      ld      a,(_sfb_dev+[_sfb_dev_type]+binaryMode)
+      bit     0,a
+      jr      z,_sbf_notBin
+
+      ; Just stuff the actual address in the buffer if
+      ;  binary mode. The high nibble in B is never used
+      ld      b,c
+      ld      c,d
+      jr      _sf_LA_load
+
+_sbf_notBin:
+      ; In std. mode, we need a tweak See ATMEL data sheets for
+      ; bit pattern
+      ld      a,(_sfb_dev+[_sfb_dev_type]+pAddrShift)
+_sbf_LAloop:
+      cp      0               ; Test 1rst because we might not shift
+      jr      z,_sbf_LAready
+      rlc     bc              ; Rotate left 1
+      dec     a
+      jr      _sbf_LAloop
+_sbf_LAready:
+      ld      a,c             ; Merge bits of of third byte
+      or      d
+      ld      c,a
+_sf_LA_load:                  ; Gets sent out big endian
+      ld      a,b
+      ld      (_serFlashComBuffer+1),a
+      ld      a,c
+      ld      (_serFlashComBuffer+2),a
+      ld      a,e
+      ld      (_serFlashComBuffer+3),a
+      ret
+#endasm
+
+/*** BeginHeader  _sbf_IsRDY */
+__root int _sbf_IsRDY(void);
+/*** EndHeader */
+/*******************************************************
+  Return RDY bit state in Z flag.
+
+  Z = 0  means device is ready.
+
+  For use only in assembly code
+
+   Trashes AF,HL,IY
+********************************************************/
+#asm
+_sbf_IsRDY::
+		call	_sbf_getStatus			; getStatus puts status byte into A, HL
+		and	0x80						; update Zero flag based on MSbit of A
+		ret
+#endasm
+
+
+/*** BeginHeader  _sbf_getStatus */
+__root int _sbf_getStatus(void);
+/*** EndHeader */
+/*******************************************************
+********************************************************/
+#asm
+_sbf_getStatus::
+		push	ix
+		push	bc
+		ld		ix, SBF_DR
+; Wait for serial flash communication to be idle, discarding unexpected Rx bytes
+;  as necessary to achieve the idle state, before attempting to transmit a
+;  serial flash command and receive a response.
+		ld		bc, 0x0004				; maximum 4 loop iterations (R6000 FIFO size)
+.sfgsDropDataLp:
+		ld		a, _cexpr(SF_SPI_ECONTROL_VALUE | 0x03)	; set both Tx and Rx stops
+ioi	ld		(ix+_ER_OFFS), a		; ensure both Tx and Rx operations are stopped
+		ld		a, _cexpr(SF_SPI_ECONTROL_VALUE)
+ioi	ld		(ix+_ER_OFFS), a		; restore the usual SxER content
+ioi	ld		a, (ix)					; attempt to ensure Rx flag bits are clear
+ioi	ld		a, (ix+_SR_OFFS)		; get current serial port status
+		and	0xAC						; test Rx full/overrun, Tx full/sending bits
+		jr		z, .sfgsDropDataDone
+		dwjnz	.sfgsDropDataLp
+
+.sfgsDropDataDone:
+
+		SFCSENABLE
+; At least some (e.g. AT45DB321C) of Atmel's serial flash devices actually
+; require the so-called "optional dummy byte" be transmitted following the read
+; status register command for applications clocking the serial flash at greater
+; than 25 MHz. For safety, we always send the dummy byte and expect the read
+; status register result in the byte following the dummy byte.
+		ld		a, 0xD7					; read status register command
+		ld		b, 3						; command + dummy + read status response
+		jr		.sfgsSendCommandByte
+
+.sfgsWriteLoop:
+		xor	a							; send 0 for dummy and read status bytes
+.sfgsSendCommandByte:
+ioi	ld		(ix), a					; send command or don't-care byte
+;; The Rabbit's SPI transmitter idle status bit is actually set 1/2 bit-time
+;; early. To compensate for this, we start a simultaneous receive plus transmit
+;; operation and wait for the receive operation to complete. We discard all but
+;; the last received byte.
+#ifdef PILOT_BIOS
+		ld		a, SBF_SPI_CONTROL	; i.e. (sbf_spi_control_value) in Pilot Bios
+		or		SPI_RXMASK | SPI_TXMASK
+#else
+		ld		a, SBF_SPI_CONTROL | SPI_RXMASK | SPI_TXMASK
+#endif
+ioi	ld		(ix+_CR_OFFS), a		; start simultaneous receive+transmit operation
+.sfgsTxWait1:
+ioi	bit	7, (ix+_SR_OFFS)		; wait for receive not empty status bit set
+		jr		z, .sfgsTxWait1
+
+ioi	bit	2, (ix+_SR_OFFS)		; wait for transmit idle status bit clear
+		jr		nz, .sfgsTxWait1
+
+ioi	ld		a, (ix)					; clear Rx buffer not empty flag / get status
+		djnz	.sfgsWriteLoop
+
+		SFCSDISABLE
+		clr	hl
+		ld		L, a						; status returned in A and in HL (LSB only)
+		pop	bc
+		pop	ix
+		ret
+#endasm
+
+
+/*** BeginHeader  _sbf_BusyWaitRDY */
+   __root void _sbf_BusyWaitRDY(void);
+/*** EndHeader */
+/*******************************************************
+  Busy wait until status RDY bit 1. Useful for program
+  loading because program buffers can still be received
+  from the host PC while busy waiting since target
+  communication is interrupt driven.
+
+   Trashes AF,HL
+********************************************************/
+#asm
+_sbf_BusyWaitRDY::
+		call	_sbf_IsRDY
+		jr		z, _sbf_BusyWaitRDY
+		ret
+#endasm
+
+/*** BeginHeader  _sbf_BIOSwritef, _sbf_far_BIOSwritef */
+   __root void _sbf_BIOSwritef(void);
+   __root void _sbf_far_BIOSwritef(void);
+/*** EndHeader */
+/*******************************************************
+ Wrapper to provide compatibility with existing near
+ calls to BIOSwritef.  Just loads PX and calls the far
+ version.
+
+   DE   = source pointer
+   BC   = number of bytes
+   JKHL = physical address in serial flash
+********************************************************/
+#asm _bootdev_debug
+_sbf_BIOSwritef::
+      push  px
+      ldl   px, de
+      call  _sbf_far_BIOSwritef
+      pop   px
+      ret
+#endasm
+
+/*******************************************************
+ Write up to 64K of data to an arbitrary serial flash
+ address.
+
+ Handles binary & std. ATMEL serial flash address modes.
+
+ There is no semaphore protection in this function if
+ devices are sharing the SPI lines! It is not for general
+ API use where devices share the SPI lines, or even where
+ they don't, because it busy waits.
+
+   PX   = source pointer
+   BC   = number of bytes
+   JKHL = physical address in serial flash
+
+ Trashes all regs.
+********************************************************/
+unsigned long sbf_destPtr, sbf_srcPtr;
+int sbf_count, sbf_curcount;
+#asm _bootdev_debug
+_sbf_far_BIOSwritef::
+#ifdef PILOT_BIOS
+      // Make sure destination + size is not in the extra
+      // space where the ID block resides.
+      push  bcde
+      push  jkhl
+      ld    d,b
+      ld    e,c
+      ld    bc,0
+      add   jkhl,bcde
+		call _sbfCheckForIDblockOverlap
+      pop   jkhl
+      pop   bcde
+      ret   nc
+#endif
+
+      push  ix
+      ld    a,b
+      or    c
+      jp    z,.sbf_Finished      ; Return if count = 0
+      ld    (sbf_count),bc       ; Save total count
+      ld    bcde, px
+      ld    (sbf_srcPtr), bcde   ; Save src. ptr.
+      ld    (sbf_destPtr), jkhl  ; Save dest physical addr.
+      ex    jkhl,bcde            ; put offset into BCDE for _sbf_getPageAddr
+      ld    ix,SBF_DR
+
+.sbf_bfwPageLoop:
+      ;*** Load internal SF buffer 2 with whole page from flash
+      call  _sbf_getPageAddr  ; expects flash address in BCDE, returns BCDE
+      push  de       ;protect DE
+      call  _sbf_LdPageAddr   ; BC=page#, DE=offset
+      call  _sbf_BusyWaitRDY
+      _SF_MEM2BUFF2              ; Read flash page into buff2
+#ifndef PILOT_BIOS
+      call  _sbf_BusyWaitRDY
+      _SF_ERASEPAGE
+#endif
+      pop   de       ;restore DE
+      ;*** Length to write this loop pass is:
+      ;   MIN(pagesize-offset, total length left to write)
+      ;    Offset to write to this pass is DE:
+      ;    DE hasn't been trashed since set, but be careful
+      ;    modifying code around here.
+      ld    hl,(_sfb_dev+[_sfb_dev_type]+pagesize)
+      sub   hl,de            ; HL = pagesize-offset
+      ld    de,(sbf_count)   ; DE = total count left
+      cp    hl,de            ; C flag set iff HL < DE
+      jr    c, .sbf_CountDone
+      ex    de,hl
+.sbf_CountDone:
+      ld    (sbf_curcount),hl ; HL = count for this pass
+
+      //*** Write the page or partial page to buffer2
+      call  _sbf_BusyWaitRDY
+      SFCSENABLE
+      ld    a,0x87      ;command for write to buffer 2
+      ld    hl,_serFlashComBuffer
+      ld    (hl),a
+      ld    bc,4
+      call  _sbfStreamOut
+      ld    bcde, (sbf_srcPtr)
+      ld    px, bcde
+      ld    bc, (sbf_curcount)
+      call  _sbf_far_StreamOut
+      SFCSDISABLE
+      call  _sbf_BusyWaitRDY
+
+      _SF_BUFF22MEM             ;*** Write buffer 2 to flash
+      call  _sbf_BusyWaitRDY
+
+      //*** Adjust total counts and src. ptr,
+      ld    hl,(sbf_count)
+      ld    de,(sbf_curcount)
+      sub   hl,de            ; HL = new total count
+      ld    (sbf_count),hl  ; Save new total count
+      ld    de,0             ; See if finished
+      cp    hl,de
+      jr    z,.sbf_Finished
+      ld    bcde, 0
+      ld    de, (sbf_curcount)
+      ld    jkhl, (sbf_srcPtr)
+      add   jkhl, bcde
+      ld    (sbf_srcPtr), jkhl
+
+      ld    jkhl,(sbf_destPtr)
+      ld    bc,0x0000         ;DE contains sbf_curcount
+      add   jkhl,bcde
+      ex    jkhl,bcde         ;put offset in BCDE for _sbf_getPageAddr
+      ld    (sbf_destPtr),bcde
+      jp    .sbf_bfwPageLoop
+.sbf_Finished:
+      xor   a
+      ccf
+      pop   ix
+      ret
+#endasm
+
+
+/*** BeginHeader  _sbf_BIOSreadf, _sbf_far_BIOSreadf */
+   __root void _sbf_BIOSreadf(void);
+   __root void _sbf_far_BIOSreadf(void);
+/*** EndHeader */
+
+/*******************************************************
+ Wrapper to provide backwards compatibility with the near
+ version of BIOSreadf.  All it does is load px and then
+ call the far version.
+
+   DE   = destination pointer
+   BC   = number of bytes to read
+   JKHL = physical address in serial flash
+*******************************************************/
+#asm
+_sbf_BIOSreadf::
+      push  px
+      ldl   px, de
+      call  _sbf_far_BIOSreadf
+      pop   px
+      ret
+#endasm
+
+/*******************************************************
+ Read up to 64K of data from an arbitrary serial flash
+ address.
+
+ Handles binary & std. ATMEL serial flash address modes.
+
+ There is no semaphore protection in this function if
+ devices are sharing the SPI lines! It is not for general
+ API use where devices share the SPI lines.
+
+   PX   = destination pointer
+   BC   = number of bytes to read
+   JKHL = physical address in serial flash
+
+ Trashes all regs.
+********************************************************/
+#asm
+_sbf_far_BIOSreadf::
+      ld    a, b
+      or    c
+      ret   z                 ; Return if zero bytes
+      push  ix
+      ld    ix, SBF_DR
+      push  bc
+ioi   ld    a, (ix)
+      // Load  _serFlashComBuffer with continuous read command
+      ex    jkhl, bcde
+      call  _sbf_getPageAddr  ;expects flash address in BCDE
+      call  _sbf_LdPageAddr
+      call  _sbf_BusyWaitRDY
+      ld    hl, _serFlashComBuffer
+      ld    a, SBF_CONTREAD_COMMAND    ;continuous read command
+      ld    (hl), a
+      ld    bc, SBF_CONTREAD_BYTES     ; Command + addr. bytes
+      pop   bc'        ; _sbf_wr_rd needs read count in BC'
+      call  _sbf_far_wr_rd  ; Send command and receive bytes.
+      pop   ix
+      ret
+#endasm
+
+
+/*** BeginHeader  _sbf_sendOnlycomm */
+   __root void _sbf_sendOnlycomm(void);
+/*** EndHeader */
+/*******************************************************
+  Handle Send only commands
+  On entry:
+     A   =  command
+     BC  =  1 + number of address and don't care bytes
+      _serFlashComBuffer[1-2] = page address
+                            (load with _sbf_LdPageAddr)
+
+     Trashes HL,BC',BC,AF
+********************************************************/
+#asm
+_sbf_sendOnlycomm::
+      push     ix
+      ld       ix,SBF_DR
+      ld       hl,_serFlashComBuffer
+      ld       (hl),a
+      ld       bc',0
+      call     _sbf_wr_rd
+      pop      ix
+      ret
+#endasm
+
+
+/*** BeginHeader  _sbfStreamOut, _sbf_far_StreamOut */
+   __root void _sbfStreamOut(void);
+   __root void _sbf_far_StreamOut(void);
+/*** EndHeader */
+/*******************************************************
+  Wrapper for compatibility with near calls.  Just loads
+  PX with HL and calls far version.
+
+  On entry:
+     HL =  Source address
+     BC =  Number of bytes
+     Trashes HL,BC,AF
+     Assumes CS is enabled before call.
+********************************************************/
+#asm
+_sbfStreamOut::
+      push  px
+      ldl   px, hl
+      call  _sbf_far_StreamOut
+      pop   px
+      ret
+#endasm
+
+#asm
+/*******************************************************
+  Output a byte stream to the serial flash
+  without changing chip select
+
+  On entry:
+     PX =  Source address
+     BC =  Number of bytes
+     Trashes PX,BC,AF
+     Assumes CS is enabled before call.
+********************************************************/
+_sbf_far_StreamOut::
+		push	ix
+		ld		ix, SBF_DR
+.sffsoTxLoop:
+		ld		a, (px)					; get a byte
+ioi	ld		(ix), a					; send it
+;; The Rabbit's SPI transmitter idle status bit is actually set 1/2 bit-time
+;; early. To compensate for this, we start a simultaneous receive plus transmit
+;; operation and wait for the receive operation to complete. We discard the
+;; received byte before proceeding.
+#ifdef PILOT_BIOS
+		ld		a, SBF_SPI_CONTROL	; i.e. (sbf_spi_control_value) in Pilot Bios
+		or		SPI_RXMASK | SPI_TXMASK
+#else
+		ld		a, SBF_SPI_CONTROL | SPI_RXMASK | SPI_TXMASK
+#endif
+ioi	ld		(ix+_CR_OFFS), a		; start simultaneous receive+transmit operation
+		ld		px, px+1					; point to the next Tx byte
+.sffsoTxWait:
+ioi	bit	7, (ix+_SR_OFFS)		; wait for receive not empty status bit set
+		jr		z, .sffsoTxWait
+
+ioi	ld		a, (ix)					; clear Rx buffer not empty flag (discard byte)
+		dwjnz	.sffsoTxLoop
+
+		pop	ix
+		ret
+#endasm
+
+/*** BeginHeader  _sbfCheckForIDblockOverlap */
+   __root void _sbfCheckForIDblockOverlap(void);
+/*** EndHeader */
+#asm
+_sbfCheckForIDblockOverlap::
+      // Make sure addres in jkhl is not in the extra
+      // space where the ID block resides. This check
+      // isn't foolproof, but the user block API does a
+      // better check. This should prevent an inadvertant
+      // pilot bios overwrite of the SysID block.
+      push  jkhl
+
+      //calculate size of flash
+      ld    bc, (_sfb_dev+[_sfb_dev_type]+binPagesize)
+      ld    de, (_sfb_dev+[_sfb_dev_type]+npages)
+      mulu
+      ex    jk,hl
+      ld    hl,bc
+      ld    de,0
+      add   jkhl,bcde
+
+      ex    jkhl,bcde
+      pop   jkhl
+      cp    jkhl,bcde
+      ret           ; Returns with clear carry flag for success
+#endasm
+
+
+
+/*** BeginHeader  _sbfEraseProgramArea */
+   __root void _sbfEraseProgramArea(void);
+/*** EndHeader */
+#asm
+/*******************************************************************
+
+        Erases from offset 0 up to JKHL.
+        Input: JKHL should have top program address set by pilot BIOS
+        Output: cleared carry flag = success
+
+        Erasing by block is much faster, so we first erase the
+        number of whole blocks in the program area, then the remaining
+        pages. Page size varies by flash size, but blocks are always
+        8 pages for the Atmel serial flash we use, and this algorithm
+        is Atmel-specific.
+
+********************************************************************/
+_sbfEraseProgramArea::
+#ifdef PILOT_BIOS
+     	ld    px,jkhl
+     	ld    px,px+1
+     	ld    jkhl,px
+
+		push  jkhl
+      ex    jkhl, bcde
+      call  _sbf_getPageAddr // now BC = top page number
+                             // DE = page offset
+
+      // Unless the top address falls on a page boundary,
+      //  we'll want to erase an additional page
+      ex    de, hl
+      test  hl
+		pop   jkhl
+      jr    z, .sbfExactPageMult
+      ld    de, (_sfb_dev+[_sfb_dev_type]+pagesize)
+      ld    bc, 0
+      add   jkhl, bcde
+
+.sbfExactPageMult:
+		push  jkhl      // Save adjusted top addr for way below
+		push  jkhl      // Preserve through call
+      call  _sbfCheckForIDblockOverlap
+		pop   jkhl
+      ret   nc
+
+      ex    jkhl, bcde
+      call  _sbf_getPageAddr // Now BC = top page number
+
+      srl   2, bcde
+      srl   1, bcde    // Now BC = # whole 8 page blocks
+		push bc 			  // Push block count
+      test  bc         // Test for less than a whole block
+      ex    bc, hl
+      ld    bc', hl    // BC' = # of whole 8 page blocks
+      ld    jkhl, 0    // Starting offset
+      jr    z, .sbfBlockErasesDone   // Skip if not a whole block
+
+.sbfEFblkLoop:
+		push  jkhl
+      ex    jkhl, bcde        // Save offset
+      ex    bc', hl
+		push  hl                // Save block count
+      call  _sbf_getPageAddr  // BC = top page number,
+      call  _sbf_LdPageAddr
+      call  _sbf_BusyWaitRDY
+      _SF_ERASEBLOCK
+		pop   bc'               // Restore count
+		pop   jkhl              // Restore offset
+      ld    bcde, 0
+      ld    de, (_sfb_dev+[_sfb_dev_type]+pagesize)
+      sll   2, bcde
+      sll   1, bcde      		// DE = 8 page block size
+      add	jkhl, bcde
+      ex    bc', hl
+      dec   hl                // Count down and test
+      test  hl
+      ex    bc', hl
+      jr    nz, .sbfEFblkLoop // Repeat if necessary
+
+.sbfBlockErasesDone:
+      ld    de, (_sfb_dev+[_sfb_dev_type]+pagesize)
+      rlc   de
+      rlc   de
+		rlc   de                // DE = blocksize
+		pop   bc                // Get block count
+      mulu                    // Now HL:BC = blocksize*blockcount
+      ex    bc,hl             //     BC:HL =  "
+      ex    de,hl             //     BC:DE =  "
+                              // = Start addr. to erase pages
+		pop   jkhl              // Get adjusted top page address
+		push  bcde              // Save page erase start addr.
+      sub   jkhl,bcde         // HL = bytes remaining (JK=0)
+      ex    jkhl,bcde
+      call  _sbf_getPageAddr  // BC = remaining page count
+      ex    bc,hl             // Save remaining page count
+      test  hl
+		ex    bc',hl
+		pop   jkhl              // Get start address
+      jr    z, .sbfPageErasesDone // Skip if no pages remain
+.sbfEFpgLoop:
+		push  jkhl              // Save offset
+      ex    jkhl, bcde
+      ex    bc', hl
+		push  hl                // Save page count
+      call  _sbf_getPageAddr
+      ld    de,0
+      call  _sbf_LdPageAddr
+      call  _sbf_BusyWaitRDY
+      _SF_ERASEPAGE
+		pop   bc'               // Restore page count
+		pop   jkhl              // Restore offset
+      ld    bcde, 0
+      ld    de, (_sfb_dev+[_sfb_dev_type]+pagesize)
+      add	jkhl,bcde         // Point to next page
+      ex    bc', hl
+      dec   hl                // Decrement and test page count
+      test  hl
+      ex    bc', hl
+      jr    nz, .sbfEFpgLoop  // Repeat if necessary
+
+.sbfPageErasesDone:
+      scf                     // Set carry flag
+      ret
+#else
+#fatal "This function is only for use in the Pilot BIOS"
+#endif
+#endasm
+
+
+/*** BeginHeader _LongToSector */
+__root int _LongToSector(unsigned long addr);
+/*** EndHeader */
+#asm
+_LongToSector::
+   call  _sbf_getPageAddr    ; convert offset to sector
+   ex   bc,hl
+   ret
+#endasm
+
+/*** BeginHeader _SectorToLong */
+__root unsigned long _SectorToLong(unsigned  addr);
+/*** EndHeader */
+#asm
+_SectorToLong::
+   ex   bc,hl
+   ld   de,(_sfb_dev+[_sfb_dev_type]+pagesize)
+   mulu
+   ex   bc,hl
+   ld   de,hl
+   ret
+#endasm
+
+
+/*** BeginHeader _GetFlashID */
+__root int _GetFlashID(void);
+/*** EndHeader */
+#asm
+_GetFlashID::
+		call	_sbf_getStatus			; Puts status byte in A and L
+		and	0x3c						; Mask out bits 7, 6, 1 and 0
+		ld		L, a
+		ld		h, 0x1f
+		ret
+#endasm
+
+/*** BeginHeader _InitFlashDriverOK */
+extern int _InitFlashDriverOK;
+/*** EndHeader */
+int _InitFlashDriverOK;
+
+/*** BeginHeader _InitFlashDriver */
+__root int _InitFlashDriver(int);
+/*** EndHeader */
+#asm
+_InitFlashDriver::
+      ld    bc,(_sfb_dev+[_sfb_dev_type]+npages)
+      ld    (_FlashInfo+[_FlashInfoType]+numSectors),bc
+      ld    de,(_sfb_dev+[_sfb_dev_type]+pagesize)
+      ld    (_FlashInfo+[_FlashInfoType]+sectorSize),de
+      mulu
+      ex    bc,hl
+      ld    de,hl
+      srl   4,bcde
+      srl   4,bcde
+      srl   4,bcde
+      ld    (_FlashInfo+[_FlashInfoType]+flashSize),de
+      ld    a,2
+      ld    (_FlashInfo+[_FlashInfoType]+writeMode),a
+
+      ld    jkhl, 1				; mark flash initialization done
+      ld    (_InitFlashDriverOK), hl
+      clr   hl						; always return 0 (no errors)
+      ret
+#endasm
+
+
+/*** BeginHeader _sbf_readSysID */
+__root int _sbf_readSysID(void);
+/*** EndHeader */
+#asm
+_sbf_readSysID::
+
+      // Point to top of sflash - marker size
+      ld     bc, (_sfb_dev+[_sfb_dev_type]+npages)
+      ld     de, (_sfb_dev+[_sfb_dev_type]+pagesize)
+      mulu               ; hl:bc = top of sflash
+      ex     jk,hl
+      ld     h,b
+      ld     L,c         ; jkhl = top of sflash
+
+      ld     de,_SysIDBlockType+@LENGTH
+      ld     bc,0
+      sub    jkhl,bcde   ; Now  jkhl = top of sflash - marker size
+      push   jkhl
+      pop    jkhl'       ;  ... jkhl' too
+
+      ld     b',17
+_sbf_RSIsearchLoop:
+      // Read in Sys ID block
+      exx    ; 4K block count and sflash offset in b', jkhl'
+      push   jkhl
+      push   bc
+      ld     de, SysIDBlock      ; DE now points to SysIDBlock struct in RAM
+      ld     bc, _SysIDBlockType+marker+6 ; BC has offset to idBlockSize member
+#ifdef PILOT_BIOS
+      ld    (PB_IDBLOCK_PADDR), jkhl   ; LSBs
+#endif
+      ipset 3
+      call _sbf_BIOSreadf
+      ipres
+      pop    bc
+      pop    jkhl
+      exx    ; restore 4K block count and sflash offset to b', jkhl'
+
+      ld     b,6
+      ld     a,0x55
+      ld     hl,SysIDBlock+marker
+
+_sbf_testMarkerLoop:
+      cp     (hl)
+      jr     nz, _sbf_badmarker
+      inc    hl
+      cpl
+      djnz   _sbf_testMarkerLoop
+      clr   hl
+      ret
+
+_sbf_badmarker:
+      exx               ; get previous sflash offset and 4K block count
+      dec    b
+      push   bc
+      ld     bc,0
+      ld     de,0x1000
+      sub    jkhl,bcde
+      pop    bc
+      exx
+      jr     nz, _sbf_RSIsearchLoop  ; only dec b afferted Z flag
+      ld     hl,-1
+      ret
+#endasm
+
+/*** BeginHeader _sbf_BIOS_LoadApp */
+__root int _sbf_BIOS_LoadApp(void);
+/*** EndHeader */
+
+/***************************************************************
+  Copy serial flash from 0x10000 to the highest program address.
+
+  It is assumed that the first 64k of flash has already been
+  copied to RAM by a PIC or boot loader.  Flash is copied up to
+  the highest program address (stored in _program_HPA).
+
+  parameters: none
+  return value: none
+***************************************************************/
+
+#define SBF_MB2_PHY_START (1 << MSB_BIT)   //physical start of memory bank 2
+
+#asm __nodebug
+_sbf_BIOS_LoadApp::
+		push	ix
+		call	_sbf_bios_initSF
+
+#if CPU_ID_MASK(_CPU_ID_) >= R6000
+		;; Rabbit 6000's PLL is (or should) never be enabled when the BIOS calls
+		;; _sbf_BIOS_LoadApp, so we can safely set up a faster serial flash clock.
+		ld		a, SFDIVISOR
+ioi	ld		(TAT5R), a				; For SCLCK divisor
+#endif//if CPU_ID_MASK(_CPU_ID_) >= R6000
+
+		; load the highest physical program address into JKHL
+		ldf	jkhl, (_program_HPA)
+
+		; compare against 64k (# of bytes copied)
+		ld		bcde, 0
+		inc	bc
+
+		cp		jkhl, bcde
+		jp		c, sbf_loadapp_exit	;if HPA < 64k, exit
+		jp		z, sbf_loadapp_exit	;if HPA == 64k, exit
+
+		ld		py, bcde					; save # of bytes copied (64KB)
+		ld		pz, jkhl					; save copy of HPA
+
+		; Set up MB2 and MB3 as though they were MB0 and MB1
+		ld		hl, _cexpr((MB1CR_SETTING)<<8 | (MB0CR_SETTING))
+ioi	ld		(MB2CR), hl
+
+#ifdef BU_ENABLE_SECONDARY
+		; Start reading from flash offset indicated in BIOS
+		ldf	bcde, (bu_loadapp_64k)
+#else
+		; load from 64KB flash offset, BCDE is still set to 64KB
+#endif
+		call	_sbf_getPageAddr		; expects flash offset in BCDE
+		call	_sbf_LdPageAddr
+
+		ld		ix, SBF_DR
+		; Send out continuous read command
+		SFCSENABLE
+		ld		hl, _serFlashComBuffer
+		ld		(hl), SBF_CONTREAD_COMMAND
+		ld		bc, SBF_CONTREAD_BYTES	;  For address and don't care bits
+		call	_sbfStreamOut
+
+		ld		jkhl, pz					; restore HPA into JKHL
+
+		; save firmware image to start of MB2 + 64k
+		ld		px, _cexpr(SBF_MB2_PHY_START + 0x10000UL)
+
+ioi	ld		a, (ix+_AR_OFFS)		; start a byte receive operation (discard byte)
+.loop:
+		;; Optimization Note:
+		;;   Because the SPI divisor value may be greater than zero, we can't be
+		;;   sure that new serial data will always be waiting when we get back to
+		;;   the top of this loop. Therefore, we always test the receiver status.
+ioi	bit	7, (ix+_SR_OFFS)		; test receiver status bit
+		jr		z, .loop					; spin if no receive data yet
+
+ioi	ld		a, (ix+_AR_OFFS)		; get byte from SxAR to trigger next read
+		ld		(px), a					; store in RAM
+		ld		px, px+1					; increment target address
+		ld		py, py+1					; increment # of bytes copied
+		ld		bcde, py
+		cp		jkhl, bcde				; HPA = bytes copied?
+		jr		nz, .loop
+
+		;; Optimization Note:
+		;;   Because the last byte read from SxAR in the above loop triggered a
+		;;   final read, wait for the final read to complete and discard the byte.
+.loop2:									; wait for the final receive to complete
+ioi	bit	7, (ix+_SR_OFFS)		; test receiver status bit
+		jr		z, .loop2				; spin if no receive data yet
+
+ioi	ld		a, (ix)					; discard the final byte (no new SPI transfer)
+
+      SFCSDISABLE
+
+sbf_loadapp_exit:
+      pop   ix
+      ret
+#endasm
+
+/*** BeginHeader  _sbfWriteFlash, _sbf_far_WriteFlash */
+ __xmem int _sbfWriteFlash(unsigned long flashDst, const void* bufferSrc,
+ 																		unsigned len);
+ __xmem int _sbf_far_WriteFlash(unsigned long flashDst, const __far void* bufferSrc,
+                                                     unsigned len);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+_sbfWriteFlash                    <BOOTDEV_SFLASH.LIB>
+
+SYNTAX: int _sbfWriteFlash(unsigned long flashDst, const void* bufferSrc,
+                                                  unsigned len);
+
+DESCRIPTION: Write len bytes (up to 64K) to physical address flashDst
+from bufferSrc (near). This function is not reentrant.
+
+NOTES:
+      This function is not power-fail safe. The function writeUserBlock
+      provides a safer way to store critical data using redundant copies.
+
+      THIS FUNCTION SHOULD BE CALLED UNTIL IT RETURNS ZERO OR A NEGATIVE
+      ERROR CODE.
+
+PARAMETER1:  the physical address of the flash destination
+PARAMETER2:  pointer (near) to the source data
+PARAMETER3:  number of bytes to write
+
+RETURN VALUE:  0 - success
+              -1 - attempt to write to User/ID block or program area
+
+
+END DESCRIPTION *********************************************************/
+_bootdev_debug
+__xmem
+int _sbfWriteFlash(unsigned long flashDst, const void* bufferSrc, unsigned len)
+{
+   return _sbf_far_WriteFlash(flashDst, bufferSrc, len);
+}
+
+/* START FUNCTION DESCRIPTION ********************************************
+_sbf_far_WriteFlash                    <BOOTDEV_SFLASH.LIB>
+
+SYNTAX: int _sbf_far_WriteFlash(unsigned long flashDst,
+											const far void* bufferSrc, unsigned len);
+
+DESCRIPTION: Write len bytes (up to 64K) to physical address flashDst
+from bufferSrc (far). This function is not reentrant.
+
+NOTES:
+      This function is not power-fail safe. The function writeUserBlock
+      provides a safer way to store critical data using redundant copies.
+
+      THIS FUNCTION SHOULD BE CALLED UNTIL IT RETURNS ZERO OR A NEGATIVE
+      ERROR CODE.
+
+PARAMETER1:  the physical address of the flash destination
+PARAMETER2:  pointer (far) to the source data
+PARAMETER3:  number of bytes to write
+
+RETURN VALUE:  0 - success
+              -1 - attempt to write to User/ID block or program area
+
+END DESCRIPTION *********************************************************/
+
+_bootdev_debug
+__xmem
+int _sbf_far_WriteFlash(unsigned long flashDst, const __far void* bufferSrc,
+                                                    unsigned len)
+{
+    auto int rc;
+    static  tempNAPCRShadow;
+
+    __costate{
+
+      //**** Check bounds ****
+      if (flashDst < MAX_FIRMWARE_BINSIZE ||
+         flashDst+len > SBF_USERBLOCK_BEGIN) {
+         rc = -1;
+         __abort;
+      }
+
+      // Yield execution if busy
+      __waitfor(-EBUSY != (rc=_sbf_write_AT45DB(flashDst, bufferSrc, len)));
+
+    }
+    return rc;
+}
+
+/*** BeginHeader  _sbf_write_AT45DB */
+   __root int _sbf_write_AT45DB(unsigned long flashDst, const __far void* bufferSrc,
+                                                      unsigned len);
+   void _sbfWFstate1(void);
+/*** EndHeader */
+/*******************************************************
+  Internal write flash function for general usage in
+  non-program,  non-user/ID block areas. Uses a finite
+  state-machine to yield when flash is busy. This is
+  for the ATMEL AT45D series, which is the only type
+  currently used & supported.
+********************************************************/
+_bootdev_debug
+__root int _sbf_write_AT45DB(unsigned long flashDst, const __far void* bufferSrc,
+                                                   unsigned len) {
+   static unsigned long _sbf_srcPtr,_sbf_destPtr,savedJKHL,savedBCDE,savedPX;
+   static int _sbf_count,_sbf_curcount,sbf_WFstate,rc;
+#GLOBAL_INIT
+{
+   sbf_WFstate = (int)_sbfWFstate1;
+}
+#asm
+      ;Restore state of registers, then jump to start of previous code state
+      ld       jkhl, (savedJKHL)
+      ld       bcde, (savedBCDE)
+      ldl      px, savedPX
+      ld       px, (px)
+      push     ix
+      ld       ix,(sbf_WFstate)
+      jp       (ix)
+_sbfWFstate1::
+      ld       hl,_sbfWFstate1a
+      ld       (sbf_WFstate),hl
+
+      ld       px,(sp+@SP+bufferSrc+2)
+      ld       hl,(sp+@SP+len+2)
+      ex       bc,hl
+      ld       jkhl,(sp+@SP+flashDst+2)
+      ld       a,b
+      or       c
+      jp       z,_sbf_Finished      ; Return if count = 0
+      ld       (_sbf_count),bc      ; Save total count
+      ldl      py, _sbf_srcPtr
+      ld       (py), px             ; Save bufferSrc ptr.
+      ld       (_sbf_destPtr),jkhl  ; Save dest physical addr.
+      ex       jkhl,bcde            ; put destination in BCDE
+
+_sbfWFstate1a::
+      call     _sbf_IsRDY           ;sets z flag if not ready
+      jp       z,_sbf_NotFinished
+      push     hl
+      ld       hl,_sbfWFstate1c
+      ld       (sbf_WFstate),hl
+      pop      hl
+
+_sbfWFstate1b::
+_sbf_bfwPageLoop:
+      ld       ix,SBF_DR
+
+      ;*** Load internal SF buffer 2 with whole page from flash
+      call     _sbf_getPageAddr  ; expects flash address in BCDE
+      call     _sbf_LdPageAddr   ; BC=page#, DE=offset
+
+_sbfWFstate1c::
+      call     _sbf_IsRDY
+      jp       z,_sbf_NotFinished
+      push     hl
+      ld       hl,_sbfWFstate2
+      ld       (sbf_WFstate),hl
+      pop      hl
+
+      push     de
+      _SF_MEM2BUFF2              ; Read flash page into buff2
+      pop      de
+
+_sbfWFstate2::
+      call     _sbf_IsRDY
+      jp       z,_sbf_NotFinished
+      push     hl
+      ld       hl,_sbfWFstate3
+      ld       (sbf_WFstate),hl
+      pop      hl
+
+      push     de
+      _SF_ERASEPAGE
+      pop      de
+      ;*** Length to write this loop pass is:
+      ;   MIN(pagesize-offset, total length left to write)
+      ;    Offset to write to this pass is DE:
+      ;    DE hasn't been trashed since set, but be careful
+      ;    modifying code around here.
+      ld       hl,(_sfb_dev+[_sfb_dev_type]+pagesize)
+      sub      hl,de            ; HL = pagesize-offset
+      ld       de,(_sbf_count)  ; DE = total count left
+      cp       hl,de            ; C flag set iff HL < DE
+      jr       c, _sbf_CountDone
+      ex       de,hl
+_sbf_CountDone:
+      ld       (_sbf_curcount),hl ; HL = count for this pass
+
+      //*** Write the page or partial page to buffer2
+
+_sbfWFstate3::
+      call     _sbf_IsRDY
+      jp       z,_sbf_NotFinished
+      ld       hl,_sbfWFstate4
+      ld       (sbf_WFstate),hl
+      SFCSENABLE
+      ld       a,0x87            ;send write command
+      ld       hl,_serFlashComBuffer
+      ld       (hl),a
+      ld       bc,4
+      call     _sbfStreamOut        ;expects source in HL, count in BC
+      ld       bc,(_sbf_curcount)
+      ldl      px, _sbf_srcPtr
+      ld       px, (px)
+      call     _sbf_far_StreamOut   ;expects source in PX, count in BC
+      SFCSDISABLE
+
+_sbfWFstate4::
+      call     _sbf_IsRDY
+      jr       z,_sbf_NotFinished
+      push     hl
+      ld       hl,_sbfWFstate5
+      ld       (sbf_WFstate),hl
+      pop      hl
+
+      _SF_BUFF22MEM             ;*** Write buffer 2 to flash
+
+_sbfWFstate5::
+      call     _sbf_IsRDY
+      jr       z,_sbf_NotFinished
+      ld       hl,_sbfWFstate1b
+      ld       (sbf_WFstate),hl
+      //*** Adjust total counts and bufferSrc ptr,
+      ld       hl,(_sbf_count)
+      ld       de,(_sbf_curcount)
+      sub      hl,de            ; HL = new total count
+      ld       (_sbf_count),hl  ; Save new total count
+      test     hl               ; see if finished
+      jr       z,_sbf_Finished
+      ld       bcde, 0
+      ld       de,(_sbf_curcount)
+      ld       jkhl,(_sbf_srcPtr)
+      add      jkhl,bcde
+      ld       (_sbf_srcPtr),jkhl ; Save new bufferSrc ptr.
+      ld       jkhl,(_sbf_destPtr)
+      add      jkhl,bcde
+      ex       jkhl,bcde        ; put new destination pointer in BCDE
+      ld       (_sbf_destPtr),bcde
+
+      jp       _sbf_bfwPageLoop
+
+_sbf_Finished:
+      ld      hl,_sbfWFstate1    ; make sure next write starts correctly
+      ld      (sbf_WFstate),hl
+      clr     hl
+      jr      _sbf_WF_Exit
+_sbf_NotFinished:
+      ld       (savedJKHL),jkhl
+      ld       (savedBCDE),bcde
+      ldl      py, savedPX
+      ld       (py), px
+      ld       hl,-EBUSY
+_sbf_WF_Exit:
+      ld       (rc),hl
+      pop      ix
+#endasm
+      return rc;
+}
+
+
+/*** BeginHeader getFlashId */
+unsigned int getFlashId(void);
+/*** EndHeader */
+
+unsigned int getFlashId(void)
+{
+   return _GetFlashID();
+}
+
+/*** BeginHeader getFlashWriteMode */
+unsigned int getFlashWriteMode(void);
+/*** EndHeader */
+unsigned int getFlashWriteMode(void)
+{
+   return 2;
+}
+
+/*** BeginHeader getFlashSize */
+unsigned int getFlashSize(void);
+/*** EndHeader */
+unsigned int getFlashSize(void)
+{
+   return _FlashInfo.flashSize;
+}
+
+/*** BeginHeader getSectorSize */
+unsigned int getSectorSize(void);
+/*** EndHeader */
+unsigned int getSectorSize(void)
+{
+   return _FlashInfo.sectorSize;
+}
+
+/*** BeginHeader getNumSectors */
+unsigned int getNumSectors(void);
+/*** EndHeader */
+unsigned int getNumSectors(void)
+{
+   return _FlashInfo.numSectors;
+}
+
+/*** BeginHeader */
+#endif   // __BOOTDEV_SFLASH__
+/*** EndHeader */

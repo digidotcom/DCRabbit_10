@@ -1,0 +1,335 @@
+/*
+ *    loopback.lib
+ *    Copyright (C) 2011 Rabbit Semiconductor. All rights reserved.
+ *
+ *		Loopback network device.
+ *		The loopback interface is used when the IP address is 127.x.y.z.
+ *
+ *	The "canonical" address is 127.0.0.0, and will work for all protocols.
+ * Other addresses in the 127.x.y.z range will work for ICMP and TCP,
+ * but not necessarily for UDP since, on the Rabbit, UDP sockets don't
+ * store the incoming (destination) IP address and thus always originate
+ * packets from the canonical interface address.
+ *
+ * This library also allows for certain addresses to be diverted to
+ * registered handlers.  This allows custom interfaces to be created which
+ * do "magic" things like send TCP streams over ordinary serial ports or
+ * ZigBee radios.  The purpose of this is to simplify applications so that
+ * they can use TCP sockets for all stream-based communication (whether over
+ * real IP networks or some other protocol).
+ *
+ * The loopback interface has no link-layer header, however for the above
+ * custom handlers to work properly, packets are assumed to start with
+ * IP headers.  This is necesary so that the driver knows where to get the
+ * destination IP address, for extraction of the handler index etc.
+ * In particular, the IP header must be contained in the first section of
+ * the ll_Gather struct.  This is certainly the case for all standard library
+ * code.
+ *
+ * The loopback interface influences TCP and UDP to *not* generate
+ * internet checksums.  Similarly, the IP header is not checksummed.  Thus,
+ * if a custom handler is going to send to a destination which expects
+ * proper checksums, it will have to generate them itself, or net.lib can
+ * be modified to make IF_CHECKSUM_OFFLOAD always have the value 0.
+ */
+
+/*** BeginHeader _LoopbackController */
+#ifndef __LOOPBACK_LIB
+#define __LOOPBACK_LIB
+
+
+#ifndef LOOPBACK_HANDLERS
+	// Number of special handlers.  Handlers are indexed by the 2nd octet
+   // of the IP address i.e. for 127.x.y.z, 'x' indexes the handler table.
+   // Entry 127.0.y.z is typically used for VSPD (TCP directly over async serial port)
+   // Entry 127.1.y.z is used for XBee stream channels.
+   // Entry 127.2.y.z is used for iDigi EDP messaging facility.
+
+	#define LOOPBACK_HANDLERS	3
+#endif
+
+// Identify the special loopback handlers
+#define LOH_VSPD				0
+#define LOH_XBEE_STREAM		1
+#define LOH_EDP_MSG			2
+
+/* ***************************************************************************/
+// Private information for this interface
+struct _LoopbackConfig;
+
+typedef struct LoopbackHandler {
+	// This function is expected to deal with outgoing packets.  It should
+   // either handle the packet and return 0, or return -1 otherwise.
+	int (*sendpacket)(struct LoopbackHandler __far * lh, ll_Gather * g);
+   void __far * context;
+   int mtu;
+   // Received data should be passed to the IP handler by calling
+   // loopback_stowpacket(g).  Naturally, the packet must start with
+   // an IP header, whether faked up or real.  There is no polling for
+   // received data, so it is up to the external API function to obtain
+   // packets and process them via stowpacket.
+} LoopbackHandler;
+
+typedef struct _LoopbackConfig {
+	const NetControllerDevice * ncd;
+   word	iface;			// Interface number
+#if LOOPBACK_HANDLERS
+	LoopbackHandler loh[LOOPBACK_HANDLERS];
+#endif
+} _LoopbackConfig;
+
+
+_LoopbackConfig	_lodata[USING_LOOPBACK] =	// Instance of _LoopbackConfig in use by the driver (DMA Ethernet Control Block)
+	{ { NULL, } };
+
+extern const NetControllerDevice _LoopbackController;
+
+// These macros are used by net.lib to properly initialize all instances.
+// Each macro is a C initializer (with trailing comma if not null).  First
+// element points to NetControllerDevice, second is a void
+// pointer which points to the specific state structure for the instance,
+// third field is instance number.
+#define LOOPBACK_TABLE1  { &_LoopbackController, (void *)_lodata, 0 },
+#define LOOPBACK_TABLE2
+
+
+/*** EndHeader */
+
+// Pointer to this is stored in IFTEntry.ncd field - basically, pointers to specific driver functions.
+const NetControllerDevice _LoopbackController =
+{
+	sizeof(_LoopbackConfig)		// sizeof_state
+  ,NCD_P2P							// flags (non-broadcast)
+  ,0									// sizeof_hwa
+  ,USING_LOOPBACK					// instances
+  ,loopback_receive					// receive()
+	#pragma nowarn warns
+  ,loopback_sendpacket				// sendpacket()
+	#pragma nowarn warns
+  ,loopback_ioctl 					// ioctl()
+#ifdef PKTDRV_VERBOSE
+	#pragma nowarn warns
+  ,loopback_prt_nicreg				// prtregs()
+#else
+	#pragma nowarn warns
+  ,NULL
+#endif
+	#pragma nowarn warns
+  ,loopback_ifctl					// ifctl()
+	#pragma nowarn warns
+  ,loopback_set_hdr
+	#pragma nowarn warns
+};
+
+
+/*** BeginHeader 	loopback_resetinterface, loopback_receive, loopback_ioctl,
+						loopback_prt_nicreg */
+
+
+int loopback_resetinterface(_LoopbackConfig * nic, word instance, int iface);
+int loopback_receive(_LoopbackConfig * nic);
+int loopback_ioctl(_LoopbackConfig * nic, int cmd, ...);
+#ifdef PKTDRV_VERBOSE
+void loopback_prt_nicreg(_LoopbackConfig * nic);
+#endif
+
+/*** EndHeader */
+
+
+
+
+/**
+ *    loopback_resetinterface()
+ *
+ *		Returns 0 on success, non-zero on error.
+ */
+
+
+_pktdrv_debug
+__nouseix int loopback_resetinterface(_LoopbackConfig * nic, word instance, int iface)
+{
+	auto int	i, j;
+   auto int st_reg;
+   auto unsigned long timeout;
+   auto longword timer;
+
+   if (instance >= USING_LOOPBACK)
+   	return -6;	// No such instance
+
+	nic->ncd = &_LoopbackController;
+   nic->iface = iface;
+
+	// return success!
+	return 0;
+}
+
+/* **************************************************************************/
+
+
+_pktdrv_debug
+int loopback_receive(_LoopbackConfig * nic)
+{
+	// Don't need to do anything, data is synchronously moved to
+   // receive buffers by loopback_sendpacket().
+   return 1;
+}
+
+
+_pktdrv_debug
+int loopback_ioctl(_LoopbackConfig * nic, int cmd, ...)
+{
+	auto char * stack;
+   auto longword ip;
+   auto byte hix;
+
+   stack = (char *)(&cmd + 1);
+	switch (cmd) {
+   case PD_HASFEATURE:
+		cmd = *(int *)stack;
+      return cmd >= PD_HASFEATURE && cmd <= PD_HAVELINK || cmd == PD_CHECKSUM_OFFLOAD ||
+             cmd == PD_MTU_BY_IPADDR;
+   case PD_INITIALIZE:
+   	return loopback_resetinterface(nic, *(word *)stack, *(int *)(stack+sizeof(word)));
+   case PD_HAVELINK:
+   	return 1;
+   case PD_MTU_BY_IPADDR:
+   #if LOOPBACK_HANDLERS
+		ip = *(longword *)stack;
+		hix = (byte)(ip >> 16);
+      if (IS_LOOPBACK_ADDR(ip) && hix < LOOPBACK_HANDLERS)
+      	return nic->loh[hix].mtu;
+   	break;
+   #endif
+   }
+   return 0;
+}
+
+#ifdef PKTDRV_VERBOSE
+_pktdrv_debug
+void loopback_prt_nicreg(_LoopbackConfig * nic)
+{
+}
+#endif
+
+/* **************************************************************************/
+
+
+/*** BeginHeader loopback_stowpacket */
+int loopback_stowpacket(ll_Gather * g);
+/*** EndHeader */
+
+_pktdrv_debug
+int loopback_stowpacket(ll_Gather * g)
+{
+	int totlen;
+   ll_prefix __far * LL;
+
+	totlen = g->len1 + g->len2 + g->len3;
+   if (totlen < 1)
+   	return -1;
+	// Must copy data
+	g->flags &= ~LLG_STAT_MASK;
+	#asm
+   ld		hl,(sp+@sp+g)
+   push	ix
+   lcall	_pb_resv_send
+   pop	ix
+   jr		nc,.s01
+   ld		py,0
+   jr		.s02
+.s01:
+	ld		hl,(sp+@sp+totlen)
+   ld		bc,hl			; packet length
+   ld		h,IF_LOOPBACK ; Interface
+   ld		L,LL_READY	; Packet ready for processing
+   ld		e,0			; Zero link layer header bytes
+   push	ix
+	lcall	_pb_finish
+   pop	ix
+   ; Set flag to not bother with IP and transport checksums.  This is
+   ; required since the loopback interface advertises itself as doing
+   ; "checksum offloading".  In fact, it does no such thing, but makes
+   ; the receiver ignore checksums.  Thus, we save on both generation
+   ; and checking of checksums, which is safe for the loopback interface
+   ; and saves a lot of unnecessary computation.
+   ld		a,CHKSUM_IGNORE
+   ld		(py+[ll_prefix]+chksum_flags),a
+.s02:
+	ld		(sp+@sp+LL),py
+   #endasm
+   return LL ? 0 : -1;
+}
+
+/*** BeginHeader loopback_sendpacket */
+int loopback_sendpacket(_LoopbackConfig * nic, ll_Gather * g);
+/*** EndHeader */
+
+_pktdrv_debug
+int loopback_sendpacket(_LoopbackConfig * nic, ll_Gather * g)
+{
+   in_Header __far * ip;
+   byte hix;
+   LoopbackHandler * lh;
+
+#ifdef LOOPBACK_VERBOSE
+	if (debug_on > 2)
+		printf("LOOPBACK: sendpacket()\n");
+#endif
+
+
+#ifdef LOOPBACK_VERBOSE
+	if (debug_on > 3)
+		printf("LOOPBACK: sendpacket totlen=%u\n", totlen);
+#endif
+	if (g->len1 < sizeof(in_Header))
+		return -1;	// Cannot transmit packet without an IP header in 1st extent
+
+#ifdef LOOPBACK_VERBOSE
+   if (debug_on > 5)
+   	_pkt_dump(buf);
+#endif
+
+#if LOOPBACK_HANDLERS
+	// Destination IP address (127.x.y.z) encodes handler number in
+   // 2nd octet (x).
+	ip = (in_Header __far *)g->data1;
+	hix = *((byte __far *)&ip->destination + 1);	// Get 2nd octet
+   if (hix < LOOPBACK_HANDLERS) {
+   	lh = nic->loh + hix;
+      if (lh->sendpacket)
+			return lh->sendpacket(lh, g);
+   }
+#endif
+
+	return loopback_stowpacket(g);
+
+}
+
+
+
+/*** BeginHeader loopback_ifctl */
+int loopback_ifctl(_LoopbackConfig * nic, int up, int change);
+/*** EndHeader */
+
+_pktdrv_debug
+int loopback_ifctl(_LoopbackConfig * nic, int up, int change)
+{
+	// Just a stub for the default ethernet interface control.
+	return ifctl_ethernet(nic->iface, up, change);
+}
+
+
+/*** BeginHeader loopback_set_hdr */
+int loopback_set_hdr(_LoopbackConfig * nic, void * hdr, void __far * override);
+/*** EndHeader */
+_pktdrv_debug
+int loopback_set_hdr(_LoopbackConfig * nic, void * hdr, void __far * override)
+{
+	return 0;
+}
+
+
+
+/*** BeginHeader */
+#endif /* __LOOPBACK_LIB */
+/*** EndHeader */

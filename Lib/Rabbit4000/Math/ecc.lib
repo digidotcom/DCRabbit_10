@@ -1,0 +1,530 @@
+/*** BeginHeader */
+#ifndef __ECC_LIB
+#define __ECC_LIB
+/*** EndHeader */
+
+/* START LIBRARY DESCRIPTION ***************************************************
+ECC.LIB
+   Copyright (c) 2006-9, Digi International, Inc.
+
+DESCRIPTION:
+   Error Correction Code (ECC) functions.  Currently, this ECC implementation is
+   limited to one bit correction and two bits detection over 256 bytes (2048
+   bits) of data or 8 bytes (64 bits) of data.  Based on information and
+   examples presented in Toshiba Corp.'s "SmartMedia(TM) ECC Reference Manual
+   Ver 2.1 (Software & Hardware)" guide for NAND flash applications and data
+   from Samsung.  Routines were re-written and optimized for Rabbit 4000+
+   processors using far pointers and 32 bit commands and registers.
+
+   The API functions are:
+      calculateECC256
+      chkCorrectECC256
+      calculateECC8
+      chkCorrectECC8
+
+SUPPORT LIB’S:
+   None.
+END DESCRIPTION ***************************************************************/
+
+/*** BeginHeader */
+
+#ifdef ECC_DEBUG
+#define _ecc_nodebug __debug
+#else
+#define _ecc_nodebug __nodebug
+#endif
+
+#ifndef _LCALL_RETBYTES
+// Not already defined in another library with pure xmem asm functions that use
+//  stack parameters.
+#define _LCALL_RETBYTES 3		// number of bytes stacked for lcall return
+#endif
+
+/*
+eccgen.c
+Generating ECC code
+March 1996
+TOSHIBA Corp.
+*/
+
+// CORRECTABLE MASKS for 256 bytes
+#define CORRECTABLE_CP  0x54
+#define CORRECTABLE_LP  0x5555
+// Correctable masks HI/LO for 8 bytes
+#define CORRECTABLE_LOW 0x55
+#define CORRECTABLE_HI  0x05
+/*** EndHeader */
+
+/*** BeginHeader ecc_table */
+extern const char ecc_table[256];
+/*** EndHeader */
+
+const char ecc_table[256] = {
+0x00,0x55,0x56,0x03,0x59,0x0C,0x0F,0x5A,0x5A,0x0F,0x0C,0x59,0x03,0x56,0x55,0x00,
+0x65,0x30,0x33,0x66,0x3C,0x69,0x6A,0x3F,0x3F,0x6A,0x69,0x3C,0x66,0x33,0x30,0x65,
+0x66,0x33,0x30,0x65,0x3F,0x6A,0x69,0x3C,0x3C,0x69,0x6A,0x3F,0x65,0x30,0x33,0x66,
+0x03,0x56,0x55,0x00,0x5A,0x0F,0x0C,0x59,0x59,0x0C,0x0F,0x5A,0x00,0x55,0x56,0x03,
+0x69,0x3C,0x3F,0x6A,0x30,0x65,0x66,0x33,0x33,0x66,0x65,0x30,0x6A,0x3F,0x3C,0x69,
+0x0C,0x59,0x5A,0x0F,0x55,0x00,0x03,0x56,0x56,0x03,0x00,0x55,0x0F,0x5A,0x59,0x0C,
+0x0F,0x5A,0x59,0x0C,0x56,0x03,0x00,0x55,0x55,0x00,0x03,0x56,0x0C,0x59,0x5A,0x0F,
+0x6A,0x3F,0x3C,0x69,0x33,0x66,0x65,0x30,0x30,0x65,0x66,0x33,0x69,0x3C,0x3F,0x6A,
+0x6A,0x3F,0x3C,0x69,0x33,0x66,0x65,0x30,0x30,0x65,0x66,0x33,0x69,0x3C,0x3F,0x6A,
+0x0F,0x5A,0x59,0x0C,0x56,0x03,0x00,0x55,0x55,0x00,0x03,0x56,0x0C,0x59,0x5A,0x0F,
+0x0C,0x59,0x5A,0x0F,0x55,0x00,0x03,0x56,0x56,0x03,0x00,0x55,0x0F,0x5A,0x59,0x0C,
+0x69,0x3C,0x3F,0x6A,0x30,0x65,0x66,0x33,0x33,0x66,0x65,0x30,0x6A,0x3F,0x3C,0x69,
+0x03,0x56,0x55,0x00,0x5A,0x0F,0x0C,0x59,0x59,0x0C,0x0F,0x5A,0x00,0x55,0x56,0x03,
+0x66,0x33,0x30,0x65,0x3F,0x6A,0x69,0x3C,0x3C,0x69,0x6A,0x3F,0x65,0x30,0x33,0x66,
+0x65,0x30,0x33,0x66,0x3C,0x69,0x6A,0x3F,0x3F,0x6A,0x69,0x3C,0x66,0x33,0x30,0x65,
+0x00,0x55,0x56,0x03,0x59,0x0C,0x0F,0x5A,0x5A,0x0F,0x0C,0x59,0x03,0x56,0x55,0x00
+};
+
+/*** BeginHeader calculateECC256 */
+__xmem long calculateECC256(__far char *data);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+calculateECC256              <ECC.LIB>
+
+SYNTAX:  long xCalculateECC256(far char *data);
+
+DESCRIPTION:  Calculates a 3 byte Error Correcting Checksum (ECC, 1 bit
+              correction and 2 bit detection capability) value for a 256
+              byte (2048 bit) data buffer located in extended memory.
+
+PARAMETER1:  data is the physical address of the 256 byte data buffer.
+
+RETURN VALUE:  The calculated ECC in the 3 LSBs of the long (ie:  BCDE)
+               result.  Note that the MSB (ie:  B) of the long result is
+               always zero.
+END DESCRIPTION *********************************************************/
+/*
+** Calculating ECC
+**  data[0-255] -> ecc0,ecc1,ecc2 using CP0-CP5 code .xce256_table[0-255]
+*/
+#asm __xmem _ecc_nodebug
+calculateECC256::
+		push	af						; preserve all the non-result registers we'll use
+		push	hl
+      push  pw
+		push	ix
+		ld		pw, (SP+_LCALL_RETBYTES+10+0)	; get data buffer address bits in PW
+      ld    jkhl,pw           ; check far pointer for unconverted near address
+      clr   hl                ; needed if JK is 0xFFFF
+      inc   hl
+      add   hl,jk
+      jr    nz,.xce256_init   ; jump if conversion not needed
+      convd pw                ; convert near representation to true far pointer
+.xce256_init:
+		ld		ix, ecc_table		; get ECC table base address into IX
+		clr	hl						; initialize loop count in HL to zero
+      ld    c, h					; initialize CP5,CP4,...,CP0 bits to 0 in C
+      ld    de,hl             ; initialize odd (D) and even (E) LP bits to 0
+.xce256_eccLoop:
+      ld		a,(pw+hl)         ; get byte from buffer
+		ld		a,(ix+a)				; get ECC lookup value (0,Dall,CP5,CP4,...,CP0)
+		bit	6, a					; is Dall bit set in ECC lookup value?
+		jr		z, .xce256_notDall	; if no (Z is set), skip LP XORs with counter
+
+		ld		b, a					; save ECC lookup value
+		ld		a, L					; get current ECC loop count value
+		cpl							; invert ECC loop count value's bits for even CPs
+		xor	e						; XOR with even LP bits calculated thus far
+		ld		e, a					; put updated even LP bits back
+		ld		a, L					; get current ECC loop count value again
+		xor	d						; XOR with odd LP bits calculated thus far
+		ld		d, a					; put updated odd LP bits back
+		ld		a, b					; get ECC lookup value
+.xce256_notDall:
+		and	0x3F					; mask out unused (bit 7) and Dall (bit 6) bits
+		xor	c						; XOR with CP bits calculated thus far
+		ld		c, a					; put updated CP bits back
+		inc	hl						; increment ECC loop count
+      bit   0, h              ; check if done (256 characters)
+		jr		z, .xce256_eccLoop	; if no (Z is set), loop back for next byte
+
+      ld    b, 8
+      clr   hl
+.xce256_xferLoop:
+		rr		e						; put least remaining even LP bit into Carry
+		rr    hl						; get unshuffled least remaining even LP bit
+		rr		d						; put least remaining odd LP bit into Carry
+		rr    hl						; get unshuffled least remaining odd LP bit
+		djnz	.xce256_xferLoop	   ; if not done, go transfer another two bits
+
+		;*** at this point, B (MSB of result) already contains zero
+		ld		a, c					; get CP5,CP4,...,CP0 bits
+		rla							; rotate into bit . . .
+		rla							;  positions 7 through 2
+		cpl							; invert shifted CP bits
+		or		0x03					; ensure bits 1 and 0 are set
+		ld		c, a					; save ecc2 (CP5,CP4,...,CP0,1,1) to result place
+		ld		a, h					; get LP15,LP14,...,LP08 bits
+		cpl							; invert these LP bits
+		ld		d, a					; save ecc1 (LP15,LP14,...,LP08) to result place
+		ld		a, L					; get LP07,LP06,...,LP00 bits
+		cpl							; invert these LP bits
+		ld		e, a					; save ecc0 (LP07,LP06,...,LP00) to result place
+		pop	ix
+      pop   pw
+		pop	hl
+		pop	af
+		lret
+#endasm
+
+/*** BeginHeader chkCorrectECC256 */
+__xmem int chkCorrectECC256(__far char *data, void *old_ecc, void *new_ecc);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+chkCorrectECC256             <ECC.LIB>
+
+SYNTAX:  int chkCorrectECC256(far char *data, void *old_ecc,
+                               void *new_ecc);
+
+DESCRIPTION:  Checks the old vs. new ECC values for a 256 byte (2048 bit)
+              data buffer, and if necessary and possible (1 bit
+              correction, 2 bit detection), corrects the data in the
+              specified extended memory buffer.
+
+PARAMETER1:  data is a far pointer to the 256 byte data buffer.
+
+PARAMETER2:  old_ecc points to the old (original) 3 byte ECC's buffer.
+
+PARAMETER3:  new_ecc points to the new (current) 3 byte ECC's buffer.
+
+RETURN VALUE:  0 if data and ECC are good (no correction is necessary),
+               1 if data is corrected and ECC is good,
+               2 if data is good and ECC is corrected, or
+               3 if data and/or ECC are bad and uncorrectable.
+END DESCRIPTION *********************************************************/
+#asm __xmem _ecc_nodebug
+chkCorrectECC256::
+		push	af						; preserve all the non-result registers we'll use
+		push	bc
+		push	de
+      push  ix
+		ld		ix, (SP+_LCALL_RETBYTES+8+4)	; get pointer to old (original) ECC
+      ld    bcde, (ix)
+		ld		ix, (SP+_LCALL_RETBYTES+8+6)	; get pointer to new ECC
+      ld    jkhl, (ix)
+      xor   jkhl, bcde
+		jp		z, .xcce256_exit 	; done, go return zero XORs result to caller
+
+      push  pw
+      ld    pw, jkhl          ; save XOR of new/old ECC's to PW
+      ld    bcde, pw          ; get copy in BCDE
+      rr    1, jkhl           ; rotate XOR by 1 for CORRECTABLE check
+      xor   jkhl, bcde           ; make CORRECTABLE test value
+      ld    de, CORRECTABLE_LP   ; get LP CORRECTABLE value
+      and   hl, de               ; mask with LP CORRECTABLE value
+      xor   hl, de               ; are LP15,LP14,...,LP00 CORRECTABLE?
+		jp		nz, .xcce256_chkECC	; if no (nonzero), go check ECC error
+
+      ex    jk, hl             ; swap CP test value to HL
+      ld    a, L               ; get CP5,CP4,...,CP0,1,1 CORRECTABLE test value
+      and   CORRECTABLE_CP     ; mask with CP5,CP4,...,CP0,1,1 CORRECTABLE value
+      xor   CORRECTABLE_CP       ; is CP5,CP4,...,CP0,1,1 CORRECTABLE?
+		jp		nz, .xcce256_chkECC	; if no (nonzero), go check ECC error
+
+      ld    bcde,pw            ; get XOR of new/old ECC's
+      ld    b,8                ; B not used by ECC, use for bit count
+.xcce256_loop:
+      rr    de                 ; drop even bits (0, 2, ...)
+      rr    de                 ; save odd bits
+      rra                      ; into the accumulator
+      djnz  .xcce256_loop
+
+		ld		pw, (SP+_LCALL_RETBYTES+12+0)	; get data buffer address
+      ld    jkhl,pw           ; check far pointer for unconverted near address
+      clr   hl                ; needed if JK is 0xFFFF
+      inc   hl
+      add   hl,jk
+      jr    nz,.xcce256_fixbit   ; jump if conversion not needed
+      convd pw                   ; convert near address to true far pointer
+.xcce256_fixbit:
+      bool  hl
+		ld		L, a						; make offset to bad byte in buffer
+		ld		a, 0x01				   ; initialize error bit mask for bit 0
+		bit	7, c						; is error bit << 4 flag set?
+		jr		z, .xcce256_notSLA4	; if no (zero), go check next lower shift flag
+
+		sla	a						   ; move error bit 4 positions
+		sla	a
+		sla	a
+		sla	a
+.xcce256_notSLA4:
+		bit	5, c						; is error bit << 2 flag set?
+		jr		z, .xcce256_notSLA2	; if no (zero), go check next lower shift flag
+
+		sla	a						   ; move error bit 2 positions
+		sla	a
+.xcce256_notSLA2:
+		bit	3, c						; is error bit << 1 flag set?
+		jr		z, .xcce256_notSLA1	; if no (zero), go correct byte in buffer
+
+		sla	a						   ; move error bit 1 position
+
+.xcce256_notSLA1:
+      ld    b, a                 ; save bit correction mask
+      ld		a, (pw+hl)           ; get byte to correct
+      xor   b                    ; toggle the bad bit
+      ld		(pw+hl), a           ; and save back to buffer
+		ld		hl, 0x0001			   ; set corrected data result code
+		jr		.xcce256_exitC		   ; go return the corrected data result
+
+.xcce256_chkECC:					; check for correctable ECC (1 bit set in new^old)
+		xor	a						; initialize nonzero bit count to zero
+      ld    bcde, pw          ; get XOR of old/new ECC's
+		ld		b, 8					; 8 bits to check in each of C, D, and E
+.xcce256_chkECCloop:
+		rr		c						; rotate current LSbit into Carry flag
+		adc   0
+		rr		d						; rotate current LSbit into Carry flag
+		adc   0
+		rr		e						; rotate current LSbit into Carry flag
+		adc   0
+		djnz	.xcce256_chkECCloop	; loop back if not checked 8 bits in C, D, E
+
+		cp		0x01					; correctable ECC? (exactly 1 bit set in new^old)
+		jr		nz, .xcce256_uncorrectable	; if no (nonzero), go return error
+
+		ld		bcde, (ix)			; replace the incorrect old ECC with the new ECC
+		ld		ix, (SP+_LCALL_RETBYTES+12+4)	; get pointer to old (original) ECC
+      ld    (ix+0), e
+		ld		(ix+1), d
+		ld		(ix+2), c
+		ld		hl, 0x0002
+		jr		.xcce256_exitC		; go return corrected ECC result code
+
+.xcce256_uncorrectable:
+		ld		hl, 0x0003			; uncorrectable error result LSB
+.xcce256_exitC:
+      pop   pw
+.xcce256_exit:
+		pop	ix						; restore all the non-result registers we've used
+		pop	de
+		pop	bc
+		pop	af
+		lret
+#endasm
+
+/*** BeginHeader calculateECC8 */
+__xmem word calculateECC8(__far char *data);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+calculateECC8              <ECC.LIB>
+
+SYNTAX:  word calculateECC8(far char *data);
+
+DESCRIPTION:  Calculates a 2 byte Error Correcting Checksum (ECC, 1 bit
+              correction and 2 bit detection capability) value for a 8
+              byte (64 bit) data buffer located in memory.
+
+PARAMETER1:  data is a far pointer to the 8 byte data buffer.
+
+RETURN VALUE:  The calculated ECC.
+END DESCRIPTION *********************************************************/
+#asm __xmem _ecc_nodebug
+calculateECC8::
+		push	af						; preserve all the non-result registers we'll use
+		push	bcde
+      push  pw
+		push	ix
+		ld		pw, (SP+_LCALL_RETBYTES+12+0)	; get data buffer address bits in PW
+		ld		ix, ecc_table		; get ECC table base address into IX
+      ld    jkhl,pw           ; check far pointer for unconverted near address
+      clr   hl                ; needed if JK is 0xFFFF
+      inc   hl
+      add   hl,jk
+      jr    nz,.xce8_init     ; jump if conversion not needed
+      convd pw                ; convert near representation to true far pointer
+.xce8_init:
+		clr	hl						; initialize loop count in HL to zero
+      ld    c, h					; initialize CP5,CP4,...,CP0 bits to 0 in C
+      ld    de,hl             ; initialize odd (D) and even (E) LP bits to 0
+.xce8_eccLoop:
+      ld		a,(pw+hl)         ; get byte from buffer
+		ld		a,(ix+a)				; get ECC lookup value (0,Dall,CP5,CP4,...,CP0)
+		bit	6, a					; is Dall bit set in ECC lookup value?
+		jr		z, .xce8_notDall	; if no (Z is set), skip LP XORs with counter
+
+		ld		b, a					; save ECC lookup value
+		ld		a, L					; get current ECC loop count value
+		cpl							; invert ECC loop count value's bits for even CPs
+		xor	e						; XOR with even LP bits calculated thus far
+		ld		e, a					; put updated even LP bits back
+		ld		a, L					; get current ECC loop count value again
+		xor	d						; XOR with odd LP bits calculated thus far
+		ld		d, a					; put updated odd LP bits back
+		ld		a, b					; get ECC lookup value
+.xce8_notDall:
+		and	0x3F					; mask out unused (bit 7) and Dall (bit 6) bits
+		xor	c						; XOR with CP bits calculated thus far
+		ld		c, a					; put updated CP bits back
+		inc	hl						; increment ECC loop count
+      bit   3, L              ; check if done (8 characters)
+		jr		z, .xce8_eccLoop	; if no (Z is set), loop back for next byte
+
+      ld    b, 3
+.xce8_xferLoop:
+		rr		e						; put least remaining even LP bit into Carry
+		rra							; get unshuffled least remaining even LP bit
+		rr		d						; put least remaining odd LP bit into Carry
+		rra							; get unshuffled least remaining odd LP bit
+		djnz	.xce8_xferLoop	   ; if not done, go transfer another two bits
+
+		;*** at this point, B (MSB of result) already contains zero
+		rr 	c						; rotate CP1 and CP0 into positions 7 and 6
+		rra
+      rr    c
+      rra
+		cpl							; invert shifted CP/LP bits
+		ld		L, a					; save secc0 (CP1,CP0,LP5,...,LP0) to result place
+		ld		a, c					; get CP5,CP4,CP3,CP2 bits
+		cpl							; invert these LP bits
+		or		0xF0					; ensure bits 7 thru 4 are set
+		ld		h, a					; save secc1 (1,1,1,1,CP5,...,CP2) to result place
+		pop	ix
+      pop   pw
+		pop	bcde
+		pop	af
+		lret
+#endasm
+
+/*** BeginHeader chkCorrectECC8 */
+__xmem int chkCorrectECC8(__far char *data, __far word *old_ecc, word new_ecc);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+chkCorrectECC8             <ECC.LIB>
+
+SYNTAX:  int chkCorrectECC8(far char *data, far word *old_ecc,
+                               word new_ecc);
+
+DESCRIPTION:  Checks the old vs. new ECC values for a 8 byte (64 bit)
+              data buffer, and if necessary and possible (1 bit error
+              correction, 2 bit detection), corrects the data/ECC in
+              the specified memory buffers.
+
+PARAMETER1:  data is a far pointer to the 8 byte data buffer.
+
+PARAMETER2:  old_ecc points to the old (stored) 2 byte far ECC value.
+
+PARAMETER3:  new_ecc contains new (calculated) 2 byte ECC value.
+
+RETURN VALUE:  0 if data and new ECC are good (no correction is necessary),
+               1 if data is corrected and ECC is good,
+               2 if data is good and old ECC is corrected, or
+               3 if data and/or ECC's are bad and uncorrectable.
+END DESCRIPTION *********************************************************/
+#asm __xmem _ecc_nodebug
+chkCorrectECC8::
+		push	af						; preserve all the non-result registers we'll use
+		push	de
+		push	pw
+		ld		pw, (SP+_LCALL_RETBYTES+8+4)	; get pointer to old (original) ECC
+      ld    jkhl,pw           ; check far pointer for unconverted near address
+      clr   hl                ; needed if JK is 0xFFFF
+      inc   hl
+      add   hl,jk
+      jr    nz,.xcce8_init    ; jump if conversion not needed
+      convd pw                ; convert near representation to true far pointer
+.xcce8_init:
+      ld    de,(pw)                       ; get old ECC into de
+      ld    hl,(SP+_LCALL_RETBYTES+8+8)  ; get new ECC into hl
+      xor   hl,de             ; create ECC comparison in hl
+		jp		z, .xcce8_exit 	; ECC's match, return all good result to caller
+
+		ld		de,hl					; save ECC comparison to de
+		srl	h						; make CORRECTABLE check value by
+		rr		L						; shifting the comparison value
+		xor	hl,de					; and XORing with original ECC comparison
+      ld    a,L               ; get low byte of ECC comparison
+      and   CORRECTABLE_LOW   ; mask with low correctable byte mask
+      cp    CORRECTABLE_LOW   ; then compare with low correctable byte mask
+      jp    nz, .xcce8_chkECC	; if no (nonzero), go check ECC error
+
+		ld		a, h					; get high byte ECC comparison
+      and   CORRECTABLE_HI    ; mask with high correctable byte mask
+      cp    CORRECTABLE_HI    ; then compare with high correctable byte mask
+      jp    nz, .xcce8_chkECC	; if no (nonzero), go check ECC error
+
+      ; correctable data bit error - setup to correct it
+		ld		pw, (SP+_LCALL_RETBYTES+8+0)	; get pointer to data buffer
+      ld    jkhl,pw           ; check far pointer for unconverted near address
+      clr   hl                ; needed if JK is 0xFFFF
+      inc   hl
+      add   hl,jk
+      jr    nz,.xcce8_fixbit  ; jump if conversion not needed
+      convd pw                ; convert near representation to true far pointer
+.xcce8_fixbit:
+      xor	a						; initialize error byte buffer offset to zero
+      rr    de                ; drop even bits (0, 2, ...)
+      rr    de                ; save odd bits
+      rra                     ; into the accumulator
+      rr    de
+      rr    de                ; repeat for bit 3
+      rra
+      rr    de
+      rr    de                ; repeat for bit 5
+      rra
+      rra                     ; shift the 3 bits to B2..B0 of accumulator
+      rra
+      rra
+      rra
+      rra                     ; now have byte offset for incorrect byte
+      bool  hl                ; clear H register and carry flag (shifting below)
+      ld    L, a              ; save offset in L register
+
+		ld		a, 1				   ; start with bit 0 set in correction mask
+		bit	1, e					; is CP1 set in ECC comparison?
+		jr		z, .xcce8_chkCP3	; if no (zero), go check CP3
+
+		rla                     ; adjust correction mask
+.xcce8_chkCP3:
+		bit	3, e					; is CP3 set in ECC comparison?
+		jr		z, .xcce8_chkCP5	; if no (zero), go check CP5
+
+		rla                     ; adjust correction mask
+      rla
+.xcce8_chkCP5:
+		bit	5, e					; is CP5 set in ECC comparison?
+		jr		z, .xcce8_correct	; if no (zero), go correct the bit error
+
+		rla                     ; adjust correction mask
+      rla
+      rla
+      rla
+.xcce8_correct:
+      ld    e, a              ; save ECC bit correction mask
+      ld    a,(pw+hl)         ; get byte that needs correction from buffer
+      xor   e                 ; toggle incorrect bit with correction mask
+      ld    (pw+hl),a         ; save corrected byte back to buffer
+		ld		hl, 0x0001			; get corrected data result code into hl
+		jr		.xcce8_exit 		; go return the corrected data result
+
+.xcce8_chkECC:					; check for correctable ECC (1 bit set in new^old)
+      xor   a                        ; clear ACC
+      ld    L, 12                    ; use L as loop counter
+.xcce8_loop:
+      rr    de                ; Loop counts high bits in lower 12 bits of DE
+      adc   0                 ; ACC is used as the counter
+      dec   L
+      jr    nz,.xcce8_loop
+      cp    1                        ; Compare number of 'error' bits in ACC
+      jr    nz, .xcce8_uncorrectable ; If not 1, then it's uncorrectable
+
+      ld    hl,(SP+_LCALL_RETBYTES+8+8)  ; get new ECC into hl
+      ld    (pw),hl                       ; correct old ECC value
+		ld		hl, 0x0002        ; put corrected ECC result code in hl
+		jr		.xcce8_exit 		; go return corrected ECC result code
+
+.xcce8_uncorrectable:
+		ld		hl, 0x0003			; uncorrectable error result code
+.xcce8_exit:
+		pop	pw						; restore all the non-result registers we've used
+		pop	de
+		pop	af
+		lret
+#endasm
+
+/*** BeginHeader */
+#endif	// __ECC_LIB
+/*** EndHeader */

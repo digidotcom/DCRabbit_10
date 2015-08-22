@@ -1,0 +1,1612 @@
+/*** BeginHeader  **********************************/
+#ifndef __COFUNC_LIB
+#define __COFUNC_LIB
+/*** EndHeader ***********************************************/
+
+/*** Beginheader __wfdheader */
+
+#ifdef PERIODIC_TIMERS
+#funcchain _GLOBAL_INIT periodic_init
+#endif
+
+__root void __wfdheader();
+/*** endheader */
+
+#asm
+
+;
+;  __wfdheader initializes the single user cofunction
+;  state array to 0xff for each entry.  this block
+;  of code is only called the firsttime the wfd runs.
+;
+;  The __wfdheader call is immediately followed by
+;  the address of the array and the size of the
+;  array.
+;
+;  The __wfdheader call also initializes the anddone
+;  wfd flag.
+;
+
+__wfdheader::
+	ld		a,(hl)			; initialize the codata flags
+	or		0xa0
+	ld		(hl),a
+
+	pop	de					; return address
+	pop	bc					; number of times to update
+	pop	hl					; address to update
+
+	ld		a,c				; nothing to do?
+	or		a
+	jr		z,__wfdh2
+
+	ld		b,c				; only support 255 cofunctions in wfd
+	ld		a,0xff			; initialize items to 0xff
+
+__wfdh1:
+	ld		(hl),a
+	inc	hl
+	djnz	__wfdh1
+
+__wfdh2:
+	ex		de,hl				; get return address
+	jp		(hl)
+
+	pop	hl					; get the call address
+	ld		e,(hl)			; get the address of array
+	inc	hl
+	ld		d,(hl)
+	inc	hl
+	ld		c,(hl)			; get the size of the array
+	inc	hl
+	inc	hl
+	push	hl					; set the proper return address
+
+	ex		de,hl
+
+	xor	a
+	ld		b,0xff			; value to initialize array
+
+	cp		c
+	jp		z,__wfdh2
+
+;__wfdh1:
+	ld		(hl),b
+	inc	hl
+	dec	c
+	jp		nz,__wfdh1
+
+;__wfdh2:
+	ret
+
+#endasm
+
+/*** Beginheader __coferr_badinstance, __coferr_badcodata */
+__coferr_badinstance();
+__coferr_badcodata();
+/*** EndHeader */
+
+#asm
+__coferr_badinstance::
+	ld		hl, -ERR_INVALIDCOFUNC			; invalid instance #
+	push	hl
+	call	exception
+	add	sp, 2
+	call	_xexit
+
+__coferr_badcodata::
+	ld		hl, -ERR_CORRUPTEDCODATA			; CoData struct trashed
+	push	hl
+	call	exception
+	add	sp, 2
+	call	_xexit
+#endasm
+
+/*** Beginheader cofprolog_, cofepilog_ */
+__root void cofprolog_();
+__root void cofepilog_();
+/*** endheader */
+
+#asm
+
+;
+;entry:
+;	registers
+;	de = cofunc descriptor pointer
+;			char  max_instances
+;			int   local_variable_size
+;			int   parameter_size
+;			void* frame_pointers[max_instances]
+;
+;	hl = caller codata pointer
+;
+;	stack
+;	sp		cof address
+;	sp+2	saved	frame pointer
+;	sp+4	wfd call address
+;	sp+6	caller codata
+;	sp+8	instance/wfd offset
+;	sp+10 parameters
+;	sp+??	space for structured return
+
+;
+; cofprolog_
+;
+
+cofprolog_::
+	ex		de,hl
+	ld		a,(hl)			; a  = max instance
+	inc	hl
+	ld		c,(hl)			; bc = size of parameters
+	inc	hl
+	ld		b,(hl)
+	inc	hl
+
+	push	bc					; save size of parameters
+
+	ld		c,(hl)			; bc = size of local variables
+	inc	hl
+	ld		b,(hl)
+	inc	hl					; hl = frame pointer table
+
+	exx
+	ld		hl,18				; point to the instance index
+	add	hl,sp
+
+	ld		b,a
+	ld		a,(hl)			; a  = instance
+
+	cp		b					; instance < max_instance
+	jp		nc,__coferr_badinstance
+
+	exx
+
+	sla	a					; a = offset into cofunction descriptor
+	add	a,l				;     for virtual frame pointer address
+	ld		l,a
+	jr		nc,__cof1
+	inc	h
+
+__cof1:
+	ld		a,(hl)
+	inc	hl
+	ld		h,(hl)
+	ld		l,a				; hl = frame pointer
+
+	ld		ix,0				; ix = frame pointer
+	ex		de,hl
+	add	ix,de
+
+	ld		a,(hl)			; check the firsttime flag
+	bit	7,a
+	jr		z,__cofrun
+
+	ex		de,hl
+	sbc	hl,bc
+
+__cof2:
+	ld		(ix+0),l			; v stack pointer -> v call frame
+	ld		(ix+1),h
+	ld		(ix+2),e			; caller codata -> v call frame
+	ld		(ix+3),d
+
+	push	ix					; hl = addr parameters in v call frame
+	pop	hl
+
+	ld		de,0x0004
+	add	hl,de
+
+	ex		de,hl
+	ld		l,17
+	add	hl,sp
+
+	ld		a,(hl)			; get the instance index
+	inc	hl
+	inc	hl					; bypass the waitfordone offset
+
+	pop	bc
+	ex		af,af'
+	ld		a,b
+	or		c
+	jr		z,__cof3
+
+	ldir						; copy parameters
+
+__cof3:
+	ex		af,af'
+	ex		de,hl
+	ld		(hl),a			; store instance index
+	inc	hl
+	inc	hl
+
+	xor	a					; set codata to the first time
+	ld		(hl),a
+
+	pop	hl
+	inc	hl
+	inc	hl
+	inc	hl
+
+	push	hl					; return past jump to epilog
+	ret
+
+__cofrun:
+	pop	bc					; restore parameter size
+
+	ld		a,(ix+2)			; validate the caller codata
+	cp		l
+	jp		nz,__coferr_badcodata
+	ld		a,(ix+3)
+	cp		h
+	jp		nz,__coferr_badcodata
+
+	push	ix					; calculate the codata
+	pop	de
+
+	ld		a,6				; add size of caller cod, virtual stack pointer,
+								; instance index, and extended cof CSState
+	add	a,e
+	jr		nc,__cofcod1
+	inc	d
+
+__cofcod1:
+	add	a,c				; add size of parameters
+	ld		e,a
+	jr		nc,__cofcod2
+	inc	d
+
+__cofcod2:
+	ex		de,hl				; hl=my codata
+
+	ld		a,(hl)			; my codata -> CSState
+	and	a,0x01
+	jp		z,__cofpr_1
+	inc	a					; trick:  1+1=2
+	and	a,(hl)
+	jp		z,__cofpr_1
+	ld		a,0x08			; complete
+	ret
+
+__cofpr_1:
+	pop	af					; remove the return value
+	inc	hl					; get the restart address
+	ld		e,(hl)
+	inc	hl
+	ld		d,(hl)
+	inc	hl
+	ld		a,d
+	cp 	0xe0				; check if address is xmem (offset > 0xe000)
+	jp c, __cof_xpcskip ; don't restore the xpc not in xmem
+	ld a, (hl)				; load the base into the spc
+	ld		xpc,a
+__cof_xpcskip:
+	push	de
+
+	ld		hl,(sp+4)		; if there is an everytime statement
+	ld		a,l
+	or		h
+
+	jr		z,__cofpr_2
+	push	hl					; place everytime statment on stack
+
+__cofpr_2:
+   ret			; return to everytime/prev yield point
+
+;
+; cofepilog_
+;
+; called at the end of each call to a cofunction.  This routine
+; updates the Cofunctions CoData undoes the cofunction's call
+; frame.
+;
+; call:
+;   a =status 0x00 yielded, 0x08 complete, 0x10 aborted, 0x18 completed
+;   hl=CoData
+;
+; return:
+;   nothing
+;
+
+cofepilog_::
+	ex		de,hl
+
+	ld		hl,(ix+2)		; get the caller codata
+
+	ld		b,a				; update the caller codata with last completion type
+	ld		a,0xe7
+	and	(hl)
+	or		b
+	ld		(hl),a
+
+	ld		a,b
+	and	0x08
+	jp		nz,__cofcomplete
+
+	ld		a,b
+	and	0x10
+	jp		nz,__cofabort
+
+	ld		a,0x02
+	res	5,(hl)			; clear anddone flag in caller codata
+
+	ex		de,hl				; update my codata to yielded
+	ld		(hl),0
+	ex		de,hl
+
+	jr		__cofsetft
+
+__cofabort:
+	ex		de,hl				; retrieve offset
+
+	ld		hl,0x000f
+	add	hl,sp
+	ld		a,(hl)
+	neg						; negate offset (because abort)
+	ld		hl,0x000a
+	add	hl,de
+	ld		(hl),a			; store offset into caller codata
+	ld		a,0x40			; transferring information in a is unreliable
+	ex		de,hl
+	jr		__cofsetft
+
+__cofcomplete:
+	ld		a,b
+	and	0x10
+	jr		nz,__cofcompleted
+	ld		a,0x82
+	ex		af,af'
+	ret
+
+__cofcompleted:
+	ex		de,hl				; get the wfd offset address
+
+	ld		hl,0x000f
+	add	hl,sp
+	ld		a,(hl)			; get the wfd offset
+	ld		hl,0x000a
+	add	hl,de
+	ld		(hl),a			; store the wfd offset into the caller codata
+	xor	a
+	ex		de,hl
+
+__cofsetft:
+	or		a					; clear carry
+	bit	7,(hl)
+	jp		nz,__cofsetft2
+	set	7,a
+
+__cofsetft2:
+	ex		af,af'
+	ret
+
+#endasm
+
+/*** Beginheader cofprologdbg_, cofepilogdbg_ */
+__root void cofprologdbg_();
+__root void cofepilogdbg_();
+/*** endheader */
+
+#asm
+
+;
+;entry:
+;	registers
+;	de = cofunc descriptor pointer
+;			char  max_instances
+;			int   local_variable_size
+;			int   parameter_size
+;			void* frame_pointers[max_instances]
+;
+;	hl = caller codata pointer
+;
+;	stack
+;	sp		cof address
+;	sp+2	saved	frame pointer
+;	sp+4	wfd call address
+;	sp+6	caller codata
+;	sp+8	instance/wfd offset
+;	sp+10 parameters
+;	sp+??	space for structured return
+
+;
+; cofprologdbg_
+;
+
+cofprologdbg_::
+	ex		de,hl
+	ld		a,(hl)			; a  = max instance
+	inc	hl
+	ld		c,(hl)			; bc = size of parameters
+	inc	hl
+	ld		b,(hl)
+	inc	hl
+
+	push	bc					; save size of parameters
+
+	ld		c,(hl)			; bc = size of local variables
+	inc	hl
+	ld		b,(hl)
+	inc	hl					; hl = frame pointer table
+
+	exx
+	ld		hl,18				; point to the instance index
+	add	hl,sp
+
+	ld		b,a
+	ld		a,(hl)			; a  = instance
+
+	cp		b					; instance < max_instance
+	jp		nc,__coferr_badinstance
+
+	exx
+
+	sla	a					; a = offset into cofunction descriptor
+	add	a,l				;     for virtual frame pointer address
+	ld		l,a
+	jr		nc,__cof1
+	inc	h
+
+__cof1:
+	ld		a,(hl)
+	inc	hl
+	ld		h,(hl)
+	ld		l,a				; hl = frame pointer
+
+	ld		ix,0				; ix = frame pointer
+	ex		de,hl
+	add	ix,de
+
+	ld		a,(hl)			; check the firsttime flag
+	bit	7,a
+	jr		z,__cofrun
+
+	ex		de,hl
+	sbc	hl,bc
+
+__cof2:
+	ld		(ix+0),l			; v stack pointer -> v call frame
+	ld		(ix+1),h
+	ld		(ix+2),e			; caller codata -> v call frame
+	ld		(ix+3),d
+
+	push	ix					; hl = addr parameters in v call frame
+	pop	hl
+
+	ld		de,0x0004
+	add	hl,de
+
+	ex		de,hl
+	ld		l,17
+	add	hl,sp
+
+	ld		a,(hl)			; get the instance index
+	inc	hl
+	inc	hl					; bypass the waitfordone offset
+
+	pop	bc
+	ex		af,af'
+	ld		a,b
+	or		c
+	jr		z,__cof3
+
+	ldir						; copy parameters
+
+__cof3:
+	ex		af,af'
+	ex		de,hl
+	ld		(hl),a			; store instance index
+	inc	hl
+	inc	hl
+
+	xor	a					; set codata to the first time
+	ld		(hl),a
+
+	pop	hl
+	inc	hl
+	inc	hl
+	inc	hl
+
+	push	hl					; return past jump to epilog
+	jp		_fentry
+
+__cofrun:
+	pop	bc					; restore parameter size
+
+	ld		a,(ix+2)			; validate the caller codata
+	cp		l
+	jp		nz,__coferr_badcodata
+	ld		a,(ix+3)
+	cp		h
+	jp		nz,__coferr_badcodata
+
+	push	ix					; calculate the codata
+	pop	de
+
+	ld		a,6				; add size of caller cod, virtual stack pointer,
+								; instance index, and extended cof CSState
+	add	a,e
+	jr		nc,__cofcod1
+	inc	d
+
+__cofcod1:
+	add	a,c				; add size of parameters
+	ld		e,a
+	jr		nc,__cofcod2
+	inc	d
+
+__cofcod2:
+	ex		de,hl				; hl=my codata
+
+	ld		a,(hl)			; my codata -> CSState
+	and	a,0x01
+	jp		z,__cofpr_1
+	inc	a					; trick:  1+1=2
+	and	a,(hl)
+	jp		z,__cofpr_1
+	ld		a,0x08			; complete
+	jp		_fentry
+
+__cofpr_1:
+	pop	af					; remove the return value
+	inc	hl					; get the restart address
+	ld		e,(hl)
+	inc	hl
+	ld		d,(hl)
+	inc	hl
+	ld		a,d
+	cp 	0xe0				; check if address is xmem (offset > 0xe000)
+	jp c, __cof_xpcskip ; don't restore the xpc not in xmem
+	ld a, (hl)				; load the base into the spc
+	ld		xpc,a
+__cof_xpcskip:
+	push	de
+
+	ld		hl,(sp+4)		; if there is an everytime statement
+	ld		a,l
+	or		h
+
+	jr		z,__cofpr_2
+	push	hl					; place everytime statment on stack
+
+__cofpr_2:
+	jp		_fentry			; return to everytime/prev yield point
+
+;
+; cofepilogdbg_
+;
+; called at the end of each call to a cofunction.  This routine
+; updates the Cofunctions CoData undoes the cofunction's call
+; frame.
+;
+; call:
+;   a =status 0x00 yielded, 0x08 complete, 0x10 aborted, 0x18 completed
+;   hl=CoData
+;
+; return:
+;   nothing
+;
+
+cofepilogdbg_::
+	ex		de,hl
+
+	ld		hl,(ix+2)		; get the caller codata
+
+	ld		b,a				; update the caller codata with last completion type
+	ld		a,0xe7
+	and	(hl)
+	or		b
+	ld		(hl),a
+
+	ld		a,b
+	and	0x08
+	jp		nz,__cofcomplete
+
+	ld		a,b
+	and	0x10
+	jp		nz,__cofabort
+
+	ld		a,0x02
+	res	5,(hl)			; clear anddone flag in caller codata
+
+	ex		de,hl				; update my codata to yielded
+	ld		(hl),0
+	ex		de,hl
+
+	jr		__cofsetft
+
+__cofabort:
+	ex		de,hl				; retrieve offset
+
+	ld		hl,0x000f
+	add	hl,sp
+	ld		a,(hl)
+	neg						; negate offset (because abort)
+	ld		hl,0x000a
+	add	hl,de
+	ld		(hl),a			; store offset into caller codata
+	ld		a,0x40			; transferring information in a is unreliable
+	ex		de,hl
+	jr		__cofsetft
+
+__cofcomplete:
+	ld		a,b
+	and	0x10
+	jr		nz,__cofcompleted
+	ld		a,0x82
+	ex		af,af'
+	jp		_fexit
+
+__cofcompleted:
+	ex		de,hl				; get the wfd offset address
+
+	ld		hl,0x000f
+	add	hl,sp
+	ld		a,(hl)			; get the wfd offset
+	ld		hl,0x000a
+	add	hl,de
+	ld		(hl),a			; store the wfd offset into the caller codata
+	xor	a
+	ex		de,hl
+
+__cofsetft:
+	or		a					; clear carry
+	bit	7,(hl)
+	jp		nz,__cofsetft2
+	set	7,a
+
+__cofsetft2:
+	ex		af,af'
+	jp		_fexit
+
+#endasm
+
+
+/*** Beginheader scofprolog_, scofepilog_, loophead, loopinit, __scofabandon */
+
+void loophead();
+void loopinit();
+__root void scofprolog_();
+__root void scofepilog_();
+__root void __scofabandon();
+void _loophead();
+void _loopinit();
+
+#makechain _loophead
+#makechain _loopinit
+
+/*** endheader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+loophead                         <COFUNC.LIB>
+
+SYNTAX: void loophead();
+
+DESCRIPTION: This function should be called within the main loop
+in a program. It is necessary for proper single-user cofunction
+abandonment handling.
+
+When two costatements are requesting access to a single-user
+cofunction, the first request is honored and the second request
+is held. When loophead notices that the first caller is not being
+called each time around the loop, it cancels the request, calls
+the abandonment code and allows the second caller in.
+
+   Example:
+
+   scofunc SCofTest(int i){
+      abandon {
+         printf("CofTest was abandoned\n");
+      }
+      while(i>0) {
+         printf("CofTest(%d)\n",i);
+         yield;
+      }
+   }
+   main(){
+      int x;
+      for(x=0;x<=10;x++) {
+         loophead();
+         if(x<5) {
+            costate {
+               wfd SCofTest(1); // first caller
+            }
+         }
+         costate {
+            wfd SCofTest(2);    // second caller
+         }
+      }
+   }
+
+END DESCRIPTION **********************************************************/
+__nodebug void loophead()
+{
+	_loophead();
+}
+
+/* START FUNCTION DESCRIPTION ********************************************
+loopinit                         <COFUNC.LIB>
+
+SYNTAX: void loopinit();
+
+DESCRIPTION: This function should be called in the beginning of a
+program that uses single-user cofunctions. It initializes internal
+data structures that are used by loophead()
+
+     Example:
+
+      // echoes characters
+      main() {
+          int c;
+          serXopen(19200);
+          loopinit();
+          while (1) {
+              loophead();
+              wfd c = cof_serAgetc();
+              wfd cof_serAputc(c);
+          }
+          serAclose();
+      }
+
+END DESCRIPTION **********************************************************/
+__nodebug void loopinit()
+{
+	_loopinit();
+}
+
+#asm
+
+
+;----------------------------------------------------------------------------
+; scof pilot call: (wfd_scofstate = 0xff)
+;
+; on entry:
+;  sp+0	= scof return address
+;	sp+2	= cofunc descriptor address
+;  sp+4  = everytime address
+;	sp+6	= saved frame pointer
+;	sp+8	= wfd return address
+;	sp+10	= caller codata address
+;	sp+12	= wfd_scofstate address
+;	a		= wfd_scofstate (0xff)
+;	de		= cofunc descriptor address
+;  hl		= caller codata
+;
+; on exit:
+;  a		= response 0x00=proceed, 0xff=busy
+;
+; In the pilot call, the single user cofunction prolog is responsible
+; for checking if the single user cofunction is currently in use. If
+; it is in use the prolog returns the value 0x00 if it is ok to
+; proceed with a firsttime call and a 0xff if it is not ok. The pilot
+; call returns directly to the waitfordone statement with a resonse of
+; proceed or busy.
+;----------------------------------------------------------------------------
+; scof firsttime call: (wfd_scofstate = 0x00)
+;
+; on entry:
+;	sp+0	= scof return address
+;	sp+2	= cofunction descriptor
+;  sp+4  = everytime address
+;	sp+6	= saved frame pointer
+;	sp+8	= wfd return address
+;  sp+10	= caller codata address
+;	sp+12	= wfd_scofstate address
+;	sp+14 = cofunction index/waitfordone offset (index=0)
+;  sp+16 = parameters
+;  sp+?? = structured return
+;  a		= wfd_scofstate (0x00)
+;  bc		= instance/offset
+;	de		= cofunction descriptor
+;	hl		= caller codata address
+;
+; On the firsttime call, the single user cofunction prolog is responsible
+; for initializing the virtual call frame.  It sets the virtual stack
+; pointer, the caller codata, the parameters, the instance index, and the
+; state flag of the cofunction codata.  The firsttime call returns to the
+; scof's first statement.
+;----------------------------------------------------------------------------
+; scof continuation call: (wfd_scofstate = 0x01)
+;
+;	sp+0	= scof return address
+;	sp+2	= cofunction descriptor
+;  sp+4  = everytime address
+;	sp+6	= saved frame pointer
+;	sp+8	= wfd return address
+;  sp+10= caller codata address
+;	sp+12	= wfd_scofstate address
+;	sp+14 = cofunction index/waitfordone offset (index=0)
+;  sp+16 = structured return
+;
+; on exit: (only if scof is completed, returns to waitfordone)
+;	a'		= 0x01
+;	cf'	= 1
+;
+;----------------------------------------------------------------------------
+
+scofprolog_::
+	cp		a,0xff
+	jr		nz,__scoffirst
+
+	;
+	; scofunc pilot call
+	;
+
+	ex		de,hl				; hl=cofunc descriptor address
+	inc	hl
+	ld		c,(hl)
+	inc	hl
+	ld		b,(hl)			; bc=size of parameters
+	inc	hl
+	inc	hl
+	inc	hl
+	ld		a,(hl)
+	inc	hl
+	ld		h,(hl)
+	ld		l,a				; hl=virtual frame pointer address
+
+	add	hl,bc
+	ld		bc,0x0006
+	add	hl,bc				; hl=scofunc codata address
+
+	ld		a,0xfe			; a=not busy
+	bit	6,(hl)
+	jp		nz,__scofbusy
+
+	set	6,(hl)			; set the semaphore
+
+	ld		hl,0x000f		; update the wfd_scofstate
+	add	hl,sp
+
+	ld		b,(hl)
+	inc	hl
+	ld		h,(hl)
+	ld		l,b				; hl=wfd_scofstate address
+	ld		(hl),0x00
+
+	inc	a
+	ld		hl,(sp+13)		; caller codata
+	ret						; a=0xff avail on entry to scofepilog
+
+__scofbusy:
+	ld		hl,(sp+13)		; caller codata
+	res	5,(hl)
+	ret						; a=0xfe busy on entry to scofepilog
+
+__scoffirst:
+	ex		de,hl				; calculate the frame pointer address
+	inc	hl
+	ld		c,(hl)			; bc=size of parameters
+	inc	hl
+	ld		b,(hl)
+	inc	hl
+
+	or		a					; firsttime???
+	jp		m,__scofiscomplete
+	jr		nz,__scofcont
+
+	;
+	; firsttime
+	;
+
+	push	bc
+
+	ld		c,(hl)			; bc=size of local variables
+	inc	hl
+	ld		b,(hl)
+	inc	hl
+
+	ld		a,(hl)			; hl=frame pointer address
+	inc	hl
+	ld		h,(hl)
+	ld		l,a
+
+	ld		ix,0
+	ex		de,hl
+	add	ix,de
+	ex		de,hl				; hl=ix=virtual frame pointer
+
+	sbc	hl,bc				; hl=virtual stack pointer
+
+	ld		(ix+0),l			; construct virtual frame
+	ld		(ix+1),h
+	ld		(ix+2),e
+	ld		(ix+3),d
+
+	add	hl,bc
+	inc	hl
+	inc	hl
+	inc	hl
+	inc	hl					; hl=offset of parameters in virtual frame
+
+	pop	bc					; bc=size of parameters
+
+	ex		de,hl
+	ld		hl,19
+	add	hl,sp				; hl=offset of parameters in call frame
+
+	ld		a,b				; ldir with bc=0 copies 64k...
+	or		c
+	jp		z,__scofnoparm
+
+	ldir						; copy parameters from call frame to virtual frame
+
+__scofnoparm:
+	xor	a
+	ld		(de),a			; instance index = 0
+	inc	de
+
+	inc	a					; reaffirm
+	ld		(de),a
+	inc	de
+
+	ld		a,0x40			; set the Codata to firsttime locked
+	ld		(de),a
+
+	pop	hl
+	inc	hl					; move past the jump to epilog
+	inc	hl
+	inc	hl
+
+	push	hl					; return just past the jump to the epilog
+	ret
+
+__scofcont:
+	inc	hl					; bypass the size of locals
+	inc	hl
+
+	ld		hl,(hl+0)		; ix = virtual frame pointer
+	ld		ix,hl
+
+	ld		a,(ix+2)			; caller codata = caller codata of first time call
+	cp		a,e
+	jp		nz,__coferr_badcodata
+	ld		a,(ix+3)
+	cp		a,d
+	jp		nz,__coferr_badcodata
+
+	add	hl,bc				; add the parameter size
+
+	inc	hl					; my codata = ix+6+size of parameters
+	inc	hl
+	inc	hl
+	inc	hl
+	inc	hl
+
+	ld		(hl),0x01		; reaffirm
+	inc	hl
+
+	ld		a,(hl)			; a = cofunction codata.CSState
+	bit	0,a
+	jp		z,__scofpr_1
+	bit	1,a
+	jp		z,__scofpr_1
+
+__scofiscomplete:
+	ld		a,0x08
+	ret
+
+__scofpr_1:
+	pop	af
+	inc	hl					; get the restart address
+	ld		e,(hl)
+	inc	hl
+	ld		d,(hl)
+	inc	hl
+	ld		a,d
+	cp 	0xe0				; check if address is xmem (offset > 0xe000)
+	jp c, __scof_xpcskip ; don't restore the xpc not in xmem
+	ld a, (hl)				; load the base into the spc
+	ld		xpc,a
+__scof_xpcskip:
+	push	de
+
+	ld		hl,(sp+4)		; get the everytime address
+	ld		a,l
+	or		h
+
+	jr		z,__scofpr_2
+	push	hl					; place everytime address on the stack
+
+__scofpr_2:
+	ret						; return to everytime/stack address
+
+;----------------------------------------------------------------------------
+; scof epilog
+;
+; on entry:
+;	sp+0	= scof return address
+;	sp+2	= cofunction descriptor
+;	sp+4	= saved frame pointer
+;	sp+6	= wfd return address
+;  sp+8	= caller codata address
+;	sp+10	= wfd_scofstate address
+;	sp+12 = cofunction index/waitfordone offset (index=0)
+;	a		= completion type 0x01=complete, 0x80=abort, 0x00=yield
+;  hl		= my codata
+;
+; on exit:
+;	a'		= response 0x00=completed, 0x80=abort, 0x01=yield
+;  cf'	= firstime 0=not 1=yes
+;
+; The single user cofunction epilog is responsible for responding to the
+; caller waitfordone or waitforfirstdone statement the results of the single
+; user cofuction:  completed, aborted, or yielded.  The epilog is responsible
+; for saving state when necessary for a yielding scof and manipulating the
+; caller codata flags to reflect the yield/abort/completed status and
+; restoring the frame pointer to its original value.
+;----------------------------------------------------------------------------
+
+scofepilog_::
+	or		a				; pilot call?
+	jp		p,__scofenopilot
+	inc	a
+	ret
+
+__scofenopilot:
+	ex		de,hl
+
+	ld		l,(ix+2)		; get the caller codata
+	ld		h,(ix+3)
+
+	ld		b,a			; update the caller codata with the last competion type
+	ld		a,0xe7
+	and	(hl)
+	or		b
+	ld		(hl),a
+
+	ld		a,b
+	and	0x08
+	jp		nz,__scofcomplete
+
+	ld		a,b
+	and	0x10
+	jp		nz,__scofabort
+
+	ld		a,0x01		; yield
+	res	5,(hl)
+	jr		__scofsetft
+
+__scofabort:
+	ex		de,hl
+	res	6,(hl)		; clear the busy bit
+
+	ld		hl,0x0011
+
+	add	hl,sp
+	ld		a,(hl)
+	neg
+	ld		hl,0x000a
+	add	hl,de
+	ld		(hl),a
+
+	ld		hl,0x000f	; get the wfdscofstate pointer
+	add	hl,sp
+	ld		a,(hl)
+	inc	hl
+	ld		h,(hl)
+	ld		l,a
+
+	bit	0,(hl)
+	ld		(hl),0x81
+
+	ex		de,hl			; hl=cofunction codata
+	res	6,(hl)		; clear the busy bit
+
+	ld		a,0x40
+	jr		z,__scofsetft2
+	set	7,a
+	jr		__scofsetft2
+
+__scofcomplete:
+	ld		a,b
+	and	0x10
+	jr		nz,__scofcompleted
+
+	ld		a,0x82
+	ex		af,af'
+	ret
+
+__scofcompleted:
+	ex		de,hl
+	res	6,(hl)		; clear the busy bit
+
+	ld		hl,0x0011
+
+	add	hl,sp
+	ld		a,(hl)
+	ld		hl,0x000a
+	add	hl,de
+	ld		(hl),a
+
+	ld		hl,0x000f	; get the wfdscofstate pointer
+	add	hl,sp
+	ld		a,(hl)
+	inc	hl
+	ld		h,(hl)
+	ld		l,a
+
+	bit	0,(hl)
+	ld		(hl),0x81
+
+	ld		a,0x00
+	jr		z,__scofsetft2
+	set	7,a
+	jr		__scofsetft2
+
+__scofsetft:
+	ld		hl,0x000f	; get the wfdscofstate pointer
+	add	hl,sp
+	ld		b,(hl)
+	inc	hl				; carry should be cleared
+	ld		h,(hl)
+	ld		l,b
+
+	bit	0,(hl)
+	set	0,(hl)
+	jp		z,__scofsetft2
+	set	7,a
+
+__scofsetft2:
+	ex		af,af'
+	ret
+
+;
+; __scofabandon
+;
+; internal routine called by the compiler to check
+; abandonment on single user cofunctions.  Assumes that
+; the hl points to the beginning of the single user
+; cofunctions data.  the cofunction is only abandoned
+; iff someone else is waiting for it.
+;
+
+__scofabandon::
+	dec	hl
+	ld		a,(hl)					; was cofunction reaffirmed?
+	cp		0x00
+	jr		nz,__scofareafirmed
+	inc	hl
+
+	ld		a,(hl)					; is cofunction active?
+	and	a,0x03
+	jr		nz,__scofadone
+
+	ld		(hl),0x02				; restart cofunction
+
+	ld		hl,(sp+7)				; is there an abandonment routine
+	ld		a,l
+	or		h
+	jr		z,__scofadone
+
+	push	ix							; yes - call it
+	ld		ix,(sp+11)
+	call	__scofabandoned
+
+	pop	ix
+	lret								; to lret or not to lret
+
+__scofabandoned:
+	push hl
+	ld 	hl, (sp+11)
+	ld		a, l
+	ld 	xpc, a
+	pop hl
+	jp		(hl)
+
+__scofareafirmed:
+	cp		0x01						; clear reaffirmed flag
+	jr		nz,__scofadone
+	dec	a
+	ld		(hl),a
+
+__scofadone:
+	lret
+
+#endasm
+
+/*** Beginheader scofprologdbg_, scofepilogdbg_ */
+__root void scofprologdbg_();
+__root void scofepilogdbg_();
+/*** endheader */
+
+#asm
+
+;----------------------------------------------------------------------------
+; scof pilot call: (wfd_scofstate = 0xff)
+;
+; on entry:
+;  sp+0	= scof return address
+;	sp+2	= cofunc descriptor address
+;  sp+4  = everytime address
+;	sp+6	= saved frame pointer
+;	sp+8	= wfd return address
+;	sp+10	= caller codata address
+;	sp+12	= wfd_scofstate address
+;	a		= wfd_scofstate (0xff)
+;	de		= cofunc descriptor address
+;  hl		= caller codata
+;
+; on exit:
+;  a		= response 0x00=proceed, 0xff=busy
+;
+; In the pilot call, the single user cofunction prolog is responsible
+; for checking if the single user cofunction is currently in use. If
+; it is in use the prolog returns the value 0x00 if it is ok to
+; proceed with a firsttime call and a 0xff if it is not ok. The pilot
+; call returns directly to the waitfordone statement with a resonse of
+; proceed or busy.
+;----------------------------------------------------------------------------
+; scof firsttime call: (wfd_scofstate = 0x00)
+;
+; on entry:
+;	sp+0	= scof return address
+;	sp+2	= cofunction descriptor
+;  sp+4  = everytime address
+;	sp+6	= saved frame pointer
+;	sp+8	= wfd return address
+;  sp+10	= caller codata address
+;	sp+12	= wfd_scofstate address
+;	sp+14 = cofunction index/waitfordone offset (index=0)
+;  sp+16 = parameters
+;  sp+?? = structured return
+;  a		= wfd_scofstate (0x00)
+;  bc		= instance/offset
+;	de		= cofunction descriptor
+;	hl		= caller codata address
+;
+; On the firsttime call, the single user cofunction prolog is responsible
+; for initializing the virtual call frame.  It sets the virtual stack
+; pointer, the caller codata, the parameters, the instance index, and the
+; state flag of the cofunction codata.  The firsttime call returns to the
+; scof's first statement.
+;----------------------------------------------------------------------------
+; scof continuation call: (wfd_scofstate = 0x01)
+;
+;	sp+0	= scof return address
+;	sp+2	= cofunction descriptor
+;  sp+4  = everytime address
+;	sp+6	= saved frame pointer
+;	sp+8	= wfd return address
+;  sp+10= caller codata address
+;	sp+12	= wfd_scofstate address
+;	sp+14 = cofunction index/waitfordone offset (index=0)
+;  sp+16 = structured return
+;
+; on exit: (only if scof is completed, returns to waitfordone)
+;	a'		= 0x01
+;	cf'	= 1
+;
+;----------------------------------------------------------------------------
+
+scofprologdbg_::
+	cp		a,0xff
+	jr		nz,__scoffirst
+
+	;
+	; scofunc pilot call
+	;
+
+	ex		de,hl				; hl=cofunc descriptor address
+	inc	hl
+	ld		c,(hl)
+	inc	hl
+	ld		b,(hl)			; bc=size of parameters
+	inc	hl
+	inc	hl
+	inc	hl
+	ld		a,(hl)
+	inc	hl
+	ld		h,(hl)
+	ld		l,a				; hl=virtual frame pointer address
+
+	add	hl,bc
+	ld		bc,0x0006
+	add	hl,bc				; hl=scofunc codata address
+
+	ld		a,0xfe			; a=not busy
+	bit	6,(hl)
+	jp		nz,__scofbusy
+
+	set	6,(hl)			; set the semaphore
+
+	ld		hl,0x000f		; update the wfd_scofstate
+	add	hl,sp
+
+	ld		b,(hl)
+	inc	hl
+	ld		h,(hl)
+	ld		l,b				; hl=wfd_scofstate address
+	ld		(hl),0x00
+
+	inc	a
+	ld		hl,(sp+13)		; caller codata
+	ret						; a=0xff avail on entry to scofepilog
+
+__scofbusy:
+	ld		hl,(sp+13)		; caller codata
+	res	5,(hl)
+	ret						; a=0xfe busy on entry to scofepilog
+
+__scoffirst:
+	ex		de,hl				; calculate the frame pointer address
+	inc	hl
+	ld		c,(hl)			; bc=size of parameters
+	inc	hl
+	ld		b,(hl)
+	inc	hl
+
+	or		a					; firsttime???
+	jp		m,__scofiscomplete
+	jr		nz,__scofcont
+
+	;
+	; firsttime
+	;
+
+	push	bc
+
+	ld		c,(hl)			; bc=size of local variables
+	inc	hl
+	ld		b,(hl)
+	inc	hl
+
+	ld		a,(hl)			; hl=frame pointer address
+	inc	hl
+	ld		h,(hl)
+	ld		l,a
+
+	ld		ix,0
+	ex		de,hl
+	add	ix,de
+	ex		de,hl				; hl=ix=virtual frame pointer
+
+	sbc	hl,bc				; hl=virtual stack pointer
+
+	ld		(ix+0),l			; construct virtual frame
+	ld		(ix+1),h
+	ld		(ix+2),e
+	ld		(ix+3),d
+
+	add	hl,bc
+	inc	hl
+	inc	hl
+	inc	hl
+	inc	hl					; hl=offset of parameters in virtual frame
+
+	pop	bc					; bc=size of parameters
+
+	ex		de,hl
+	ld		hl,19
+	add	hl,sp				; hl=offset of parameters in call frame
+
+	ld		a,b				; ldir with bc=0 copies 64k...
+	or		c
+	jp		z,__scofnoparm
+
+	ldir						; copy parameters from call frame to virtual frame
+
+__scofnoparm:
+	xor	a
+	ld		(de),a			; instance index = 0
+	inc	de
+
+	inc	a					; reaffirm
+	ld		(de),a
+	inc	de
+
+	ld		a,0x40			; set the Codata to firsttime locked
+	ld		(de),a
+
+	pop	hl
+	inc	hl					; move past the jump to epilog
+	inc	hl
+	inc	hl
+
+	push	hl					; return just past the jump to the epilog
+	jp		_fentry
+
+__scofcont:
+	inc	hl					; bypass the size of locals
+	inc	hl
+
+	ld		hl,(hl+0)		; ix = virtual frame pointer
+	ld		ix,hl
+
+	ld		a,(ix+2)			; caller codata = caller codata of first time call
+	cp		a,e
+	jp		nz,__coferr_badcodata
+	ld		a,(ix+3)
+	cp		a,d
+	jp		nz,__coferr_badcodata
+
+	add	hl,bc				; add the parameter size
+
+	inc	hl					; my codata = ix+6+size of parameters
+	inc	hl
+	inc	hl
+	inc	hl
+	inc	hl
+
+	ld		(hl),0x01		; reaffirm
+	inc	hl
+
+	ld		a,(hl)			; a = cofunction codata.CSState
+	bit	0,a
+	jp		z,__scofpr_1
+	bit	1,a
+	jp		z,__scofpr_1
+
+__scofiscomplete:
+	ld		a,0x08
+	jp		_fentry
+
+__scofpr_1:
+	pop	af
+	inc	hl					; get the restart address
+	ld		e,(hl)
+	inc	hl
+	ld		d,(hl)
+	inc	hl
+	ld		a,d
+	cp 	0xe0				; check if address is xmem (offset > 0xe000)
+	jp c, __scof_xpcskip ; don't restore the xpc not in xmem
+	ld a, (hl)				; load the base into the spc
+	ld		xpc,a
+__scof_xpcskip:
+	push	de
+
+	ld		hl,(sp+4)		; get the everytime address
+	ld		a,l
+	or		h
+
+	jr		z,__scofpr_2
+	push	hl					; place everytime address on the stack
+
+__scofpr_2:
+	jp		_fentry			; return to everytime/stack address
+
+;----------------------------------------------------------------------------
+; scof epilog
+;
+; on entry:
+;	sp+0	= scof return address
+;	sp+2	= cofunction descriptor
+;	sp+4	= saved frame pointer
+;	sp+6	= wfd return address
+;  sp+8	= caller codata address
+;	sp+10	= wfd_scofstate address
+;	sp+12 = cofunction index/waitfordone offset (index=0)
+;	a		= completion type 0x01=complete, 0x80=abort, 0x00=yield
+;  hl		= my codata
+;
+; on exit:
+;	a'		= response 0x00=completed, 0x80=abort, 0x01=yield
+;  cf'	= firstime 0=not 1=yes
+;
+; The single user cofunction epilog is responsible for responding to the
+; caller waitfordone or waitforfirstdone statement the results of the single
+; user cofuction:  completed, aborted, or yielded.  The epilog is responsible
+; for saving state when necessary for a yielding scof and manipulating the
+; caller codata flags to reflect the yield/abort/completed status and
+; restoring the frame pointer to its original value.
+;----------------------------------------------------------------------------
+
+scofepilogdbg_::
+	or		a				; pilot call?
+	jp		p,__scofenopilot
+	inc	a
+	ret
+
+__scofenopilot:
+	ex		de,hl
+
+	ld		l,(ix+2)		; get the caller codata
+	ld		h,(ix+3)
+
+	ld		b,a			; update the caller codata with the last competion type
+	ld		a,0xe7
+	and	(hl)
+	or		b
+	ld		(hl),a
+
+	ld		a,b
+	and	0x08
+	jp		nz,__scofcomplete
+
+	ld		a,b
+	and	0x10
+	jp		nz,__scofabort
+
+	ld		a,0x01		; yield
+	res	5,(hl)
+	jr		__scofsetft
+
+__scofabort:
+	ex		de,hl
+	res	6,(hl)		; clear the busy bit
+
+	ld		hl,0x0011
+
+	add	hl,sp
+	ld		a,(hl)
+	neg
+	ld		hl,0x000a
+	add	hl,de
+	ld		(hl),a
+
+	ld		hl,0x000f	; get the wfdscofstate pointer
+	add	hl,sp
+	ld		a,(hl)
+	inc	hl
+	ld		h,(hl)
+	ld		l,a
+
+	bit	0,(hl)
+	ld		(hl),0x81
+
+	ex		de,hl			; hl=cofunction codata
+	res	6,(hl)		; clear the busy bit
+
+	ld		a,0x40
+	jr		z,__scofsetft2
+	set	7,a
+	jr		__scofsetft2
+
+__scofcomplete:
+	ld		a,b
+	and	0x10
+	jr		nz,__scofcompleted
+
+	ld		a,0x82
+	ex		af,af'
+	jp		_fexit
+
+__scofcompleted:
+	ex		de,hl
+	res	6,(hl)		; clear the busy bit
+
+	ld		hl,0x0011
+
+	add	hl,sp
+	ld		a,(hl)
+	ld		hl,0x000a
+	add	hl,de
+	ld		(hl),a
+
+	ld		hl,0x000f	; get the wfdscofstate pointer
+	add	hl,sp
+	ld		a,(hl)
+	inc	hl
+	ld		h,(hl)
+	ld		l,a
+
+	bit	0,(hl)
+	ld		(hl),0x81
+
+	ld		a,0x00
+	jr		z,__scofsetft2
+	set	7,a
+	jr		__scofsetft2
+
+__scofsetft:
+	ld		hl,0x000f	; get the wfdscofstate pointer
+	add	hl,sp
+	ld		b,(hl)
+	inc	hl				; carry should be cleared
+	ld		h,(hl)
+	ld		l,b
+
+	bit	0,(hl)
+	set	0,(hl)
+	jp		z,__scofsetft2
+	set	7,a
+
+__scofsetft2:
+	ex		af,af'
+	jp		_fexit
+#endasm
+
+/*** BeginHeader  **********************************/
+#endif
+/*** EndHeader ***********************************************/
+

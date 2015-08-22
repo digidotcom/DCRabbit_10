@@ -1,0 +1,495 @@
+/******************************************************************************
+R6000_BIOS.LIB
+
+   Copyright (c) 2010 Digi International Inc., All Rights Reserved
+
+   This software contains proprietary and confidential information of Digi
+   International Inc.  By accepting transfer of this copy, Recipient agrees
+   to retain this software in confidence, to prevent disclosure to others,
+   and to make no use of this software other than that for which it was
+   delivered.  This is a published copyrighted work of Digi International
+   Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+   prohibited.
+
+   Restricted Rights Legend
+
+   Use, duplication, or disclosure by the Government is subject to
+   restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+   Technical Data and Computer Software clause at DFARS 252.227-7031 or
+   subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+   Restricted Rights at 48 CFR 52.227-19, as applicable.
+
+   Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+
+
+DESCRIPTION:   This library is intented to be used when sharing SPI port B
+					where the serial flash is located. The serial flash can be
+               used by FAT or other serial flash lib's.
+
+               All LIB's that access serial flash automatically use
+               SPIgetSemaphore and SPIfreeSemaphore routines.
+
+               When an application uses SPI port B, the application code
+               must implement the SPIgetSemaphore/SPIfreeSemaphore functions
+               to properly control access to the various deivces on SPI port B.
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader */
+#ifndef __R6000_BIOS_LIB__
+#define __R6000_BIOS_LIB__
+
+#if (!(RCM6600W_SERIES || RCM6700_SERIES))
+#fatal "R6000_BIOS.LIB only supports R6000 based boards."
+#endif
+
+#define SPIgetSemaphore _SPIgetSemaphore
+#define SPIfreeSemaphore _SPIfreeSemaphore
+#define DB_IP_SET3 ipset 3
+#define DB_IP_RES  ipres
+
+// Define this so the SD and other drivers know whether to use a semaphore
+// for protection of the shared SPI port.
+#define _SPI_SD_LINES_SHARED_
+
+// Reserved for LIB usage
+#define SPI_SF  &_spi_dev[0]
+#define SPI_DF  &_spi_dev[1]
+#define SPI_SD  &_spi_dev[2]
+
+// SPI port CLK and mode settings
+#define SPI_SF_DIVISOR  5
+#define SPI_SF_SBER 0x08
+
+#define SPI_DF_DIVISOR  5
+#define SPI_DF_SBER 0x08
+
+#define SPI_SD_DIVISOR  5
+#define SPI_SD_SBER 0x08
+
+
+// If defined to zero, then semaphore flags get cleared when timeout occurs.
+#ifndef SPI_FATAL_ERROR
+	#define SPI_FATAL_ERROR 1
+#endif
+
+#ifndef SPI_MAXTIME
+  #define SPI_MAXTIME 100UL  // In milliseconds
+#endif
+
+//*** Structure for tracking of shared devices on the SPI port ***
+ struct SPIDev{
+   char ID;            	// 0   Device ID
+   char SPInesting;     // 1   Semaphore nesting
+   char SCLCKdiv;      	// 2   SPI CLK divider
+   char SBERvalue;     	// 3   SPI mode setting
+ };
+
+//*** Controlling structure for the SPI port semaphore ***
+ struct _spiSemaphore{
+   char owner;         // Owner ID
+   char timerState;    // 1 = initialized, 0 = not, 2 = timeout occurred
+   char lastDiv;       // last divisor
+   char SemError;		  // Error Flag for semaphore timeout
+ };
+
+  extern void* spi_Mutex; // Will be used as OS_EVENT*
+  void* spi_Mutex;        //   Use void* here so it doesn't
+
+/*** EndHeader */
+
+/*** BeginHeader  _SPIgetSemaphore, _SPIfreeSemaphore */
+ __root int SPIgetSemaphore(const struct SPIDev *dev);
+ __root int SPIfreeSemaphore(const struct SPIDev *dev);
+ extern unsigned long _SPI_t0_;
+ extern struct SPIDev _spiActiveDev;
+ extern const unsigned long _SPI_TIMEOUT;
+ extern struct _spiSemaphore _SPI_semaphore;
+/*** EndHeader */
+
+unsigned long _SPI_t0_;
+const unsigned long _SPI_TIMEOUT = (long)SPI_MAXTIME;
+struct SPIDev _spiActiveDev;
+struct _spiSemaphore _SPI_semaphore;
+
+/* START FUNCTION DESCRIPTION ********************************************
+SPIgetSemaphore                <R6000_BIOS.LIB>
+
+SYNTAX:		  	int SPIgetSemaphore(const struct SPIDev *dev);
+
+DESCRIPTION:  	This function grabs a semaphore to prevent devices from
+				  	trying to use the shared SPI lines at the same time. The first
+				  	attempt to grab the semaphore by a device when the semaphore
+				  	is already in use by another device starts a timeout timer.
+				  	If the device specified by dev is already the owner, it will
+				  	return 0 for success.
+
+               When a device obtains the semaphore the resource will be locked
+               unitl a call to SPIfreeSemaphore is done by the owner, if nested
+               semaphore calls where made by the owner, then only the top level
+               SPIfreeSemaphore function call will free the resource.
+
+               Note: SPIgetSemaphore/SPIfreeSemaphore functions have a maximum
+                     of 255 levels of nesting for proper tracking of when the
+                     resource is actually freed.
+
+               When the semaphore is successfully grabbed, SBER is written
+               with the correct mode and TAT5R is written with the correct
+               baud divisor. If the divisor has changed, a small loop allows
+               the baud clock to run down.
+
+PARAMETER1:   	dev - one of  SPI_SF, SPI_DF,  SPI_SD or customer devices
+
+            	SPI_SF  - SFlash access using IDBlock.lib (userblock functions).
+               SPI_DF  - SFlash access using Sflash.lib or FAT Lib's.
+               SPI_SD  - SFlash access using SDFlash.lib.
+
+RETURN VALUE:  0 - Success The device specified by dev now owns it,
+                            Or already owned it.
+     			  	1 - Semaphore is in use by the boot serial flash driver.
+     			  	2 - Semaphore is in use by the data serial flash driver.
+               3-  Semaphore is in use by the SD card driver.
+     				4 - 255 Semaphore is in use by Customer specified device(s).
+
+					If more than _SPI_MAXTIME milliseconds elapsed since
+      			the last attempt to grab the semaphore by device
+      			specified in dev, a fatal run-time error -ETIME results.
+
+****************************************************************/
+const int structSize = sizeof(struct SPIDev);
+__nodebug
+__root int SPIgetSemaphore(const struct SPIDev *dev)
+{
+
+	#GLOBAL_INIT{
+   // Initialize device struct
+   memset(&_spiActiveDev, 0, sizeof(_spiActiveDev));
+	_SPI_semaphore.owner = 0;    // Make SF first owner
+   _SPI_semaphore.timerState = 0;
+   }
+
+#asm __nodebug
+#ifndef  SPI_NODEVSHARING
+	 DB_IP_SET3
+    ld    a,(_SPI_semaphore)  ; A = ID
+    ld	 b,a
+    cp    (hl)
+	 jr    nz,.SPIowner
+    ld    a,(_spiActiveDev+SPIDev+SPInesting)
+    inc	 a
+    ld    (_spiActiveDev+SPIDev+SPInesting),a
+	 clr	 hl // Already owner, return success for nesting
+    DB_IP_RES
+    ret
+
+.SPIowner:
+    cp	 0
+    jp    nz,.spiGSdone
+
+    ld	 a,(hl)
+    ld    (_SPI_semaphore),a  ; Calling dev owns it now
+    ld    (_SPI_semaphore+_spiSemaphore+timerState),a
+    ld    bc,(structSize)     ; Make caller active
+    ld    de,_spiActiveDev
+    ldir                      ; Load structure
+
+    cp	 0x03
+    jr	 c,.spiPortD
+    // Set SPI port to Parallel port C
+    // BitWrPortI(PCFR, &PCFRShadow, 0, 5);
+	 ld 	 hl,PCFRShadow
+    ld    a,(hl)
+    res   5,a
+    ld    (hl),a
+ioi ld    (PCFR),a
+    // BitWrPortI(PCDDR, &PCDDRShadow, 0, 5);
+	 ld 	 hl,PCDDRShadow
+    ld    a,(hl)
+    res   5,a
+    ld    (hl),a
+ioi ld    (PCDDR),a
+
+    // WrPortI(PCAHR, &PCAHRShadow, RdPortI(PCAHR) & 0xFC | 0x00);
+	 ld 	 hl,PCAHRShadow
+ioi ld    a,(PCAHR)
+    and   0xFC
+    ld    (hl),a
+ioi ld    (PCAHR),a
+    // BitWrPortI(PCFR, &PCFRShadow, 1, 4);
+	 ld 	 hl,PCFRShadow
+    ld    a,(hl)
+    set   4,a
+    ld    (hl),a
+ioi ld    (PCFR),a
+    // BitWrPortI(PCFR, &PCFRShadow, 1, 4);
+	 ld 	 hl,PCDDRShadow
+    ld    a,(hl)
+    set   4,a
+    ld    (hl),a
+ioi ld    (PCDDR),a
+	 // WrPortI(SBCR, &SBCRShadow, RdPortI(SBCR) & 0xCF);
+ioi ld    a, (SBCR)
+	 ld 	 hl,SBCRShadow
+	 and   a,0xCF
+    ld	 (hl),a
+ioi ld    (SBCR),a
+	 jp    .spiPortInit
+
+.spiPortD:
+    // Set SPI port to Parallel port D
+    // BitWrPortI(PCFR, &PCFRShadow, 0, 5);
+	 ld 	 hl,PDFRShadow
+    ld    a,(hl)
+    res   5,a
+    ld    (hl),a
+ioi ld    (PDFR),a
+    // BitWrPortI(PCDDR, &PCDDRShadow, 0, 5);
+	 ld 	 hl,PDDDRShadow
+    ld    a,(hl)
+    res   5,a
+    ld    (hl),a
+ioi ld    (PDDDR),a
+
+    // WrPortI(PCAHR, &PCAHRShadow, RdPortI(PCAHR) & 0xFC | 0x00);
+	 ld 	 hl,PDAHRShadow
+ioi ld    a,(PDAHR)
+    and   0xFC
+    ld    (hl),a
+ioi ld    (PDAHR),a
+    // BitWrPortI(PCFR, &PCFRShadow, 1, 4);
+	 ld 	 hl,PDFRShadow
+    ld    a,(hl)
+    set   4,a
+    ld    (hl),a
+ioi ld    (PDFR),a
+    // BitWrPortI(PCFR, &PCFRShadow, 1, 4);
+	 ld 	 hl,PDDDRShadow
+    ld    a,(hl)
+    set   4,a
+    ld    (hl),a
+ioi ld    (PDDDR),a
+	// WrPortI(SBCR, &SBCRShadow, RdPortI(SBCR) & 0xCF | 0x10);
+ioi ld    a, (SBCR)
+	 ld 	 hl,SBCRShadow
+	 and   a,0xCF
+    ld    b,a
+    ld    a,0x10
+    or    b
+    ld	 (hl),a
+ioi ld    (SBCR),a
+
+.spiPortInit:
+    ; In case these differ...
+    ld    hl,_spiActiveDev+SPIDev+SBERvalue
+    ld    a,(hl)
+    ld	 hl,SBERShadow
+    ld	 (hl),a
+ioi ld    (SBER),a
+
+    ; If baud rate changed, run down clock
+    ld    hl, _spiActiveDev+SPIDev+SCLCKdiv
+    ld    a,(hl)              ; A =  _spiActiveDev.SCLCKdiv
+    ld    hl,_SPI_semaphore+_spiSemaphore+lastDiv
+    cp    (hl)                ; Compare with last divisor
+    ld    (hl),a
+    jr    z,.spiGSdone1       ; Return success if no change
+	 ld    hl,TAT5RShadow
+    ld    (hl),a
+ioi ld    (TAT5R),a           ; Otherwise change divisor
+    ld    b,16                ; and delay for baud run down
+.spiBCdelay:
+    djnz  .spiBCdelay
+.spiGSdone1:
+    clr   hl              ; Return success
+    DB_IP_RES
+    ret
+
+.spiGSdone:
+    cp    b
+    jr    nz,.spiGSnotsame
+    ld    b,0                   ; Caller already has semaphore
+    jr    .spiGSdone2
+
+.spiGSnotsame:
+    ld    hl,_SPI_semaphore+_spiSemaphore+timerState  ; Get timer state
+    bit   0,(hl)
+    jr    z,.spiInitTimer
+
+    //  MS_TIMER-t0 > _SF_TIMEOUT ?
+    exx
+    ld    jkhl,(MS_TIMER)
+    ld    bcde,(_SPI_t0_)
+    sub   jkhl,bcde
+    ld    bcde,(_SPI_TIMEOUT)
+    cp    jkhl,bcde
+    exx
+    jr    c,.spiGSdone2
+
+#if SPI_FATAL_ERROR
+    DB_IP_RES
+c   exit(-ETIME);             // Timed out
+#else
+    xor   a
+    ld    (_SPI_semaphore),a  ;  _SPI_semaphore.ID = 0
+    ld    (_spiActiveDev),a   ;  _spiActiveDev.owner = 0
+    ld    (_spiActiveDev+SPIDev+SPInesting),a ;_spiActiveDev.SPInesting = 0
+	 jr 	 .spiGSdone2
+#endif
+
+.spiInitTimer:  			      ; Init timeout test
+    inc   (hl)                ; _SPI_semaphore.timerstate = 1
+    ld    jkhl,(MS_TIMER)
+    ld    (_SPI_t0_),jkhl     ; t0 = MS_TIMER
+
+.spiGSdone2:
+    ld    L,a   ; current owner ID
+    ld    h,0
+#else
+    clr   hl
+#endif
+    DB_IP_RES
+    ret
+#endasm
+}
+
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+SPIfreeSemaphore                <R6000_BIOS.LIB>
+
+SYNTAX:		 	int SPIfreeSemaphore(const struct SPIDev *dev);
+
+DESCRIPTION:  	Must be called by device specified by dev when the
+					device no longer needs to use the SPI lines or before
+               the semaphore can grabbed by any other device.
+
+       			If nested semaphore calls where made by the owner, then only
+               the top level SPIfreeSemaphore function call will free the
+               resource.
+
+               Note: SPIgetSemaphore/SPIfreeSemaphore functions have a maximum
+                     of 255 levels of nesting for proper tracking of when the
+                     resource is actually freed.
+
+
+PARAMETER1:   	dev - one of  SPI_SF, SPI_DF, SPI_SD or customer device(s)
+
+            	SPI_SF  - SFlash access using IDBlock.lib (userblock functions).
+               SPI_DF  - SFlash access using Sflash.lib or FAT Lib's.
+               SPI_SD  - SFlash access using SDFlash.lib.
+
+RETURN VALUE:  0 - Success (Semaphore freed to be used by any other devices)
+     			  	1 - Semaphore is in use by the boot serial flash driver.
+     			  	2 - Semaphore is in use by the data serial flash driver.
+               3-  Semaphore is in use by the SD card driver.
+     				4 - 255 Semaphore is in use by Customer specified device(s).
+
+               Notes: 1. If call to SPIgetSemaphore is single level, then this
+                      function free's the Semaphore to be used by any device.
+
+                      2. If call to SPIgetSemaphore is multi-level, this access
+                      will only decrement the nested level value and return
+                      the current owner ID.
+
+*************************************************************************/
+#asm __nodebug
+SPIfreeSemaphore::
+#ifndef  SPI_NODEVSHARING
+    DB_IP_SET3
+    ld    a,(_SPI_semaphore)  ; A = ID
+    cp    (hl)                ; Only owner can free it
+    jp    nz,.spiFSOwnerID
+    ld    a,(_spiActiveDev+SPIDev+SPInesting)
+    cp	 a,0
+    jr	 z,.spiFSclear
+    dec   a
+    cp	 a,0
+    jr	 z,.spiFSclear
+    ld    (_spiActiveDev+SPIDev+SPInesting),a
+    xor	 a
+    jp	 .spiSuccess			; Exit, Owner still has SPI port
+.spiFSclear:
+
+	 // Default SPI port Back to Parallel port D
+    // SPI RX Parallel Port D
+    // BitWrPortI(PDFR, &PDFRShadow, 0, 5);
+	 ld 	 hl,PDFRShadow
+    ld    a,(hl)
+    res   5,a
+    ld    (hl),a
+ioi ld    (PDFR),a
+    // BitWrPortI(PDDDR, &PDDDRShadow, 0, 5);
+    ld 	 hl,PDDDRShadow
+    ld    a,(hl)
+    res   5,a
+    ld    (hl),a
+ioi ld    (PDDDR),a
+    // WrPortI(PDAHR, &PDAHRShadow, RdPortI(PDAHR) & 0xFC | 0x00);
+    ld 	 hl,PDAHRShadow
+ioi ld    a,(PDAHR)
+    and   0xFC
+    ld    (hl),a
+ioi ld    (PDAHR),a
+    // BitWrPortI(PDFR, &PDFRShadow, 1, 4);
+    ld 	 hl,PDFRShadow
+    ld    a,(hl)
+    set   4,a
+    ld    (hl),a
+ioi ld    (PDFR),a
+    // BitWrPortI(PDDDR, &PDDDRShadow, 1, 4);
+    ld 	 hl,PDDDRShadow
+    ld    a,(hl)
+    set   4,a
+    ld    (hl),a
+ioi ld    (PDDDR),a
+	 // WrPortI(SBCR, &SBCRShadow, RdPortI(SBCR) & 0xCF | 0x10);
+ioi ld    a, (SBCR)
+	 ld 	 hl,SBCRShadow
+	 and   a,0xCF
+    ld    b,a
+    ld    a,0x10
+    or	 b
+    ld	 (hl),a
+ioi ld    (SBCR),a
+
+    xor   a
+    ld    (_SPI_semaphore),a  ;  _SPI_semaphore.ID = 0
+    ld    (_spiActiveDev),a   ;  _spiActiveDev.owner = 0
+    ld    (_spiActiveDev+SPIDev+SPInesting),a
+
+.spiFSOwnerID:
+    ld	 a,(_SPI_semaphore)
+.spiSuccess:
+    DB_IP_RES
+    ld    h,0
+    ld    L,a                 ; 0 for success or owner
+#else
+    clr   hl
+#endif
+    ret
+#endasm
+
+
+/*** BeginHeader _spi_dev */
+// Define shared SPI devices
+#ifndef _spi_dev
+extern const struct SPIDev _spi_dev[];
+#endif
+
+/*** EndHeader */
+
+#ifndef _spi_dev
+const struct SPIDev _spi_dev[] = {
+/*Dev 1 */{1, 1, SPI_SF_DIVISOR, SPI_SF_SBER},    	// Boot Flash
+/*Dev 2*/ {2, 1, SPI_DF_DIVISOR, SPI_DF_SBER},	   // Data Serial Flash
+/*Dev 3*/ {3, 1, SPI_SD_DIVISOR, SPI_SD_SBER} 		// SD
+
+};
+#endif
+
+
+/*** BeginHeader */
+#endif	// __R6000_BIOS_LIB__
+/*** EndHeader */
+
+

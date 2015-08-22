@@ -1,0 +1,2663 @@
+/*** BeginHeader */
+#ifndef __HTTPC_LIB
+#define __HTTPC_LIB
+/*** EndHeader */
+/*
+	http_client.lib
+	Copyright (c) 2008 Digi International Inc., All Rights Reserved
+
+	This software contains proprietary and confidential information of Digi
+	International Inc.  By accepting transfer of this copy, Recipient agrees
+	to retain this software in confidence, to prevent disclosure to others,
+	and to make no use of this software other than that for which it was
+	delivered.  This is a published copyrighted work of Digi International
+	Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+	prohibited.
+
+	Restricted Rights Legend
+
+	Use, duplication, or disclosure by the Government is subject to
+	restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+	Technical Data and Computer Software clause at DFARS 252.227-7031 or
+	subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+	Restricted Rights at 48 CFR 52.227-19, as applicable.
+
+	Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+*/
+/* START LIBRARY DESCRIPTION ************************************************
+
+   HTTP client library, used for connecting to web servers.
+
+   See Samples/tcpip/http/http client.c for an example of using the library.
+
+   An HTTP client is useful for applications which may be deployed behind
+   firewalls, and yet need to access the global Internet.  The alternative,
+   which is to have an HTTP server, is not always welcome since it means
+   that special exceptions need to be made in the firewall rules.  An
+   application with an HTTP client can go out and "poll" a known central
+   HTTP server in order to retrieve data and commands, or even
+   firmware updates.  Client mode HTTP Secure (HTTPS) is also available.
+
+	*** NOTES ************************************************************
+	1. In general, any pointers to string data which are provided to the
+	API routines in this library must point to data which is constant
+	for the life of the connection (that is, between calling one of
+	the opening functions, and calling httpc_close()).  This is required
+	because pointers are saved in the state structure, not copies of
+	the original data.
+
+	2. This library is not intended for posting large amounts of data.
+	If the length of the post data exceeds the available space in the TCP socket
+	buffer, then the routines will block until the data can be
+	transmitted, regardless of whether HTTPC_NONBLOCKING mode is in effect.
+   **********************************************************************
+
+	This is a quick API overview.  Look at the sample programs for proper
+	examples of error checking and additional API calls.
+
+		// Do this once only (per hsock)
+		httpc_Socket hsock;
+		tcp_Socket tsock;
+	   httpc_init( &hsock, &tsock);
+
+	   // or, to tie to a particular interface
+	   // httpc_init_if( &hsock, &tsock, IF_PPP0);
+
+	   // configure client to route all requests through a proxy server
+	   httpc_use_proxy( inet_addr("192.168.1.1"), 80, "username:password");
+
+	   loop for each connection :
+
+	         // connect to google.com and request their homepage
+	         httpc_get_url( &hsock, "http://www.google.com/");
+
+	         // read the next header from the response
+	         do {
+	            retval = httpc_read_header( &hsock, buffer, sizeof(buffer) - 1);
+	         } while (hsock.status == HTTPC_STATE_HEADER);
+
+	         // skip over the headers entirely (blocking call)
+	         httpc_skip_headers( &hsock);
+
+	         // read bytes from the body of the response, retval = # of
+	         // bytes written
+	         do {
+	            retval = httpc_read_body( &hsock, buffer, sizeof(buffer) - 1);
+	         } while (hsock.status == HTTPC_STATE_BODY);
+
+	         // close the socket
+	         httpc_close( &hsock);
+
+	Configuration macros:
+
+	HTTPC_VERBOSE - If defined, library will print status messages to STDOUT.
+
+	HTTPC_DEBUG - If defined, functions will be debuggable (i.e., you can set
+				breakpoints and single-step into them).
+
+	HTTPC_PROGRESS_TIMEOUT - Millisecond timeout for progress in reading
+				headers and/or body.  If the connection does not read an
+				additional line from the server for this amount of time,
+				the connection is aborted.  Default is 30000 (30 seconds),
+				unless HTTPC_DEBUG is defined, in which case it is 5 seconds.
+				Max is 32767.
+
+	HTTPC_HEADER_TIMEOUT - Timeout, in milliseconds, to wait for headers to
+				complete when calling httpc_skip_headers().  Defaults to 5000
+				(5 seconds).
+
+	HTTPC_PROXY_AUTH_STRLEN - Maximum length of authentication information
+				(printable string in "username:password" format) for proxy server.
+				Does not include null-terminator at end of string.  Defaults to 64.
+
+	HTTPC_MAX_REDIRECT - Maximum number of redirections to follow if the
+				HTTPC_AUTO_REDIRECT option is provided to httpc_set_mode().
+				Default 1.  If set to zero, following of redirection is effectively
+				disabled.
+
+	HTTPC_RX_BUFFER_SIZE - Receive buffer size for TCP socket when not using
+	         TLS.  Defaults to 4000.
+
+
+	Configuration for use with Secure HTTP (HTTPS):
+
+	This is enabled by ensuring that "ssl_sock.lib" is #use'd before
+	using this library.  Use of HTTPS in a particular connection is selected
+	by specifying a scheme of "https://" in the URL.  If not using
+	the httpc_get_url() functions (and the like), you can also use the
+	httpc_set_scheme() function to force use of HTTP or HTTPS as required.
+
+	HTTPC_TLS_RX_BUFFER_SIZE - Specify non-default transport (TCP) socket
+				receive buffer length.  Default is 16420 for most boards,
+				except 6000 bytes for the RCM5700 (owing to its small RAM).
+				The 5700 may have problems with some web sites whose servers
+				can send records larger than this size.  Unfortunately, to
+				guarantee successful TLS/SSL connections, the buffer must be
+				over 16k.
+
+
+END DESCRIPTION **********************************************************/
+
+/*
+	ChangeLog:
+
+	2010-04-05 1.07 SJH - Added PUT request.
+
+	2009-10-08 1.06 SJH - Added HTTPS support, made open/close optionally
+							non-blocking, added automatic redirect-follow.
+
+	2008-12-21 1.05 Updated for release with Dynamic C.
+
+	2008-07-08 1.04 Updated to match Digi/Rabbit coding standards.
+
+	2008-04-18 1.03 Added support for Proxy-Authorization.
+
+  	Feature ideas:
+  		- a version of read_body that treats data as ASCII (see NAT check)
+  		- support for methods other than GET and POST (maybe HEAD?)
+  			- HEAD just retrieves the headers (like a GET without the body)
+  		- some sort of cookie support (save and resend, possibly store in xmem)
+*/
+
+/*** BeginHeader */
+#define HTTPC_VERSION	0x0107
+#define HTTPC_VERSTR		"1.07"
+
+#if CC_VER < 0x0A60
+	#fatal "This version of http_client.lib requires Dynamic C 10.60 or later"
+#endif
+
+#ifdef HTTPC_DEBUG
+	#define _httpc_debug __debug
+#else
+	#define _httpc_debug __nodebug
+#endif
+
+#use "BASE64.LIB"
+#use "URL.LIB"
+
+#ifdef _SSL_SOCK_H
+	#define HTTPC_USE_TLS	1
+#else
+	#define HTTPC_USE_TLS	0
+#endif
+
+#ifndef HTTPC_RX_BUFFER_SIZE
+	#define HTTPC_RX_BUFFER_SIZE 4000
+#endif
+
+#ifndef HTTPC_TLS_RX_BUFFER_SIZE
+	#if _BOARD_TYPE_ == RCM5700
+		// This board only has 128k RAM, so we can't afford the full
+		// amount, however 6k will work in the majority of cases
+		// and allows this small board to work with a single TLS
+		// socket at a time.
+		#define HTTPC_TLS_RX_BUFFER_SIZE 6000
+	#else
+		#define HTTPC_TLS_RX_BUFFER_SIZE 16420
+	#endif
+#endif
+
+#ifndef HTTPC_PROGRESS_TIMEOUT
+	#ifdef HTTPC_DEBUG
+		#define HTTPC_PROGRESS_TIMEOUT 5000
+	#else
+		#define HTTPC_PROGRESS_TIMEOUT 30000
+	#endif
+#endif
+
+#ifndef HTTPC_MAX_REDIRECT
+	// Max redirections followed.
+	#define HTTPC_MAX_REDIRECT		1
+#endif
+
+#ifndef HTTPC_BUF_SIZE
+	#define HTTPC_BUF_SIZE 512
+#endif
+#if HTTPC_BUF_SIZE < 512
+	#warnt "HTTPC_BUF_SIZE must be at least 512 bytes."
+	#undef HTTPC_BUF_SIZE
+	#define HTTPC_BUF_SIZE 512
+#endif
+
+
+// Use these macros consistently for dealing with TCP and/or SSL sockets
+#define _TCP_SOCK_OF_HTTPC(state) (state->tport)
+#if HTTPC_USE_TLS
+	#define _SOCK_OF_HTTPC(state) (state->sock)
+	#define _SSL_SOCK_OF_HTTPC(state) (state->_n_ssl)
+#else
+	#define _SOCK_OF_HTTPC(state) _TCP_SOCK(state->sock)
+	#define _SSL_SOCK_OF_HTTPC(state) NULL	// should never be used
+#endif
+
+
+typedef struct _httpc_socket
+{
+	void				*sock;		// Same as tport or _n_ssl, depending on state.
+	tcp_Socket		*tport;		// pointer to underlying tcp socket
+#if HTTPC_USE_TLS
+   ssl_Socket * 	_n_ssl;		// pointer to secure socket (using tport)
+   int				secured;		// True if currently secured (1 when resources
+   									// allocated, 2 when TLS negotiation complete).
+#endif
+	int            iface;      // interface to use for socket
+	int				state;
+#define HTTPC_STATE_CLOSED			0	// Closed, ready to open
+#define HTTPC_STATE_OPEN			1	// Open, ready for GET command etc.
+#define HTTPC_STATE_POSTING		2	// Posting POST data
+#define HTTPC_STATE_HEADER			3	// Reading header(s)
+#define HTTPC_STATE_BODY			4	// Reading body
+#define HTTPC_STATE_TRAILER		5	// Reading trailer
+#define HTTPC_STATE_DONE			6	// Done, waiting for app to close
+// Above states are the normal, open, states.  Following are transient when
+// opening and closing...
+#define HTTPC_STATE_RESOLVING		7	// Initial DNS resolve
+#define HTTPC_STATE_OPENING		8	// Opening transport
+#define HTTPC_STATE_SECURING		9	// Securing transport
+#define HTTPC_STATE_UNSECURING	10	// Unsecuring transport
+#define HTTPC_STATE_CLOSING		11	// Closing transport
+	const char __far *hostname;	// Host name (saved here for cert policy callback)
+	longword 		ip;			// Host IP address
+	word 				port;			// Host port (usually 80)
+#ifndef DISABLE_DNS
+	int				dns;			// Handle for nameserver resolve
+#endif
+	word				prog_timeout;	// Progress timer
+	word				req_type;	// HTTP request type as follows:
+#define HTTPC_REQ_GET	0			// GET
+#define HTTPC_REQ_HEAD	1			// not implemented; reserved
+#define HTTPC_REQ_POST	2			// POST
+#define HTTPC_REQ_PUT	3			// PUT
+	int				response;	// response from HTTP server (200, 404, etc.)
+										// See RFC2616, section 10 for a full list
+	word				flags;
+#define HTTPC_FLAG_CHUNKED 	0x0001	// body of response has chunked encoding
+#define HTTPC_FLAG_HTTP10		0x0002	// HTTP/1.0 response
+#define HTTPC_FLAG_HTTP11		0x0004	// HTTP/1.1 response
+#define HTTPC_FLAG_GOTLENGTH	0x0008	// parsed Content-Length header
+#define HTTPC_FLAG_READBODY	0x0010	// Set when response code indicates a
+													// valid entity ('body') follows.  If
+													// not set, any entity provided by the
+													// server is ignored and we close the
+													// connection.
+#define HTTPC_FLAG_UNUSED5		0x0020
+#define HTTPC_FLAG_UNUSED6		0x0040
+#define HTTPC_FLAG_UNUSED7		0x0080
+	unsigned long	filesize;	// size of data, reported by headers (0=unknown)
+	unsigned long	bytesread;	// bytes read from body
+	unsigned long	currchunk;	// bytes left in the current chunk (if chunked)
+										// 0: read CRLF from end of chunk
+										// 0xFFFFFFFF: read the next chunksize
+	long				skew;			// skew + SEC_TIMER is the server's time (in GMT)
+										// as # of seconds since 1/1/1980
+	int				scheme;		// Scheme (protocol) as follows:
+#define HTTPC_SCHEME_HTTP		0		// http:// ... Garden variety HTTP
+													// must be zero, so memset gives correct
+													// default.
+#define HTTPC_SCHEME_HTTPS		1		// https:// ... Secure HTTP
+	const char __far *post_data;	// Data being posted (application owns it)
+	const char __far *content_type;	// Content type of post data; NULL for URL enc.
+	word				post_len;	// Total length of post data
+	word				post_sent;	// Amount sent so far (used in non-blocking mode)
+	// Following is set to the various parts of the URL being retrieved.
+	url_parsed_t 	parsed;		// Points to application-owned data
+	int				redirecting;// 1 if seen 3xx response, 2,3 when processing it.
+	char __far *		redirect;	// If not NULL, points to malloc'd storage
+										// which contains a redirect-to URI, in the
+										// case that a 301,302,303,305 or 307 response
+										// was received.  This is automatically freed
+										// when httpc_close() is called.
+	word				redirs_remaining;	// Counter for remaining allowable
+												// redirections at this level
+	struct _httpc_socket __far * sub;	// Sub-state for redirection.  This re-uses
+										// this state's socket, and will have one less
+										// 'redirs_remaining'.
+} httpc_Socket;
+/*** EndHeader */
+
+/*** BeginHeader httpc_globals */
+#ifndef HTTPC_PROXY_AUTH_STRLEN
+	#define HTTPC_PROXY_AUTH_STRLEN 64
+#endif
+typedef struct
+{
+	// Proxy settings...
+	unsigned long	ip;					// ip address of proxy server, or 0 for none
+	word				port;					// tcp port of proxy server
+	char				auth[HTTPC_PROXY_AUTH_STRLEN + 1];		// username:password
+	const char __far * proxy_hostname;	// Proxy server's host name for
+												// verifying its certificate.  This field
+												// is used by the default SSL policy
+												// callback.
+
+	word				mode;			// Mode flags as set by httpc_set_mode():
+#define HTTPC_NONBLOCKING				0x0001	// Basic non-blocking
+#define HTTPC_AUTO_CLOSE				0x0002	// Automatic close.
+#define HTTPC_AUTO_REDIRECT			0x0004	// Automatic follow redirect
+
+	int				scheme;		// Scheme (protocol) set when connection is
+										// opened.  See corresponding field in
+										// httpc_Socket.
+
+#if HTTPC_USE_TLS
+	// Following fields set using httpc_set_tls().  See that function for details.
+	word 		tls_flags;
+	SSL_Cert_t __far * my_cert;
+	SSL_Cert_t __far * trusted;
+	int (*policy)( /* ssl_Socket far * state,
+	                       int trusted,
+	                       struct x509_certificate far * cert */ );
+#endif
+
+} httpc_globals_t;
+
+extern httpc_globals_t httpc_globals;
+/*** EndHeader */
+httpc_globals_t httpc_globals;				// global proxy settings for this device
+
+/*** BeginHeader httpc_init_if */
+#define httpc_init( s, t)	httpc_init_if( s, t, IF_ANY)
+int httpc_init_if( httpc_Socket __far *s, tcp_Socket *t, int iface);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+httpc_init                                               <HTTP_CLIENT.LIB>
+
+SYNTAX: int httpc_init( httpc_Socket far *s, tcp_Socket *t);
+
+DESCRIPTION: 	This function initializes the httpc_Socket structure and
+               binds it to tcp_Socket t.  This *must* be called once before any
+               other httpc API functions that take a httpc_Socket pointer
+               parameter.
+
+PARAMETER 1:	Pointer to an httpc_Socket structure.
+
+PARAMETER 2:	Pointer to the tcp_Socket that the HTTP client will use for
+               its connections.
+
+RETURN VALUE:  Integer code as follows:
+						 0: OK
+						-EINVAL: NULL passed for one of the first two parameters.
+
+NOTE:				httpc_init() is a macro for httpc_init_if, using IF_ANY.
+
+END DESCRIPTION **********************************************************/
+
+/* START FUNCTION DESCRIPTION ********************************************
+httpc_init_if                                            <HTTP_CLIENT.LIB>
+
+SYNTAX: int httpc_init_if( httpc_Socket far *s, tcp_Socket *t, int iface);
+
+DESCRIPTION: 	This function initializes the httpc_Socket structure, binds
+               it to tcp_Socket t and forces it to use interface iface.
+  					This *must* be called once before any other httpc API functions
+  					that take a httpc_Socket pointer parameter.
+
+PARAMETER 1:	Pointer to an httpc_Socket structure.
+
+PARAMETER 2:	Pointer to the tcp_Socket that the HTTP client will use for
+               its connections.  Caller should memset this structure to 0
+               before first use.
+
+PARAMETER 3:	Interface to use for connection (if on a multi-interface device).
+
+RETURN VALUE:  Integer code as follows:
+						 0: OK
+						-EINVAL: NULL passed for one of the first two parameters,
+							or an invalid interface passed for iface.
+
+END DESCRIPTION **********************************************************/
+_httpc_debug
+int httpc_init_if( httpc_Socket __far *s, tcp_Socket *t, int iface)
+{
+	auto int sch;
+#GLOBAL_INIT {
+	memset( &httpc_globals, 0, sizeof(httpc_globals));
+}
+	if (!s || !t ||
+		((iface != IF_ANY) && ((iface < 0) || (iface >= IF_MAX+VIRTUAL_ETH))) )
+	{
+		return -EINVAL;
+	}
+
+	_f_memset( s, 0, sizeof(httpc_Socket));
+	s->sock = t;
+	s->tport = t;
+	s->iface = iface;
+
+	return 0;
+}
+
+/*** BeginHeader httpc_open */
+int httpc_open( httpc_Socket __far *s, const char __far *host, word port);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+httpc_open                                               <HTTP_CLIENT.LIB>
+
+SYNTAX: int httpc_open( httpc_Socket far *s, const char far *host, word port);
+
+DESCRIPTION: 	Attempts to open a connection to a web server.
+               In blocking mode (the default, unless changed by
+               httpc_set_mode()), then this function completes the
+               entire connection opening process before returning.
+               Otherwise, in non-blocking mode, the application must
+               call it first with non-null host name, then subsequently
+               with a NULL host until it returns something other than
+               -EAGAIN.
+
+PARAMETER 1:   Pointer to httpc_Socket structure to use for connection.
+
+PARAMETER 2:   Hostname (or dotted IP) to connect to.  NULL for calls
+               other than the first in non-blocking mode.
+
+PARAMETER 3:   Port to connect to, or 0 for default port (80 if using HTTP,
+               443 if using HTTPS: see httpc_set_scheme()).
+
+NOTE:				If a proxy server has been configured by calling httpc_use_proxy,
+					the host and port parameters are ignored and the proxy server
+					settings are used for establishing the connection.
+
+RETURN VALUE:  Integer code as follows:
+						 0: Success
+					   -EINVAL: Calling in wrong state (i.e. using NULL host
+					   		parameter when already open).
+						-NETERR_DNSERROR: Can't resolve hostname.
+						-NETERR_NOHOST_ARP: Local host or gateway unreachable
+						-EAGAIN: currently in non-blocking mode, and process
+						  is not complete.  Call again with NULL host parameter
+						  until it returns one of the above codes.
+
+END DESCRIPTION **********************************************************/
+#if HTTPC_USE_TLS
+_httpc_debug
+int _httpc_dflt_policy(ssl_Socket __far * state, int trusted,
+	                       struct x509_certificate __far * cert,
+	                       httpc_Socket __far * s)
+{
+	const char __far * host;
+
+	if (httpc_globals.ip)
+		host = httpc_globals.proxy_hostname;
+	else
+		host = s->hostname;
+#ifdef HTTPC_VERBOSE
+	printf("HTTPC: Default policy callback: %ls vs. expected %ls\n",
+		cert->subject.cn, host);
+#endif
+#ifdef HTTPC_ALLOW_CERT_CN_MISMATCH
+	return 0;	// All sweetness and light
+#else
+	// Default is to reject if not matching CN.
+	return strcmp(cert->subject.cn, host);
+#endif
+}
+#endif
+
+_httpc_debug
+int _httpc_open( httpc_Socket __far *s, const char __far *host, word port)
+{
+	auto char hnbuf[256];	//DEVIDEA: make DNS far ptrs
+	auto int retval;
+#if HTTPC_USE_TLS
+	auto ssl_Socket * tssl;
+#endif
+	auto longword ipaddr;
+
+	switch (s->state) {
+	case HTTPC_STATE_CLOSED:
+
+	   if (httpc_globals.ip)
+	   {
+	      // Use of proxy server overrides host
+	      s->ip = httpc_globals.ip;
+	      s->port = httpc_globals.port;
+	   }
+	   else
+	   {
+	      s->port = port ? port : (s->scheme == HTTPC_SCHEME_HTTP) ? 80 : 443;
+#ifdef HTTPC_VERBOSE
+         printf("HTTPC: Resolving %ls\n", host);
+#endif
+			//DEVIDEA: make DNS far ptrs
+			_f_strcpy(hnbuf,host);
+#ifdef DISABLE_DNS
+         s->ip = resolve(hnbuf);
+         if (!s->ip)
+#else
+         s->dns = resolve_name_start(hnbuf);
+         if (s->dns < 0)
+#endif
+         {
+			_httpc_dnserror:
+#ifdef HTTPC_VERBOSE
+            printf("HTTPC: Error resolving server (%d).\n", s->dns);
+#endif
+#ifdef DISABLE_DNS
+				return -NETERR_DNSERROR;
+#else
+            return s->dns;
+#endif
+         }
+#ifndef DISABLE_DNS
+         s->state=HTTPC_STATE_RESOLVING;
+			break;
+#endif
+	   }
+	_open:
+
+	   // tcp_extopen has non-standard return -- 0 is failure, !0 is success
+#ifdef HTTPC_VERBOSE
+		printf("HTTPC: Opening IP=%08lX port=%u iface=0x%x\n", s->ip, s->port, s->iface);
+#endif
+#if HTTPC_USE_TLS
+	   retval = tcp_extopen(s->sock, s->iface, 0, s->ip, s->port, NULL, 0,
+	   				s->scheme == HTTPC_SCHEME_HTTPS ? -HTTPC_TLS_RX_BUFFER_SIZE :
+	   								-HTTPC_RX_BUFFER_SIZE);
+#else
+	   retval = tcp_extopen(s->sock, s->iface, 0, s->ip, s->port, NULL, 0,
+	   								-HTTPC_RX_BUFFER_SIZE);
+#endif
+	   if (!retval)
+	   	return -NETERR_NOHOST_ARP;
+      s->state=HTTPC_STATE_OPENING;
+      break;
+
+
+	case HTTPC_STATE_OPENING:
+		if (!sock_alive(s->sock)) {
+			_httpc_handle_error(s);
+			return -NETERR_CONN_TIMEOUT;
+		}
+
+		if (sock_established(s->sock)) {
+#ifdef HTTPC_VERBOSE
+			printf("HTTPC: Socket connected!\n");
+#endif
+			s->state = HTTPC_STATE_OPEN;
+#if HTTPC_USE_TLS
+			if (s->scheme == HTTPC_SCHEME_HTTPS) {
+				// Want to use tunneled TLS mode.
+	         // OK, secure this socket and re-jig pointers so that server struct
+	         // points to secure socket rather than direct transport.
+	         // App data buffers are sized to be the same as the transport (TCP socket)
+	         // buffer sizes, and dynamically allocated.
+	         retval = sock_secure(_TCP_SOCK_OF_HTTPC(s), &tssl,
+	                      TCP_BUF_SIZE*3>>2, NULL, // Read buffer (3/4)
+	                      TCP_BUF_SIZE>>2, NULL, // Write buffer (1/4)
+	                      1,   // Is a client
+	                      httpc_globals.tls_flags,
+	                      0, 0, 0, 0,
+	                      httpc_globals.my_cert,
+	                      httpc_globals.trusted,
+	                      NULL          // No session to resume
+	                      );
+	         if (!retval) {
+					s->secured = 1;	// indicate resources allocated, so can free
+											// up even if does not negotiate.
+	         	s->_n_ssl = tssl;
+	            s->sock = s->_n_ssl;
+	            if (httpc_globals.policy)
+						sock_set_policy(s->_n_ssl, httpc_globals.policy, s);
+					else
+						sock_set_policy(s->_n_ssl, _httpc_dflt_policy, s);
+	         }
+	         else {
+	            // Error securing socket, most likely because of malloc or other
+	            // resource failure.
+	            _httpc_handle_error(s);
+	            return retval;
+	         }
+				s->state = HTTPC_STATE_SECURING;
+			}
+			else
+#endif
+			return 0;
+		}
+		break;
+
+
+#ifndef DISABLE_DNS
+	case HTTPC_STATE_RESOLVING:
+      if ((retval = resolve_name_check(s->dns, &ipaddr)) == RESOLVE_SUCCESS) {
+      	s->ip = ipaddr;
+         goto _open;
+      }
+      if (retval != RESOLVE_AGAIN) {
+      	s->dns = retval;
+         goto _httpc_dnserror;
+      }
+      break;
+
+#endif
+
+#if HTTPC_USE_TLS
+	case HTTPC_STATE_SECURING:
+      /*
+       *   Wait for the TLS connection to become established
+       */
+		if (!sock_alive(s->sock)) {
+			_httpc_handle_error(s);
+			return -NETERR_REMOTE_RESET;
+		}
+
+      if (sock_established(s->sock))
+      {
+#ifdef HTTPC_VERBOSE
+				printf("HTTPC: Secured with TLS\n");
+#endif
+			s->state = HTTPC_STATE_OPEN;
+			s->secured = 2;
+			return 0;
+      }
+      break;
+
+#endif
+	case HTTPC_STATE_OPEN:
+	case HTTPC_STATE_POSTING:
+		// OK to call when just opened
+		return 0;
+	default:
+		// Bad state to be calling this
+		return -EINVAL;
+
+	}
+
+   return -EAGAIN;
+}
+
+
+_httpc_debug
+int httpc_open( httpc_Socket __far *s, const char __far *host, word port)
+{
+	auto int retval;
+
+	if (host) {
+		// 1st call for new session
+	   // reset the httpc socket structure
+	   //retval = httpc_init_if(s, s->tport, s->iface);
+	   //if (retval)
+	   //   return retval;
+
+	   // reuse socket if it's still open.  This is OK with an uninitialized
+	   // socket, but application should not rely on it since it doesn't send
+	   // RST to peer!
+	   tcp_unthread(s->tport);
+   	s->sock = s->tport;
+	   // Save hostname (used for TLS policy callback)
+	   s->hostname = host;
+		s->scheme = httpc_globals.scheme;
+#if HTTPC_USE_TLS
+		s->secured = 0;
+#endif
+	   s->state = HTTPC_STATE_CLOSED;
+	   s->redirs_remaining = HTTPC_MAX_REDIRECT;
+	}
+
+	do {
+		tcp_tick(NULL);
+		retval = _httpc_open(s, host, port);
+		if (retval && retval != -EAGAIN)
+			_httpc_handle_error(s);
+	} while (!(httpc_globals.mode & HTTPC_NONBLOCKING) && retval == -EAGAIN);
+
+	return retval;
+}
+
+
+/*** BeginHeader httpc_close, _httpc_handle_error */
+int httpc_close( httpc_Socket __far *s);
+void _httpc_handle_error(httpc_Socket __far *s);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+httpc_close                                              <HTTP_CLIENT.LIB>
+
+SYNTAX: int httpc_close( httpc_Socket far *s);
+
+DESCRIPTION: 	Closes an open socket to the web server.
+               In blocking mode (the default, unless changed by
+               httpc_set_mode()), then this function completes the
+               entire close (tear-down) process before returning.
+               Otherwise, in non-blocking mode, the application must
+               call it until it returns something other than -EAGAIN.
+
+PARAMETER 1:   Pointer to socket structure to use for connection.
+
+RETURN VALUE:  Integer code as follows:
+					0: close completed
+					-EAGAIN: not complete, call again.
+
+END DESCRIPTION **********************************************************/
+_httpc_debug
+int _httpc_close( httpc_Socket __far *s)
+{
+	switch (s->state) {
+	case HTTPC_STATE_OPEN:
+	case HTTPC_STATE_HEADER:
+	case HTTPC_STATE_BODY:
+	case HTTPC_STATE_TRAILER:
+	case HTTPC_STATE_DONE:
+#if HTTPC_USE_TLS
+		if (s->secured > 1) {
+	      if (tls_query_unsent(s->_n_ssl))
+	         break;
+	      // close at TLS level
+			sock_close(s->sock);
+	      s->state = HTTPC_STATE_UNSECURING;
+	      // 5 sec for any CN to get through
+	      s->prog_timeout = _SET_SHORT_TIMEOUT(5000);
+		}
+		else
+			goto _closeit;
+		break;
+	case HTTPC_STATE_UNSECURING:
+		if (tls_query_unsent(s->_n_ssl)) {
+			if (!_CHK_SHORT_TIMEOUT(s->prog_timeout))
+	      	break;
+	   }
+      sock_unsecure(s->_n_ssl);
+      s->_n_ssl = NULL;
+      s->secured = 0;
+      s->sock = s->tport;
+#endif
+	_closeit:
+		s->state = HTTPC_STATE_CLOSING;
+		sock_abort(s->sock);
+		break;
+
+	case HTTPC_STATE_CLOSING:
+		if (!sock_alive(s->sock)) {
+			s->state = HTTPC_STATE_CLOSED;
+			return 0;
+		}
+		break;
+#if HTTPC_USE_TLS
+	case HTTPC_STATE_SECURING:
+      sock_unsecure(s->_n_ssl);
+      s->_n_ssl = NULL;
+      s->secured = 0;
+      s->sock = s->tport;
+      // fall thru...
+#endif
+	case HTTPC_STATE_OPENING:
+		sock_abort(s->tport);
+		s->state = HTTPC_STATE_CLOSED;
+		// fall thru
+	default:
+		return 0;
+	}
+
+	return -EAGAIN;
+}
+
+_httpc_debug
+int httpc_close( httpc_Socket __far *s)
+{
+	auto int retval;
+	_httpc_clear_redirect(s);
+	do {
+		tcp_tick(NULL);
+		retval = _httpc_close(s);
+	} while (!(httpc_globals.mode & HTTPC_NONBLOCKING) && retval == -EAGAIN);
+	return retval;
+}
+
+_httpc_debug
+void _httpc_handle_error(httpc_Socket __far *s)
+{
+#ifdef HTTPC_VERBOSE
+	printf("HTTPC: unexpected error (rem=%d), aborting connection\n", s->redirs_remaining);
+#endif
+	_httpc_clear_redirect(s);
+#if HTTPC_USE_TLS
+	if (s->secured) {
+      sock_unsecure(s->_n_ssl);
+      s->_n_ssl = NULL;
+      s->secured = 0;
+      s->sock = s->tport;
+	}
+#endif
+	sock_abort(s->tport);
+	s->state = HTTPC_STATE_CLOSED;
+}
+
+
+/*** BeginHeader httpc_get */
+int httpc_get( httpc_Socket __far *s, const char __far *host, word port,
+	const char __far *file, const char __far *auth);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+httpc_get                                                <HTTP_CLIENT.LIB>
+
+SYNTAX: int httpc_get( httpc_Socket far *s, const char far *host,
+                       word port,
+                       const char far *file, const char far *auth);
+
+DESCRIPTION: 	Connect to 'host' and GET 'file' using 'auth' credentials.
+
+PARAMETER 1:   Pointer to socket structure to use for connection.
+
+PARAMETER 2:   Hostname (or dotted IP) to connect to.  NULL if non-blocking
+					mode is set, and this is a subsequent call after -EAGAIN
+					was returned.
+
+PARAMETER 3:   Port to connect to (typically 80).
+
+PARAMETER 4:	Filename (resource) to request (should start with "/")
+
+PARAMETER 5:	Optional username and password (separated with ':') to
+					authenticate with.  Use NULL for no credentials.
+
+RETURN VALUE:  Integer code as follows:
+						 0: Success
+						-NETERR_DNSERROR: Can't resolve hostname.
+						-Other NETERR_* error codes: miscellaneous network
+						 conditions such as remote host disconnection.
+						-EIO: Unable to send request over socket
+						-E2BIG: Buffer full trying to create HTTP request
+						-EAGAIN: non-blocking mode is set, and the operation is
+						  not complete.  Call again with NULL host (and other
+						  parameters may be zeros and NULLs since they are
+						  ignored if the host is NULL)
+						-EINVAL: calling this routine in an invalid state when
+						  using non-blocking mode.  This usually means that the
+						  connection is already open.
+
+END DESCRIPTION **********************************************************/
+_httpc_debug
+int httpc_get( httpc_Socket __far *s, const char __far *host, word port,
+	const char __far *file, const char __far *auth)
+{
+	auto char buffer[512];
+	auto int bytes, retval;
+
+	s->req_type = HTTPC_REQ_GET;
+	if (file)
+		s->parsed.path = file;
+	if (auth)
+		s->parsed.userinfo = auth;
+
+#ifdef HTTPC_VERBOSE
+	if (host)
+		printf( "httpc_get: opening socket\n");
+#endif
+	retval = httpc_open( s, host, port);
+	if (retval)
+	{
+		return retval;
+	}
+
+	bytes = httpc_request( buffer, sizeof(buffer),
+													"GET",
+													s->scheme,
+													s->hostname, s->port,
+													s->parsed.path,
+													s->parsed.userinfo);
+	if (bytes < 0)
+	{
+		// couldn't fit request into buffer
+		_httpc_handle_error(s);
+		return bytes;
+	}
+
+	bytes += snprintf( &buffer[bytes], sizeof(buffer) - bytes, "\r\n");
+
+#ifdef HTTPC_VERBOSE
+	printf("httpc: sending request:\n");
+	mem_dump(buffer, bytes);
+#endif
+
+	// This won't normally block, since requests won't be bigger than
+	// socket buffer.
+   retval = sock_write( s->sock, buffer, bytes);
+
+#ifdef HTTPC_VERBOSE
+	printf( "httpc: sock_write %d bytes, %d written\n", bytes, retval);
+#endif
+
+	if (retval == -1)
+	{
+		_httpc_handle_error(s);
+		return -EIO;
+	}
+
+   s->state = HTTPC_STATE_HEADER;
+   s->prog_timeout = _SET_SHORT_TIMEOUT(HTTPC_PROGRESS_TIMEOUT);
+	_httpc_clear_redirect(s);
+   return 0;
+}
+
+/*** BeginHeader httpc_request */
+int httpc_request( char *buffer, int bufsize,
+	const char __far *method,
+	int scheme,
+	const char __far *host, word port, const char __far *file,
+	const char __far *auth);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+httpc_request                                            <HTTP_CLIENT.LIB>
+
+SYNTAX: int httpc_request( char *buffer, int bufsize,
+					const char far *method,
+					int scheme,
+					const char far *host, word port, const char far *file,
+					const char far *auth);
+
+DESCRIPTION: 	Generate HTTP headers to request a file from an HTTP server.
+
+PARAMETER 1:   Buffer to store the request in.
+
+PARAMETER 2:	Size of buffer.
+
+PARAMETER 3:	Method (typically "GET", "POST", "PUT" or maybe "HEAD")
+
+PARAMETER 4:	Scheme (HTTPC_SCHEME_HTTP or HTTPC_SCHEME_HTTPS)
+
+PARAMETER 5:   Hostname (or dotted IP) to connect to.
+
+PARAMETER 6:   Port to connect to or 0 for default (80).  Only used with proxy
+					servers, ignored otherwise.
+
+PARAMETER 7:	Filename to request (must start with "/")
+
+PARAMETER 8:	Optional username and password (separated with ':') to
+					authenticate with.  Use NULL for no credentials.
+
+RETURN VALUE:  >0: Number of bytes written to buffer.  Caller can add additional
+						headers, but must append \r\n (CRLF) before sending to HTTP
+						server.
+
+					-E2BIG: request would overflow buffer
+
+SEE ALSO: httpc_get, httpc_get_url, httpc_post_url, httpc_post, httpc_post_ext
+
+END DESCRIPTION **********************************************************/
+_httpc_debug
+int httpc_request( char *buffer, int bufsize, const char __far *method,
+   int scheme,
+	const char __far *host, word port, const char __far *file,
+	const char __far *auth)
+{
+	auto int i, retval, bytes, authlen;
+	auto word dflt_port;
+	auto char port_str[10];
+
+	bytes = 0;
+	if (scheme == HTTPC_SCHEME_HTTPS)
+		dflt_port = 443;
+	else
+		dflt_port = 80;
+	if (!port)
+		port = dflt_port;
+	if (port != dflt_port)
+		sprintf(port_str, ":%u", port);
+	else
+		port_str[0] = 0;
+	if (httpc_globals.ip)
+	{
+	   bytes += snprintf( &buffer[bytes], bufsize - bytes,
+	   	"%ls %s://%ls%s%ls HTTP/1.1\r\nHost: %ls%s\r\n",
+	   	method,
+	   	scheme == HTTPC_SCHEME_HTTPS ? "https" : "http",
+	   	host,
+	   	port_str, file,
+	   	host, port_str);
+	}
+	else
+	{
+	   bytes += snprintf( &buffer[bytes], bufsize - bytes,
+	   	"%ls %ls HTTP/1.1\r\nHost: %ls%s\r\n",
+	   	method, file,
+	   	host, port_str);
+	}
+	bytes += snprintf( &buffer[bytes], bufsize - bytes,
+		"User-Agent: Digi-Rabbit-httpc/%s\r\n", HTTPC_VERSTR);
+	bytes += snprintf( &buffer[bytes], bufsize - bytes,
+		"Connection: close\r\n");
+
+	if (*httpc_globals.auth)
+	{
+		bytes += snprintf( &buffer[bytes], bufsize - bytes,
+			"Proxy-Authorization: Basic ");
+		authlen = strlen(httpc_globals.auth);
+		if ((authlen + 2) * 3 / 4 > bufsize - bytes)
+		{
+			// not enough room in buffer for credentials
+			return -E2BIG;
+		}
+		bytes += base64_encode( &buffer[bytes], httpc_globals.auth, authlen);
+		bytes += snprintf( &buffer[bytes], bufsize - bytes, "\r\n");
+	}
+
+	if (auth && *auth)
+	{
+		bytes += snprintf( &buffer[bytes], bufsize - bytes,
+			"Authorization: Basic ");
+		authlen = strlen(auth);
+		if ((authlen + 2) * 3 / 4 > bufsize - bytes)
+		{
+			// not enough room in buffer for credentials
+			return -E2BIG;
+		}
+		bytes += base64_encode( &buffer[bytes], auth, authlen);
+		bytes += snprintf( &buffer[bytes], bufsize - bytes, "\r\n");
+	}
+
+	return (bytes > bufsize) ? -E2BIG : bytes;
+}
+
+/*** BeginHeader httpc_headermatch */
+char __far *httpc_headermatch( char __far *header, char __far *match);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+httpc_headermatch                                        <HTTP_CLIENT.LIB>
+
+SYNTAX:	char far *httpc_headermatch( char far *header, char far *match)
+
+DESCRIPTION: 	See if a header matches a particular field name.
+
+PARAMETER 1:   Pointer to a line from the headers.
+
+PARAMETER 2:	Header to match.
+
+RETURN VALUE:	NULL: header does not match
+					non-NULL: far pointer to value of header
+
+EXAMPLE:			httpc_headermatch( "Content-Type: text/html", "Content-Type")
+					returns a pointer to "text/html".
+END DESCRIPTION **********************************************************/
+_httpc_debug
+char __far *httpc_headermatch( char __far *header, char __far *match)
+{
+	while (*match)
+	{
+		if (tolower( *match++) != tolower( *header++))
+		{
+			return NULL;
+		}
+	}
+
+	// name must end in ":"
+	// (avoid matching "Content-Length" when searching for "Content")
+	if (*header != ':')
+	{
+		return NULL;
+	}
+   header++;		// point past ":"
+
+	// skip over spaces to reach value of header
+	while (*header == ' ')
+	{
+		header++;
+	}
+
+	return header;
+}
+
+/*** BeginHeader httpc_read_header, _httpc_clear_redirect */
+int httpc_read_header( httpc_Socket __far *s, char *user_buffer, int user_buflen);
+void _httpc_clear_redirect(httpc_Socket __far *s);
+/*** EndHeader */
+
+typedef struct _rfc1123_date
+{
+	// RFC1123 date strings have fixed-length fields
+	// Example: Tue, 30 Aug 2005 17:19:44 GMT
+	char	dow[3];		// Tue
+	char	comma;
+	char	space0;
+	char	mday[2];		// 30			First character is space if mday < 10
+	char	space1;
+	char	month[3];	// Aug
+	char	space2;
+	char	year[4];		// 2005
+	char 	space3;
+	char	hour[2];		// 17			First character is zero if hour < 10
+	char	colon0;
+	char	min[2];		// 19			First character is zero if min < 10
+	char	colon1;
+	char	sec[2];		// 44			First character is zero if sec < 10
+	char	space4;
+	char	gmt[3];		// GMT
+} _rfc1123_date_t;
+
+/* START FUNCTION DESCRIPTION ********************************************
+httpc_read_header                                        <HTTP_CLIENT.LIB>
+
+SYNTAX:	int httpc_read_header( httpc_Socket far *s, char *buffer, int buflen)
+
+DESCRIPTION: 	Read the next header from the socket.
+
+PARAMETER 1:   Pointer to socket structure to use for connection.
+
+PARAMETER 2:	Buffer to store the header in, recommend at least 128 bytes.
+					Header will be up to (buflen-1) bytes, followed by a null
+					terminator.  Pass NULL if the calling function doesn't need
+					a copy of the header.
+
+PARAMETER 3:	Length of buffer for storing header.  Ignored if parameter 2
+					is NULL.
+
+RETURN VALUE:	>0: length of header read (excluding null-terminator byte)
+					0: no more headers or incomplete header read from socket
+					-NETERR_REMOTE_RESET: connection closed before end of headers
+					-NETERR_INACTIVE_TIMEOUT: aborted because of lack-of-progress
+					  timeout (HTTPC_PROGRESS_TIMEOUT).
+					-EINVAL: invalid state to be reading headers
+
+END DESCRIPTION **********************************************************/
+
+_httpc_debug
+void _httpc_clear_redirect(httpc_Socket __far *s)
+{
+	s->redirecting = 0;
+   if (s->redirect) {
+   	_sys_free(s->redirect);
+	   s->redirect = NULL;
+	}
+	if (s->sub) {
+		_httpc_handle_error(s->sub);
+		_sys_free(s->sub);
+		s->sub = NULL;
+	}
+}
+
+_httpc_debug
+int httpc_read_header( httpc_Socket __far *s, char *user_buffer, int user_buflen)
+{
+	auto char stackbuf[128];
+	auto int i, j, rc;
+	auto int err;
+	auto int bytesread, bytesavail;
+	auto int usestack;
+	auto char *buffer;
+	auto char __far *value;
+	auto char __far *tailptr;
+	auto int buflen;
+	auto unsigned long longsec;
+	auto struct tm t;
+	auto _rfc1123_date_t __far *datestr;
+	auto word delim;
+	auto httpc_Socket __far *sr;
+	auto url_parsed_t __far * temp_p;
+
+	if (s->state != HTTPC_STATE_HEADER)
+		return -EINVAL;
+
+	switch (s->redirecting) {
+	case 2:
+		// All those nulls and zeros indicate continuance of process
+		if (s->sub->req_type == HTTPC_REQ_POST ||
+		    s->sub->req_type == HTTPC_REQ_PUT)
+			rc = _httpc_req(s->sub, s->sub->req_type, NULL, 0, NULL, NULL, NULL, 0, NULL);
+		else
+			rc = httpc_get(s->sub, NULL, 0, NULL, NULL);
+		if (rc == -EAGAIN)
+			return 0;
+		if (rc < 0) {
+			_httpc_handle_error(s);
+			return rc;
+		}
+		s->redirecting = 3;
+#ifdef HTTPC_VERBOSE
+		printf( "httpc: redirection (rem=%d), starting to return headers\n",
+			s->redirs_remaining);
+#endif
+	case 3:
+		sr = s->sub;
+		if (sr->state == HTTPC_STATE_HEADER) {
+			rc = httpc_read_header (sr, user_buffer, user_buflen);
+			if (rc >= 0)
+				return rc;
+			_httpc_handle_error(s);
+			return rc;
+		}
+#ifdef HTTPC_VERBOSE
+		printf( "httpc: redirection (rem=%d), done headers\n", s->redirs_remaining);
+#endif
+		value = s->redirect;
+		if (sr->redirect) {
+			value = sr->redirect;
+			_sys_free(s->redirect);
+		}
+		_f_memcpy(s, sr, sizeof(*s));
+		_sys_free(sr);
+		s->redirect = value;
+		return 0;
+	default:
+		break;
+	}
+
+	err = 0;
+
+	// If the user supplies a small buffer, use our larger buffer instead.
+	usestack = (user_buffer == NULL) || (user_buflen < 128);
+	if (usestack)
+	{
+		buffer = stackbuf;
+		buflen = sizeof(stackbuf);
+	}
+	else
+	{
+		buffer = user_buffer;
+		buflen = user_buflen;
+	}
+
+	tcp_tick(NULL);
+
+	buffer[0] = '*';	// set first byte so we can tell if we read a blank line
+	buffer[1] = '\0';
+
+	// read up to next cr/lf into buffer
+	delim = DELIM_CRLF;
+	bytesavail = sock_stringready( s->sock, &delim, buflen);
+	if (bytesavail < 0)
+	{
+      // invalid socket, or connection closed before end of headers
+      _httpc_handle_error(s);
+      return -NETERR_REMOTE_RESET;
+	}
+	if (! bytesavail)
+	{
+		if (_CHK_SHORT_TIMEOUT(s->prog_timeout)) {
+      	_httpc_handle_error(s);
+      	return -NETERR_INACTIVE_TIMEOUT;
+		}
+		return 0;
+	}
+
+   s->prog_timeout = _SET_SHORT_TIMEOUT(HTTPC_PROGRESS_TIMEOUT);
+	bytesread = sock_fastread( s->sock, buffer, bytesavail);
+
+	if (bytesread < 0)
+	{
+		// invalid socket, or connection closed before end of headers
+		_httpc_handle_error(s);
+		return -NETERR_REMOTE_RESET;
+	}
+
+	if (DELIM_CRLF == delim)
+	{
+		// ignore the CRLF read by sock_fastread
+		bytesread -= 2;
+	}
+	else if (bytesread == buflen)
+	{
+		--bytesread;
+	}
+	buffer[bytesread] = 0;
+
+	if (! bytesread)
+	{
+		// read blank line, this could be the line between headers and body
+	   if (usestack && (user_buflen > 0))
+	   {
+	   	*user_buffer = '\0';
+		}
+
+		if (! *buffer)
+		{
+	      // end of headers
+	      if (s->response == 100)
+	      {
+	      	// In HTTP/1.1 protocol, server can send a response header with
+	      	// a response code of 100 (Continue).  If the last response was
+	      	// 100, this blank line does not indicate the start of the body.
+	      	// More headers are coming, so clear the 100 response and
+	      	// HTTP 1.0/1.1 flags and continue parsing headers.
+	      	// See Section 8.2.3 or RFC 2616 for details on status 100.
+	         s->response = 0;
+	         s->flags &= ~(HTTPC_FLAG_HTTP11 | HTTPC_FLAG_HTTP10);
+	      }
+	      else
+	      {
+	      	if (s->redirecting && s->redirect) {
+	      		// Remain in header state, but open a new state machine to
+	      		// perform the redirection.  This simplifies the application
+#ifdef HTTPC_VERBOSE
+					printf( "httpc: redirection (rem=%d), new state\n", s->redirs_remaining-1);
+#endif
+	      		s->redirecting = 2;
+					// Abort current socket so it can be re-used.
+            #if HTTPC_USE_TLS
+               if (s->secured) {
+                  sock_unsecure(s->_n_ssl);
+      				s->_n_ssl = NULL;
+                  s->secured = 0;
+                  s->sock = s->tport;
+               }
+            #endif
+               sock_abort(s->tport);
+
+               // New state
+					s->sub = _sys_malloc(sizeof(*s->sub));
+					httpc_init_if(s->sub, s->tport, s->iface);
+
+					// According to RFC 2616, the 303 response indicates to change
+					// a POST request to a GET at the new location.  All others
+					// should resubmit the same request type.  (RFC also says
+					// not to automatically resubmit POSTs without asking user,
+					// but we're embedded so we can ignore this requirement).
+					// Also, when changing POST to GET (if 303 code) then the
+					// Location (redirect URI) should contain the appropriate
+					// GET query to use: we don't send the POST data again!
+					// (See also http://en.wikipedia.org/wiki/Post/Redirect/Get)
+					if (s->req_type == HTTPC_REQ_PUT)
+						rc = httpc_put_url(s->sub, s->redirect, s->post_data,
+								s->post_len, s->content_type);
+					if (s->response != 303 && s->req_type == HTTPC_REQ_POST)
+						rc = httpc_post_url(s->sub, s->redirect, s->post_data,
+								s->post_len, s->content_type);
+					else
+						rc = httpc_get_url(s->sub, s->redirect);
+
+					if (rc < 0 && rc != -EAGAIN) {
+						// Uh-oh, redirection failed!  Drop everything...
+						_httpc_handle_error(s);
+						return rc;
+					}
+					// Reduce the number of remaining redirections
+					s->sub->redirs_remaining = s->redirs_remaining - 1;
+					if (rc != -EAGAIN) {
+#ifdef HTTPC_VERBOSE
+						printf( "httpc: redirection (rem=%d), skipping to read body\n", s->redirs_remaining);
+#endif
+						s->redirecting = 3;
+					}
+					return 0;	// Make it look as if we are still processing headers
+	      	}
+	      	if (s->flags & HTTPC_FLAG_READBODY)
+        			s->state = HTTPC_STATE_BODY;
+        		else
+        			s->state = HTTPC_STATE_DONE;
+	      }
+	   }
+
+	   return 0;
+	}
+
+	// at this point, we've read a header from the HTTP server
+#ifdef HTTPC_VERBOSE
+	printf( "httpc: read header %s\n", buffer);
+#endif
+
+	// if it's the response code, log it
+   if (! strncmpi( buffer, "HTTP/1.", 7))
+   {
+   	if (buffer[7] == '1')
+   	{
+   		s->flags |= HTTPC_FLAG_HTTP11;
+   	}
+   	else if (buffer[7] == '0')
+   	{
+   		s->flags |= HTTPC_FLAG_HTTP10;
+   	}
+      s->response = (int) strtol( buffer + 9, NULL, 10);
+      // Set flag indicating whether a valid entity follows the
+      // headers.  We assume anything other than the following
+      // codes will result in no body, or one that the application
+      // cannot use (such as the boilerplate some servers send
+      // with error responses, which is intended for browsers).
+      if (HTTPC_REQ_HEAD != s->req_type
+      					&& (s->response == 100
+          				    || s->response == 200
+          				    || s->response == 203) )
+      {
+			s->flags |= HTTPC_FLAG_READBODY;
+      }
+      else
+      {
+			s->flags &= ~HTTPC_FLAG_READBODY;
+      }
+      if (httpc_globals.mode & HTTPC_AUTO_REDIRECT &&
+      	 s->redirs_remaining &&
+      	 (1u<<(word)s->response-300) & 0xAE)
+      	s->redirecting = 1;
+   }
+   else if ( (datestr =
+   					(_rfc1123_date_t __far *) httpc_headermatch( buffer, "Date")) )
+   {
+	   // if it's the date header (RFC1123), calculate skew from RTC
+	   // Format -- Date: Tue, 30 Aug 2005 17:19:44 GMT
+		for (j = 1; j < 13; j++)
+		{
+			if (! strncmpi( datestr->month, _dtmonname[j], 3))
+			{
+				t.tm_mon = month2tm_mon(j);
+				i = atoi( datestr->year);
+				if (i < 1980)
+				{
+					// Rabbit's RTC can't handle years before 1980
+					break;
+				}
+	         t.tm_year = i - 1900;
+	         t.tm_mday = (datestr->mday[1]-'0')
+	            + (datestr->mday[0] == ' ' ? 0 : 10 * (datestr->mday[0]-'0'));
+	         t.tm_hour = 10 * (datestr->hour[0]-'0') + (datestr->hour[1]-'0');
+	         t.tm_min  = 10 * (datestr->min[0]-'0') + (datestr->min[1]-'0');
+	         t.tm_sec  = 10 * (datestr->sec[0]-'0') + (datestr->sec[1]-'0');
+	         longsec = mktime( &t);
+	         s->skew = longsec - SEC_TIMER;
+	         #ifdef HTTPC_VERBOSE
+	            printf( "httpc: parsed date (%ls) as %lu, skew=%ld\n",
+	            	(char __far *) datestr, longsec, s->skew);
+	         #endif
+				break;
+			}
+		}
+   }
+   else if ( (value = httpc_headermatch( buffer, "Content-Length")) )
+   {
+	   // Store the content length.
+	   // Note: parse errors result in return value of 0, which fits with our
+	   // treatment of 0 in the filesize field (0: unknown size)
+      s->filesize = _f_strtol (value, &tailptr, 10);
+      if (tailptr != value)
+      {
+			// successful conversion
+			s->flags |= HTTPC_FLAG_GOTLENGTH;
+			if (s->filesize == 0)
+			{
+				s->flags &= ~HTTPC_FLAG_READBODY;
+			}
+      }
+   }
+   else if ( (value = httpc_headermatch( buffer, "Transfer-Encoding")) )
+   {
+		// If the body is chunked, we need to know in httpc_read_body
+		if (_f_strstr( value, "chunked") != NULL)
+		{
+			s->flags |= HTTPC_FLAG_CHUNKED;
+			s->currchunk = 0xFFFFFFFF;				// body starts with a chunk size
+		}
+	}
+   else if ((value = httpc_headermatch( buffer, "Location")) )
+   {
+   	// Redirection location
+   	if (s->redirect)
+   		_sys_free(s->redirect);
+   	// Standard says the Location URI should be absolute, however for
+   	// interoperability, we allow relative URIs.  At this point, we
+   	// compute the absolute URI.
+   	temp_p = (url_parsed_t __far *)_sys_malloc(sizeof(url_parsed_t));
+		_url_parse(temp_p, value, URL_FLAG_RELATIVE_HOST, &s->parsed);
+		s->redirect = url_unparse(temp_p);
+		_sys_free(temp_p);
+
+		// Old way... doesn't handle relative URLs
+   	//s->redirect = _sys_malloc(strlen(value)+1);
+   	//_f_strcpy(s->redirect, value);
+   }
+
+	if (usestack && (user_buffer != NULL))
+	{
+		// copy read header back to user's buffer
+		if (bytesread >= user_buflen)
+		{
+			bytesread = user_buflen - 1;
+		}
+		memcpy( user_buffer, buffer, bytesread);
+		user_buffer[bytesread] = '\0';
+	}
+
+	return err ? err : s->redirecting ? 0 : bytesread;
+}
+
+/*** BeginHeader httpc_skip_headers */
+int httpc_skip_headers( httpc_Socket __far *s);
+/*** EndHeader */
+#ifndef HTTPC_HEADER_TIMEOUT
+	#define HTTPC_HEADER_TIMEOUT (5*1000)
+#endif
+
+/* START FUNCTION DESCRIPTION ********************************************
+httpc_skip_headers                                       <HTTP_CLIENT.LIB>
+
+SYNTAX:	int httpc_skip_headers( httpc_Socket far *s);
+
+DESCRIPTION: 	Skip through the headers to get to the body of the HTTP response.
+					Blocks up to HTTPC_HEADER_TIMEOUT milliseconds (defaults to 5000
+					if not defined), unless non-blocking mode is in effect,
+					in which case it returns -EAGAIN if not yet completed and
+					the timeout is ignored.
+
+PARAMETER 1:   Pointer to socket structure to use for connection.
+
+RETURN VALUE:	Total bytes in headers, or <0 for error.
+               -NETERR_INACTIVE_TIMEOUT: timed out due to inactivity
+					-NETERR_REMOTE_RESET: connection closed before end of headers
+					-EAGAIN: non-blocking mode is set, and the operation is
+						  not complete.  Call again until not -EAGAIN.
+
+Note, the macro HTTPC_HEADER_TIMEOUT controls the timeout, in milliseconds,
+that httpc_skip_headers will block while waiting for the headers to complete.
+If not set, HTTPC_HEADER_TIMEOUT defaults to 5000 (5 seconds).
+
+END DESCRIPTION **********************************************************/
+_httpc_debug
+int httpc_skip_headers( httpc_Socket __far *s)
+{
+	auto int err;
+	auto int bytecount;
+	auto unsigned long timeout;
+
+	bytecount = 0;
+	timeout = _SET_TIMEOUT(HTTPC_HEADER_TIMEOUT);
+	do {
+		err = httpc_read_header( s, NULL, 0);
+		if (err > 0)
+			bytecount += err;
+		else if (err < 0)
+			return err;
+		else if (httpc_globals.mode & HTTPC_NONBLOCKING)
+			return -EAGAIN;
+		else if (_CHK_TIMEOUT( timeout)) {
+			_httpc_handle_error(s);
+			return -NETERR_INACTIVE_TIMEOUT;
+		}
+	} while (s->state == HTTPC_STATE_HEADER);
+
+   return bytecount;
+}
+
+/*** BeginHeader httpc_read_body */
+int httpc_read_body( httpc_Socket __far *s, char *buffer, int buflen);
+/*** EndHeader */
+
+#define HTTPC_IN_CHUNK(s)		((s)->currchunk && (s)->currchunk != 0xFFFFFFFF)
+#define HTTPC_END_OF_CHUNK(s)		(!(s)->currchunk)
+#define HTTPC_READ_CHUNK_SIZE(s)	((s)->currchunk == 0xFFFFFFFF)
+
+/* START FUNCTION DESCRIPTION ********************************************
+httpc_read_body                                          <HTTP_CLIENT.LIB>
+
+SYNTAX:	int httpc_read_body(httpc_Socket far *s, char *buffer,
+										int buflen);
+
+DESCRIPTION: 	Read some of the body returned by the HTTP server.
+
+					Note: body (known as "entity" in the W3C documentation)
+					will only be provided to the application if the response
+					code was 200 or 203.
+
+PARAMETER 1:   Pointer to socket structure to use for connection.
+
+PARAMETER 2:	Buffer to store the data in.
+
+PARAMETER 3:	Length of buffer for storing data.
+
+RETURN VALUE:	>0: length of data read
+					 0: waiting on data from socket
+					-ENOTCONN: connection closed, can't read from socket
+					-NETERR_REMOTE_RESET: connection closed before end of headers
+					-NETERR_INACTIVE_TIMEOUT: aborted because of lack-of-progress
+					  timeout (HTTPC_PROGRESS_TIMEOUT).
+					-EIO: error in chunked encoding
+					-EINVAL: invalid state for reading body
+
+END DESCRIPTION **********************************************************/
+_httpc_debug
+int httpc_read_body( httpc_Socket __far *s, char *buffer, int buflen)
+{
+	auto char chunksize[80];
+	auto char *tail;
+	auto int bytesread;
+	auto int bytesavail;
+	auto word delim;
+
+
+	if (s->state == HTTPC_STATE_HEADER)
+	{
+		// Burn through headers.  Call httpc_read_header for as long as it
+		// returns a positive value (header read).  Once it reaches zero, we've
+		// either stalled inside the headers or we've finished reading them.
+		do {
+			bytesread = httpc_read_header( s, NULL, 0);
+		} while (bytesread > 0);
+		if (bytesread < 0)
+		{
+			// httpc_read_header returned an error, pass on to the user
+			return bytesread;
+		}
+	}
+
+	if (s->state != HTTPC_STATE_BODY)
+	{
+		// invalid state
+		return -EINVAL;
+	}
+
+	tcp_tick( NULL);
+	if (s->flags & HTTPC_FLAG_CHUNKED)
+	{
+		delim = DELIM_CRLF;
+
+		if (HTTPC_END_OF_CHUNK(s))
+		{
+	      // read CRLF from end of last chunk
+	      bytesavail = sock_stringready( s->sock, &delim, 0);
+	      if (bytesavail < 0)
+	      {
+	      	// error, socket not readable
+				_httpc_handle_error(s);
+				return bytesavail;
+	      }
+	      if (bytesavail > 2)
+	      {
+	      	// at this point, we're expecting CRLF and nothing else
+	      	// if there's something other than CRLF available, it's an error
+				_httpc_handle_error(s);
+				return -EIO;
+	      }
+
+	      if (bytesavail == 2)
+	      {
+				s->currchunk = 0xFFFFFFFF;
+				sock_fastread( s->sock, chunksize, 2);
+	      }
+	      else
+	      {
+	         if (_CHK_SHORT_TIMEOUT(s->prog_timeout)) {
+	            _httpc_handle_error(s);
+	            return -NETERR_INACTIVE_TIMEOUT;
+	         }
+				return 0;		// still waiting for CRLF to end chunk
+	      }
+
+		}
+		if (HTTPC_READ_CHUNK_SIZE(s))
+		{
+			// need to read next chunksize
+			bytesavail = sock_stringready( s->sock, &delim, 0);
+
+	      if (bytesavail < 0)
+	      {
+	      	// error, socket not readable
+				_httpc_handle_error(s);
+				return -ENOTCONN;
+	      }
+			if (bytesavail <= 2)
+			{
+				// chunksize not available yet
+	         if (_CHK_SHORT_TIMEOUT(s->prog_timeout)) {
+	            _httpc_handle_error(s);
+	            return -NETERR_INACTIVE_TIMEOUT;
+	         }
+				return 0;
+			}
+
+			if (bytesavail > sizeof(chunksize))
+			{
+	         #ifdef HTTPC_VERBOSE
+	            printf( "httpc: error parsing chunksize, too long (%u bytes)\n",
+	            	bytesavail);
+	         #endif
+				_httpc_handle_error(s);
+				return -EIO;
+			}
+
+         bytesread = sock_fastread( s->sock, chunksize, bytesavail);
+			if (bytesread < 0)
+			{
+				// error
+				_httpc_handle_error(s);
+				return -ENOTCONN;
+			}
+
+   		s->prog_timeout = _SET_SHORT_TIMEOUT(HTTPC_PROGRESS_TIMEOUT);
+			s->currchunk = _n_strtol( chunksize, &tail, 16);
+			if (tail == chunksize)
+			{
+	         #ifdef HTTPC_VERBOSE
+	            printf( "httpc: error parsing chunksize (%s)\n", chunksize);
+	         #endif
+				_httpc_handle_error(s);
+				return -EIO;
+			}
+         #ifdef HTTPC_VERBOSE
+            printf( "httpc: next chunk is %lu bytes\n", s->currchunk);
+         #endif
+			if (! s->currchunk)
+			{
+				// end of body (chucksize == 0) or parsing error in strtol
+				s->state = HTTPC_STATE_TRAILER;
+				return 0;
+			}
+		}
+		bytesread = sock_fastread( s->sock, buffer,
+			(s->currchunk < (unsigned long) buflen) ? (int) s->currchunk : buflen);
+		if (bytesread > 0)
+		{
+   		s->prog_timeout = _SET_SHORT_TIMEOUT(HTTPC_PROGRESS_TIMEOUT);
+			s->currchunk -= bytesread;
+		}
+	}
+	else
+	{
+		bytesread = sock_fastread( s->sock, buffer, buflen);
+		if (!bytesread) {
+         if (_CHK_SHORT_TIMEOUT(s->prog_timeout)) {
+            _httpc_handle_error(s);
+            return -NETERR_INACTIVE_TIMEOUT;
+         }
+		}
+   	s->prog_timeout = _SET_SHORT_TIMEOUT(HTTPC_PROGRESS_TIMEOUT);
+	}
+
+	// error calling sock_fastread, socket closed unexpectedly
+   if (bytesread < 0)
+   {
+   	if (s->filesize > s->bytesread)
+   	{
+			_httpc_handle_error(s);
+			return -ENOTCONN;
+		}
+		// not a failure if file size wasn't known (== 0) or we read all bytes
+		s->state = HTTPC_STATE_DONE;
+		return 0;
+   }
+
+   if (bytesread > 0)
+   	s->bytesread += bytesread;
+   if ((s->filesize > 0) && (s->filesize == s->bytesread)) {
+		s->state = HTTPC_STATE_DONE;
+		if (httpc_globals.mode & HTTPC_AUTO_CLOSE)
+			httpc_close(s);
+	}
+
+   return bytesread;
+}
+
+/*** BeginHeader httpc_use_proxy, httpc_use_proxy_ext */
+void httpc_use_proxy( unsigned long ip, word port, const char __far *auth);
+void httpc_use_proxy_ext( unsigned long ip, word port,
+				const char __far *auth, const char __far *proxy_hostname);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+httpc_use_proxy                                          <HTTP_CLIENT.LIB>
+
+SYNTAX:	void httpc_use_proxy( unsigned long ip, word port,
+																	const char far *auth)
+
+DESCRIPTION: 	Configure the HTTP client library to use a proxy server for all
+               new connections.  Pass 0UL for the ip address to switch
+               back to the default behavior of making direct connections.
+
+               NOTE: if using HTTP Secure (https), then use
+               httpc_use_proxy_ext() instead of this function, since the
+               application will need to specify the proxy server's
+               host (domain) name.
+
+PARAMETER 1:   IP address of the proxy server.
+
+PARAMETER 2:	Port number to connect to.
+
+PARAMETER 3:	Basic authentication credentials (in username:password format)
+					to use when connecting.  Use NULL or an empty string if
+					the proxy server does not require authentication.
+
+RETURN VALUE:	none
+
+SEE ALSO:		httpc_use_proxy_ext
+
+END DESCRIPTION **********************************************************/
+/* START FUNCTION DESCRIPTION ********************************************
+httpc_use_proxy_ext                                       <HTTP_CLIENT.LIB>
+
+SYNTAX:	void httpc_use_proxy_ext( unsigned long ip, word port,
+							const char far *auth, const char far *proxy_hostname)
+
+DESCRIPTION: 	Configure the HTTP client library to use a proxy server for all
+               new connections.  Pass 0UL for the ip address to switch
+               back to the default behavior of making direct connections.
+
+PARAMETER 1:   IP address of the proxy server.
+
+PARAMETER 2:	Port number to connect to.
+
+PARAMETER 3:	Basic authentication credentials (in username:password format)
+					to use when connecting.  Use NULL or an empty string if
+					the proxy server does not require authentication.
+
+PARAMETER 4:	Host name of the proxy server.  This is only required if
+               HTTP Secure (https) is being used, and is compared with
+               the proxy's certificate subject Common Name field in
+               a TLS policy callback.  The pointed-to string must not change,
+               since only the pointer is stored.  The CA which signed the
+               proxy's certificate must be in the "trusted" list, otherwise
+               connections via the proxy will be rejected.
+
+RETURN VALUE:	none
+
+END DESCRIPTION **********************************************************/
+_httpc_debug
+void httpc_use_proxy_ext( unsigned long ip, word port,
+			const char __far *auth, const char __far *proxy_hostname)
+{
+	httpc_globals.ip = ip;
+	httpc_globals.port = port;
+	httpc_globals.proxy_hostname = proxy_hostname;
+	if (auth && *auth)
+	{
+		snprintf( httpc_globals.auth, sizeof(httpc_globals.auth), "%ls", auth);
+	}
+	else
+	{
+		*httpc_globals.auth = '\0';
+	}
+}
+
+_httpc_debug
+void httpc_use_proxy( unsigned long ip, word port, const char __far *auth)
+{
+	httpc_use_proxy_ext(ip, port, auth, NULL);
+}
+
+/*** BeginHeader httpc_get_url */
+int httpc_get_url( httpc_Socket __far *s, const char __far *url);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+httpc_get_url                                            <HTTP_CLIENT.LIB>
+
+SYNTAX: int httpc_get_url( httpc_Socket far *s, const char far *url);
+
+DESCRIPTION:	Like httpc_get, but with a URL instead of separate host,
+               auth, port and file parameters
+
+PARAMETER 1:   Pointer to socket structure to use for connection.
+
+PARAMETER 2:   URL, in the following format (items in [] are optional):
+                   [http://][user[:pass]@]hostname[:port]/filename
+               If you #use "ssl_sock.lib" before http_client.lib, then
+               you can also use secure HTTP by specifying a scheme of
+               "https://" e.g.
+               	https://secure.example.com/page.html
+
+RETURN VALUE:  Integer code as follows:
+						 0: Success
+					   -EINVAL: Error parsing URL
+					   -E2BIG: URL is too big to parse.  Increase URL_MAX_BUFFER_SIZE
+					   		to handle larger URLs.
+						-EAGAIN: non-blocking mode is set, and the operation is
+						  not complete.  Continue by subsequently calling
+						  httpc_get() with a NULL host name until it returns
+						  something other than -EAGAIN.
+						Other: any return code from httpc_get().
+
+END DESCRIPTION **********************************************************/
+_httpc_debug
+int httpc_get_url( httpc_Socket __far *s, const char __far *url)
+{
+	auto int err;
+
+	err = url_parse( &s->parsed, url);
+	if (!err) {
+#ifdef HTTPC_VERBOSE
+		printf("HTTPC: using scheme '%ls'\n", s->parsed.scheme);
+#endif
+	   httpc_set_scheme(!strcmp(s->parsed.scheme, "https") ?
+	   	HTTPC_SCHEME_HTTPS : HTTPC_SCHEME_HTTP);
+	   err = httpc_get( s, s->parsed.hostname, s->parsed.port, s->parsed.path,
+	      s->parsed.userinfo);
+	}
+	return err;
+}
+
+
+/*** BeginHeader httpc_post_url */
+int httpc_post_url( httpc_Socket __far *s, const char __far *url,
+	const char __far *postdata, word plen, const char __far *contenttype);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+httpc_post_url                                           <HTTP_CLIENT.LIB>
+
+SYNTAX: int httpc_post_url( httpc_Socket far *s, const char far *url,
+                      const char far *postdata, word plen,
+                      const char far *contenttype);
+
+DESCRIPTION: 	Connect to resource at <url> and POST <plen> bytes of <postdata>.
+
+PARAMETER 1:   Pointer to socket structure to use for connection.
+
+PARAMETER 2:   URL, in the following format (items in [] are optional):
+                   [http://][user[:pass]@]hostname[:port]/filename
+               If you #use "ssl_sock.lib" before http_client.lib, then
+               you can also use secure HTTP by specifying a scheme of
+               "https://" e.g.
+               	https://secure.example.com/page.html
+
+PARAMETER 3:	Data to post, already url-encoded.  This string must not be
+					changed until the post is complete, since only the pointer
+					to it is saved in the state struct.
+
+PARAMETER 4:	Length of data to post (typically strlen(postdata))
+
+PARAMETER 5:	String to send as "Content-Type".  Use NULL for default of
+               "application/x-www-form-urlencoded".  This string must not be
+					changed until the post is complete.
+
+RETURN VALUE:  Integer code as follows:
+						 0: Success
+					   -EINVAL: Error parsing URL
+					   -E2BIG: URL is too big to parse.  Increase URL_MAX_BUFFER_SIZE
+					   		to handle larger URLs.
+						-EAGAIN: non-blocking mode is set, and the operation is
+						  not complete.  Continue by subsequently calling
+						  httpc_post() with a NULL host name until it returns
+						  something other than -EAGAIN.
+						Other: any return code from httpc_post_ext().
+
+SEE ALSO:		httpc_post, httpc_post_ext, url_encodestr
+
+END DESCRIPTION **********************************************************/
+_httpc_debug
+int httpc_post_url( httpc_Socket __far *s, const char __far *url,
+	const char __far *postdata, word plen, const char __far *contenttype)
+{
+	auto int err;
+
+	err = url_parse(&s->parsed, url);
+	if (!err) {
+#ifdef HTTPC_VERBOSE
+		printf("HTTPC: using scheme '%ls'\n", s->parsed.scheme);
+#endif
+	   httpc_set_scheme(!strcmp(s->parsed.scheme, "https") ?
+	   	HTTPC_SCHEME_HTTPS : HTTPC_SCHEME_HTTP);
+		err = httpc_post_ext( s, s->parsed.hostname, s->parsed.port, s->parsed.path,
+			s->parsed.userinfo, postdata, plen, contenttype);
+	}
+
+	return err;
+}
+
+/*** BeginHeader httpc_put_url */
+int httpc_put_url( httpc_Socket __far *s, const char __far *url,
+	const char __far *postdata, word plen, const char __far *contenttype);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+httpc_put_url                                           <HTTP_CLIENT.LIB>
+
+SYNTAX: int httpc_put_url( httpc_Socket far *s, const char far *url,
+                      const char far *postdata, word plen,
+                      const char far *contenttype);
+
+DESCRIPTION: 	Connect to resource at <url> and PUT <plen> bytes of <postdata>.
+
+					Note that PUT is very similar to POST.  To quote the relevant
+					RFC 2616:
+
+					"The fundamental difference between the POST and PUT requests is
+					reflected in the different meaning of the Request-URI. The URI
+					in a POST request identifies the resource that will handle the
+					enclosed entity. That resource might be a data-accepting process,
+					a gateway to some other protocol, or a separate entity that
+					accepts annotations. In contrast, the URI in a PUT request
+					identifies the entity enclosed with the request -- the user agent
+					knows what URI is intended and the server MUST NOT attempt to
+					apply the request to some other resource. If the server desires
+					that the request be applied to a different URI, it MUST send
+					a 301 (Moved Permanently) response; the user agent MAY then make
+					its own decision regarding whether or not to redirect the
+					request."
+
+PARAMETER 1:   Pointer to socket structure to use for connection.
+
+PARAMETER 2:   URL, in the following format (items in [] are optional):
+                   [http://][user[:pass]@]hostname[:port]/filename
+               If you #use "ssl_sock.lib" before http_client.lib, then
+               you can also use secure HTTP by specifying a scheme of
+               "https://" e.g.
+               	https://secure.example.com/page.html
+
+PARAMETER 3:	Data to put, already url-encoded.  This string must not be
+					changed until the put is complete, since only the pointer
+					to it is saved in the state struct.
+
+PARAMETER 4:	Length of data to put (typically strlen(postdata))
+
+PARAMETER 5:	String to send as "Content-Type".  Use NULL for default of
+               "application/x-www-form-urlencoded".  This string must not be
+					changed until the post is complete.
+
+RETURN VALUE:  Integer code as follows:
+						 0: Success
+					   -EINVAL: Error parsing URL
+					   -E2BIG: URL is too big to parse.  Increase URL_MAX_BUFFER_SIZE
+					   		to handle larger URLs.
+						-EAGAIN: non-blocking mode is set, and the operation is
+						  not complete.  Continue by subsequently calling
+						  httpc_post() with a NULL host name until it returns
+						  something other than -EAGAIN.
+						Other: any return code from httpc_put_ext().
+
+SEE ALSO:		httpc_put_ext, url_encodestr
+
+END DESCRIPTION **********************************************************/
+_httpc_debug
+int httpc_put_url( httpc_Socket __far *s, const char __far *url,
+	const char __far *postdata, word plen, const char __far *contenttype)
+{
+	auto int err;
+
+	err = url_parse(&s->parsed, url);
+	if (!err) {
+#ifdef HTTPC_VERBOSE
+		printf("HTTPC: using scheme '%ls'\n", s->parsed.scheme);
+#endif
+	   httpc_set_scheme(!strcmp(s->parsed.scheme, "https") ?
+	   	HTTPC_SCHEME_HTTPS : HTTPC_SCHEME_HTTP);
+		err = httpc_put_ext( s, s->parsed.hostname, s->parsed.port, s->parsed.path,
+			s->parsed.userinfo, postdata, plen, contenttype);
+	}
+
+	return err;
+}
+
+/*** BeginHeader _httpc_req */
+int _httpc_req( httpc_Socket __far *s, int reqtype, const char __far *host, word port,
+	const char __far *file, const char __far *auth, const char __far *postdata, word plen,
+	const char __far *contenttype);
+/*** EndHeader */
+_httpc_debug
+int _httpc_req( httpc_Socket __far *s, int reqtype, const char __far *host, word port,
+	const char __far *file, const char __far *auth, const char __far *postdata, word plen,
+	const char __far *contenttype)
+{
+	auto char buffer[512];
+	auto int i, retval, bytes;
+
+	s->req_type = reqtype;
+	if (file)
+		s->parsed.path = file;
+	if (auth)
+		s->parsed.userinfo = auth;
+   if (postdata) {
+      s->post_data = postdata;
+      s->post_len = plen;
+      s->content_type = contenttype;
+   }
+
+#ifdef HTTPC_VERBOSE
+	if (host)
+		printf( "httpc_post_ext: opening socket\n");
+#endif
+	retval = httpc_open( s, host, port);
+	if (retval)
+	{
+		return retval;
+	}
+
+	if (s->state == HTTPC_STATE_OPEN) {
+		// Connection freshly opened.  Do this once...
+
+	   bytes = httpc_request( buffer, sizeof(buffer),
+	   											reqtype == HTTPC_REQ_PUT ? "PUT" : "POST",
+                                       s->scheme,
+                                       s->hostname, s->port,
+                                       s->parsed.path,
+                                       s->parsed.userinfo);
+	   if (bytes < 0)
+	   {
+	      // buffer to small to hold request
+	      _httpc_handle_error(s);
+	      return bytes;
+	   }
+
+	   if (!contenttype)
+	   	contenttype = "application/x-www-form-urlencoded";
+      bytes += snprintf( &buffer[bytes], sizeof(buffer) - bytes,
+	         "Content-Type: %ls\r\n", contenttype);
+
+	   bytes += snprintf( &buffer[bytes], sizeof(buffer) - bytes,
+	      "Content-Length: %u\r\n\r\n", s->post_len);
+
+	#ifdef HTTPC_VERBOSE
+	   printf("httpc: sending request:\n");
+	   mem_dump(buffer, bytes);
+	   printf("https: post data:\n");
+	   mem_dump(s->post_data, s->post_len);
+	#endif
+
+	   // This will be non-blocking since request will normally be smaller
+	   // than tx buffer.  The following post data may be large, so it is
+	   // handled by state machine.
+	   if (sock_write( s->sock, buffer, bytes) == -1)
+	   {
+	      _httpc_handle_error(s);
+	      return -EIO;
+	   }
+
+	   s->post_sent = 0;
+	   s->state = HTTPC_STATE_POSTING;
+	}
+
+	// Typically, this won't block unless there's a lot of post data
+	// Note that we consume the entire post data at this point, and yet we
+	// need to keep the pointer (and data) valid in case we get a redirect
+	// response, in which case we need to send the post data again.
+	while (s->post_sent < s->post_len)
+	{
+		tcp_tick(NULL);
+		i = sock_writable(s->sock);
+		if (!i) {
+			_httpc_handle_error(s);
+			return -EIO;
+		}
+		--i;
+		if (!i) {
+			if (httpc_globals.mode & HTTPC_NONBLOCKING)
+				return -EAGAIN;
+			continue;
+		}
+		i = u_min(i, s->post_len - s->post_sent);
+		// This will always succeed completely...
+		sock_fastwrite(s->sock, (char __far *)s->post_data + s->post_sent, i);
+		s->post_sent += i;
+	}
+
+   s->state = HTTPC_STATE_HEADER;
+   s->prog_timeout = _SET_SHORT_TIMEOUT(HTTPC_PROGRESS_TIMEOUT);
+	_httpc_clear_redirect(s);
+
+	return 0;
+}
+
+
+
+/*** BeginHeader httpc_post, httpc_post_ext */
+int httpc_post( httpc_Socket __far *s, const char __far *host, word port,
+	const char __far *file, const char __far *auth, const char __far *postdata);
+int httpc_post_ext( httpc_Socket __far *s, const char __far *host, word port,
+	const char __far *file, const char __far *auth, const char __far *postdata, word plen,
+	const char __far *contenttype);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+httpc_post                                               <HTTP_CLIENT.LIB>
+
+SYNTAX: int httpc_post( httpc_Socket far *s, const char far *host, word port,
+								const char far *file, const char far *auth,
+								const char far *postdata);
+
+DESCRIPTION: 	Connect to 'host' and POST 'postdata' to 'file' using 'auth'
+					credentials.
+
+PARAMETER 1:   Pointer to socket structure to use for connection.
+
+PARAMETER 2:   Hostname (or dotted IP) to connect to.  NULL if non-blocking
+					mode is set, and this is a subsequent call after -EAGAIN
+					was returned.
+
+PARAMETER 3:   Port to connect to (typically 80).
+
+PARAMETER 4:	Filename to request (should start with "/")
+
+PARAMETER 5:	Optional username and password (separated with ':') to
+					authenticate with (or NULL for no authentication).
+
+PARAMETER 6:	Data to post (already URL-encoded and null terminated).
+					This string must not be changed until the post is complete,
+					since only the pointer to it is saved in the state struct.
+
+RETURN VALUE:  Integer code as follows:
+						 0: Success
+						-NETERR_DNSERROR: Can't resolve hostname.
+						-Other NETERR_* error codes: miscellaneous network
+						 conditions such as remote host disconnection.
+						-EAGAIN: non-blocking mode is set, and the operation is
+						  not complete.  Continue by subsequently calling
+						  httpc_post() with a NULL host name until it returns
+						  something other than -EAGAIN.
+						-EINVAL: calling this routine in an invalid state when
+						  using non-blocking mode.  This usually means that the
+						  connection is already open.
+
+SEE ALSO:		httpc_post_url, httpc_post_ext
+
+END DESCRIPTION **********************************************************/
+_httpc_debug
+int httpc_post( httpc_Socket __far *s, const char __far *host, word port,
+	const char __far *file, const char __far *auth, const char __far *postdata)
+{
+	return httpc_post_ext( s, host, port, file, auth, postdata,
+		postdata ? strlen(postdata) : 0, NULL);
+}
+/* START FUNCTION DESCRIPTION ********************************************
+httpc_post_ext                                           <HTTP_CLIENT.LIB>
+
+SYNTAX: int httpc_post_ext( httpc_Socket far *s, const char far *host,
+           word port, const char far *file, const char far *auth,
+           const char far *postdata, word postlen,
+			  const char far *contenttype)
+
+DESCRIPTION: 	Connect to 'host' on 'port' and POST 'postlen' bytes from
+               'postdata' to 'file' using 'auth' credentials.
+
+PARAMETER 1:   Pointer to socket structure to use for connection.
+
+PARAMETER 2:   Hostname (or dotted IP) to connect to.  NULL if non-blocking
+					mode is set, and this is a subsequent call after -EAGAIN
+					was returned.
+
+PARAMETER 3:   Port to connect to (typically 80).
+
+PARAMETER 4:	Filename to request (should start with "/").
+
+PARAMETER 5:	Optional username and password (separated with ':') to
+					authenticate with (or NULL for no authentication).
+
+PARAMETER 6:	Data to post (already URL-encoded and null terminated).  This
+					string must not be changed until the post is complete.  In
+					non-blocking mode, the same parameter value must be passed
+					on each subsequent call.
+
+PARAMETER 7:	Length of data to post (typically strlen(postdata)).
+
+PARAMETER 8:	String to send as "Content-Type".  Use NULL for default of
+               "application/x-www-form-urlencoded".
+
+RETURN VALUE:  Integer code as follows:
+						 0: Success
+						-EIO: couldn't write to socket
+						-NETERR_DNSERROR: Can't resolve hostname.
+						-Other NETERR_* error codes: miscellaneous network
+						 conditions such as remote host disconnection.
+						-E2BIG: Buffer full trying to create HTTP request
+						-EAGAIN: non-blocking mode is set, and the operation is
+						  not complete.  Continue by subsequently calling
+						  httpc_post_ext() with a NULL host name until it returns
+						  something other than -EAGAIN.
+						-EINVAL: calling this routine in an invalid state when
+						  using non-blocking mode.  This usually means that the
+						  connection is already open.
+
+SEE ALSO:		httpc_post_url, httpc_post
+
+END DESCRIPTION **********************************************************/
+_httpc_debug
+int httpc_post_ext( httpc_Socket __far *s, const char __far *host, word port,
+	const char __far *file, const char __far *auth, const char __far *postdata, word plen,
+	const char __far *contenttype)
+{
+	return _httpc_req(s, HTTPC_REQ_POST, host, port, file, auth, postdata,
+				plen, contenttype);
+}
+
+
+/*** BeginHeader httpc_put, httpc_put_ext */
+int httpc_put( httpc_Socket __far *s, const char __far *host, word port,
+	const char __far *file, const char __far *auth, const char __far *postdata);
+int httpc_put_ext( httpc_Socket __far *s, const char __far *host, word port,
+	const char __far *file, const char __far *auth, const char __far *postdata, word plen,
+	const char __far *contenttype);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+httpc_put                                               <HTTP_CLIENT.LIB>
+
+SYNTAX: int httpc_put( httpc_Socket far *s, const char far *host, word port,
+								const char far *file, const char far *auth,
+								const char far *postdata);
+
+DESCRIPTION: 	Connect to 'host' and PUT 'postdata' to 'file' using 'auth'
+					credentials.
+
+PARAMETER 1:   Pointer to socket structure to use for connection.
+
+PARAMETER 2:   Hostname (or dotted IP) to connect to.  NULL if non-blocking
+					mode is set, and this is a subsequent call after -EAGAIN
+					was returned.
+
+PARAMETER 3:   Port to connect to (typically 80).
+
+PARAMETER 4:	Filename to request (should start with "/")
+
+PARAMETER 5:	Optional username and password (separated with ':') to
+					authenticate with (or NULL for no authentication).
+
+PARAMETER 6:	Data to put (already URL-encoded and null terminated).
+					This string must not be changed until the put is complete,
+					since only the pointer to it is saved in the state struct.
+
+RETURN VALUE:  Integer code as follows:
+						 0: Success
+						-NETERR_DNSERROR: Can't resolve hostname.
+						-Other NETERR_* error codes: miscellaneous network
+						 conditions such as remote host disconnection.
+						-EAGAIN: non-blocking mode is set, and the operation is
+						  not complete.  Continue by subsequently calling
+						  httpc_post() with a NULL host name until it returns
+						  something other than -EAGAIN.
+						-EINVAL: calling this routine in an invalid state when
+						  using non-blocking mode.  This usually means that the
+						  connection is already open.
+
+SEE ALSO:		httpc_put_url, httpc_put_ext
+
+END DESCRIPTION **********************************************************/
+_httpc_debug
+int httpc_put( httpc_Socket __far *s, const char __far *host, word port,
+	const char __far *file, const char __far *auth, const char __far *postdata)
+{
+	return httpc_put_ext( s, host, port, file, auth, postdata,
+		postdata ? strlen(postdata) : 0, NULL);
+}
+/* START FUNCTION DESCRIPTION ********************************************
+httpc_put_ext                                           <HTTP_CLIENT.LIB>
+
+SYNTAX: int httpc_put_ext( httpc_Socket far *s, const char far *host,
+           word port, const char far *file, const char far *auth,
+           const char far *postdata, word postlen,
+			  const char far *contenttype)
+
+DESCRIPTION: 	Connect to 'host' on 'port' and PUT 'postlen' bytes from
+               'postdata' to 'file' using 'auth' credentials.
+
+PARAMETER 1:   Pointer to socket structure to use for connection.
+
+PARAMETER 2:   Hostname (or dotted IP) to connect to.  NULL if non-blocking
+					mode is set, and this is a subsequent call after -EAGAIN
+					was returned.
+
+PARAMETER 3:   Port to connect to (typically 80).
+
+PARAMETER 4:	Filename to request (should start with "/").
+
+PARAMETER 5:	Optional username and password (separated with ':') to
+					authenticate with (or NULL for no authentication).
+
+PARAMETER 6:	Data to put (already URL-encoded and null terminated).  This
+					string must not be changed until the put is complete.  In
+					non-blocking mode, the same parameter value must be passed
+					on each subsequent call.
+
+PARAMETER 7:	Length of data to put (typically strlen(postdata)).
+
+PARAMETER 8:	String to send as "Content-Type".  Use NULL for default of
+               "application/x-www-form-urlencoded".
+
+RETURN VALUE:  Integer code as follows:
+						 0: Success
+						-EIO: couldn't write to socket
+						-NETERR_DNSERROR: Can't resolve hostname.
+						-Other NETERR_* error codes: miscellaneous network
+						 conditions such as remote host disconnection.
+						-E2BIG: Buffer full trying to create HTTP request
+						-EAGAIN: non-blocking mode is set, and the operation is
+						  not complete.  Continue by subsequently calling
+						  httpc_post_ext() with a NULL host name until it returns
+						  something other than -EAGAIN.
+						-EINVAL: calling this routine in an invalid state when
+						  using non-blocking mode.  This usually means that the
+						  connection is already open.
+
+SEE ALSO:		httpc_put_url, httpc_put
+
+END DESCRIPTION **********************************************************/
+_httpc_debug
+int httpc_put_ext( httpc_Socket __far *s, const char __far *host, word port,
+	const char __far *file, const char __far *auth, const char __far *postdata, word plen,
+	const char __far *contenttype)
+{
+	return _httpc_req(s, HTTPC_REQ_PUT, host, port, file, auth, postdata,
+				plen, contenttype);
+}
+
+
+/*** BeginHeader httpc_set_tls */
+
+/* START FUNCTION DESCRIPTION ********************************************
+httpc_set_tls          		<HTTP_CLIENT.LIB>
+
+SYNTAX: int httpc_set_tls(word flags,
+					SSL_Cert_t far * my_cert,
+	 				SSL_Cert_t far * trusted,
+	 				int (*policy)() );
+
+DESCRIPTION:	Set various options for Secure HTTP (HTTPS).  HTTPS is
+					basically an ordinary HTTP transaction, wrapped in a
+					secure (TLS) layer.  TLS is negotiated before any HTTP
+					messages are exchanged.
+
+					See samples\tcpip\http\https_client.c for example use of
+					HTTPS.
+
+					The application enables use of client-side HTTPS by:
+					1. #use "ssl_sock.lib"
+					   #use "http_client.lib"
+					2. use a scheme string of "https" in the URL e.g.
+					    https://www.example.com/
+
+               This function is only available if you first #use "ssl_sock.lib"
+               before #use this library.
+
+               The options provided here are basically passed to sock_secure()
+               when the HTTPS connection is started.
+
+               NOTE: this function only copies the pointers, not the objects
+               to which they refer.  Thus, the application should be careful
+               not to modify or delete the relevant objects.  The application
+               is responsible for all certificate management.
+
+               NOTE: settings provided by this function persist over multiple
+               uses of httpc_get() etc.
+
+PARAMETER 1: flags:
+				 A bitwise combination of the following flags:
+               SSL_F_REQUIRE_CERT  Require certificate from peer.
+               SSL_F_PEER_CERT_OK  Pretend all certs are valid.  This is mainly
+                         for debugging.
+               SSL_F_NO_RESUME     Set to not attempt session resumption.
+               SSL_S_ALLOW_NULL    Permit NULL bulk encryption suites.  This
+											  allows eavesdropping, but still requires
+											  strong authentication and message integrity.
+					SSL_S_FORBID_RC4    Do not permit RC4 stream cipher (force AES)
+					SSL_S_FORBID_MD5    Do not permit MD5-based hash (force SHA-1)
+PARAMETER 2:my_cert:
+				 If not NULL, is a parsed certificate including private key
+				 information.  This certificate will be presented to the server
+				 if requested.  This is not normally required, since most publicly
+				 accessible HTTPS servers will use account details provided by
+				 userid and password rather than a client certificate provided
+				 by this function.  Userid and password are most easily
+				 specified by using them in the URL e.g.
+				   https://userid:password@www.example.com/resource.html
+				 (see url_parse()).
+PARAMETER 3:trusted:
+				 Pre-parsed certificate chain representing the list of trusted
+				 authorities.  This is required if server authentication is
+				 required by the application.  If the application is intended to
+				 work with a single HTTPS server, then it is sufficient to provide
+				 that server's certificate only.  Otherwise, it may be necessary
+				 to provide a relatively long list of CA certificates, or allow
+				 CA certificates to be provided at run-time.
+PARAMETER 4:policy
+				 Callback function which is called by this library when a server
+				 certificate is provided.  Prototype of such a callback must be:
+					int https_server_policy(
+									ssl_Socket far * state,
+	                       	int trusted,
+	                       	struct x509_certificate far * cert,
+	                       	httpc_Socket far * s
+										);
+				 Pass NULL to remove this callback and use the default.
+				 If not NULL, this callback
+				 is called if and only if the SSL_F_REQUIRE_CERT flag is set,
+				 after a valid certificate is available.  If trusted is false, then
+				 no trusted CA list was specified. If there is a trusted CA list,
+				 but the certificate could not be validated, then this function
+				 will not be called since this always causes an error.
+             Function should return 0 to proceed (allow) or non-zero to
+             disallow. In the latter case, an access_denied alert will be sent
+             to the peer.
+             'cert' parameter is the peer certificate.  This has several fields
+             (see X509.lib) which indicate the subject and issuer etc.  Most
+             useful field is cert->subject which points to a struct containing
+             ascii representations of the various certificate subject name
+             fields.  Function may call x509_name_string() to get a formatted
+             subject name e.g. for messages.
+             's' parameter is the HTTPC state structure.  The callback can
+             access the field s->host to get the origin host domain name,
+             and also the global variable httpc_globals.proxy_hostname
+             which will contain the domain name of the proxy host if used.
+             A proxy host is used if httpc_globals.ip is non-zero (it is the
+             IP address of the proxy).
+
+             NOTE: the default policy callback compares the expected host
+             name with the certificate's subject Common Name field, and
+             rejects the connection if there is a mismatch.  This is
+             sufficient for most cases, so it is recommended to simply
+             leave the callback as NULL.
+
+RETURN VALUE: 	0
+
+SEE ALSO: 	url_parse,
+
+END DESCRIPTION **********************************************************/
+
+#if HTTPC_USE_TLS
+int httpc_set_tls(
+					word flags,
+					SSL_Cert_t __far * my_cert,
+	 				SSL_Cert_t __far * trusted,
+	 				int (*policy)( /* ssl_Socket far * state,
+	                       int trusted,
+	                       struct x509_certificate far * cert,
+	                       httpc_Socket far * s */ )
+					);
+#endif
+/*** EndHeader */
+
+_httpc_debug
+int httpc_set_tls(
+					word flags,
+					SSL_Cert_t __far * my_cert,
+	 				SSL_Cert_t __far * trusted,
+	 				int (*policy)( /* ssl_Socket far * state,
+	                       int trusted,
+	                       struct x509_certificate far * cert,
+	                       httpc_Socket far * s */ )
+					)
+{
+	httpc_globals.tls_flags = flags;
+	httpc_globals.my_cert = my_cert;
+	httpc_globals.trusted = trusted;
+	httpc_globals.policy = policy;
+	return 0;
+}
+
+
+/*** BeginHeader httpc_set_scheme */
+int httpc_set_scheme(int scheme);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+httpc_set_scheme                                         <HTTP_CLIENT.LIB>
+
+SYNTAX: int httpc_set_scheme(int scheme);
+
+DESCRIPTION: 	Set scheme (protocol).  The setting
+               in effect at the time that httpc_open() is called will
+               be used for that connection.
+
+PARAMETER 1:   scheme:  must be one of the following values:
+					HTTPC_SCHEME_HTTP - this is the default, and specifies
+					  normal HTTP.
+					HTTPC_SCHEME_HTTPS - specifies secure HTTP.  This is only
+					  available if you first #use "ssl_sock.lib" before using
+					  this library.  See samples\tcpip\http\htps_client.c
+					  for more details, and the httpc_set_tls() function
+					  documentation.
+
+RETURN VALUE:  Integer code as follows:
+						 0: Success
+						-1: Scheme not available
+
+END DESCRIPTION **********************************************************/
+_httpc_debug
+int httpc_set_scheme(int scheme)
+{
+	if (scheme == HTTPC_SCHEME_HTTP
+#if HTTPC_USE_TLS
+		|| scheme == HTTPC_SCHEME_HTTPS
+#endif
+		) {
+		httpc_globals.scheme = scheme;
+		return 0;
+	}
+	return -1;
+}
+
+/*** BeginHeader httpc_set_mode */
+void httpc_set_mode(int mode_flags);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+httpc_set_mode                                    <HTTP_CLIENT.LIB>
+
+SYNTAX: void httpc_set_mode(int mode_flags);
+
+DESCRIPTION: 	Set various mode flags for *all* connections.  The parameter
+					is a bitmask of desired options:
+
+					HTTPC_NONBLOCKING:
+               Blocking mode (the default) requires that the application
+               calls httpc_close() at the end of a connection, and
+               opening a connection (httpc_open(), or implicitly if
+               httpc_get_url() etc. is called) may also block.
+
+               Basic non-blocking mode requires the application to call
+               httpc_open() and httpc_close() until they returns something
+               other than -EAGAIN.  The advantage of this is that other
+               parts of the application may run while waiting for
+               connection establishment and tear-down.  This is particularly
+               useful when using HTTPS (secure HTTP) since HTTPS has more
+               overhead in these phases.
+
+					HTTPC_AUTO_CLOSE:
+					If set, then automatically close connection after completion
+					of reading the body.  This obviates the need for the
+					application to call httpc_close() at the end of the session.
+					It is NOT recommended to set this option if also setting
+					non-blocking, since in that case the application would still
+					need to spin on httpc_close() unitl it completes.
+
+					HTTPC_AUTO_REDIRECT:
+					If set, and the initial header response gets a '3xx'
+					response code, then automatically re-open the connection
+					to the given URL.  This is only done up to HTTPC_MAX_REDIRECT
+					times (default 1 redirection).  If this redirection count is
+					exceeded, then the application will need to handle this.
+					If this flag is not set, then redirections are never followed.
+					The headers that come with the redirection response are
+					not sent to the application.  The application will only start
+					to receive headers (via httpc_read_header()) when a non-
+					redirected resource is located.
+
+					The response codes which may cause a redirect are 301,302,
+					303,305 and 307.  Whether or not this option is enabled,
+					the redirect-to URI may be found in the state->redirect
+					field (if it is not NULL).
+
+
+               NOTE: this function applies to all current and future
+               HTTPC connections (until changed).  It is not possible to use
+               different modes for concurrent HTTP client connections.
+
+PARAMETER 1:	ORed combination of the following flags:
+					HTTPC_NONBLOCKING: turn on non-blocking behavior
+					HTTPC_AUTO_CLOSE: close the connection automatically.
+					HTTPC_AUTO_REDIRECT: follow 301/302 redirections.
+					Anything else: reserved, don't use.
+
+END DESCRIPTION **********************************************************/
+_httpc_debug
+void httpc_set_mode(int mode_flags)
+{
+	httpc_globals.mode = mode_flags;
+}
+
+
+/*** BeginHeader ***/
+#endif // __HTTPC_LIB
+/*** EndHeader ***/

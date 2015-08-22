@@ -1,0 +1,1005 @@
+/*
+ *    icmp.lib
+ *    Copyright (C) Rabbit Semiconductor, Inc. All rights reserved.
+ *    Portions used with permission of Erick Engelke.
+ *
+ *
+ * ICMP - Based on RFCs 792 & 1122
+ *        Also RFC 1256 for router discovery: #define ICMP_ROUTER_DISCOVERY
+ *         to enable on all broadcast interfaces.
+ *
+ */
+
+/*** BeginHeader */
+#ifndef ICMP_H
+#define ICMP_H
+
+#ifndef IP_H
+	#use "ip.lib"
+#endif
+
+#ifdef ICMP_DEBUG
+	#define _icmp_nodebug __debug
+#else
+	#define _icmp_nodebug __nodebug
+#endif
+
+// Define this symbol to make the ICMP handler call a specified function
+// on receipt of any echo request (PING).  You must define it to be the name
+// of a callback function with the following prototype:
+//
+//   int my_callback(longword icmp_dest_addr, byte iface, int bcastdest, in_Header * ip);
+//
+// Of course, the name does not have to be "my_callback".  This function is called
+// for every ICMP echo request packet received.  You can use it to set the local
+// IP address if desired.  Parameters are:
+//   dest_addr: destination IP address as received in the request.  This would
+//     usually be the current IP address, but could also be a broadcast or
+//     completely different address.
+//   iface: interface number which received the request.  Currently always IF_DEFAULT.
+//   bcastdest: Non-zero if the request was broadcast at the IP and/or link layer.
+//   ip: pointer to IP header part of packet.  This header is also followed by
+//     the ICMP header and data.
+// The return value should be '0' to tell the ICMP handler NOT to respond to
+// the echo request, or '1' to respond normally.
+//#define ICMP_ECHOREQ_CALLBACK  my_callback
+
+// Define this symbol if ICMP sends replies to IP broadcast echo requests (broadcast PING).
+//#define ICMP_RESPOND_TO_BCAST_ECHOREQ
+
+#ifndef ICMP_TOS
+	#define ICMP_TOS IPTOS_DEFAULT
+#endif
+#ifndef ICMP_TTL
+	#define ICMP_TTL 64
+#endif
+
+#ifdef ICMP_PING_SEND_BUFFER
+	#ifdef ICMP_PING_SEND_LEN
+		#define ICMP_USE_PINGDATA 1
+	#endif
+#endif
+#ifndef ICMP_USE_PINGDATA
+	#define ICMP_USE_PINGDATA 0
+#endif
+// If the above is non-zero, then you'll probably want to define the following
+// macro to be the name of a callback function.  See function description
+// of _send_ping_iface() for details.
+//#define ICMP_PINGDATA_CALLBACK pingdata_callback
+
+/* backward compatibility */
+#define _ping(h, c) _send_ping_iface((h), (c), 250, 0, NULL, IF_ANY)
+
+#define ICMP_REFLECT_HEADER		8		// Size of TCP/UDP header to echo in unreachable etc.
+
+typedef struct icmp_unused {
+   byte    type;
+   byte code;
+   word checksum;
+   longword   unused;
+   in_Header  ip;
+   byte spares[ ICMP_REFLECT_HEADER ];
+} icmp_unused_t;
+
+typedef struct icmp_pointer {
+   byte type;
+   byte code;
+   word checksum;
+   byte pointer;
+   byte unused[ 3 ];
+   in_Header  ip;
+} icmp_pointer_t;
+
+typedef struct icmp_ip {
+   byte type;
+   byte code;
+   word checksum;
+   longword   ipaddr;
+   in_Header  ip;
+} icmp_ip_t;
+
+typedef struct icmp_echo {
+   byte type;
+   byte code;
+   word checksum;
+   longword identifier;  // Actually, this is identifier plus sequence
+   //word sequence;
+   longword index;
+} icmp_echo_t;
+
+typedef struct icmp_timestamp {
+   byte type;
+   byte code;
+   word checksum;
+   word identifier;
+   word sequence;
+   longword   original; /* original timestamp */
+   longword   receive;  /* receive timestamp */
+   longword   transmit; /* transmit timestamp */
+} icmp_timestamp_t;
+
+typedef struct icmp_info {
+   byte type;
+   byte code;
+   word checksum;
+   word identifier;
+   word sequence;
+} icmp_info_t;
+
+typedef struct icmp_redirect {
+   byte type;
+   byte code;
+   word checksum;
+   longword new_router;
+} icmp_redirect_t;
+
+#ifdef ICMP_ROUTER_DISCOVERY
+typedef struct icmp_router_adv {
+   byte type;
+   byte code;
+   word checksum;
+   byte num_addrs;
+   byte addr_size;	// =2 (number of lonwords per entry)
+   word lifetime;		// seconds
+   struct {
+   	longword addr;
+   	long	preference;
+   } addrs[1];			// 1st of num_addrs entries
+} icmp_router_adv_t;
+
+typedef struct icmp_router_sol {
+   byte type;
+   byte code;
+   word checksum;
+   longword reserved;
+} icmp_router_sol_t;
+#endif
+
+typedef union {
+   struct icmp_unused   unused;
+   struct icmp_pointer  pointer;
+   struct icmp_ip    ip;
+   struct icmp_echo  echo;
+   struct icmp_timestamp   timestamp;
+   struct icmp_info  info;
+   struct icmp_redirect  redirect;
+#ifdef ICMP_ROUTER_DISCOVERY
+	struct icmp_router_adv  radv;
+	struct icmp_router_sol  rsol;
+#endif
+} icmp_pkt;
+
+typedef struct _pkt {
+   in_Header  in;
+   icmp_pkt   icmp;
+} _pkt_t;
+
+#define ICMPTYPE_ECHOREPLY       0
+#define ICMPTYPE_UNREACHABLE     3
+#define ICMPTYPE_SOURCE_QUENCH   4
+#define ICMPTYPE_REDIRECT        5
+#define ICMPTYPE_ECHO_REQ        8
+#define ICMPTYPE_ROUTER_ADV      9
+#define ICMPTYPE_ROUTER_SOL		10
+#define ICMPTYPE_TIMEEXCEEDED    11
+#define ICMPTYPE_PARAM_PROBLEM   12
+#define ICMPTYPE_TIMESTAMP_REQ   13
+#define ICMPTYPE_TIMESTAMP_REP   14
+#define ICMPTYPE_INFO_REQ        15
+#define ICMPTYPE_INFO_REP        16
+
+#define ICMP_UNREACH_NET 				0
+#define ICMP_UNREACH_HOST 				1
+#define ICMP_UNREACH_PROTO				2
+#define ICMP_UNREACH_PORT 				3
+#define ICMP_UNREACH_FRAGNEEDED 		4
+#define ICMP_UNREACH_SRCROUTEFAILED	5
+
+#define ICMP_EXCEEDED_TTL 				0
+#define ICMP_EXCEEDED_FRAGREASM 		1
+
+/* a user-installed ICMP handler */
+typedef int (*icmp_handler_type)(in_Header *ip);
+
+/* a user-installed ICMP echo handler */
+typedef int (*icmp_echohandler_type)(longword icmp_dest_addr, byte iface,
+	int bcastdest, in_Header * ip);
+
+/*** EndHeader */
+
+/*** BeginHeader _send_ping */
+/* START FUNCTION DESCRIPTION ********************************************
+_send_ping                             <ICMP.LIB>
+
+SYNTAX: int _send_ping( longword host, longword countnum, byte ttl,
+                        byte tos, longword *theid );
+
+KEYWORDS:		tcpip, icmp, ping
+
+DESCRIPTION: 	generate an ICMP request for host.  Blocks for up to 1
+               second to resolve the destination hardware address.
+
+               Note that this function simply calls _send_ping_iface
+               with an IF_ANY parameter.
+
+PARAMETER1: 	ip address to send ping
+PARAMETER2: 	user defined count number
+PARAMETER3: 	time to live for the packets (hop count)
+                 - see sock_set_ttl() for details.
+PARAMETER4: 	type of service on the packets
+                 - see sock_set_tos() for details.
+PARAMETER5: 	returns the identifier that was sent out
+
+RETURN VALUE:  0 successful
+               1 failed when sending packet
+               -1 failed because could not resolve host hardware address.
+
+SEE ALSO:      _chk_ping, _ping, sock_set_ttl, sock_set_tos,
+               _send_ping_iface
+
+END DESCRIPTION **********************************************************/
+
+int _send_ping( longword host, longword countnum, byte ttl, byte tos,
+	longword *theid );
+/*** EndHeader */
+_icmp_nodebug int _send_ping( longword host, longword countnum,
+			 byte ttl, byte tos, longword *theid )
+{
+	return _send_ping_iface(host, countnum, ttl, tos, theid, IF_ANY);
+}
+
+/*** BeginHeader _send_ping_iface */
+
+/* START FUNCTION DESCRIPTION ********************************************
+_ping                                  <ICMP.LIB>
+
+SYNTAX: int _ping( longword host, longword sequence_number );
+
+KEYWORDS:		tcpip, icmp, ping
+
+DESCRIPTION: 	generate an ICMP request for host.  NOTE: this is a macro
+               which calls _send_ping_iface as follows:
+
+						_send_ping_iface(host, sequence_number, 250, 0, NULL, IF_ANY)
+
+					that is with a hop count of 250, unspecified type of service,
+					no identifier return, and any appropriate interface.
+
+PARAMETER1: 	ip address to send ping
+PARAMETER2: 	user defined sequence number
+
+RETURN VALUE:  0 successful
+               1 failed when sending packet
+               -1 failed because could not resolve host hardware address.
+
+SEE ALSO:      _chk_ping, _send_ping, _send_ping_iface
+
+END DESCRIPTION **********************************************************/
+
+/* START FUNCTION DESCRIPTION ********************************************
+_send_ping_iface                             <ICMP.LIB>
+
+SYNTAX: int _send_ping_iface( longword host, longword countnum, byte ttl,
+                        byte tos, longword *theid, word iface);
+
+KEYWORDS:		tcpip, icmp, ping
+
+DESCRIPTION: 	generate an ICMP request for host.  Blocks for up to 1
+               second to resolve the destination hardware address.
+
+					As of Dynamic C 10.60, you can define the following macros
+					in your main application before including this library:
+
+						ICMP_PING_SEND_BUFFER
+							Define to the name of a global variable of type
+							"char far *" which will be set to point to a buffer
+							which contains data to send with a ping request.
+						ICMP_PING_SEND_LEN
+							Define to the name of a global variable of type "int"
+							which will be set to contain the length of data in the
+							above buffer.  This can also be set to a non-negative
+							constant if a fixed amount of additional data is to be
+							sent.
+						ICMP_PINGDATA_CALLBACK
+						   Optionally, define to name of function with following
+						   prototype:
+							int callback(struct icmp_echo far * icmp,
+		                            char far * data,
+		                            int len,
+		                            int iface,
+		                            longword dest_host);
+							This function may modify the data area at 'data' which
+							has length 'len'.  This data is transmitted as the data
+							portion of the outgoing echo request packet.  The function
+							return value may be set to any value between 0 and 'len'
+							inclusive, which will be the transmitted data length.
+							'iface' and 'dest_host' indicate the interface and
+							destination host IP address for this packet.  'icmp' is
+							a structure which contains the ICMP echo request packet
+							header.  This is filled in with suitable default values
+							and does not normally need to be touched.  Some
+							applications may wish to alter the 'identifier' and/or
+							'index' fields.  If so, note that these must be stored
+							in network order.
+
+					If using the above macros, both ICMP_PING_SEND_BUFFER and
+					ICMP_PING_SEND_LEN must be defined or you will
+					get compilation errors.  When defined, the specified data will
+					be added to the end of each ping packet sent to a remote host.
+					If both of these macros are undefined, zero additional data
+					will be supplied.
+
+					The extra data length, ICMP_PING_SEND_LEN, is in addition to
+					the following components of a normal ping packet:
+					  IP header (20 bytes)
+					  ICMP echo request header (8 bytes)
+					  Index number (4 bytes, always added as the "sequence number")
+					Thus, the value obtained from ICMP_PING_SEND_LEN+32 should not
+					exceed the MTU of the interface.  For example, on ethernet
+					(with MTU of 1500), the value for ICMP_PING_SEND_LEN should
+					not exceed 1468.
+
+PARAMETER1: 	ip address to send ping
+PARAMETER2: 	user defined count number
+PARAMETER3: 	time to live for the packets (hop count)
+                 - see sock_set_ttl() for details.
+PARAMETER4: 	type of service on the packets
+                 - see sock_set_tos() for details.
+PARAMETER5: 	returns the identifier that was sent out
+PARAMETER6: 	specific interface number (IF_ETH0 etc.) or may be
+               IF_ANY to select the interface automatically based on the
+               given IP address.
+
+RETURN VALUE:  0 successful
+               1 failed when sending packet
+               -1 failed because could not resolve host hardware address.
+
+SEE ALSO:      _chk_ping, _ping, sock_set_ttl, sock_set_tos,
+               _send_ping
+
+END DESCRIPTION **********************************************************/
+
+
+int _send_ping_iface( longword host, longword countnum, byte ttl,
+	byte tos, longword *theid, word iface );
+/*** EndHeader */
+
+_icmp_nodebug
+int _send_ping_iface( longword host, longword countnum,
+	byte ttl, byte tos, longword *theid, word iface )
+{
+	auto byte pkt_hdr[IP_MAX_LL_HDR + sizeof(struct _pkt)];	// LL and IP headers, plux max ICMP
+	auto ll_Gather g;
+   auto struct _pkt *p;
+   auto in_Header *ip;
+   auto struct icmp_echo *icmp;
+   auto ATHandle ath;
+   auto longword timeout;
+   auto int rc;
+   auto int xl;
+
+   ath = arpresolve_start_iface(host, iface);
+   if (ath < 0)
+   	return -1;
+
+   timeout = _SET_TIMEOUT(1000);
+   for (;;) {
+   	tcp_tick(NULL);
+   	if (arpresolve_check(ath, host) > 0)
+   		break;
+   	if (chk_timeout(timeout))
+   		return -1;
+   }
+
+#ifdef ICMP_VERBOSE
+      printf("ICMP: sending echo request\n");
+#endif
+
+	p = (struct _pkt *)pkt_make_ip(ath, pkt_hdr, &g);
+
+   ip = &p->in;
+   memset( ip, 0, sizeof( in_Header ));
+   icmp = &(p->icmp.echo);
+
+   icmp->type = ICMPTYPE_ECHO_REQ;
+   icmp->code = 0;
+   icmp->index = intel(countnum);		// 1st 4 bytes of "data" field
+   icmp->identifier = intel(MS_TIMER);	// Sets identifier and sequence number
+   if( theid ) *theid = icmp->identifier;
+   /* finish the icmp checksum portion */
+#if ICMP_USE_PINGDATA
+	xl = ICMP_PING_SEND_LEN;
+	if (xl > 0) {
+	   if (xl > MAX_MTU - 32)
+	      xl = MAX_MTU - 32;
+	#ifdef ICMP_PINGDATA_CALLBACK
+		xl = ICMP_PINGDATA_CALLBACK((struct icmp_echo __far *)icmp,
+		                            (char __far *)data, xl, g.iface, host);
+	   if ((word)xl > MAX_MTU - 32)
+	      xl = MAX_MTU - 32;
+   	if( theid ) *theid = icmp->identifier;
+	#endif
+	   icmp->checksum = _f_checksum(ICMP_PING_SEND_BUFFER, xl, 0, NULL);
+	}
+	else {
+		xl = 0;
+		icmp->checksum = 0;
+	}
+#else
+	xl = 0;
+   icmp->checksum = 0;
+#endif
+   icmp->checksum = ~fchecksum( icmp, sizeof(struct icmp_echo) );
+
+   /* encapsulate into a nice ip packet */
+   ip->ver_hdrlen=0x45;
+   ip->length = intel16(sizeof(in_Header) + sizeof(struct icmp_echo) + xl);
+   ip->tos = tos;
+   ip->identification = intel16(++ip_id);
+   ip->ttl = ttl;
+   ip->proto = ICMP_PROTO;
+   ip->source = intel(_if_tab[g.iface].ipaddr);
+   ip->destination = intel( host );
+   ip->checksum = ~fchecksum( ip, sizeof( in_Header ));
+
+   g.len1 = sizeof(struct icmp_echo) + (word)((char __far *)paddr(icmp) - g.data1);
+#if ICMP_USE_PINGDATA
+	g.len2 = xl;
+	g.data2 = ICMP_PING_SEND_BUFFER;
+#endif
+   return pkt_gather(&g);
+}
+
+/*** BeginHeader _send_router_solicit */
+int _send_router_solicit(int iface, int use_multicast);
+
+/* START FUNCTION DESCRIPTION ********************************************
+_send_router_solicit                                  <ICMP.LIB>
+
+SYNTAX: int _send_router_solicit(int iface, int use_multicast);
+
+KEYWORDS:		tcpip, icmp, router
+
+DESCRIPTION: 	Send a router solicitation request.  This is primarily
+					for internal use.
+
+					When the reply comes (if at all) the results will be
+					added to the router table as transient (temporary)
+					entries.  This will happen asynchronously to this call.
+
+					This is sent either to limited broadcast (0xFFFFFFFF) or
+					to the "all routers" multicast address (224.0.0.2),
+					depending on parameter.
+
+PARAMETER1: 	interface number from which to send request.
+PARAMETER2:		boolean indicating whether to use multicast (224.0.0.2)
+					or else limited broadcast (xFFFFFFFF).
+
+RETURN VALUE:  0 successful
+               1 failed when sending packet
+
+END DESCRIPTION **********************************************************/
+/*** EndHeader */
+#ifndef ICMP_ROUTER_DISCOVERY
+	#error "Must define ICMP_ROUTER_DISCOVERY to use _send_router_solicit"
+#endif
+
+_icmp_nodebug
+int _send_router_solicit(int iface, int use_multicast)
+{
+	auto byte pkt_hdr[IP_MAX_LL_HDR + sizeof(struct _pkt)];	// LL and IP headers, plux max ICMP
+	auto byte hwa[6];
+	auto ll_Gather g;
+   auto struct _pkt *p;
+   auto in_Header *ip;
+   auto struct icmp_router_sol *icmp;
+   auto longword dest;
+   auto int rc;
+
+	if (use_multicast)
+		dest = IPADDR(224,0,0,2); // Calling all routers.
+	else
+		dest = 0xFFFFFFFFuL;
+
+
+#ifdef ICMP_VERBOSE
+	printf("ICMP: sending router solicit on iface %d using %s\n",
+		iface, use_multicast ? "multicast" : "broadcast");
+#endif
+
+	p = (struct _pkt *)pkt_make_bcast_ip(dest, iface, pkt_hdr, &g);
+	if (!p) {
+#ifdef ICMP_VERBOSE
+		printf("ICMP:  can't do on this iface\n");
+#endif
+		return 1;
+	}
+
+   ip = &p->in;
+   memset( ip, 0, sizeof( in_Header ));
+   icmp = &(p->icmp.rsol);
+
+   icmp->type = ICMPTYPE_ROUTER_SOL;
+   icmp->code = 0;
+   icmp->reserved = 0;
+   icmp->checksum = 0;
+   icmp->checksum = ~fchecksum( icmp, sizeof(*icmp) );
+
+   /* encapsulate into a nice ip packet */
+   ip->ver_hdrlen=0x45;
+   ip->length = intel16(sizeof(in_Header) + sizeof(*icmp));
+   ip->tos = ICMP_TOS;
+   ip->identification = intel16(++ip_id);
+   ip->ttl = 1;	// Only one hop is reasonable
+   ip->proto = ICMP_PROTO;
+   ip->source = intel(_if_tab[g.iface].ipaddr);	// Valid to be zero (pre config)
+   ip->destination = intel(dest);
+   ip->checksum = ~fchecksum(ip, sizeof(in_Header));
+
+   g.len1 = sizeof(*icmp) + (word)((char __far *)paddr(icmp) - g.data1);
+   return pkt_gather(&g);
+}
+
+/*** BeginHeader icmp_handler, set_icmp_handler, icmp_Unreach, icmp_Reply, _chk_ping */
+
+/* START FUNCTION DESCRIPTION ********************************************
+_chk_ping                              <ICMP.LIB>
+
+SYNTAX: longword _chk_ping( longword host, longword* sequence_number);
+
+KEYWORDS:		tcpip, icmp, ping
+
+DESCRIPTION: 	checks for any outstanding ping replies from host.  _chk_ping
+					should be called frequently with a host IP address.  If an appropriate
+					packet is found from that host IP address, the sequence number is
+					returned through *sequence_number. The time difference between our
+					request and their response is returned in milliseconds.
+
+PARAMETER1: 	ip address to receive ping from
+PARAMETER2: 	sequence number of reply
+
+RETURN VALUE:  Time in milliseconds from the ping request to the host’s ping
+					reply.  If _chk_ping returns 0xffffffffL, there were no ping
+					receipts on this current call.
+
+SEE ALSO:      _ping, _send_ping, ping.c
+
+END DESCRIPTION **********************************************************/
+
+longword _chk_ping( longword host, longword *ptr );
+
+void icmp_Reply(struct _pkt *p, longword src, longword dest, int icmp_length,
+	byte tos, ll_Gather * g);
+void icmp_Unreach(ll_prefix __far * LL, byte * hdrbuf, int what);
+
+void set_icmp_handler( icmp_handler_type user_handler );
+ll_prefix __far * icmp_handler(ll_prefix __far * LL, byte * hdrbuf);
+
+/*** EndHeader */
+longword ping_hcache /*= 0*/;	/* host */
+longword ping_tcache /*= 0*/;	/* time */
+longword ping_number /*= 0*/;
+
+/* handler called in icmp_handler if this isn't null */
+icmp_handler_type user_icmp_handler /*= NULL*/;
+
+_icmp_nodebug
+longword _chk_ping( longword host, longword *ptr )
+{
+   #GLOBAL_INIT { ping_hcache=ping_tcache=ping_number=0;user_icmp_handler=NULL; }
+
+   if( ping_hcache == host ) {
+      ping_hcache = 0xffffffffL;
+      *ptr = ping_number;
+      return( ping_tcache );
+   }
+   return( 0xffffffffL );
+}
+
+/*
+ * icmp_Reply - format and send a reply packet
+ *  	      - note that src and dest are NETWORK order not host!!!!
+ */
+_icmp_nodebug void icmp_Reply(struct _pkt *p, longword src, longword dest, int icmp_length, byte tos, ll_Gather * g)
+{
+   auto in_Header *ip;
+   auto icmp_pkt *icmp;
+   auto char __far * odata;
+
+   ip = &p->in;
+   memset(ip, 0, sizeof(in_Header));
+   icmp = &p->icmp;
+
+   /* finish the icmp checksum portion */
+   icmp->unused.checksum = 0;
+   odata = g->data1;
+   g->len1 = icmp_length;
+   g->data1 = (char __far *)paddr(icmp);
+   icmp->unused.checksum = ~gchecksum(g, 0);
+   g->data1 = odata;
+
+   /* encapsulate into a nice ip packet */
+   ip->ver_hdrlen=0x45;
+   ip->length = intel16(sizeof( in_Header ) + icmp_length + g->len2 + g->len3);
+   ip->identification = intel16(++ip_id);
+   ip->ttl = ICMP_TTL;
+   ip->tos = tos;
+   ip->proto = ICMP_PROTO;
+   ip->source = src;
+   ip->destination = dest;
+   ip->checksum = ~fchecksum( ip, sizeof( in_Header ));
+
+   g->len1 = icmp_length + (word)((char __far *)paddr(icmp) - g->data1);
+   pkt_gather(g);
+}
+
+
+// send ICMP port/proto unreachable, in reply to the IP header received in ip.
+// This bypasses ARP.  ip MUST point to the header in the global packet receive buffer.
+
+_icmp_nodebug void icmp_Unreach(ll_prefix __far * LL, byte * hdrbuf, int what) {
+	auto byte pkt_hdr[IP_MAX_LL_HDR + sizeof(struct _pkt) + 40 + ICMP_REFLECT_HEADER];
+		// LL, IP and ICMP headers, plus reflected headers (extra 40 bytes for max IP options)
+	auto ll_Gather g;
+   auto icmp_pkt *icmp;
+   auto struct _pkt *pkt;
+   auto word len;
+   auto in_Header *ip;
+
+   ip = (in_Header *)(hdrbuf + LL->net_offs);
+   len = in_GetHdrlenBytes(ip) + ICMP_REFLECT_HEADER;		// Original IP header plus 8 bytes of transport layer
+	pkt = (struct _pkt *)pkt_reply_ip(LL->iface, pkt_hdr, &g, &((eth_Header *)hdrbuf)->source);
+
+   icmp = &pkt->icmp;
+   icmp->unused.type = ICMPTYPE_UNREACHABLE;
+   icmp->unused.code = what;  // ICMP_UNREACH_PORT or _PROTO
+   icmp->unused.unused = 0L;
+   memcpy(&icmp->unused.ip, ip, len);
+   // The extra 8 for the size of the basic ICMP fields above
+   icmp_Reply(pkt, ip->destination, ip->source, 8 + len, ICMP_TOS, &g);
+}
+
+
+/*
+ * Register the user ICMP handler.  Only one at a time...
+ * To disable user handler, call  set_icmp_handler(NULL);
+ */
+_icmp_nodebug
+void set_icmp_handler( icmp_handler_type user_handler )
+{
+   #GLOBAL_INIT { user_icmp_handler=NULL; }
+
+   user_icmp_handler = user_handler;
+}
+
+
+_icmp_nodebug ll_prefix __far * icmp_handler(ll_prefix __far * LL, byte * hdrbuf)
+{
+	auto byte pkt_hdr[IP_MAX_LL_HDR + sizeof(struct _pkt)];
+	auto byte destmac[6];
+		// LL, IP and ICMP headers.  Echo data is gathered from incoming buffer.
+   auto in_Header *ip;
+	auto ll_Gather g;
+   auto icmp_pkt *icmp, *newicmp;
+   auto struct _pkt *pkt;
+   auto int len, code, num_rtr;
+   auto in_Header *retval;
+   auto longword hisip, myip, host, router;
+   auto int b, bcast, lo;
+   auto int msgbase;
+   auto word iface;
+   auto ATHandle ath, rath;
+   auto word j, temp;
+
+   ip = (in_Header *)(hdrbuf + LL->net_offs);
+   _pkt_buf2root(LL, icmp = (icmp_pkt *)(hdrbuf+LL->tport_offs), sizeof(icmp_pkt), LL->tport_offs);
+
+   iface = LL->iface;
+#ifdef ICMP_VERBOSE
+   if(debug_on >= 4) printf("ICMP: incoming on i/f %u\n", iface);
+#endif
+
+   len = intel16(ip->length) - in_GetHdrlenBytes(ip);
+   if (len < 8) {
+#ifdef ICMP_VERBOSE
+      if(debug_on >= 1) printf("ICMP: Invalid length %d\n", len);
+#endif
+      return LL;
+   }
+
+   if (lchecksum(LL, LL->tport_offs, len) != 0xffff) {
+#ifdef ICMP_VERBOSE
+      if(debug_on >= 1) printf("ICMP: Bad Checksum\n");
+#endif
+      return LL;
+   }
+
+   hisip = intel(ip->source);
+   myip = intel(ip->destination);
+   bcast = IS_SUBNET_BCAST_ADDR(myip, iface);
+
+   /*
+    * If there's a user handler installed, call the user's handler;
+    *     return of anything but 0 and this handler will continue
+    *     processing the message after the user is done with it.
+    * Otherwise, stop processing it now.
+    */
+   if( user_icmp_handler )
+   {
+   	code = (user_icmp_handler)( ip );
+      if ( !code )   /* don't continue processing? */
+         return LL;
+   }
+
+   // Ignore if the request is from an invalid source i.e. my address, broadcast,
+   // network, unless it is loopback.
+   lo = IS_LOOPBACK_ADDR(hisip);
+   if (!lo) {
+	   if (IS_MY_ADDR(hisip, iface) || !IS_VALID_SOURCE(hisip, iface))
+	      return LL;
+	}
+
+   code = icmp->unused.code;
+   retval = & (icmp->ip.ip);
+
+	if (icmp->unused.type == ICMPTYPE_ECHO_REQ &&
+	    !(_if_tab[iface].flags & (IFF_ICMP_CFG_OK|IFF_DHCP)) &&
+	    !IF_P2P(iface) &&
+	    _if_tab[iface].flags & IFF_ICMP_CONFIG &&
+	    _if_tab[iface].ipaddr != myip &&
+	    !bcast &&
+	    !(LL->ll_flags & (LL_BROADCAST | LL_MULTICAST))
+	    ) {
+		// Do processing for directed ping configuration of local IP address.  This works if the
+		// initial IP address is set to zero, and the ping is unicast to our MAC address.
+		// Also, the IFF_ICMP_CONFIG flag must be set for the interface, and the interface
+		// must be up (otherwise we would not get to this point).  If DHCP is requested
+		// for this interface, then ping configure is not allowed.  Ping configure can only
+		// work when DHCP has timed out (or is not requested).
+		// The IP address is set from the IP header destination, and the netmask is set to
+		// all 0xFF.  The IP source address of the sender is used as the "router" address for
+		// the new link, which is effectively a point-point link since the netmask is narrow.
+		// In practice, we will only be able to talk to the sender (unless the sender is really
+		// a router).  It is expected that the sender will continue with normal configuration
+		// via telnet or http so that the netmask can be expanded appropriately.  Note that
+		// the router entry is added with the "transient" flag and low preference.
+#ifdef ICMP_VERBOSE
+		printf("ICMP: Ping configured address.  Was %08lX, now is %08lX\n",
+		  _if_tab[iface].ipaddr, myip);
+#endif
+		_abort_socks(NETERR_IPADDR_CHANGE, iface);
+		_if_tab[iface].ipaddr = myip;
+		_if_tab[iface].mask = 0xFFFFFFFF;
+		_if_tab[iface].flags |= IFF_ICMP_CFG_OK;
+		router_add(hisip, iface, -100 /*preference*/, 900000 /*15 min timeout*/, RTE_TRANSIENT);
+	}
+
+#ifdef ICMP_ECHOREQ_CALLBACK
+   if (icmp->unused.type == ICMPTYPE_ECHO_REQ) {
+      if (!ICMP_ECHOREQ_CALLBACK(myip, IF_DEFAULT, bcast, ip)) {
+         #ifdef ICMP_VERBOSE
+         printf("ICMP: echo request rejected by callback\n");
+         #endif
+         return LL;
+      }
+   }
+   else
+#else
+		// Default to rejecting if non-matching dest addr, unless it is
+      // broadcast or loopback.  In the latter case, we accept ICMP to
+      // any of the addresses in the 127.x.y.z range.
+      if (!bcast && !lo && myip != _if_tab[iface].ipaddr)
+         return LL;
+#endif
+
+   // Ignore if broadcast request or destination addr mismatch
+   // (except possibly for echo request).
+   if (bcast
+      #ifdef ICMP_RESPOND_TO_BCAST_ECHOREQ
+       && icmp->unused.type != ICMPTYPE_ECHO_REQ
+      #endif
+      )
+      return LL;
+
+   switch (icmp->unused.type) {
+   case ICMPTYPE_ECHOREPLY :
+#ifdef ICMP_VERBOSE
+      if(debug_on > 0) printf("ICMP: Echo Reply\n");
+#endif
+
+      /* check if we were waiting for it */
+      ping_hcache = hisip;
+      ping_tcache = MS_TIMER - intel(icmp->echo.identifier);
+      ping_number = intel(icmp->echo.index);
+      /* do more */
+      break;
+
+   case ICMPTYPE_ECHO_REQ :
+#ifdef ICMP_VERBOSE
+      printf("ICMP: Echo Request len=%u\n", len);
+#endif
+
+		//Vantive 23956: now use ARP lookup instead of sending back to source's MAC address.
+      ath = arpresolve_start_iface(hisip, iface);
+      if (ath > 0 && (ath = arpresolve_check(ath, hisip)) > 0) {
+         // Router/localhost resolved, use its MAC
+#ifdef ICMP_VERBOSE
+      	if (debug_on > 0) printf("ICMP: ...using ARP table entry\n");
+#endif
+         arpcache_hwa(ath, destmac);
+      }
+      else {
+         // Not imediately available, fall back to source MAC address
+#ifdef ICMP_VERBOSE
+      	if (debug_on > 0) printf("ICMP: ...using sender hw address as fallback\n");
+#endif
+         memcpy(destmac, &((eth_Header *)hdrbuf)->source, sizeof(destmac));
+      }
+
+      pkt = (struct _pkt *)pkt_reply_ip(LL->iface, pkt_hdr, &g, (eth_address *)destmac);
+
+      newicmp = &pkt->icmp;
+
+      memcpy(newicmp, icmp, 8);	// Copy the ICMP header
+      // Truncate the length to max that we can return.
+      if (len > MAX_MTU-20) {
+      	len = MAX_MTU-20;
+#ifdef ICMP_VERBOSE
+      	printf(" ...truncating to len=%u (max MTU=%u)\n", len, MAX_MTU);
+#endif
+		}
+
+      g.len2 = len - 8;
+      g.data2 = LL->data1 + (LL->tport_offs+8);
+      newicmp->echo.type = ICMPTYPE_ECHOREPLY;
+      newicmp->echo.code = code;
+
+      /* note that ip values are still in network order */
+      icmp_Reply( pkt, bcast ? intel(_if_tab[iface].ipaddr) : ip->destination, ip->source, 8, ip->tos, &g);
+      break;
+
+   case ICMPTYPE_UNREACHABLE :
+#ifdef ICMP_VERBOSE
+      if (debug_on > 0 ) printf("ICMP: Unreachable, code %d\n", code);
+#endif
+   	if (code > 12)
+			break;
+   	msgbase = NETERR_NET_UNREACH;
+   _icmp_upcall:
+      /* handle udp or tcp socket */
+#ifndef DISABLE_TCP
+      if (retval->proto == TCP_PROTO)
+         _tcp_notify((icmp_ip_t *)icmp, msgbase+code, LL);
+#endif
+#ifndef DISABLE_UDP
+      if (retval->proto == UDP_PROTO)
+         _udp_notify((icmp_ip_t *)icmp, msgbase+code, LL);
+#endif
+      break;
+
+   case ICMPTYPE_SOURCE_QUENCH :
+#ifdef ICMP_VERBOSE
+      if (debug_on > 0 ) printf("ICMP: Source Quench\n");
+#endif
+   	code = 0;
+   	msgbase = NETERR_SOURCE_QUENCH;
+   	goto _icmp_upcall;
+
+   case ICMPTYPE_REDIRECT :
+#ifdef ICMP_VERBOSE
+      if (debug_on >= 1) printf("ICMP: redirect code %d\n", code);
+#endif
+   	if (code > 3)
+			break;
+   	msgbase = NETERR_REDIRECT_NET;
+   	// Handle redirect.  We don't distinguish redirects for TOS from normal redirects.
+   	if (code == 0 || code == 2)
+	   	// We ignore redirects for networks.
+   		break;
+   	// Validate the source of the redirect.  Must be on our subnet.
+   	if (ip_iface(hisip, 1) != iface)
+   		break;
+   	// Validate the router.  It must be on the subnet of the incoming interface.
+   	router = intel(icmp->redirect.new_router);
+   	if (ip_iface(router, 1) != iface)
+   		break;
+   	// Must be for host.  Tell ARP to add a new router entry and update ARP table entry for host.
+   	// This starts a new resolve for the specified router.
+   	host = intel(retval->destination);
+   	if ((rath = router_add(router, (byte)iface, 0, 0, RTE_REDIRECT)) < 0)
+   		break;
+#ifdef ICMP_VERBOSE
+      if (debug_on >= 1) printf("ICMP: added redirect router %08lX\n", router);
+#endif
+   	ath = arpcache_search(host, 0);
+   	if (ath > 0) {
+   		arpcache_load(ath, NULL, IF_ANY, ATE_REDIRECTED | ATE_ROUTER_HOP, _router_last_add);
+   		arpresolve_start(host);	// Re-resolve him (redirect router may need it).
+#ifdef ICMP_VERBOSE
+      	if (debug_on >= 1) printf("ICMP: redirected host %08lX\n", host);
+#endif
+   	}
+   	break;
+
+   case ICMPTYPE_TIMEEXCEEDED :
+#ifdef ICMP_VERBOSE
+      if (debug_on > 0) printf("ICMP: Time exceeded code %d\n", code);
+#endif
+		if (code > 1)
+			break;
+		msgbase = NETERR_TTL_EXC;
+		goto _icmp_upcall;
+
+   case ICMPTYPE_PARAM_PROBLEM :
+#ifdef ICMP_VERBOSE
+      if (debug_on > 0) printf("ICMP: Parameter problem code %d\n", code);
+#endif
+		if (code > 1)
+			break;
+		msgbase = NETERR_PARAM_PROB;
+		goto _icmp_upcall;
+
+#ifdef ICMP_ROUTER_DISCOVERY
+	case ICMPTYPE_ROUTER_ADV :
+		// Router advertisement.  If valid, add to our router table.
+#ifdef ICMP_VERBOSE
+      if (debug_on > 0) printf("ICMP: Router discovery\n");
+#endif
+		if (code)
+			break;
+		num_rtr = intel16(icmp->radv.num_addrs);
+		if (!num_rtr)
+			break;
+		if (intel16(icmp->radv.addr_size) < 2)
+			break;
+		if (len < 8 + 4 * num_rtr * intel16(icmp->radv.addr_size))
+			break;
+		// Passed validity according to RFC 1256
+		// Add routers to our table
+		for (j = 0; j < num_rtr; ++j) {
+	      router = intel(icmp->radv.addrs[j].addr);
+	      if (ip_iface(router, 1) != iface)
+	         continue;	// Not reachable on this interface
+#ifdef ICMP_VERBOSE
+      	if (debug_on > 0) printf("ICMP: adding router 0x%08lX pref %ld\n",
+      			router, intel(icmp->radv.addrs[j].preference));
+#endif
+			router_add(router, (byte)iface,
+				intel(icmp->radv.addrs[j].preference),
+				intel(icmp->radv.lifetime)*1000uL, RTE_TRANSIENT);
+	   }
+		break;
+	case ICMPTYPE_ROUTER_SOL :
+		// Router solicitation.  Since we are a host, this is ignored.
+		break;
+#endif
+
+   default : /* unknown */
+#ifdef ICMP_VERBOSE
+      if (debug_on > 0) printf("ICMP: Unimplemented Type %d, code %d\n", (int)icmp->unused.type, code);
+#endif
+      break;
+
+   }
+   return LL;
+}
+
+/*** BeginHeader setICMPEchoHandler, ICMPEchoHandler */
+void setICMPEchoHandler( icmp_echohandler_type user_handler );
+extern icmp_echohandler_type ICMPEchoHandler;
+/*** EndHeader */
+
+icmp_echohandler_type ICMPEchoHandler;
+
+_icmp_nodebug
+void setICMPEchoHandler ( icmp_echohandler_type user_handler )
+{
+   #GLOBAL_INIT { ICMPEchoHandler = NULL; }
+
+   ICMPEchoHandler = user_handler;
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+

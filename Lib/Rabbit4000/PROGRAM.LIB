@@ -1,0 +1,335 @@
+/* START LIBRARY DESCRIPTION *********************************************
+PROGRAM.LIB
+	Digi International, Copyright (c) 2008.  All rights reserved.
+
+DESCRIPTION:  This library must be used when the program is compiled (as
+opposed to when the BIOS is compiled).  This would also be a
+reasonable place to put program libraries.
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader */
+#ifndef __PROGRAM_LIB
+#define __PROGRAM_LIB
+
+#ifndef _program_debug
+   #define _program_debug __nodebug
+#endif
+/*** EndHeader */
+
+
+/*** BeginHeader _copysysstack */
+__lcall__ void _copysysstack();
+/*** EndHeader */
+
+#asm
+_copysysstack::
+	;; lcall function does not need to save xpc
+   ;; Normalize address from DXXX to EXXX
+   ld de, (__initial_stack)
+   ld a, d
+   and 0x0f
+   or 0xe0
+   ld d, a
+   ;; subtract 1 from XPC part of address to account for D to E adjustment
+   ld hl, (__initial_stack+2)
+   dec hl
+   ld lxpc, hl
+   ; load 19 into hl and bc (16 + 3 for call to this function)
+   or a	; clear carry
+	ld hl, 0xdfff	; 3 more than the the high stack position (accounts for return addres on stack)
+   sbc hl, sp
+	ld bc, hl
+   ; load the current stack (+16) into hl
+	add hl, sp
+   ; now copy
+   lddr
+   ld a, d
+   and 0x0f
+   or 0xd0
+   ld d, a
+   inc de
+   inc de
+   inc de
+   ld (__initial_stack), de
+	lret
+#endasm
+
+/*** BeginHeader dc_timestamp */
+extern const unsigned long dc_timestamp;
+/*** EndHeader */
+// date/time stamp at the start of the compile (seconds since Jan. 1 1980)
+// Note that it is more efficient to use _DC_GMT_TIMESTAMP_ directly in your
+// program instead of the dc_timestamp constant.
+const unsigned long dc_timestamp = _DC_GMT_TIMESTAMP_;
+
+/*** BeginHeader __initial_stack */
+extern long __initial_stack;
+/*** EndHeader */
+
+long __initial_stack;
+
+/*** BeginHeader premain */
+__root void premain(void);
+// dummy equate insures that premain is always compiled
+#asm
+dummypremain: equ premain
+#endasm
+/*** EndHeader */
+//#use serdiag.lib
+
+
+void _init_bad_interrupts(void);
+
+#ifdef DCRTCP
+	#ifndef MCOS
+		#define DEFAULTSTACKSIZE 0x1000
+	#else
+		#define DEFAULTSTACKSIZE 0x200
+	#endif
+#else
+	#ifndef MCOS
+		#define DEFAULTSTACKSIZE 0x1000
+	#else
+   	#define DEFAULTSTACKSIZE 0x200
+	#endif
+#endif
+
+// Check that the SSL version is compatible with this processor
+#ifdef __SSL_LIB__
+   #ifndef _SSL_VERS
+      #define _OLD_SSL_4K
+   #elif _SSL_VERS < 0x0105
+      #define _OLD_SSL_4K
+   #endif
+   #ifdef _OLD_SSL_4K
+      #error "SSL versions prior to 1.05 are not compatible with Rabbit 4000 "
+      #fatal "or later processors.  Please upgrade to SSL 1.05 or later."
+      #undef _OLD_SSL_4K
+   #endif
+#endif
+
+/* START FUNCTION DESCRIPTION **************************************************
+premain							<PROGRAM.LIB>
+
+SYNTAX:	void premain();
+
+DESCRIPTION:	Dynamic C first calls premain to start initialization functions
+such as VdInit.  The last thing premain should do is call main.
+
+
+RETURN VALUE:	none.
+
+SEE ALSO:		ARGC
+END DESCRIPTION ***************************************************************/
+
+_program_debug
+__root
+void premain(void)
+{
+	/* WARNING: Local variables in premain should be static due
+	   to the fact that premain switches between the BIOS
+	   and program stacks. */
+
+#if CPU_ID_MASK(_CPU_ID_) >= R6000
+	// Initialize this so that PLL_SwitchCPU(1)
+	// can be called without returning in-use error
+	// if PLL_DO_NOT_USE_PLL_BY_DEFAULT #define'd
+	_pll_CPU_usingPLL = 0;
+
+ #ifndef PLL_DO_NOT_USE_PLL_BY_DEFAULT
+
+  #ifndef PLL_DEFAULT_PLL_SPEED_MHz
+	#define  PLL_DEFAULT_PLL_SPEED_MHz 325
+  #endif
+
+	if (!PLL_SwitchCPU(0))	// ensure CPU is running from regular clock
+	{
+		if (!PLL_Init(PLL_DEFAULT_PLL_SPEED_MHz))	// set up the PLL dividers
+		{
+			if (-ETIME == PLL_SwitchCPU(1))	// switch CPU to run from PLL output
+			{
+				// At this point, the PLL was started but timed out before
+				// stabilizing. We (blindly) attempt to shut off the PLL and
+				// continue, running the CPU from the regular clock.
+				PLL_SwitchCPU(0);
+			}
+		}
+	}
+ #endif
+#endif
+
+		#asm
+		ld		(dkInitStkTop), sp
+		xor	a
+		ld		(dkInBiosStack), a
+ #if defined MCOS || defined SLICING
+		ld		(bios_intnesting), a
+ #endif
+ #ifdef MCOS
+		ld		(OSRunning), a
+		ld		(dkOSRunning), a
+		ld		(dkPrologCount), a
+		clr	hl
+		ld		(OSTCBCur), hl
+		ld		(dkLastTCB), hl
+		ld		(dkDbgTCB), hl
+ #endif
+		#endasm
+ 	_init_bad_interrupts();
+	_init_xalloc();
+
+	// initialize stdio streams
+	// printf, puts, gets, etc. won't work until this function is called
+	_stdio_files_init();
+
+ #ifdef USE_CORE_INIT
+	coreInit();   // Located in RCMxxxx_Bios.lib for core module family
+ #endif
+
+ #if _SERIAL_BOOT_FLASH_
+	_sbf_bios_initSF();	//Re-initialize serial flash.
+ #endif
+
+	// Disable watch expressions in _GLOBAL_INIT()
+ #ifndef _DEBUG_GLOBAL_INIT
+	_DISABLE_DEBUG;
+ #endif
+
+	#pragma nowarn warnt 		 // Supress warning for missing prototype
+	_GLOBAL_INIT();             // trigger the function blocks
+
+ #ifndef _DEBUG_GLOBAL_INIT
+	// Re-enable watch expressions
+	_ENABLE_DEBUG;
+ #endif
+
+	// initialize stack allocation for user programs
+	_Init_Stacks();
+	__initial_stack = _Alloc_Stack(DEFAULTSTACKSIZE);
+	if (!__initial_stack)
+	{
+		exception(-ERR_BADSTACKALLOC);
+		exit(-ERR_BADSTACKALLOC);
+	}
+	_ProgStkSwitch(__initial_stack);
+	dkInitStkTop = (int) __initial_stack;
+
+	// initialize virtual watchdogs, the secondary watchdog and the periodic ISR.
+	VdInit();
+
+ #ifdef PORTA_AUX_IO
+		#asm
+		ld		a, (SPCRShadow)		; change to the aux I/O bus
+		or		a, 0x0c
+		ld		(SPCRShadow), a
+ioi	ld		(SPCR), a
+		#endasm
+ #endif   // PORTA_AUX_IO
+
+/* START FUNCTION DESCRIPTION **************************************************
+ARGC,ARGV,main                                                    <PROGRAM.LIB>
+
+SYNTAX:	#define ARGC number
+         #define ARGV string, string, ...
+         int main(int argc, char *argv[]);
+
+DESCRIPTION:
+      The POSIX standard defines main to have two arguments:
+      -  argc is the number of command-line arguments passed in
+      -  argv is an array of strings, one for each command line argument
+
+      To use argc and argv, define the macros ARGC and ARGV.  ARGC should be
+      the number of arguments, and ARGV should be the same number of
+      comma-separated strings.  Traditionally, the first string is the name of
+      the executable:
+
+         #define ARGC 3
+         #define ARGV "hello.program", "hello world", "life is grand!"
+
+         int main(int argc, char **argv) {...}
+
+      If either ARGC and ARGV are defined, both must be defined.  The default
+      values are ARGC == 1, and ARGV == "Dynamic C",.
+
+RETURN VALUE:	Dynamic C currently ignores the value returned from main() (if
+               any)
+
+SEE ALSO:		premain
+END DESCRIPTION ***************************************************************/
+
+   // main can be int main(), void main(), int main(void), int main(argc, argv),
+   // etc., so it cannot be prototyped.  Call it as main(argc, argv) when ARGC
+   // is defined, otherwise call it as main().
+   #if defined(ARGC) ^ defined(ARGV)
+      #error "If either ARGC or ARGV is defined, both must be defined"
+   #elif defined(ARGC)
+      {
+         static char *argv[] = {ARGV};
+         main(ARGC, argv);
+      }
+   #else
+      main();
+   #endif
+
+	// Anything that should happen during an orderly shutdown should be added
+	// to the exit() function itself, since it's called in all cases except
+	// abort() or a watchdog timeout.
+	exit(0);
+}
+
+
+/*** BeginHeader _init_bad_interrupts */
+void _init_bad_interrupts(void);
+/*** EndHeader */
+// _init_bad_interrupts()
+//
+// Set all interrupt vectors NOT already set by the BIOS
+//	to default "unexpected interrupt" handler.  Note:  we
+// also skip over the periodic interrupt vector since it
+// may still be running from a previous program...
+// ld		hl,ERR
+// jp    _unexp_interrupt
+#define UEI(BASE, OFS, ERR)	ld (BASE+OFS),bc		$\
+										ld	de,ERR						$\
+										ld (BASE+OFS+1),de	$\
+                        		ld	(BASE+OFS+3),a	$\
+                        		ld	(BASE+OFS+4),hl
+
+#asm
+_init_bad_interrupts::
+
+	ld		a, 0xC3						;jp opcode
+	ld		hl, _unexp_interrupt
+	ld		bc, 0x21						;ld hl,mn opcode
+	; skip the periodic interrupt
+   ; skip the secondary watchdoe interrupt
+	UEI(INTVEC_BASE, RST10_OFS, -ERR_UNEXPECTEDRST10)
+	; skip the RST 18h, 20h, 28h interrupts
+	UEI(INTVEC_BASE, SYSCALL_OFS, -ERR_UNEXPECTEDSYSCALL)
+	UEI(INTVEC_BASE, RST38_OFS, -ERR_UNEXPECTEDRST38)
+	UEI(INTVEC_BASE, SLAVE_OFS, -ERR_UNEXPECTEDSLAVE)
+	UEI(INTVEC_BASE, WPV_OFS, -ERR_UNEXPECTEDWPV)
+	UEI(INTVEC_BASE, TIMERA_OFS, -ERR_UNEXPECTEDTIMERA)
+	UEI(INTVEC_BASE, TIMERB_OFS, -ERR_UNEXPECTEDTIMERB)
+	; skip the serial port A interrupt
+	UEI(INTVEC_BASE, SERB_OFS, -ERR_UNEXPECTEDSERIALB)
+	UEI(INTVEC_BASE, SERC_OFS, -ERR_UNEXPECTEDSERIALC)
+	UEI(INTVEC_BASE, SERD_OFS, -ERR_UNEXPECTEDSERIALD)
+	; now do external interrupts
+	UEI(XINTVEC_BASE, EXT0_OFS, -ERR_UNEXPECTEDEXT0)
+	UEI(XINTVEC_BASE, EXT1_OFS, -ERR_UNEXPECTEDEXT1)
+
+	UEI(INTVEC_BASE, PWM_OFS,  -ERR_UNEXPECTEDPWM)
+	UEI(INTVEC_BASE, SMV_OFS, -ERR_UNEXPECTEDSMV)
+	UEI(INTVEC_BASE, QUAD_OFS, -ERR_UNEXPECTEDQUAD)
+	UEI(INTVEC_BASE, INPUTCAP_OFS, -ERR_UNEXPECTEDINPUTCAP)
+	UEI(INTVEC_BASE, SLV_OFS, -ERR_UNEXPECTEDSSLV)
+	UEI(INTVEC_BASE, SERE_OFS, -ERR_UNEXPECTEDSERIALE)
+	UEI(INTVEC_BASE, SERF_OFS, -ERR_UNEXPECTEDSERIALF)
+	ret
+#endasm
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

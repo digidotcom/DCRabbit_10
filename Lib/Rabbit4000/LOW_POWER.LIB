@@ -1,0 +1,514 @@
+/* START LIBRARY DESCRIPTION *********************************************
+LOW_POWER.LIB
+Copyright (c) 2006, Rabbit Semiconductor
+
+DESCRIPTION:	Routines for controlling power consumption rate.
+
+REVISION HISTORY:
+	2005 Apr 01  omid	 Reworked for operation on all core modules & boards.
+	2010 Jan 06  SJH   Updated to work with Rabbit 6000
+
+END DESCRIPTION **********************************************************/
+
+/*** Beginheader */
+#ifndef __LOW_POWER_LIB
+	#define __LOW_POWER_LIB
+
+//#define LOWPOWER_VERBOSE
+//#define LOWPOWER_DEBUG
+
+#ifdef LOWPOWER_DEBUG
+	#define _LowPower_nodebug __debug
+#else
+	#define _LowPower_nodebug __nodebug
+#endif
+
+#define NUM_POWER_MODES 10
+
+/*** Endheader */
+
+/*** BeginHeader set_cpu_power_mode */
+
+#define	CLKDOUBLER_OFF		0
+#define	CLKDOUBLER_ON		1
+#define	SHORTCS_OFF			0
+#define	SHORTCS_ON			1
+
+
+int set_cpu_power_mode(unsigned int mode, char clkDoubler, char shortChipSelect);
+
+/*** EndHeader */
+
+#define	_GCSRCLKDIV_1		0x08
+#define	_GCSRCLKDIV_2		0x0C
+#define	_GCSRCLKDIV_4		0x18
+#define	_GCSRCLKDIV_6		0x1C
+//#define	_GCSRCLKDIV_8		0x04	//periph clock=main osc, proc clock=mainosc/8
+#define	_GCSRCLKDIV_8		0x00		//periph clock=proc clock=mainosc/8
+
+#define _GPSCR32CLKDIV_1	0x00
+#define _GPSCR32CLKDIV_2	0x04
+#define _GPSCR32CLKDIV_4	0x05
+#define _GPSCR32CLKDIV_8	0x06
+#define _GPSCR32CLKDIV_16	0x07
+
+char _lp_1st_time;
+
+word  _saved_freq_divider;
+word  _canon_freq_divider;
+word  _debug_bps;
+char  _savedGCDR;
+char  _savedGCSR;
+char  _savedTAT4;
+#if _RAB6K
+char	_savedPLL_on;	// whether on
+char	_savedPLL_pd;	// predivider
+char	_savedPLL_ld;	// loop divider
+#endif
+
+/* START FUNCTION DESCRIPTION ********************************************
+set_cpu_power_mode						<LOW_POWER.LIB>
+
+SYNTAX:			int set_cpu_power_mode(unsigned int mode, char clkDoubler,
+							char shortChipSelect);
+
+DESCRIPTION:	Sets operating power of the CPU.  Since lowering the
+					CPU clock speed (especially to 32kHz modes) may have a drastic
+					effect on communication and interrupt handling, the caller
+					should:
+
+					1) Suspend serial communication and other data transmission
+					activity (including Ethernet or Wifi).
+
+					2) Halt interrupt processing.
+
+					Resume these processes after restoring to high clock speed.
+
+					This function is non-reentrant.
+
+					** Rabbit 6000 Note **
+					This CPU is limited in power saving modes, because it is
+					not possible for most applications to run the CPU from the
+					32kHz clock (doing so trashes the internal dynamic RAM).
+					It is recommended to use the PLL_SwitchCPU() function
+					in PLL.LIB instead of using this function.  Do not mix use
+					of the functions in PLL.LIB with those in this library.
+
+PARAMETER1:		Mode operation. Use the following table values below.
+					(The higher the value the lower the power consumption of
+					CPU.).  Note that mode 0 restores to the state that was
+					in effect the first time this function was called.
+					** NOTE **
+					On the Rabbit 6000, it is not advisable to use the 32kHz
+					clock to run the CPU.  If attempted, the contents of the
+					main internal RAM will be erased, since this RAM is
+					dynamic and requires the CPU to run at at least a few MHz
+					in order to get refreshed.  The 32Khz modes are retained
+					for the Rabbit 6000 in case it is permissible to erase the
+					internal memory contents during low power mode.
+					Since the Rabbit 6000 normally runs from the PLL, new modes
+					have been added to allow the PLL to be disabled, and run
+					the CPU directly from the PLL input clock.  Basically,
+					adding 10 to mode numbers 1..5 will run the CPU from the
+					input clock, which is considerably slower than the PLL
+					output, hence saving power.
+
+PARAMETER2:    Clock doubler setting. Use CLKDOUBLER_ON, or CLKDOUBLER_OFF.
+               This parameter only affects main oscillator modes, not 32 kHZ
+               oscillator modes. Turning Clock doubler off reduces power
+               consumption.  This parameter ignored if mode==0.
+               ** NOTE **
+               The clock doubler can only be switched on if it was on
+               at boot time.  In particular, the Rabbit 6000 usually does
+               not use the clock doubler (since the PLL provides a fast
+               clock) hence this parameter is ignored for most Rabbit
+               6000 boards.
+
+PARAMETER3:		Short Chip Select setting. Use SHORTCS_OFF, or SHORTCS_ON.
+					Note: When short chip select is on, make sure that interrupts
+               are disabled during I/O operations. Turning Short Chip Select
+               on may reduce power consumption.  This parameter ignored if
+               mode==0. (See pg. 87 of Rabbit 3000 processor manual for more
+               information).
+
+Mode	Description								Comments
+====	================================	==========================
+ 0    Reset to initial state           On Rabbit 6000, does not modify PLL
+                                       setting.  If PLL was changed, this
+                                       may result in loss of debug.
+ 1 	Cclk=Pclk=MainOsc   					Debug capable
+ 2		Cclk=Pclk=MainOsc/2 					Debug capable (1/2 max baud rate)
+ 3 	Cclk=Pclk=MainOsc/4 					Debug capable (1/4 max baud rate)
+ 4		Cclk=Pclk=MainOsc/6              etc.
+ 5		Cclk=Pclk=MainOsc/8
+
+(Modes 6..10 not recommended for Rabbit 6000, will trash dynamic RAM)
+ 6		Cclk=Pclk 			  = 32.768KHz	Periodic Int disabled; hitwd()
+ 7		Cclk=Pclk=32KHz/2   = 16.384KHz	Periodic Int disabled; hitwd()
+ 8		Cclk=Pclk=32KHz/4   =  8.192KHz	Periodic Int disabled; hitwd()
+ 9		Cclk=Pclk=32KHz/8   =  4.096KHz	Periodic Int disabled; hitwd()
+10		Cclk=Pclk=32kHz/16  =  2.048KHz	Periodic Int disabled; hitwd()
+
+(Modes 11..15 for Rabbit 6000 only)
+11 	Cclk=Pclk=InputOsc (i.e. input to PLL)
+12 	Cclk=Pclk=InputOsc/2
+13 	Cclk=Pclk=InputOsc/4
+14 	Cclk=Pclk=InputOsc/6   Caution: may be insufficient for RAM refresh
+15 	Cclk=Pclk=InputOsc/8   Caution: may be insufficient for RAM refresh
+
+RETURN VALUE:	0 if valid parameter,
+					-1 if invalid parameter,
+
+END DESCRIPTION **********************************************************/
+
+_LowPower_nodebug
+int set_cpu_power_mode(unsigned int mode, char clkDoubler, char shortChipSelect)
+{
+	auto word new_gcsr, new_gpscr, new_div, was_32k, now_32k, no_pll;
+#GLOBAL_INIT { _lp_1st_time = 1; }
+
+	if (_lp_1st_time) {
+		// First time.  Save "reference" values for doubler setting,
+		// debug baud rate timer, etc.  Calling with mode 0 will
+		// restore to this state.
+		_lp_1st_time = 0;
+
+	#if _RAB6K
+		_savedPLL_pd = RdPortI(GCM1R) & 0x0F;
+		_savedPLL_ld = RdPortI(GCM0R) & 0x1F;
+	#endif
+
+		_savedGCDR = RdPortI(GCDR);
+		_savedGCSR = RdPortI(GCSR);
+	   // Compute 'canonical' freq divider i.e. as if CPU was running on
+	   // main oscillator, with clock doubler on, and no lock divider.
+	   // For the R6000, the PLL is assumed to be set for an 8x
+	   // multiplication (i.e. 25MHz -> 200MHz).
+	   _saved_freq_divider = freq_divider;
+	   _canon_freq_divider = _saved_freq_divider + 1;
+	   if (!(_savedGCDR & 0x1F))
+			_canon_freq_divider *= 2;
+		switch (_savedGCSR & 0x1C) {
+		default: break;
+		case 0x00: _canon_freq_divider *= 8; break;
+		case 0x0C: _canon_freq_divider *= 2; break;
+		case 0x18: _canon_freq_divider *= 4; break;
+		case 0x1C: _canon_freq_divider *= 6; break;
+		}
+	#if _RAB6K
+		_savedPLL_on = 0;
+		if (!(RdPortI(MSCR) & 0x80))
+			// No PLL, convert to canonical for 8x PLL.
+			_canon_freq_divider *= 8;
+		else {
+			// Is running from PLL, normalize to 8x PLL.
+			_savedPLL_on = 1;
+			_canon_freq_divider = _canon_freq_divider * 16 * _savedPLL_pd / _savedPLL_ld;
+		}
+	#endif
+	   // Compute current debug speed in units of 600 bps.
+	   _savedTAT4 = RdPortI(TAT4R);
+	   _debug_bps = 32 * freq_divider / (_savedTAT4 + 1);
+	   // Coerce debug speed to standard value
+	   if (_debug_bps < 6)
+	   	_debug_bps = 4;	// 2400
+	   else if (_debug_bps < 12)
+	   	_debug_bps = 8;	// 4800
+	   else if (_debug_bps < 24)
+	   	_debug_bps = 16;	// 9600
+	   else if (_debug_bps < 48)
+	   	_debug_bps = 32;	// 19200
+	   else if (_debug_bps < 80)
+	   	_debug_bps = 64;	// 38400
+	   else if (_debug_bps < 96*3/2)
+	   	_debug_bps = 96;	// 57600
+	   else if (_debug_bps < 192*3/2)
+	   	_debug_bps = 192;	// 115200
+	   else if (_debug_bps < 384*3/2)
+	   	_debug_bps = 384;	// 230k
+	   else if (_debug_bps < 768*3/2)
+	   	_debug_bps = 768;	// 460k
+	   else
+	   	_debug_bps = 1536;	// 920k
+	}
+
+	was_32k = (RdPortI(GCSR) & 0x18) == 0x10;
+
+#ifdef LOWPOWER_VERBOSE
+	// only print debugging messages when running on main oscillator
+	if (!was_32k) {
+	   printf("\n Switching to mode %d.", mode);
+	   printf("\n Using %s clock.\n", mode < 6 ? "main CPU":"32 KHZ");
+	}
+#endif
+
+	// Check for valid range of mode
+#if _RAB6K
+	// Account for silicon bug: change /6 and /8 modes to /4.
+	//if (mode == 4 || mode == 5)
+	//	mode = 3;
+	if (mode > 15u)
+		return -1;
+	if (mode >= 11u) {
+		mode -= 10;
+		no_pll = 1;
+	}
+	else
+		no_pll = 0;
+#else
+   if (mode > 10u)
+   	return -1;
+#endif
+
+	if (!mode) {
+		now_32k = 0;
+		GCDRShadow = _savedGCDR;
+		new_gcsr = _savedGCSR & 0x1F;
+		new_gpscr = GPSCRShadow & 0xF8;
+		freq_divider = _saved_freq_divider;
+		TAT4RShadow = _savedTAT4;
+#if _RAB6K
+		no_pll = !_savedPLL_on;
+#endif
+		goto _setClk;
+	}
+
+   now_32k = mode >= 6u;
+
+
+   // Decide whether or not clock doubler should be turned on.  If it was
+   // not on at initial call, this will have no effect.
+	GCDRShadow = (clkDoubler && mode < 6) ? _savedGCDR : (_savedGCDR & 0xE0);
+	// new_div is scaled up by 64 to improve fixed point math precision
+	new_div = 64;
+	if (!(GCDRShadow & 0x1F))
+		new_div *= 2;
+	// Setup shortChipSelect as a register mask
+   shortChipSelect = (shortChipSelect) ? 0x10 : 0x00;
+
+	new_gpscr = 0;
+	new_gcsr = 0x14;	// Default 32k, with main osc and periodic ISR disabled
+   switch (mode) {
+   	case 1: new_gcsr = _GCSRCLKDIV_1 | 1;              break;
+   	case 2: new_gcsr = _GCSRCLKDIV_2 | 1; new_div *= 2; break;
+   	case 3: new_gcsr = _GCSRCLKDIV_4 | 1; new_div *= 4; break;
+   	case 4: new_gcsr = _GCSRCLKDIV_6 | 1; new_div *= 6; break;
+   	case 5: new_gcsr = _GCSRCLKDIV_8 | 1; new_div *= 8; break;
+   	case 6: new_gpscr = _GPSCR32CLKDIV_1; break;
+   	case 7: new_gpscr = _GPSCR32CLKDIV_2; break;
+   	case 8: new_gpscr = _GPSCR32CLKDIV_4; break;
+   	case 9: new_gpscr = _GPSCR32CLKDIV_8; break;
+   	case 10: new_gpscr = _GPSCR32CLKDIV_16; break;
+
+   }
+#if _RAB6K
+	if (no_pll)
+		new_div *= 8;
+	else
+		new_div = new_div * 16 / (RdPortI(GCM0R) & 0x1F) * (RdPortI(GCM1R) & 0x0F) ;
+#endif
+   new_gpscr |= GPSCRShadow & 0xF8 | shortChipSelect;
+   freq_divider = (word)(((long)_canon_freq_divider * 128 / new_div + 1)/2);
+	TAT4RShadow = (64 * freq_divider / _debug_bps + 1)/2 - 1;
+	freq_divider -= 1;
+
+_setClk:
+
+#asm _LowPower_nodebug
+
+	ld		a,0x5a
+  	ioi 	ld (WDTCR),a			  	;hit watchdog
+
+   ld    a,(GCDRShadow)          ;set clock doubler on or off
+   ioi   ld (GCDR),a
+
+	ld		hl,(sp+@sp+new_gpscr)
+	ld		a,L
+	ld		(GPSCRShadow),a
+	ioi	ld (GPSCR),a
+
+#if _RAB6K
+	ioi ld	a,(MSCR)
+	res	7,a
+	ld		hl,(sp+@sp+no_pll)
+	bool	hl
+	jr		nz,.ldmscr
+	set	7,a
+.ldmscr:
+	ioi ld (MSCR),a
+#endif
+
+	ld		hl,(sp+@sp+new_gcsr)
+	ld		a,L
+	ld		(GCSRShadow),a
+	ioi	ld (GCSR),a
+
+	; Update debug timers
+	ld		a,(TAT4RShadow)
+	ioi	ld (TAT4R),a
+
+	ld		a,0x5a
+  	ioi 	ld (WDTCR),a			  	;hit watchdog
+
+	ld		hl,(sp+@sp+now_32k)
+	bool	hl
+	jr		nz,.nowait
+
+	; If starting up main clock (from 32k), delay a while to
+	; stabilize clock, since the oscillator was turned off.
+	ld		bc,8192
+.waitloop:
+	dwjnz	.waitloop
+
+	ld		hl,(sp+@sp+was_32k)
+	bool	hl
+	jr		z,.nowait
+	; Also update timers if going back to fast clock (they are
+	; not updated automatically in 32k clock mode because the periodic
+	; interrupt is disabled).
+	call	updateTimers
+.nowait:
+
+#endasm
+	return 0;
+}
+
+/*** BeginHeader timedAlert */
+__root void timedAlert(unsigned long timeout);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+timedAlert																<LOW_POWER.LIB>
+
+SYNTAX:			void timedAlert(unsigned long timeout)
+
+DESCRIPTION:	Use this function to poll real-time clock until timeout occurs.
+					It will enter into low power mode.  Upon timeout
+					this function will enable normal	power source
+					Analog device oscillator will be disabled and enabled.
+				   This function is non-reentrant.
+
+PARAMETER1:		Timeout in seconds.
+
+RETURN VALUE:	None
+
+END DESCRIPTION **********************************************************/
+_LowPower_nodebug
+void timedAlert(unsigned long timeout)
+{
+	if (timeout == 0)
+	{
+		exception(ERR_BADPARAMETER);
+		exit(ERR_BADPARAMETER);
+	}
+
+	//Cclk = Pclk = 32kHz/16 = 2.048KHz
+	use32kHzOsc();								// main osc off, CPU and periph on 32kHz
+	set32kHzDivider(OSC32DIV_16);			// 32kHz divide for CPU and periph
+
+#asm
+	call	read_rtc							; returns current time in BCDE
+	ld		jkhl, (sp+@sp+timeout)
+	add	jkhl, bcde						; JKHL = target RTC value (BCDE + timeout)
+
+.polltime:
+	ld		a,05ah
+	ioi 	ld (WDTCR),a		;2 sec hitwd
+
+	push	jkhl					; preserve JKHL
+	call	read_rtc				; load current RTC into BCDE
+	pop	jkhl					; restore JKHL
+
+	cp		jkhl, bcde
+
+	jr		nc, .polltime
+#endasm
+
+	useMainOsc();					//recover from 32khz divided operations
+}
+
+
+/*** BeginHeader digInAlert */
+__root void digInAlert(int dataport, int portbit, int value, unsigned long
+	timeout);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+digInAlert																<LOW_POWER.LIB>
+
+SYNTAX:	void digInAlert(int dataport, int portbit, int value, unsigned long
+timeout);
+
+DESCRIPTION:	Use this function to poll digital input for a value
+					or until timeout occurs.
+					It will enter into low power mode.  Upon timeout or
+					correct byte from receiver, this function will enable normal
+					power source and exit.
+				   This function is non-reentrant.
+
+PARAMETER1:		Input port data register to poll, PADR for example.
+
+PARAMETER2:		Input port bit to poll (0 - 7).
+
+PARAMETER3:		Input value of 0 or 1 to receive.
+
+PARAMETER4:		Timeout in seconds if input value is not received on channel.
+					Enter 0 for no timeout.
+
+RETURN VALUE:	None
+
+END DESCRIPTION **********************************************************/
+_LowPower_nodebug
+void digInAlert(int dataport, int portbit, int value, unsigned long timeout)
+{
+	auto int notime, bitmask, match;
+	auto long waittime;
+
+	bitmask = (1 << portbit);
+	match = value ? bitmask : 0;
+	notime = ! timeout;
+
+	//Cclk = Pclk = 32kHz/16 = 2.048KHz
+	use32kHzOsc();								// main osc off, CPU and periph on 32kHz
+	set32kHzDivider(OSC32DIV_16);			// 32kHz divide for CPU and periph
+
+#asm
+		call	read_rtc						; returns current time in BCDE
+		ld		jkhl, (sp+@sp+timeout)
+		add	jkhl, bcde					; JKHL = target RTC value (BCDE + timeout)
+		ld		(sp+@sp+waittime), jkhl	; target RTC value
+
+.polltime:
+		ld		hl, (sp+@sp+notime)
+		bool	hl
+		jp		nz,.pollinput		; no timeout check
+
+		ld		a,05ah
+ioi 	ld		(WDTCR),a			;2 sec hitwd
+
+		call	read_rtc				; load current RTC into BCDE
+		ld		jkhl, (sp+@sp+waittime)		; compare current RTC to target RTC
+		cp		jkhl, bcde
+		jr		c, .done				; timeout
+
+.pollinput:
+		ld		a,05ah
+ioi 	ld		(WDTCR),a			;2 sec hitwd
+
+		ld		hl, (sp+@sp+bitmask)
+		ld		a, L
+		ld		hl, (sp+@sp+dataport)
+ioi	and	a, (hl)
+		ld		hl, (sp+@sp+match)
+		cp		L
+		jp		nz, .polltime		; doesn't match yet, try again
+
+.done:
+#endasm
+
+	useMainOsc();					//recover from 32khz divided operations
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

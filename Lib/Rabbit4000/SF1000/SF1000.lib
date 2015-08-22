@@ -1,0 +1,1045 @@
+/* START LIBRARY DESCRIPTION **************************************************
+SF1000.LIB 1.16
+
+Copyright Rabbit Semiconductor Inc. Feb 2006
+
+Modification list
+ 11-Jan-2006 EK   1.16 Add long cast for TIMER calc in WaitReady function.
+ 18-Oct-2004 JLC	1.15 modifed error return code (-2) in SF1000Write
+								modify wait algorithm in WaitReady
+ 11-Aug-2004 JLC	1.14 add code for multiple SF10xx devices
+ 29-Aug-2003 JLC	1.13 minor timing adjustment for SF1016
+ 26-Aug-2003 JLC	1.12 add 1.0 MB part - AT45DB081B for RCM3700
+ 28-May-2003 JLC	1.11 add 0.5M part - AT45DB041B for TinyCore
+ 			reduced size of prefix bytes to 8 - removed checksum
+  6-Feb-2003 JLC	1.10 add 16MB part, add write cycles to prefix
+			Changed definitions of DENS_xMB to accomodate 16MB part
+			Modified WaitReady - added 1 second timeout
+  7-Nov-2002 JLC	1.01 add SF1000_FAST_WRITE macro to allow writing a single
+  			sector and not wait for it to finish
+
+This library contains several functions which allow connection to an
+external serial flash device (Atmel AT45DBnnn) via either an SPI or a
+parallel interface.
+
+Flash notes:
+1) All references to RAM refer to Buffer 1 in the flash device.  These
+		functions do not currently make use of Buffer 2 to implement
+		double buffering.
+2) A prefix area within each sector contains three values of interest:
+	a) a fixed sync value indicating that the sector has been written
+		at least once
+	b) version number
+	c) a long integer value for the number of times the sector has been written
+
+The Rabbit 2000 shifts out data on the falling edge and reads in data on
+the rising edge of the clock.  The AT45Dxxx will do the same IF the clock
+is high when /CS transitions from high to low.
+
+NOTES:
+
+Flash Commands which are implemented	(x = don't care bits):
+0x53	read from flash to buffer 1:		2x, 12 address, 10x
+													7x, 14 address, 11x	16 MB
+
+0x54	read from buffer 1:					14x, 10 address, 8x, <data>
+0xD4
+													21x, 11 address, 8x	16 MB
+
+0xD7	read the status register			<status byte>
+			bit  7: device status:	1=Ready		0=Busy
+			bit  6: compare			1=differ		0=match
+			bits 5..3: density
+
+0x83	write from buffer 1 to flash:		 2x, 12 address, 10x		2 MB
+0x83												 1x, 13 address, 10x		4 MB
+0x83												13x, 11 address			8 MB
+0x81	page erase								7x, 14 address, 11x		16 MB
+0x88	write from buffer 1 to flash		7x, 14 address, 11x		16 MB
+
+0x84	write data to buffer 1:				13x, 11 address, <data>
+0x84												21x, 11 address, <data>	16 MB
+
+See SF1000Init for interface details
+
+END DESCRIPTION **********************************************************/
+
+/*****************************************************************************/
+/*****************************************************************************/
+
+/*** BeginHeader */
+#ifndef __SF1000LIB
+#define __SF1000LIB
+/*** EndHeader */
+
+/*** Beginheader */
+#use "spi.lib"
+
+#ifndef SF1000_DEBUG
+#define SF1000_DEBUG		__nodebug
+#endif
+
+#ifndef SF1000_DEBUG_DELAY
+#define SF1000_DEBUG_DELAY 7
+#endif
+
+//								**** set up chip select ****
+#ifndef SF1000_COUNT			// if no user SF1000cs function
+
+#ifndef SF1000_CS_PORT		// if no CS port
+
+#ifdef SPI_SER_A
+#define SF1000_CS_PORT			GOCR
+#define SF1000_CS_PORTSHADOW	GOCRShadow
+#define SF1000_CS_BIT				4
+
+#else // not SPI_SER_A
+#warnt "No SF1000 /CS Interface defined: using PB7"
+#define SF1000_CS_PORT			PBDR
+#define SF1000_CS_PORTSHADOW	PBDRShadow
+#define SF1000_CS_BIT				7
+#endif // SPI_SER_A
+
+#endif // if no SF1000_CS_PORT
+
+#ifndef CS_ENABLE
+#define CS_ENABLE	 BitWrPortI ( SF1000_CS_PORT, &SF1000_CS_PORTSHADOW, 0, SF1000_CS_BIT ); \
+	SPIxor = 0xFF;		// invert the received bits
+#define CS_DISABLE BitWrPortI ( SF1000_CS_PORT, &SF1000_CS_PORTSHADOW, 1, SF1000_CS_BIT )
+#endif
+
+#else // SF1000_COUNT is defined
+
+#define CS_ENABLE	 SF1000cs (1); \
+	SPIxor = 0xFF;		// invert the received bits
+#define CS_DISABLE SF1000cs (0);
+
+#endif // SF1000_COUNT
+
+//								**** define memory sizes ****
+#define DENS__5MB		0x07
+#define DENS_1MB		0x09
+#define DENS_2MB		0x0A
+#define DENS_4MB     0x0C
+#define DENS_8MB		0x0E
+#define DENS_16MB		4
+#define DENS_32MB		0
+
+
+#define SYNC_VALUE			0xC0	// this value should never be changed!!!
+#define VERSION				0xA2	// program version number
+#define VERSION_0				0xA0	// original version number
+
+typedef struct
+{
+	char	SyncValue;			//  1
+	char	Version;				//  1
+	long	WriteCount;			//  4
+	int	WriteCycles;		//  2
+   char	dummy[24];			// place holder from eearlier versions
+} SF1000_Prefix_struct;
+
+/*** endheader */
+
+
+/*** Beginheader ReadStatus */
+
+// low level flash function prototypes
+int	RAMtoSector		( int Sector );
+int	SectorToRAM		( int Sector );
+
+int	WriteRAM			( char* Data, int StartAddr, int ByteCount );
+int	ReadRAM			( char* Data, int StartAddr, int ByteCount );
+
+int	ReadStatus		( void );
+int	WaitReady		( void );
+void	ClearComp		( void );
+void	SF_2us			( void );
+
+// low level misc function prototypes
+int	CheckFlashAddr	( long DestAddr, int BytesToWrite );
+int	ReadPrefixBlock ( void );
+void	RevBytes			( int Address );
+
+extern const char sZeros[];
+
+extern SF1000_Prefix_struct SF1000_Prefix;
+
+extern int	SF1000_Density_Value;
+extern int	SF1000_Sector_size;
+extern int	SF1000_Block_size;
+extern unsigned int	SF1000_Nbr_of_Blocks;
+extern long	SF1000_Unit_Bytes;
+extern int	SF1000_Unit;
+
+extern char SF1000_String[];
+extern int	Prefix_Bytes;
+
+extern int SectorInRAM;
+extern int SectorInPrefix;
+
+extern int	WaitReadyFlag;
+extern unsigned long DelayEnd;
+
+/*** endheader */
+
+const char sZeros[] = { 0,0,0,0,0,0,0,0,0,0 };
+
+SF1000_Prefix_struct SF1000_Prefix;
+
+int	SF1000_Density_Value;
+int	SF1000_Sector_size;
+int	SF1000_Block_size;
+unsigned int	SF1000_Nbr_of_Blocks;
+long	SF1000_Unit_Bytes;
+int	SF1000_Unit;
+
+char	SF1000_String[32];		// general purpose transmit/receive string
+int	Prefix_Bytes;				// SECTOR_SIZE - BLOCK_SIZE = nbr of prefix bytes
+
+int	SectorInRAM;
+int	SectorInPrefix;
+
+int	WaitReadyFlag;
+unsigned long DelayEnd;
+
+/********************************************************************/
+/***************** Low Level Flash Functions ************************/
+/********************************************************************/
+
+
+/*****************************************************************
+Write RAM buffer 1 to a flash sector
+Input Parameter: Sector number
+Return values:
+	 0 = success
+	-1 = failure writing to the SF1000 RAM buffer
+	-2 = failure to erase the flash sector (16MB part only)
+   -3 = failure writing the flash sector
+Note: the flash sector must have been read into the flash RAM
+*/
+
+SF1000_DEBUG
+int RAMtoSector ( int Sector )
+{
+	auto unsigned long	EndTime;
+   auto int i;
+   static int	EraseCount;
+
+#GLOBAL_INIT { EraseCount = 0; }
+
+// update the prefix area (in RAM) of the sector
+	ReadPrefixBlock ();						// get the prefix info
+	if ( SF1000_Prefix.SyncValue != SYNC_VALUE ) // if first time
+	{	SF1000_Prefix.WriteCount = 1;		// initialize write count
+		SF1000_Prefix.WriteCycles = 1;	// initialize write cycles
+	}
+	if ( SF1000_Prefix.Version == VERSION_0 )
+		SF1000_Prefix.WriteCycles = (int)SF1000_Prefix.WriteCount;
+	if ( SF1000_Prefix.Version == 0xA1 )
+		SF1000_Prefix.WriteCycles = (int)SF1000_Prefix.dummy;
+
+	SF1000_Prefix.SyncValue = SYNC_VALUE; // insert sync byte
+	SF1000_Prefix.Version = VERSION;		// and version
+	SF1000_Prefix.WriteCount += 1;		// increment write count
+	SF1000_Prefix.WriteCycles += 1;		// and write cycles
+
+// write prefix to the SF1000 RAM
+	CS_ENABLE;
+	SPIWrite ( "\x84", 1 );					// write to RAM
+	if ( SF1000_Density_Value == DENS_16MB )
+		SPIWrite ( sZeros, 1 );				// 1st 8 don't care bits
+	SPIWrite ( sZeros, 3 );					// 24 bits required by flash
+	SPIWrite ( (char*)&SF1000_Prefix, Prefix_Bytes ); 	// send prefix values to RAM
+	CS_DISABLE;
+	if ( WaitReady () < 0 ) return -1;
+
+// write the data in RAM to the flash
+	CS_ENABLE;
+	if ( SF1000_Density_Value == DENS_16MB )
+	{
+	// erase the page first
+		SPIWrite ( "\x81", 1 );				// page erase
+		RevBytes ( Sector>>5 );				// send bits 13..5
+		RevBytes ( Sector<<11 );			// send bits 4..0 and the extra byte
+		CS_DISABLE;
+
+#if SF1000_DEBUG_DELAY & 1
+/*
+		EndTime = TICK_TIMER + 50; 		// 488usec per tick
+		while ( (long) (TICK_TIMER - EndTime) < 0 );	// delay time
+*/
+   	EraseCount += 1;						// update nbr of erases
+      if ( (long) (MS_TIMER - DelayEnd) > 0 )
+      	// if >100 ms between writes
+			EraseCount = 0;					// start count over
+      else
+		{ 	if ( EraseCount >= 16 )			// if more than X sequential erases
+         {  EndTime = TICK_TIMER + 100; 		// 488usec per tick
+				while ( (long) (TICK_TIMER - EndTime) < 0 );	// delay time
+				EraseCount = 0;				// restart count
+         }
+      }
+#endif
+
+		WaitReadyFlag = 1;
+		if ( WaitReady () < 0 ) return -2; // wait for erase to complete
+
+   // now write the data from RAM
+		CS_ENABLE;
+		SPIWrite ( "\x88", 1 );	 			// write RAM to sector
+		RevBytes ( Sector>>5 );				// send bits 13..5
+		RevBytes ( Sector<<11 );			// send bits 4..0 and the extra byte
+   }
+   else
+   {
+		SPIWrite ( "\x83", 1 );				// write RAM to sector
+		i = 4;									// default sector multiplier
+		if ( SF1000_Density_Value == DENS_8MB ) i = 8;
+		if ( SF1000_Density_Value == DENS__5MB ) i = 2;
+		RevBytes ( Sector*i );				// send the sector number
+		SPIWrite ( sZeros, 1 );	 			// required by command
+   }
+	CS_DISABLE;
+
+#ifndef SF1000_FAST_WRITE
+	if ( WaitReady () < 0 ) return -3;	// wait for write to complete
+#endif
+	DelayEnd = MS_TIMER + 100;				// set up for next write
+
+	return 0;
+} // RAMtoSector
+
+
+/*****************************************************************  53
+Read a flash sector into flash RAM buffer 1
+Input Parameter: Sector number
+Return values:
+	 0 = success
+	-1 = failure
+*/
+SF1000_DEBUG
+int SectorToRAM ( int Sector )
+{	auto int i;
+
+	if ( WaitReady () < 0 ) return -1;
+	CS_ENABLE;
+	SPIWrite ( "\x53", 1 );					// transfer sector to RAM
+	if ( SF1000_Density_Value == DENS_16MB )
+	{	RevBytes ( Sector>>5 );				// send bits 13..5
+		RevBytes ( Sector<<11 );			// send bits 4..0 and the extra byte
+   }
+	else
+	{	i = 4;									// 4MB part
+		if ( SF1000_Density_Value == DENS_8MB ) i = 8;
+		if ( SF1000_Density_Value == DENS__5MB ) i = 2;
+   	RevBytes ( Sector*i );				// send the sector number
+		SPIWrite ( sZeros, 1 );			  	// required by command
+   }
+	CS_DISABLE;
+	SectorInRAM = Sector;					// save current sector number
+	if ( WaitReady () < 0 ) return -1;
+	return 0;
+} // SectorToRAM
+
+
+/*****************************************************************  84
+Write data to flash RAM buffer 1
+Input Parameters:
+	1: address of data
+	2: Starting Address within the RAM
+	3: Number of bytes
+Return values:
+	 0 = success
+	-1 = failure
+*/
+SF1000_DEBUG
+int WriteRAM ( char* Data, int StartAddr, int ByteCount )
+{
+	if ( WaitReady () < 0 ) return -1;
+	CS_ENABLE;
+	SPIWrite ( "\x84", 1 );					// write to RAM
+	if ( SF1000_Density_Value == DENS_16MB )
+		SPIWrite ( sZeros, 1 );				// 1st 8 don't care bits
+	SPIWrite ( sZeros, 1 );					// required by command
+	RevBytes ( StartAddr+Prefix_Bytes ); // send the starting address
+	SPIWrite ( Data, ByteCount );			// send the data
+	CS_DISABLE;
+	return 0;
+} // WriteRAM
+
+
+/*****************************************************************  54
+Read from flash RAM buffer 1
+Input Parameters:
+	1: address to put data
+	2: Starting Address within the RAM
+	3: Number of bytes
+*/
+SF1000_DEBUG
+int ReadRAM ( char* Data, int StartAddr, int ByteCount )
+{
+	CS_ENABLE;
+	if ( SF1000_Density_Value == DENS_16MB )
+	{	SPIWrite ( "\xD4", 1 );				// read from RAM
+		SPIWrite ( sZeros, 1 );				// 8 x
+   }
+	else if ( SF1000_Density_Value == DENS_8MB )
+		SPIWrite ( "\xD4", 1 );				// read from RAM
+	else
+		SPIWrite ( "\x54", 1 );				// read from RAM
+
+	SPIWrite ( sZeros, 1 );					// 8 x
+	RevBytes ( StartAddr+Prefix_Bytes );	// 5 x, 11 addr
+	SPIWrite ( sZeros, 1 );					// 8 x
+	SPIRead ( Data, ByteCount );			// read user data
+	CS_DISABLE;
+	return 0;
+} // ReadRAM
+
+
+/*****************************************************************  D7
+Read the Status Register
+*/
+SF1000_DEBUG
+int ReadStatus ( void )
+{
+	CS_ENABLE;
+	SPIWrite ( "\xD7", 1 );					// command to
+	if ( SF1000_Density_Value == DENS_16MB )
+		SPIWrite ( sZeros, 1 );				// optional dummy byte
+	SPIRead ( SF1000_String, 1 );			// read the status register
+	CS_DISABLE;
+	return ( (int) SF1000_String[0] );
+} // ReadStatus
+
+
+void SF_us();
+/*****************************************************************  D7
+Read the Status Register - wait for Ready
+return values:
+	>0 = success
+	-1 = illegal status value
+   -2 = timeout (>1 sec)
+*/
+#asm
+SF_us::
+		ld		a, 15		; 10 counts per millisecond
+
+SF_us0:					; 100usec loop @ 25.8MHz
+		ld		b, 86			; 4
+SF_us1:	; each iteration = 1.163us with a 25.8MHz clock
+		push	IX				;12
+      pop	IX				; 9
+		nop					; 2
+		nop					; 2
+		djnz	SF_us1		; 5
+
+      dec	a
+      jr		nz, SF_us0
+      ret					; 8
+#endasm
+
+SF1000_DEBUG
+int WaitReady ( void )
+{	auto int i;
+	auto unsigned long EndTime;
+
+	EndTime = MS_TIMER+1000L;
+	do
+	{
+		CS_ENABLE;
+
+#if SF1000_DEBUG_DELAY & 2
+		if (WaitReadyFlag == 1 )
+			SF_us();
+#endif
+
+		SPIWrite ( "\xD7", 1 );				// ask for status
+
+#if SF1000_DEBUG_DELAY & 4
+		if (WaitReadyFlag == 1 )
+			SF_us();
+#endif
+
+   	SPIRead ( SF1000_String, 1 );		// read the status register
+		i = SF1000_String[0];				// keep status bit
+		if ( i == 0  ||  i == 0xFF ) i = -1; // force illegal value exit
+		if ( (long)(MS_TIMER - EndTime) >= 0 ) i = -2; // force timeout exit
+		CS_DISABLE;
+	} 	while ( (i & 0x80) == 0 );			// check status bit
+	WaitReadyFlag = 0;
+	return ( i );
+} // WaitReady
+
+
+/********************************************************************/
+/***************** Low Level Misc Functions *************************/
+/********************************************************************/
+
+
+/********************************************************************
+Verify that the starting address and number of bytes does
+not overflow the flash.
+*/
+SF1000_DEBUG
+int CheckFlashAddr ( long DestAddr, int BytesToWrite )
+{	auto unsigned long i;
+
+	i = DestAddr + (long)BytesToWrite;	// calculate end address
+#ifndef SF1000_COUNT
+	if ( i >= SF1000_Unit_Bytes ) return -1;
+#else
+	SF1000_Unit = (int)(DestAddr/SF1000_Unit_Bytes);
+   if ( i >= SF1000_Unit_Bytes*SF1000_COUNT ) return -1;
+#endif
+	return 0;
+} // CheckFlashAddr
+
+
+/********************************************************************
+Read flash prefix block from flash RAM buffer 1
+Sector must have already been read from flash into flash RAM buffer 1
+Return values:
+	 0 = success
+	-1 = failure
+	-2 = invalid prefix
+*/
+SF1000_DEBUG
+int ReadPrefixBlock ( void )
+{
+	if ( WaitReady () < 0 ) return -1;
+	CS_ENABLE;
+	if ( SF1000_Density_Value == DENS_16MB )
+	{	SPIWrite ( "\xD4", 1 );				// read from RAM
+		SPIWrite ( sZeros, 1 );				// 8 x
+   }
+	else if ( SF1000_Density_Value == DENS_8MB )
+		SPIWrite ( "\xD4", 1 );				// read from RAM
+	else
+		SPIWrite ( "\x54", 1 );				// read from RAM
+
+	SPIWrite ( sZeros, 4 );					// 14 x, 10 addr, 8 x: where addr = 0
+	SPIRead ( (char*)&SF1000_Prefix, Prefix_Bytes ); // read prefix block
+	CS_DISABLE;
+
+	SectorInPrefix = SectorInRAM;
+	if ( SF1000_Prefix.SyncValue == SYNC_VALUE  &&
+			SF1000_Prefix.Version == VERSION )
+		return 0;
+	else
+		return -2;
+} // ReadPrefixBlock
+
+/********************************************************************
+Reverse the byte order of the integer and transmit it via SPI
+*/
+SF1000_DEBUG
+void	RevBytes ( int Address )
+{	auto char bytes[2];
+
+	bytes[0] = Address>>8;					// msb
+	bytes[1] = Address & 0xFF;				// lsb
+	SPIWrite ( bytes, 2 );
+} // RevBytes
+
+
+/********************************************************************/
+/******************* User API Functions *****************************/
+/********************************************************************/
+
+
+/*** Beginheader SF1000EraseBlock */
+int SF1000EraseBlock ( int Block );
+/*** endheader */
+
+/* START FUNCTION DESCRIPTION ****************************************
+SF1000EraseBlock                  <SF1000.LIB>
+
+SYNTAX:	      int SF1000EraseBlock ( int Block );
+
+DESCRIPTION:   Erase a single block
+
+PARAMETER1:   	(int) block number (0 relative)
+
+RETURN VALUE: 	 0 = success
+					-1 = error reading device status
+					-2 = error erasing the block
+
+END DESCRIPTION *****************************************************/
+
+
+SF1000_DEBUG
+int SF1000EraseBlock	( int Block )
+{
+#ifndef SF1000_COUNT			// if no user SF1000cs function
+	if ( Block >= SF1000_Nbr_of_Blocks ) return -1;
+#else
+	if ( Block >= SF1000_Nbr_of_Blocks*SF1000_COUNT ) return -1;
+#endif
+	if ( WaitReady () < 0 ) return -1;
+	CS_ENABLE;
+	SPIWrite ( "\x81", 1 );					// erase the block
+	RevBytes ( Block*4 );					// send the block number
+	SPIWrite ( sZeros, 1 );					// required by command
+	CS_DISABLE;
+	if ( WaitReady () < 0 ) return -2;
+	return (0);
+} // SF1000EraseBlock
+
+
+
+/*** Beginheader SF1000Init */
+int SF1000Init ( void );
+/*** endheader */
+
+/* START FUNCTION DESCRIPTION ****************************************
+SF1000Init                   <SF1000.LIB>
+
+SYNTAX:	      int SF1000Init ( void );
+
+DESCRIPTION:   Minimal setup needed to verify correct flash operation
+
+PARAMETER1:    None
+
+RETURN VALUES:		 0 = success
+						-1 = invalid density value read
+						-2 = unknown response
+						-3 = maybe no device?
+
+NOTES:
+(1) The user may choose to implement more than one flash device by
+simply developing his/her own CS_ENABLE/CS_DISABLE functions such that
+they apply the CS signal to the devices appropriately.  The only
+restriction is that all flash devices are the same part number.  The
+CS_ENABLE macro in this library also sets SPIxor to 0xFF.  This is
+required because the SF1000 has a transistor invertor for level
+shifting on the data out of the serial flash device.
+
+(2) When using one of the synchronous serial ports the receive and
+transmit functions use a bit swapping algorithm in order to compensate
+for the fact that the SPI on the Rabbit 2000 transmits and receives
+the least significant bit first.  This algorithm uses a table lookup
+in order to decrease execution time.
+
+The following is a description of the values which the user may define
+BEFORE the #use SF1000.lib statement:
+
+			****** Items 1..3 are required by SPI.LIB ******
+(1) Interface (default is SPI_SER_B)
+	SPI_SER_A			use serial port A ( default: STATUS is chip select )
+	SPI_SER_B			use serial port B ( default: PB7 is chip select )
+	SERB_USEPORTD		define this to use the alternate serial port B pins
+	SPI_MODE_PARALLEL	use a parallel I/O port
+
+(2) SPI Bit Rate if using serial port (default is 5)
+	SPI_CLK_DIVISOR	This is the divisor for the appropriate Timer A register.
+
+(3) I/O bits for parallel interface							(defaults)
+	SPI_TX_REG		register for clock and Tx data		(PDDR)
+	SPI_TXD_BIT		bit number for Tx Data					(bit 1)
+	SPI_CLK_BIT		bit number for Clock						(bit 0)
+	SPI_RX_REG		register for Rx data						(PDDR)
+	SPI_RXD_MASK	mask for Rx bit							(8, bit 3)
+	NOTES for the parallel interface:
+	(1) the default values will be used if SPI_TX_REG is not defined.
+		If SPI_TX_REG is defined then all the values must be defined.
+	(2) the transmit data and clock bits must be in the same register
+	(3) the user MUST initialize the I/O port as required for
+		proper operation of the appropriate output and input bits!
+
+(4) I/O bit to be used for Chip Select - default is PB7
+	SF1000_CS_PORT
+	SF1000_CS_PORTSHADOW
+	SF1000_CS_BIT
+		note: if SF1000_CS_PORT is defined then ALL 3 must be defined!
+		note: these values are used in the CS_ENABLE & CS_DISABLE macros
+					in this library
+
+(5) If you have multiple, IDENTICAL SF10xx devices on the same serial port
+	you must have a function which enables and disables the appropriate chip
+   select bit.  That function must be named SF1000cs and accept a single
+   parameter: CS state: 0=disable, 1=enable
+	Function prototype example:
+   	void SF1000cs ( int CS_state );
+	The global variable SF1000_Unit (0 relative) must be used to determine
+   	which chip select signal is to be activated.
+	The function must follow the #use SF1000.
+	You must also define the macro SF1000_COUNT, before the #use SF1000, as
+   the number of SF10xx devices ( 1 relative ) in your system.
+
+	All the devices MUST be the same model and be on the same serial port.
+   You need to remove R7 from all but one unit.
+
+The following functions are provided for the user API:
+int	SF1000Init			( void );
+int	SF1000Write			( long FlashAddrDest, void * Data, int ByteCount );
+int	SF1000Read			( long FlashAddrSource, void * Data, int ByteCount );
+long	SF1000CheckWrites	( int Block );
+
+The functions will block until complete but do not disable interrupts.
+The functions are NOT re-entrant.
+
+GLOBALS DEFINED:
+			int	SF1000_Density_Value:
+         			DENS__5MB	AT45DB041B
+         			DENS_1MB		AT45DB081B
+         			DENS_4MB		AT45DB322B
+                  DENS_8MB		AT45DB642B
+                  DENS_16MB	AT45DB1282B
+			int	SF1000_Block_size					nbr of bytes in a block
+			unsigned int SF1000_Nbr_of_Blocks	nbr of blocks in a single SF10xx
+			long	SF1000_Unit_Bytes					nbr of bytes in a single SF10xx
+			int	SF1000_Unit	 - used only with multiple SF1000s
+END DESCRIPTION *****************************************************/
+
+SF1000_DEBUG
+int SF1000Init ( void )
+{	auto int i, j;
+
+
+#if SF1000_CS_PORT == GOCR
+	BitWrPortI ( GOCR, &GOCRShadow, 1, 5 ); // enable STATUS pin as /CS
+#endif
+
+// cycle the chip select to get it ready
+#ifndef SF1000_COUNT			// if no user SF1000cs function
+	CS_DISABLE;
+	CS_ENABLE;
+	CS_DISABLE;
+#else
+	for (SF1000_Unit=0; SF1000_Unit<SF1000_COUNT; SF1000_Unit++ )
+   {	SF1000cs ( 0 );
+  		SF1000cs ( 1 );
+     	SF1000cs ( 0 );
+   }
+	SF1000_Unit = 0;							// set up for ReadStatus
+#endif
+
+	SPIinit ();									// set up the serial port
+
+//	while (1)
+	i = ReadStatus();
+	i = ReadStatus();
+	if ( i == 0xFF ) return (-3);			// maybe no flash device connected???
+	if ( i & 0x80 )							// if flash is ready
+	{	SF1000_Density_Value = (i >> 2) & 0xF; // get density value
+   	if ( SF1000_Density_Value >= 0x0A )
+      	SF1000_Density_Value &= 0x0E;	// clear bit 2 for "older" units
+		i = 0;									// show success
+		switch (SF1000_Density_Value)
+		{
+			case DENS__5MB:
+				SF1000_Sector_size = 264;
+				SF1000_Block_size = 256;
+				SF1000_Nbr_of_Blocks = 2048;
+				break;
+			case DENS_1MB:
+				SF1000_Sector_size = 264;
+				SF1000_Block_size = 256;
+				SF1000_Nbr_of_Blocks = 4096;
+				break;
+			case DENS_2MB:
+				SF1000_Sector_size = 528;
+				SF1000_Block_size = 512;
+				SF1000_Nbr_of_Blocks = 4096;
+				break;
+			case DENS_4MB:
+				SF1000_Sector_size = 528;
+				SF1000_Block_size = 512;
+				SF1000_Nbr_of_Blocks = 8192;
+				break;
+			case DENS_8MB:
+				SF1000_Sector_size = 1056;
+				SF1000_Block_size = 1024;
+				SF1000_Nbr_of_Blocks = 8192;
+				break;
+			case DENS_16MB:
+				SF1000_Sector_size = 1056;
+				SF1000_Block_size = 1024;
+				SF1000_Nbr_of_Blocks = 16384;
+				break;
+			default:
+				i = -1;
+		}
+		Prefix_Bytes = SF1000_Sector_size - SF1000_Block_size;
+												// starting offset into sector for data
+		SF1000_Unit_Bytes = (long)SF1000_Block_size * (long)SF1000_Nbr_of_Blocks;
+	}
+	else i = -2;
+
+// initialize some values
+	SectorInRAM = -1;
+	SectorInPrefix = -1;
+	DelayEnd = MS_TIMER + 100;			// set up for first write
+
+	return i;
+} // SF1000Init
+
+
+/*** Beginheader SF1000Write */
+int SF1000Write ( long FlashAddrDest, void * SrcAddr, int ByteCount );
+/*** endheader */
+
+/* START FUNCTION DESCRIPTION ****************************************
+SF1000Write                  <SF1000.LIB>
+
+SYNTAX:	      int SF1000Write ( long FlashAddrDest, void * SrcAddr,
+						int ByteCount );
+
+DESCRIPTION:   Write a block of data to the flash
+
+PARAMETER1:		(long) address of destination
+PARAMETER2:		(void*) source RAM starting address
+PARAMETER3:		(int) number of bytes to write
+
+RETURN VALUES: 	 0 = success
+					  	-1 = illegal byte count or starting address
+						-2 = error reading flash sector
+						-3 = device not ready - only used if SF1000_FAST_WRITE is
+                  		defined
+						-11..-13 = error writing to a sector
+
+If SF1000_FAST_WRITE is not defined the function can handle any number of
+bytes up to 65K.  It will block until the bytes have been written.
+
+If SF1000_FAST_WRITE is defined then you are limited to writing to a single
+block, see SF1000_Block_size.  The function will return to the caller while
+the flash is being written.  Calling this function before the previous write
+has completed will result in a -3 error code.  Attempting to write across a
+block boundary will result in a -1 error code.
+THIS FEATURE IS CURRENTLY NOT AVAILABLE WITH THE 16 MB UNIT.
+
+END DESCRIPTION *****************************************************/
+
+SF1000_DEBUG
+int SF1000Write ( long FlashAddrDest, void * SrcAddr, int ByteCount )
+{	auto int	BytesToWrite;
+	auto int Block;
+	auto int	Offset;
+	auto int i;
+
+	if ( CheckFlashAddr ( FlashAddrDest, ByteCount ) ) return -1;
+
+#ifdef SF1000_FAST_WRITE
+	i = ReadStatus ();			// get current status
+	if ( (i & 0x80) == 0 ) return -3; // exit if not ready
+#endif
+
+	Block = (int)(FlashAddrDest / SF1000_Block_size);
+	Offset = (int)(FlashAddrDest % SF1000_Block_size); // offset into first block
+
+#ifdef SF1000_FAST_WRITE
+	if ( Offset + ByteCount > SF1000_Block_size ) return -1;
+#endif
+
+// write first sector
+	if ( Offset )								// if writing at end of first sector
+	{
+		BytesToWrite = SF1000_Block_size-Offset; // calculate byte count
+		if (BytesToWrite > ByteCount)
+				BytesToWrite = ByteCount;	// if all bytes in first block
+		if ( SectorToRAM ( Block ) < 0 ) return -2; // read the sector
+		WriteRAM ( SrcAddr, Offset, BytesToWrite );	// write new data to RAM
+		i = RAMtoSector ( Block );			// write RAM to flash
+		if (i) return i-10;
+		ByteCount -= BytesToWrite;			// update byte count
+		(char*)SrcAddr += BytesToWrite;	// point to next data to write
+		Block++;									// next block number
+#ifdef SF1000_COUNT
+		if ( Block == SF1000_Nbr_of_Blocks )
+      {	Block = 0;
+      	SF1000_Unit += 1;
+      }
+#endif
+	}
+
+// write "middle" sectors
+	while ( ByteCount >= SF1000_Block_size )
+	{
+		if ( SectorToRAM ( Block ) < 0 ) return -2; // read the sector
+		WriteRAM ( SrcAddr, 0, SF1000_Block_size ); // write new data to RAM
+		i = RAMtoSector ( Block );			// write RAM to flash
+		if (i) return i-10;
+		ByteCount -= SF1000_Block_size;	// update byte count
+		(char*)SrcAddr += SF1000_Block_size; // point to next data to write
+		Block++;									// next block number
+#ifdef SF1000_COUNT
+		if ( Block == SF1000_Nbr_of_Blocks )
+      {	Block = 0;
+      	SF1000_Unit += 1;
+      }
+#endif
+	}
+
+// write final sector
+	if ( ByteCount )							// if writing at beginning of last sector
+	{
+		if ( SectorToRAM ( Block ) < 0 ) return -2; // read the sector
+		WriteRAM ( SrcAddr, 0, ByteCount ); // write new data to RAM
+		i = RAMtoSector ( Block );			// write RAM to flash
+		if (i) return i-10;
+	}
+
+	return 0;
+} // SF1000Write
+
+
+/*** Beginheader SF1000Read */
+int SF1000Read			( long FlashAddrSource, void * DestAddr, int ByteCount );
+/*** endheader */
+
+/* START FUNCTION DESCRIPTION ****************************************
+SF1000Read                  <SF1000.LIB>
+
+SYNTAX:	      int SF1000Read ( long FlashAddrSource, void * DestAddr,
+						int ByteCount );
+
+DESCRIPTION:   Read a block of data from the flash
+
+PARAMETER1:		(long) address of source
+PARAMETER2:		(void *) destination RAM starting address
+PARAMETER3:		(int) number of bytes to read
+
+RETURN VALUES: 	 0 = success
+						-1 = illegal byte count
+						-2 = illegal flash address
+
+END DESCRIPTION *****************************************************/
+
+SF1000_DEBUG
+int SF1000Read  ( long FlashAddrSource, void * DestAddr, int ByteCount )
+{	auto int	BytesToRead;
+	auto int	Block;
+	auto int	Offset;
+
+	if ( CheckFlashAddr ( FlashAddrSource, ByteCount ) ) return -1;
+	Block = (int)(FlashAddrSource / SF1000_Block_size);
+	Offset = (int)(FlashAddrSource % SF1000_Block_size);
+
+// read first sector
+	if ( Offset )								// read end of first sector
+	{
+		BytesToRead = SF1000_Block_size-Offset; // calculate byte count
+		if (BytesToRead > ByteCount)
+				BytesToRead = ByteCount;	// if all bytes in first block
+		if ( SectorToRAM ( Block ) < 0 ) return -1; // read the sector
+		ReadRAM ( DestAddr, Offset, BytesToRead ); // read data from RAM
+		ByteCount -= BytesToRead;			// update byte count
+		(char*)DestAddr += BytesToRead;	// point to next data to write
+		Block++;									// next block number
+#ifdef SF1000_COUNT
+		if ( Block == SF1000_Nbr_of_Blocks )
+      {	Block = 0;
+      	SF1000_Unit += 1;
+      }
+#endif
+	}
+
+// read "middle" sectors
+	while ( ByteCount >= SF1000_Block_size )
+	{
+		if ( SectorToRAM ( Block ) < 0 ) return -1; // read the sector
+		ReadRAM ( DestAddr, 0, SF1000_Block_size ); // read data from RAM
+		ByteCount -= SF1000_Block_size;	// update byte count
+		(char*)DestAddr += SF1000_Block_size; // point to next data to write
+		Block++;									// next sector number
+#ifdef SF1000_COUNT
+		if ( Block == SF1000_Nbr_of_Blocks )
+      {	Block = 0;
+      	SF1000_Unit += 1;
+      }
+#endif
+	}
+
+// read final sector
+	if ( ByteCount )							// read beginning of last sector
+	{
+		if ( SectorToRAM ( Block ) < 0 ) return -1; // read the sector
+		ReadRAM ( DestAddr, 0, ByteCount );	// read data from RAM
+	}
+
+	return 0;
+} // SF1000Read
+
+
+/*** Beginheader SF1000CheckWrites */
+long SF1000CheckWrites	( int Block );
+/*** endheader */
+
+/* START FUNCTION DESCRIPTION ****************************************
+SF1000CheckWrites                  <SF1000.LIB>
+
+SYNTAX:	      long SF1000CheckWrites ( int Block );
+
+DESCRIPTION:   Read the number of times that a block has been written
+
+PARAMETER1:   	(int) block number (0 relative)
+
+RETURN VALUE: 	>=0 = the number of times the block has been written
+					-1 = illegal prefix value
+					-2 = illegal block number
+
+END DESCRIPTION *****************************************************/
+
+
+SF1000_DEBUG
+long SF1000CheckWrites ( int Block )
+{
+#ifndef SF1000_COUNT
+	if ( Block >= SF1000_Nbr_of_Blocks ) return -2;
+#else
+	SF1000_Unit = Block/SF1000_Nbr_of_Blocks;
+	if ( SF1000_Unit >= SF1000_COUNT ) return -2;
+   Block %= SF1000_Nbr_of_Blocks;		// block nbr within SF1000 unit
+#endif
+	if ( SectorToRAM ( Block ) < 0 ) return -1; // read the sector
+	if ( !ReadPrefixBlock () )				// read into local buffer
+		return (SF1000_Prefix.WriteCount);
+	else
+		return (-1);
+} // SF1000CheckWrites
+
+
+/*** BeginHeader */
+#endif	// __SF1000LIB
+/*** EndHeader */
+
+/*		call graph
+SF1000Write
+	CheckFlashAddress
+
+	SectorToRAM
+		WaitReady
+			SPIWrite
+			SPIRead
+		SPIWrite
+		SPIWrite
+		WaitReady
+	WriteRAM
+		WaitReady
+		SPIWrite
+		SPIWrite
+		SPIWrite
+	RAMtoSector
+		ReadPrefixBlock
+			WaitReady
+			SPIWrite
+			SPIWrite
+			SPIRead
+		SPIWrite
+		SPIWrite
+		SPIWrite
+		WaitReady
+		SPIWrite
+		WaitReady
+
+	SectorToRAM
+	WriteRAM
+	RAMtoSector
+
+	SectorToRAM
+	WriteRAM
+	RAMtoSector
+
+*/

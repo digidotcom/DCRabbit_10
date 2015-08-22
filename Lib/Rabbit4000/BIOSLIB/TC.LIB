@@ -1,0 +1,1816 @@
+/*** BeginHeader */
+#ifndef __TC_LIB
+#define __TC_LIB
+/*** EndHeader */
+
+/*** BeginHeader  */
+
+/*
+ * pull in the packet definitions
+
+ */
+#use "tc_defs.lib"
+
+/*
+ * TC-layer configuration
+ */
+#define DKC_FLASH_BUF_SIZE	1024
+
+/* if this is defined, interrupts will be turned back on while in the callbacks */
+//#define TC_NEST_INTERRUPTS
+
+/* the main state structure for the TC-layer */
+typedef struct {
+	/* function pointers to the low-level handlers */
+	int	(*ReadPort)();
+	int	(*WritePort)();
+	int	(*ClearReadInt)();
+
+	/* queue of pending TX packets */
+	faraddr_t	NextPacket;
+
+	/* list of RX buffers, indexed by 'type' */
+	faraddr_t	*RXBufferList;
+
+	/* list of callbacks, indexed by 'type' */
+	int	*CallbackList;
+
+	void	*TXState;
+	void	*RXState; 				 //	the address (state) of debugger kernel target communications
+	void	*TXSubState;				 //   the address (state) of which part (header/body/footer) to send next
+	void	*RXSubState;				 //   same as the above, for rx
+
+	_TC_PacketHeader	HeaderTX;
+	_TC_PacketFooter	FooterTX;
+	_TC_PacketHeader	HeaderRX;
+	_TC_PacketFooter	FooterRX;
+
+	char		TXBusy;						// boolean flag indicating if the transmitter is busy sending
+													// a packet at the moment. 0 if it is free, 1 if it is busy
+
+	int 	TXLength;
+	int	RXLength;						// length counts for the header/body/footer sections
+	char 	*TXPtr;
+	char	*RXPtr;					 		// current pointers into the respective buffers
+	char	TXEscChar;						// storage for the escaped character, after the xor 0x20
+	char	RXEsc;							// flag for if we need to un-escape the next character
+
+	uint16	TXBufferXPC;				// address of the buffer of the currently transmitting packet
+	uint16 	TXBufferOffset;
+
+	uint16	RXBufferXPC;				// address of the current receive buffer
+	uint16 	RXBufferOffset;
+
+	uint16	TXChecksum;
+	uint16	RXChecksum;					// storage for the currently-computing checksum
+	uint16	RXFinishedChecksum;
+
+	char	RXScheduleNAK;					// is a NAK scheduled for the end of this packet?
+	char	RXNAKType;						// type of the NAK that is scheduled
+
+	faraddr_t	CallbackQueue;			// a queue of pending finished packets, that need
+												// to be given to a callback
+
+	char	CallbackLock;					// 0 if a callback is not happening, 1 if it is
+
+	int		RXCurrentBufferIsSysBuf;	// true if the current buffer is a system buffer
+	uint16	RXCurrentBufferPool;			// a pointer to the pool the current buffer came from
+	faraddr_t	RXCurrentBuffer;			// a pointer to the current buffer that the receive
+													// driver is using
+
+	faraddr_t	CallbackSysbuf;			// system buffer currently being run through the callback
+
+	faraddr_t	TXCurrentBuffer;			// a pointer to the current buffer that the transmit
+													// driver is using
+
+	char	TrapSysWrites;						// if this is true, sys-writes will be trapped, and
+													// handled as a special case
+
+	int	(*SysWriteHandler)();			// If TrapSysWrites is true, this is the address of
+													// the handler that will be called after a sys-write
+													// header has been read
+
+	char	dont_nest_interrupts;			// set this flag to leave interrupts untouched (off)
+													// durring the callback
+} _tc_state;
+
+/* Useful prototypes */
+int _tc_queue_buffer(faraddr_t *chain, faraddr_t buffer);
+faraddr_t _tc_get_buffer(faraddr_t *chain);
+int _tc_create_queue(faraddr_t* chain, faraddr_t buffer, long bufsize, int number);
+int _tc_queue_empty(faraddr_t* chain);
+__root void dkcSystemINIT(void);
+
+/* extern so the struct can be seen globaly */
+extern _tc_state TCState;
+extern faraddr_t dkcRXBufferListStore[TC_MAX_APPLICATIONS];
+extern void *dkcCallbackListStore[TC_MAX_APPLICATIONS];
+extern faraddr_t dkcSystemBufPool;
+extern faraddr_t dkcWriteBufPhysical;
+__root void dkcSystemWriteHeader(void);
+
+/*
+ * Basic loads and stores from the _tc_state structure.
+ */
+#define TC_LOAD(dst,src) ld dst,(iy+[TCState]+src)
+#define TC_STOR(dst,src) ld (iy+[TCState]+dst),src
+
+/*
+ * Pointer (address) loads through the _tc_state structure.
+ * The register mentioned in the macro will be CLOBBERED
+ * when the macro runs! The final result will always be
+ * stored in hl.
+ */
+#define TC_LDA_DE(offset)	ld	de,[TCState]+offset $ ld hl,iy $ add hl,de
+#define TC_LDA_BC(offset) 	ld bc,[TCState]+offset $ ld hl,iy $ add hl,bc
+
+/* the actuall state structure */
+_tc_state TCState;
+
+/*** EndHeader */
+
+
+
+/*** BeginHeader dkcEntryRX, dkcEntryTX, dkcInit, dkcSystemProbed */
+__xmem void dkcInit();
+__root void dkcEntryRX();
+__root void dkcEntryTX();
+extern char dkcSystemProbed;
+/*
+*/
+#orgmac TC_SYSBUF_BLOCK_START = tc_buff physical start
+/*** EndHeader */
+
+char dkcSystemProbed;
+
+faraddr_t	dkcSystemBufBlock;		// the physical address of the start of the system buffers
+faraddr_t	dkcSystemBufPool;			// pool that the system buffers are allocated out of
+faraddr_t	dkcWriteBufPhysical;		// physical address of the WriteBlock buffer
+
+/* the list of receive buffer queues */
+faraddr_t dkcRXBufferListStore[TC_MAX_APPLICATIONS];
+
+/* list of callbacks, indexed by 'type' */
+// the first definition is probably more accurate, but gave compile issues
+//int ((*dkcCallbackList)())[TC_MAX_APPLICATIONS];
+void *dkcCallbackListStore[TC_MAX_APPLICATIONS];
+
+#asm __xmem
+dkcInit::	;	initialize the communication module
+      ld		hl,lxpc
+      push	hl
+
+		; blank out the 'type' indexed lists
+		ld		de,TC_MAX_APPLICATIONS
+		or		a
+		rl		de
+		ld		b,d
+		ld		c,e							; doubled value is in bc, as the first list is of (int)s
+		TC_LOAD(hl,CallbackList)
+		lcall	dkcClearMemory
+
+		ld		de,TC_MAX_APPLICATIONS
+		or		a
+		rl		de
+		rl		de
+		ld		b,d
+		ld		c,e							; bc == 4*TC_MAX_APPLICATIONS
+		TC_LOAD(hl,RXBufferList)
+		lcall	dkcClearMemory
+
+		bool	hl
+		ld		l,h
+		TC_STOR(CallbackQueue,hl)
+		TC_STOR(CallbackQueue+2,hl)			; init the callback queue to empty
+		TC_STOR(CallbackSysbuf,hl)
+		TC_STOR(CallbackSysbuf+2,hl)			; mark the buffer as a non-sysbuf
+
+		xor	a
+		TC_STOR(CallbackLock,a)					; callback lock is unlocked
+		TC_STOR(dont_nest_interrupts,a)		; nest interrupts by default
+      ld		(dkcSystemProbed),a
+
+		; init the send and receive ISRs
+		lcall	.dkcRXInit
+		lcall	.dkcTXInit
+		; init the internal system application
+		;call	dkcSystemBufINIT
+
+      pop	hl
+      ld		lxpc,hl
+		lret
+
+.dkcRXInit:
+		ld		hl,.dkcRXStart
+		TC_STOR(RXState,hl)
+		xor	a
+		TC_STOR(RXEsc,a)
+		TC_STOR(RXCurrentBufferIsSysBuf,a)
+		; mark that we have no buffer currently in use
+		bool	hl
+		ld		l,h
+		TC_STOR(RXCurrentBufferPool,hl)
+		TC_STOR(RXCurrentBuffer,hl)
+		TC_STOR(RXCurrentBuffer+2,hl)
+		lret
+
+.dkcTXInit:
+		ld		hl,dkcTXNothing
+		TC_STOR(TXState,hl)
+		TC_STOR(TXSubState,hl)
+		ld		a,TC_FRAMING_ESC	; init the pending-esc storage to a null value (ie: nothing pending)
+		TC_STOR(TXEscChar,a)
+		xor	a
+		TC_STOR(TXBusy,a)
+		bool	hl
+		ld		l,h
+		TC_STOR(NextPacket,hl)
+		TC_STOR(NextPacket+2,hl)
+		lret
+
+;
+; initilize the system buffer pool, and any
+; other internal requirements
+;
+
+dkcSystemBufINIT::
+	c	dkcSystemBufBlock = TC_SYSBUF_BLOCK_START;
+	c	dkcWriteBufPhysical = TC_SYSBUF_BLOCK_START + ((long)TC_SYSBUF_SIZE * (long)TC_SYSBUF_COUNT);
+
+	ld		hl,(dkcSystemBufBlock)
+	ex		de,hl
+	ld		hl,(dkcSystemBufBlock+2)
+	ld		b,h
+	ld		c,l
+
+	bool	hl
+	ld		l,h
+	ld		(dkcSystemBufPool),hl
+	ld		(dkcSystemBufPool+2),hl
+
+	exx
+	ld		b,TC_SYSBUF_COUNT
+dkcSystemINITLoop:
+	push	bc									; save our djnz counter
+	exx
+
+	push	bc
+	push	de
+	call	dkcReturnSystemBuffer		; add the buffer to the pool
+	pop	de
+	pop	bc
+
+	ld		hl,TC_SYSBUF_SIZE
+	add	hl,de
+	ex		de,hl
+	ld		hl,0								; zero hl without affecting the c flag
+	adc	hl,bc								; push the carry flag into the high byte
+	ld		b,h
+	ld		c,l
+
+	exx
+	pop	bc									; restore the b counter
+	djnz	dkcSystemINITLoop
+	exx
+	lret
+
+#endasm
+#asm
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; Notes about the RX & TX handlers!
+;
+; The XPC may be destroyed! Be sure to save
+; it, if necessary, before calling dkcEntryRX
+; or dkcEntryTX!
+;
+; In fact, I guarentee NOTHING about the state
+; of ANY of the registers! Backup anything important!
+;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; The Receive (RX) handler
+;
+dkcEntryRX::			;	this is the entry point of the receive handler
+		TC_LOAD(hl,RXState)	;	load address of current RX state
+		jp		(hl)					;	and jump indirect to it
+
+.dkcRXStart::				;  waiting for the START byte
+		ld		hl,.dkcRXStartReturnAddr
+		push	hl							; push the return addr
+		TC_LOAD(hl,ReadPort)			; get the read handler
+		jp		(hl)						; ...and jump to it
+.dkcRXStartReturnAddr:
+		ret	z
+		cp		TC_FRAMING_START	;  is it the START byte?
+		ret	nz						;  if not, return
+		;  we have a start char now - fall through to the next section
+
+dkcRXHaveStartChar:
+		; check to see if we still have a buffer pending
+		TC_LOAD(hl,RXCurrentBufferPool)
+		ld		a,h
+		or		l
+		jr		z,.dkcRXReceiveHeader
+
+
+		; we still have a buffer from last time - return it to the appropriate pool
+		TC_LOAD(hl,RXCurrentBuffer)
+		ex		de,hl
+		TC_LOAD(hl,RXCurrentBuffer+2)
+		ld		b,h
+		ld		c,l
+
+		TC_LOAD(a,RXCurrentBufferIsSysBuf)
+		or		a
+		jr		z,.dkcRXNonSysBuf
+
+		; we have a system buffer - return it
+		call	dkcReturnSystemBuffer
+		xor	a
+		TC_STOR(RXCurrentBufferIsSysBuf,a)
+		jr		.dkcRXReceiveHeader
+
+.dkcRXNonSysBuf:
+		TC_LOAD(hl,RXCurrentBufferPool)
+		call	dkcQueueBuffer
+
+.dkcRXReceiveHeader:
+		; prepare to receive the header
+	   xor	a
+		TC_STOR(RXScheduleNAK,a);  no NAK is scheduled
+		TC_STOR(RXEsc,a)			;  do not un-escape the first character
+		TC_STOR(RXCurrentBufferIsSysBuf,a)
+		bool	hl
+		ld		l,h
+		TC_STOR(RXChecksum,hl)	; 	the checksum starts at 0
+		TC_STOR(RXCurrentBufferPool,hl)
+		TC_LDA_DE(HeaderRX)		;  start receiving into the header
+		TC_STOR(RXPtr,hl)
+		ld		hl,TC_HEADER_SIZE		;  number of header-bytes to receive
+		TC_STOR(RXLength,hl)
+		ld		hl,dkcRXHeader			;  receive-header state
+		TC_STOR(RXState,hl)
+		ld		hl,.dkcRXFinishHeader	;	store the substate, for when we are done
+		TC_STOR(RXSubState,hl)	;  receiving the header
+		ret
+
+dkcRXBody::
+		TC_LOAD(hl,RXBufferXPC)
+		ld		lxpc,hl
+dkcRXFooter:
+dkcRXHeader::
+		ld		hl,.dkcRXReadPortReturnAddr
+		push	hl							; push the return addr
+		TC_LOAD(hl,ReadPort)			; get the read handler
+		jp		(hl)						; ...and jump to it
+.dkcRXReadPortReturnAddr:
+		ret	z
+		cp		TC_FRAMING_START		;  is it a START character?
+		jr		z,dkcRXHaveStartChar	;  if so, reset and start again
+		cp		TC_FRAMING_ESC			;  is it a ESC character?
+		jr		z,.dkcRXEscape
+
+		ld		c,a						;  save the character we read in c
+		TC_LOAD(a,RXEsc)			;  grab the un-escape next character flag
+		or		a
+		jr		z,.dkcRXNormalCharacter	;  branch if the character doesn't need to be escaped
+
+		ld		a,c
+		xor	0x20						;  fix the received character
+		ld		c,a						;  store it in c again, for the following code
+		xor	a
+		TC_STOR(RXEsc,a)			;  do not un-escape the next character
+
+.dkcRXNormalCharacter:				;  valid received character is in c
+		TC_LOAD(hl,RXPtr)			;  get where to store the byte
+		ld		a,c						;  data is in a now
+		ld		(hl),a					;  store the byte
+		inc	hl							;  advance the pointer to the next byte
+		TC_STOR(RXPtr,hl)			;  ...and store it back
+
+
+		TC_LOAD(hl,RXChecksum)	;  get the checksum variable
+		call	dkcComputeChecksum	;  the value to checksum is still in 'a'
+		TC_STOR(RXChecksum,hl)
+
+		TC_LOAD(hl,RXLength)		;  get our lenght remaining
+		dec	hl							;  subtract the byte we just stored
+		TC_STOR(RXLength,hl)		;  store it again
+		ld		a,l
+		or		h							;  is the length 0?
+		ret	nz							;  if not, we are done
+
+		TC_LOAD(hl,RXSubState)
+		jp		(hl)						;  ...and jump indirect to it
+
+.dkcRXEscape:
+		ld		a,0x01
+		TC_STOR(RXEsc,a)			;  flag the next character to be un-escaped
+		ret
+
+.dkcRXFinishHeader:
+		TC_LOAD(a,HeaderRX+version)
+		cp		TC_VERSION
+		jr		nz,.dkcRXBadVersion	; was the version number appropriate?
+
+		TC_LDA_DE(HeaderRX)		;  pointer to the packet
+		ld		ix,hl
+		call	dkcChecksumTheHeader	;  get the header-checksum
+		ex		de,hl
+		TC_LOAD(hl,HeaderRX+header_checksum)	; get the transmitted checksum
+		or		a							;  clear the carry flag
+		sbc	hl,de
+		jr		z,.dkcRXHeaderWasGood
+
+		; the header checksum failed
+.dkcRXBadVersion:
+		ld		hl,.dkcRXStart
+		TC_STOR(RXState,hl)		;  wait for a START character again
+		ret
+
+.dkcRXHeaderWasGood:
+		TC_LOAD(a,TrapSysWrites)	;  should we handle sys-writes as a special case?
+		or		a
+		jr		z,.dkcRXFinishHeaderNormalPacket
+
+		; test for special packet types
+		TC_LOAD(a,HeaderRX+type)
+		cp		TC_TYPE_SYSTEM			;  is this packet the special internal SYSTEM type?
+		jr		nz,.dkcRXFinishHeaderNormalPacket
+		TC_LOAD(a,HeaderRX+subtype)
+		cp		TC_SYSTEM_WRITE		;  ...and is it a WRITE request?
+		jr		nz,.dkcRXFinishHeaderNormalPacket
+		; jump to the sys-write handler
+		TC_LOAD(hl,SysWriteHandler)
+		jp		(hl)
+
+.dkcRXFinishHeaderNormalPacket:
+		;  no, it's a normal packet - is an application registered for it?
+		TC_LOAD(a,HeaderRX+type)
+		cp		TC_TYPE_SYSTEM
+		jr		nz,dkcRXFinishHeaderVerifyCallback
+
+		; this is a SYSTEM packet - get the buffer from the system pool
+		call	dkcGetSystemBuffer
+		jp		nz,dkcRXFlushPacket					; if we can't get a buffer, flush it
+		xor	a
+		inc	a
+		TC_STOR(RXCurrentBufferIsSysBuf,a)	; mark that the current buffer is a system buffer
+		TC_STOR(RXCurrentBufferPool,a)		; tag that variable such that the check above works...
+		jr		.dkcRXFinishHeaderHaveTheBuffer
+
+dkcRXFinishHeaderVerifyCallback:
+		; verify the 'type' value is < the limit
+		ld		b,a
+		ld		a,TC_MAX_APPLICATIONS
+		cp		b
+		jr		c,.dkcRXNoApplication				; was the type off the end of the list?
+		ld		a,b
+
+		TC_LOAD(hl,CallbackList)
+		ld		ix,hl
+		TC_LOAD(hl,RXBufferList)
+
+		ld		e,a
+		xor	a                    ; clears carry
+		ld		d,a
+
+		rl		de                   ; needs carry cleared from xor a...
+		add	ix,de
+		rl		de
+		add	hl,de
+		;  ix == pointer to the callback; hl == pointer to (long)buffer_list
+
+		ex		de,hl						;  save the buffer pointer
+		ld		hl,(ix)
+		ld		a,h
+		or		l
+		jr		z,.dkcRXNoApplication
+		ex		de,hl						;  restore the buffer pointer
+		;  hl == pointer to (long)buffer_list
+
+		TC_STOR(RXCurrentBufferPool,hl)	; save the chain where we got the buffer from
+
+		call	dkcGetBuffer			;  remove a buffer from the queue, if avaliable
+		jr		nz,.dkcRXNoBuffers
+
+		; mark the buffer as a non-system buffer
+		xor	a
+		TC_STOR(RXCurrentBufferIsSysBuf,a)
+
+.dkcRXFinishHeaderHaveTheBuffer:
+		;  save the physical address for later
+		ld		h,b
+		ld		l,c
+		TC_STOR(RXCurrentBuffer+2,hl)	; backup the buffer's location for later use
+		ex		de,hl
+		TC_STOR(RXCurrentBuffer,hl)
+		ex		de,hl
+
+		call	dkcPhysicalToLogical
+
+		; a has xpc, hl has address
+		ld		ix,hl
+		TC_STOR(RXBufferOffset,hl)
+      ex		jk,hl
+		TC_STOR(RXBufferXPC,hl)		   ; save the values for later use
+
+		ld		lxpc,hl						;  move into the proper window
+
+		TC_LOAD(hl,HeaderRX+length)	;  length of the packet to receive
+		ld		a,h
+		or		l
+		jr		z,dkcRXFinishBody			;  no body to receive - jump straight to the footer
+
+		ex		de,hl							;  buffer length is in de
+		ld		hl,(ix+TC_HEADER_LENGTH);  get the length of the buffer
+		or		a								;  clear c
+		sbc	hl,de
+		jr		nc,.dkcRXLengthIsOK
+
+		; the packet is too big for the buffer - drop it
+		ld		a,TC_NAK_TOOBIG
+		ld		hl,(ix+TC_HEADER_LENGTH)
+		call	.dkcRXNAK
+		jp		dkcRXFlushPacket
+
+.dkcRXLengthIsOK:
+		TC_LOAD(hl,HeaderRX+length)
+		TC_STOR(RXLength,hl)
+
+		TC_LOAD(hl,RXBufferOffset)	;  start receiving into the body
+		ex		de,hl
+		ld		hl,TC_HEADER_RESERVE
+		add	hl,de							;  skip the header
+		TC_STOR(RXPtr,hl)
+		ld		hl,dkcRXBody				;  receive-body state
+		TC_STOR(RXState,hl)
+		ld		hl,dkcRXFinishBody		;	store the substate, for when we are done
+		TC_STOR(RXSubState,hl)
+		ret
+
+.dkcRXNoApplication:						;  no callback was registered! schedule a NAK!
+		ld		a,TC_NAK_NOAPP
+		call	.dkcRXNAK
+		jp		dkcRXFlushPacket
+
+.dkcRXNoBuffers:						;  no buffers were avaliable - schedule a NAK!
+		TC_LOAD(a,HeaderRX+type)
+		cp		TC_TYPE_SYSTEM			;  is this packet the special internal SYSTEM type?
+		jp		z,dkcRXFlushPacket	;  if it was a system packet, do not NAK it
+
+		bool	hl
+		ld		l,h
+		TC_STOR(RXCurrentBufferPool,hl)	; we didn't get a buffer - mark the current-pointer as empty
+		ld		a,TC_NAK_NOBUF
+		call	.dkcRXNAK
+		jp		dkcRXFlushPacket
+
+dkcRXFinishBody::
+		TC_LOAD(hl,RXChecksum)	;  save the checksum we computed
+		TC_STOR(RXFinishedChecksum,hl)
+		TC_LDA_DE(FooterRX)		;  start receiving into the footer
+		TC_STOR(RXPtr,hl)
+		ld		hl,TC_FOOTER_SIZE		;  number of footer-bytes to receive
+		TC_STOR(RXLength,hl)
+		ld		hl,dkcRXFooter			;  receive-footer state
+		TC_STOR(RXState,hl)
+		ld		hl,.dkcRXFinishFooter	;	store the substate, for when we are done
+		TC_STOR(RXSubState,hl)
+		ret
+
+.dkcRXFinishFooter:
+		; prepare to receive the next packet, by resetting the FSM
+		ld		hl,.dkcRXStart
+		TC_STOR(RXState,hl)		;  move back to the start state, to watch for START bytes
+		TC_STOR(RXSubState,hl)
+
+		;  verify the checksum
+		TC_LOAD(hl,RXFinishedChecksum)
+		ex		de,hl
+		TC_LOAD(hl,FooterRX+checksum)
+		or		a							; clear the carry bit
+		sbc	hl,de						; did the checksums match?
+		ld		a,h
+		or		l
+		jr		nz,.dkcRXDropPacket	; checksum was bad - drop the packet
+		; the packet was good
+		ld		hl,TC_RECEIVE			; only the receive bit should be set
+		call	.dkcRXFillHeader
+
+		; queue the received packet
+		TC_LOAD(hl,RXCurrentBuffer)
+		ex		de,hl
+		TC_LOAD(hl,RXCurrentBuffer+2)
+		ld		b,h
+		ld		c,l
+
+		push	de
+		TC_LDA_DE(CallbackQueue)
+		pop	de
+		call	dkcQueueBuffer			;  put it on the callback queue
+
+		bool	hl
+		ld		l,h
+		TC_STOR(RXCurrentBufferPool,hl)	; flag that buffer as being done, as
+														; we are no longer interested in it
+.dkcRXDropPacket:
+		; parse the internal headers
+		jp		.dkcRXFinishPacket
+
+.dkcRXFlushData:		; just read out the requested number of bytes, to skip this packet
+		ld		hl,.dkcRXFlushReturnAddr
+		push	hl							; push the return addr
+		TC_LOAD(hl,ReadPort)			; get the read handler
+		jp		(hl)						; ...and jump to it
+.dkcRXFlushReturnAddr:
+		ret	z
+		cp		TC_FRAMING_START		;  is it a START character?
+		jp		z,dkcRXHaveStartChar	;  if so, reset and start again
+		cp		TC_FRAMING_ESC			;  is it a ESC character?
+		jr		z,.dkcRXSkipEscBytes
+
+		; normal data byte - just decrement our counter
+		TC_LOAD(hl,RXLength)
+		dec	hl
+		TC_STOR(RXLength,hl)
+
+		; are we done with the packet?
+		ld		a,h
+		or		l
+		jr		nz,.dkcRXSkipEscBytes
+
+		; we are done!
+		TC_LOAD(hl,RXSubState)
+		jp		(hl)
+
+.dkcRXSkipEscBytes:
+		ret
+
+; fills in the current packet's header - expects the 'flags' field to be in hl
+.dkcRXFillHeader:
+		push	hl
+		TC_LOAD(hl,RXCurrentBuffer)
+		ex		de,hl
+		TC_LOAD(hl,RXCurrentBuffer+2)
+		ld		b,h
+		ld		c,l
+		call	dkcPhysicalToLogical
+      ex		jk',hl
+      ex		jk,hl
+		ld		lxpc,hl
+      ex		jk',hl
+		ld		ix,hl
+		pop	hl
+
+		ld		(ix+TC_HEADER_FLAGS),hl		; save the flags
+		TC_LOAD(hl,HeaderRX+length)
+		ld		(ix+TC_HEADER_LENGTH),hl	; save the length
+		TC_LOAD(a,HeaderRX+type)
+		ld		(ix+TC_HEADER_TYPE),a		; save the type
+		TC_LOAD(a,HeaderRX+subtype)
+		ld		(ix+TC_HEADER_SUBTYPE),a	; save the subtype
+		ret
+
+; this packet is not supported - schedule a NAK
+; expects: a == 0 or 1, the NAK type
+.dkcRXNAK:
+		TC_STOR(RXNAKType,a)
+		xor	a
+		inc	a
+		TC_STOR(RXScheduleNAK,a)	; the NAK is scheduled
+		ret
+
+
+dkcRXFlushPacket::	; we don't care about the rest of this packet - just drop it
+							; this should only be called just after the header was read!
+		TC_LOAD(hl,HeaderRX+length)
+		ex		de,hl
+		ld		hl,TC_FOOTER_SIZE
+		add	hl,de
+		TC_STOR(RXLength,hl)		; store the length of the remaining bytes
+
+		ld		hl,.dkcRXFlushData
+		TC_STOR(RXState,hl)
+		ld		hl,.dkcRXFinishPacket
+		TC_STOR(RXSubState,hl)	; when the packet is done, try and parse the header
+		ret
+
+; called when a valid packet has been read
+.dkcRXFinishPacket:
+		;;; generate a response, if necessary (NAK?)
+		TC_LOAD(a,RXScheduleNAK)
+		or		a
+		jr		z,.dkcRXNoNAKNecessary
+
+		; build the NAK
+		call	dkcGetSystemBuffer
+		jr		nz,.dkcRXNoNAKNecessary	; was there a system buffer free?
+
+		call	dkcPhysicalToLogical
+		ld		ix,hl						; ix == pointer to the buffer
+      ex		jk,hl
+		ld		lxpc,hl					; set the window to the buffer
+
+		; build the NAK packet's header
+		ld		hl,3
+		ld		(ix+TC_HEADER_LENGTH),hl	; length == 3
+		ld		a,TC_TYPE_SYSTEM
+		ld		(ix+TC_HEADER_TYPE),a		; type == SYSTEM
+		ld		a,TC_SYSTEM_NAK
+		ld		(ix+TC_HEADER_SUBTYPE),a	; subtype == SYSTEM_NAK
+
+		TC_LOAD(a,RXNAKType)
+		ld		(ix+TC_HEADER_RESERVE+0),a		; data_portion[0] == flag
+		TC_LOAD(a,HeaderRX+type)
+		ld		(ix+TC_HEADER_RESERVE+1),a		; data_portion[1] == type
+		TC_LOAD(a,HeaderRX+subtype)
+		ld		(ix+TC_HEADER_RESERVE+2),a		; data_portion[2] == subtype
+
+		push	de
+		TC_LDA_DE(NextPacket)
+		pop	de
+		call	dkcQueueBuffer			; queue the NAK on the tx list
+
+		xor	a
+		TC_STOR(RXScheduleNAK,a)	; unschedule the NAK
+		TC_STOR(RXNAKType,a)
+
+		TC_LOAD(a,TXBusy)				; is the transmitter doing anything?
+		or		a
+		jr		nz,.dkcRXNoNAKNecessary
+		call	dkcTXStart				; try and start that packet transmitting
+
+.dkcRXNoNAKNecessary:
+		jp		.dkcRunCallbacks		; run any queued callbacks before we return
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; The Transmit (TX) handler
+;
+dkcEntryTX::			;	this is the entry point of the transmit handler
+		TC_LOAD(hl,TXState)	;	load address of current TX state
+		jp		(hl)					;	and jump indirect to it
+
+dkcTXNothing::			;  nothing is waiting to be sent - just ack interrupt
+		ld		hl,.dkcTXNothingReturnAddr
+		push	hl							; push the return addr
+		TC_LOAD(hl,ClearReadInt)	; get the read handler
+		jp		(hl)						; ...and jump to it
+.dkcTXNothingReturnAddr:
+		ret				;  this label could really be put infront of any 'ret' opcode,
+							;  but I've included it on it's own for clarity
+
+.dkcTXBody:				;  send the body of the packet
+		TC_LOAD(hl,TXBufferXPC)
+		ld		lxpc,hl	          ; set the xpc for the buffer
+dkcTXHeader::			;  send the header
+.dkcTXFooter:			;  send the footer
+		TC_LOAD(a,TXEscChar)	;  do we have a pending escaped character?
+		ld		c,a
+		cp		TC_FRAMING_ESC					;  if we stored an ESC character, this is invalid - skip it
+		jr		nz,.dkcTXSendChar		;  it was an escaped character - send it now
+
+		TC_LOAD(hl,TXPtr)
+		ld		a,(hl)	;  get the next byte to be sent
+		ld		c,a		;  WriteProgPort wants it in c
+
+		TC_LOAD(hl,TXChecksum)  ;  get the checksum variable
+		call	dkcComputeChecksum  ;  compute the checksum
+		TC_STOR(TXChecksum,hl)
+
+		; check to see if the byte needs to be escaped
+		ld		a,c
+		cp		TC_FRAMING_START
+		jr		z,.dkcTXEscape
+		cp		TC_FRAMING_ESC
+		jr		z,.dkcTXEscape
+
+.dkcTXSendChar:
+		ld		hl,.dkcTXSendCharReturnAddr
+		push	hl							; push the return addr
+		TC_LOAD(hl,WritePort)		; get the read handler
+		jp		(hl)						; ...and jump to it
+.dkcTXSendCharReturnAddr:
+		ret	nz			;  return if we didn't transmit
+
+		; clear the pending escaped character, if there is one, as it has now been sent
+		ld		a,TC_FRAMING_ESC
+		TC_STOR(TXEscChar,a)
+
+		; move to the next byte to transmit
+		TC_LOAD(hl,TXLength)	;  get the length remaining
+		dec	hl
+		ld		a,l
+		or		h						;  is it non-zero?
+		jr		nz,.dkcTXNext		;  if so, move to the next character
+
+		TC_LOAD(hl,TXSubState)	;  we are done with this part - move to the next one
+		jp		(hl)					;  jump indirect right to where we need to be
+
+.dkcTXNext:				;  prepare the pointers/etc to send the next byte, when the ISR is entered again
+		TC_STOR(TXLength,hl)	;  store the decremented length
+		TC_LOAD(hl,TXPtr)
+		inc	hl						;  increment the pointer to the data
+		TC_STOR(TXPtr,hl)
+		ret
+
+.dkcTXEscape:			;  byte to transmit must be escaped
+		xor	0x20		;  escape the necessary character
+		TC_STOR(TXEscChar,a)		;  save the escaped character
+		ld		a,TC_FRAMING_ESC
+		ld		c,a
+
+		ld		hl,.dkcTXEscapeReturnAddr
+		push	hl							; push the return addr
+		TC_LOAD(hl,WritePort)		; get the read handler
+		jp		(hl)						; ...and jump to it
+.dkcTXEscapeReturnAddr:
+		ret	z						;  if write succeded, return
+		ld		a,TC_FRAMING_ESC	;  undo the store if the write failed
+		TC_STOR(TXEscChar,a)
+		ret
+
+dkcTXFinishHeader::
+		TC_LOAD(hl,HeaderTX+length)	;  get the body lenght from the header
+		ld		a,h
+		or		l
+		jr		z,.dkcTXFinishBody		;  zero-byte packet - jump straight to the footer
+		TC_STOR(TXLength,hl)		;  store the body length
+
+		ld		hl,.dkcTXBody	      ;  move to the next state
+		TC_STOR(TXState,hl)
+		ld		hl,.dkcTXFinishBody	;  update the substate to the body
+		TC_STOR(TXSubState,hl)
+
+		TC_LOAD(hl,TXBufferOffset)	;  get where the body is stored
+		ex		de,hl
+		ld		hl,TC_HEADER_RESERVE	;  move past the header to the data portion
+		add	hl,de
+		TC_STOR(TXPtr,hl)			;  store the new location
+		ret
+
+.dkcTXFinishBody:
+		TC_LOAD(hl,TXChecksum)			;  find the TX checksum
+		TC_STOR(FooterTX+checksum,hl)	; ... and save it as the checksum to send
+
+		ld		hl,.dkcTXFooter			;  move to the next state
+		TC_STOR(TXState,hl)
+		ld		hl,.dkcTXFinishFooter	;  update the substate to the footer
+		TC_STOR(TXSubState,hl)
+		ld		hl,TC_FOOTER_SIZE
+		TC_STOR(TXLength,hl)		;  store the footer length
+		TC_LDA_DE(FooterTX)		;  get where the body is stored
+		TC_STOR(TXPtr,hl)			;  store the new location
+		ret
+
+.dkcTXFinishFooter:
+		; queue a TXDONE callback
+		TC_LOAD(hl,TXBufferXPC)
+		ld		lxpc,hl						; set the window to the buffer's header
+		TC_LOAD(hl,TXBufferOffset)	; point at the header
+		ld		ix,hl
+		ld		hl,TC_TXDONE
+		ld		(ix+TC_HEADER_FLAGS),hl	; save the 'flags' value
+
+		TC_LOAD(hl,TXCurrentBuffer)
+		ex		de,hl
+		TC_LOAD(hl,TXCurrentBuffer+2)
+		ld		b,h
+		ld		c,l
+
+		ld		hl,.dkcTXRestart
+		TC_STOR(TXState,hl)		;  we are done transmitting - store the 'nothing' state
+		TC_STOR(TXSubState,hl)	;  reset the substate as well, to make things cleaner
+
+      ; wait for transmitter to be empty
+.dkcTXWaitempty:
+	   ioi	ld a, (SASR)
+   	bit	SS_TFULL_BIT,a      ;   can I transmit now?
+	   jr		nz,.dkcTXWaitempty   ;   nope, wait
+
+		push	de
+		TC_LDA_DE(CallbackQueue)
+		pop	de
+		call	dkcQueueBuffer					; ...and queue the txdone callback
+
+		jp		.dkcRunCallbacks
+
+.dkcTXRestart:
+		ld		hl,dkcTXNothing
+		TC_STOR(TXState,hl)		;  we are done transmitting - store the 'nothing' state
+		TC_STOR(TXSubState,hl)	;  reset the substate as well, to make things cleaner
+
+#ifdef TC_NEST_INTERRUPTS
+		;ipset	0							;  turn interrupts back on for the Start process
+#endif
+		call	dkcTXStart				;  try and start the next packet transmitting
+#ifdef TC_NEST_INTERRUPTS
+		;ipset	1							;  ... and turn them back off for the rest of the ISR
+#endif
+		jr		z,.dkcTXStartWasSuccessfull
+
+		xor	a
+		TC_STOR(TXBusy,a)				;  no packet was waiting - unlock the transmitter
+
+.dkcTXStartWasSuccessfull:
+		ret
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; start a packet transmitting
+;
+; returns with z set if it successfully started transmitting,
+; and nz if it was not able to send the first byte - call it again
+;
+; NOTE - this WILL trash the xpc!
+dkcTXStart::
+      ld		hl,lxpc
+      push	hl
+
+		;  find the next packet, if one exists
+		TC_LDA_DE(NextPacket)	; pointer to the tx chain
+		call	dkcGetBuffer
+		jr		nz,.dkcTXStartDone
+
+		xor	a
+		inc	a
+		TC_STOR(TXBusy,a)			; flag the transmitter as busy
+
+		ld		h,b
+		ld		l,c
+		TC_STOR(TXCurrentBuffer+2,hl)
+		ex		de,hl
+		TC_STOR(TXCurrentBuffer,hl)
+		ex		de,hl
+
+		call	dkcPhysicalToLogical
+
+		; a has xpc, hl has address
+		TC_STOR(TXBufferOffset,hl)
+		ld		ix,hl
+      ex		jk,hl
+		TC_STOR(TXBufferXPC,hl)		; save the values for later use
+		ld		lxpc,hl					; move into the proper window
+
+		ld		hl,(ix+TC_HEADER_LENGTH)	;  get the length of the packet
+		TC_STOR(HeaderTX+length,hl)
+		ld		a,(ix+TC_HEADER_TYPE)		;  get the type
+		TC_STOR(HeaderTX+type,a)
+		ld		a,(ix+TC_HEADER_SUBTYPE)	;  get the subtype
+		TC_STOR(HeaderTX+subtype,a)
+
+		; generate the rest of the header
+		xor	a
+		TC_STOR(HeaderTX+flags,a)
+		ld		a,TC_VERSION
+		TC_STOR(HeaderTX+version,a)
+
+		TC_LDA_DE(HeaderTX)		;  pointer to the header
+		ld		ix,hl
+		call	dkcChecksumTheHeader	;  the the header-checksum
+		TC_STOR(HeaderTX+header_checksum,hl)	; and save it in the header
+
+		;  start the packet transmitting
+		bool	hl
+		ld		l,h						;  hl==0
+		TC_STOR(TXChecksum,hl)	;  init the checksum to 0
+		ld		hl,dkcTXHeader	      ;  move to the next state
+		TC_STOR(TXState,hl)
+		ld		hl,dkcTXFinishHeader	;  update the substate to the header
+		TC_STOR(TXSubState,hl)
+		ld		hl,TC_HEADER_SIZE
+		TC_STOR(TXLength,hl)		;  store the header length
+		TC_LDA_DE(HeaderTX)		;  get where the header is stored
+		TC_STOR(TXPtr,hl)			;  store the new location
+
+		ld		a,TC_FRAMING_START	;  load the start-byte for transmission
+		ld		c,a
+.dkcTXSendFirstByte:
+		ld		hl,.dkcTXStartReturnAddr
+		push	hl							; push the return addr
+		TC_LOAD(hl,WritePort)		; get the read handler
+		jp		(hl)						; ...and jump to it
+.dkcTXStartReturnAddr:
+		jr		nz,.dkcTXSendFirstByte;  this shouldn't block, as we verified that the transmitter was
+											;  free at the beginning of this function
+		xor	a							;  set z
+.dkcTXStartDone:
+		ex		af,af'
+		pop	hl
+		ld		lxpc,hl
+		ex		af,af'
+		ret
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; This code will run the queue of pending callbacks
+;
+.dkcRunCallbacks:
+		;;; run the callbacks, if we can this interrupt
+		TC_LOAD(a,CallbackLock)
+		or		a
+		jp		nz,.dkcNoCallbackNow			; is there a callback in process right now?
+
+		inc	a
+		TC_STOR(CallbackLock,a)			; lock the callback - only one should ever happen at any given time!
+
+.dkcCallbackLoop:
+		TC_LDA_DE(CallbackQueue)		; get a pointer to the callback chain
+		call	dkcGetBuffer
+		jp		nz,.dkcCallbacksFinished	; is there a buffer on the callback chain?
+
+		; callback the buffer in bc,de
+		call	dkcPhysicalToLogical
+		ld		ix,hl								; ix == pointer to the buffer
+      ex		jk,hl
+		ld		lxpc,hl							; set the window
+
+		push	iy									; save our iy pointer, to protect it from the callback
+
+		bool	hl
+		ld		l,h
+		TC_STOR(CallbackSysbuf,hl)
+		TC_STOR(CallbackSysbuf+2,hl)
+
+		ld		a,(ix+TC_HEADER_TYPE)		; is the type SYSTEM?
+		cp		TC_TYPE_SYSTEM
+		jr		nz,.dkcCallbackNormalStackFrame
+
+		ld		a,(ix+TC_HEADER_SUBTYPE)
+		cp		TC_SYSTEM_WRITE
+		jr		z,.dkcCallbackNormalStackFrame
+
+		; test to see if the theoretical sysbuf is in the SysBufBlock
+		ld		hl,(dkcSystemBufBlock+2)
+		or		a
+		sbc	hl,bc
+		jr		nz,.dkcCallbackNormalStackFrame	; does the MSW match?
+		ld		hl,(dkcSystemBufBlock)
+		or		a
+		sbc	hl,de
+		jr		z,.dkcCallbackSysbufAddress			; is the LSW >= than the LSW of dkcSystemBufBlock
+		jr		c,.dkcCallbackSysbufAddress
+		jr		.dkcCallbackNormalStackFrame
+.dkcCallbackSysbufAddress:
+
+		ld		h,b
+		ld		l,c
+		TC_STOR(CallbackSysbuf+2,hl)
+		ex		de,hl
+		TC_STOR(CallbackSysbuf,hl)
+		ex		de,hl
+
+		ld		a,(ix+TC_HEADER_SUBTYPE)
+		cp		TC_SYSTEM_NAK
+		jr		nz,.dkcCallbackNormalStackFrame
+		ld		hl,(ix+TC_HEADER_FLAGS)
+		bit	1,l
+		jr		nz,.dkcCallbackNormalStackFrame	; is this a TXDONE callback? if so, it's a normal callback
+
+		; this is a NAK - build a NAK stack frame instead
+		ld		hl,(ix+TC_HEADER_USERDATA+2)
+		push	hl
+		ld		hl,(ix+TC_HEADER_USERDATA)
+		push	hl									; (long) userdata
+		bool	hl
+		ld		l,h
+		push	hl
+		push	hl									; (long) buffer==0x00000000
+		push	hl									; (int) length
+		ld		a,(ix+TC_HEADER_RESERVE+2)	; subtype value from the packet
+		ld		l,a
+		push	hl									; (char) subtype
+		ld		a,(ix+TC_HEADER_RESERVE+1)	; type value from the packet
+		ld		l,a
+		ld		b,a								; save the type in b for later
+		push	hl									; (int) length
+		ld		a,(ix+TC_HEADER_RESERVE+0)	; get the 'NAK-flag'
+		cp		TC_NAK_NOAPP
+		jr		nz,.dkcCallbackNAKskip01
+		ld		hl,TC_SYSBUF|TC_UNSUPPORTED
+		jr		.dkcCallbackNAKskipDONE
+.dkcCallbackNAKskip01:
+		cp		TC_NAK_NOBUF
+		jr		nz,.dkcCallbackNAKskip02
+		ld		hl,TC_SYSBUF|TC_NOBUFFER
+		jr		.dkcCallbackNAKskipDONE
+.dkcCallbackNAKskip02:
+		cp		TC_NAK_TOOBIG
+		jr		nz,.dkcCallbackNAKskipDONE
+		ld		hl,TC_SYSBUF|TC_TOOBIG
+		;jr		.dkcCallbackNAKskipDONE   ; fall through, instead of jumping
+.dkcCallbackNAKskipDONE:
+		push	hl									; (int) flags
+		jr		.dkcCallbackRunTheCallback
+
+.dkcCallbackNormalStackFrame:
+		; build the normal stack frame
+		ld		hl,(ix+TC_HEADER_USERDATA+2)
+		push	hl
+		ld		hl,(ix+TC_HEADER_USERDATA)
+		push	hl									; (long) userdata
+		push	bc
+		push	de									; (long) buffer
+		ld		hl,(ix+TC_HEADER_LENGTH)
+		push	hl									; (int) length
+		ld		a,(ix+TC_HEADER_SUBTYPE)
+		ld		h,0
+		ld		l,a
+		push	hl									; (char) subtype
+		ld		a,(ix+TC_HEADER_TYPE)
+		ld		b,a								; the type, or index into the array, saved for later
+		ld		h,0
+		ld		l,a
+		push	hl									; (char) type
+		ld		hl,(ix+TC_HEADER_FLAGS)
+		push	hl									; (int) flags
+
+.dkcCallbackRunTheCallback:
+		ld		hl,.dkcCallbackReturnAddr
+		push	hl									; save the return address
+
+		ld		a,TC_MAX_APPLICATIONS
+		cp		b
+		jr		c,.dkcSkipCallback				; was the type off the end of the list?
+
+		TC_LOAD(hl,CallbackList)
+		ld		a,b
+		or		a
+		jr		z,.dkcCallbackNoSearch		; if type is 0, we don't need to increment the pointer
+.dkcFindTheCallback:
+		inc	hl
+		inc	hl
+		djnz	.dkcFindTheCallback
+.dkcCallbackNoSearch:
+		ld		hl,(hl)							; get the callback address
+		ld		a,h
+		or		l
+		jr		z,.dkcSkipCallback				; is the callback NULL? if so, skip it.
+
+#ifdef TC_NEST_INTERRUPTS
+		; turn on interrupts
+		TC_LOAD(a,dont_nest_interrupts)
+		or		a
+		jr		nz,.dkcCallbackDontNestInts
+		ipset 0									; re-enable interrupts during the callback
+.dkcCallbackDontNestInts:
+#endif
+
+		jp		(hl)								; do the actuall jump to the user's code
+.dkcCallbackReturnAddr:
+
+#ifdef TC_NEST_INTERRUPTS
+		; turn interrupts back off
+		TC_LOAD(a,dont_nest_interrupts)
+		or		a
+		jr		nz,.dkcCallbackDontNestInts2
+		ipset	1									; shut interrupts back off now that the callback is finished
+.dkcCallbackDontNestInts2:
+#endif
+
+.dkcSkipCallback:
+		add	sp,0x10							; restore the stack
+		pop	iy									; restore iy
+
+		TC_LOAD(hl,CallbackSysbuf)
+		ex		de,hl
+		TC_LOAD(hl,CallbackSysbuf+2)
+		ld		b,h
+		ld		c,l
+
+		ld		a,b
+		or		c
+		or		d
+		or		e
+		jp		z,.dkcCallbackLoop				; was this a sysbuf? if not, loop
+
+		; return the system buffer
+		call	dkcReturnSystemBuffer
+		jp		.dkcCallbackLoop				; try and run another callback
+
+.dkcCallbacksFinished:
+		xor	a
+		TC_STOR(CallbackLock,a)				; unlock the callback process
+		; all done - fall through to the next section
+
+.dkcNoCallbackNow:
+		ret
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; Various internal utility functions...
+;
+
+; This will add a buffer to a specified queue.
+;
+; assumes the following:
+;   bc,de == physical address of the buffer
+;   hl    == pointer to the root of the queue
+;
+;   iy will be preserved
+dkcQueueBuffer::
+	push	ip
+	ipset	1							;  turn off interrupts, as we might be called from userland
+   ex		jk',hl
+   ld		hl,lxpc
+   push	hl
+   ex		jk',hl
+	push	iy
+
+	ld		ix,hl						;  move the queue's pointer to ix
+	exx								;  save the new buffer address for later
+
+	ld		hl,(ix)
+	ex		de,hl
+	ld		hl,(ix+2)				;  get the root address of the queue
+
+	ld		a,h
+	or		l
+	or		d
+	or		e							;  is the root address 0 (NULL)?
+	jr		nz,.dkcQueueNormal
+
+	; it's null - just point it at itself
+	exx								;  bring back the new buffer's address
+	call	dkcPhysicalToLogical	;  get the logical address
+
+	ld		iy,hl						;  put the offset in iy
+   ex		jk,hl
+   ld		lxpc,hl
+
+	ld		h,b
+	ld		l,c
+	ld		(ix+2),hl
+	ld		(iy+2),hl
+	ex		de,hl
+	ld		(ix),hl					;  point the root pointer at the buffer
+	ld		(iy),hl					;  point the buffer at itself
+	jr		.dkcQueueBufferDone
+
+.dkcQueueNormal:
+	ld		b,h
+	ld		c,l						;  address must be bc,de for the PtoL call
+	call	dkcPhysicalToLogical	;  get the logical address of the last buffer on the queue
+
+   ex		jk',hl
+   ex		jk,hl
+	push	hl							; save the lxpc for later
+	ld		lxpc,hl					; set the window to the last buffer on the queue
+   ex		jk',hl
+	push	hl							;  ...and save the offset as well
+
+	ld		iy,hl						;  iy == offset into the buffer
+
+	ld		hl,(iy)
+	push	hl
+	ld		hl,(iy+2)				;  get the address of the first buffer in the queue (pointed at by the last)
+	push	hl							;  and put it on the stack
+
+	exx								;  get the new buffer's address back
+	call	dkcPhysicalToLogical	;  ...and get its logical address
+
+	ld		iy,hl						;  and iy == the offset into it
+   ex		jk,hl
+   ld		lxpc,hl
+
+	pop	hl
+	ld		(iy+2),hl
+	pop	hl
+	ld		(iy),hl					;  point the new buffer at the first buffer in the queue
+
+	pop	iy							;  get the offset for the old 'last buffer' on the queue
+   pop	hl
+   ld		lxpc,hl
+
+	ld		h,b
+	ld		l,c
+	ld		(ix+2),hl
+	ld		(iy+2),hl
+	ex		de,hl
+	ld		(ix),hl					;  point the root pointer at the new buffer
+	ld		(iy),hl					;  point the old 'last buffer' at the new buffer in the queue
+	; all done - fall through to the next section
+
+.dkcQueueBufferDone:
+	pop	iy
+   pop	hl
+   ld		lxpc,hl
+	pop	ip							;  restore interrupts
+	ret
+
+; Removes the first item from a specified queue, and
+; returns it to the caller.
+;
+; assumes the following:
+;   hl == pointer to the root of the queue
+;
+; returns the following:
+;   nz, if there wasn't a buffer to return
+;   z, if the buffer is good. in that case:
+;      bc,de == physical address of the buffer
+;
+;   iy will be preserved
+dkcGetBuffer::
+	push	ip
+	ipset	1							;  turn off interrupts, as we might be called from userland
+   ex		jk',hl
+   ld		hl,lxpc
+   push	hl
+   ex		jk',hl
+	push	iy
+
+	ld		iy,hl						;  move the queue's pointer to iy
+
+	ld		hl,(iy)
+	ex		de,hl
+	ld		hl,(iy+2)				;  get the root address of the queue
+
+	ld		a,h
+	or		l
+	or		d
+	or		e							;  is the root address 0 (NULL)?
+	jp		z,.dkcGetBufNoBuffer	;  no buffers are on the queue - return nz
+
+	push	hl
+	push	de							;  save the root node's address, for comparison later
+
+	ld		b,h
+	ld		c,l						;  move the address byte into bc, for the following function
+	call	dkcPhysicalToLogical	;  get the logical address of this buffer
+										;  now a==xpc, hl==offset
+   ld		ix,hl
+   ex		jk,hl
+   ld		lxpc,hl
+
+	; compare the longs pointed to by ix & sp, and see if they match
+	ld		hl,(ix)
+	ex		de,hl
+	ld		hl,(sp)
+	or		a							;  clear the carry
+	sbc	hl,de
+	jr		nz,.dkcGetBufNormal
+	ld		hl,(ix+2)
+	ex		de,hl
+	ld		hl,(sp+2)
+	or		a							;  clear the carry
+	sbc	hl,de
+	jr		nz,.dkcGetBufNormal
+
+	; they matched - there is only one buffer in this chain
+	; the answer is on the stack, and will be placed in bc,de later
+	; just blank out the root pointer for now
+	bool	hl
+	ld		l,h
+	ld		(iy),hl			; iy should still have the root pointer
+	ld		(iy+2),hl
+	jr		.dkcGetBufDone
+
+.dkcGetBufNormal:		; the normal case - (>=2 buffers on the chain)
+	ld		hl,(ix)
+	ld		(sp),hl
+	ex		de,hl
+	ld		hl,(ix+2)
+	ld		(sp+2),hl	; sp now has the correct answer (final phys address)
+	ld		b,h
+	ld		c,l			; bc,de now has the phyical address
+
+	; remove the buffer from the chain
+   ld		hl,lxpc
+   push	hl
+	call	dkcPhysicalToLogical
+   ld		iy,hl
+   ex		jk,hl
+   ld		lxpc,hl
+
+	ld		hl,(iy)
+	ex		de,hl
+	ld		hl,(iy+2)	; hl,de has the buffer that the removed buf pointed to
+
+   ex		jk',hl
+   pop	hl
+   ld		lxpc,hl
+   ex		jk',hl
+
+	ld		(ix+2),hl
+	ex		de,hl
+	ld		(ix),hl		; update the pointer in the old buffer, to point past the removed buffer
+	; all done! fall through to the next section
+
+.dkcGetBufDone:			; cleanup everything, and return z
+	pop	de
+	pop	bc				; remove the buffer from the stack, and put it in the proper place
+
+	xor	a				; set z
+	; fall through to the next section
+
+.dkcGetBufferDone:		; fix interrupts and return - must NOT change z/nz!
+	pop	iy
+	ex		af,af'		; save the flags
+   pop	hl
+   ld		lxpc,hl
+	ex		af,af'		; restore the flags
+	pop	ip
+	ret
+
+.dkcGetBufNoBuffer:
+	inc	a				; unset z (set nz) [a is 0 before we get here]
+	jr		.dkcGetBufferDone
+
+; Computes a checksum
+; Uses the 8-bit Fletcher checksum algorithim. See RFC1145 for more info
+;
+; assumes the following:
+;   hl == the checksum variable
+;   a  == the value to add to the checksum
+dkcComputeChecksum::
+	add	a,h
+	adc	a,0x00
+	ld		h,a								; A = A + D[i]
+	add	a,l
+	adc	a,0x00
+	ld		l,a								; B = B + A
+	ret
+
+; Computs the header-checksum
+;
+; assumes the following:
+;   ix == pointer to the beginning of a header
+;
+; returns the following:
+;   hl == the checksum of a header, sutable for the header_checksum field
+dkcChecksumTheHeader::
+	push	ix					;  save the pointer
+	ld		b,TC_HEADER_SIZE
+	dec	b
+	dec	b					;  don't count the checksum field
+
+	bool	hl
+	ld		l,h				;  the checksum starts as zero
+
+dkcChecksumHeaderLoop:
+	ld		a,(ix)
+	inc	ix
+	add	a,h
+	adc	a,0x00
+	ld		h,a								; A = A + D[i]
+	add	a,l
+	adc	a,0x00
+	ld		l,a								; B = B + A
+	djnz	dkcChecksumHeaderLoop
+
+	pop	ix					;  restore the pointer
+	; the return value is still in hl
+	ret
+
+
+;
+; This will clear memory to 0x0000 in a specified region.
+;
+; assumes:
+;   bc == length to clear, in bytes
+;   hl == addres of the first byte to clear
+
+#endasm
+
+#asm
+;
+; Gets a system buffer into bc,de if one is avaliable.
+;
+; z is set on success, nz if no buffer was avaliable
+;
+dkcGetSystemBuffer::
+	ld		hl,dkcSystemBufPool
+	call	dkcGetBuffer
+	ret
+
+;
+; Returns a system buffer to the avaliable pool.
+;
+; Assumes:
+;    bc,de == the system buffer
+dkcReturnSystemBuffer::
+   ld		hl,lxpc
+   push	hl
+	call	dkcPhysicalToLogical
+   ld		ix,hl
+   ex		jk,hl
+   ld		lxpc,hl
+	ld		hl,TC_SYSBUF_SIZE-TC_HEADER_RESERVE		; store the length of the buffer
+	ld		(ix+TC_HEADER_LENGTH),hl
+
+	ld		hl,dkcSystemBufPool
+	call	dkcQueueBuffer
+   pop	hl
+   ld		lxpc,hl
+	ret
+#endasm
+
+/*** BeginHeader _tc_queue_buffer */
+int _tc_queue_buffer(faraddr_t *chain, faraddr_t buffer);
+/*** EndHeader */
+/*
+ *  Add 'buffer' to the end of the chain started w/ 'ptr'
+ *
+ *  'ptr' is the ADDRESS of the pointer that is the root of the chain!
+ */
+__nodebug __root int _tc_queue_buffer(faraddr_t *chain, faraddr_t buffer)
+{
+#asm
+	ld		hl,(sp+@sp+buffer)
+	ex		de,hl
+	ld		hl,(sp+@sp+buffer+2)
+	ld		b,h
+	ld		c,l
+	ld		hl,(sp+@sp+chain)
+	call	dkcQueueBuffer
+#endasm
+	return 0;
+}
+
+/*** BeginHeader _tc_get_buffer */
+faraddr_t _tc_get_buffer(faraddr_t *chain);
+/*** EndHeader */
+/*
+ * Removes a buffer from a specified chain, and returns the long-pointer
+ * to it, or 0 if there was no buffer avaliable on that chain.
+ */
+__nodebug __root faraddr_t _tc_get_buffer(faraddr_t *chain)
+{
+	auto 	faraddr_t buf;
+#asm
+	ld		hl,(sp+@sp+chain)
+	call	dkcGetBuffer
+	jr		z,._tc_bufwasgood
+
+	xor	a
+	ld		b,a
+	ld		c,a
+	ld		d,a
+	ld		e,a			; there was no buffer - return 0
+
+._tc_bufwasgood:		; load the buffer value into 'buf'
+	ld		h,b
+	ld		l,c
+	ld		(sp+@sp+buf+2),hl
+	ex		de,hl
+	ld		(sp+@sp+buf),hl
+#endasm
+
+	return buf;			//; return the answer
+}
+
+/*** BeginHeader _tc_create_queue */
+int _tc_create_queue(faraddr_t* chain, faraddr_t buffer, long bufsize, int number);
+/*** EndHeader */
+__nodebug
+int _tc_create_queue(faraddr_t* chain, faraddr_t buffer, long bufsize, int number)
+{
+	auto int x;
+
+	*chain=0;
+
+	if(buffer!=0) {
+		for(x=0;x<number;x++)
+			_tc_queue_buffer(chain,buffer+x*bufsize);
+	}
+
+	return *chain==0;
+}
+
+/*** BeginHeader _tc_queue_empty */
+int _tc_queue_empty(faraddr_t* chain);
+/*** EndHeader */
+int _tc_queue_empty(faraddr_t* chain)
+{
+	return *chain==0;
+}
+
+/*** BeginHeader _tc_lockinit, _tc_lock, _tc_unlock */
+
+/*
+ *		General Locking Functions
+ *
+ */
+
+typedef uint8 DevMateLock;
+
+int _tc_lockinit(void* pointer);
+int _tc_lock(void* pointer, long timeout);
+int _tc_unlock(void* pointer);
+
+/*** EndHeader */
+
+int _tc_lockinit(void* pointer)
+{
+	*((char*)pointer)=0;
+	return 0;
+}
+
+int _tc_lock(void* pointer, long timeout)
+{
+	auto int done;
+
+	done=0;
+
+	do {
+#asm
+		ld		hl,(sp+@SP+pointer)
+		bit	0,(hl)
+		set	0,(hl)
+		jr		nz,.locked
+		ld		hl,(sp+@SP+done)
+		inc	hl
+		ld		(sp+@SP+done),hl
+.locked:
+#endasm
+	} while(!done && ((long)(timeout-MS_TIMER))>0);
+
+	if(!done)
+		return -1;
+
+	return 0;
+}
+
+int _tc_unlock(void* pointer)
+{
+	*((char*)pointer)=0;
+	return 0;
+}
+
+
+/*** BeginHeader dkcLogicalToPhysical, dkcLongLogicalToPhysical */
+// Assembler call: convert long logical format (as obtained by LDL instructions,
+// i.e. where MSBs are 0xFFFF for a logical address) to a straight physical
+// address.  Addresses which are already physical are not changed.
+// Parameter passed and returned in BCDE.  Mapping is assumed to be data space.
+__root void dkcLongLogicalToPhysical();
+// Assembler call: convert logical (16 bit) in HL to physical address in BCDE.
+// On entry, if A is non-zero then code space mapping is assumed, else data.
+__root void dkcLogicalToPhysical();
+/*** EndHeader ****************************************************************/
+#asm __root
+dkcLongLogicalToPhysical::
+		inc	bc
+		test	bc									; if BC was not 0xFFFF then...
+		dec	bc
+		ret	nz									; ...return after fixing BC back up.
+		ex		de,hl								; else move logical part to HL
+		xor	a									; use data space conversion
+		ld		c,a								; no A16/A19 inversions
+		; fall through to do true log->phys conversion
+dkcLogicalToPhysical::
+		ex		af, af'                   ; Put the check inversion flag in a'
+      push	af                        ; Save f'.
+      ld		a, h                      ; load the high byte into a
+		cp 	a, 0xE0                   ; If hl == E000, then ~(a < E0)
+   	jr		c, .checkstackseg         ; If address < E000 check the stack seg
+
+   	xor	a                         ; Clear the inversion mask
+   	ex		de, hl                    ; .buildphysical expects addr in de
+   	ld		hl, lxpc                  ; .buildphysical expects seg in hl
+   	jr		.buildphysical            ; Go make the physical address
+
+.checkstackseg:                       ; Stack segment check
+ioi	ld		a, (SEGSIZE)              ; SEGSIZE: 7-4 stack | 3-0 data
+		ld    b, a							  ; Save result if next section reached
+		and	a, 0xF0                   ; Mask off dataseg logical break
+      cp		a, h                      ; Is stack break > address?
+      jr		gtu, .checkdataseg        ; If so, check the data segment
+
+      xor	a                         ; Clear the inversion mask
+		ex		de, hl                    ; Put address in de
+ioi	ld		hl, (STACKSEGL)           ; Load stackseg into hl
+		jr		.buildphysical            ; Go make the physical address
+
+.checkdataseg:                        ; Data segment check
+		ld		a, b                      ; Remember segsize
+		rlca                            ; rotate left
+      rlca
+		rlca
+      rlca                            ; Now data break is in high nibble
+      and 	a, 0xF0                   ; mask out the stack break
+      cp		a, h                      ; Is data break > address?
+      ex		bc, hl                    ; Save address
+      flag 	gtu, hl                   ; hl = data break > address (root)
+      ex		bc, hl                    ; bc = root?, hl remembers address
+
+      ld		e, 0                      ; Preload xor mask with 0
+      ex		af, af'                   ; Remember check inversion.
+      or		a, a                      ; Is it nonzero?
+      jr		nz, .skipinversions       ; If so, caller wants code address
+
+ioi	ld		a, (MMIDR)                ; Load inversion settings
+		test	bc                        ; Checking root?
+      jr		nz, .checkrootMSB         ; If so, check the rootseg MSB inversion
+
+		bit	3, a                      ; Otherwise check the dataseg MSB inver.
+      jr		.testMSB                  ; Jump to test
+
+.checkrootMSB:
+		bit   1, a                      ; Test rootseg MSB inversion
+
+.testMSB:
+      jr		z, .noinvertMSB           ; If MSB inv off, proceed to A16
+      set	MSB_ID_MASK_BIT, e        ; Otherwise set the xor bit
+
+.noinvertMSB:
+		test	bc                        ; Checking root?
+      jr		nz, .checkrootA16         ; If so, check the rootseg A16 inversion
+
+      bit	2, a                      ; Otherwise, check the dataseg A16 inver.
+      jr		.testA16                  ; Jump to test
+
+.checkrootA16:
+		bit	0, a                      ; Test rootseg A16 inversion
+
+.testA16:
+      jr		z, .skipinversions        ; If A16 inv off, proceed to build
+      set	0, e                      ; Otherwise set the xor bit
+
+.skipinversions:
+      ld		a, e                      ; Load the xor mask into A
+      ex		de, hl                    ; Load address into de
+      clr	hl								  ; Preclear segment
+      test	bc                        ; Checking root?
+      jr		nz, .buildphysical        ; If so, we've loaded the segment
+
+ioi	ld		hl, (DATASEGL)            ; Otherwise, load the dataseg
+
+.buildphysical:
+		ex		jk, hl                    ; Exchange segment into jk
+      clr	hl                        ; Clear hl (jkhl = seg:00)
+      ld		bc, hl                    ; bc = 0 (bcde = 00:addr)
+      srl	4, jkhl                   ; Shift seg by 4
+      add	jkhl, bcde                ; Add shifted seg to addr
+      ex		jkhl, bcde                ; Physical result in jkhl to bcde
+      xor	a, c                      ; Apply inversions (result in A)
+      ld		c, a                      ; Replace upper byte of physical
+      ld		b, 0                      ; Clear 24-31 in case of carry
+
+      pop	af
+      ex		af, af'
+      ret
+#endasm
+
+/*** BeginHeader dkcPhysicalToLogical *****************************************/
+void dkcPhysicalToLogical();
+/*** EndHeader ****************************************************************/
+
+#asm __root
+; Converts a physical address stored in bc,de to a logical address.
+; The resulting xpc will be in a, and the offset will be in hl.
+; if R4000, lxpc will be in jk (xpc in a too for now), offset in hl
+dkcPhysicalToLogical::
+	push	bc			; save the address for later
+	push	de
+
+   ld    h,c
+   ld    l,d
+   rr    hl
+   rr    hl
+   rr    hl
+   rr    hl
+   ld    a,0x0f
+   and   h
+   ld    h,a
+   push  hl
+   ld    hl,0x000e
+   ex    jk,hl
+   pop   hl
+   sub   hl,jk
+   ld    a,h
+   and   0x0f
+   ld    h,a
+   ld    a,l
+   ex    jk,hl
+   ld    hl,0x0fff
+   and   hl,de
+   ex    de,hl
+   ld    hl,0xe000
+   add   hl,de
+
+	pop	de
+	pop	bc			; restore the address
+	ret
+#endasm
+
+/*** BeginHeader dkcClearMemory ***********************************************/
+void dkcClearMemory();
+/*** EndHeader ****************************************************************/
+
+#asm __xmem
+dkcClearMemory::
+	ld		(hl),0x00			; clear the first byte
+	ld		d,h
+	ld		e,l
+	inc	hl						; move the pointer to the 2nd byte
+	ex		de,hl					; hl == first byte, de == 2nd byte
+	dec	bc						; count = count - 1
+	ldir							; run the copy
+	lret
+#endasm
+
+
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+

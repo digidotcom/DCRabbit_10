@@ -1,0 +1,1737 @@
+/************************************************************************
+SFLASH.LIB
+
+COPYRIGHT - Digi International, Inc. (c) 2006 - 2008
+
+Library for interfacing to serial flash memory devices on an SPI bus.
+Specifically, written to work with Atmel DataFlash (AT45DBxxx) parts.
+
+By default, uses serial port B for SPI port and PE6 for the chip select.
+
+To change the serial port, redefine the following macros:
+	SF_SERPORT - Define to SADR, SBDR, SCDR, or SDDR to select serial port.
+	SF_ALTCLOCK - Define to use an alternate clock pin.  [Currently only
+		useful for having Rabbit400 use PE7 on serial port C instead of PD2.]
+
+To change the chip select, redefine the following macros:
+	SF_SPI_CSPORT     - data register for port with CS pin (e.g. PEDR)
+	SF_SPI_CSSHADOW   - shadow varible for data register (e.g. PEDRShadow)
+	SF_SPI_CSDD       - data direction register for CS pin (e.g. PEDDR)
+	SF_SPI_CSDDSHADOW - shadow for data direction register (PEDDRShadow)
+	SF_SPI_CSPIN      - pin number of CS  (e.g. 6)
+	SF_SPI_CSINVERTED - define if chip select is active high
+
+To limit the driver's use of the serial flash, define SF_PROTECT_LOW and
+SF_PROTECT_HIGH:
+
+	SF_PROTECT_LOW and SF_PROTECT_HIGH are used to restrict the driver
+	to reading/writing to pages that are past the number of pages needed
+   to store the protected bytes on each end.  Both are given as a number
+   of bytes.
+
+   This means usable pages are in the range of
+   	prot_lowpages (SF_PROTECT_LOW / pagesize) to
+   	prot_hipages (truepagecount - SF_PROTECT_HIGH / pagesize - 1) inclusive.
+   Page calculations will round up to an integer number of erase pages.
+
+	Driver will claim to have <truepagecount - (prot_lowpages + prot_hipages)>
+	pages available for writing, so the protected page mechanism is transparent
+   to higher-level code (like the FAT library).
+
+The library has two sets of API functions. The first is maintained for
+compatibility with previous versions of SFLASH.LIB. It interfaces to a
+single serial flash chip whose SPI parameters are set at compile time
+using the macros described above. These functions are all blocking and
+only work for single flash devices. The functions are:
+	sf_init
+	sf_status
+	sf_writeRAM
+	sf_readRAM
+	sf_RAMToPage
+	sf_pageToRAM
+	There are also global variables initialized by sf_init():
+	sf_blocks
+	sf_blocksize
+	sf_prefixsize
+
+The new API functions make use of an sf_device structure as a handle for
+a specific serial flash device. This allows multiple devices to be used
+by an application with this library. The new functions are:
+	sf_initDevice
+	sf_getPageSize
+	sf_getPageCount
+	sf_writeDeviceRAM
+	sf_readDeviceRAM
+	sf_readPage
+	sf_writePage
+	sf_isWriting
+
+Revision History:	Rev 1.0 Initial Release
+						Rev 1.1 Clear Rcv FIFO upon initialization for
+                          proper startup of serial commumications.
+						Rev 1.2 Changed SCLKC and SCLKD to parallel port D.
+						Rev 1.3 [tbc] Added ALTCLOCK and CSINVERTED options,
+						        did some other cleanup.  Added sf_address() for
+						        adding x-byte addresses to commands.
+                  Rev 1.4 Created Rabbit 4000+ specific version taking
+                          advantage of bit reversal available in R4000
+                          processor.  This eliminated several functions
+                          used for bit reversal in earlier revisions.
+                  Rev 1.5 Moved board-specific hardware configurations in
+                          from SFLASH_FAT.LIB.  Added method to protect
+                          bytes at start and end of flash from being
+                          overwritten.  Support for writing serial boot flash
+                          on BL4S1xx boards.
+
+*************************************************************************/
+
+/*** BeginHeader */
+
+#ifndef __SFLASH_LIB__
+#define __SFLASH_LIB__
+
+#if RCM6600W_SERIES || RCM6700_SERIES
+#use "R6000_bios.lib"
+#endif
+
+#ifdef SFLASH_DEBUG
+	#define _sflash_nodebug __debug
+#else
+	#define _sflash_nodebug __nodebug
+#endif
+
+
+#ifndef SF_SPI_DIVISOR
+	#if CPU_ID_MASK(_CPU_ID_) < R6000
+		#define SF_SPI_DIVISOR 0
+	#else
+		#define SF_SPI_DIVISOR 6
+	#endif
+#endif
+
+#define SF_SPI_TXMASK 0x80
+#define SF_SPI_RXMASK 0x40
+
+#ifndef SF_SPI_CLOCKMODE
+	#define SF_SPI_CLOCKMODE 0
+#endif
+
+#ifndef SF_SPI_CSPORT
+   #if RCM4200_SERIES
+	   // define Serial Flash on serial port C, chip select on TXDD+
+	   #define SF_SPI_CSPORT		NAPCR
+	   #define SF_SPI_CSPIN			5
+	   #define SF_SPI_CSINVERTED
+	   #define SF_SERPORT			SCDR
+	   #define SF_ALTCLOCK        // use PE7 instead of PD2 for clock
+   #elif RCM4400W_SERIES
+	   // define Serial Flash on serial port B, chip select on TXDD+
+	   #define SF_SPI_CSPORT		NAPCR
+	   #define SF_SPI_CSPIN			5
+	   #define SF_SPI_CSINVERTED
+	   #define SF_SERPORT			SBDR
+		// Reserve 169,287 bytes for FPGA firmware (642 pages) plus 2 spare.
+		// (In original code that wrote firmware, it added an extra page with
+		// a copyright notice.  We preserve that page plus one more for safety.)
+		// FPGA firmware is ALWAYS 169,287 bytes since it's based on the number
+		// of gates (8 gates/byte) on the FPGA.
+		#define SF_PROTECT_LOW (169287 + 2 * 264)
+   #elif RCM5400W_SERIES
+	   // define Serial Flash on serial port B, chip select on PH0
+	   #define SF_SPI_CSPORT		PHDR
+	   #define SF_SPI_CSPIN			0
+	   #define SF_SERPORT			SBDR
+	#elif _BOARD_TYPE_ == RCM5750 || RCM5600W_SERIES || RCM6700_SERIES ||  \
+         RCM6600W_SERIES
+		// Note that RCM5750 and RCM5760 have the same _BOARD_TYPE_.
+		// define Serial Flash on serial port B, chip select on PD6
+		#define SF_SPI_CSPORT		PDDR
+		#define SF_SPI_CSPIN			6
+		#define SF_SERPORT			SBDR
+		// serial port RXB and TXB are both hosted on parallel port D
+		#define SERB_TXPORT			PDDR
+		#define SERB_RXPORT			PDDR
+   #elif BL4S100_SERIES
+	   // define Serial Flash on serial port B, chip select on PE4
+	   #define SF_SPI_CSPORT		PEDR
+	   #define SF_SPI_CSPIN			4
+	   #define SF_SERPORT			SBDR
+   // Note that we don't support the serial boot flash on the RCM4300 for two
+   // reasons.  First, it's on a shared SPI port and this library doesn't make
+   // use of that semaphore.  Second, FAT is available on SD card, and the need
+   // to make use of the SBF for storage is minimal.
+   #else
+   	#error "On this target, you must define SF_SERPORT, SF_SPI_CSPORT,"
+   	#fatal "SF_SPI_CSSHADOW, SF_SPI_CSDD, SF_SPI_CSDDSHADOW and SF_SPI_CSPIN."
+	   // Example of defines for serial port B, chip select on PE6
+	   /*
+      #define SF_SPI_CSPORT		PEDR
+      #define SF_SPI_CSPIN			6
+	   #define SF_SERPORT			SBDR
+
+	   // If using a chip select port other than PDDR, PEDR, PHDR or NAPCR, you
+	   // also need to define SF_SPI_CSSHADOW, SF_SPI_CSDD and SF_SPI_CSDDSHADOW.
+      */
+   #endif
+#endif
+
+#ifndef SF_SPI_CSPIN
+	#fatal "SF_SPI_CSPIN not defined."
+#endif
+#ifndef SF_SERPORT
+	#fatal "SF_SERPORT not defined."
+#endif
+
+#if _SERIAL_BOOT_FLASH_
+   /*
+      These defines only apply to boards that can use a portion of the
+      serial boot flash for data.
+
+      StdBios.c sets MAX_FIRMWARE_BINSIZE to protect the portion of the
+      serial flash used to store the boot firmware.
+
+      If BU_TEMP_USE_SBF or BU_ENABLE_SECONDARY are defined, we need to protect
+      additional space for the temporary/secondary firmware stored on the flash.
+
+      In the case of BU_ENABLE_SECONDARY, the BIOS defines BU_PROTECT_BYTES as
+      the upper address used by the bootloader and primary/secondary firmwares.
+
+      In the case of BU_TEMP_USE_SBF, we simply double the MAX_FIRMWARE_BINSIZE
+      value, which allows enough room for two copies of firmware.
+   */
+   #if defined BU_ENABLE_SECONDARY
+      // protect the boot & secondary firmware, BU_PROTECT_BYTES defined in Bios
+      #define SF_PROTECT_LOW     BU_PROTECT_BYTES
+      // 0x8000UL below is a hard-coded minimum useful mass-storage size
+      #if SF_PROTECT_LOW > ORG_FLASH_SIZE - ORG_USER_BLOCK_SIZE - 0x8000UL
+         #define __SF_PROTECT_LOW_ERROR_CONDITION
+         #error "In Project Options' Defines box, define MAX_FIRMWARE_BINSIZE"
+         #error " to be less than half the serial boot flash size."
+      #endif
+   #elif defined BU_TEMP_USE_SBF
+      // protect the boot firmware and "temp" location
+      #define SF_PROTECT_LOW     (MAX_FIRMWARE_BINSIZE * 2)
+      // 0x8000UL below is a hard-coded minimum useful mass-storage size
+      #if SF_PROTECT_LOW > ORG_FLASH_SIZE - ORG_USER_BLOCK_SIZE - 0x8000UL
+         #define __SF_PROTECT_LOW_ERROR_CONDITION
+         #error "In Project Options' Defines box, define MAX_FIRMWARE_BINSIZE"
+         #error " to be substantially less than half the serial boot flash" \
+                                                                        " size."
+      #endif
+   #else			// using sflash or FAT
+      // protect the boot firmware
+      #define SF_PROTECT_LOW     MAX_FIRMWARE_BINSIZE
+      // 0x8000UL below is a hard-coded minimum useful mass-storage size
+      #if defined BU_TEMP_USE_FAT && \
+          SF_PROTECT_LOW + _MAX_EXPECTED_BINSIZE 		\
+          						> ORG_FLASH_SIZE - ORG_USER_BLOCK_SIZE - 0x8000UL
+         #define __SF_PROTECT_LOW_ERROR_CONDITION
+         #error "In Project Options' Defines box, define MAX_FIRMWARE_BINSIZE"
+         #error " to be substantially less than half the serial boot flash" \
+                                                                        " size."
+      #elif SF_PROTECT_LOW > ORG_FLASH_SIZE - ORG_USER_BLOCK_SIZE - 0x8000UL
+         #define __SF_PROTECT_LOW_ERROR_CONDITION
+         #error "In Project Options' Defines box, define MAX_FIRMWARE_BINSIZE"
+         #error " to be substantially less than the serial boot flash size."
+      #endif
+   #endif
+
+   #if defined __SF_PROTECT_LOW_ERROR_CONDITION
+      #if ORG_FLASH_SIZE <= 0x100000
+         #error "To make roughly half of the serial boot flash available for" \
+                                                                " mass storage,"
+         #if defined BU_ENABLE_SECONDARY
+            #fatal " put MAX_FIRMWARE_BINSIZE=0x40000 into the Project" \
+                                                        " Options' Defines box."
+         #elif defined BU_TEMP_USE_FAT || defined BU_TEMP_USE_SBF
+            #fatal " put MAX_FIRMWARE_BINSIZE=0x40000 into the Project" \
+                                                        " Options' Defines box."
+         #else
+            #fatal " put MAX_FIRMWARE_BINSIZE=0x80000 into the Project" \
+                                                        " Options' Defines box."
+         #endif
+      #elif ORG_FLASH_SIZE <= 0x200000
+         #error "To make roughly half of the serial boot flash available for" \
+                                                                " mass storage,"
+         #if defined BU_ENABLE_SECONDARY
+            #fatal " put MAX_FIRMWARE_BINSIZE=0x80000 into the Project" \
+                                                        " Options' Defines box."
+         #elif defined BU_TEMP_USE_FAT || defined BU_TEMP_USE_SBF
+            #fatal " put MAX_FIRMWARE_BINSIZE=0x80000 into the Project" \
+                                                        " Options' Defines box."
+         #endif
+      #else
+         #fatal "__SF_PROTECT_LOW_ERROR_CONDITION defined for unknown reasons!"
+      #endif
+   #endif
+
+   // protect the User block and system ID block
+   #define SF_PROTECT_HIGH       (SBF_FLASH_BYTES - SBF_USERBLOCK_BEGIN)
+#endif
+
+// automatically define macros for data shadow, and data-direction reg/shadow
+#if SF_SPI_CSPORT == PDDR
+	#ifndef SF_SPI_CSSHADOW
+		#define SF_SPI_CSSHADOW    PDDRShadow
+	#endif
+	#ifndef SF_SPI_CSDD
+   	#define SF_SPI_CSDD        PDDDR
+   #endif
+   #ifndef SF_SPI_CSDDSHADOW
+   	#define SF_SPI_CSDDSHADOW  PDDDRShadow
+	#endif
+#endif
+#if SF_SPI_CSPORT == PEDR
+	#ifndef SF_SPI_CSSHADOW
+		#define SF_SPI_CSSHADOW    PEDRShadow
+	#endif
+	#ifndef SF_SPI_CSDD
+   	#define SF_SPI_CSDD        PEDDR
+   #endif
+   #ifndef SF_SPI_CSDDSHADOW
+   	#define SF_SPI_CSDDSHADOW  PEDDRShadow
+	#endif
+#endif
+#if CPU_ID_MASK(_CPU_ID_) >= R5000
+   // PHDR is an option on Rabbit 5000 and later
+   #if SF_SPI_CSPORT == PHDR
+      #ifndef SF_SPI_CSSHADOW
+         #define SF_SPI_CSSHADOW    PHDRShadow
+      #endif
+      #ifndef SF_SPI_CSDD
+         #define SF_SPI_CSDD        PHDDR
+      #endif
+      #ifndef SF_SPI_CSDDSHADOW
+         #define SF_SPI_CSDDSHADOW  PHDDRShadow
+      #endif
+   #endif
+#endif
+#if CPU_ID_MASK(_CPU_ID_) == R4000
+   // NAPCR is an option on Rabbit 4000 boards
+   #if SF_SPI_CSPORT == NAPCR
+      #ifndef SF_SPI_CSSHADOW
+         #define SF_SPI_CSSHADOW    NAPCRShadow
+      #endif
+      #ifndef SF_SPI_CSDD
+         // no need for DD shadow if CSDD is 0
+         #define SF_SPI_CSDD        0x00
+      #endif
+   #endif
+#endif
+
+//serial port register offsets
+#define SF_AR_OFFSET 1
+#define SF_SR_OFFSET 3
+#define SF_CR_OFFSET 4
+#define SF_ER_OFFSET 5
+
+#if SF_SERPORT == SADR
+   #define SF_SERPORT_TR 4
+   #define SF_SERPORT_TR_REG TAT4R
+   #define SF_SERPORT_TR_SHADOW TAT4RShadow
+   #define SF_SERPORT_CR_SHADOW SACRShadow
+   #define SF_SERPORT_ER_SHADOW SAERShadow
+   #ifdef SERA_TXPORT
+   	#define SF_SPI_TXPORT SERA_TXPORT
+   #endif
+
+#elif SF_SERPORT == SBDR
+   #define SF_SERPORT_TR 5
+   #define SF_SERPORT_TR_REG TAT5R
+   #define SF_SERPORT_TR_SHADOW TAT5RShadow
+   #define SF_SERPORT_CR_SHADOW SBCRShadow
+   #define SF_SERPORT_ER_SHADOW SBERShadow
+   #ifdef SERB_TXPORT
+   	#define SF_SPI_TXPORT SERB_TXPORT
+   #endif
+
+#elif SF_SERPORT == SCDR
+   #define SF_SERPORT_TR 6
+   #define SF_SERPORT_TR_REG TAT6R
+   #define SF_SERPORT_TR_SHADOW TAT6RShadow
+   #define SF_SERPORT_CR_SHADOW SCCRShadow
+   #define SF_SERPORT_ER_SHADOW SCERShadow
+   #ifdef SERC_TXPORT
+   	#define SF_SPI_TXPORT SERC_TXPORT
+   #endif
+
+#elif SF_SERPORT == SDDR
+   #define SF_SERPORT_TR 7
+   #define SF_SERPORT_TR_REG TAT7R
+   #define SF_SERPORT_TR_SHADOW TAT7RShadow
+   #define SF_SERPORT_CR_SHADOW SDCRShadow
+   #define SF_SERPORT_ER_SHADOW SDERShadow
+   #ifdef SERD_TXPORT
+   	#define SF_SPI_TXPORT SERD_TXPORT
+   #endif
+
+#else
+	#fatal "Invalid definition of SF_SERPORT"
+#endif
+
+#ifdef SF_PROTECT_HIGH
+	#define SF_PROTECTED
+	#ifndef SF_PROTECT_LOW
+		#define SF_PROTECT_LOW 0
+	#endif
+#else
+	#ifdef SF_PROTECT_LOW
+		#define SF_PROTECTED
+		#define SF_PROTECT_HIGH 0
+	#endif
+#endif
+
+#define SF_BITSREVERSED 0x01   // Not used in RCM4000 modules
+                               //  Now a placeholder for legacy versions
+#define SF_RAMBANK1 0x00
+#define SF_RAMBANK2 0x02
+
+#ifndef SPI_BUSY_FLAG_DECLARED
+int _sf_spi_busy;
+#endif
+
+// max wait time for page write to complete (in msec)
+#ifndef SF_PAGEWRITE_WAIT
+	#define SF_PAGEWRITE_WAIT 100
+#endif
+
+/*** EndHeader */
+
+/*** BeginHeader sfspi_init */
+void sfspi_init(void);
+
+/* START FUNCTION DESCRIPTION ********************************************
+sfspi_init                 <SFLASH.LIB>
+
+SYNTAX: void sfspi_init(void);
+
+DESCRIPTION:	Initialize SPI driver for use with serial flash. This must
+					be called before any calls to sf_initDevice()
+
+END DESCRIPTION **********************************************************/
+
+/*** EndHeader */
+
+#ifdef SF_SERPORT_ALTRXTX
+	/*
+		SF_SERPORT_ALTRXTX was added to the 10.56 release only, and is
+		unnecessary due to existing macros SERx_TXPORT and SERx_RXPORT.
+		See RS232.LIB for how these macros are used.
+	*/
+	#error "SF_SERPORT_ALTRXTX deprecated, use SERx_TXPORT and SERx_RXPORT"
+#endif
+
+#ifndef SF_SPI_CONTROL_VALUE
+	#if defined(SF_SPI_TXPORT) && (SF_SPI_TXPORT == PDDR)
+	   // serial port Rx is hosted on parallel port D
+	   #define SF_SPI_CONTROL_VALUE 0x1C
+	#elif defined(SF_SPI_TXPORT) && (SF_SPI_TXPORT == PEDR)
+	   // serial port Rx is hosted on parallel port E
+	   #define SF_SPI_CONTROL_VALUE 0x2C
+	#else
+	   // serial port Rx is hosted on parallel port C
+		#define SF_SPI_CONTROL_VALUE 0x0C
+	#endif
+#endif
+
+_sflash_nodebug void sfspi_init(void)
+{
+	_sf_spi_busy = TRUE;
+	BitWrPortI(TACR, &TACRShadow, 0, SF_SERPORT_TR); //use pclk/2 for TATxR
+   WrPortI(SF_SERPORT_TR_REG, &SF_SERPORT_TR_SHADOW, SF_SPI_DIVISOR);
+
+   WrPortI(SF_SERPORT + SF_CR_OFFSET,
+   		  &SF_SERPORT_CR_SHADOW,
+           SF_SPI_CONTROL_VALUE);
+   WrPortI(SF_SERPORT + SF_ER_OFFSET,    // Sets clock mode & reverse bit order
+   		  &SF_SERPORT_ER_SHADOW,        // Reverse bit order is a new SPI
+           (SF_SPI_CLOCKMODE << 4) + 8); // feature available on Rabbit 4000.
+
+   //specific code for setting up pins for different ports
+#if SF_SERPORT == SADR
+   BitWrPortI(PCFR, &PCFRShadow, 1, 6); //set to ser A TX
+   BitWrPortI(PCDDR, &PCDDRShadow, 1, 6); //make sure PC6 (TxA) is an output
+   BitWrPortI(PBDDR, &PBDDRShadow, 1, 1); //make sure CLK(PB1) is output
+
+#elif SF_SERPORT == SBDR
+ #if defined(SERB_RXPORT) && (SERB_RXPORT == PDDR)
+	// serial port RXB is hosted on parallel port D
+	BitWrPortI(PDFR, &PDFRShadow, 0, 5);	// reset PD5 (RXB) as normal I/O
+	BitWrPortI(PDDDR, &PDDDRShadow, 0, 5);	// reset PD5 (RXB) as input
+ #elif defined(SERB_RXPORT) && (SERB_RXPORT == PEDR)
+	// serial port RXB is hosted on parallel port E
+	BitWrPortI(PEFR, &PEFRShadow, 0, 5);	// reset PE5 (RXB) as normal I/O
+	BitWrPortI(PEDDR, &PEDDRShadow, 0, 5);	// reset PE5 (RXB) as input
+ #else
+	// serial port RXB is hosted on parallel port C
+	BitWrPortI(PCFR, &PCFRShadow, 0, 5);	// reset PC5 (RXB) as normal I/O
+	BitWrPortI(PCDDR, &PCDDRShadow, 0, 5);	// reset PC5 (RXB) as input
+ #endif
+ #if defined(SERB_TXPORT) && (SERB_TXPORT == PDDR)
+	// serial port TXB is hosted on parallel port D
+	WrPortI(PDAHR, &PDAHRShadow, RdPortI(PDAHR) & 0xFC | 0x00);
+	                                    	// prepare PD4 as alternate I/O TXB
+	BitWrPortI(PDFR, &PDFRShadow, 1, 4);	// set PD4 (TXB) as alternate I/O
+	BitWrPortI(PDDDR, &PDDDRShadow, 1, 4);	// set PD4 (TXB) as output
+ #else
+	// serial port TXB is hosted on parallel port C
+	WrPortI(PCAHR, &PCAHRShadow, RdPortI(PCAHR) & 0xFC | 0x00);
+	                                    	// prepare PC4 as alternate I/O TXB
+	BitWrPortI(PCFR, &PCFRShadow, 1, 4);	// set PC4 (TXB) as alternate I/O
+	BitWrPortI(PCDDR, &PCDDRShadow, 1, 4);	// set PC4 (TXB) as output
+ #endif
+	BitWrPortI(PBDDR, &PBDDRShadow, 1, 0);	// set PB0 (SCLKB) as output
+
+#elif SF_SERPORT == SCDR
+   BitWrPortI(PCFR, &PCFRShadow, 1, 2); //set to ser C TX
+   BitWrPortI(PCDDR, &PCDDRShadow, 1, 2); //make sure PC2 (TxC) is an output
+   //setup CLK(PE7 or PD2)
+   #ifdef SF_ALTCLOCK
+      // use PE7 for clock
+      BitWrPortI(PEFR, &PEFRShadow, 1, 7);
+      BitWrPortI(PEDCR, &PEDCRShadow, 0, 7);
+      BitWrPortI(PEAHR, &PEAHRShadow, 1, 6);
+      BitWrPortI(PEAHR, &PEAHRShadow, 1, 7);
+      BitWrPortI(PEDDR, &PEDDRShadow, 1, 7);
+   #else
+      // use PD2 for clock
+      BitWrPortI(PDFR, &PDFRShadow, 1, 2);
+      BitWrPortI(PDDCR, &PDDCRShadow, 0, 2);
+      BitWrPortI(PDALR, &PDALRShadow, 0, 4);
+      BitWrPortI(PDALR, &PDALRShadow, 0, 5);
+      BitWrPortI(PDDDR, &PDDDRShadow, 1, 2);
+   #endif
+
+#elif SF_SERPORT == SDDR
+   BitWrPortI(PCFR, &PCFRShadow, 1, 0); //set to ser D TX
+   BitWrPortI(PCDDR, &PCDDRShadow, 1, 0); //make sure PC0 (TxD) is an output
+   //setup CLK(PD0)
+   BitWrPortI(PDFR, &PDFRShadow, 1, 0);
+   BitWrPortI(PDDCR, &PDDCRShadow, 0, 0);
+   BitWrPortI(PDDDR, &PDDDRShadow, 1, 0);
+#endif
+
+	// setup CS pin, make sure serial flash is deselected
+#ifdef SF_SPI_CSINVERTED
+   BitWrPortI(SF_SPI_CSPORT, &SF_SPI_CSSHADOW, 0, SF_SPI_CSPIN);
+#else
+   BitWrPortI(SF_SPI_CSPORT, &SF_SPI_CSSHADOW, 1, SF_SPI_CSPIN);
+#endif
+
+#if SF_SPI_CSDD != 0x00
+   BitWrPortI(SF_SPI_CSDD, &SF_SPI_CSDDSHADOW, 1, SF_SPI_CSPIN);
+#endif
+
+   // Clear Rcv Status
+	RdPortI( SF_SERPORT);
+
+   _sf_spi_busy = FALSE;
+   return;
+}
+
+
+
+
+/*** BeginHeader sfspi_write */
+int sfspi_write(const char *buffer, int len);
+
+/* START _FUNCTION DESCRIPTION ********************************************
+sfspi_write                 <SFLASH.LIB>
+
+SYNTAX: int sfspi_write(const char *buffer, int len)
+
+DESCRIPTION:   Transmits a block of data over the SPI port. This
+					function blocks until the tranmission completes
+
+PARAMETER1:		buffer - An array of bytes to transmit
+PARAMETER2:		len - number of bytes to transmit
+
+RETURN VALUE:  0 - transmit OK
+					-1 - error
+
+END DESCRIPTION **********************************************************/
+
+/*** EndHeader */
+
+_sflash_nodebug
+int sfspi_write(const char *buffer, int len)
+{
+	return sfspi_xwrite((long)paddr(buffer), len);
+}
+
+/*** BeginHeader sfspi_xwrite */
+int sfspi_xwrite(long buffer, int len);
+
+/* START _FUNCTION DESCRIPTION ********************************************
+sfspi_xwrite                 <SFLASH.LIB>
+
+SYNTAX: int sfspi_xwrite(long buffer, int len)
+
+DESCRIPTION:   Transmits a block of data over the SPI port from an xmem
+					buffer. This function blocks until the tranmission completes
+
+PARAMETER1:		buffer - Pointer to an array of bytes in xmem
+PARAMETER2:		len - number of bytes to transmit
+
+RETURN VALUE:  0 - transmit OK
+					-1 - error
+
+END DESCRIPTION **********************************************************/
+/*** EndHeader */
+
+_sflash_nodebug
+int sfspi_xwrite(long buffer, int len)
+{
+   auto int rc;
+
+#ifdef SFLASH_VERBOSE
+   printf( "sfwrite ");
+   mem_dump( (char __far *) buffer, (len > 16) ? 16 : len);
+#endif
+#asm
+      ld    hl, (SP+@SP+len)           ; get len value
+      test  hl                         ; test for len zero or negative
+      jr    z, .xwrite_done            ; zero, go return OK
+
+      jp    p, .continue               ; non-negative, go continue
+
+      clr   hl                         ; get error (-1) result code into HL
+      dec   hl                         ;
+      jr    .xwrite_done               ; go return error code
+
+.continue:
+      ld    bc, hl
+      ld    px, (SP+@SP+buffer)
+      push  ix
+      ld    ix, SF_SERPORT
+		; Wait for serial flash communication to be idle, discarding unexpected Rx
+		; bytes as necessary to achieve the idle state, before attempting to
+		; transmit commands or data to the serial flash.
+		; This loop is a potential lock up point, but if lockup occurs it means
+		; serial flash communication is somehow broken. In this case it's probably
+		; better to lock up instead of continuing in some broken manner.
+.dropDataLp:
+ioi	ld		a, (ix)					; attempt to ensure Rx flag bits are clear
+ioi	ld		a, (ix+SF_SR_OFFSET)	; get current serial port status
+		and	0xAC						; test Rx full/overrun, Tx full/sending bits
+		jr		nz, .dropDataLp		; if TX busy or RX not empty go re-check . . .
+
+.xwrite_loop:
+      ld    a, (px)                    ; get a byte
+ioi   ld    (ix), a                    ; write it to Tx data register
+      ld    px, px+1
+      ; The Rabbit's SPI transmitter idle status bit is actually set 1/2 bit-
+      ; time early. To compensate for this, we start a simultaneous receive plus
+      ; transmit operation and wait for the receive operation to complete. We
+      ; discard the received byte before proceeding.
+      ld    a, (SF_SERPORT_CR_SHADOW)
+      or    SF_SPI_RXMASK | SF_SPI_TXMASK
+ioi   ld    (ix+SF_CR_OFFSET), a       ; load simultaneous RX+TX control value
+.xwrite_wait:
+ioi   bit   7, (ix+SF_SR_OFFSET)       ; wait for receive bit to be set
+      jr    z, .xwrite_wait
+
+ioi   ld    a, (ix)                    ; get dummy Rx byte (clear receiver bit)
+      dwjnz .xwrite_loop
+
+      pop   ix
+      clr   hl
+.xwrite_done:
+      ld    (SP+@SP+rc), hl
+#endasm
+   return rc;
+}
+
+
+/*** BeginHeader sfspi_read */
+int sfspi_read(char *buffer, int len);
+
+
+/* START _FUNCTION DESCRIPTION ********************************************
+sfspi_read                 <SFLASH.LIB>
+
+SYNTAX: int sfspi_read(char *buffer, int len)
+
+DESCRIPTION:   Reads in len bytes of data from the SPI port into a buffer
+
+PARAMETER1:		buffer - buffer for received bytes
+PARAMETER2:		len - number of bytes to receive
+
+RETURN VALUE:  0 - receive OK
+					-1 - error
+
+END DESCRIPTION **********************************************************/
+
+/*** EndHeader */
+
+_sflash_nodebug
+int sfspi_read(char *buffer, int len)
+{
+	return sfspi_xread((long)paddr(buffer), len);
+}
+
+
+/*** BeginHeader sfspi_xread */
+int sfspi_xread(long buffer, int len);
+
+/* START _FUNCTION DESCRIPTION ********************************************
+sfspi_xread                 <SFLASH.LIB>
+
+SYNTAX: int sfspi_xread(long buffer, int len)
+
+DESCRIPTION:   Reads in len bytes of data from the SPI port into
+					an xmem buffer
+
+PARAMETER1:		buffer - xmem buffer for received bytes
+PARAMETER2:		len - number of bytes to receive
+
+RETURN VALUE:  0 - receive OK
+					-1 - error
+
+END DESCRIPTION **********************************************************/
+
+/*** EndHeader */
+
+_sflash_nodebug
+int sfspi_xread(long buffer, int len)
+{
+   auto int rc;
+
+#asm
+      ld    hl, (SP+@SP+len)
+      test  hl
+      jr    z, .xread_done
+
+      jp    p, .continue               ; non-negative, go continue
+
+      clr   hl                         ; get error (-1) result code into HL
+      dec   hl                         ;
+      jr    .xread_done                ; go return error code
+
+.continue:
+      ld    bc, hl
+      ld    px, (SP+@SP+buffer)
+      push  ix
+      ld    ix, SF_SERPORT
+		; Wait for serial flash communication to be idle, discarding unexpected Rx
+		; bytes as necessary to achieve the idle state, before attempting to
+		; read data or status from the serial flash.
+		; This loop is a potential lock up point, but if lockup occurs it means
+		; serial flash communication is somehow broken. In this case it's probably
+		; better to lock up instead of continuing in some broken manner.
+.dropDataLp:
+ioi	ld		a, (ix)					; attempt to ensure Rx flag bits are clear
+ioi	ld		a, (ix+SF_SR_OFFSET)		; get current serial port status
+		and	0xAC						; test Rx full/overrun, Tx full/sending bits
+		jr		nz, .dropDataLp		; if TX busy or RX not empty go re-check . . .
+
+.xread_loop:
+      ld    a, (SF_SERPORT_CR_SHADOW)
+      or    SF_SPI_RXMASK
+ioi   ld    (ix+SF_CR_OFFSET), a       ; load RX control value
+.xread_wait:                           ; wait for the rec. to complete
+ioi   bit   7, (ix+SF_SR_OFFSET)       ; test receiver bit
+      jr    z, .xread_wait             ; jump if not done yet
+
+ioi   ld    a,(ix)                     ; get the byte
+      ld    (px), a                    ; store the byte
+      ld    px, px+1                   ; point to next byte
+      dwjnz .xread_loop
+
+      pop   ix
+      clr   hl
+.xread_done:
+      ld       (SP+@SP+rc), hl
+#endasm
+#ifdef SFLASH_VERBOSE
+   printf( "sfread  ");
+   mem_dump( (char __far *) buffer, (len > 16) ? 16 : len);
+#endif
+   return rc;
+}
+
+
+/*** BeginHeader */
+
+typedef struct
+{
+	int port;
+   char *shadow;
+   char mask;
+} sf_cspin;
+
+typedef struct sf_device_st
+{
+	struct sf_device_st *next;  //next element in linked list
+	long pages; //number of usable pages in flash device
+   unsigned int pagesize; //size (in bytes) of pages in flash device
+   int addressbytes; // number of bytes used for page addressing
+   int pagebitshift; // number of 'don't care' bits following the page address
+   unsigned int page_offset;  // # of protected pages at the start of device
+   int write_state;  // state for multi-page writes (used by filesystem)
+   long write_page;  // page currently being written (used by filesystem)
+   sf_cspin cspin;
+} sf_device;
+
+/*** EndHeader */
+
+
+/*** BeginHeader sf_init */
+int sf_init(void);
+
+// Separate variables kept for backward compatibility, initialized by sf_init.
+extern long sf_blocks;
+extern int sf_prefixsize;
+extern int sf_blocksize;
+extern sf_device sf_dev;
+
+/*** EndHeader */
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+sf_init                 <SFLASH.LIB>
+
+SYNTAX: int sf_init(void);
+
+DESCRIPTION:  Initializes serial flash chip. This function must be called
+				before the serial flash can be used.
+            Currently supported devices are:
+            AT45DB041
+            AT45DB081
+            AT45DB642
+            AR45DB1282
+
+RETURN VALUE:  0 for success,
+					-1 if no flash chip detected
+               -2 if error communicating with flash chip
+               -3 if unknown flash chip type
+               -4 if shared SPI port in use by other resource
+
+END DESCRIPTION **********************************************************/
+
+
+sf_device sf_dev;
+long sf_blocks;
+int sf_prefixsize;
+int sf_blocksize;
+
+
+_sflash_nodebug
+int sf_init(void)
+{
+	auto int rc;
+
+   sf_blocks = 0;
+   sf_prefixsize = 0;
+   sf_blocksize = 0;
+
+   sfspi_init();
+
+   if ((rc = sf_initDevice(&sf_dev, SF_SPI_CSPORT, &SF_SPI_CSSHADOW,
+          SF_SPI_CSPIN)) < 0 )
+   	return rc;
+
+   //fill in variables needed for backward compatibility
+   sf_blocks = sf_dev.pages;
+   sf_prefixsize = sf_dev.pagesize % 256; //extra space past n*256
+   sf_blocksize = sf_dev.pagesize;
+
+   return 0;
+}
+
+/*** BeginHeader sf_print_dev */
+void sf_print_dev(const sf_device *dev);
+/*** EndHeader */
+//DEBUGGING function
+void sf_print_dev(const sf_device *dev)
+{
+	printf("sf_device address: 0x%x\n", (unsigned int)dev );
+   printf("\tnext: 0x%x\n", (unsigned int)(dev->next) );
+   printf("\tpages: %ld\n", dev->pages);
+   printf("\tpagesize: %d\n", dev->pagesize);
+   printf("\taddressbytes: %d\n", dev->addressbytes);
+   printf("\tpagebitshift: %d\n", dev->pagebitshift);
+   printf("\twrite_state: %d\n", dev->write_state);
+   printf("\twrite_page: %ld\n", dev->write_page);
+   printf("\tcs_pin:\n");
+   printf("\t\tport: 0x%x\n", dev->cspin.port);
+   printf("\t\tshadow: 0x%x\n", (unsigned int)(dev->cspin.shadow) );
+   printf("\t\tmask: 0x%x\n", dev->cspin.mask);
+}
+
+/*** BeginHeader sf_initDevice */
+int sf_initDevice(sf_device *dev, int cs_port, char *cs_shadow, int cs_pin);
+
+/* START FUNCTION DESCRIPTION ********************************************
+sf_initDevice                 <SFLASH.LIB>
+
+SYNTAX: int sf_initDevice(sf_device *dev,
+							     int cs_port,
+                          char *cs_shadow,
+                          int cs_pin);
+
+DESCRIPTION: Initializes the serial flash chip.  This function must be
+             called before the serial flash can be used.  The sfspi_init()
+             function must be called before any calls to this function to
+             initialize the SPI port for serial flash usage.
+              Currently supported devices are:
+              AT45DB041
+              AT45DB081
+              AT45DB642
+              AR45DB1282
+
+PARAMETER1:		dev - pointer to an empty sf_device struct that will be
+						filled in. The struct will then act as a handle for
+                  the device
+PARAMETER2:		cs_port - I/O port for the active low chip select pin for
+							the device
+PARAMETER3:		cs_shadow - pointer to the shadow variable for cs_port
+PARAMETER4:		cs_pin - I/O port pin number for the chip select signal
+
+
+RETURN VALUE:  0 for success,
+					-1 if no flash chip detected
+               -2 if error communicating with flash chip
+               -3 if unknown flash chip type
+               -4 if shared SPI port in use by other resource
+
+END DESCRIPTION **********************************************************/
+
+/*** EndHeader */
+
+
+/*
+table for flash device configuration
+*/
+
+typedef struct {
+	int id_code;
+   long pages;
+   unsigned int pagesize;
+   int addressbytes;
+   int pagebitshift;
+} sf_devtable_entry;
+
+const sf_devtable_entry sf_devtable[] =
+{
+   {0x001C, 2048L, 264, 3, 9},	  // AT45DB041B
+   {0x0024, 4096L, 264, 3, 9},	  // AT45DB081B
+   {0x002C, 4096L, 528, 3, 10},	  // AT45DB161D - new RCM5450W 2MB serflash
+   {0x0034, 8192L, 528, 3, 10},	  // AT45DB321
+   {0x003C, 8192L, 1056, 3, 11},  // AT45DB642
+   {0x0010, 16384L, 1056, 4, 11}, // AT45DB1282
+   {0, 0L, 0, 0, 0},              // Place holder for manual addition
+   {0, 0L, 0, 0, 0}
+};
+#define SFLASH_DEVTABLE_SIZE (sizeof(sf_devtable)/sizeof(sf_devtable[0]))
+
+_sflash_nodebug sf_initDevice(sf_device *dev,
+                              int cs_port,
+                              char *cs_shadow,
+                              int cs_pin)
+{
+	auto char status;
+   auto int i;
+   auto unsigned long t;
+
+#if RCM6600W_SERIES || RCM6700_SERIES
+   if (SPIgetSemaphore(SPI_DF)) {
+      return -4;     // SPI port in use by another resource
+   }
+#endif
+   dev->pages = 0;
+   dev->pagesize = 0;
+   dev->next = NULL; //defaults to end of linked list
+
+   dev->cspin.port = cs_port;
+   dev->cspin.shadow = cs_shadow;
+   dev->cspin.mask = 1 << cs_pin;
+
+   dev->write_state = 0;
+
+   // read until status not busy (with timeout mechanism)
+  	t = MS_TIMER;
+   do {
+     status = _sf_deviceStatus(dev);
+   } while (!(status & 0x80) && ((MS_TIMER - t) < SF_PAGEWRITE_WAIT));
+
+#if RCM6600W_SERIES || RCM6700_SERIES
+   SPIfreeSemaphore(SPI_DF);
+#endif
+
+   if(status == 0xff)
+   {
+   	return -1; //no response
+   }
+   if((status & 0x80) == 0)
+   {
+   	return -2; //serial flash busy timeout
+   }
+
+   //SJH - note that this method of determining the device density (using
+   // middle 4 bits of status register) is obsolete and should be replaced
+   // with the proper JEDEC "manufacterer and device ID read" command.
+   for(i = 0; i < SFLASH_DEVTABLE_SIZE;i++)
+   {
+      if(sf_devtable[i].id_code == (status & 0x3C))
+      {
+         dev->pagesize = sf_devtable[i].pagesize;
+			dev->page_offset = 0;
+			dev->pages = sf_devtable[i].pages;
+
+	      #ifdef SF_PROTECTED
+	      	// Make sure this is the compile-time flash and not some other
+	      	// flash getting added at run-time.  Note that SF_PROTECT_LOW and
+	      	// SF_PROTECT_HIGH might only be available at run-time (like on
+	      	// sbf boards where we need to read the SysIDBlock to learn the
+	      	// location of the UserBlock to protect with SF_PROTECT_HIGH).
+	      	if (cs_port == SF_SPI_CSPORT && cs_pin == SF_SPI_CSPIN)
+	      	{
+	            if (SF_PROTECT_LOW > 0)
+	            {
+	               dev->page_offset =
+	                  (unsigned int)(1 + (SF_PROTECT_LOW - 1) / dev->pagesize);
+	               dev->pages -= dev->page_offset;
+	            }
+	            if (SF_PROTECT_HIGH > 0)
+	            {
+	               dev->pages -= 1 + (SF_PROTECT_HIGH - 1) / dev->pagesize;
+	            }
+	            if (dev->pages < 0)
+	            {
+	            	// PROTECT_LOW and PROTECT_HIGH use up all of the pages
+						dev->pages = 0;
+	            }
+				}
+			#endif
+         dev->addressbytes = sf_devtable[i].addressbytes;
+         dev->pagebitshift = sf_devtable[i].pagebitshift;
+	      #ifdef SFLASH_VERBOSE
+	         printf("sflash device initialized:\n");
+	         sf_print_dev(dev);
+	      #endif
+			return 0;
+      }
+      else if(sf_devtable[i].id_code == 0)
+      {
+      	break; //end of valid entries
+      }
+   }
+#ifdef SFLASH_VERBOSE
+	printf("status = 0x%x\n", status);
+#endif
+	return -3; //unknown part
+}
+
+
+
+/*** BeginHeader sf_status */
+char sf_status(void);
+/*** EndHeader */
+
+//return status byte
+_sflash_nodebug char sf_status(void)
+{
+   return sf_deviceStatus(&sf_dev);
+}
+
+/*** BeginHeader sf_enableCS, sf_disableCS */
+void sf_enableCS(const sf_device *dev);
+void sf_disableCS(const sf_device *dev);
+/*** EndHeader */
+
+#define _sf_cspin_high(c) \
+						WrPortI((c).port, (c).shadow, *((c).shadow) | ((c).mask) )
+#define _sf_cspin_low(c)	\
+						WrPortI((c).port, (c).shadow, *((c).shadow) &~((c).mask) )
+
+_sflash_nodebug void sf_enableCS(const sf_device *dev)
+{
+   auto char ipreg;
+
+	// prevent interruption of WrPortI
+	#asm
+   inc	sp          ; Adjust SP for save to ipreg variable
+	push	ip          ; Save IP register in ipreg variable on stack
+	ipset	1           ; Set IP to prevent interruption of WrPortI
+	#endasm
+   _sf_spi_busy = TRUE;
+	#ifdef SF_SPI_CSINVERTED
+		_sf_cspin_high(dev->cspin);
+	#else
+		_sf_cspin_low(dev->cspin);
+	#endif
+	#asm
+	ioi	ld a, (SF_SERPORT)		; dummy read to empty any "junk"
+	pop	ip          ; Restore IP register from ipreg variable
+   dec	sp          ; And adjust the SP back to compensate for the INC SP
+	#endasm
+}
+
+_sflash_nodebug void sf_disableCS(const sf_device *dev)
+{
+   auto char ipreg;
+
+	// prevent interruption of WrPortI
+	#asm
+   inc	sp          ; Adjust SP for save to ipreg variable
+	push	ip          ; Save IP register in ipreg variable on stack
+	ipset	1           ; Set IP to prevent interruption of WrPortI
+	#endasm
+	#ifdef SF_SPI_CSINVERTED
+		_sf_cspin_low(dev->cspin);
+	#else
+		_sf_cspin_high(dev->cspin);
+	#endif
+   _sf_spi_busy = FALSE;
+	#asm
+	pop	ip          ; Restore IP register from ipreg variable
+   dec	sp          ; And adjust the SP back to compensate for the INC SP
+	#endasm
+}
+
+/*** BeginHeader sf_deviceStatus, _sf_deviceStatus */
+char sf_deviceStatus(const sf_device *dev);
+//  On modules with dedicated SPI ports, make two versions public and private
+//   to allow semaphore or no semaphore as needed.
+#if RCM6600W_SERIES || RCM6700_SERIES
+char _sf_deviceStatus(const sf_device *dev);
+#else
+ // Otherwise, private and public version both call the public version
+ #define _sf_deviceStatus sf_deviceStatus
+#endif
+
+#define sf_isWriting(X) (!(sf_deviceStatus(X) & 0x80))
+#define _sf_isWriting(X) (!(_sf_deviceStatus(X) & 0x80))
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+sf_isWriting                 <SFLASH.LIB>
+
+SYNTAX: int sf_isWriting(const sf_device *dev);
+
+DESCRIPTION:   Returns 1 if the flash device is busy writing to a page
+
+PARAMETER1:		dev - pointer to initialized sf_device structure for
+						 the flash chip
+
+RETURN VALUE:  1 busy
+					0 ready, not currently writing
+
+END DESCRIPTION **********************************************************/
+
+/* START FUNCTION DESCRIPTION ********************************************
+sf_deviceStatus                 <SFLASH.LIB>
+
+SYNTAX: int sf_deviceStatus(const sf_device *dev);
+
+DESCRIPTION:   Returns status from flash device
+
+PARAMETER1:		dev - pointer to initialized sf_device structure for
+						 the flash chip
+
+RETURN VALUE:  status value from flash chip
+
+END DESCRIPTION **********************************************************/
+
+#if RCM6600W_SERIES || RCM6700_SERIES
+// Semaphore locked public version for core modules with shared SPI port
+_sflash_nodebug char sf_deviceStatus(const sf_device *dev)
+{
+	auto char status;
+
+   status = 0x80; // Initialize for busy condition, bit 0 indicates its SPI
+   if (!SPIgetSemaphore(SPI_DF))
+   {
+		sf_enableCS(dev);
+		/*
+			At least some (e.g. AT45DB321) of Atmel's serial flash devices actually
+			require the so-called "optional dummy byte" be transmitted following
+			the read status register command for applications clocking the serial
+			flash at greater than 25 MHz. For safety, we always send the dummy byte
+			and expect the read status register result in the byte following the
+			dummy byte.
+		*/
+   	sfspi_xwrite(paddr("\xD7"), 2);  //Send command 0xD7 and dummy 0x00
+   	sfspi_xread(paddr(&status), 1);  //Read status byte
+		sf_disableCS(dev);
+
+      SPIfreeSemaphore(SPI_DF);
+   }
+   return status;
+}
+
+// No semaphore version, either public or private based on core module
+_sflash_nodebug char _sf_deviceStatus(const sf_device *dev)
+#else
+_sflash_nodebug char sf_deviceStatus(const sf_device *dev)
+#endif
+{
+	auto char status;
+
+	sf_enableCS(dev);
+	/*
+		At least some (e.g. AT45DB321) of Atmel's serial flash devices actually
+		require the so-called "optional dummy byte" be transmitted following the
+		read status register command for applications clocking the serial flash at
+		greater than 25 MHz. For safety, we always send the dummy byte and expect
+		the read status register result in the byte following the dummy byte.
+	*/
+   sfspi_xwrite(paddr("\xD7"), 2);  //Send command 0xD7 and dummy 0x00
+   sfspi_xread(paddr(&status), 1);  //Read status byte
+	sf_disableCS(dev);
+
+   return status;
+}
+
+
+/*** BeginHeader sf_address */
+void sf_address (char *p, int addrbytes, long addr);
+/*** EndHeader */
+// write address in addrbytes at address p, MSB first
+_sflash_nodebug void sf_address (char *p, int addrbytes, long addr)
+{
+	p += addrbytes - 1;
+	while (addrbytes--) {
+		*p-- = (char) (addr & 0x000000FF);
+		addr >>= 8;
+	}
+}
+
+/*** BeginHeader sf_getPageSize */
+unsigned int sf_getPageSize(const sf_device *dev);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+sf_getPageSize                 <SFLASH.LIB>
+
+SYNTAX: unsigned int sf_getPageSize(const sf_device *dev);
+
+DESCRIPTION:	Return size(in bytes) of a page on the current flash
+					device.
+PARAMETER1:		dev - pointer to sf_device struct for initialized flash
+						device
+
+RETURN VALUE:  bytes in a page
+
+END DESCRIPTION **********************************************************/
+
+_sflash_nodebug unsigned int sf_getPageSize(const sf_device *dev)
+{
+	return dev->pagesize;
+}
+
+/*** BeginHeader sf_getPageCount */
+long sf_getPageCount(const sf_device *dev);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+sf_getPageCount                 <SFLASH.LIB>
+
+SYNTAX: long sf_getPageCount(const sf_device *dev);
+
+DESCRIPTION:	Return number of pages in a flash device.
+
+PARAMETER1:		dev - pointer to sf_device struct for initialized flash
+						device
+
+
+RETURN VALUE:  number of pages
+
+END DESCRIPTION **********************************************************/
+
+_sflash_nodebug long sf_getPageCount(const sf_device *dev)
+{
+	return dev->pages;
+}
+
+
+
+/*** BeginHeader sf_writeRAM */
+int sf_writeRAM(const char *buffer, int offset, int len);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+sf_writeRAM                 <SFLASH.LIB>
+
+SYNTAX: int sf_writeRAM(const char *buffer, int offset, int len);
+
+DESCRIPTION:	Write data to the RAM buffer on the serial flash chip
+
+PARAMETER1:    buffer - pointer to data to write into the flash
+						chip RAM
+PARAMETER2:		offset - the address in the serial flash RAM to start
+						writing at
+PARAMETER3:		len - the number of bytes to write
+
+RETURN VALUE:  0 for success
+					-1 for error
+               positive N  -  SPI in use by device N
+
+END DESCRIPTION **********************************************************/
+
+//buffer size is equal to block size
+_sflash_nodebug int sf_writeRAM(const char *buffer, int offset, int len)
+{
+	return sf_writeDeviceRAM(&sf_dev, paddr(buffer), offset, len, SF_RAMBANK1);
+}
+
+/*** BeginHeader sf_writeDeviceRAM */
+int sf_writeDeviceRAM(const sf_device *dev,
+					  		 long buffer,
+                 		 int offset,
+                 		 int len,
+                 		 int flags);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+sf_writeDeviceRAM                 <SFLASH.LIB>
+
+SYNTAX: int sf_writeDeviceRAM(const sf_device *dev,
+                         long buffer,
+                         int offset,
+                         int len
+                         int flags);
+
+DESCRIPTION:	Write data to the RAM buffer on the serial flash chip from
+					a buffer in xmem.
+
+PARAMETER1:		dev - pointer to sf_device structure
+PARAMETER2:    buffer - pointer to xmem data to write into the flash
+						chip RAM
+PARAMETER3:		offset - the address in the serial flash RAM to start
+						writing at
+PARAMETER4:		len - the number of bytes to write
+
+PARAMETER5:		flags -
+                  SF_BITREVERSED - Ignored on R4000 based cores, still
+                                    reserved for legacy code support.
+                  SF_RAMBANK1(default) - Writes to the first RAM bank on
+                  	the flash device
+                  SF_RAMBANK2 - Writes to the alternate RAM bank on the
+                  	flash device
+
+RETURN VALUE:  0 for success
+					-1 for error
+               positive N  -  SPI in use by device N
+
+END DESCRIPTION **********************************************************/
+
+//buffer size is equal to block size
+_sflash_nodebug int sf_writeDeviceRAM(const sf_device *dev,
+                                      long buffer,
+                                 	  int offset,
+                                 	  int len,
+                                 	  int flags)
+{
+   auto unsigned char command[6], dummy;
+   auto int addrbytes;
+   auto int status;
+   static tempNAPCRShadow;
+
+   if(len == 0)
+   {
+   	return 0; //don't write anything
+   }
+
+	addrbytes = dev->addressbytes;
+
+   if(dev->addressbytes > 4)
+   {
+   	return -1; //too many address bytes for command buffer
+   }
+
+#if RCM6600W_SERIES || RCM6700_SERIES
+   if (!(status = SPIgetSemaphore(SPI_DF)))
+   {
+#endif
+
+#ifdef SFLASH_VERBOSE
+	printf( "write %d bytes, bank %c\n", len, (flags & SF_RAMBANK2) ? '2' : '1');
+	mem_dump( (char __far *) buffer, (len > 16) ? 16 : len);
+#endif
+
+   	command[0] = (flags & SF_RAMBANK2) ? 0x87 : 0x84;
+   	sf_address (&command[1], addrbytes, offset);
+
+		sf_enableCS(dev);
+
+   	sfspi_xwrite(paddr(command), addrbytes + 1);
+
+		sfspi_xwrite(buffer, len);
+
+   	sf_disableCS(dev);
+
+#if RCM6600W_SERIES || RCM6700_SERIES
+      SPIfreeSemaphore(SPI_DF);
+   }
+#else
+   status = 0;
+#endif
+
+	return status;
+}
+
+/*** BeginHeader sf_readRAM */
+int sf_readRAM(char *buffer, int offset, int len);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+sf_readRAM                 <SFLASH.LIB>
+
+SYNTAX: int sf_readRAM(char *buffer, int offset, int len);
+
+DESCRIPTION:	Read data from the RAM buffer on the serial flash chip
+
+PARAMETER1:    buffer - pointer to character buffer to copy data
+						into
+PARAMETER2:		offset - the address in the serial flash RAM to start
+						reading from
+PARAMETER3:		len - the number of bytes to read
+
+RETURN VALUE:  0 for success
+					-1 for error
+               positive N  -  SPI in use by device N
+
+END DESCRIPTION **********************************************************/
+
+
+//buffer is equal to block size
+_sflash_nodebug int sf_readRAM(char *buffer, int offset, int len)
+{
+	return sf_readDeviceRAM(&sf_dev, paddr(buffer), offset, len, 0x00);
+}
+
+/*** BeginHeader sf_readDeviceRAM */
+int sf_readDeviceRAM(const sf_device *dev,
+                     long buffer,
+                     int offset,
+                     int len,
+                     int flags);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+sf_readDeviceRAM                 <SFLASH.LIB>
+
+SYNTAX: int sf_readDeviceRAM(const sf_device *dev,
+                        long buffer,
+                        int offset,
+                        int len,
+                        int flags);
+
+DESCRIPTION:	Read data from the RAM buffer on the serial flash chip
+					into an xmem buffer.
+
+PARAMETER1:		dev - pointer to sf_device structure
+PARAMETER2:		buffer - address of an xmem buffer
+PARAMETER3:		offset - the address in the serial flash RAM to start
+						reading from
+PARAMETER4:		len - the number of bytes to read
+
+PARAMETER5:		flags -
+                  SF_BITREVERSED - Ignored on R4000 based cores, still
+                                    reserved for legacy code support.
+                  SF_RAMBANK1(default) - Reads from the first RAM bank on
+                  	the flash device
+                  SF_RAMBANK2 - Reads from the alternate RAM bank on the
+                  	flash device
+RETURN VALUE:  0 for success
+					-1 for error
+               positive N  -  SPI in use by device N
+
+END DESCRIPTION **********************************************************/
+
+
+//buffer is equal to block size
+_sflash_nodebug int sf_readDeviceRAM(const sf_device *dev,
+                                      long buffer,
+                                		  int offset,
+                                		  int len,
+                                		  int flags)
+{
+   auto unsigned char command[7];
+   auto int addrbytes;
+   auto int status;
+   static tempNAPCRShadow;
+
+   if(len == 0)
+   {
+   	return 0; //don't read anything
+   }
+
+	addrbytes = dev->addressbytes;
+   if(dev->addressbytes > 4)
+   {
+   	return -1; //too many address bytes for command buffer
+   }
+
+#if RCM6600W_SERIES || RCM6700_SERIES
+   if (!(status = SPIgetSemaphore(SPI_DF)))
+   {
+#endif
+   	command[0] = (flags & SF_RAMBANK2) ? 0xD6 : 0xD4;
+   	sf_address (&command[1], addrbytes, offset);
+   	command[addrbytes+1] = '\x00'; //add 'don't care' byte to end
+
+   	sf_enableCS(dev);
+
+   	sfspi_xwrite(paddr(command), addrbytes + 2);
+   	sfspi_xread(buffer, len);
+   	sf_disableCS(dev);
+
+#ifdef SFLASH_VERBOSE
+		printf( "read %d bytes, bank %c\n", len, (flags & SF_RAMBANK2) ? '2' : '1');
+		mem_dump( (char __far *) buffer, (len > 16) ? 16 : len);
+#endif
+
+#if RCM6600W_SERIES || RCM6700_SERIES
+      SPIfreeSemaphore(SPI_DF);
+   }
+#else
+   status = 0;
+#endif
+
+	return status;
+}
+
+
+
+/*** BeginHeader sf_RAMToPage */
+int sf_RAMToPage(long page);
+
+/* START FUNCTION DESCRIPTION ********************************************
+sf_RAMToPage                 <SFLASH.LIB>
+
+SYNTAX: int sf_RAMToPage(long page);
+
+DESCRIPTION:	Command the serial flash to write it's RAM buffer contents
+					to one of the flash memory pages
+
+PARAMETER1:    page - the page to write the RAM buffer to
+
+RETURN VALUE:  0 for success
+					-1 for error, write operation timed out
+               positive N  -  SPI in use by device N
+
+END DESCRIPTION **********************************************************/
+
+/*** EndHeader */
+
+_sflash_nodebug int sf_RAMToPage(long page)
+{
+   auto unsigned long t;
+   auto int status;
+
+	#if RCM6600W_SERIES || RCM6700_SERIES
+   if (!(status = SPIgetSemaphore(SPI_DF)))
+   {
+	#endif
+		if(sf_writePage(&sf_dev, 1, page)) //use bank 1
+   	{
+			#if RCM6600W_SERIES || RCM6700_SERIES
+   		SPIfreeSemaphore(SPI_DF);
+			#endif
+   		return -1;
+   	}
+   	t = MS_TIMER;
+   	while(_sf_isWriting(&sf_dev))
+   	{
+   		if( (MS_TIMER - t) > SF_PAGEWRITE_WAIT)
+     		{
+				#if RCM6600W_SERIES || RCM6700_SERIES
+      		SPIfreeSemaphore(SPI_DF);
+				#endif
+     			return -1;
+     		}
+   	}
+#if RCM6600W_SERIES || RCM6700_SERIES
+      SPIfreeSemaphore(SPI_DF);
+   }
+#else
+   status = 0;
+#endif
+	return status;
+}
+
+/*** BeginHeader sf_writePage */
+int sf_writePage(const sf_device *dev, int bank, long page);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+sf_writePage                 <SFLASH.LIB>
+
+SYNTAX: int sf_writePage(const sf_device *dev, int bank, long page);
+
+DESCRIPTION:	Replaces sf_RAMTOPage().
+					Command the serial flash to write it's RAM buffer contents
+					to one of the flash memory pages. Check for completion
+               of the write operation using sf_isWriting().
+
+PARAMETER1:		dev - pointer to initialized sf_device structure for
+						 the flash chip
+PARAMETER2:		bank - which RAM bank to write the data from. For Atmel
+						45DBxxx devices, this can be 1 or 2
+PARAMETER3:    page - the page to write the RAM buffer to
+
+RETURN VALUE:  0 for success
+					-1 for error
+               positive N  -  SPI in use by device N
+
+END DESCRIPTION **********************************************************/
+_sflash_nodebug int sf_writePage(const sf_device *dev, int bank, long page)
+{
+   auto unsigned char command[7];
+   auto int addrbytes;
+   auto int status;
+   static tempNAPCRShadow;
+
+   if ((addrbytes = dev->addressbytes) > 4)
+   {
+#ifdef SFLASH_VERBOSE
+		printf("sf_writePage - ERROR, too many address bytes (%d)\n", addrbytes);
+#endif
+   	return -1;	//too many address bytes
+   }
+   if ((unsigned long) page >= dev->pages)
+   {
+#ifdef SFLASH_VERBOSE
+		printf("sf_writePage - ERROR, page %ld >= %ld\n", page, dev->pages);
+#endif
+		return -1;	// trying to write past last page
+   }
+
+#if RCM6600W_SERIES || RCM6700_SERIES
+   if (!(status = SPIgetSemaphore(SPI_DF)))
+   {
+#endif
+#ifdef SFLASH_VERBOSE
+		printf("sf_writePage - write from bank %d to page %ld\n", bank, page);
+#endif
+
+   	command[0] = (bank == 1) ? 0x83 : 0x86;
+   	sf_address (&command[1], addrbytes,
+   		(page + dev->page_offset) << dev->pagebitshift);
+   	command[addrbytes + 1] = '\x00'; //extra zero byte
+
+   	sf_enableCS(dev);
+
+   	sfspi_xwrite(paddr(command), addrbytes + 2);
+
+   	sf_disableCS(dev);
+
+#if RCM6600W_SERIES || RCM6700_SERIES
+      SPIfreeSemaphore(SPI_DF);
+   }
+#else
+   status = 0;
+#endif
+	return status;
+}
+
+
+/*** BeginHeader sf_pageToRAM */
+int sf_pageToRAM(long page);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+sf_pageToRAM                 <SFLASH.LIB>
+
+SYNTAX: int sf_pageToRAM(long page);
+
+DESCRIPTION:	Command the serial flash to copy the contents of one of
+					it's flash pages into it's RAM buffer.
+
+PARAMETER1:    page - the page to copy from
+
+RETURN VALUE:  0 for success
+					-1 for error
+               positive N  -  SPI in use by device N
+
+END DESCRIPTION **********************************************************/
+
+_sflash_nodebug int sf_pageToRAM(long page)
+{
+   return sf_readPage(&sf_dev, 1, page);
+}
+
+
+/*** BeginHeader sf_readPage */
+int sf_readPage(const sf_device *dev, int bank, long page);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+sf_readPage                 <SFLASH.LIB>
+
+SYNTAX: int sf_readPage(const sf_device *dev, int bank, long page);
+
+DESCRIPTION:	Replaces sf_pageToRAM().
+					Command the serial flash to copy from one it's flash pages
+               to one of it's RAM buffers.
+
+PARAMETER1:		dev - pointer to initialized sf_device structure for
+						 the flash chip
+PARAMETER2:		bank - which RAM bank to write the data to. For Atmel
+						45DBxxx devices, this can be 1 or 2
+PARAMETER3:    page - the page to read from
+
+RETURN VALUE:  0 for success
+					-1 for error
+               positive N  -  SPI in use by device N
+
+END DESCRIPTION **********************************************************/
+
+_sflash_nodebug int sf_readPage(const sf_device *dev, int bank, long page)
+{
+   auto unsigned char command[7];
+   auto int addrbytes;
+   auto int status;
+   static tempNAPCRShadow;
+
+   if ((addrbytes = dev->addressbytes) > 4)
+   {
+#ifdef SFLASH_VERBOSE
+		printf("sf_readPage - ERROR, too many address bytes (%d)\n", addrbytes);
+#endif
+   	return -1;	//too many address bytes
+   }
+   if ((unsigned long) page >= dev->pages)
+   {
+#ifdef SFLASH_VERBOSE
+		printf("sf_readPage - ERROR, page %ld >= %ld\n", page, dev->pages);
+#endif
+		return -1;	// trying to read past last page
+   }
+
+#if RCM6600W_SERIES || RCM6700_SERIES
+   if (!(status = SPIgetSemaphore(SPI_DF)))
+   {
+#endif
+#ifdef SFLASH_VERBOSE
+	printf("sf_readPage - read from page %ld to bank %d\n", page, bank);
+#endif
+
+   command[0] = (bank == 1) ? 0x53 : 0x55;
+   sf_address (&command[1], addrbytes,
+   	(page + dev->page_offset) << dev->pagebitshift);
+
+   sf_enableCS(dev);
+
+   sfspi_xwrite(paddr(command), addrbytes + 1);
+
+   sf_disableCS(dev);
+   // No check for semaphore as FAT already has it locked
+	while((_sf_deviceStatus(dev) & 0x80) == 0); //wait for RDY bit
+
+#if RCM6600W_SERIES || RCM6700_SERIES
+      SPIfreeSemaphore(SPI_DF);
+   }
+#else
+   status = 0;
+#endif
+   return status;
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+
+

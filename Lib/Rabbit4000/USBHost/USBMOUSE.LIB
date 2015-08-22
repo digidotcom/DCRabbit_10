@@ -1,0 +1,775 @@
+/*
+ *  Copyright (c) 1996-2007 Digi International Inc., All Rights Reserved
+ *
+ *  This software contains proprietary and confidential information of Digi
+ *  International Inc.  By accepting transfer of this copy, Recipient agrees
+ *  to retain this software in confidence, to prevent disclosure to others,
+ *  and to make no use of this software other than that for which it was
+ *  delivered.  This is an unpublished copyrighted work of Digi International
+ *  Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+ *  prohibited.
+ *
+ *  Restricted Rights Legend
+ *
+ *  Use, duplication, or disclosure by the Government is subject to
+ *  restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+ *  Technical Data and Computer Software clause at DFARS 252.227-7031 or
+ *  subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+ *  Restricted Rights at 48 CFR 52.227-19, as applicable.
+ *
+ *  Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+ *
+ *
+ * usbMouse.c - Sample USB HOST low-speed interrupt transfer example
+ *              application using a USB mouse, the routine
+ *              mouseProbe is called as devices are connected to the
+ *              USB. The cooridinates received from the mouse are
+ *              then printed out the screen.
+ *
+ *              Applications can register a mouse listener callback function
+ *              to be notified of mouse events as they occur.
+ *
+ *              SJH - added keyboard handling too, since it's basically
+ *              identical to mouse processing except for the report
+ *              format.  usb_mouse_init() can now specify calback hooks
+ *              for mouse and/or keyboard.
+ *
+ * IMPORTANT NOTE: This mouse driver is a shared component with NDS and
+ *                 its functionality should not be changed without understanding
+ *                 the impact to NDS.
+ *
+ *************************************************************************/
+
+/*** BeginHeader */
+#ifndef __USB_MOUSE_H
+#define __USB_MOUSE_H
+
+//#define USBMouseDebug
+#ifndef USBMOUSE_DEBUG
+	#define  USBMouseDebug __nodebug
+#else
+	#define  USBMouseDebug __debug
+#endif
+
+// This will save save a lot of const space over more specific messages
+//  because the compiler will optimize all instances down to two
+//  strings, __FILE__ and "result !=0 File: %s,Line %d\n\n"
+#ifdef USBMOUSE_VERBOSE
+	#define USBMOUSE_PRINTF_ERR printf("File: %s,Line %d\n", __FILE__,  __LINE__)
+#else
+  	#define USBMOUSE_PRINTF_ERR
+#endif
+
+typedef struct usb_mouse
+{
+    usbDevice  __far      *usbDev;
+    char                buttons;     // current button state
+    long                dx;          // dx, dy, dz are change since last read
+    long                dy;
+    long                dz;
+    int                 active;      // someone has this mouse device open
+    int                 nLanguageIds;
+    unsigned   int      languageId;
+    char       __far      *deviceIdString;
+    char       __far      *buffer;
+    USB_LIST_ENTRY      list;
+    long                number;
+
+    //SJH - added fields for keyboard support
+    char						isKB;			// True if actually a standard keyboard
+    char						pkd[4];		// Record keys down previously seen
+    											// USB allows 6 keys simultaneously,
+    											// but we only look at the first 4.
+    char						pmod;			// Previous modifiers
+}USB_MOUSE;
+
+// USB Mouse Error Codes
+// Use range from 301 to 400
+#define USB_MOUSE_SEMAPHORE_CREATE_FAILED       301
+#define USB_MOUSE_THREAD_CREATE_FAILED          302
+#define USB_MOUSE_NULL_POINTER                  303
+
+// Mouse driver data transfer buffer sizes
+// Must be multiple of 32 bytes and aligned on a 32 byte boundary
+#define USB_MOUSE_EVENT_BUFFER_SIZE           32
+#define USB_MOUSE_PROBE_BUFFER_SIZE           160
+
+/*** EndHeader */
+
+
+/*** BeginHeader usb_mouse_init, usb_mouse_probe */
+
+int usb_mouse_init(int * error_code,
+							int (*userMouseCallBackHook)(),
+							int (*userKeyboardCallBackHook)());
+__root long usb_mouse_probe(usbDevice __far *device);
+
+extern char global_buttons;
+extern long global_dx;
+extern long global_dy;
+extern long global_dz;
+extern usbDevice __far *diagUsbDevice;
+extern USB_LIST_ENTRY __far mouselist;
+extern OS_FLAG_GRP  *usb_mouse_event_flags;
+
+//#ifdef USBMOUSE_VERBOSE
+extern char ndevIdString[65];
+//#endif
+
+/*** EndHeader */
+
+USB_LIST_ENTRY __far mouselist;
+usbDevice __far *diagUsbDevice;     // used to store the device structure
+OS_FLAG_GRP  *usb_mouse_event_flags;
+
+//char usb_mouse_driver_thread_stack[USB_MOUSE_STACK_SIZE];
+//TX_THREAD usb_mouse_driver_thread;
+
+// used to send out update event
+//USB_MOUSE far usb_mouse;
+
+
+// Mouse ISR callback increments semaphore count when mouse activity occurs
+TX_SEMAPHORE mouse_isr_sem;
+
+const usbDriver mouseDriver = {
+    "USB Mouse/Keyboard",
+    usb_mouse_probe,
+    usb_mouse_disconnect,
+    { NULL, NULL }
+};
+
+//#ifdef USBMOUSE_VERBOSE
+    char ndevIdString[65];
+//#endif
+
+/*
+ * This function is called by the USB Host stack when a device is connected.
+ * The function queries the device and configures the device if a mouse
+ * device was found.
+ */
+USBMouseDebug
+__root long usb_mouse_probe(usbDevice __far *device)
+{
+    int rc, result, errorCode;
+    long bytesTransferred;
+    char __far *buffer;
+    usbInterfaceDescriptor __far *interface;
+    usbEndpointDescriptor __far *endpoint;
+    static USB_MOUSE mouse;
+    unsigned long pipe, t0;
+    int i, p;
+    unsigned char __far *ids;
+    unsigned char productStringIndex;
+
+    static unsigned short languageId[255];
+    static char __far devIdString[255];
+
+#GLOBAL_INIT
+{
+     memset(ndevIdString, 0, sizeof(ndevIdString));
+}
+    result = 0;
+
+    memset(&mouse, 0, sizeof(USB_MOUSE));
+    buffer = NULL;
+
+    if(device == NULL){
+       USB_PRINTF_ERR;
+    }
+
+    // No support for multiple configuration or multiple interface mice
+    if ((device->descriptor.bNumConfigurations != 1) ||
+    		(device->config[0].bNumInterfaces != 1))
+    {
+        result = -1;
+        goto exit_usbMouseProbe;
+    }
+
+    // Check descriptor data for mouse device
+    interface = &device->config[0].interface[0];
+    if ((interface->bInterfaceClass != USB_CLASS_HID)    ||
+        (interface->bInterfaceSubClass != 1) ||
+ 	     (interface->bInterfaceProtocol != 2 &&
+ 	      interface->bInterfaceProtocol != 1) ||
+        (interface->bNumEndpoints != 1)
+	 )
+    {
+        result = -1;
+        goto exit_usbMouseProbe;
+    }
+
+    if (interface->bInterfaceProtocol == 1)
+    	//SJH Is a keyboard, not a mouse.  They're really so similar that
+    	// we handle both device types using the "mouse" library.
+    	mouse.isKB = 1;
+
+    // Check that endpoint is not an output endpoint or not an interrupt endpoint
+    endpoint = &interface->endpoint[0];
+    if ( (!(endpoint->bEndpointAddress & 0x80)) || ((endpoint->bmAttributes & 3) != 3))
+    {
+        result = -1;
+        goto exit_usbMouseProbe;
+    }
+
+ #ifdef USBMOUSE_VERBOSE
+    printf("usb_mouse_probe: USB %s found\n", mouse.isKB ? "keyboard" : "mouse");
+ #endif
+
+    // Add to the list of mice
+    InsertHeadList(&mouselist, (USB_LIST_ENTRY __far *) &mouse.list);
+
+    // Set the device configuration to use
+    if (usb_set_configuration(device, (int)device->config[0].bConfigurationValue,
+           &errorCode))
+    {
+		  result = -1;
+        USBMOUSE_PRINTF_ERR;
+        // "usb_mouse_probe: usb_set_configuration failed"
+        goto exit_usbMouseProbe;
+    }
+
+    // Get the device id string
+    // 32 byte aligned and multiple of 32 bytes for cache coherency
+    buffer = pfcalloc(&usb_gen_list);
+    if (buffer == NULL)
+    {
+        result = -1;
+        USBMOUSE_PRINTF_ERR;
+        //"usb_mouse_probe: usb_malloc failed"
+        goto exit_usbMouseProbe;
+    }
+    //_f_memset(buffer, 0, USB_MOUSE_PROBE_BUFFER_SIZE);
+
+    if (usb_get_string(device, 0, 0, buffer, USB_MOUSE_PROBE_BUFFER_SIZE,
+          &bytesTransferred, &errorCode))
+    {
+        result = -1;
+		  USBMOUSE_PRINTF_ERR;
+        // "usb_mouse_probe: usb_get_string failed"
+        //goto exit_function; //BPM:COIO
+    }
+    else
+    {
+        t0 = MS_TIMER;
+        OSTimeDlyHMSM(0,0,0,12);  //BPM Not in NS code
+        if (!bytesTransferred) {
+	         // no string information returned //
+	         result = -1;
+	         USBMOUSE_PRINTF_ERR;
+	         //"usb_mouse_probe: usb_get_string returned no data"
+	         //goto exit_function;//BPM:COIO
+        }
+        if (buffer[0] > 4) {
+	         // first byte is the size of the mouse string descriptor
+	         //   and the max size is 4
+	         result = -1;
+	         USBMOUSE_PRINTF_ERR;
+	         //"usb_mouse_probe: usb_get_string returned data 1st byte invalid"
+	         goto exit_usbMouseProbe;
+        }
+    }
+    if (!result)
+    {
+        ids = buffer + 2;
+        mouse.deviceIdString = (char __far*)&devIdString;
+
+        mouse.nLanguageIds = (buffer[0]-2) / 2;
+        for (i=0; i< mouse.nLanguageIds; i++)
+        {
+            mouse.languageId = (short)(ids[(i*2)+1]<<8 | ids[i*2]);
+        }
+
+        for (i=0; i < mouse.nLanguageIds; i++)
+        {
+				productStringIndex = device->descriptor.iProduct;
+            _f_memset(buffer, 0, USB_MOUSE_PROBE_BUFFER_SIZE);
+
+
+            if(usb_get_string(          device,
+                             mouse.languageId,
+                            productStringIndex,
+                                        buffer,
+                   USB_MOUSE_PROBE_BUFFER_SIZE,
+                             &bytesTransferred,
+                                    &errorCode)
+               )
+            {
+                result = -1;
+                USBMOUSE_PRINTF_ERR;
+                //"usb_mouse_probe: usb_get_string failed"
+                goto exit_usbMouseProbe;
+            }
+            OSTimeDlyHMSM(0,0,0,12);  //BPM  Not in NS code
+            if (bytesTransferred)
+            {
+                for (p=0; p < (int)bytesTransferred/2-1; p++)
+                {
+                     buffer[p] = buffer[p*2+2];
+                }
+
+                buffer[p]=0;
+                _f_strcpy(mouse.deviceIdString, buffer);
+            }
+            else
+            {
+                devIdString[i] = 0;
+            }
+//   #ifdef USBMOUSE_VERBOSE
+            _f_strncpy((char __far*)ndevIdString, mouse.deviceIdString,sizeof(ndevIdString)-1);
+            ndevIdString[sizeof(ndevIdString)-1] = 0;
+//   #endif
+        }
+    }
+
+    // Get descriptor type 0x22 136 bytes
+    if (usb_mouse_get_hid_descriptor(device, buffer, 136,
+                            &bytesTransferred, &errorCode))
+    {
+        result = -1;
+        USBMOUSE_PRINTF_ERR;
+        //"usb_mouse_probe: usb_mouse_get_hid_descriptor failed"
+        goto exit_usbMouseProbe;
+    }
+
+//    OSTimeDlyHMSM(0,0,0,20); //BPM
+
+ #ifdef USBMOUSE_VERBOSE
+     printf("usb_mouse_probe: get HID len=%d \n",
+                  (int)bytesTransferred);
+ #endif
+
+ 	/*SJH - re-purpose this buffer below
+    if (fsfree(buffer))
+    {
+        result = -1;
+        USBMOUSE_PRINTF_ERR;
+        //"usb_mouse_probe: usb_free failed"
+        goto exit_usbMouseProbe;
+    }
+	*/
+
+     //    The fields for this pipe are defined as:
+     //  - device:       bits 8-14
+     //  - endpoint:     bits 15-18
+     //  - Data0/1:      bit 19
+     //  - direction:    bit 7       (0 = Host-to-Device, 1 = Device-to-Host)
+     //  - speed:        bit 26      (0 = High, 1 = Low Speed)
+     // - max size:     bits 0-1    (00 = 8, 01 = 16, 10 = 32, 11 = 64)
+     //  - pipe type:    bits 30-31  (00 = isochronous, 01 = interrupt,
+     //                                        10 = control, 11 = bulk)
+
+    pipe = (USB_PIPE_TYPE_INTERRUPT << 30) | (device->devnum << 8) |
+                      ((endpoint->bEndpointAddress & ~0x80UL) << 15) |
+           ((unsigned long)device->Speed << 26) | (endpoint->bEndpointAddress & 0x80);
+
+    // Allocate more RAM than is needed.
+    // 32 byte aligned and multiple of 32 bytes for cache coherency
+    /*
+    mouse.buffer = fsmalloc(USB_MOUSE_EVENT_BUFFER_SIZE);
+    if(mouse.buffer == NULL)
+    {
+        result = -1;
+        USBMOUSE_PRINTF_ERR;
+        //"usb_mouse_probe: malloc failed"
+        goto exit_usbMouseProbe;
+    }
+	 */
+	 mouse.buffer = buffer;	//SJH - use the previously allocated buffer
+    mouse.usbDev   = device;
+    device->driverData = (void __far*)&mouse;
+
+    diagUsbDevice = device; // Save this address for later
+    // Request for an interrupt transfer slot to handle mouse activities
+
+    if (usb_request_interrupt_transfer(
+           device, pipe,
+           usb_mouse_isr_callback,
+           (unsigned)endpoint->bInterval,
+           &mouse,
+           (int)endpoint->wMaxPacketSize,
+           mouse.buffer,
+           &errorCode))
+    {
+        result = -1;
+        USBMOUSE_PRINTF_ERR;
+        //"usb_mouse_probe: usb_request_interrupt_transfer failed"
+        goto exit_usbMouseProbe;
+    }
+
+ #ifdef USBMOUSE_VERBOSE
+    printf("usb_mouse_probe, usb mouse enumerated\n");
+ #endif
+exit_usbMouseProbe:
+	 if (buffer && !mouse.buffer)
+	 	// Allocated buffer, but did not successfully re-purpose.
+	 	pffree(&usb_gen_list, buffer);
+    rc = OSFlagPost(usb_mouse_event_flags, 1, OS_FLAG_SET, (char*)&result);
+    return result;
+
+}
+/* START FUNCTION DESCRIPTION ********************************************
+   usb_mouse_init            <USBMOUSE.LIB>
+
+SYNTAX: int usb_mouse_init(int * error_code,
+                           int (*MouseCallBackHook)(),
+                           int (*KeyboardCallBackHook)() );
+
+DESCRIPTION: This routine is called to initialize the sample USB mouse
+   and keyboard driver.
+   When a the mouse or KB is enumerated and ready, the driver will post
+   usb_mouse_event_flags. A task can be suspended until the mouse is ready
+   by pending the flag:
+
+	   rc = OSFlagPend( usb_mouse_event_flags,
+   				 		                      1,
+								OS_FLAG_WAIT_SET_ANY,
+                               				 0,
+				                 (char*)&errMess
+                      );
+
+PARAMETER:
+	MouseCallBackHook -- NULL, or user defined function to be called whenever
+   the USB host receives an interrupt from the mouse device. The function
+   must use the following format for it parameter:
+			(int dx, int dy, int dz, char buttons)
+   dx,dy contain the change is position of the mouse. dz - represents
+   wheel movements on mice with wheels. Each button is represented by one
+   bit in buttons.
+
+   KeyboardCallBackHook -- NULL, or keyboard handler.  This function
+   has parameters
+     (unsigned int modifiers, unsigned long press, unsigned long release)
+   where modifiers is a bitmask of modifiers (i.e. keys like shift or
+   ctrl which are depressed at the point of this event).  'press' is up to 4
+   keycodes packed into a longword which indicate key(s) which were
+   pressed, and 'release' is similar for keys which were released.  Modifier
+   bits are
+    	  0 LEFT CTRL
+    	  1 LEFT SHIFT
+    	  2 LEFT ALT
+    	  3 LEFT GUI
+    	  4 RIGHT CTRL
+    	  5 RIGHT SHIFT
+    	  6 RIGHT ALT
+    	  7 RIGHT GUI
+   Note that scan codes do not correspond to ASCII codes or anything that
+   simple!
+
+RETURN VALUE:
+	 0  - Success
+   -1  - Failure
+
+END DESCRIPTION **********************************************************/
+
+USBMouseDebug
+int usb_mouse_init(int * error_code,
+						int (*CallBackHook)(),
+						int (*KeyboardCallBackHook)() )
+{
+    int result, errorCode,errMess;
+#GLOBAL_INIT { usb_mouse_event_flags = NULL; }
+
+    // boilerplate to get USB started if not already.
+	 _usb_init();
+
+    result = 0;
+    if (!usb_mouse_event_flags) {
+    	usb_mouse_event_flags = OSFlagCreate (0, (INT8U*)&result);
+    	if (result != OS_NO_ERR) {
+    		exception(result);
+    		exit(result);
+    	}
+    }
+
+    userMouseCallBackHook = CallBackHook;
+    userKeyboardCallBackHook = KeyboardCallBackHook;
+    mouselist.next = &mouselist;
+    mouselist.prev = &mouselist;
+
+    //_f_memset(&usb_mouse, 0, sizeof(USB_MOUSE));
+	 memset(ndevIdString,0,sizeof(ndevIdString));
+
+    mouse_isr_sem = OSSemCreate(1);
+    if( mouse_isr_sem==NULL ){
+       exception(USB_SEMAPHORE_ERROR);
+       exit(USB_SEMAPHORE_ERROR);
+    }
+
+    // Register the USB mouse driver with the USB host library.
+    if (usb_register(&mouseDriver, &errorCode))
+    {
+        result = -1;
+        USBMOUSE_PRINTF_ERR;
+        //"usb_mouse_init: usb_register failed";
+        goto _usbmouseInitExit;
+    }
+
+_usbmouseInitExit:
+
+    return result;
+}
+
+
+/*** BeginHeader usb_mouse_disconnect */
+__root void usb_mouse_disconnect(usbDevice __far *device);
+/*** EndHeader */
+
+/*
+ * This routine is called when the mouse is disconnected from the USB.
+ */
+USBMouseDebug
+__root void usb_mouse_disconnect(usbDevice __far *device)
+{
+    USB_MOUSE __far *mouse;
+    int i;
+
+    if (device == NULL)
+    {
+        USBMOUSE_PRINTF_ERR;
+        //"usb_mouse_disconnect: device is NULL"
+        return;
+    }
+
+    mouse = (USB_MOUSE __far *)device->driverData;
+    if(mouse == NULL)
+    {
+        USBMOUSE_PRINTF_ERR;
+        // "usb_mouse_disconnect: device->driverData is NULL"
+        return;
+    }
+
+    if(mouse->buffer)
+    {
+    	/*
+        if (fsfree(mouse->buffer))
+        {
+            USBMOUSE_PRINTF_ERR;
+            // "usb_mouse_disconnect: usb_free failed"
+        }
+      */
+      pffree(&usb_gen_list, mouse->buffer);
+    }
+
+    RemoveEntryList(&mouse->list);
+    //fsfree(mouse);
+
+ #ifdef USBMOUSE_VERBOSE
+    printf("usb_mouse_disconnect: usb %s disconnected",
+    	mouse->isKB ? "keyboard" : "mouse");
+ #endif
+}
+
+
+
+/*** BeginHeader usb_mouse_get_hid_descriptor */
+int usb_mouse_get_hid_descriptor(usbDevice __far * device,
+                             unsigned char __far * buffer,
+                                    int bytesToTransfer,
+                                 long * bytesTransferred,
+                                   int *errorCode);
+/*** EndHeader */
+
+/*
+ * This routine requests a descriptor from an HID (human interface device)
+ * and fills in the buffer passed to this routine with the response
+ * from the device.
+ *
+ * Arguments:
+ *
+ * device		A pointer to the usbDevice structure registered for the device.
+ * buffer		Buffer to fill in with the response.
+ * bytesToTransfer      Number of bytes to transfer.
+ * bytesTransferred     Pointer to an integer that stores the number of bytes received.
+ * errorCode		Pointer to an integer that stores the error code.
+ *
+ * Return values:
+ * 0			Success
+ * -1			Failure
+ *
+ */
+USBMouseDebug
+int
+usb_mouse_get_hid_descriptor(usbDevice __far * device, unsigned char __far * buffer,
+              int bytesToTransfer, long * bytesTransferred, int *errorCode)
+{
+    int result;
+
+    devrequest request;
+    result = 0;
+
+    if (device == NULL || buffer == NULL || bytesTransferred == NULL)
+    {
+        result = -1;
+        *errorCode = USB_MOUSE_NULL_POINTER;
+        goto exitmousegethid;
+    }
+
+	FORMAT_USB_DEVICE_REQUEST(
+				&request, 				  	// Request pointer
+				0x81,							//		Request Type
+				USB_REQ_GET_DESCRIPTOR, //		Request
+				MAKE16(USB_DT_HID, 0),	//		Value (High Byte = Type, Low Byte = Index)
+				0,								//		Index
+				bytesToTransfer);			//		Length
+
+    if (usb_device_request(device, FALSE, &request, buffer, bytesToTransfer,
+                 bytesTransferred, TX_WAIT_FOREVER, errorCode))
+       result = -1;
+
+#ifdef  USBHOSTAPI_VERBOSE
+	printf("usb_mouse_get_hid_descriptor: len=%ld\n", *bytesTransferred);
+	mem_dump(buffer, (word)*bytesTransferred);
+#endif
+
+exitmousegethid:
+    return result;
+}
+
+
+/*** BeginHeader usb_mouse_isr_callback */
+__root
+int usb_mouse_isr_callback(long status, char __far *buffer, long bytesTransferred,
+                           void __far *device_id, TX_SEMAPHORE sem );
+extern int (*userMouseCallBackHook)();
+extern int (*userKeyboardCallBackHook)();
+/*** EndHeader */
+/*
+ * This function is the function called by the USB Host ISR when
+ * the USB host controller reads data from the mouse.  The function
+ * increments the mouse driver semaphore count to inform the mouse
+ * driver thread of mouse data.
+ */
+
+int (*userMouseCallBackHook)();
+int (*userKeyboardCallBackHook)();
+
+__root
+USBMouseDebug
+int usb_mouse_isr_callback(long status, char __far *buffer, long bytesTransferred,
+                           void __far *device_id, TX_SEMAPHORE sem)
+{
+    auto USB_MOUSE __far * mouse;
+    auto int dx,dy,dz;
+    auto word bt, i, j, nkp, nkr;
+    auto char k[4], kp[4], kr[4];
+
+
+    mouse = (USB_MOUSE __far *)device_id;
+
+    bt = (word)bytesTransferred;
+
+    if (status == USB_STATUS_DEVICENOTRESPONDING ||
+        bt > 8 || // maximum bytes from mouse or keyboard  //BPM was 5
+        mouse == NULL ||
+        mouse->buffer != buffer )
+    {
+        return FALSE;
+    }
+
+    if (!bt)
+    {
+        /* handle mice that return 0 bytes on the interrupt endpoint */
+        return TRUE;
+    }
+
+    if (mouse->isKB) {
+    	// Output reports can be used to set keyboard LEDS:
+    	//  0 NUM LOCK
+		//  1 CAPS LOCK
+		//  2 SCROLL LOCK
+		//  3 COMPOSE
+		//  4 KANA
+
+		// Get current event scancodes
+		*(long *)k = *(long __far *)(buffer + 2);
+		*(long *)kp = 0;
+		*(long *)kr = 0;
+		if (*(long *)k == 0x01010101 || bt < 6)
+			// Key overflow or insufficient report size; just ignore this
+			return TRUE;
+		// Construct 'press' array by finding codes which are in k but not
+		// in pkd.
+		nkp = 0;
+		for (i = 0; i < 4; ++i) {
+			if (!k[i]) continue;
+			for (j = 0; j < 4; ++j)
+				if (k[i] == mouse->pkd[j]) break;
+			if (j == 4)
+				kp[nkp++] = k[i];
+		}
+		// Construct 'release' array by finding codes which are not in k but are
+		// in pkd.
+		nkr = 0;
+		for (i = 0; i < 4; ++i) {
+			if (!mouse->pkd[i]) continue;
+			for (j = 0; j < 4; ++j)
+				if (k[j] == mouse->pkd[i]) break;
+			if (j == 4)
+				kr[nkr++] = mouse->pkd[i];
+		}
+		*(long __far *)mouse->pkd = *(long *)k;
+
+    	if(userKeyboardCallBackHook &&
+    		(buffer[0] != mouse->pmod || *(long *)kp || *(long *)kr))
+    		userKeyboardCallBackHook(buffer[0], *(long *)kp, *(long *)kr);
+    	mouse->pmod = buffer[0];
+    	return TRUE;
+    }
+
+    /***************************************************
+    * When a mouse interrupt occurs, mouse button      *
+    * and coordiante data is received by the host      *
+    *                                                  *
+    * The data read from the USB mouse is as follows:  *
+    * [Microsoft IntelliMouse. Explorer]               *
+    * buttons data[0]                                  *
+    *   left      1                                    *
+    *   right     2                                    *
+    *   back      8                                    *
+    *   next     16                                    *
+    *   wheel     4                                    *
+    * horizontal data[1]                               *
+    *   left      -                                    *
+    *   right     +                                    *
+    * vertical data[2]                                 *
+    *   up        -                                    *
+    *   down      +                                    *
+    * wheel data[3]                                    *
+    *   up        1                                    *
+    *   down     -1 (0xff)                             *
+    ***************************************************
+
+     Update the shared usb_mouse structure that
+     is examined by the reader thread. This structure
+     holds the mouse coordinate changes that have ocured
+     since the last time that the reader thread examined
+     the mouse coordinates. After examining the data, the
+     reader thread resets the coordinates to zero.
+
+     ***************************************************/
+
+    // Sign extend the the unsigned character data
+    //  if necessary
+    if(0x80 & buffer[1])
+		dx =  (int)((unsigned)buffer[1] | 0xff00);
+    else
+		dx = buffer[1];
+    if(0x80 & buffer[2])
+    	dy =  (int)((unsigned)buffer[2] | 0xff00);
+    else
+    	dy = buffer[2];
+    if(0x80 & buffer[3])
+    	dz =  (int)((unsigned)buffer[3] | 0xff00);
+    else
+    	dz = buffer[3];       // z is the wheel
+
+    if(userMouseCallBackHook) userMouseCallBackHook(dx,dy,dz,buffer[0]);
+    return TRUE;
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+
+

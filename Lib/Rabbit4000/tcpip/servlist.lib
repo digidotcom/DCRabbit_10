@@ -1,0 +1,256 @@
+/*
+ *		servlist.lib
+ *		Copyright (C) Rabbit Semiconductor, Inc. All rights reserved.
+ *
+ * Server list manipulation.  Used internally by DNS.LIB and other
+ * libraries.  Can also be used by applications.
+ */
+
+/*** BeginHeader  */
+#ifndef __SERVLIST_LIB
+#define __SERVLIST_LIB
+
+#ifdef SERVLIST_DEBUG
+	#define _servlist_debug __debug
+#else
+	#define _servlist_debug __nodebug
+#endif
+
+typedef struct {
+	longword		ip;		// Server or resource IP address
+   word			flags;	// Flags bits
+   void *		data;		// Opaque data for application use
+} ServTableEntry;
+
+
+// Header structure.  Application is responsible for initializing this struct.
+typedef struct {
+	word			num;		// Current number of entries.  App inits to zero.
+   word			max;		// Max permissible entries.  App inits to array size of following.
+   ServTableEntry *
+   				table;	// First element in table.  App inits to point to array of entries.
+               			// The array does not need to be initialized.
+   // App defines the following, which should be constant for life of the table.
+   word			sources;	// "Source" bits of entry flags field
+   word			health;	// "Health" bits of entry flags field - mutex with "sources"
+   word			preference;	// "Preference" bits of entry flags field - may overlap either or both the above.
+} ServTableDesc;
+
+
+/*** EndHeader */
+
+/*** BeginHeader _servlist_sort_preferences */
+void _servlist_sort_preferences(ServTableDesc * std);
+/*** EndHeader */
+_servlist_debug void _servlist_sort_preferences(ServTableDesc * std)
+{
+	// No need to do really fast sort, and avoid bringing in qsort().
+   auto ServTableEntry x;
+   auto word i, j;
+   auto ServTableEntry * d, * e;
+
+   for (i = 0; i < std->num; i++) {
+   	d = std->table + i;
+   	for (j = i + 1; j < std->num; j++) {
+      	e = std->table + j;
+      	if ((d->flags & std->preference) < (e->flags & std->preference)) {
+         	memcpy(&x, d, sizeof(x));
+            memcpy(d, e, sizeof(*d));
+            memcpy(e, &x, sizeof(*e));
+         }
+      }
+   }
+}
+
+/*** BeginHeader servlist_add */
+int servlist_add(ServTableDesc * std, longword ip, word source, void * data);
+/*** EndHeader */
+_servlist_debug int servlist_add(ServTableDesc * std, longword ip, word source, void * data)
+{
+	auto word i;
+
+   if (!ip)
+   	return -1;
+   source &= std->sources;
+  	LOCK_GLOBAL_IF_INIT(TCPGlobalLock);
+   for (i = 0; i < std->num; ++i)
+   	if (std->table[i].ip == ip) {
+      	std->table[i].flags |= source;
+         if (data)
+         	std->table[i].data = data;
+      	break;
+      }
+   if (i == std->num && i < std->max) {
+   	std->table[i].ip = ip;
+      std->table[i].flags = source | std->health;	// Assume OK
+      std->table[i].data = data;
+      ++std->num;
+   }
+   _servlist_sort_preferences(std);
+  	UNLOCK_GLOBAL_IF_INIT(TCPGlobalLock);
+   return i < std->max ? 0 : -1;
+}
+
+/*** BeginHeader servlist_delete */
+int servlist_delete(ServTableDesc * std, longword ip, word source);
+/*** EndHeader */
+_servlist_debug int servlist_delete(ServTableDesc * std, longword ip, word source)
+{
+	auto word i, f;
+   auto int n;
+
+   source &= std->sources;
+   n = 0;
+  	LOCK_GLOBAL_IF_INIT(TCPGlobalLock);
+   for (i = 0; i < std->num; ++i)
+      if (std->table[i].ip == ip || !ip) {
+      	n++;
+         f = std->table[i].flags & ~source & std->sources;
+         std->table[i].flags &= ~source;
+         if (!f) {
+         	if (i+1 < std->num) {
+	            memcpy(std->table + i, std->table + (i+1), sizeof(ServTableEntry)*(std->num-(i+1)));
+	            --std->num;
+	            --i;
+            }
+            else
+            	--std->num;
+         }
+      }
+   _servlist_sort_preferences(std);
+  	UNLOCK_GLOBAL_IF_INIT(TCPGlobalLock);
+   return n-1;
+}
+
+/*** BeginHeader servlist_set_health */
+int servlist_set_health(ServTableDesc * std, longword ip, word mask, word health);
+/*** EndHeader */
+_servlist_debug int servlist_set_health(ServTableDesc * std, longword ip, word mask, word health)
+{
+	auto word i;
+   auto int n;
+
+   health &= std->health;
+   mask &= std->health;
+   n = 0;
+  	LOCK_GLOBAL_IF_INIT(TCPGlobalLock);
+   for (i = 0; i < std->num; ++i)
+      if (std->table[i].ip == ip || !ip) {
+      	n++;
+         std->table[i].flags = std->table[i].flags & ~mask | health;
+      }
+  	_servlist_sort_preferences(std);
+  	UNLOCK_GLOBAL_IF_INIT(TCPGlobalLock);
+   return n-1;
+}
+
+/*** BeginHeader servlist_flags */
+word servlist_flags(ServTableDesc * std, longword ip);
+/*** EndHeader */
+_servlist_debug word servlist_flags(ServTableDesc * std, longword ip)
+{
+	auto word i, f;
+
+   f = 0;
+  	LOCK_GLOBAL_IF_INIT(TCPGlobalLock);
+   for (i = 0; i < std->num; ++i)
+      if (std->table[i].ip == ip)
+      	f = std->table[i].flags;
+  	UNLOCK_GLOBAL_IF_INIT(TCPGlobalLock);
+   return f;
+}
+
+/*** BeginHeader servlist_first */
+longword servlist_first(ServTableDesc * std, word source, void ** data);
+/*** EndHeader */
+_servlist_debug longword servlist_first(ServTableDesc * std, word source, void ** data)
+{
+	auto longword ip;
+   auto word i;
+
+   ip = 0uL;
+   if (!source)
+   	source = std->sources;
+  	LOCK_GLOBAL_IF_INIT(TCPGlobalLock);
+   for (i = 0; i < std->num; i++) {
+   	if (!(std->table[i].flags & source))
+      	continue;
+	   ip = std->table[i].ip;
+	   if (data)
+	      *data = std->table[i].data;
+      break;
+   }
+  	UNLOCK_GLOBAL_IF_INIT(TCPGlobalLock);
+   return ip;
+}
+
+/*** BeginHeader servlist_next */
+longword servlist_next(ServTableDesc * std, longword current, word source,
+	void ** data);
+/*** EndHeader */
+_servlist_debug longword servlist_next(ServTableDesc * std, longword current,
+	word source, void ** data)
+{
+	auto word i, j;
+   auto longword ip;
+
+   if (!std->num)
+   	return 0uL;
+   ip = 0uL;
+   if (!source)
+   	source = std->sources;
+  	LOCK_GLOBAL_IF_INIT(TCPGlobalLock);
+   for (i = 0; i < std->num; ++i)
+      if (std->table[i].ip == current) {
+      	++i;
+      	break;
+      }
+   if (i == std->num)
+   	i = 0;
+   j = i;
+   do {
+   	if (std->table[j].flags & source) {
+		   ip = std->table[i].ip;
+		   if (data)
+		   	*data = std->table[i].data;
+         break;
+      }
+      if (++j == std->num)
+      	j = 0;
+   } while (j != i);
+  	UNLOCK_GLOBAL_IF_INIT(TCPGlobalLock);
+   return ip;
+}
+
+/*** BeginHeader servlist_print */
+void servlist_print(void * vp);
+/*** EndHeader */
+_servlist_debug void servlist_print(void * vp)
+{
+	auto word i;
+	auto ServTableDesc * std;
+
+  	std = (ServTableDesc *)vp;
+	LOCK_GLOBAL_IF_INIT(TCPGlobalLock);
+
+   for (i = 0; i < std->num; ++i) {
+   	printf("IP: %08lX  flags: %04X\n", std->table[i].ip, std->table[i].flags);
+   }
+
+	UNLOCK_GLOBAL_IF_INIT(TCPGlobalLock);
+}
+
+
+/*** BeginHeader servlist_getstd */
+void* servlist_getstd(void);
+/*** EndHeader */
+_servlist_debug
+void* servlist_getstd (void)
+{
+	return &_dns_server_table;
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+

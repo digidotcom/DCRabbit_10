@@ -1,0 +1,728 @@
+/* START LIBRARY DESCRIPTION ***************************************************
+WIEGAND.LIB
+
+   Copyright (c) 2010 Digi International Inc., All Rights Reserved
+
+   This software contains proprietary and confidential information of Digi
+   International Inc.  By accepting transfer of this copy, Recipient agrees
+   to retain this software in confidence, to prevent disclosure to others,
+   and to make no use of this software other than that for which it was
+   delivered.  This is a published copyrighted work of Digi International
+   Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+   prohibited.
+
+   Restricted Rights Legend
+
+   Use, duplication, or disclosure by the Government is subject to
+   restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+   Technical Data and Computer Software clause at DFARS 252.227-7031 or
+   subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+   Restricted Rights at 48 CFR 52.227-19, as applicable.
+
+   Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+
+DESCRIPTION:
+   Library API functions to access a wiegand card reader.
+
+END DESCRIPTION ***************************************************************/
+
+/*** BeginHeader _ws0, _ws1, _ws2, _ws3, w_debug, wiegand_valid */
+#ifndef WIEGAND_H
+#define WIEGAND_H
+
+#ifdef WIEGAND_DEBUG
+	#define _wiegand_debug	__debug
+#else
+	#define _wiegand_debug	__nodebug
+#endif
+
+#ifndef WIEGAND_IP
+	#define WIEGAND_IP	1
+#endif
+
+#ifndef WIEGAND_BIT_INTERVAL
+	#define WIEGAND_BIT_INTERVAL 3
+#endif
+
+typedef struct {
+	word	num_bits; 	// 26 for standard format; can be 4 to 64 inclusive.
+	word	half_bits; 	// floor(num_bits/2) : used to divvy up parity
+   						// check sections.
+   word	bitsrec;		// Bits received.  App sets to zero when ready to
+   						// receive next sequence.
+   						// When this reaches num_bits, following samples are
+                     //	ready for analysis, and the ISR will stop processing
+                     // new bits.
+
+   word	ms_start;	// LSBs of MS_TIMER when first bit received.  If bitsrec
+   						// does not equal num_bits within the following timeout,
+                     // then the partial sequence is abandoned. This is a
+   word	ms_allow;   // constant which depends on the number of bits.  The
+   						// standard allows a maximum of 20ms between successive
+                     // bits.  We allow WIEGAND_BIT_INTERVAL ms, (defaults
+                     // to 3, since most readers are faster than the minimum)
+                     // and this value is set to WIEGAND_BIT_INTERVAL ms times
+                     // the number of bits.  If the full number of bits is not
+                     // received in this time interval, then the bit count is
+                     // reset to zero.
+
+   // Received bits are shifted into these fields.  MSB comes in first.
+   // The bits are divided into two sections to make parity checking easier.
+   unsigned long msbs;	// The floor(num_bits/2) most significant bits,
+   							// including the even parity MSB
+   unsigned long lsbs;	// The ceil(num_bits/2) least significant bits,
+   							// including odd parity LSB.
+
+} Wiegand_state;
+
+#if CPU_ID_MASK(_CPU_ID_) >= R3000
+	#define WIEGAND_USE_IC
+   #define WIEGAND_MAX	4
+#else
+	#define WIEGAND_MAX	2
+#endif
+
+// One state struct for each possible input.  Since these use the input
+// capture peripheral, only two are supported.
+extern Wiegand_state _ws0, _ws1;
+#ifdef WIEGAND_USE_IC
+extern Wiegand_state _ws2, _ws3;
+#endif
+extern char w_debug;
+extern word wiegand_valid;
+
+/*** EndHeader */
+
+Wiegand_state _ws0, _ws1;
+#ifdef WIEGAND_USE_IC
+Wiegand_state _ws2, _ws3;
+#endif
+
+char w_debug;
+word wiegand_valid;
+
+/*** BeginHeader wiegand_isr_e0, wiegand_isr_e1, wiegand_isr_ic  */
+void wiegand_isr_e0(void);
+void wiegand_isr_e1(void);
+void wiegand_isr_ic(void);
+/*** EndHeader */
+
+#asm __root
+wiegand_isr_e0::
+	push	af
+   push	hl
+   push	ix
+   ld		ix,_ws0		; This is for first unit on PE0+4
+	ioi ld a,(PEDR)
+   jr		.wisre
+
+wiegand_isr_e1::
+	push	af
+   push	hl
+   push	ix
+   ld		ix,_ws1		; This is for second unit on PE1+5
+	ioi ld a,(PEDR)
+   rra					; Shift port pin bits into 'canonical' position
+                     ; (i.e. bits 0 and 4).
+.wisre:
+	; Continue with common processing.  If A(bit 0) is low, then this is a
+   ; zero bit. If A(bit 4) is low, then this is a one bit.  If neither low,
+   ; then ignore this bit (spurious interrupts).  The case when both
+   ; are low is not considered.
+   rra
+   jr		nc,.wisre_zero
+   bit	3,a
+   jr		nz,.wisre_exit
+.wisre_zero:
+	; Cy flag contains current bit to shift in.
+   rl		h			; Save the Cy flag
+   ld		a,(ix+[_ws0]+bitsrec)
+   cp		(ix+[_ws0]+num_bits)
+   jr		z,.wisre_exit				; Skip if already completed
+   cp		(ix+[_ws0]+half_bits)
+   jr		nc,.wisre_do_lsbs
+   rr		h			; Get back Cy flag
+   ld		hl,(ix+[_ws0]+msbs)
+   adc	hl,hl
+   ld		(ix+[_ws0]+msbs),hl
+   ld		hl,(ix+[_ws0]+msbs+2)
+   adc	hl,hl
+   ld		(ix+[_ws0]+msbs+2),hl
+   jr		.wdone
+.wisre_do_lsbs:
+   rr		h			; Get back Cy flag
+   ld		hl,(ix+[_ws0]+lsbs)
+   adc	hl,hl
+   ld		(ix+[_ws0]+lsbs),hl
+   ld		hl,(ix+[_ws0]+lsbs+2)
+   adc	hl,hl
+   ld		(ix+[_ws0]+lsbs+2),hl
+
+.wdone:
+   inc	(ix+[_ws0]+bitsrec)
+	or		a
+   jr		nz,.wisre_exit
+   ld		hl,(MS_TIMER)
+   ld		(ix+[_ws0]+ms_start),hl
+
+.wisre_exit:
+   pop	ix
+   pop	hl
+   pop	af
+   ipres
+   ret
+
+
+#endasm
+
+
+#ifdef WIEGAND_USE_IC
+
+#asm __root
+wiegand_isr_ic::
+	push	af
+   push	hl
+   push	bc
+   push	ix
+
+	ioi ld a,(ICCSR)	; Read and reset interrupt cond.
+   ld		b,a
+   rla
+   rla
+   ld		c,a			; Save shifted bit positions for 2nd call
+
+#ifdef WIEGAND_DEBUG
+   ld		a,(w_debug)
+   or		b
+   ld		(w_debug),a
+#endif
+
+   ld		ix,_ws3		; Start with the 2nd IC unit
+	call	.wisr
+
+   ld		b,c			; get ISR bits into position for 1st unit
+   ld		ix,_ws2		; Then do 1st IC unit
+   call	.wisr
+
+   pop	ix
+   pop	bc
+   pop	hl
+   pop	af
+	ipres
+   ret
+
+.wisr:
+
+   ld		a,(ix+[_ws0]+bitsrec)
+   cp		(ix+[_ws0]+num_bits)
+   ret	z				; Skip if already completed
+   cp		(ix+[_ws0]+half_bits)
+   jr		nc,.do_lsbs
+   rl		b
+   jr		c,.got_ms
+   bit	7,b
+   ret	z
+.got_ms:
+	ccf
+   ; Carry flag contains most recent bit in the MSB half.
+   ld		hl,(ix+[_ws0]+msbs)
+   adc	hl,hl
+   ld		(ix+[_ws0]+msbs),hl
+   ld		hl,(ix+[_ws0]+msbs+2)
+   adc	hl,hl
+   ld		(ix+[_ws0]+msbs+2),hl
+   jr		.wdone
+.do_lsbs:
+   rl		b
+   jr		c,.got_ls
+   bit	7,b
+   ret	z
+.got_ls:
+	ccf
+   ; Carry flag contains most recent bit in the LSB half.
+   ld		hl,(ix+[_ws0]+lsbs)
+   adc	hl,hl
+   ld		(ix+[_ws0]+lsbs),hl
+   ld		hl,(ix+[_ws0]+lsbs+2)
+   adc	hl,hl
+   ld		(ix+[_ws0]+lsbs+2),hl
+.wdone:
+   inc	(ix+[_ws0]+bitsrec)
+	or		a
+   ret	nz
+   ld		hl,(MS_TIMER)
+   ld		(ix+[_ws0]+ms_start),hl
+   ret
+
+#endasm
+
+#else
+void wiegand_isr_ic(void)
+{
+	// Dummy
+}
+
+#endif
+
+/*** BeginHeader wiegand_getPtr */
+Wiegand_state * wiegand_getPtr(int which);
+/*** EndHeader */
+
+_wiegand_debug Wiegand_state * wiegand_getPtr(int which)
+{
+	if (which < 0 || which >= WIEGAND_MAX)
+   	return NULL;
+#ifdef WIEGAND_USE_IC
+   switch (which) {
+   default: return &_ws0;
+   case 1:	return &_ws1;
+   case 2:	return &_ws2;
+   case 3:	return &_ws3;
+   }
+#else
+   if (which)
+   	return &_ws1;
+   else
+   	return &_ws0;
+#endif
+
+}
+
+/*** BeginHeader wiegand_init */
+int wiegand_init(int which, int port_0, int bit_0, int port_1,
+                 int bit_1, int num_bits);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wiegand_init                  <WIEGAND.LIB>
+
+SYNTAX:		   int wiegand_init(int which, int port_0, int bit_0,
+                      int port_1, int bit_1, int num_bits)
+
+DESCRIPTION:   Initialize the Wiegand format card reader interface.
+
+					For Rabbit 4000 and later based boards, external interrupt
+               pins may be used in pairs (PE0+4 for which==0, or PE1+5 for
+               which==1).  This is recommended if the input capture peripherals
+               are needed by other functions.
+
+               If 'which' is 2 or 3, this function sets up the input capture
+               peripheral.  The port pins must be set up by the caller to be
+               inputs for normal operation.  If the port pins are actually
+               outputs, then you can simulate a Wiegand card reader by having
+               some other part of your program pulse the pins low (i.e.
+               simulating a reader).
+
+               The Wiegand standard allows for low-going TTL pulses with
+               pulse width between 20 and 100us.  Pulses are separated
+               by between 200us and 20,000us (20ms).
+
+               This implementation allows for an even wider range of
+               parameters.  Data is clocked on the falling edge of
+               either input.  Two edges (same or different line) should
+               not occur less than about 20us apart, otherwise the
+               interrupt may not get serviced in time to distinguish
+               the bits.  The pulse width should be greater than
+               about 0.5us to be captured reliably.
+
+               If electrical noise is a potential problem, then you
+               should apply RC filtering to the inputs such that
+               the time constant is about half of the low-going
+               pulse width.
+
+               It is assumed that pulses come in no slower than every
+               3ms.  This is slower than the allowable timing of 20ms
+               however most card readers use a 1- or 2-ms interval
+               between bits.  If you are connecting a slower card
+               reader, you can #define WIEGAND_BIT_INTERVAL to be
+               other than the default value of 3.  This macro should
+               be defined to be a bit slower than the actual expected
+               rate.  E.g. if your reader outputs a new bit every 5ms,
+               then #define WIEGAND_BIT_INTERVAL 6 in your main
+               application before #use wiegand.lib.
+
+               Note that if you are using CARD_READER.LIB, it also uses
+               the input capture peripheral which is required by this
+               library (if which=2 or 3).  Since there is only 1 input
+               capture interrupt vector, you cannot use both this library
+               and the CARD_READER library.
+
+               If you are using only the external interrupts (which =0 or
+               1), then this library fully interoperates with
+               CARD_READER.LIB.  Thus you can have up to two Wiegand
+               readers and one mag stripe reader with a Rabbit board.
+
+PARAMETER1:    0 : use PE0 and PE4 pins (external interrupt 0)
+               1 : use PE1 and PE5 pins (external interrupt 1)
+                      - PE0/1 are used for the zero bit line,
+                      - PE4/5 are used for the one bit line.
+               2 : use input capture 0.
+               3 : use input capture 1.
+
+               Note that the A8 timer is not altered by this library
+               since time stamping is not required.  Thus you are free
+               to use the other input capture if you only have one
+               Wiegand reader installed on an input capture basis.
+PARAMETER2:    Parallel port to which the 'zero bit' line is connected.
+               Must be one of PCDR, PDDR, PEDR This parameter is only used
+               if 'which' is 2 or 3.
+PARAMETER3:    Parallel port bit number to which the 'zero bit' line is
+               connected.  Must be one of 1, 3, 5 or 7.  This parameter
+               is only used if 'which' is 2 or 3.
+PARAMETER4:    Parallel port to which the 'one bit' line is connected.
+               Must be one of PCDR, PDDR, PEDR. This parameter is only used
+               if 'which' is 2 or 3.
+PARAMETER5:    Parallel port bit number to which the 'one bit' line is
+               connected.  Must be one of 1, 3, 5 or 7.  This parameter
+               is only used if 'which' is 2 or 3.
+PARAMETER6:    Number of bits (including parity bits) in the format.
+               The most common standard is 26, however this library
+               supports any number of bits between 4 and 64 inclusive.
+
+RETURN VALUE:	0 - OK
+					-1 - 'which' is invalid should be 0-3.
+               -2 - zero bit invalid
+               -3 - one bit invalid
+               -4 - invalid number of bits.
+
+SEE ALSO:      wiegand_ready, wiegand_result
+
+END DESCRIPTION **********************************************************/
+
+_wiegand_debug int wiegand_badport(int port, int bit)
+{
+   if (port != PCDR && port != PDDR && port != PEDR)
+   	return 1;
+   if (bit != 1 && bit != 3 && bit != 5 && bit != 7)
+   	return 1;
+   return 0;
+}
+
+_wiegand_debug int wiegand_init(int which, int port_0, int bit_0,
+                                int port_1, int bit_1, int num_bits)
+{
+	auto Wiegand_state * w;
+   auto int icsxr;
+
+   #GLOBAL_INIT { wiegand_valid = 0; }
+
+   w = wiegand_getPtr(which);
+   if (!w)
+   	return -1;
+#ifdef WIEGAND_USE_IC
+   if (which >= 2) {
+	   if (wiegand_badport(port_0, bit_0))
+	      return -2;
+	   if (wiegand_badport(port_1, bit_1))
+	      return -3;
+   }
+#endif
+
+   if (num_bits < 4 || num_bits >= 65)
+   	return -4;
+
+
+	w->num_bits = (word)num_bits;
+	w->half_bits = (word)num_bits >> 1;
+   w->ms_allow = (word)(WIEGAND_BIT_INTERVAL * num_bits);
+   w->lsbs = 0;
+   w->msbs = 0;
+	w->bitsrec = 0;
+   w_debug = 0;
+
+   wiegand_valid |= 1<<which;
+
+   if (which == 0) {
+		SetVectExtern(EXT0_OFS/0x10, wiegand_isr_e0);
+      BitWrPortI(PEDDR, &PEDDRShadow, 0, 0);	// Make inputs
+      BitWrPortI(PEDDR, &PEDDRShadow, 0, 4);
+      WrPortI(I0CR, &I0CRShadow, 0x14 + WIEGAND_IP);	// Both falling edge
+   }
+   if (which == 1) {
+		SetVectExtern(EXT1_OFS/0x10, wiegand_isr_e1);
+      BitWrPortI(PEDDR, &PEDDRShadow, 0, 1);	// Make inputs
+      BitWrPortI(PEDDR, &PEDDRShadow, 0, 5);
+      WrPortI(I1CR, &I1CRShadow, 0x14 + WIEGAND_IP);	// Both falling edge
+   }
+
+#ifdef WIEGAND_USE_IC
+	if (which >= 2) {
+		SetVectIntern(INPUTCAP_OFS/0x10, wiegand_isr_ic);
+	   WrPortI(ICCR, &ICCRShadow, WIEGAND_IP);
+	   switch (port_0) {
+	   case PCDR: icsxr = 0x00; break;
+	   case PDDR: icsxr = 0x40; break;
+      case PEDR: icsxr = 0x80; break;
+	   }
+	   switch (bit_0) {
+	   case 1: icsxr |= 0x00; break;
+	   case 3: icsxr |= 0x10; break;
+	   case 5: icsxr |= 0x20; break;
+	   case 7: icsxr |= 0x30; break;
+	   }
+	   switch (port_1) {
+	   case PCDR: icsxr |= 0x00; break;
+	   case PDDR: icsxr |= 0x04; break;
+      case PEDR: icsxr |= 0x08; break;
+
+	   }
+	   switch (bit_1) {
+	   case 1: icsxr |= 0x00; break;
+	   case 3: icsxr |= 0x01; break;
+	   case 5: icsxr |= 0x02; break;
+	   case 7: icsxr |= 0x03; break;
+	   }
+
+	   if (!which) {
+	      WrPortI(ICT1R, &ICT1RShadow, 0xBA);  // Freerun counter, latch both,
+	      WrPortI(ICS1R, &ICS1RShadow, icsxr); // both falling edge.
+	      BitWrPortI(ICCSR, &ICCSRShadow, 1, 5); // Enable start/stop interrupts
+	      BitWrPortI(ICCSR, &ICCSRShadow, 1, 4);
+	   }
+	   else {
+	      WrPortI(ICT2R, &ICT2RShadow, 0xBA);  // Freerun counter, latch both,
+	      WrPortI(ICS2R, &ICS2RShadow, icsxr); // both falling edge
+	      BitWrPortI(ICCSR, &ICCSRShadow, 1, 7);
+	      BitWrPortI(ICCSR, &ICCSRShadow, 1, 6);
+	   }
+   }
+#endif
+   return 0;
+}
+
+/*** BeginHeader wiegand_ready */
+int wiegand_ready(void);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wiegand_ready                  <WIEGAND.LIB>
+
+SYNTAX:        int wiegand_ready(void)
+
+DESCRIPTION:   Test if a card has been presented to any Wiegand reader.
+               The test will return 'true' even if an invalid parity
+               has been received, since the parity is not checked until
+               wiegand_result() is called.
+
+               Only readers which have been successfully initialized by
+               wiegand_init() are tested for ready status.
+
+	            This should be called at least once per second, in order
+               to cancel any partial result which is taking too long.
+               Preferred to call every N ms, where N is about 4ms times the
+               number of bits (e.g. every 100ms for 26-bit format).
+
+               Note that rather than calling this function, you can also
+               just call wiegand_result() for a specific reader and check
+               for a return code other than WIEGAND_NOT_READY.
+
+RETURN VALUE:	0 - no reader is ready
+					non-zero - one or more readers are ready.  Call
+                 wiegand_result() to retrieve the result for each non-zero
+                 bit in the return value.  Note that no new reading can
+                 be obtained until wiegand_result() has been called for
+                 a particular reader.
+                 Note that this non-zero result is a bitmask of the
+                 readers which are ready.  Bit 0 for reader 0, bit 1
+                 for reader 1 etc.
+
+SEE ALSO:      wiegand_init, wiegand_result
+
+END DESCRIPTION **********************************************************/
+
+_wiegand_debug int wiegand_ready(void)
+{
+	// This should be called at least once per second, in order to cancel any
+   // partial result which is taking too long.  Preferred to call every N ms,
+   // where N is about 4ms times the number of bits (e.g. every 100ms for
+   // 26-bit format).
+   // Note that this function returns true when the correct number of bits
+   // has been accumulated. It does not check validity of the result.
+	auto Wiegand_state * w;
+   auto int which;
+   auto int r;
+
+	r = 0;
+   for (which = 0; which < WIEGAND_MAX; ++which) {
+   	if (!(wiegand_valid & 1<<which))
+      	continue;
+	   w = wiegand_getPtr(which);
+
+	   if (w->bitsrec && w->bitsrec != w->num_bits &&
+	       (int)(w->ms_start + w->ms_allow - (word)MS_TIMER) < 0) {
+	      // If full number of bits not received within allowable timeout,
+	      // reset to start.
+	      #ifdef WIEGAND_VERBOSE
+	      printf("WIEGAND %d: incomplete transfer.  Got %d out of %d bits \
+                (0x%lX,%lX)  wd=%X\n", which, w->bitsrec, w->num_bits,
+                w->msbs, w->lsbs, w_debug);
+	      #endif
+	      w->bitsrec = 0;
+	      w_debug = 0;
+	   }
+      if (w->bitsrec == w->num_bits)
+      	r |= 1<<which;
+   }
+
+	return r;
+}
+
+/*** BeginHeader wiegand_result */
+int wiegand_result(int which, unsigned long * raw_result,
+                   unsigned long * result);
+
+#define WIEGAND_OK					0
+#define WIEGAND_NOT_READY			1
+#define WIEGAND_PARITY_ERROR		2
+#define WIEGAND_INVALID				3
+
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wiegand_result                  <WIEGAND.LIB>
+
+SYNTAX:        int wiegand_result(int which,
+                    unsigned long * raw_result, unsigned long * result)
+
+DESCRIPTION:   After wiegand_ready() indicates that a reader is ready,
+               call this function to retrieve and validate the most recent
+               data from the reader.
+
+               You must call this function to reset the reader so it
+               is ready for the next card.
+
+               The result values are split into half of the total
+               number of bits.  raw_result includes the parity bits,
+               and result has the parity bits stripped out.  For
+               example, with 26 bit Wiegand format, raw_result[0]
+               will contain the least significant 13 bits, with
+               the very LSB (bit 0) containing an odd parity.
+               raw_result[1] will contain the 13 MSBs, with the
+               very MSB (bit 12) containing an even parity for the
+               MSBs.  result[0] will contain the 12 LSBs, not
+               including parity, and result[1] will contain the
+               12 MSBs, not including parity.
+
+               Note: one standard for 26 bit format divides the
+               total 24 bit result (not including parity) into
+               an 8-bit 'facility' field and a 16-bit 'ID number'.
+               This division must be performed by the caller, by
+               shifting and combining the two result longwords.
+               E.g.
+
+                 auto unsigned long R[2];
+                 auto unsigned short fac, id;
+
+                 if (wiegand_result(0, NULL, R) == WIEGAND_OK) {
+                   fac = (unsigned short)(R[1] >> 4);
+                   id = (unsigned short)(R[0] |
+                                        (R[1] & 0x0F) << 12);
+                 }
+
+
+PARAMETER1:    Which reader to access, as specified by the wiegand_init()
+               call.
+PARAMETER2:		A pointer to two unsigned long values, or NULL.  If not
+               NULL, then the first element is set to the least
+               significant half of the raw data received, and the
+               second element is set to the most significant half.
+PARAMETER2:		A pointer to two unsigned long values, or NULL.  If not
+               NULL, then the two elements are set as for raw_result,
+               except that the parity bits are stripped out.
+
+RETURN VALUE:	WIEGAND_OK (0) - valid card data retrieved
+					WIEGAND_NOT_READY (1) - no data is ready.
+               WIEGAND_PARITY_ERROR (2) - data was retrieved, but there
+                 was a parity error.  raw_result contains the raw data
+                 including the parity bits which were in error.
+               WIEGAND_INVALID (3) - the reader number is not valid or
+                 has not been successfully initialized.
+
+SEE ALSO:      wiegand_init, wiegand_ready
+
+END DESCRIPTION **********************************************************/
+
+_wiegand_debug int wiegand_result(int which, unsigned long * raw_result,
+                                  unsigned long * result)
+{
+	// Returns result state (one of the WIEGAND_* codes)
+	auto Wiegand_state * w;
+   auto unsigned long r, r2, pm, pm2;
+   auto int i, pe, po;
+
+   w = wiegand_getPtr(which);
+   if (!w)
+   	return WIEGAND_INVALID;
+
+   if (!(wiegand_ready() & 1<<which))
+   	return WIEGAND_NOT_READY;
+
+	r = w->lsbs;
+   r2 = w->msbs;
+   w->lsbs = 0;
+   w->msbs = 0;
+
+   // r,r2 contain raw result i.e. two half sequences, with parity.
+   if (raw_result) {
+   	raw_result[0] = r;
+     	raw_result[1] = r2;
+	}
+
+   #ifdef WIEGAND_VERBOSE
+ 	printf("WIEGAND %d: got raw 0x%lX,%lX\n", which, r2, r);
+   #endif
+
+   w->bitsrec = 0;
+
+   // Strip out the parity bits and clean up the results.
+   pm2 = 1uL << (w->num_bits - w->half_bits - 1);
+   pe = (r2 & pm2) != 0;
+   r2 &= pm2 - 1;
+   po = (int)(r & 1uL);
+   pm = 1uL << (w->half_bits - 1);
+   r >>= 1;
+   r &= pm - 1;
+
+   #ifdef WIEGAND_VERBOSE
+	printf("WIEGAND %d: got 0x%lX,%lX pm2=%lX, pm=%lX\n", which, r2, r, pm2, pm);
+   #endif
+
+
+   // The MSB is an even parity bit for the first half (MSBs) of the bits,
+   // The LSB is an odd parity bit for the second half (LSBs).
+   for (pm2 >>= 1; pm2; pm2 >>= 1)
+   	if (r2 & pm2)
+      	++pe;
+   if (pe & 1) {
+      #ifdef WIEGAND_VERBOSE
+      printf("WIEGAND %d: MSBs parity error\n", which);
+      #endif
+      return WIEGAND_PARITY_ERROR;
+   }
+
+   for (pm >>= 1; pm; pm >>= 1)
+   	if (r & pm)
+      	++po;
+   if (!(po & 1)) {
+      #ifdef WIEGAND_VERBOSE
+      printf("WIEGAND %d: LSBs parity error\n", which);
+      #endif
+      return WIEGAND_PARITY_ERROR;
+   }
+
+   #ifdef WIEGAND_VERBOSE
+	printf("WIEGAND %d: got 0x%lX,%lX\n", which, r2, r);
+   #endif
+
+   if (result) {
+   	result[0] = r;
+      result[1] = r2;
+   }
+
+	return WIEGAND_OK;
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+

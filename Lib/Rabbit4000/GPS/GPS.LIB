@@ -1,0 +1,1025 @@
+/*
+	Copyright (c) 2011 Digi International Inc., All Rights Reserved
+
+	This software contains proprietary and confidential information of Digi
+	International Inc.  By accepting transfer of this copy, Recipient agrees
+	to retain this software in confidence, to prevent disclosure to others,
+	and to make no use of this software other than that for which it was
+	delivered.  This is a published copyrighted work of Digi International
+	Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+	prohibited.
+
+	Restricted Rights Legend
+
+	Use, duplication, or disclosure by the Government is subject to
+	restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+	Technical Data and Computer Software clause at DFARS 252.227-7031 or
+	subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+	Restricted Rights at 48 CFR 52.227-19, as applicable.
+
+	Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+*/
+
+/*** BeginHeader nmea0183_data */
+#ifndef __GPS_LIB
+#define __GPS_LIB
+
+#ifdef GPS_DEBUG
+	#define _gps_debug __debug
+#else
+	#define _gps_debug __nodebug
+#endif
+
+#ifndef GPS_PPS_IPSET
+	#define GPS_PPS_IPSET 0
+#endif
+
+#ifndef GPS_GGA_LATENCY
+	#define GPS_GGA_LATENCY	500
+#endif
+#ifndef GPS_GLL_LATENCY
+	#define GPS_GLL_LATENCY	500
+#endif
+#ifndef GPS_RMC_LATENCY
+	#define GPS_RMC_LATENCY	500
+#endif
+
+
+/* START LIBRARY DESCRIPTION *********************************************
+gps.lib
+
+functions for parsing NMEA-0183 location and UTC data from a GPS receiver.
+Also has functions for computing distances.
+
+gps_get_position
+gps_get_utc
+gps_ground_distance
+nmea_status
+nmea_process
+nmea_set_rtc
+
+Following macros may be defined:
+
+#define GPS_DEBUG
+	Turn on Dynamic C single stepping for GPS library.
+	Default nodebug.
+
+#define GPS_PPS_IPSET	3
+	Define to interrupt priority for PPS interrupt (1-3), or 0 to disable.
+	Default 0.
+
+#define GPS_GGA_LATENCY	500
+#define GPS_GLL_LATENCY	500
+#define GPS_RMC_LATENCY	500
+	Define approximate number of milliseconds between true UTC time
+	(PPS) and the subsequent UTC timestamp message received from the
+	NMEA-0183 GGA, GLL or RMC message.  Most receivers will have at
+	least some delay because of the time it takes to send the message,
+	plus other internal lags.  Each of the three message types will
+	have a different delay, however setting them to the same approximate
+	value is OK provided that the true value is within +/-500ms of the
+	macro value(s).  If a PPS signal is available and connected to
+	one of the external interrupt pins (PE0,1,4 or 5) then the local
+	Rabbit clocks can be brought into exact synchronization.
+	All default to 500 (1/2 second).
+
+END DESCRIPTION *********************************************************/
+
+
+//This structure holds geographical position as reported by a GPS receiver
+//use the gps_get_position function below to set the fields.
+// NOTE: there is a global instance, nmea0183_data, which is automatically
+// maintained by regularly calling nmea_process().  This is recommended for
+// new code since it is easier for applications to use.
+typedef struct {
+	unsigned flags;		// Flags as follows:
+#define GPS_F_OK				0x0001	// At least one $GP message received.
+#define GPS_F_UOK				0x0002	// UTC offset is known and applied
+#define GPS_F_UDATE			0x0004	// UTC date (DDMMYY) is known
+#define GPS_F_RTC				0x0008	// Rabbit RTC has been set to UTC
+												// (usually via nmea_set_rtc())
+#define GPS_F_LOCKED			0x0010	// Rabbit timers are locked to PPS
+												// signal.  When set, SEC_TIMER will
+												// be correct UTC within about 1ms,
+												// as will TICK_TIMER modulo 1024.
+												// (MS_TIMER is not directly related
+												// to UTC, but will increment accurately
+												// in the long term).
+#define GPS_F_TRACK			0x0020	// Track PPS signal
+#define GPS_F_SLEW			0x0040	// Slewing to track PPS signal
+#define GPS_F_PPS				0x0080	// Got PPS interrupt
+#define GPS_F_FIX_OK			0x0100	// Got valid fix (GGA message field 6
+												// or RMC field 2)
+#define GPS_F_ALT_OK			0x0200	// Got valid altitude (FIX_OK and
+												// GGA mesage)
+#define GPS_F_UPD_UTC		0x0400	// UTC updated by message
+#define GPS_F_UPD_LOC		0x0800	// Lat/Lon updated by message
+	// The following are valid only when GPS_F_FIX_OK
+	int lat_degrees;		// Always positive 0..90
+	float lat_minutes;	// 0..59.9999
+	int lon_degrees;		// Always positive 0..180
+	float lon_minutes;	// 0..59.9999
+	char lat_direction;	// 'N' or 'S'
+	char lon_direction;	// 'E' or 'W'
+	// Latitude and longitude in radians.  This is much more convenient
+	// for calculation.  Precision is 1 part in 16M, or about 2.3m on the
+	// Earth's surface, which is much better than current GPS receiver
+	// accuracy, however using the split values above provides greater
+	// (and usually spurious) resolution.
+	float lat;				// +ve North
+	float lon;				// +ve East
+	unsigned numsat;		// Number of visible satellites
+
+	// Following is valid only when GPS_F_ALT_OK
+	// Altitude above mean sea level (meters)
+	float	alt;
+
+	// UTC timestamp from most recent message.  Only valid when
+	// GPS_F_UDATE.
+	struct tm utc;
+	long	 t_timer;		// Local (crystal-based) timestamp when utc last
+								// updated.  Takes account of message latency
+								// using the GPS_xxx_LATENCY macro settings.
+	unsigned tick_timer;	// 16 LSBs of TICK_TIMER at last PPS interrupt
+	unsigned rtc_lsbs;	// 16 LSBs of Rabbit RTC at last PPS interrupt
+} GPSPosition;
+
+extern __far GPSPosition nmea0183_data;
+// Macros to return various static information
+#define nmea_utc() (&nmea0183_data.utc)
+#define nmea_lat() (nmea0183_data.lat)
+#define nmea_lon() (nmea0183_data.lon)
+#define nmea_alt() (nmea0183_data.alt)
+#define nmea_numsat() (nmea0183_data.numsat)
+#define nmea_rtc_lsbs() (nmea0183_data.rtc_lsbs)
+
+
+//in km
+#define GPS_EARTH_RADIUS 6371
+
+#define NMEA0183_MAX_MSG_LEN	79
+
+/*** EndHeader */
+
+__far GPSPosition nmea0183_data;
+
+/*** BeginHeader gps_parse_coordinate */
+int gps_parse_coordinate(char __far *coord,
+			int __far *degrees, float __far *minutes);
+/*** EndHeader */
+
+//helper function for splitting xxxxx.xxxx into degrees and minutes
+//returns 0 if succeeded
+_gps_debug
+int gps_parse_coordinate(char __far *coord,
+			int __far *degrees, float __far *minutes)
+{
+	auto char __far *decimal_point;
+	auto char temp;
+	auto char __far *dummy;
+
+	decimal_point = _f_strchr(coord, '.');
+	if(decimal_point == NULL)
+		return -1;
+	temp = *(decimal_point - 2);
+	*(decimal_point - 2) = 0; //temporary terminator
+	*degrees = atoi(coord);
+	*(decimal_point - 2) = temp; //reinstate character
+	*minutes = _f_strtod(decimal_point - 2, &dummy);
+	return 0;
+}
+
+/*** BeginHeader gps_get_position */
+int gps_get_position(GPSPosition __far *newpos, char __far *sentence);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+gps_get_position		                  <gps.lib>
+
+SYNTAX: 			int gps_get_position(GPSPositon *newpos, char *sentence);
+
+KEYWORDS:      gps
+
+DESCRIPTION:   Parses a sentence to extract position data.
+					This function is able to parse any of the following
+					GPS sentence formats: GGA, GLL, RMC, ZDA.
+
+					It also does everything done by gps_get_utc() except
+					for computing the day of week, which can be done using
+   					mktm(&newpos->utc, mktime(&newpos->utc));
+					The UTC timestamp results get set in newpos->utc (struct tm)
+					and an indication of whether the UTC offset is known via
+					newpos->flags & GPS_F_UOK.
+
+               **NOTE**
+
+               GPS uses atomic time, which is ofset from UTC by the
+               number of leap seconds in effect.  The GPS receiver
+               will not know the correct offset until it has had clear
+               satellite view for several minutes.  Thus, the time
+               returned by this routine may jump several seconds some
+               time after initial satellite acquisition.  After that
+               point, the correct UTC time will be returned.
+
+               You can detect whether the correct UTC offset is
+               known by examining the GPS_F_UOK bit in the flags field.
+
+               ZDA messages always provide a timestamp, but it is not
+               possible to determine whether the offset has been applied.
+               Other messages typically leave the UTC time field empty
+               until the correct offset is known.
+
+PARAMETER1:    newpos - a GPSPosition structure to fill
+PARAMETER2:		sentence - a string containing a line of GPS data
+					in NMEA-0183 format
+
+RETURN VALUE:  0 - success
+					-1 - parsing error
+
+SEE ALSO:		nmea_process, nmea_tick
+
+END DESCRIPTION **********************************************************/
+
+_gps_debug
+int gps_get_position(GPSPosition __far *newpos, char __far *sentence)
+{
+#define MAX_NMEA_FIELDS 12
+	enum {
+		IGNORE = 0, LAT_DEC, LAT_DIR, LON_DEC, LON_DIR, LINK_QUAL,
+		STATUS, UTC_OR_NOT, DDMMYY, DD, MM, YYYY, HHMMSS,
+		NUMSAT, ALT_MSL
+	};
+	static const int gga[MAX_NMEA_FIELDS] =
+		{UTC_OR_NOT, LAT_DEC, LAT_DIR, LON_DEC, LON_DIR, LINK_QUAL,
+		 NUMSAT, IGNORE, ALT_MSL};
+	static const int gll[MAX_NMEA_FIELDS] =
+		{LAT_DEC, LAT_DIR, LON_DEC, LON_DIR, UTC_OR_NOT, STATUS};
+	static const int rmc[MAX_NMEA_FIELDS] =
+		{UTC_OR_NOT, STATUS, LAT_DEC, LAT_DIR, LON_DEC, LON_DIR,
+		 IGNORE, IGNORE, DDMMYY};
+	// Note: we ignore the HHMMSS field in ZDA because it may be GPS or
+	// UTC without being able to tell which.  The above messages will
+	// supply UTC when correct offset is known.
+	static const int zda[MAX_NMEA_FIELDS] =
+		{IGNORE, DD, MM, YYYY};
+	int i;
+	int gotfix = 0;
+	long latency;
+	const int * table;
+	float a;
+
+#ifdef GPS_VERBOSE
+	printf("GPS: got NMEA-0183 string:\n  %ls\n", sentence);
+#endif
+
+	if (strlen(sentence) < 7)
+		return -1;
+	if (strncmp(sentence, "$GP", 3) || sentence[6] != ',')
+		return -1;
+	newpos->flags |= GPS_F_OK;	// Got at least one message
+	sentence += 3;
+	if (!strncmp(sentence, "GGA", 3)) {
+		table = gga;
+		latency = GPS_GGA_LATENCY;
+	}
+	else if (!strncmp(sentence, "GLL", 3)) {
+		table = gll;
+		latency = GPS_GLL_LATENCY;
+	}
+	else if (!strncmp(sentence, "RMC", 3)) {
+		table = rmc;
+		latency = GPS_RMC_LATENCY;
+	}
+	else if (!strncmp(sentence, "ZDA", 3))
+		table = zda;
+	else
+		return -1;
+
+	for (i = 0; i < MAX_NMEA_FIELDS; ++i) {
+		sentence = _f_strchr(sentence, ',');
+		if (!sentence)
+			break;
+		++sentence;
+		switch (table[i]) {
+      case LAT_DEC: // decimal latitude in degrees
+         if (gps_parse_coordinate(sentence,
+                                  &newpos->lat_degrees,
+                                  &newpos->lat_minutes))
+            return -1; //get_coordinate failed
+         gotfix = 1;
+         break;
+      case LAT_DIR: // lat direction
+         newpos->lat_direction = *sentence;
+         gotfix = 1;
+         break;
+      case LON_DEC: // decimal longitude in degrees
+         if (gps_parse_coordinate(sentence,
+                                  &newpos->lon_degrees,
+                                  &newpos->lon_minutes))
+            return -1; //get_coordinate failed
+         gotfix = 1;
+         break;
+      case LON_DIR: // lon direction
+         newpos->lon_direction = *sentence;
+         gotfix = 1;
+         break;
+      case LINK_QUAL: // link quality (0 = bad, 1+ = OK)
+      case STATUS: // Status (A or V)
+         if (*sentence == '0' || *sentence == 'V')
+            newpos->flags &= ~(GPS_F_FIX_OK|GPS_F_ALT_OK);
+         else
+            newpos->flags |= GPS_F_FIX_OK;
+         break;
+      case UTC_OR_NOT:
+         if (*sentence == ',')
+            newpos->flags &= ~GPS_F_UOK;
+         else {
+            newpos->flags |= GPS_F_UOK | GPS_F_UPD_UTC;
+      		newpos->t_timer = TICK_TIMER - latency;
+      case HHMMSS:
+            newpos->utc.tm_hour =
+            	(sentence[0]-'0')*10 + (sentence[1]-'0');
+            newpos->utc.tm_min =
+            	(sentence[2]-'0')*10 + (sentence[3]-'0');
+            newpos->utc.tm_sec =
+            	(sentence[4]-'0')*10 + (sentence[5]-'0');
+         }
+         break;
+      case DDMMYY: // DDMMYY date
+      	if (newpos->flags & GPS_F_UOK)
+      		// Date only accepted after UTC offset received
+      		newpos->flags |= GPS_F_UDATE;
+         newpos->utc.tm_mday =
+         		(sentence[0]-'0')*10 + (sentence[1]-'0');
+         newpos->utc.tm_mon =
+         		month2tm_mon((sentence[2]-'0')*10 + (sentence[3]-'0'));
+         newpos->utc.tm_year = 100 +
+         		(sentence[4]-'0')*10 + (sentence[5]-'0');
+         break;
+      case DD: // Day of month
+      	newpos->flags |= GPS_F_UDATE;
+         newpos->utc.tm_mday =
+         		(sentence[0]-'0')*10 + (sentence[1]-'0');
+         break;
+      case MM:
+         newpos->utc.tm_mon =
+         		month2tm_mon((sentence[0]-'0')*10 + (sentence[1]-'0'));
+         break;
+      case YYYY:
+         newpos->utc.tm_year = atoi(sentence) - 1900;
+         break;
+      case NUMSAT:
+      	if (sentence[0] != ',')
+      		newpos->numsat = (unsigned)atoi(sentence);
+      	break;
+      case ALT_MSL:
+      	if (sentence[0] != ',') {
+	         newpos->alt = _f_strtod(sentence, NULL);
+	         newpos->flags |= GPS_F_ALT_OK;
+			}
+			break;
+		}
+	}
+
+	// All OK, convert to radians
+	if (gotfix && newpos->flags & GPS_F_FIX_OK) {
+	   a = newpos->lat_degrees + newpos->lat_minutes/60;
+	   if(newpos->lat_direction == 'S')
+	      a = -a;
+	   newpos->lat = a * (PI / 180);
+	   a = newpos->lon_degrees + newpos->lon_minutes/60;
+	   if(newpos->lon_direction == 'W')
+	      a = -a;
+	   newpos->lon = a * (PI / 180);
+	   newpos->flags |= GPS_F_UPD_LOC;
+	}
+
+	return 0;
+}
+
+/*** BeginHeader gps_get_utc */
+int gps_get_utc(struct tm *newtime, char *sentence);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+gps_get_utc		                  <gps.lib>
+
+SYNTAX: 			int gps_get_utc(struct tm *newtime, char *sentence);
+
+KEYWORDS:      gps
+
+DESCRIPTION:   Parses an RMC or ZDA sentence to extract UTC time.
+
+					** This function is deprecated.  Use nmea_process()
+					   instead since it is more efficient and handles
+					   UTC offsets correctly **
+
+
+PARAMETER1:		newtime - tm structure to fill with new UTC time
+PARAMETER2:		sentence - a string containing a line of GPS data
+					in NMEA-0183 format(RMC or ZDA sentence)
+
+RETURN VALUE:  0 - success
+					-1 - parsing error
+					-2 - sentence marked invalid
+					-3 - RMC message passed, however UTC offset is not
+					     yet acquired so the returned time is invalid.
+
+SEE ALSO:		nmea_process, nmea_tick
+
+END DESCRIPTION **********************************************************/
+
+_gps_debug
+int gps_get_utc(struct tm *newtime, char *sentence)
+{
+	int i;
+	char temp_str[5];
+	unsigned long epoch_sec;
+	temp_str[2] = 0; //2 character string (except year, which is last in ZDA)
+	if(strncmp(sentence, "$GPRMC", 6) == 0)
+	{
+		//parse RMC sentence
+		for(i = 0;i < 9;i++)
+		{
+			sentence = _n_strchr(sentence, ',');
+			if(sentence == NULL)
+				return -1;
+			sentence++; //first character in field
+			switch (i) {
+			case 0:
+				if (*sentence == ',')
+					return -3;
+            strncpy(temp_str, sentence, 2);
+            newtime->tm_hour = atoi(temp_str);
+            strncpy(temp_str, sentence+2, 2);
+            newtime->tm_min = atoi(temp_str);
+            strncpy(temp_str, sentence+4, 2);
+            newtime->tm_sec = atoi(temp_str);
+				break;
+			case 1:
+				if (*sentence != 'A')
+					return -2;
+				break;
+			case 8: // DDMMYY date
+				strncpy(temp_str, sentence, 2);
+				newtime->tm_mday = atoi(temp_str);
+				strncpy(temp_str, sentence+2, 2);
+				newtime->tm_mon = month2tm_mon(atoi(temp_str));
+				strncpy(temp_str, sentence+4, 2);
+				newtime->tm_year = 100 + atoi(temp_str);
+				break;
+			}
+		}
+	}
+	else if(strncmp(sentence, "$GPZDA", 6) == 0)
+	{
+		for(i = 0;i < 4;i++)
+		{
+			sentence = _n_strchr(sentence, ',');
+			if(sentence == NULL)
+				return -1;
+			sentence++; //first character in field
+			switch (i) {
+			case 0:
+				strncpy(temp_str, sentence, 2);
+				newtime->tm_hour = atoi(temp_str);
+				strncpy(temp_str, sentence+2, 2);
+				newtime->tm_min = atoi(temp_str);
+				strncpy(temp_str, sentence+4, 2);
+				newtime->tm_sec = atoi(temp_str);
+				break;
+			case 1:
+				strncpy(temp_str, sentence, 2);
+				newtime->tm_mday = atoi(temp_str);
+				break;
+			case 2:
+				strncpy(temp_str, sentence, 2);
+				newtime->tm_mon = month2tm_mon(atoi(temp_str));
+				break;
+			case 3:
+				strncpy(temp_str, sentence, 4);
+				temp_str[4] = 0;
+				newtime->tm_year = atoi(temp_str) - 1900;
+				break;
+			}
+		}
+	}
+	else
+		return -1; //unknown sentence type
+
+   //convert back and forth to get weekday
+   epoch_sec = mktime(newtime);
+   mktm(newtime, epoch_sec);
+   return 0;
+}
+
+/*** BeginHeader gps_ground_distance */
+float gps_ground_distance(GPSPosition *a, GPSPosition *b);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+gps_ground_distance		               <gps.lib>
+
+SYNTAX: float gps_ground_distance(GPSPosition *a, GPSPosition *b);
+
+KEYWORDS:      gps
+
+DESCRIPTION:   Calculates ground distance(in km) between to
+               geographical points. (Uses spherical earth model)
+
+PARAMETER1:		a - first point
+PARAMETER2:		b - second point
+
+RETURN VALUE:  distance in kilometers
+
+SEE ALSO:		nmea_process, nmea_tick
+
+END DESCRIPTION **********************************************************/
+
+_gps_debug
+float gps_ground_distance(GPSPosition *a, GPSPosition *b)
+{
+	float angle;
+	float lat_a, lon_a, lat_b, lon_b;
+	float slon, slat;
+
+	lat_a = a->lat;
+	lon_a = a->lon;
+
+	lat_b = b->lat;
+	lon_b = b->lon;
+
+	slon = sin((lon_a - lon_b)/2);
+	slat = sin((lat_a - lat_b)/2);
+	angle = sqrt(cos(lat_a)*cos(lat_b)*slon*slon + slat*slat);
+	angle = 2*asin(angle);
+
+	return angle * GPS_EARTH_RADIUS;
+}
+
+/*** BeginHeader nmea_status */
+int nmea_status(void);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+nmea_status		               									<gps.lib>
+
+SYNTAX:	int nmea_status(void)
+
+
+KEYWORDS:      gps
+
+DESCRIPTION:   Return status of the global GPS data structure.
+
+					This function is used in conjunction with nmea_process()
+
+RETURN VALUE:  0: Invalid
+					1: At least one $GP message processed.  This indicates
+					   successful communication with the GPS receiver.
+					2: UTC offset received and time/date known within about
+					   1/2 second of true time.
+					3: UTC tracking within 1ms of true time.  This only
+					   returned if PPS is enabled and nmea_set_rtc() called
+					   with the track parameter.
+
+
+SEE ALSO:		nmea_process, nmea_set_rtc, nmea_tick
+
+END DESCRIPTION **********************************************************/
+
+_gps_debug
+int nmea_status(void)
+{
+	if (!(nmea0183_data.flags & GPS_F_OK))
+		return 0;
+	if (!(nmea0183_data.flags & GPS_F_UOK) ||
+	    !(nmea0183_data.flags & GPS_F_UDATE))
+		return 1;
+	if (nmea0183_data.flags & GPS_F_LOCKED)
+		return 3;
+	return 2;
+}
+
+
+/*** BeginHeader nmea_process */
+int nmea_process(char __far * data, int len);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+nmea_process		               									<gps.lib>
+
+SYNTAX:	int nmea_process(char __far * data, int len);
+
+
+KEYWORDS:      gps
+
+DESCRIPTION:   Process a stream of NMEA-0183 messages from a GPS
+					receiver.  The caller may provide the stream data in
+					arbitrary size chunks and arbitrary boundaries.
+
+					The data is stored in a temporary static buffer, so
+					this routine should be called from a single task only.
+
+					Results (basically the latest position and UTC time fix)
+					are available in a global variable declared as:
+
+					  far GPSPosition  nmea0183_data;
+
+					** NOTE **
+
+					This is a low-level function.  See nmea_tick() for a
+					higher level GPS data handler.
+
+PARAMETER1:		data - new data
+PARAMETER2:		len - length of new data
+
+RETURN VALUE:  0: OK
+					negative: parsing or checksum error
+
+SEE ALSO:		gps_get_position, nmea_set_rtc, nmea_status, nmea_tick
+
+END DESCRIPTION **********************************************************/
+
+
+_gps_debug
+int nmea_process(char __far * data, int len)
+{
+	static __far char buf[NMEA0183_MAX_MSG_LEN+1];
+	static enum {
+		SEARCH_DOLLAR,
+		SEARCH_LF
+	} state = SEARCH_DOLLAR;
+	static int idx;	// buffer index
+	__far char * s;
+	int dtc, rc;
+	#GLOBAL_INIT { _f_memset(&nmea0183_data, 0, sizeof(nmea0183_data)); }
+	rc = 0;
+	while (len) {
+		switch (state) {
+		case SEARCH_DOLLAR:
+			s = _f_memchr(data, '$', len);
+			if (!s) {
+				len = 0;
+				break;
+			}
+			len -= (int)(s - data) + 1;
+			data = s + 1;
+			state = SEARCH_LF;
+			buf[0] = '$';
+			idx = 1;
+			if (!len)
+				break;
+			// else fall through
+		case SEARCH_LF:
+			s = _f_memchr(data, '\n', len);
+			if (!s) {
+				dtc = len;
+				if (idx+dtc > NMEA0183_MAX_MSG_LEN)
+					dtc = NMEA0183_MAX_MSG_LEN - idx;
+				_f_memcpy(buf + idx, data, dtc);
+				idx += dtc;
+				len = 0;
+				break;
+			}
+			dtc = (int)(s - data);
+         if (idx+dtc > NMEA0183_MAX_MSG_LEN)
+            dtc = NMEA0183_MAX_MSG_LEN - idx;
+         _f_memcpy(buf + idx, data, dtc);
+         data += dtc;
+         len -= dtc;
+         idx += dtc;
+         state = SEARCH_DOLLAR;
+         buf[idx] = 0;
+			if (gps_get_position(&nmea0183_data, buf) < 0)
+				rc = -1;
+			break;
+		}
+	}
+	return rc;
+}
+
+
+/*** BeginHeader gps_set_rtc, nmea_set_rtc */
+int gps_set_rtc(GPSPosition __far * p, int upd_SEC_TIMER, int track);
+int nmea_set_rtc(int upd_SEC_TIMER, int track);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+nmea_set_rtc		               									<gps.lib>
+
+SYNTAX:	int nmea_set_rtc(int upd_SEC_TIMER, int track)
+
+
+KEYWORDS:      gps
+
+DESCRIPTION:   Set Rabbit Real-Time Clock (RTC) to the latest UTC
+					timestamp in the given parameter.  Assumes you are
+					using nmea_process() to maintain up-to-date information.
+
+PARAMETER1:		TRUE if also set SEC_TIMER and TICK_TIMER to approximate
+					UTC (within about 500ms).
+
+					Normally, SEC_TIMER and TICK_TIMER
+					should run monotonically since they are used to implement
+					timeouts in other libraries.  It is useful to set it
+					at the start of program.  Set the 'track' parameter to
+					converge SEC_TIMER/TICK_TIMER to "exact" UTC
+					without sudden jumps (requires PPS interrupt).
+
+					**NOTE** if leap seconds are introduced subsequent to
+					calling this function, SEC_TIMER will lead UTC by
+					exactly one second.  If necessary, the application will
+					need to adjust SEC_TIMER e.g. using
+					  asm ipset 3;
+					  --SEC_TIMER;
+					  asm ipres;
+					however some applications may not permit SEC_TIMER to
+					jump back in this manner.  In such cases, the application
+					should maintain a leap second offset and always add
+					that value to the value of SEC_TIMER when reporting
+					true UTC.
+
+PARAMETER2:		TRUE if attempt to lock on to PPS signal.  For this
+               to work, you must also #define GPS_PPS_IPSET to a
+               non-zero interrupt priority level (1-3), and you
+               must also have called nmea_pps_init() in order to
+               specify the interrupt source pin.  When locked,
+               SEC_TIMER and the low 10 bits of TICK_TIMER (1/1024
+               second counter) will differ from true UTC by no more
+               than +/- 1/1024 seconds.
+
+RETURN VALUE:  0: OK
+					-EPERM: not permitted because data is not yet valid.
+						The GPS_F_UOK must be set in the flags member of the
+						parameter, to indicate that the UTC offset has been
+						received.  Also, at least one message with a valid
+						UTC date+time must have been received.  Use
+						nmea_status() to determine global GPS status.
+
+SEE ALSO:		nmea_process, nmea_status, nmea_pps_init, nmea_tick
+
+END DESCRIPTION **********************************************************/
+
+_gps_debug
+int nmea_set_rtc(int upd_SEC_TIMER, int track)
+{
+	return gps_set_rtc(&nmea0183_data, upd_SEC_TIMER, track);
+}
+
+_gps_debug
+int gps_set_rtc(GPSPosition __far * p, int upd_SEC_TIMER, int track)
+{
+	long newtime;
+	long millis;
+
+	if (p->flags & GPS_F_UOK &&
+	    p->flags & GPS_F_UDATE) {
+		millis = TICK_TIMER - p->t_timer;
+		write_rtc(newtime = mktime(&p->utc) + (millis >> 10));
+		p->flags |= GPS_F_RTC;
+		if (upd_SEC_TIMER) {
+			millis &= 0x3FF;
+			asm ipset 3;
+			SEC_TIMER = newtime;
+			TICK_TIMER = TICK_TIMER & ~0x3FF | millis;
+			asm ipres;
+		}
+		if (track) {
+			p->flags |= GPS_F_TRACK;
+			p->flags &= ~(GPS_F_LOCKED | GPS_F_SLEW | GPS_F_PPS);
+		}
+#ifdef GPS_VERBOSE
+		printf("GPS: set RTC\n");
+#endif
+	}
+	else
+		return -EPERM;
+	return 0;
+}
+
+
+/*** BeginHeader nmea_pps_init */
+int nmea_pps_init(int which);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+nmea_pps_init                  <GPS.LIB>
+
+SYNTAX:  int nmea_pps_init(int which)
+
+DESCRIPTION:   Initialize the PPS input interrupt.
+
+PARAMETER1:    which
+                   0 : use PE0 pin (external interrupt 0)
+                   1 : use PE1 pin (external interrupt 1)
+                0x10 : use PE4 pin (external interrupt 0)
+                0x11 : use PE5 pin (external interrupt 1)
+
+RETURN VALUE:	0 - OK
+					-EINVAL - 'which' is invalid for this processor
+
+SEE ALSO:		nmea_process, nmea_status, nmea_set_rtc, nmea_tick
+
+END DESCRIPTION **********************************************************/
+
+
+_gps_debug
+int nmea_pps_init(int which)
+{
+	unsigned intno = which & 7;
+	unsigned pinvar = which >> 4;
+
+	if (intno > 1)
+		return -EINVAL;
+	if (which & 0x08)
+		return -EINVAL;
+	if (pinvar > 1)
+		return -EINVAL;
+	SetVectExtern(intno, nmea_pps_handler);
+	// Make appropriate pin input
+	BitWrPortI(PEDDR, &PEDDRShadow, 0, intno + 4*pinvar);
+	// Set external interrupt options
+	WrPortI(intno ? I1CR : I0CR,
+	        intno ? &I1CRShadow : &I0CRShadow,
+	        (pinvar == 1 ? 0x20 : 0x08) + GPS_PPS_IPSET); // Rising edge
+   return 0;
+}
+
+
+/*** BeginHeader nmea_pps_handler */
+__root void nmea_pps_handler(void);	// Interrupt handler: do not call from C
+/*** EndHeader */
+
+/*
+  PPS interrupt handler.
+*/
+#asm root __nodebug
+nmea_pps_handler::
+	push	af
+	push	hl
+	push	de
+	push	px
+	ld		px,nmea0183_data	; point to global control struct
+.rtcloop:
+	ioi ld (RTC0R),a
+	ioi ld hl,(RTC0R)
+	ioi ld de,(RTC0R)
+	cp		hl,de
+	jr		nz,.rtcloop
+	ld		(px+[GPSPosition]+rtc_lsbs),hl
+	ld		hl,(px+[GPSPosition]+flags)
+	bit 	5,L					; GPS_F_TRACK
+	jr		z,.isr_exit
+	set	7,L					; GPS_F_PPS
+	ld		(px+[GPSPosition]+flags),hl	; Got a PPS pulse
+
+	; Want tracking.  If bit 9 of TICK_TIMER is 1 (negative) then advance,
+	; else retard.
+	ld		hl,(TICK_TIMER)
+	ld		(px+[GPSPosition]+tick_timer),hl
+	ld		de,0x3FF
+	and	hl,de
+	jr		nz,.adjust
+	; Got zero offset, set locked flag
+	ld		hl,(px+[GPSPosition]+flags)
+	set	4,L					; GPS_F_LOCKED
+	ld		(px+[GPSPosition]+flags),hl
+	jr		.isr_exit
+.adjust:
+	bit	1,h		; bit 9
+	flag	nz,hl
+	call	_clock_adjust
+
+.isr_exit:
+	pop	px
+	pop	de
+	pop	hl
+	pop	af
+	ipres
+	ret
+#endasm
+
+
+/*** BeginHeader nmea_tick */
+int nmea_tick(int serport);
+
+#define GPS_UPD_UTC			0x0001
+#define GPS_UPD_PPS			0x0002
+#define GPS_UPD_LOCATION	0x0004
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+nmea_tick		               									<gps.lib>
+
+SYNTAX:	int nmea_tick(int serport);
+
+
+KEYWORDS:      gps
+
+DESCRIPTION:   Call as often as possible (for example, inside the
+					application main loop) to obtain NMEA messages from
+					a serial port and process.  This function also maintains
+					clock synchronization if PPS (Pulse Per Second) is
+					available.
+
+PARAMETER1:		Serial port number.  Use one of the macros
+						SER_PORT_A
+						SER_PORT_B
+						SER_PORT_C
+						SER_PORT_D
+						SER_PORT_E
+						SER_PORT_F
+					Note that the application is expected to set up the
+					serial port (using serXopen() etc.).  nmea_tick() uses
+					only the functions serXrdUsed() and serXread().
+
+RETURN VALUE:	If zero or positive:
+					Zero or more of the following bitfield values, which
+					indicate which (if any) data has been updated (an initial
+					fix is also considered an update).
+					  GPS_UPD_UTC	     UTC time updated
+					  GPS_UPD_PPS	     PPS pulse detected
+					  GPS_UPD_LOCATION  Lat/Lon updated
+					If negative:
+					 error code.
+
+SEE ALSO:		nmea_status, nmea_pps_init, nmea_set_rtc,
+					serXrdUsed, serXread
+
+END DESCRIPTION **********************************************************/
+
+
+_gps_debug
+int nmea_tick(int serport)
+{
+	static int setrtc = 1;
+	static int tmr;
+	int t, rc;
+	char buf[80];
+	int len = serXrdUsed(serport);
+	unsigned updflags = 0;
+	int oldday = nmea0183_data.flags & GPS_F_UDATE ?
+						nmea0183_data.utc.tm_mday : 0;
+
+	if (len) {
+		if (len > sizeof(buf))
+			len = sizeof(buf);
+		// Won't block...
+		serXread(serport, buf, len, 1);
+		rc = nmea_process(buf, len);
+		if (rc < 0)
+			return rc;
+	}
+
+	if ((nmea0183_data.flags & (GPS_F_TRACK  | GPS_F_PPS))
+			== (GPS_F_TRACK  | GPS_F_PPS)) {
+		// Want tracking, and had at least one PPS interrupt.
+		// If PPS tick_timer LSBs are off by more than 16, then
+		// set slew mode.
+		t = nmea0183_data.tick_timer & 0x3F0;
+		if (t != 0 && t != 0x3F0) {
+			if (!(nmea0183_data.flags & GPS_F_SLEW))
+				tmr = _SET_SHORT_TIMEOUT(0);
+			nmea0183_data.flags |= GPS_F_SLEW;
+		}
+		else
+			nmea0183_data.flags &= ~GPS_F_SLEW;
+	}
+	//	If slew mode, adjust clock at high rate.
+	if (nmea0183_data.flags & GPS_F_SLEW) {
+		if (_CHK_SHORT_TIMEOUT(tmr)) {
+			tmr = _SET_SHORT_TIMEOUT(32);
+			_clock_adjust((nmea0183_data.tick_timer & 0x200) != 0);
+		}
+	}
+
+	if (setrtc) {
+		if (nmea_status() > 1) {
+			nmea_set_rtc(1, 1);
+			setrtc = 0;
+		}
+	}
+
+	if (nmea0183_data.flags & GPS_F_UPD_UTC) {
+		updflags |= GPS_UPD_UTC;
+	}
+	if (nmea0183_data.flags & GPS_F_UPD_LOC) {
+		updflags |= GPS_UPD_LOCATION;
+		if (nmea0183_data.flags & GPS_F_UDATE &&
+				oldday != nmea0183_data.utc.tm_mday) {
+			// Brand new day.  Fully update utc sub-struct with
+			// weekday.
+			mktm(&nmea0183_data.utc, mktime(&nmea0183_data.utc));
+		}
+	}
+   if (nmea0183_data.flags & GPS_F_PPS) {
+      nmea0183_data.flags &= ~GPS_F_PPS;
+		updflags |= GPS_UPD_PPS;
+	}
+	nmea0183_data.flags &= ~(GPS_F_UPD_UTC|GPS_F_UPD_LOC);
+	return updflags;
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

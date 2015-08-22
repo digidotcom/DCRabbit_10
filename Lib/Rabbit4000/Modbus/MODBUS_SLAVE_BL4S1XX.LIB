@@ -1,0 +1,808 @@
+/* START LIBRARY DESCRIPTION *********************************************
+
+Copyright April 2009, Digi International
+
+DESCRIPTION:	Dynamic C MODBus Slave user functions for a BL4S1xx.
+
+Modbus_Slave_BL4S1xx					Ver 1.01
+
+Modifications:
+JLC	1.01	Apr 2009		initial release
+
+This library contains functions specific to the targeted device.  The user
+must complete each of the functions in this library based on the hardware
+in the system.  These functions are independent of the communications
+media being used: RS485, TCP/IP, etc.
+
+*************************************************************************
+IMPORTANT:
+(1) The user program must execute the necessary functions to set up the board
+I/O before starting the Modbus engine:
+(2) This library does not support the "special" functions of the RIO:
+		Input Capture, Quadrature Decoder, PWM, etc.
+
+The function mbsbrdInit will handle board initialization.
+*************************************************************************
+
+The following functions are defined:
+
+mbsbrdInit	initialize the I/O of the board
+
+mbsStart		pre-packet processing - usually an empty function
+mbsDone		post-packet processing - usually an empty function
+
+			Single Bit functions
+mbsDigOutRd	return the state of a single output [0x01]
+mbsDigIn		return the state of a single input [0x02]
+mbsDigOut	set the state of a single output [0x05]
+
+			Byte/Word functions
+mbsRegOutRd	return the value of a holding register [0x03]
+mbsRegIn		return the value of an input register [0x04]
+mbsRegOut	set the state of a holding register [0x06]
+
+The following describes the Modbus function codes and how they relate
+to the BL4S1xx I/O:
+
+NOTE: The Dynamic C functions which program the digital outputs use a value
+of 0 to turn on the output.  The easiest way to remember this is to think in
+terms of the voltage level of the output when you need to program it.
+
+mbsDigOutRd:	ModBus function code 0x01 - return the state of an output bit
+						 OutputNbr 0..7
+
+mbsDigIn:		MODBUS function code 0x02 - read the state of an input bit
+						InputNbr 0..11
+
+mbsRegOutRd:	ModBus function code 0x03 - return the state of output register
+						OutputNbr 0..7 = register 0
+
+mbsRegIn:		ModBus function code 0x04 - read an input register
+						InputNbr 0..11 = register 0
+
+mbsDigOut:		MODBUS function code 0x05 - set the state of an output bit
+						function code 0x0F - set the state of multiple outputs
+						OutputNbr 0..7
+
+mbsRegOut:		ModBus function code 0x06 - write to an I/O register
+						function code 0x10 - write to multiple I/O registers
+						OutputNbr 0..7 = register 0
+
+These are the defined error return values:
+MB_SUCCESS		// success
+MB_BADFUNC		//	Illegal Function
+MB_BADADDR		//	Illegal Data Address
+MB_BADDATA		//	Illegal Data Value
+MB_BUSY			//	Target is busy with another request
+MB_NORESP		//	No response from target
+MB_DEVNOTSET	// device not properly set up
+
+
+These three functions will only be needed if this device is connected to
+'downstream' MODBUS devices via a serial interface - probably RS485.
+
+MODBUS_Serial_Init initialize the serial port for 'downstream' devices
+MODBUS_Serial_Tx	send a message to a 'downstream' device
+MODBUS_Serial_Rx	receive a message from a 'downstream' device
+
+END DESCRIPTION **********************************************************/
+
+
+/*** BeginHeader */
+#ifndef __MODBUS_SLAVE_BL4S1xx
+#define __MODBUS_SLAVE_BL4S1xx
+
+#ifndef MODBUS_SLAVE_DEBUG
+#define MODBUS_SLAVE_DEBUG __nodebug
+#endif
+
+// definitions for "special" functions:
+
+#define MODBUS_SPECIAL_REG			1000
+#define MODBUS_BL2600_DIO_CONFIG	MODBUS_SPECIAL_REG
+#define MODBUS_FLAGS0				MODBUS_SPECIAL_REG+999
+#define MODBUS_ANALOG_OUT_BASE	2000
+#define MODBUS_ANALOG_IN_BASE		3000
+
+#ifndef BYTE_TIME
+// maximum number of byte times to wait between received bytes
+	#define BYTE_TIME		5
+#endif
+
+static union
+{	float fpval;
+   int intval[2];
+} AnalogValue;
+
+char	a2dGainCode[8];
+int	anaInConfigVal[8];
+
+int	tempint;
+int	DigOutValue;
+
+// serial port stuff - probably not necessary since the BL4S1xx does not support RS485
+
+#ifndef MODBUS_PORT
+	#define MODBUS_PORT	D
+#endif
+
+#ifndef SERIAL_MODE
+	#define SERIAL_MODE 0
+#endif
+
+#ifndef MODBUS_BAUD
+	#define MODBUS_BAUD	19200
+#endif
+
+#define serOpen					CONCAT ( CONCAT(ser,MODBUS_PORT), open )
+#define serClose					CONCAT ( CONCAT(ser,MODBUS_PORT), close )
+#define serRead					CONCAT ( CONCAT(ser,MODBUS_PORT), read )
+#define serRdUsed					CONCAT ( CONCAT(ser,MODBUS_PORT), rdUsed )
+#define serWrUsed					CONCAT ( CONCAT(ser,MODBUS_PORT), wrUsed )
+#define serWrite					CONCAT ( CONCAT(ser,MODBUS_PORT), write )
+#define serPeek					CONCAT ( CONCAT(ser,MODBUS_PORT), peek )
+#define serRdFlush				CONCAT ( CONCAT(ser,MODBUS_PORT), rdFlush )
+#define serWrFlush				CONCAT ( CONCAT(ser,MODBUS_PORT), wrFlush )
+#define serFlowCtrlOn			CONCAT ( CONCAT(ser,MODBUS_PORT), flowCtrlOn )
+#define serFlowCtrlOff			CONCAT ( CONCAT(ser,MODBUS_PORT), flowCtrlOff )
+#define serPutc					CONCAT ( CONCAT(ser,MODBUS_PORT), putc )
+
+/*** EndHeader */
+
+
+/**********************************************************************
+The following are the Function Descriptions for the functions which
+MUST be implemented by the customer and in this library.
+**********************************************************************/
+
+
+/* START FUNCTION DESCRIPTION *****************************************
+mbsStart						<Modbus_Slave_BL4S1xx.LIB>
+
+NOTE: Modbus_Slave_BL4S1xx.LIB functions are generally not reentrant.
+
+SYNTAX: void mbsStart()
+
+DESCRIPTION: Called just before a received Modbus packet is processed,
+this function is primarily intended to be used to lock resources so
+that data returned in one Modbus response packet are atomic. Locking
+resources may or may not be required, depending on how the Modbus functions
+are implemented in a particular Modbus slave application. Note that Modbus
+command handler functions in Modbus_slave_tcp.LIB may make multiple calls
+to those functions while responding to a single Modbus command.
+
+RETURN VALUE: None.
+END DESCRIPTION ******************************************************/
+
+/*** BeginHeader mbsStart */
+void mbsStart	(	void );
+/*** EndHeader */
+
+MODBUS_SLAVE_DEBUG
+void mbsStart ( void )
+{
+}
+
+
+/* START FUNCTION DESCRIPTION *****************************************
+mbsDone						<Modbus_Slave_BL4S1xx.LIB>
+
+NOTE: Modbus_Slave_BL4S1xx.LIB functions are generally not reentrant.
+
+SYNTAX: void mbsDone()
+
+DESCRIPTION: Called just after a received Modbus command has been
+processed and just before the reply is sent. This function is intended
+to be used to unlock resources that were locked by msStart().  See msStart
+for more details.
+
+RETURN VALUE: None.
+END DESCRIPTION ******************************************************/
+
+/*** BeginHeader mbsDone */
+void mbsDone	(	void );
+/*** EndHeader */
+
+MODBUS_SLAVE_DEBUG
+void mbsDone ( void )
+{
+}
+
+/* START FUNCTION DESCRIPTION ********************************************
+mbsbrdInit					<Modbus_Slave_BL4S1xx.LIB>
+
+SYNTAX:			void mbsbrdInit (void);
+
+DESCRIPTION:	Initialize the I/O of the board
+
+PARAMETER:		none
+
+RETURN VALUE:	none
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader mbsbrdInit*/
+void mbsbrdInit (void);
+/*** EndHeader */
+
+void mbsbrdInit (void)
+{	int i;
+
+	brdInit();						// initialize the board I/O - primarily the RIO
+   for (i=0; i<=11; i++ ) setDigIn ( i ); // all inputs are general inputs
+   for (i=0; i<=7; i++ ) setDigOut ( i, 1 ); // all outputs are general outputs
+													//				and turned off (value=1)
+// initialize the A/D channels for Single Ended, 20V, unipolar
+	for (i=0; i<=7; i++ ) a2dGainCode[i] = 0;
+	for (i=0; i<=7; i++ ) anaInConfigVal[i] = SE0_MODE;
+	for (i=0; i<=7; i++ ) anaInConfig ( i, SE0_MODE );
+
+
+// you may add any other initialization required by the application here
+// or insert it into your main program after executing this function.
+
+}
+
+
+/* START FUNCTION DESCRIPTION *****************************************
+mbsDigOutRd					<Modbus_Slave_BL4S1xx.LIB>
+
+NOTE: Modbus_Slave_BL4S1xx.LIB functions are generally not reentrant.
+
+ModBus function code = 0x01
+
+SYNTAX: 			int mbsDigOutRd ( unsigned OutputNbr, int *pnState )
+
+DESCRIPTION:   returns the last value written to OutputNbr
+						0 = output on - load grounded
+                  1 = output off
+
+PARAMETER1:		output number: 0..7
+
+PARAMETER2:		pointer to destination variable
+
+RETURN VALUE:	MB_SUCCESS = success
+               MB_BADADDR = illegal Output Nbr
+               MB_DEVNOTSET = I/O not set as output
+
+END DESCRIPTION ******************************************************/
+
+/*** BeginHeader mbsDigOutRd */
+int mbsDigOutRd ( unsigned OutputNbr, int *pnState );
+/*** EndHeader */
+
+MODBUS_SLAVE_DEBUG
+int mbsDigOutRd ( unsigned OutputNbr, int *pnState )
+{
+	if ( OutputNbr > 7 )
+	{
+		return MB_BADADDR;
+	}
+	if( __brdInitFlag == FALSE )
+	{
+		return MB_DEVNOTSET;
+	}
+
+	*pnState = (DigOutValue>>OutputNbr)&0x01;
+	return MB_SUCCESS;
+} // mbsDigOutRd
+
+
+/* START FUNCTION DESCRIPTION *****************************************
+mbsDigIn						<Modbus_Slave_BL4S1xx.LIB>
+
+ModBus function code = 0x02
+
+NOTE: Modbus_Slave_BL4S1xx.LIB functions are generally not reentrant.
+
+SYNTAX:			int mbsDigIn ( unsigned InputNbr, int *pnState )
+
+DESCRIPTION:	read the specified input
+
+PARAMETER1:		input number: 0..11
+
+PARAMETER2:		pointer to destination variable
+						a '1' is returned if the input is high
+
+RETURN VALUE:	MB_SUCCESS = success
+					MB_BADADDR = illegal channel
+               MB_DEVNOTSET = I/O not set as output
+
+END DESCRIPTION ******************************************************/
+
+/*** BeginHeader mbsDigIn */
+int mbsDigIn ( unsigned InputNbr, int *pnState );
+/*** EndHeader */
+
+MODBUS_SLAVE_DEBUG
+int mbsDigIn ( unsigned InputNbr, int *pnState )
+{
+	if ( InputNbr > 11 )
+	{
+		return MB_BADADDR;
+	}
+	if( __brdInitFlag == FALSE )
+	{
+		return MB_DEVNOTSET;
+	}
+
+	*pnState = digIn ( InputNbr );
+	return MB_SUCCESS;
+} // mbsDigIn
+
+
+/* START FUNCTION DESCRIPTION *****************************************
+mbsRegOutRd					<Modbus_Slave_BL4S1xx.LIB>
+
+NOTE: Modbus_Slave_BL4S1xx.LIB functions are generally not reentrant.
+
+ModBus function code = 0x03
+
+SYNTAX:			int mbsRegOutRd ( unsigned OutRegNbr, unsigned *pwValue )
+
+DESCRIPTION:	read an 8 bit output register
+
+PARAMETER1:		register number
+						0 = value last written of all the outputs
+
+PARAMETER2:		pointer to destination variable
+						for each bit: 0 = output is on, 1 = output is off
+
+RETURN VALUE:	MB_SUCCESS = success
+					MB_BADADDR = illegal register
+               MB_DEVNOTSET = I/O not set as output
+END DESCRIPTION ******************************************************/
+
+/*** BeginHeader mbsRegOutRd */
+int mbsRegOutRd ( unsigned OutRegNbr, unsigned *pwValue );
+/*** EndHeader */
+
+MODBUS_SLAVE_DEBUG
+int mbsRegOutRd ( unsigned OutRegNbr, unsigned *pwValue )
+{	auto int i, RegValue;
+
+	if( __brdInitFlag == FALSE )
+   {
+   	return MB_DEVNOTSET;
+   }
+
+	if ( OutRegNbr ) return MB_BADADDR;
+
+   *pwValue = DigOutValue;
+
+	return MB_SUCCESS;
+} // mbsRegOutRd
+
+
+/* START FUNCTION DESCRIPTION *****************************************
+mbsRegIn						<Modbus_Slave_BL4S1xx.LIB>
+
+NOTE: Modbus_Slave_BL4S1xx.LIB functions are generally not reentrant.
+
+ModBus function code = 0x04
+
+SYNTAX: 			int mbsRegIn ( unsigned InRegNbr, unsigned *pwValue )
+
+DESCRIPTION:	read an input register: read state of pins (0V = 0)
+
+PARAMETER1:		register number
+						0 =  Inputs 0..11
+	               Special Registers:
+						3nnx = Analog Input where nn = A/D channel (0..7)
+                  	3nn0 = execute an A/D read and
+                     	returns least significant word of floating point value
+                     3nn1 = returns most significant word of floating point value
+                     		note: DIFF_MODE and mAMP_MODE only valid for floating point
+                     3nn2 = integer millivolts
+                     3003 = integer raw value
+	               see mbsRegOut for setting up the A/D channels
+
+PARAMETER2:		pointer to destination variable
+
+RETURN VALUE:	MB_SUCCESS = success
+					MB_BADADDR = illegal channel or function
+               MB_DEVNOTSET = board not initialized
+               MB_BADFUNC = invalid function
+END DESCRIPTION ******************************************************/
+
+/*** BeginHeader mbsRegIn */
+int mbsRegIn ( unsigned InRegNbr, unsigned *pwValue );
+/*** EndHeader */
+
+MODBUS_SLAVE_DEBUG
+int mbsRegIn ( unsigned InRegNbr, unsigned *pwValue )
+{	auto int channel, function, temp, DiffFlag, maFlag;
+
+	if( __brdInitFlag == FALSE )
+   {
+   	return MB_DEVNOTSET;
+   }
+
+	if ( InRegNbr >= (MODBUS_ANALOG_IN_BASE)  &&
+   			InRegNbr <= (MODBUS_ANALOG_IN_BASE+73) )	// if read A/D
+   {
+   	channel = (InRegNbr-MODBUS_ANALOG_IN_BASE)/10;
+		DiffFlag = ( anaInConfigVal[channel] & (DIFF_MODE|SE0_MODE) ) == DIFF_MODE;
+		maFlag = ( anaInConfigVal[channel] & mAMP_MODE ) == mAMP_MODE;
+		function = InRegNbr - MODBUS_ANALOG_IN_BASE - (channel*10);
+
+		if ( channel > 7 ) return MB_BADADDR;
+
+   	switch (function)
+		{
+			case 0:
+				if ( mAMP_MODE )
+            	AnalogValue.fpval = anaInmAmps (channel);
+				else
+            {
+	         	if ( !DiffFlag )
+   	         	AnalogValue.fpval = anaInVolts (channel, (int)a2dGainCode[channel]);
+      	      else
+         	   	AnalogValue.fpval = anaInDiff (channel, (int)a2dGainCode[channel]);
+            }
+            *pwValue = AnalogValue.intval[0];
+			break;
+
+			case 1:
+            *pwValue = AnalogValue.intval[1];
+         break;
+
+			case 2:
+         	AnalogValue.fpval = anaInVolts (channel, (int)a2dGainCode[channel]);
+				*pwValue = (int)(AnalogValue.fpval*1000.0);
+         break;
+
+			case 3:
+         	*pwValue = anaIn ( channel, (int)a2dGainCode[channel] );
+         break;
+
+         default: return MB_BADFUNC;
+         break;
+      }
+		return MB_SUCCESS;
+   } // MODBUS_ANALOG_IN_BASE
+
+	if ( InRegNbr ) return MB_BADADDR;
+
+   {	temp = 0;								// init return value
+		for ( channel = 0; channel <= 11; channel++ ) // for each channel
+		{ 	temp |= digIn(11-channel);		// get state of channel
+			temp << 1;
+		}
+	   *pwValue = temp;
+   }
+	return MB_SUCCESS;
+} // mbsRegIn
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+mbsDigOut						<Modbus_Slave_BL4S1xx.LIB>
+
+NOTE: Modbus_Slave_BL4S1xx.LIB functions are generally not reentrant.
+
+MODBUS command = 0x05, 0x0F
+
+SYNTAX:     	int mbsdigOut ( unsigned OutputNbr, int state );
+
+DESCRIPTION:	turn the specified output on or off
+
+PARAMETER1:		output channel number
+						0 <= channel <= 7
+
+PARAMETER2:		output state
+						0 = turn output on - connects load to ground
+						1 = turn output off - high impedance state
+
+RETURN VALUE:	MB_SUCCESS = success
+					MB_BADADDR = illegal channel
+               MB_BADDATA = illegal data value
+               MB_DEVNOTSET = I/O not set as output
+
+SEE ALSO: 		brdInit, digOutConfig
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader mbsDigOut */
+int mbsDigOut ( unsigned OutputNbr, int state );
+/*** EndHeader */
+
+MODBUS_SLAVE_DEBUG
+int mbsDigOut ( unsigned OutputNbr, int state )
+{	auto mask;
+
+   #GLOBAL_INIT { DigOutValue = 0xFF; } // default to all outputs off
+
+	if ( OutputNbr > 7 )
+	{
+		return MB_BADADDR;
+	}
+	if ( (state < 0) || (state > 1) )
+	{
+		return MB_BADDATA;
+	}
+	if( __brdInitFlag == FALSE )
+	{
+		return MB_DEVNOTSET;
+	}
+
+	digOut ( OutputNbr, state );
+
+   mask = (1<<OutputNbr);
+   if (state) DigOutValue |= mask;
+   else DigOutValue &= ~mask;
+
+   return MB_SUCCESS;
+} // mbsDigOut
+
+
+/* START FUNCTION DESCRIPTION *****************************************
+mbsRegOut						<Modbus_Slave_BL4S1xx.LIB>
+
+NOTE: Modbus_Slave_BL4S1xx.LIB functions are generally not reentrant.
+
+ModBus function codes = 0x06, 0x10, 0x16 and 0x17,
+
+SYNTAX: 			int mbsRegOut ( unsigned OutRegNbr, unsigned wValue )
+
+DESCRIPTION: 	write to an I/O register
+
+PARAMETER1:		register number
+						0 = Digital outputs 0..7
+                  writes all outputs at one time
+                  REMEMBER: 0 = output on
+               Special Registers:
+                  2nnx = Analog Output where nn = D/A nbr
+                  	2nn0, 2nn1 = floating point volts: see anaOutVolts
+                     2nn2 = integer millivolts: uses anaOutVolts
+                     2nn3 = integer raw value: see anaOut
+                     2nn9 = turn on D/A power: see anaOutPwr
+						3nnx = Analog Input where nn = A/D channel
+							3nn8 = integer operating mode: see anaInConfig
+                     3nn9 = integer range code: see anaIn
+
+PARAMETER2:		register value
+					for DIO: each bit (0..7)
+						0 = turn output off
+                  1 = turn output on
+               for A/D - see anaInConfig
+
+RETURN VALUE:	MB_SUCCESS = success
+					MB_BADADDR = illegal channel
+               MB_DEVNOTSET = I/O not set as output
+               MB_BADFUNC = invalid function
+END DESCRIPTION ******************************************************/
+
+/*** BeginHeader mbsRegOut */
+int mbsRegOut ( unsigned OutRegNbr, unsigned wValue );
+/*** EndHeader */
+
+MODBUS_SLAVE_DEBUG
+int mbsRegOut ( unsigned OutRegNbr, unsigned wValue )
+{	auto int channel, function;
+
+	if ( __brdInitFlag == FALSE )
+	{
+		return MB_DEVNOTSET;
+	}
+
+	if ( OutRegNbr >= (MODBUS_ANALOG_IN_BASE)  &&
+   			OutRegNbr <= (MODBUS_ANALOG_IN_BASE+79) )	// if setup A/D
+   {
+   	channel = ((OutRegNbr-MODBUS_ANALOG_IN_BASE)/10);
+		function = OutRegNbr - MODBUS_ANALOG_IN_BASE - (channel*10);
+
+		if ( channel > 7 ) return MB_BADADDR;
+
+		switch ( function )
+      {
+			case 8: 								// operating mode
+				anaInConfig ( channel, wValue );
+            anaInConfigVal[channel] = wValue;
+         break;
+
+			case 9: 								// range
+         	a2dGainCode[channel] = (char)wValue & 0x07; // in bits 0..2
+         break;
+
+         default: return MB_BADFUNC;
+         break;
+	   } // switch
+		return MB_SUCCESS;
+   } // if ( OutRegNbr >= MODBUS_SPECIAL_REG )
+
+	if ( OutRegNbr ) return MB_BADADDR;
+
+	digOutBank ( 0, wValue );
+	DigOutValue = wValue;
+
+	return MB_SUCCESS;
+} // mbsRegOut
+
+
+/**********************************************************************/
+/**********************************************************************/
+/**********************************************************************/
+
+/* The following functions are for communicating with "downstream"
+MODBUS devices connected to a serial port on this unit.  They can remain
+blank functions if there are no such devices - do NOT delete the blank
+functions.
+*/
+
+/**********************************************************************/
+/**********************************************************************/
+/**********************************************************************/
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+MODBUS_Serial_Init		<Modbus_Slave_BL4S1xx.lib>
+
+SYNTAX:        int MODBUS_Serial_Init ();
+
+DESCRIPTION:	Initialize the serial port
+					Requires the following macros:
+               	MODBUS_PORT		D or F
+               	MODBUS_BAUD		desired baud rate
+                  SERIAL_MODE:	0 or 1
+                     Mode   Port D		     Port F
+                     ----   ------          ------
+                     0      RS232, 3wire	  RS232, 3 wire
+                     1		 RS232, 5wire	  RTS/CTS
+                     * make sure MODBUS_PORT agrees with SERIAL_MODE
+
+					Calculate Serial_timeout, used by MODBUS_Serial_Rx,
+					as the timeout between bytes once a byte has been
+					received: 5 byte times or 2msec, whichever is greater.
+
+PARAMETER1:		none
+
+RETURN VALUE:	MB_SUCCESS
+					MB_BADDATA if illegal SERIAL_MODE
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader MODBUS_Serial_Init, Serial_timeout */
+int MODBUS_Serial_Init (void);
+extern int Serial_timeout;
+/*** EndHeader */
+
+int Serial_timeout;
+
+MODBUS_SLAVE_DEBUG
+int MODBUS_Serial_Init ( void )
+{	auto float timeout;
+
+	if(serMode(SERIAL_MODE)<0)
+   {
+   	return MB_BADDATA;
+   }
+
+	timeout = BYTE_TIME*11*1000.0/(float)MODBUS_BAUD;
+   												// time for BYTE_TIME bytes in msec
+   Serial_timeout = (int)(timeout+.5);	// convert to integer
+   if ( Serial_timeout < 2 )
+	{
+		Serial_timeout = 2; // insure minimum delay
+	}
+   serOpen ( MODBUS_BAUD );
+   serRdFlush(); 							// clear the read FIFO
+	MODBUS_flags0 = 0;						// initialize special flags
+	return MB_SUCCESS;
+} // MODBUS_Serial_Init
+
+/* START FUNCTION DESCRIPTION ********************************************
+MODBUS_Serial_Tx			<Modbus_Slave_BL4S1xx.lib>
+
+SYNTAX:			int MODBUS_Serial_Tx ( char *Packet, int ByteCount );
+
+DESCRIPTION:	Transmit a Modbus packet to a "downstream" device.
+					Calculate the CRC and append to the packet.
+
+PARAMETER1:		address of packet - must have two byte pad at end for
+					inclusion of CRC word
+
+PARAMETER2:		number of bytes in the packet
+
+RETURN VALUE:	MB_SUCCESS
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader MODBUS_Serial_Tx */
+int MODBUS_Serial_Tx ( char *Packet, int ByteCount );
+/*** EndHeader */
+
+MODBUS_SLAVE_DEBUG
+int MODBUS_Serial_Tx ( char *Packet, int ByteCount )
+{	auto int CalcCRC,i;
+
+// insert CRC
+#ifndef USE_MODBUS_CRC
+	CalcCRC = getcrc ( Packet, ByteCount, 0xFFFF );
+	Packet[ByteCount] = CalcCRC;			// store low byte
+	Packet[ByteCount+1] = CalcCRC>>8;	// store high byte
+#else
+	CalcCRC = MODBUS_CRC(Packet, ByteCount);
+	Packet[ByteCount+1] = CalcCRC;		// store low byte
+	Packet[ByteCount] = CalcCRC>>8;		// store high byte
+#endif
+	ByteCount += 2;							// adjust for CRC
+
+#if MODBUS_DEBUG_PRINT & 8
+	printf ( "Ser Tx:" );
+	for ( i=0; i<ByteCount; i++ )
+   {
+   	printf ( " %02X", Packet[i] );
+   }
+	printf ( "\n\r" );
+#endif
+
+	serWrite ( Packet, ByteCount ); // send the data
+
+	return MB_SUCCESS;						// show success
+} // MODBUS_Serial_Tx
+
+/* START FUNCTION DESCRIPTION *********************************************
+MODBUS_Serial_Rx			<Modbus_Slave_BL4S1xx.lib>
+
+DESCRIPTION:	Receive the response from the Modbus Slave
+					Uses the global variable Serial_timeout
+					It is the responsibility of the caller to handle
+					a timeout if required.
+
+PARAMETER1:		address to put the data
+
+RETURN VALUE:	0 = no message
+					+n = number of bytes with valid CRC
+               MB_CRC_ERROR = invalid CRC
+
+END DESCRIPTION **********************************************************/
+/*** BeginHeader MODBUS_Serial_Rx */
+int MODBUS_Serial_Rx ( char * DataAddress );
+/*** EndHeader */
+
+MODBUS_SLAVE_DEBUG
+int MODBUS_Serial_Rx ( char * DataAddress )
+{	auto int RxCRC, CalcCRC;
+	auto int ByteCount,i, reg, p1;
+
+	ByteCount = serRead( DataAddress, 100, Serial_timeout );
+   if ( ByteCount )
+   {
+	#if MODBUS_DEBUG_PRINT & 8
+		printf ( "\n\rSer Rx:" );
+		for ( i=0; i<ByteCount; i++ ) printf ( " %02X", DataAddress[i] );
+	#endif
+   	ByteCount -= 2;						// adjust for CRC
+
+	#ifndef USE_MODBUS_CRC
+		CalcCRC = getcrc ( DataAddress, ByteCount, 0xFFFF );
+		RxCRC = DataAddress[ByteCount] & 0x00FF; // LSByte
+   	i = DataAddress[ByteCount+1]<<8;	// MSByte
+	#else
+		CalcCRC = MODBUS_CRC(DataAddress, ByteCount);
+		RxCRC = DataAddress[ByteCount+1] & 0x00FF; // LSByte
+   	i = DataAddress[ByteCount]<<8;	// MSByte
+	#endif
+   	RxCRC = RxCRC | ( i & 0xFF00 );	// merge bytes
+
+	#if MODBUS_DEBUG_PRINT & 4
+   	reg = DataAddress[2];
+      reg = (reg<<8) + (int)DataAddress[3];
+		p1 = DataAddress[4];
+      p1 = (p1<<8) + (int)DataAddress[5];
+		printf ( "\n\rSer Rx: Addr=%02d Function=%02X Reg=%05d P1=0x%04X  Calc CRC=%04X\n\r",
+      	DataAddress[0], DataAddress[1], reg, p1, CalcCRC );
+	#endif
+
+	   if ( CalcCRC != RxCRC )
+		{
+			ByteCount = MB_CRC_ERROR;
+		}
+   }
+   return ByteCount;
+} // MODBUS_Serial_Rx
+
+/*** BeginHeader */
+#endif	// __Modbus_Slave_BL4S1xx
+/*** EndHeader */
+

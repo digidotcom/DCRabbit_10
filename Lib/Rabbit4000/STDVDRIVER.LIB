@@ -1,0 +1,641 @@
+ /***********************************************************
+  *
+  *   Syntax:    Standard VDriver Library (no RabbitSys)
+  *   Created:   09/15/2004 11:22AM
+  *
+  ************************************************************/
+
+/*** BeginHeader */
+#ifndef __STDVDRIVER_LIB
+#define __STDVDRIVER_LIB
+/*** EndHeader */
+
+/*** BeginHeader secwd_isr */
+void secwd_isr(void);
+/*** EndHeader */
+
+#asm __nodebug __root
+;
+; secwd_isr
+;
+; Handles a secondary watchdog interrupt if the periodic interrupt fails to
+; hit the secondary watchdog timer.  This ISR disables the secondary watchdog,
+; reloads the secondary watchdog timeout register, re-enables interrupts, sets
+; the interrupt priority level to 0, and causes an ERR_SECONDARYWDTO exception.
+; The interrupt priority level is set to 0, rather than doing an ipres to ensure
+; proper behavior with the debug kernel.  In the case of a program running
+; stand-alone, the run-time exception will result in a primary watchdog timeout.
+;
+
+secwd_isr::
+		ld		a, 0x5A				; disable secondary watchdog
+ioi	ld		(SWDTR), a
+		ld		a, 0x52
+ioi	ld		(SWDTR), a
+		ld		a, 0x44
+ioi	ld		(SWDTR), a
+		ld		a, 0xff				; reload secondary watchdog timer
+ioi	ld		(SWDTR), a
+		ld		hl, _cexpr(-ERR_SECONDARYWDTO)
+		push	hl
+		ipset	0
+		call	exception
+		ld		hl, (sp)
+		call	exit
+#endasm
+
+/*** BeginHeader _enet_activity_counter, _enet_link_status */
+extern char _enet_activity_counter;
+extern char _enet_link_status;
+/*** EndHeader */
+
+char _enet_activity_counter;
+char _enet_link_status;
+
+/*** BeginHeader __MCOS_CNT_VAL, __MCOS_COUNTER */
+extern unsigned __MCOS_CNT_VAL;
+extern unsigned __MCOS_COUNTER;
+/*** EndHeader */
+
+unsigned __MCOS_CNT_VAL;
+unsigned __MCOS_COUNTER;
+
+/*** BeginHeader periodic_init, periodic_isr, MS_TIMER, SEC_TIMER, TICK_TIMER,
+			_clock_adjust */
+
+__xmem void periodic_init(void);
+__root void periodic_isr(void);
+__root void _clock_adjust(int advance);
+
+extern __shared unsigned long MS_TIMER;
+extern __shared unsigned long SEC_TIMER;
+extern __shared unsigned long TICK_TIMER;
+
+// Consistent way of setting timeouts from 1ms through to about 24 days,
+// and 1ms thru 32 seconds using only 16-bit arithmetic (and a macro for
+// evaluation rather than a function call).
+#define _SET_TIMEOUT(x) (MS_TIMER + (x))
+#define _CHK_TIMEOUT(x) chk_timeout(x)
+#define _SET_SHORT_TIMEOUT(x) ((word)MS_TIMER + (x))
+#define _CHK_SHORT_TIMEOUT(x) ((int)((word)MS_TIMER - (x)) >= 0)
+/*** EndHeader */
+
+char __MS_COUNTER;
+char __TICK_COUNTER;
+char _defer_adjust;
+__shared unsigned long MS_TIMER;
+__shared unsigned long SEC_TIMER;
+__shared unsigned long TICK_TIMER;
+
+#asm __xmem __nodebug
+;
+; periodic_init
+;
+; Initializes the TICK_TIMER, MS_TIMER, and SEC_TIMER global
+; counters.  Sets up the periodic interrupt and the associated
+; ISR.
+;
+periodic_init::
+		push	ip
+		ipset	3
+#if defined MCOS
+c	OSRunning = 0;						// mark uC/OS-II as not yet running
+#endif
+		xor	a
+		ld		jkhl, 0
+#if defined _ENABLED_ENET_STATUS
+		;; initialize ethernet activity counter and link status to zero
+		ld		(_enet_activity_counter), a
+		ld		(_enet_link_status), a
+#endif
+#if defined MCOS || defined SLICING
+		;; initialize task switch pending flag, interrupt nesting count to zero
+		ld		(bios_swpend), a
+		ld		(bios_intnesting), a
+#endif
+		;; initialize tick and millisecond timers to zero
+		ld		(__TICK_COUNTER), a
+		ld		(_defer_adjust),a
+		ld		(TICK_TIMER), jkhl
+		ld		(__MS_COUNTER), a
+		ld		(MS_TIMER), jkhl
+c	SEC_TIMER = read_rtc();			// initialize SEC_TIMER to current RTC value
+		;; add the periodic ISR into the internal interrupts vector table
+		ld		a, 0xC3					; jp instruction opcode
+		ld		(INTVEC_BASE+PERIODIC_OFS), a
+		ld		hl, periodic_isr		; interrupt service routine address
+		ld		(INTVEC_BASE+PERIODIC_OFS+1), hl
+		;; enable the periodic interrupt at priority level 1
+		ld		a, (GCSRShadow)
+		and	0xFC
+		or		0x01
+		ld		(GCSRShadow), a
+ioi	ld		(GCSR), a
+#if defined USE_SECONDARY_WD
+		ld		a, 0xFF					; secondary watch dog will cause priority level
+ioi	ld		(SWDTR), a				; 3 interrupt if not hit every 7.8125 ms
+		ld		a, 0x5F					;
+ioi	ld		(WDTCR), a				; now restart the secondary watch dog timer
+#endif
+		pop	ip
+		lret
+#endasm
+
+#asm __nodebug __root
+;
+; periodic_isr
+;
+; The periodic ISR is actually called 2048 times per second, but is split
+; between relatively long running timers update duties vs. relatively quick
+; watchdog and (conditional) Ethernet status update duties. Tasking / Slicing
+; duties are checked at each periodic interrupt.
+;
+; The periodic ISR cannot be called recursively. To decrease latency, interrupts
+; are reenabled towards the beginning of the ISR, but it is necessary for the
+; completion of the ISR to not be delayed past the next periodic interrupt by
+; other interrupts.
+;
+periodic_isr::
+		push	af							; 10  save registers used during this ISR
+		push	ip							; 9
+		push	hl							; 10
+		ld		hl, lxpc					; 2
+		push	hl							; 10
+		push	de							; 10
+		push	ix							; 12
+periodic_isr_ep2::					;     Extra entry point for hooking to this ISR
+ioi	ld		a, (GCSR)				; 11  clear interrupt source
+#if defined MCOS || defined SLICING
+		ld		hl, bios_intnesting	; 5   increase the nesting count
+		inc	(hl)						; 8
+#endif
+		ipres								; 4   reenable interrupts
+		ld		hl, __TICK_COUNTER	; 6
+		inc	(hl)						; 8
+		bit	0, (hl)					; 7   alternate duties on even, odd counts
+		jr		z, .DoTimers			; 5   on even counts, go do timer duties
+
+		; Handle deferred clock adjustment
+		ld		a,(_defer_adjust)
+		add	a,(hl)
+		ld		(hl),a
+		xor	a
+		ld		(_defer_adjust),a
+
+		;; Odd count, so do watchdog+(conditional) Ethernet status output duties.
+		ld		a, 0x7E					; 4   call virtual wd's 16 time per second
+		and	(hl)						; 5    (ignore LSbit, which is always 1)
+		jr		nz, .novwdog			; 5
+
+		lcall	vwdog						; 12
+		ld		hl, __TICK_COUNTER	; 6   reload HL with address of __TICK_COUNTER
+.novwdog:
+#ifdef USE_SECONDARY_WD
+		ld		a, 0x06					; 4   secondary wdog must be hit every 7.8ms
+		and	(hl)						; 5    (ignore LSbit, which is always 1)
+		jr		nz, .no2ndWDogHit		; 5
+
+		ld		a, 0x5F					; 4   restart secondary watchdog
+ioi	ld		(WDTCR), a				; 12
+.no2ndWDogHit:
+#endif
+#if defined _ENABLED_ENET_STATUS
+	#if _ENET_ACT_D == _ENET_LINK_D && ENET_ACTIVITY_MASK == ENET_LINK_MASK
+		;; combined activity+link status (if no activity then display link status)
+		ld		a, 0x3E						; update combined status 32 time per second
+		and	(hl)							;  (ignore LSbit, which is always 1)
+		jr		nz, .enet_skip_status_update
+
+		ld		hl, _enet_activity_counter
+		ld		a, (hl)
+		or		a								; update Z flag (Z set if no activity)
+		ld		a, (_ENET_ACT_DSHADOW)	; does not affect any CPU flags
+		jr		z, .enet_no_activity
+
+		dec	(hl)						; decrement the nonzero activity down-counter
+		xor	_cexpr(ENET_ACTIVITY_MASK)	; toggle the status display on activity
+		jr		.enet_display_combined_status
+
+.enet_no_activity:
+		ld		a, (_enet_link_status)
+		or		a								; update Z flag (Z set if no link)
+		ld		a, (_ENET_LINK_DSHADOW)	; does not affect any CPU flags
+		jr		z, .enet_no_link
+
+		#if defined ENET_LINK_ACTIVEHIGH
+		or		_cexpr(ENET_LINK_MASK)
+		#else
+		and	_cexpr(~ENET_LINK_MASK)
+		#endif
+		jr		.enet_display_combined_status
+
+.enet_no_link:
+		#if defined ENET_LINK_ACTIVEHIGH
+		and	_cexpr(~ENET_LINK_MASK)
+		#else
+		or		_cexpr(ENET_LINK_MASK)
+		#endif
+.enet_display_combined_status:
+		ld		(_ENET_ACT_DSHADOW), a
+ioi	ld		(_ENET_ACT_D), a
+.enet_skip_status_update:
+	#else
+		;; separate activity and link status (updated 1024 times per second)
+		ld		a, (_enet_link_status)
+		or		a								; update Z flag (Z set if no link)
+		ld		a, (_ENET_LINK_DSHADOW)	; does not affect any CPU flags
+		jr		z, .enet_no_link
+
+		#if defined ENET_LINK_ACTIVEHIGH
+		or		_cexpr(ENET_LINK_MASK)
+		#else
+		and	_cexpr(~ENET_LINK_MASK)
+		#endif
+		jr		.enet_display_link_status
+
+.enet_no_link:
+		#if defined ENET_LINK_ACTIVEHIGH
+		and	_cexpr(~ENET_LINK_MASK)
+		#else
+		or		_cexpr(ENET_LINK_MASK)
+		#endif
+.enet_display_link_status:
+		ld		(_ENET_LINK_DSHADOW), a
+ioi	ld		(_ENET_LINK_D), a
+		ld		hl, _enet_activity_counter
+		ld		a, (hl)
+		or		a								; update Z flag (Z set if no activity)
+		ld		a, (_ENET_ACT_DSHADOW)	; does not affect any CPU flags
+		jr		z, .enet_no_activity
+
+		dec	(hl)						; decrement the nonzero activity down-counter
+		#if defined ENET_ACTIVITY_ACTIVEHIGH
+		or		_cexpr(ENET_ACTIVITY_MASK)
+		#else
+		and	_cexpr(~ENET_ACTIVITY_MASK)
+		#endif
+		jr		.enet_display_activity_status
+
+.enet_no_activity:
+		#if defined ENET_ACTIVITY_ACTIVEHIGH
+		and	_cexpr(~ENET_ACTIVITY_MASK)
+		#else
+		or		_cexpr(ENET_ACTIVITY_MASK)
+		#endif
+.enet_display_activity_status:
+		ld		(_ENET_ACT_DSHADOW), a
+ioi	ld		(_ENET_ACT_D), a
+	#endif
+#endif
+		jr		.CheckAllTicksTasks	; 5   wdog, etc. duties done, go check tasks
+
+.DoTimers:
+		; Handle deferred clock adjustment
+		ld		a,(_defer_adjust)
+		add	a,(hl)
+		ld		(hl),a
+		xor	a
+		ld		(_defer_adjust),a
+
+		;; Do periodic timers: ~79 average cycles.
+		;;                     279 worst case (assumes TICK_TIMER, MS_TIMER and
+		;;                     SEC_TIMER all roll over on the same interrupt).
+		ld		hl, TICK_TIMER			; 6   this runs every 1/1024th s.
+		inc	(hl)						; 8
+		jr		nz, .DoneTICK			; 5
+
+		inc	hl							; 2   this runs every 1/4 s.
+		inc	(hl)						; 8
+		ld		a, (hl)					; 5
+		ld		d, a						; 2   save 1/4 s. counter in D
+		and	3							; 4   test for 1 second boundary
+		jr		nz, .DoneTICK			; 5
+
+		ld		hl, SEC_TIMER			; 6
+		inc	(hl)						; 8   this runs ~ every 1 s.
+		jr		nz, .DoneSec			; 5
+
+		inc	hl							; 2
+		inc	(hl)						; 8   this runs ~ every 256 s.
+		jr		nz, .DoneSec			; 5
+
+		inc	hl							; 2
+		inc	(hl)						; 8   this runs ~ every 65536 s.
+		jr		nz, .DoneSec			; 5
+
+		inc	hl							; 2
+		inc	(hl)						; 8   this runs ~ every 16777216 s.
+.DoneSec:
+		xor	a							; 2
+		or		d							; 2   look at previously saved count
+		jr		nz, .DoneTICK			; 5
+
+		ld		hl, TICK_TIMER+2		; 6   this runs every 64 s.
+		inc	(hl)						; 8
+		jr		nz, .DoneTICK			; 5
+
+		inc	hl							; 2   this runs every 16384 s.
+		inc	(hl)						; 8
+.DoneTICK:
+		ld		a, (__MS_COUNTER)		; 9   this runs every 1/1024th s.
+		add	a, 250					; 4
+		ld		(__MS_COUNTER), a		; 10
+		jr		nc, .DoneTimers		; 5   skip 6 times per 256 entries because
+											;     (250 / 256) * 1024 = 1000
+		ld		hl, MS_TIMER			; 6   this runs 1000 time per s.
+		inc	(hl)						; 8
+		jr		nz, .DoneTimers		; 5
+
+		inc	hl							; 2   this runs ~ every 32/125 s.
+		inc	(hl)						; 8
+		jr		nz, .DoneTimers		; 5
+
+		inc	hl							; 2   this runs ~ every 8192/125 s.
+		inc	(hl)						; 8
+		jr		nz, .DoneTimers		; 5
+
+		inc	hl							; 2   this runs ~ every 2097152/125 s.
+		inc	(hl)						; 8
+.DoneTimers:
+#ifdef SLICING
+		;; slice task scheduling is checked at even-numbered periodic timer ticks
+		;;  (i.e. 1024 times per second)
+		call	__slice_tick			; 71 / 21 (active / inactive) schedule slicing
+#endif
+.CheckAllTicksTasks:
+#ifdef MCOS
+		;; uC/OS-II task scheduling is checked at every periodic timer tick
+		;;  (i.e. 2048 times per second)
+		ld		a, (OSRunning)			; 9   has MCOS started multitasking yet?
+		or		a							; 2
+		jr		z, .pisr_ncall			; 5
+
+		ld		hl, __MCOS_COUNTER	; 6   MCOS scheduling performed 2^4 / 2^11,
+											;     or 128 times per second (default)
+		dec	(hl)						; 8
+		jr		nz, .pisr_ncall		; 5
+
+		call	OSTimeTick				; 162 + OSTimeTickHook + num of tasks
+                                 ; (+ 210 worst or + 57 best)
+		call	OSIntExit				; 67 / 332 Best / Worst
+		ld		hl, (__MCOS_CNT_VAL)	;     user defined count down value
+		ld		(__MCOS_COUNTER), hl	;     reset __MCOS_COUNTER
+.pisr_ncall:
+#endif
+#if defined MCOS || defined SLICING
+		;; task-switching is checked at every periodic timer tick
+		;;  (i.e. 2048 times per second)
+		ipset	1
+		ld		hl, bios_intnesting
+		dec	(hl)
+		jr		nz, .pisr_done
+
+		ld		a,(bios_swpend)
+		or		a
+		jr		z,.pisr_done
+
+		ex		jk, hl
+		push	hl
+		push	bc
+		push	pw
+		push	px
+		push	py
+		push	pz
+		ex		af, af'
+		push	af
+		exx
+		exp
+		push	jkhl
+		push	bcde
+		push	iy
+		push	pw
+		push	px
+		push	py
+		push	pz
+		lcall	bios_intexit
+		pop	pz
+		pop	py
+		pop	px
+		pop	pw
+		pop	iy
+		pop	bcde
+		pop	jkhl
+		exp
+		exx
+		pop	af
+		ex		af, af'
+		pop	pz
+		pop	py
+		pop	px
+		pop	pw
+		pop	bc
+		pop	hl
+		ex		jk, hl
+.pisr_done:
+#endif
+		pop	ix							; 9
+		pop	de							; 7
+		pop	hl							; 7
+		ld		lxpc, hl					; 2
+		pop	hl							; 7
+		pop	ip							; 7
+		pop	af							; 7
+		ipres								; 4
+		ret								; 8
+
+
+; Adjust clock counters (MS_TIMER, SEC_TIMER, TICK_TIMER) forward or
+; back by 1/2048 sec, maintaining consistency.
+; On entry: HL = 0 to retard clock, 1 to advance it
+;
+; Since the 32kHz crystal should be within 100ppm of true time, and each
+; adjustment via this function will average 1/2048 sec, worst case adjustment
+; would require calling this function at most once per 4 seconds.
+;
+; This works by adjusting the bit which determines whether the periodic
+; ISR does its timer updates, or the "alternative" work.  Normally,
+; they alternate every 1/2048 sec, however forcing the relevant divider
+; bit will make the timer run on two successive interrupts (thus advancing)
+; or make the alternative processing run twice (thus retarding).  It is
+; a 50% probability because the bit might already be in the adjusted state.
+; In that case, the adjustment has to be deferred.
+;
+; So that the application can detect a "miss", returned HL is set to 0 if
+; the adjustment was deferred, else 1 if the advance/retard was successfully
+; scheduled for the next periodic interrupt.  Either case will perform the
+; desired adjustment; the deferred adjustment simply takes 1/2ms longer
+; to come into effect.
+;
+; This routine is currently used by nmea_pps_handler() in order to keep
+; the Rabbit clocks locked on to a pulse-per-second signal from a GPS
+; receiver.
+_clock_adjust::
+	bool	hl
+	ld		hl,__TICK_COUNTER
+	jr		z,.retard_clock
+	bit	0,(hl)
+	set	0,(hl)
+	flag	z,hl
+	ret	nz
+	ld		a,1
+	ld		(_defer_adjust),a
+	ret
+.retard_clock:
+	bit	0,(hl)
+	res	0,(hl)
+	flag	nz,hl
+	ret	nz
+	ld		a,1
+	ld		(_defer_adjust),a
+	ret
+
+#endasm
+
+
+
+/*** BeginHeader bios_intexit, bios_intnesting, bios_swpend */
+__xmem void bios_intexit(void);
+
+extern char bios_intnesting;
+extern char bios_swpend;
+/*** EndHeader */
+
+char bios_intnesting;
+char bios_swpend;
+
+#asm __nodebug __xmem
+;
+; bios_intexit
+; change the stack to the next task
+;
+; worst case 91, not including restoring registers
+;
+bios_intexit::
+#ifdef SLICING
+		ld		ix, (FSP)							; 13
+		clr	hl										; 2
+		add	hl, sp								; 2
+		ld		(ix+[SliceData]+my_sp), hl		; 11
+		ld		hl, (ix+[SliceData]+save_sp)	; 9
+		ld		sp, hl								; 2
+		clr	hl										; 2
+		ld		(FSP), hl							; 13
+#endif
+#ifdef MCOS
+		ld		ix, (OSTCBCur)						; OSTCBCur->OSTCBStkPtr=sp
+		clr	hl
+		add	hl, sp
+		ld		(ix+os_tcb+OSTCBStkPtr), hl
+		call	OSTaskSwHook
+		ld		a, (OSPrioHighRdy)				; OSPrioCur = OSPrioHighRdy
+		ld		(OSPrioCur), a
+		ld		ix, (OSTCBHighRdy)				; OSTCBCur = OSTCBHighRdy
+		ld		(OSTCBCur), ix
+		ld		hl, (ix+os_tcb+OSTCBStkSeg)	; Get STACKSEG of task to resume
+		ex		de, hl
+		ld		hl, (ix+os_tcb+OSTCBStkPtr)
+		ld		sp, hl								; ptr = OSTCBHighRdy->OSTCBStkPtr
+ioi	ld		(STACKSEGL), de					; set stack segment while privileged
+#endif
+		xor	a										; 4
+		ld		(bios_swpend), a					; 10  clear task-switch pending flag
+		ld		(bios_intnesting), a				; 10  clear nesting counter
+		lret											; 13  restore new/old context
+#endasm
+
+
+/*** BeginHeader chk_timeout */
+int chk_timeout(unsigned long timeout);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION *********************************************
+chk_timeout                   <STDVDRIVER.LIB>
+
+SYNTAX:
+   int chk_timeout(unsigned long timeout);
+
+DESCRIPTION:
+   Check a previously set (+0/-1 millisecond precision) time-out for
+   expiry. The following example code snippet sets a ten second time-out
+   and then busy-waits until the time-out has expired:
+
+   unsigned long my_timeout;
+
+   my_timeout = set_timeout(10U);
+   while (!chk_timeout(my_timeout))
+   {
+      ;  // may do something here while busy-waiting for time-out expiry
+   }
+
+PARAMETER1:
+   The time-out value to be checked for expiry. Normally, the time-out
+   value is the result of a previous set_timeout() function call.
+
+RETURN VALUE:
+   0 if the time-out has not expired.
+   1 if the time-out has expired.
+
+SEE ALSO:
+   set_timeout
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int chk_timeout(unsigned long timeout)
+{
+#asm
+		; do the subtraction, but only need MSB of result.
+		ld		jkhl, (MS_TIMER)		; atomic get
+		sub	jkhl, bcde				; jkhl = MS_TIMER - timeout
+		rl		1, jkhl
+		ccf
+		sbc	hl, hl					; HL will be zero iff timeout > MS_TIMER
+		bool	hl							; i.e. not yet timed out
+#endasm
+	//return ((long)(MS_TIMER-timeout))>=0;
+}
+
+
+/*** BeginHeader set_timeout */
+unsigned long set_timeout(unsigned seconds);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION *********************************************
+set_timeout                   <STDVDRIVER.LIB>
+
+SYNTAX:
+   unsigned long set_timeout(unsigned seconds);
+
+DESCRIPTION:
+   Set a (+0/-1 millisecond precision) time-out period, specified in units
+   of one second. The following example code snippet sets a ten second
+   time-out and then busy-waits until the time-out has expired:
+
+   unsigned long my_timeout;
+
+   my_timeout = set_timeout(10U);
+   while (!chk_timeout(my_timeout))
+   {
+      ;  // may do something here while busy-waiting for time-out expiry
+   }
+
+PARAMETER1:
+   The desired time-out period, specified in units of one second.
+
+RETURN VALUE:
+   The milliseconds time-out expiry value, relative to the current system
+   milliseconds timer count.
+
+SEE ALSO:
+   chk_timeout
+END DESCRIPTION **********************************************************/
+
+__nodebug
+unsigned long set_timeout(unsigned seconds)
+{
+	return _SET_TIMEOUT(seconds * 1000L);
+}
+
+
+/*** BeginHeader */
+#endif	// __STDVDRIVER_LIB
+/*** EndHeader */

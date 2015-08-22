@@ -1,0 +1,610 @@
+/* START LIBRARY DESCRIPTION ***************************************************
+
+Copyright June 2008, Digi International
+
+Modbus_slave_tcp.LIB                  Ver 1.00
+
+		Copyright (c) 2005 	RabbitSemiconductor, Inc
+		Copyright (c) 2002 	IAS, Inc.
+		Copyright (c) 2000 	Z-World, Inc.
+		Copyright (c) 1997  	CFControls.
+
+DESCRIPTION:	Dynamic C MODBus TCP Slave.
+
+      Release History.
+================================================================================
+Date	  	Ver		History
+Nov 2005	1.00		Initial Port from IAS Inc.
+================================================================================
+
+This library allows connections to a Modbus TCP Network.
+
+This is a MODBUS slave device therefore it is a TCP/IP Server listening for
+requests from a MODBUS master which is a TCP/IP client.
+
+The IP address for this device must be located in tcp_config.lib.  See the
+tcp/ip User's manual for more information on setting up tcp_config.lib.
+
+================================================================================
+
+There are three modes of using this library:
+(1) This device is the target of the ModBus commands
+(2) This device is a gateway to "downstream" devices
+(3) This device is both a target and a gateway
+
+The following lists the libraries required for each of the modes:
+(1,3) Modbus_Slave_TCP.Lib,  Modbus_Slave.Lib, Modbus_Slave_(Target).Lib
+(2) Modbus_Slave_TCP.Lib
+
+For modes 2 and 3 the "downstream" device(s) will require the following:
+Modbus_Slave.Lib and Modbus_Slave_(Target).Lib
+
+================================================================================
+
+The library Modbus_Slave_(Target).Lib is specific for the target device and must
+contain the following functions:
+
+mbsStart		pre-packet processing - usually an empty function
+mbsDone		post-packet processing - usually an empty function
+
+			Single Bit functions
+mbsDigOutRd	return the state of a single output [0x01]
+mbsDigIn		return the state of a single input [0x02]
+mbsDigOut	set the state of a single output [0x05]
+
+			Byte/Word functions
+mbsRegOutRd	return the value of a holding register [0x03]
+mbsRegIn		return the value of an input register [0x04]
+mbsRegOut	set the state of a holding register [0x06]
+
+See ModBus_Slave.Lib for details on usesr function requirements.
+================================================================================
+
+The following defines must be made in the user program:
+#define	INACTIVE_PERIOD		5		// period of inactivity, in seconds, before
+												// sending a keepalive, or 0 to turn off
+                                    // keepalives.
+#define	KEEPALIVE_WAITTIME  	3		// number of seconds to wait between
+			  						  			//	keepalives, after the 1st keepalive
+                                    // was sent
+#define	KEEPALIVE_NUMRETRYS	3		// number of retrys
+
+#define MB_MAX_SKT	1					// Maximum number of socket connections
+
+#define MODBUS_GATEWAY 					// define ONLY if this device is a gateway
+
+#define TCPCONFIG 1						// use the "normal" TCP/IP configuration
+
+The following libraries must be #use'd in this order:
+#use dcrtcp.lib
+#use Modbus_Slave.lib
+#use Modbus_Slave_TCP.lib
+// The following will change based on your specific target device but will
+// not be necessary if this device is only a gateway.
+#use Modbus_slave_BL26xx.lib
+
+See the Function Description for MODBUS_TCP_Init for more information.
+
+END DESCRIPTION ***************************************************************/
+
+/*** BeginHeader */
+#ifndef __MBSLAVE_TCP
+#define __MBSLAVE_TCP
+
+// Handler states
+#define CONNECTION_INIT					0
+#define CONNECTION_IDLE					1
+#define CONNECTION_NEW_REQUEST		2
+#define CONNECTION_AWAIT_PKT			3
+#define CONNECTION_AWAIT_RESPONSE	4
+
+#ifndef MB_MAX_SKT
+#define MB_MAX_SKT	1					// Maximum number of socket connections
+#endif
+
+#ifndef INACTIVE_PERIOD             // period of inactivity, in seconds, before
+#define	INACTIVE_PERIOD		5     // sending a keepalive, or 0 to turn off
+#endif                              // keepalives.
+
+
+#ifndef KEEPALIVE_WAITTIME          // number of seconds to wait between
+#define	KEEPALIVE_WAITTIME  	3     // keepalives, after the 1st keepalive was
+#endif                              // sent
+
+#ifndef KEEPALIVE_NUMRETRYS
+#define	KEEPALIVE_NUMRETRYS	3		// number of retrys
+#endif
+
+/*** EndHeader */
+
+
+/*** BeginHeader MODBUS_TCP_Init */
+
+#ifndef MODBUS_DEBUG
+#define MODBUS_DEBUG __nodebug
+#endif
+
+#ifndef MODBUS_DEBUG_PRINT					// see MODBUS_TCP_Init for details
+#define MODBUS_DEBUG_PRINT 0
+#endif
+
+typedef struct
+{
+	int state; 									// current handler state
+	int pkt_length;   						// pkt length
+	unsigned int pkt_bytes;					// bytes in current packet
+	tcp_Socket socket;  						// socket
+   unsigned mbPort;    						// TCP Port
+	char buffer[256];   						// command buffer
+}  _mbs_state;
+
+void MODBUS_TCP_Init	( unsigned	wAddr, unsigned wPort );
+void MODBUS_TCP_tick	( void );
+void mbs_Handler	( void );
+void mbsPkt			( void );
+
+/*
+ *		mbs_state contains all of the information necessary
+ *		to manage the connection.  The state is one of the above
+ *		connection states.  The offset and length are used to
+ *		send the response.  The socket structure is used internally by DCRTCP
+ *		to manage the state and buffers.  The buffer is used to
+ *		temporarily hold the MODBUS TCP request packet.
+ *
+ */
+
+_mbs_state mbs_state[MB_MAX_SKT];
+int socket_index;								// current socket index
+int wMSAddr;
+/*** EndHeader */
+
+
+/*=======================================================================*\
+	Initialize MODBus TCP Driver
+\*=======================================================================*/
+
+/* START FUNCTION DESCRIPTION *****************************************
+MODBUS_TCP_Init					<Modbus_slave_tcp.LIB>
+
+NOTE: Modbus_slave_tcp.LIB functions are generally not reentrant.
+
+This function must be called ONE time only. It initializes the MODBUS TCP
+system.  It does NOT initialize the TCP/IP connection.
+
+The function MODBUS_TCP_tick must be called repeatedly, usually within a loop,
+by the program in order to ensure that the TCP/IP command packets get
+serviced properly.
+
+SYNTAX: void MODBUS_TCP_Init ( unsigned wAddr, unsigned wPort )
+
+PARAMETER1:	unsigned wAddr = the MODBUS slave address
+
+PARAMETER2:	unsigned wPort = Modbus TCP port number
+			The standard MODBUS port is 502
+
+RETURN VALUE: None.
+
+Macros:
+#define	INACTIVE_PERIOD		5		// period of inactivity, in seconds, before
+												// sending a keepalive, or 0 to turn off
+                                    // keepalives.
+#define	KEEPALIVE_WAITTIME  	3		// number of seconds to wait between
+												// keepalives, after the 1st keepalive was
+                                    // sent
+#define	KEEPALIVE_NUMRETRYS	3		// number of retrys
+#define	MB_MAX_SKT	1					// Maximum number of socket connections
+#define	MODBUS_GATEWAY					// define ONLY if this device is a gateway
+#define	TCPCONFIG 0						// use the TCP/IP configuration macros
+#define USE_ETHERNET		1				//		so that the application can define the
+#define IFCONFIG_ETH0 \					//		appropriate IP addresses
+		IFS_IPADDR,aton("10.10.6.101"), \
+		IFS_NETMASK,aton("255.255.255.0"), \
+		IFS_UP
+
+
+MODBUS_DEBUG			nodebug (default) = disallows library debugging
+							debug = allows you to debug the library
+
+MODBUS_DEBUG_PRINT	0 (default) = no printing of messages
+							bit 0 = 1 = state machine transitions
+                     bit 1 = 1 =
+                     bit 2 = 1 = TCP packets
+                     bit 3 = 1 = Serial packets
+
+The library MODBUS_Slave supports the following commands:
+		0x01	Read Coil Status						 1 bit
+      0x02	Read Input Status						 1 bit
+      0x03	Read Holding Registers				16 bits
+      0x04	Read Input Registers			  		16 bits
+      0x05	Write Single Coil						 1 bit
+      0x06	Write Single Register				16 bits
+		0x0F	Write Multiple Coils					 1 bit
+      0x10	Write Multiple Registers			16 bits
+      0x16	Mask Write Register					16 bits
+      0x17	Read/Write Multiple Registers		16 bits
+
+      For 16 bit ( 2 byte ) data, the MSByte is first ( Big Endian ).
+
+The Following functions must be defined in the board specific library
+Modbus_Slave_xxxx.Lib, whether or not they are actually used.
+See Modbus_Slave_BL26xx.lib for an example.
+
+mbsStart			Function is called whenever a packet is received.
+mbsDone			Function is called whenever a packet is finished.
+mbsDigOutRd	( CoilNbr, *nState )		command 0x01 = Read Coil Status
+mbsDigIn		( InputNbr, *nState ) 	command 0x02 =	Read Input Status
+mbsRegOutRd	( RegNbr, *wData ) 		command 0x03 =	Read Holding Registers
+mbsRegIn		( RegNbr, *wData )		command 0x04 =	Read Input Registers
+mbsDigOut	( wCoil, wData )	  		command 0x05 = Write Single Coil
+mbsRegOut	( wAddr, wData )	  		command 0x06 =	Write Single Register
+
+command 0x0F =	Write Multiple Coils uses mbsDigOut
+command 0x10 =	Write Multiple Registers uses mbsRegOut
+command 0x16 =	Mask Write Register uses mbsRegOutRd  and mbsRegOut
+command 0x17 =	Read/Write Multiple Registers uses mbsRegOut and mbsRegIn
+
+Return values for each of the above functions:
+	MB_SUCCESS		0			// success
+	MB_BADFUNC		0x01		//	Illegal Function
+	MB_BADADDR		0x02		//	Illegal Data Address
+	MB_BADDATA		0x03		//	Illegal Data Value
+	MB_BUSY			0x06		//	Target is busy with another request
+	MB_NORESP		0x0B		//	No response from target
+
+See also: MODBUS_TCP_tick
+
+END DESCRIPTION ******************************************************/
+
+MODBUS_DEBUG
+void  MODBUS_TCP_Init (	unsigned	wAddr, unsigned wPort )
+{
+	for ( socket_index=0; socket_index < MB_MAX_SKT; socket_index++ ){
+   		// initialize tcp socket handler states
+      mbs_state[socket_index].mbPort = wPort; // TCP Port to use
+		mbs_state[socket_index].state = CONNECTION_INIT; // state variable
+   }
+	wMSAddr = wAddr;							// save the MODBUS address
+	socket_index = 0;							// init index into socket list
+
+#ifdef MODBUS_GATEWAY
+	MODBUS_Serial_Init ();					// for "downstream" devices
+#endif
+
+} // MODBUS_TCP_Init
+
+
+/* START FUNCTION DESCRIPTION *****************************************
+MODBUS_TCP_tick			<Modbus_slave_tcp.LIB>
+
+NOTE: Modbus_slave_tcp.LIB functions are generally not reentrant.
+
+DESCRIPTION: Process MODBus TCP state handler
+		This function must be called repeatedly, usually within a loop,
+		by the program in order to ensure that the TCP/IP command packets
+      get serviced properly.  It causes tcp_tick to execute.
+      This function will service one socket each time it is called.
+
+SYNTAX: void MODBUS_TCP_tick ( void );
+
+see also: MODBUS_TCP_Init
+
+There are several printing options available for debugging by defining
+the macro MODBUS_DEBUG_PRINT.  See details in MODBUS_TCP_Init
+
+END DESCRIPTION **********************************************************/
+
+MODBUS_DEBUG
+void MODBUS_TCP_tick ( void )
+{	//    MODBUS_TCP_tick => mbs_Handler => mbsPkt => msExec
+
+	mbs_Handler ( );		// try TCP connection
+	if( ++socket_index > (MB_MAX_SKT-1)) // no more open sockets
+   {
+   	socket_index = 0;
+   }
+
+} // MODBUS_TCP_tick
+
+
+/*=======================================================================*\
+	mbs_Handler: MODBus TCP state machine handler
+   MODBUS_TCP_tick => mbs_Handler => mbsPkt => msExec
+\*=======================================================================*/
+
+/*
+ *		This is the state machine that manages
+ *		the MODBUS TCP connections.
+ *
+ *		The INIT state sets a socket up for listening.
+ *		The IDLE state checks for a connection and sets
+ *			up the data structures for an open socket.
+ *		The NEW_REQUEST state handles incomming packet format
+ *			checking and packet parsing
+ *		The AWAIT_PKT state waits for balance of MODBUS TCP request packet
+ *		The AWAIT_RESPONSE state handles sending of MODBUS TCP responses
+ *		The CLOSE state waits for the socket to be
+ *			available again.
+ *
+ */
+
+MODBUS_DEBUG
+void mbs_Handler( void )
+{
+	auto tcp_Socket* socket;
+	auto int bytes_read;						// bytes read of current packet
+   auto int i,j;
+   auto int socket_state;
+
+
+	socket = &mbs_state[socket_index].socket;
+   socket_state = mbs_state[socket_index].state;
+
+   // check if the client closed the connection or keepalives expired & aborted
+   if ( socket_state != CONNECTION_INIT  &&  tcp_tick (socket) == 0 )
+	{
+		socket_state = CONNECTION_INIT;	// re-initialize the connection
+	}
+
+   switch ( socket_state )
+	{
+		case CONNECTION_INIT:	// Listen for a connection
+			tcp_listen ( socket, mbs_state[socket_index].mbPort, 0, 0, NULL, 0 );
+         tcp_keepalive ( socket, INACTIVE_PERIOD ); // enable keepalives.
+         socket_state = CONNECTION_IDLE;
+				#if MODBUS_DEBUG_PRINT & 1
+				printf ( "  CONNECTION_INIT complete\n\r" );
+				#endif
+			break;
+
+		case CONNECTION_IDLE: 	// wait for connection
+      	i = sock_established(socket);
+         j = sock_bytesready(socket);
+			if ( i || (j>=0) )
+			{
+          	socket_state = CONNECTION_NEW_REQUEST;
+					#if MODBUS_DEBUG_PRINT & 1
+					printf ( "  CONNECTION_IDLE complete\n\r" );
+					#endif
+         }
+			break;
+
+		case CONNECTION_NEW_REQUEST: 		// process MODBUS TCP request.
+         if  ( sock_bytesready(socket) != -1 )
+			{
+         	bytes_read = sock_preread(socket,mbs_state[socket_index].buffer,6);
+				if ( bytes_read == 6 )
+            {
+            	mbs_state[socket_index].pkt_bytes =
+               				mbs_state[socket_index].buffer[5] + 6;
+					socket_state = CONNECTION_AWAIT_PKT;
+						#if MODBUS_DEBUG_PRINT & 1
+						printf ( "\n\r  CONNECTION_NEW_REQUEST complete\n\r" );
+						#endif
+				}
+			}
+			break;
+
+		case CONNECTION_AWAIT_PKT: 		// wait for balance of packet.
+			bytes_read = sock_preread ( socket, mbs_state[socket_index].buffer,
+         										mbs_state[socket_index].pkt_bytes );
+			if ( bytes_read == mbs_state[socket_index].pkt_bytes )
+         {										 // if new packet read successfully
+         	bytes_read = sock_fastread ( socket, mbs_state[socket_index].buffer,
+            										mbs_state[socket_index].pkt_bytes );
+				mbs_state[socket_index].pkt_length =
+            										mbs_state[socket_index].pkt_bytes;
+					#if MODBUS_DEBUG_PRINT & 4
+					printf ( "TCP Rx:" );
+					for ( i=0; i<bytes_read; i++ )
+               {
+						printf ( " %02X", mbs_state[socket_index].buffer[i] );
+               }
+      	     	printf ( "\n\r" );
+					#endif
+            mbsPkt ( );		// handle the packet <<<<<<<<<<<
+				socket_state = CONNECTION_AWAIT_RESPONSE;
+					#if MODBUS_DEBUG_PRINT & 1
+					printf ( "  CONNECTION_AWAIT_PKT complete\n\r" );
+					#endif
+			}
+         else if ( bytes_read > mbs_state[socket_index].pkt_bytes )
+         {
+         	#if MODBUS_DEBUG_PRINT & 4
+				printf ( "bytes_read:%d > mbs_state[socket_index].pkt_bytes:%d\n\r",
+            						bytes_read, mbs_state[socket_index].pkt_bytes );
+				#endif
+         }
+			break;
+
+		case CONNECTION_AWAIT_RESPONSE:	// ** NOT really true here we are
+      											//			sending a response
+         #if MODBUS_DEBUG_PRINT & 4
+			printf ( "TCP Tx:" );
+			for ( i=0; i<mbs_state[socket_index].pkt_length; i++ )
+         {
+				printf ( " %02X", mbs_state[socket_index].buffer[i] );
+         }
+         printf ( "\n\r" );
+			#endif
+         sock_flushnext(socket);
+         if ( sock_fastwrite(socket, mbs_state[socket_index].buffer,
+         									mbs_state[socket_index].pkt_length) > 0 )
+	      {  // data was sent
+            sock_flush(socket);
+				socket_state = CONNECTION_NEW_REQUEST;
+					#if MODBUS_DEBUG_PRINT & 1
+					printf ( "  CONNECTION_AWAIT_RESPONSE complete\n\r" );
+					#endif
+			}
+         else	// connection error, usually means tx socket buffer is full
+         {     //  because client is not responding
+            #if MODBUS_DEBUG_PRINT & 4
+				printf ( " nak\n\r" );
+				#endif
+         }
+         break;
+
+		default:
+         socket_state = CONNECTION_INIT;
+			break;
+	}
+	mbs_state[socket_index].state = socket_state;
+} // mbs_Handler
+
+
+/*=======================================================================*\
+	mbsPkt: Process MODBus TCP Packet
+   MODBUS_TCP_tick => mbs_Handler => mbsPkt => msExec
+
+Enter with the TCP/IP packet in the socket buffer
+		<pointer to socket structure>->buffer
+
+Execute the command
+The TCP/IP packet contents:
+	MBAP Header, [Function Code, Data]
+   If the message is for a "downstream" device this program must insert
+   a CRC as the last two bytes.
+   maximum total packet length is 256 bytes
+
+MBAP Header ( MODBUS Application Protocol Header ) is 7 bytes:
+	0,1 = Transaction Identifier
+   			Used for transaction pairing, returned by target so host knows
+            which transaction is being responded to.
+   2,3 = Protocol Identifier = 0 for MODBUS
+   4,5 = Length: number of following bytes - starting with Unit Identifier
+   6   = Unit Identifier: remote slave identification
+   			Used when the message is for another target.
+            If value = 0xFF or wMSAddr then message is for this unit,
+            if value = 0 then message is broadcast and is NOT supported,
+            otherwise, message is for 'downstream" device
+
+Contents of acMSCmd:
+offset	desc
+ 0			Unit Identifier:
+ 				0xFF or wMSAddr = this unit,  0 = broadcast,
+            	else = downstream unit address
+ 1			function code
+2,3		initial register address
+4,5		number of registers
+6...		data
+
+\*=======================================================================*/
+
+MODBUS_DEBUG
+void mbsPkt ( void  )
+{	auto int BytesRcvd;
+// create binary command buffer in acMSCmd from packet buffer in state structure
+	memcpy ( acMSCmd, mbs_state[socket_index].buffer+6,
+   												mbs_state[socket_index].pkt_length-6 );
+	if ( !acMSCmd[0] )
+	{
+		return;  // broadcast not supported
+	}
+	if ( acMSCmd[0] == wMSAddr  ||  acMSCmd[0] == 0xFF ) // if for this device
+   {	// parse and act on command packet in acMSCmd
+		msExec();		// in ModBus_Slave.lib
+      // setup response packet in state buffer
+		// copy response to socket buffer - leaving 1st 6 bytes
+		memcpy(mbs_state[socket_index].buffer+6,acMSReply,(pcMSReply-acMSReply));
+		// insert packet byte count - including MBAP prefix
+		mbs_state[socket_index].pkt_length = (pcMSReply-acMSReply)+6;
+		// insert message byte count
+		*(mbs_state[socket_index].buffer+5)= mbs_state[socket_index].pkt_length-6;
+      											// insert msg byte count
+		*(mbs_state[socket_index].buffer+4) = 0;// insure MSByte of bytecount is 0
+	}
+   else			// here if packet is for a "down stream" unit
+	{
+#ifdef MODBUS_GATEWAY
+		BytesRcvd = mbs_SendPkt(acMSReply); // send message to downstream device
+      // setup response packet in state buffer
+		// copy response to socket buffer - leaving 1st 6 bytes
+		memcpy( mbs_state[socket_index].buffer+6, acMSReply, BytesRcvd );
+		// insert packet byte count - including MBAP prefix
+		mbs_state[socket_index].pkt_length = BytesRcvd+6;
+		// insert message byte count
+		*(mbs_state[socket_index].buffer+5)= mbs_state[socket_index].pkt_length-6;
+      											// insert msg byte count
+		*(mbs_state[socket_index].buffer+4) = 0;// insure MSByte of bytecount is 0
+#else
+		_mbsError ();
+#endif
+	}
+} // mbsPkt
+
+
+
+
+/*********************************************************************
+**********************************************************************
+		The following function is for communicating with a
+      "downstream" MODBUS device.
+**********************************************************************
+*********************************************************************/
+
+/*** BeginHeader mbs_SendPkt */
+int mbs_SendPkt ( char *ResponseAddress );
+/*** EndHeader */
+
+/* mbs_SendPkt: Send a packet to a down stream MODBUS device
+
+SYNTAX:			int mbs_SendPkt (char *ResponseAddress)
+					the data to transmit must be in mbs_state[socket_index].buffer
+
+PARAMETER1:		address to put the response message
+
+RETURN VALUE:	number of buytes received = success
+					MB_TIMEOUT = timeout
+               MB_CRC_ERROR = incorrect CRC
+
+If using RS485 for downstream devices the following functions must be in
+the board specific library:
+
+	MODBUS_Serial_Init
+   	Initialize whatever serial port is used
+
+	MODBUS_Serial_Tx ( void *Packet, int ByteCount )
+		This function must enable the RS485 transmitter and transmit
+      the packet using the appropriate serXwrite function.  The function
+      must block until the packet transmission is complete and the response
+      packet has been received.  The current time out value is 50ms.
+
+	MODBUS_Serial_Rx( char *DataAddress )
+   	This function must receive the response from the downstream device.
+
+Packet Format:
+	1 byte	destination device address
+   1 byte	function code
+   n bytes	data
+   2 bytes	CRC (low byte, high byte)
+Everything but the CRC comes from the "upstream" MODBUS master via TCP/IP.
+The CRC is calculated by this device.
+
+*/
+
+int mbs_SendPkt ( char *ResponseAddress )
+{	auto int	ByteCount;
+   auto unsigned long Endtime;
+
+	ByteCount = mbs_state[socket_index].pkt_length-6; // get byte count
+// send the packet using the customer implemented transmit function
+	MODBUS_Serial_Tx ( mbs_state[socket_index].buffer+6, ByteCount );
+
+// get the response
+	Endtime = MS_TIMER+150L;					// allow up to 150msec for response
+	while (  ( (long)(MS_TIMER - Endtime) < 0L )
+      && ( (ByteCount = MODBUS_Serial_Rx(ResponseAddress)) == 0 )  );
+	if ( ByteCount == 0 )
+   {
+   	ByteCount = 2;
+		ResponseAddress[0] = acMSCmd[1] | 0x80; // show error in command byte
+      ResponseAddress[1] = MB_NORESP;
+   }
+   return ByteCount;
+} // mbs_SendPkt
+
+
+/*** BeginHeader */
+#endif	// __MBSLAVE_TCP
+/*** EndHeader */
+

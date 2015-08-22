@@ -1,0 +1,319 @@
+/*** BeginHeader */
+#ifndef __SLICE_LIB
+#define __SLICE_LIB
+/*** EndHeader */
+
+
+/*** Beginheader FSP */
+#define SLICING
+#define PERIODIC_TIMERS
+
+typedef struct
+{
+	int    time_out;
+	void * my_sp;
+	void * save_sp;
+	CoData codata;
+} SliceData;
+
+extern void *FSP, *DBGFSP;	// slice statement context pointer
+/*** Endheader */
+
+#ifdef MCOS
+	#fatal "Slice statements and uC/OS-II cannot be used together"
+#endif
+
+void *FSP, *DBGFSP;	// slice statement context pointer
+
+__nodebug
+void slicefsp_init(void)
+{
+#asm xmemok
+		push	ip
+		ipset	1
+		clr	hl
+		ld		(FSP), hl
+		ld		(DBGFSP), hl
+		pop	ip
+#endasm
+}
+
+#funcchain _GLOBAL_INIT slicefsp_init
+
+/*** Beginheader __slice_tick */
+__root void __slice_tick(void);
+/*** Endheader */
+
+#ifdef MCOS
+	#fatal "Slice statements and uC/OS-II cannot be used together"
+#endif
+#ifdef DCRTCP
+	#fatal "Slice statements and DCRTCP cannot be used together"
+#endif
+
+#asm
+;
+; __slice_tick - this routine forms the basis for scheduling
+; for slice statements. it is called from the periodic interrupt
+; once per tick.
+;
+; When the debugger kernel is running slicing is disabled by the
+; dbg_prolog/epilog in the debugger kernel library.
+;
+; worst case:
+;   slicing inactive:  21
+;   slicing active:    71
+;
+__slice_tick::
+		;; check if slicing is active (FSP is nonzero when slicing is active)
+		ld		hl, (FSP)							; 11
+		test	hl										; 2   is slicing active?
+		ret	z										; 2/8 if not, return immediately
+
+		;; decrement the time_out counter
+		ld		ix, hl								; 4
+		ld		hl, (ix+[SliceData]+time_out)	; 10
+		dec	hl										; 2
+		ld		(ix+[SliceData]+time_out), hl	; 12
+		test	hl										; 2   has time_out hit zero?
+		ret	nz										; 2/8 if not, return immediately
+
+		xor	a										; 4
+		inc	a										; 2
+		ld		(bios_swpend), a					; 10  set the pending task-switch flag
+		ret											; 8
+#endasm
+
+/*** Beginheader __slice_entry, __slice_exit, slice_yield, __slice_yield,
+                 __slice_abort, __slice_waitfor */
+__root void __slice_entry(void);
+__root void __slice_exit(void);
+__root void slice_yield(void);
+__root void __slice_yield(void);
+__root void __slice_abort(void);
+__root void __slice_waitfor(void);
+/*** Endheader */
+
+#ifdef MCOS
+	#fatal "Slice statements and uC/OS-II cannot be used together"
+#endif
+#ifdef DCRTCP
+	#fatal "Slice statements and DCRTCP cannot be used together"
+#endif
+
+#asm __nodebug
+;
+; __slice_entry
+;
+; This routine is called on the way into a slice.  It saves the
+; interrupt register and the frame pointer to the system stack.
+; It initializes the tick counter in the buffer.  On a first
+; time call it initializes the other data structures in the
+; buffer and returns to 4 bytes after the return address
+; that was on the stack.  On a continuation call it does a
+; long return which will restore the registers and continue
+; where the slice statement previously left off.
+;
+;
+; on entry:
+;   hl   = ticks
+;   sp+0 = return address
+;   sp+2 = ticks
+;   sp+4 = buffer size
+;   sp+6 = buffer with SliceData structure at offset 0
+;
+; return:
+;   nothing
+;
+__slice_entry::
+		push	ip
+		push	ix
+		ld		hl, lxpc
+		lcall	__sliceentry2
+		pop	ix
+		pop	ip
+		pop	hl
+		add	sp, 6											; 8 after segment/stacklen added
+		jp		(hl)
+
+__sliceentry2:
+		;; on entry:
+		;;   hl          = new LXPC value
+		;;   sp+6  (0+6) = return address (excluding XPC)
+		;;   sp+8  (2+6) = ticks
+		;;   sp+10 (4+6) = buffer size
+		;;   sp+12 (6+6) = buffer with SliceData structure at offset 0
+		ld		lxpc, hl
+		ld		iy, (sp+12)									; get SliceData pointer
+		ld		hl, (sp+8)									; get slice ticks value
+		ld		(iy+[SliceData]+time_out), hl			; set slice time_out
+		ld		b, (iy+[SliceData]+codata+CSState)
+		bit	_CS_INITB, b								; re-entering a slice?
+		jr		z, __DC_se_2								; if bit reset, go do re-entry
+
+		;; initial entry into slice
+		ld		(iy+[SliceData]+codata+CSState), 0	; reset CoData status bits
+		clr	hl
+		add	hl, sp
+		ld		(iy+[SliceData]+save_sp), hl			; save the current stack pointer
+		ld		hl, iy
+		ex		de, hl										; save the SliceData pointer
+		ld		hl, (sp+10)									; get the buffer size
+		add	hl, de										; calculate my stack pointer
+		ld		iy, (sp+6)									; get return address (no XPC)
+		ld		sp, hl
+		ex		de, hl										; recover the SliceData pointer
+		ld		(FSP), hl									; save it in the global variable
+		ld		hl, iy										; HL get return address
+		inc	hl												; CAUTION! This 4-byte offset to
+		inc	hl												;  the first slice instruction
+		inc	hl												;  is a hard-coded generated
+		inc	hl												;  code size assumption!
+		jp		(hl)											; go to first slice instruction
+
+__DC_se_2:
+		;; re-entry into slice
+		clr	hl
+		add	hl, sp
+		ld		(iy+[SliceData]+save_sp), hl			; save the current stack pointer
+		ld		hl, (iy+[SliceData]+my_sp)				; get the slice's stack pointer
+		ld		sp, hl
+		;; change segment
+		ld		(FSP), iy									; save the SliceData pointer
+		lret
+
+;
+; __slice_exit
+;
+; This routine is called after the last statement in the
+; slice statement has completed.  It disables slicing,
+; restarts the slice statement data structure, switches the
+; stack, and returns to the call of the __slice_enter.
+; routine.  Directly following the __slice_enter call is a
+; jump to the statement which follows the slice statement.
+; execution continues there.
+;
+; on entry:
+;   nothing
+;
+; return:
+;   nothing
+;
+__slice_exit::
+		ld		iy, (FSP)
+		clr	hl
+		ld		(FSP), hl
+		ld		(iy+[SliceData]+codata+CSState), _cexpr(_CS_INIT)
+		ld		hl, (iy+[SliceData]+save_sp)
+		ld		sp, hl
+		lret
+
+;
+; slice_yield(void)
+;
+; This function can be placed in the libraries to
+; indicate that the current task has finished what it
+; can for a while.  It does a forced yield of the
+; current slice statement if one is active.  Otherwise
+; it has no effect.
+;
+; on entry:
+;   nothing
+;
+; return:
+;   nothing
+;
+slice_yield::
+		ld		hl, (FSP)							; make sure slicing is active
+		bool	hl
+		ret	z
+
+;
+; __slice_yield
+;
+; This internal routine is called as a result of
+; a yield statement in a slice statement.  It saves
+; the interrupt mask and the frame pointer on the
+; slice statements stack, saves the current context
+; and returns to just after the __slice_entry call
+; which then jumps the statement directly following
+; the slice statement.
+;
+; on entry:
+;   nothing
+;
+; return:
+;   nothing
+;
+__slice_yield::
+		push	ip
+		push	ix
+		lcall	__slice_yield2
+		pop	ix
+		pop	ip
+		ret
+
+__slice_yield2:
+		xor	a
+		ld		ix, (FSP)
+		clr	hl										; disable slicing ld (FSP),0
+		ld		(FSP), hl
+		add	hl, sp
+		ld		(ix+[SliceData]+my_sp), hl		; save the slice sp to the slice data
+		ld		hl, (ix+[SliceData]+save_sp)	; get the system stack pointer
+		ld		sp, hl								; restore the old stack
+		ipres
+		lret
+
+;
+; __slice_abort
+;
+; This routine is called as a result of an abort
+; statement inside of a slice statement.  It disables
+; slicing, restarts the slice data structure, changes
+; the stack back to the slice statement, and returns
+; to just after the slice statement.
+;
+; on entry:
+;	 hl=slice's CoData
+;
+; return:
+;   nothing
+;
+__slice_abort::
+		ld		iy, hl
+		clr	hl												; stop slicing
+		ld		(FSP), hl
+		ld		(iy), _cexpr(_CS_INIT|_CS_STOPPED)	; set CoData abort status
+		ld		hl, (iy-2)									; HL gets SliceData->save_sp
+		ld		sp, hl
+		lret
+
+;
+; __slice_waitfor
+;
+; This routine is called when a slice statement needs to
+; yield as a result of a waitfor(...) statement.  It updates
+; the next address in the CoData and rearranges the return
+; value to match up with a call to __slice_yield.
+;
+; on entry:
+;   hl=slice's CoData
+;
+; return:
+;   hl=slice's CoData
+;
+__slice_waitfor::
+		pop	iy
+		push	hl						; save CoData pointer
+		inc	hl						; point HL to CoData->lastlocADDR
+		ld		hl, (hl)				; HL gets CoData->lastlocADDR
+		ex		(sp), hl				; recover CoData pointer, put lastlocADDR on stack
+		jp		__slice_yield
+
+		call	funcblk_init		; dummy to bring costatement code
+#endasm
+
+/*** BeginHeader */
+#endif	// __SLICE_LIB
+/*** EndHeader */

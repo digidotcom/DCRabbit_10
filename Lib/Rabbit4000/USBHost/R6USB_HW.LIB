@@ -1,0 +1,294 @@
+/*
+ *  Copyright (c) 1996-2007 Digi International Inc., All Rights Reserved
+ *
+ *  This software contains proprietary and confidential information of Digi
+ *  International Inc.  By accepting transfer of this copy, Recipient agrees
+ *  to retain this software in confidence, to prevent disclosure to others,
+ *  and to make no use of this software other than that for which it was
+ *  delivered.  This is an unpublished copyrighted work of Digi International
+ *  Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+ *  prohibited.
+ *
+ *  Restricted Rights Legend
+ *
+ *  Use, duplication, or disclosure by the Government is subject to
+ *  restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+ *  Technical Data and Computer Software clause at DFARS 252.227-7031 or
+ *  subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+ *  Restricted Rights at 48 CFR 52.227-19, as applicable.
+ *
+ *  Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+ *
+ *
+ * R6USB_HW.lib - Rabbit6000-specifics.
+ *
+ * Revision History:
+ *         Date           Author    Description
+ *         Feb. 29, 2008  BMurtha   Initial Dynamic C/Rabbit 6000 port.
+ *         Aug. 26, 2009  SJH       Changed memory allocation.
+ *************************************************************************/
+
+
+/*** BeginHeader  */
+#ifndef __R6USB_HW__
+#define __R6USB_HW__
+
+
+#define USB_OHCI_REV_ADDR                    0x1000
+#define USB_OHCI_HC_CONTROL_ADDR             0x1004
+#define USB_OHCI_HC_CMD_STAT_ADDR            0x1008
+#define USB_OHCI_HC_INT_STAT_ADDR            0x100C
+#define USB_OHCI_HC_INT_EN_ADDR              0x1010
+#define USB_OHCI_HC_INT_DIS_ADDR             0x1014
+#define USB_OHCI_HC_HCCA_ADDR                0x1018
+#define USB_OHCI_HC_PERIODIC_CURRENT_ED_ADDR 0x101C
+#define USB_OHCI_HC_CONTROL_HEAD_ED_ADDR     0x1020
+#define USB_OHCI_HC_CONTROL_CURRENT_ED_ADDR  0x1024
+#define USB_OHCI_HC_BULK_HEAD_ED_ADDR        0x1028
+#define USB_OHCI_HC_BULK_CURRENT_ED_ADDR     0x102C
+#define USB_OHCI_HC_DONE_HEAD_ADDR           0x1030
+#define USB_OHCI_HC_FM_INTERVAL_ADDR         0x1034
+#define USB_OHCI_HC_FM_REMAIN_ADDR           0x1038
+#define USB_OHCI_HC_FM_NUMBER_ADDR           0x103C
+#define USB_OHCI_HC_PERIODIC_START_ADDR      0x1040
+#define USB_OHCI_HC_LS_THRESHOLD_ADDR        0x1044
+#define USB_OHCI_HC_RH_DESCA_ADDR            0x1048
+#define USB_OHCI_HC_RH_DESCB_ADDR            0x104C
+#define USB_OHCI_HC_RH_STATUS_ADDR           0x1050
+#define USB_OHCI_HC_RH_PORT_STAT_ADDR        0x1054
+#define USB_OVERCURRENT_ENABLE_ADDR          0x1060
+
+#define USB_HOST_REG_BASE_ADDRESS   USB_OHCI_REV_ADDR
+
+
+#define USB_ENABLE         0x20
+#define USB_DISABLE        0x00
+#define USB_INT_DISABLE    0x00
+#define USB_INT_PRIORITY_1 0x04
+#define USB_INT_PRIORITY_2 0x08
+
+//**** Set USB interrupt priority here *****
+#define USB_INT_PRIORITY   USB_INT_PRIORITY_1
+
+#if  USB_INT_PRIORITY == USB_INT_PRIORITY_2
+  #define USB_INT_PRI_BIT 3
+#endif
+#if  USB_INT_PRIORITY == USB_INT_PRIORITY_1
+  #define USB_INT_PRI_BIT 2
+#endif
+
+// Use uC/OS-II macros
+#define TX_DISABLE  OS_ENTER_CRITICAL()
+#define TX_RESTORE  OS_EXIT_CRITICAL()
+
+
+
+
+/*** EndHeader */
+
+/*** BeginHeader ohciInitR6000io, usb_req_list, usb_dev_list, usb_gen_list */
+__root void ohciInitR6000io();
+
+#define USB_REQ_LIST_NEL 128
+Pool_t usb_req_list;	// For USBD_REQUEST structs
+
+// 1 for root hub, then one for each expected device or hub attached.
+#define USB_DEV_LIST_NEL 3
+Pool_t usb_dev_list;	// For usbDevice+private data
+
+// Pool for general buffering requirements.  Will be 32-byte aligned.
+// Should allocate at least one entry for every device expected to be
+// connected simultaneously.  Current devices (mass storage and mouse)
+// can live with the 256-byte size.  Increase this (within reason)
+// if some future device needs more -- the drawback is, of course,
+// inefficient memory usage for existing devices.
+#define USB_GEN_LIST_NEL 20
+#define USB_GEN_LIST_ELSIZE 256
+Pool_t usb_gen_list;	// For general temp data
+
+
+/*** EndHeader */
+_usb_debug
+__root void ohciInitR6000io()
+{
+    WrPortI(ENPR, NULL, RdPortI(ENPR) | USB_ENABLE); // Enable USB
+
+    //DEVIDEA - Lots of board specific stuff that will need to move!
+
+    // Set up the special DMA bits.  USB currently uses channels 10,11.
+    // These settings are "magic" and allow the DMA to be controlled by the
+    // USB controller.
+  	 WrPortI(D11SCR, NULL, 0xC0);
+  	 WrPortI(D10SCR, NULL, 0x80);
+
+    // Enable the USB Host GPIO pin used for power relay
+    BitWrPortI(PDDR,  &PDDRShadow, 1,2);
+    BitWrPortI(PDDR,  &PDDRShadow, 1,3);
+    WrPortI(0x4e1, NULL, 1);  // Enable pull-up on PDDR:1
+    BitWrPortI(PDDDR, &PDDDRShadow, 0,1);
+    BitWrPortI(PDDDR, &PDDDRShadow, 1,2);
+
+     //BPM not sure what value is optimum here
+    WrPortI((unsigned)USB_OVERCURRENT_ENABLE_ADDR, NULL, 6);  // Enable rx of overcurrent
+    BitWrPortI(PDDDR, &PDDDRShadow, 1,3);
+
+    //SJH create memory pools (other than those for ED and TD, which are
+    // created in USBOHCI.LIB).
+	 pool_create(&usb_req_list, USB_REQ_LIST_NEL,
+	 	sizeof (USBD_REQUEST), POOL_ALIGNED|POOL_SYS_MALLOC, 32);
+	 pool_create(&usb_dev_list, USB_DEV_LIST_NEL,
+	 	sizeof(usbDevice)+sizeof (HCD_ENDPOINT_DESCRIPTOR), POOL_SYS_MALLOC, 0);
+	 pool_create(&usb_gen_list, USB_GEN_LIST_NEL,
+	 	USB_GEN_LIST_ELSIZE, POOL_ALIGNED|POOL_SYS_MALLOC, 32);
+
+}
+
+/*** BeginHeader OHCI_INIT_ISR, ___USBISRPROLOG */
+__root void OHCI_INIT_ISR();
+__root void ___USBISRPROLOG();
+__root void ___USBISREPILOG();
+/*** EndHeader */
+
+#asm __root
+___USBISRPROLOG::
+   push   jkhl
+	ld 	 hl, ENPR
+ioi res   USB_INT_PRI_BIT, (hl)
+   push   af
+   push   px
+   push   py
+   push   pw
+   push   pz
+   push   bcde
+   push   ix
+   push   iy
+   ex     af,af'
+   push   af
+   exx
+   exp
+   push   bcde
+   push   jkhl
+	push	 pw
+	push	 px
+	push	 py
+	push	 pz
+	ld		 hl,lxpc
+	push	 hl
+
+#ifdef MCOS
+   #if OS_SCHED_LOCK_EN < 1
+      #error "USB needs to be able to lock the uC/OS II task scheduler, but"
+      #fatal "   OS_SCHED_LOCK_EN < 1"
+   #endif
+   // Don't let uC/OS II switch away from the ISR
+   // -- lcall OSSchedLock
+   // Increment OSLockNesting, but back it off if overflows
+   ld    a, (OSLockNesting)
+   inc   a
+   jr    nz, usbmcos_no_ovfl  ; Check for overflow
+   dec   a                    ; Decrement on overflow
+usbmcos_no_ovfl:
+   ld    (OSLockNesting), a
+#endif
+
+   push ip
+#ifdef USING_USB_MASS_STORAGE
+	 // DEVIDEA - BPM, this is a temporary kludge.
+	 //  Mass storage has occasional errors if RAM
+	 //  runs with zero wait states and the USB ISR
+	 //  enables interrupts. But some mice fail
+	 //  if the RAM has waitstates, and the sample
+	 //  mouse program stdio output is very jerky
+	 //  if the ISR doesn't turn on interrupts.
+#else
+	// Early re-enable
+   ipres
+#endif
+   lcall  usbOhciInterruptService
+   pop ip
+
+   ; Disable interrupts, reenable the hardware request line
+
+#ifdef MCOS
+   // -- lcall OSSchedUnlock
+   // Decrement OSLockNesting if not zero
+
+   ld    a, (OSLockNesting)
+   or    a                 ; Don't decrement if zero
+   jr    z, usbmcos_no_decr
+   dec   a
+usbmcos_no_decr:
+   ld    (OSLockNesting), a
+
+#endif
+
+___USBISREPILOG::
+	 pop	hl
+	 ld   lxpc,hl
+	 pop	pz
+	 pop	py
+	 pop	px
+	 pop	pw
+    pop  jkhl
+    pop  bcde
+    exx
+    exp
+    pop    af
+    ex     af,af'
+    pop    iy
+    pop    ix
+    pop    bcde
+    pop    pz
+    pop    pw
+    pop    py
+    pop    px
+	 ld 	  hl,USB_OHCI_HC_INT_EN_ADDR
+ioi set 	  1, (hl)
+	 ld  	  hl,USB_OHCI_HC_INT_EN_ADDR+3
+ioi set 	  7, (hl)
+    ld     hl, ENPR
+    pop    af
+ioi set    USB_INT_PRI_BIT, (hl)
+    pop    jkhl
+    ipres
+    ret
+
+OHCI_INIT_ISR::
+   ipset  3
+   ld		 iy, INTVEC_BASE + USB_OFS
+   ld		 (iy),_OP_JP	; jump opcode
+   ld		 hl, ___USBISRPROLOG
+   ld		 (iy+1),hl     ; copy the jump insn into interrupt table
+   ipres
+   ret
+#endasm
+
+// 32 bit io R/W functions needed for USB host driver
+/*** BeginHeader OHCI_WRITE */
+__root unsigned long OHCI_WRITE(word port, unsigned long value);
+/*** EndHeader */
+__nodebug
+__root unsigned long OHCI_WRITE(word port, unsigned long value)
+{
+#asm
+   	ld   	bcde,(sp + @SP + value)
+ioi   ld    (hl),bcde
+#endasm
+}
+
+/*** BeginHeader OHCI_READ */
+__root unsigned long OHCI_READ(word port);
+/*** EndHeader */
+__nodebug
+__root unsigned long OHCI_READ(word port)
+{
+#asm
+ioi   ld    bcde,(hl)
+#endasm
+}
+
+
+/*** BeginHeader  */
+#endif
+/*** EndHeader */
+

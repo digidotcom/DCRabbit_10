@@ -1,0 +1,3560 @@
+/*
+ *  Copyright (c) 1996-2007 Digi International Inc., All Rights Reserved
+ *
+ *  This software contains proprietary and confidential information of Digi
+ *  International Inc.  By accepting transfer of this copy, Recipient agrees
+ *  to retain this software in confidence, to prevent disclosure to others,
+ *  and to make no use of this software other than that for which it was
+ *  delivered.  This is an unpublished copyrighted work of Digi International
+ *  Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+ *  prohibited.
+ *
+ *  Restricted Rights Legend
+ *
+ *  Use, duplication, or disclosure by the Government is subject to
+ *  restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+ *  Technical Data and Computer Software clause at DFARS 252.227-7031 or
+ *  subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+ *  Restricted Rights at 48 CFR 52.227-19, as applicable.
+ *
+ *  Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+ *
+ *
+ * usbOhci.c - Open Host Controller interface.
+ *           - Interface to NS9750 OHCI register set.
+ *
+ * Note:
+ *  This code is derived from the example code which is in the
+ *  OpenHCI Release 1.0a Chapter 5, refer to this document as
+ *  a guide to this source code. There is one thread which is used to handle
+ *  incoming incoming requests.
+ *
+ * Note:
+ * There is a endianess problem with the USB host implementation in the ns9750,
+ * all memory which OHCI touches must be swapped (except for the data which the
+ * TD's point to), we do this to avoid having to
+ * byte swap the data payload, once this problem is fixed you can remove the
+ * byte swapping macros.
+ *
+ * Revision History:
+ *   Flag  Date           Author    Description
+ *   A1    April 4, 2006  JRyan     Allow 1ms latency interval when
+ *                                   scheduling interrupt request
+ *
+ *         Feb. 29, 2008 BMurtha    Initial Dynamic C/Rabbit 6000 port.
+ *                                  Work in progress.
+ *                                  "//BPM:COIO" means "Commented out in
+ *                                       the original" NS code.
+ */
+
+
+/*** BeginHeader */
+
+#ifndef __USBOHCI_
+#define __USBOHCI_
+
+#ifndef USBOHCI_VERBOSE
+	#define USBOHCI_VERBOSE 0
+#endif
+
+//***********************************************************
+//  Define some macros for standard NULL ptr and return value
+//  checking patterns used throughout the OHCI driver code.
+//  Helps cut down on literal string space in verbose mode.
+//************************************************************
+
+//***** NULL ptr check. ***********************************
+//  p=ptr,  r=value to assign to local result variable,
+//  x = label to go to (usually an exit label)
+#ifdef NDEBUG
+  #define USB_NULL_PTR_CHK(p,r,x) if(p==NULL) { result=r;goto x; }
+#else
+  #if USBOHCI_VERBOSE
+    #define USB_NULL_PTR_CHK(p,r,x)                              \
+       if(p==NULL){                                              \
+          printf("NULL ptr @ File: %s,Line %d\n\n",              \
+             __FILE__, __LINE__);                                \
+             result=r;goto x;                                    \
+       }
+  #else
+    #define USB_NULL_PTR_CHK(p,r,x) if(p==NULL) { result=r;goto x; }
+  #endif
+#endif
+
+//****** Fatal NULL ptr error (not actually used yet! - BPM) ************
+#ifdef NDEBUG
+ #if !USBOHCI_VERBOSE
+   #define USB_NULL_PTR_CHKFAT(p,r,x) \
+     if(p==NULL) {                    \
+       exception(-ERR_ASSERTFAILURE); \
+       exit(-ERR_ASSERTFAILURE);      \
+     }
+ #else
+  #if USBOHCI_VERBOSE
+   #define USB_NULL_PTR_CHKFAT(p,r,x)               \
+       if(p==NULL){                                 \
+          printf("NULL ptr @ File: %s,Line %d\n\n", \
+             __FILE__, __LINE__);                   \
+             result=r;goto x;                       \
+       }
+  #else
+   #define USB_NULL_PTR_CHKFAT(p,r,x)               \
+       if(p==NULL){result=r;goto x; }
+  #endif
+ #endif
+#else
+ #if USBOHCI_VERBOSE
+   #define USB_NULL_PTR_CHKFAT(p,r,x)               \
+       if(p==NULL){                                 \
+          printf("NULL ptr @ File: %s,Line %d\n\n", \
+             __FILE__, __LINE__);                   \
+             result=r;goto x;                       \
+       }
+ #else
+   #define USB_NULL_PTR_CHKFAT(p,r,x)               \
+       if(p==NULL){ result=r;goto x;  }
+ #endif
+#endif
+
+//****** Return result check *******************
+// result is a locally defined variable
+// s = string to print if USBOHCI_VERBOSE #defin'ed
+#ifdef NDEBUG
+  #define USB_RES_CHK(s,x) \
+         if(result) {goto x;}
+#else
+  #if USBOHCI_VERBOSE
+   #if USBOHCI_VERBOSE > 1
+     #define USB_RES_CHK(s,x) \
+         if(result) {printf("%s");goto x;}
+   #else
+     #define USB_RES_CHK(s,x) \
+         if(result) {printf("result=%d File: %s,Line %d\n\n",result,__FILE__, __LINE__);goto x;}
+   #endif
+  #else
+     #define USB_RES_CHK(s,x) \
+         if(result) {goto x;}
+  #endif
+#endif
+
+//******************************************************************
+#if USBOHCI_VERBOSE
+	#ifdef NDEBUG // ANSI standard
+	  	#define USBOHCI_ASSERT(ignore)
+	#else
+		#define USBOHCI_ASSERT(exp)   \
+   		 ((exp) ? (void)0 :        \
+	    	_dc_assert(#exp, __FILE__, __LINE__))
+   #endif
+#else
+	#ifdef NDEBUG // ANSI standard
+	  	#define USBOHCI_ASSERT(ignore)
+	#else
+		#define USBOHCI_ASSERT(exp)       \
+   		 if(exp) { } else {            \
+		   exception(-ERR_ASSERTFAILURE); \
+		   exit(-ERR_ASSERTFAILURE); }
+   #endif
+#endif
+
+#ifndef USBOHCI_DEBUG
+  #define  _usbohci_debug __debug
+#else
+  #define  _usbohci_debug __nodebug
+#endif
+
+#ifndef INT32
+ #define INT32 long
+#endif
+#ifndef UINT32
+ #define UINT32 unsigned long
+#endif
+
+#define TX_WAIT_FOREVER 0
+
+#if USBOHCI_VERBOSE
+   // This will save a lot of const space over more specific messages
+   //  because the compiler will optimize all instances down to two
+   //  strings, __FILE__ and "result !=0 File: %s,Line %d\n\n"
+	#define USB_PRINTF_ERR printf("Error: File: %s,Line %d\n\n",__FILE__, __LINE__)
+#else
+  	#define USB_PRINTF_ERR
+#endif
+
+Pool_t td_list;
+
+Pool_t ed_list;
+
+/*** EndHeader */
+
+/*** BeginHeader usbOhciInit, usbOhciEnableHostMode, usbOhciWaitForUsbEnabled,
+    usbOhciWaitForHostReset, init_td_list, init_ed_list,
+     usbOhciWaitForPortEnabled */
+
+	__xmem long usbOhciInit ();
+	__xmem int usbOhciWaitForUsbEnabled();
+	__xmem void usbOhciEnableHostMode();    //BPM probably not needed
+	__xmem int usbOhciWaitForHostReset();
+   __xmem int init_td_list();
+   __xmem int init_ed_list();
+   __xmem int usbOhciWaitForPortEnabled(unsigned int port);
+	extern unsigned int td_list_init;
+	extern unsigned int ed_list_init;
+   extern unsigned long  connect_to_power_stable_delay;
+#if USE_GENERAL_REQUEST_SEMAPHORE
+extern TX_SEMAPHORE general_request_sem;
+#endif
+
+extern TX_SEMAPHORE start_of_frame_sem;
+
+extern TX_SEMAPHORE root_hub_status_change_sem;
+
+ 	extern TX_SEMAPHORE hub_status_change_sem;
+   extern unsigned int td_list_count;
+   extern usbh_write_reg ohci_write_reg;
+   extern usbh_read_reg ohci_read_reg;
+	extern int usbd_request_mem_pool_init;
+   extern char device_number_table[MAX_USB_DEVICES];
+	//extern int saveIPstate;
+
+// These were used with NS processors to changed endian-ness
+//  in the host context struct below.
+//  We don't have to worry about them.
+#define   ohci_read_mem(x) (x)
+#define   ohci_read_address(x) (x)
+
+#define ohci_read_reg(x)  OHCI_READ(x)
+#define ohci_write_reg(x,y)  OHCI_WRITE(x,y)
+
+/*** EndHeader */
+
+//int saveIPstate;  // Global variable to save IP in critical sections
+
+// These are a struct for a host context in the new NS code,
+//  But we don't anticipate driving multiple hosts for the R6K
+//  so just using individual variables.
+//typedef struct
+//{
+// pointer to the host controller structure associated with OHCI resources
+//    usbHostController * host_controller;
+
+    // Pointer to OHCI information
+    __far HCD_DEVICE_DATA USBDeviceData;
+
+    // Semaphores to synchronize critical areas of OHCI stack
+	 TX_SEMAPHORE root_hub_status_change_sem;
+//    TX_SEMAPHORE root_hub_status_change_sem;
+#if USE_GENERAL_REQUEST_SEMAPHORE
+    TX_SEMAPHORE general_request_sem;
+#endif
+    TX_SEMAPHORE  start_of_frame_sem;
+ 	 TX_SEMAPHORE hub_status_change_sem;
+
+    // table of available device numbers for the controller
+    char device_number_table[MAX_USB_DEVICES];
+
+    // function pointers for the swap functions
+    usbh_write_reg ohci_write_reg;
+    usbh_read_reg ohci_read_reg;
+
+//} usbOhciContext;   // Just global variables now
+
+	int usbd_request_mem_pool_init;
+
+UINT32 connect_to_power_stable_delay;
+
+_usbohci_debug
+__xmem INT32 usbOhciInit ()
+{
+    auto unsigned long status, data;
+    auto long result, free_ohci_mem ;
+
+    memset(device_number_table, 0, MAX_USB_DEVICES);
+    device_number_table[0] = FIRST_USB_DEVICE_NUMBER;
+    result = 0; free_ohci_mem = 0;
+
+    connect_to_power_stable_delay = 150;
+
+    //**** Set the correct USB host related register values
+    ohciInitR6000io();
+
+    root_hub_status_change_sem = OSSemCreate(0);
+    if( root_hub_status_change_sem==NULL ){
+       exception(USB_SEMAPHORE_ERROR);
+       exit(USB_SEMAPHORE_ERROR);
+    }
+
+    start_of_frame_sem = OSSemCreate(0);
+    if( start_of_frame_sem==NULL){
+       exception(USB_SEMAPHORE_ERROR);
+       exit(USB_SEMAPHORE_ERROR);
+    }
+
+#if USE_GENERAL_REQUEST_SEMAPHORE
+    general_request_sem = OSSemCreate(1);
+    if( general_request_sem==NULL ){
+       exception(USB_SEMAPHORE_ERROR);
+       exit(USB_SEMAPHORE_ERROR);
+    }
+#endif
+
+    //**** Disable usb host interrupts
+    OHCI_WRITE(USB_OHCI_HC_INT_DIS_ADDR, 0x80000000ul);
+
+    OSTimeDlyHMSM(0,0,0,(int)connect_to_power_stable_delay);
+
+  	 // Check the rev
+  	 if (ohci_read_reg(USB_OHCI_REV_ADDR) != 0x00000010UL){
+   	USB_PRINTF_ERR;  // expected 0x10"
+    	result = -1;
+      goto usbinitexit;
+  	 }
+    usbd_request_mem_pool_init = 1;
+
+
+    usbOhciEnableHostMode();
+    usbOhciWaitForUsbEnabled();
+    usbOhciWaitForHostReset();
+
+    // Initialize a list of TDs
+    // The list of TDs is global and shared by all OHCI contexes
+    if (!td_list_init)
+    {
+        result = init_td_list();
+        USB_RES_CHK("usbOhciInit: init_td_list failed\n",usbinitexit);
+    }
+
+    // Initialize a list of EDs
+    // The list of EDs is global and shared by all OHCI contexes
+    if (!ed_list_init)
+    {
+        result = init_ed_list();
+        USB_RES_CHK("usbOhciInit: init_ed_list failed\n",usbinitexit);
+    }
+
+    // Allocate the running OHCI structures
+    result = usbOhciMallocOhci();
+    if (result)
+    {
+        USB_PRINTF_ERR;
+        result = usbOhciFreeOhci();
+        goto usbinitexit;
+    }
+    else
+    {
+		  OSTaskCreate(usbOhciTask, (void *)0, TASK_STK_SIZE, 11);
+		  OHCI_INIT_ISR();
+        // Initialize and install the USB ISR handler
+        usb_host_enable_interrupts();
+        WrPortI(ENPR, NULL, RdPortI(ENPR) | USB_ENABLE | USB_INT_PRIORITY);
+
+    }
+
+usbinitexit:
+    return result;
+}
+
+
+// Enable host mode, clean bit zero in the global control
+// and status register.
+//
+_usbohci_debug
+__xmem void usbOhciEnableHostMode()
+{
+   OHCI_WRITE(USB_OHCI_HC_CONTROL_ADDR, 0x1ul);
+	return;
+}
+
+unsigned int ed_list_init;
+
+_usbohci_debug
+__xmem int usbOhciWaitForUsbEnabled()  //BPM maybe not needed
+{
+    // Make sure it's enabled (bit 12 in this register, 1=disabled)
+    // Global control and status register.
+    while (ohci_read_reg(USB_OHCI_HC_CMD_STAT_ADDR) & 0x1000)
+   		OSTimeDlyHMSM(0,0,0,MIN_SLEEP_INTERVAL_MS);
+	 return 0;
+}
+
+
+/*
+ * This functions checks the specified port's PortEnableStatus bit
+ * to determine if the port is enabled
+ */
+_usbohci_debug
+__xmem int usbOhciWaitForPortEnabled(unsigned int port)
+{
+    unsigned long portstatus;
+    int result;
+
+    result = 0;
+
+    USBOHCI_ASSERT(port < MAX_ROOT_PORTS);
+    if (port >= MAX_ROOT_PORTS)
+    {
+#if USBOHCI_VERBOSE
+        printf("usbOhciWaitForPortEnabled: Invalid port number\n");
+#endif
+        result = USBH_INVALID_PORT_NUMBER;
+        goto usbwfpeexit;
+    }
+    //SJH - only one port on Rabbit6000
+    portstatus = ohci_read_reg(USB_OHCI_HC_RH_PORT_STAT_ADDR);
+    while (!(portstatus & PORT_PES))
+    {
+ 	     OSTimeDlyHMSM(0,0,0,MIN_SLEEP_INTERVAL_MS);
+        portstatus = ohci_read_reg(USB_OHCI_HC_RH_PORT_STAT_ADDR);
+    }
+
+usbwfpeexit:
+    return result;
+}
+
+_usbohci_debug
+__xmem int usbOhciWaitForHostReset()
+{
+    // Wait for the reset bit to be cleared
+    while (ohci_read_reg(USB_OHCI_HC_CMD_STAT_ADDR) & 0x800)
+	  		OSTimeDlyHMSM(0,0,0,MIN_SLEEP_INTERVAL_MS);
+	 return 0;
+}
+
+
+_usbohci_debug
+__xmem int init_ed_list()
+{
+#GLOBAL_INIT { ed_list_init = 0; }
+
+	 pool_create(&ed_list, MAX_NUM_EDS, sizeof (HCD_ENDPOINT), POOL_ALIGNED|POOL_SYS_MALLOC, 32);
+    ed_list_init = 1;
+    return 0;
+}
+
+//#define TD_BLOCK_POOL_SIZE (sizeof(TD_LIST_T) + sizeof(void *)) * MAX_NUM_TDS
+
+//unsigned int td_list_count;
+unsigned int td_list_init;
+
+_usbohci_debug
+__xmem int init_td_list(void)  //BPM was 32 bit int
+{
+#GLOBAL_INIT { td_list_init = 0; }
+
+	 pool_create(&td_list, MAX_NUM_TDS, sizeof (HCD_TRANSFER_DESCRIPTOR), POOL_ALIGNED|POOL_SYS_MALLOC, 32);
+    td_list_init = 1;
+    return 0;
+}
+
+/*** BeginHeader usbOhciMallocOhci, usbOhciUsbAllocate */
+__xmem int usbOhciMallocOhci();
+__xmem int usbOhciUsbAllocate(usbDevice __far * parent, usbDevice __far ** child);
+extern HCD_DEVICE_DATA __far * DeviceData;
+/*** EndHeader */
+
+HCD_DEVICE_DATA __far * DeviceData;
+
+_usbohci_debug
+__xmem int usbOhciMallocOhci()
+{
+    auto int j, k,i, err, result;
+    static usbDevice __far *usb;
+    static HCD_TRANSFER_DESCRIPTOR __far *td;
+    static HCD_ENDPOINT __far *ed;
+    static HCD_ENDPOINT __far *StaticED[ED_INTERRUPT_32ms]; //BPM
+    const static unsigned char Balance[16] = { 0x0, 0x8, 0x4, 0xc,
+                                         0x2, 0xa, 0x6, 0xe,
+                                         0x1, 0x9, 0x5, 0xd,
+                                         0x3, 0xb, 0x7, 0xf };
+
+#GLOBAL_INIT{
+    DeviceData =  &USBDeviceData;
+    //SJH - code altered to directly use I/O register addresses.  Not memory
+    // mapped on Rabbit6000.
+    //DeviceData->regs  = (OHCI_REGS far *)USB_OHCI_REV_ADDR; // USBOHCI Reg base
+}
+    td = NULL;
+    ed = NULL;
+    result = 0;
+    usb = NULL;
+
+    DeviceData->countEd = DeviceData->countTd = 0;
+    DeviceData->reset_ohci = FALSE;
+
+    INIT_LIST_HEAD(&DeviceData->interrupt_list);
+
+    // Allocate the USB device structure
+    result = usbOhciUsbAllocate(NULL, &usb);
+    USB_RES_CHK("usbOhciMallocOhci: usbOhciUsbAllocate()\n", usbmoexit);
+
+    DeviceData->usb = usb;
+
+    // Assign the next page of memory to the HCCA
+    DeviceData->hcca = _sys_memalign(sizeof(HCCA_BLOCK), 256);
+	 USB_NULL_PTR_CHK(DeviceData->hcca, USBH_MALLOC_FAILED, usbmoexit);
+    _f_memset(DeviceData->hcca, 0, sizeof(HCCA_BLOCK));
+
+    // Initialize the root hub device structure
+    if (usb_connect_device(DeviceData->usb, &err))
+    {
+        USB_PRINTF_ERR;
+        //"usbOhciMallocOhci: usb_connect_device()\n"
+        result = err;
+        goto usbmoexit;
+    }
+    DeviceData->usb->descriptor.bMaxPacketSize0 = 8;
+    // Get the number of downstream ports on this controller
+    DeviceData->usb->maxchild = ohci_read_reg(USB_OHCI_HC_RH_DESCA_ADDR) & 0x00ff;
+#if USBOHCI_VERBOSE
+    printf("usbOhciMallocOhci: DeviceData->usb->maxchild=%d\n", DeviceData->usb->maxchild);
+#endif
+    if ((DeviceData->usb->maxchild > MAX_ROOT_PORTS) || (DeviceData->usb->maxchild < 1))
+    {
+        USB_PRINTF_ERR;
+        //"usbOhciMallocOhci: Maximum number of ports is invalid\n"
+        result = USBH_INVALID_PORT_NUMBER;
+        goto usbmoexit;
+    }
+
+    DeviceData->lastportstatus[0] = 0x0;
+
+    // Initialize endpoint lists
+
+    // Control endpoint list
+    result = alloc_ed(&ed);
+    USB_RES_CHK("usbOhciMallocOhci: alloc_ed() failed\n", usbmoexit);
+
+    ed->status = OHCI_ED_SKIP;
+
+    // Give a blank TD to the EDs
+    result = alloc_td(&td);
+    USB_RES_CHK("usbOhciMallocOhci: alloc_td() failed\n", usbmoexit);
+
+
+    ed->headTd = (UINT32)td;
+    ed->tailTd = (UINT32)td;
+
+    DeviceData->pEd[ED_CONTROL] = ed;
+#if USBOHCI_VERBOSE > 3
+    printf("DeviceData->pEd[ED_CONTROL(%d)]=%08lx\n",(int)ED_CONTROL, ed);
+    printf("  TD=%08lx\n",td);
+#endif
+
+    // Bulk endpoint list
+    result = alloc_ed(&ed);
+    USB_RES_CHK("usbOhciMallocOhci: alloc_ed() failed\n", usbmoexit);
+    ed->status = OHCI_ED_SKIP;
+
+    // Give a blank TD to the EDs
+    result = alloc_td(&td);
+    USB_RES_CHK("usbOhciMallocOhci: alloc_td() failed\n", usbmoexit);
+
+
+    ed->headTd = (UINT32)td;
+    ed->tailTd = (UINT32)td;
+
+    DeviceData->pEd[ED_BULK] = ed;
+#if USBOHCI_VERBOSE > 3
+    printf("DeviceData->pEd[ED_BULK(%d)]=%08lx\n",(int)ED_BULK, ed);
+    printf("  TD=%08lx\n",td);
+#endif
+
+    // Interrupt endpoint list
+    for (i = 0; i < ED_INTERRUPT_32ms; i++)
+    {
+        result = alloc_ed(&ed);
+        USB_RES_CHK("usbOhciMallocOhci: alloc_ed() failed\n", usbmoexit);
+        ed->status = OHCI_ED_SKIP;
+
+        StaticED[i] = ed;
+
+        // Give a blank TD to the EDs
+        result = alloc_td(&td);
+        USB_RES_CHK("usbOhciMallocOhci: alloc_td() failed\n", usbmoexit);
+
+
+        ed->headTd = (UINT32)td;
+        ed->tailTd = (UINT32)td;
+
+        DeviceData->pEd[i] = ed;
+#if USBOHCI_VERBOSE > 3
+        printf("DeviceData->pEd[%d] = %08lx\n",i,DeviceData->pEd[i]);
+        printf("  TD = %08lx\n",td);
+#endif
+        if (i > 0)
+        {
+            ed->nextEd = ( (unsigned long)StaticED[(i - 1) / 2] );
+        }
+        else
+        {
+            ed->nextEd = 0;
+        }
+    }
+    //    Set head pointers for 32ms scheduling lists which start from HCCA
+    for (i = 0, j = ED_INTERRUPT_32ms; i < 32; i++, j++)
+    {
+        // Allocating static EDs for 32ms
+        result = alloc_ed(&ed);
+        USB_RES_CHK("usbOhciMallocOhci: alloc_ed() failed\n", usbmoexit);
+        ed->status = OHCI_ED_SKIP;
+
+        // Give a blank TD to the EDs
+        result = alloc_td(&td);
+        USB_RES_CHK("usbOhciMallocOhci: alloc_td() failed\n", usbmoexit);
+
+
+        ed->headTd = (UINT32)td;
+        ed->tailTd = (UINT32)td;
+
+        k = Balance[i & 0xf] + ED_INTERRUPT_16ms;
+
+        ed->nextEd =  (UINT32)StaticED[(unsigned)k];  // next ed is physical address
+
+        // Interrupt list requires physical addresses
+        DeviceData->hcca->intTable[i] = (unsigned long)ed;
+
+#if USBOHCI_VERBOSE > 3
+        printf("DeviceData->hcca->intTable[%d] = %08lx\n",i,ed);
+#endif
+        DeviceData->pEd[(unsigned)j] = (HCD_ENDPOINT __far *)ed;
+#if USBOHCI_VERBOSE > 3
+        printf("DeviceData->pEd[%d] = %08lx\n",(unsigned)j,ed);
+        printf("  Next = %08lx (%d)\n",(UINT32)StaticED[(unsigned)k],k);
+        printf("   td = %08lx\n",td);
+#endif
+    }
+
+usbmoexit:
+    return result;
+}
+
+
+_usbohci_debug
+__xmem int usbOhciUsbAllocate(usbDevice __far * parent, usbDevice __far ** child)
+{
+    auto usbDevice __far *usbDev;
+    auto HCD_ENDPOINT_DESCRIPTOR __far *edData;
+    auto int result, free_memory;
+
+    usbDev = NULL;
+    edData = NULL;
+    result = 0, free_memory = 0;
+
+    // The function argument can be NULL or non-NULL.
+    // If NULL, a usbDevice is allocated for the root hub.
+    // If non-NULL, a usbDevice is allocated for an external hub
+
+    // This requires no alignment, but we need to free it if
+    //  the device is removed, so use malloc
+    usbDev = pfcalloc(&usb_dev_list);
+
+    USB_NULL_PTR_CHKFAT(usbDev, USBH_MALLOC_FAILED, usboaexit);
+
+    //_f_memset(usbDev, 0, sizeof(usbDevice));
+
+    // Allocate struct EdData
+    // SJH - this used to be separate allocation, but for efficiency
+    // we just tack on the required private struct to the public usbDevice.
+	 usbDev->hcEdData = (HCD_ENDPOINT_DESCRIPTOR __far *)(usbDev + 1);
+    /*
+    edData = fsmalloc(sizeof(HCD_ENDPOINT_DESCRIPTOR));
+    if(edData == NULL)free_memory = 1;
+    USB_NULL_PTR_CHKFAT(edData, USBH_MALLOC_FAILED, usboaexit);
+
+    _f_memset(edData, 0, sizeof(HCD_ENDPOINT_DESCRIPTOR));
+    usbDev->hcEdData = edData;
+    */
+    usbDev->parent    = parent;
+
+    *child = usbDev;
+
+usboaexit:
+    return result;
+}
+
+/*** BeginHeader usbOhciFreeOhci */
+   __xmem int usbOhciFreeOhci();
+/*** EndHeader */
+//
+// Deallocate all memory resources and shut down the HCCA.
+//
+_usbohci_debug
+__xmem int usbOhciFreeOhci()
+{
+    auto int result;
+
+    result = 0;
+
+    // Ensure that HC is stopped before releasing the HCCA
+    ohci_write_reg(USB_OHCI_HC_CONTROL_ADDR, OHCI_USB_SUSPEND);
+
+    if (DeviceData->hcca)
+        _sys_free(DeviceData->hcca);
+    DeviceData->hcca = NULL;
+
+usbofoexit:
+    return result;
+}
+
+
+/*** BeginHeader alloc_td */
+   __xmem int alloc_td(HCD_TRANSFER_DESCRIPTOR __far ** td_ptr);
+/*** EndHeader */
+//
+// This function allocates a transfer descriptor from the TD list
+//
+_usbohci_debug
+__xmem int alloc_td(HCD_TRANSFER_DESCRIPTOR __far ** td_ptr)
+{
+    auto HCD_TRANSFER_DESCRIPTOR __far *td;
+
+	//SJH - reimplemented to use pool.  Also use calloc since most every call
+	// is followed by a memset 0.
+	 *td_ptr = (HCD_TRANSFER_DESCRIPTOR __far *)pfcalloc(&td_list);
+	 if (!*td_ptr)
+	 	return USBH_NO_TRANSFER_DESCRIPTORS;
+	 return 0;
+}
+
+/*** BeginHeader alloc_ed */
+   __xmem int  alloc_ed(HCD_ENDPOINT __far ** ed_ptr);
+/*** EndHeader */
+//
+// This function allocates an endpoint from the ED list
+//
+_usbohci_debug
+__xmem int alloc_ed(HCD_ENDPOINT __far ** ed_ptr)
+{
+	*ed_ptr = pfcalloc(&ed_list);
+	if (!*ed_ptr)
+		return USBH_NO_ENDPOINT_DESCRIPTORS;
+	return 0;
+}
+
+/*** BeginHeader usbOhciStartHcd, usbOhciResetHcd, usbOhciSetFrameInterval */
+   __xmem int usbOhciStartHcd();
+   __xmem int usbOhciResetHcd();
+	__xmem int usbOhciSetFrameInterval(unsigned long fminterval);
+/*** EndHeader */
+_usbohci_debug
+__xmem int usbOhciSetFrameInterval(unsigned long fminterval)
+{
+    auto unsigned long reg_val, periodic_start_val;
+    auto int result;
+
+    result = 0;
+
+    if (!fminterval)
+    {
+        USB_PRINTF_ERR;
+        //"usbOhciSetFrameInterval: Invalid frame interval"
+        result = USBH_INVALID_FRAME_INTERVAL;
+        goto usbosfiexit;
+    }
+
+//BPM - make absolutely sure periodic_start_val is correct at some point!
+
+    // fminterval is a 14 bit value which starts at bit 0, the max
+    // packet size transfered in one frame is 10240, this number directly
+    // affects throughput.
+    fminterval = 0x2edf;  // Will be 83ns * 4000 = 333,000ns between SOF
+    reg_val = ((fminterval - 210)*6)/7;  // From OHCI spec.  (frame interval - MAX_OVERHEAD) * 6/7.  6/7 for worst case bit stuffing.
+
+    ohci_write_reg(USB_OHCI_HC_FM_INTERVAL_ADDR,
+          0x80000000UL | (reg_val<<16) | fminterval);
+
+    // The periodic start value is 10% subtracted from the fminterval.
+    periodic_start_val = (fminterval & 0xfffful) - ((fminterval & 0xfffful) / 10);
+
+    ohci_write_reg(USB_OHCI_HC_PERIODIC_START_ADDR, periodic_start_val);
+
+usbosfiexit:
+    return result;
+}
+
+
+_usbohci_debug
+__xmem int usbOhciResetHcd()
+{
+    auto int timeout_in_ticks, result;
+
+    timeout_in_ticks = 10; result = 0;
+
+    ohci_write_reg(USB_OHCI_HC_INT_DIS_ADDR, OHCI_INTR_MIE);
+    ohci_write_reg(USB_OHCI_HC_CONTROL_ADDR, 0x000);
+    ohci_write_reg(USB_OHCI_HC_CMD_STAT_ADDR, 1);      // HC Reset
+
+    while ((ohci_read_reg(USB_OHCI_HC_CMD_STAT_ADDR) & 1) != 0)
+    {
+        if (--timeout_in_ticks <= 0)
+        {
+            USB_PRINTF_ERR;
+            //"usbOhciResetHc: timeout\n"
+            result = USBH_TIMEOUT;
+            goto usborhexit;
+        }
+		  OSTimeDlyHMSM(0,0,0,2*MIN_SLEEP_INTERVAL_MS);
+    }
+
+    usbOhciWaitForHostReset();
+
+usborhexit:
+    return result;
+}
+
+//**** Reset and start an OHCI controller
+_usbohci_debug
+__xmem int usbOhciStartHcd()
+{
+    auto int timeout;          // used to prevent an infinite loop.
+    auto int result;
+
+    timeout = 300;
+    result = 0;
+
+    result = usbOhciResetHcd();
+    if (result)
+    {
+        USB_PRINTF_ERR;
+        //"usbOhciStartHcd: usbOhciResetHcd() failed\n"
+        goto usboshexit;
+    }
+
+    // wait for USBSUSPEND state
+    while ((ohci_read_reg(USB_OHCI_HC_CONTROL_ADDR) & 0xc0UL) == 0UL)
+    {
+        if (!--timeout)
+        {
+            //printf("usbOhciStartHcd: Timeout waiting for USBSUSPEND state!\n");
+            USB_PRINTF_ERR;
+            result = USBH_TIMEOUT;
+            goto usboshexit;
+        }
+#if USBOHCI_VERBOSE > 2
+       printf("usbOhciStartHcd sleep\n");
+#endif
+ 	     OSTimeDlyHMSM(0,0,0,MIN_SLEEP_INTERVAL_MS);
+#if USBOHCI_VERBOSE > 2
+        printf("usbOhciStartHcd back\n");
+#endif
+    }
+
+    ohci_write_reg(USB_OHCI_HC_CONTROL_HEAD_ED_ADDR,
+                (unsigned long)DeviceData->pEd[ED_CONTROL]);
+
+    ohci_write_reg(USB_OHCI_HC_BULK_HEAD_ED_ADDR,
+                (unsigned long)DeviceData->pEd[ED_BULK]);
+
+    ohci_write_reg(USB_OHCI_HC_HCCA_ADDR,
+          (unsigned long)DeviceData->hcca);  // a reset clears this
+
+    // Set the frame interval and the max packet size
+    result = usbOhciSetFrameInterval(0x2edf);
+    if (result)
+    {
+		  USB_PRINTF_ERR;
+        //"usbOhciStartHcd: usbOhciSetFrameInterval() failed\n"
+        goto usboshexit;
+    }
+
+    // This writes the the default value which the spec says
+    // cannot be changed, so skip it. -BPM
+    //ohci_write_reg(USB_OHCI_HC_LS_THRESHOLD_ADDR, 0x628);
+
+
+    // BPM - need to understand HW issues & dependencies here,
+    //       don't know if this is absolutely correct, but it works
+    //       on a R6000 simulator
+
+    //   5.1.1.3.2 BIOS Driver (NS)
+    //   RemoteWakeupConnected in HcControl
+    //   FrameInterval and FSLargestDataPacket in HcFmInterval
+    //   PowerOnToPowerGoodTime, PowerSwitchingMode and
+    //   OverCurrentProtection in HcRhDescriptorA
+    //  RemovableDevice in HcRhDescriptorB
+
+    //OHCI_WRITE_SET(USB_OHCI_HC_RH_DESCA_ADDR, 9 << 8);  //BPM:COIO
+    //OHCI_WRITE_MASK(USB_OHCI_HC_RH_DESCA_ADDR, ~(6 << 8));  //BPM:COIO
+
+    // original code to enable ARM9 host controller's global port power
+    //OHCI_WRITE_MASK(USB_OHCI_HC_RH_DESCB_ADDR, 0); //BPM:COIO
+    // Note: ARM9 OHCI controller has problems with per port powering scheme,
+    // but since there is only 1 port, we can use global port powering scheme
+    ohci_write_reg(USB_OHCI_HC_RH_DESCA_ADDR,
+           ohci_read_reg(USB_OHCI_HC_RH_DESCA_ADDR) & ~OHCI_NPS);
+
+    ohci_write_reg(USB_OHCI_HC_RH_DESCA_ADDR,
+           ohci_read_reg(USB_OHCI_HC_RH_DESCA_ADDR) & ~OHCI_PSM);
+
+    //set LPSC global power ON BPM:COIO
+    //OHCI_WRITE_SET(USB_OHCI_HC_RH_STATUS_ADDR, 0x10000);
+    ohci_write_reg(USB_OHCI_HC_RH_STATUS_ADDR,
+           ohci_read_reg(USB_OHCI_HC_RH_STATUS_ADDR) | OHCI_LPSC);
+
+    ohci_write_reg(USB_OHCI_HC_CONTROL_ADDR,
+	    OHCI_USB_OPER | OHCI_CTL_CLE | OHCI_CTL_BLE | OHCI_CTL_PLE
+       );
+
+    ohci_write_reg(USB_OHCI_HC_RH_PORT_STAT_ADDR,
+           ohci_read_reg(USB_OHCI_HC_RH_PORT_STAT_ADDR) | 1);
+
+usboshexit:
+    return result;
+}
+
+
+/*** BeginHeader usbOhciTask */
+	__root void usbOhciTask (void *data);
+	extern int firstTimeFlag;
+/*** EndHeader */
+   int firstTimeFlag;
+
+//
+// This function is the entry function for the OHCI thread.
+// The function waits on a semaphore for a root hub status change event.
+//
+_usbohci_debug
+__root void usbOhciTask (void *data)
+{
+    auto int result;
+    auto int maxport;
+    auto int port;
+    auto int status;
+    unsigned i;
+    unsigned long value;
+	 auto OS_EVENT pevent;
+    auto OS_SEM_DATA pdata;
+
+#GLOBAL_INIT{ firstTimeFlag=1;}
+
+    result = 0;
+
+#if USBOHCI_VERBOSE
+    printf( "usbOhciTask: starting...\n");
+#endif
+    // Wait for the usbOhciInterruptService interrupt to increment the semaphore
+    for (;;)
+    {
+		  // Wait for semaphore
+  	     usb_ucos_sem_pend(root_hub_status_change_sem,500);
+#if USBOHCI_VERBOSE
+        printf("usbOhciTask: root hub status change event occurred!\n");
+#endif
+
+        if (DeviceData->reset_ohci)
+        {
+            // Try to recover from Unrecoverable Error interrupt.
+            DeviceData->reset_ohci = FALSE;
+
+            result = usbOhciStartHcd();
+            USB_RES_CHK("usbOhciTask: usbOhciStartHcd() failed\n", usbtskexit);
+            maxport = (int)ohci_read_reg(USB_OHCI_HC_RH_DESCA_ADDR) & 0xff;
+            for (port = 0; port < maxport; port++)
+            {
+                result = usbOhciResetPort(port + 1);
+                USB_RES_CHK("usbOhciTask: usbOhciResetPort() failed\n", usbtskexit);
+            }
+#if USBOHCI_VERBOSE
+            printf(
+             "usbOhciTask: Attempting to recover from a Unrecoverable Error\n");
+#endif
+        }
+        else
+        {
+
+            //usb_ucos_sem_pend(hub_status_change_sem, 0);
+
+            result = usbOhciCheckRootHubStatus();
+            if (result)
+            {
+#if USBOHCI_VERBOSE
+		       	 printf("usbOhciTask: Enumeration error\n");
+					 //SJH usb_ucos_sem_post(root_hub_status_change_sem);  //BPM
+#endif
+                //"usbOhciTask: usbOhciCheckRootHubStatus() failed\n"
+                // DO NOT exit function to allow handling enumeration
+                // errors by disconnecting and reconnecting device
+            }
+            ohci_write_reg(USB_OHCI_HC_INT_EN_ADDR, OHCI_INTR_RHSC);
+
+#if USBOHCI_VERBOSE > 2
+				//usb_dump_ohci();
+            printf("posting hub_status_change_sem\n");
+#endif
+
+            usb_ucos_sem_post(hub_status_change_sem);
+
+#if USBOHCI_VERBOSE > 2
+            printf("hub_status_change_sem posted\n");
+#endif
+        }
+      }  // End for
+usbtskexit:
+   ;//FIXME: an empty statement here prevents a compiler error
+}
+
+
+/*** BeginHeader usbOhciRootHubConnectionStatusChange */
+__xmem int usbOhciRootHubConnectionStatusChange(int port);
+/*** EndHeader */
+
+//
+// This function processes a root hub status change event
+// for the specified port.
+ _usbohci_debug
+__xmem int usbOhciRootHubConnectionStatusChange(int port)
+{
+    auto word portaddr;
+    auto usbDevice __far *usb;
+    auto int err, result;
+    auto unsigned long portstatus;
+
+
+    result = 0;
+
+    USBOHCI_ASSERT((port >= 0) && (port < MAX_ROOT_PORTS));
+    if (port < 0 || port > MAX_ROOT_PORTS)
+    {
+        USB_PRINTF_ERR;
+        //printf( "usbOhciRootHubConnectionStatusChange: Invalid port number\n");
+        result = USBH_INVALID_PORT_NUMBER;
+        goto usbrhcscexit;
+    }
+    portaddr = USB_OHCI_HC_RH_PORT_STAT_ADDR;
+
+    portstatus = ohci_read_reg(portaddr);
+
+    firstTimeFlag=0;
+
+    //
+    // Because of the status change we have to forget
+    // everything we think we know about the device
+    // on this root hub port.  It may have changed.
+//BPM - disconnecting needs some work
+    result = usb_disconnect_device(
+          (UINT32)DeviceData->usb->children+port,
+            &err
+            );
+
+ //BPM   USB_RES_CHK("usbOhciRootHubConnectionStatusChange: usb_disconnect_device() failed\n", usbrhcscexit);
+
+    // disable the port if nothing is connected
+    if (!(portstatus & PORT_CCS) )
+    {
+        ohci_write_reg(portaddr, PORT_CCS);
+#if USBOHCI_VERBOSE
+        printf(
+          "usbOhciRootHubConnectionStatusChange: Device is disconnected from root hub port %d\n",
+          port);
+#endif
+        goto usbrhcscexit;
+    }
+#if USBOHCI_VERBOSE
+    printf("usbOhciRootHubConnectionStatusChange: Device is connected to port %d\n", port);
+#endif
+
+    // Allocate a data structure used to store information
+    // about the device connected to the root hub
+    result = usbOhciUsbAllocate(NULL, &usb);
+    USB_RES_CHK("usbOhciRootHubConnectionStatusChange: usbOhciUsbAllocate() failed\n", usbrhcscexit);
+#if USBOHCI_VERBOSE
+    printf("usbOhciRootHubConnectionStatusChange: Allocated usbDevice %p\n",
+               (void __far *)DeviceData->usb);
+#endif
+
+    // Initialize the device structure
+    if(usb_connect_device(usb, &err))
+    {
+        USB_PRINTF_ERR;
+        //printf( "usbOhciRootHubConnectionStatusChange: usb_connect_device() failed\n");
+        result = err;
+		  goto usbrhcscexit;
+    }
+    // link it into the bus's device tree
+    DeviceData->usb->children[port] = usb;
+
+    // Enable the port
+    ohci_write_reg(USB_OHCI_HC_RH_PORT_STAT_ADDR, PORT_PES);
+
+    result = usbOhciWaitForPortEnabled(port);
+    if (result)
+    {
+#if USBOHCI_VERBOSE
+        printf( "usbOhciRootHubConnectionStatusChange: usbOhciWaitForPortEnabled() failed\n");
+#endif
+         goto usbrhcscexit;
+    }
+
+    // Enable the interrupts we care about
+    usbOhciEnableAllInterrupts();
+
+
+    // Reset the specified port
+    result = usbOhciResetPort(port);
+    USB_RES_CHK("usbOhciRootHubConnectionStatusChange: usbOhciResetPort() failed\n", usbrhcscexit);
+
+    // Get speed information
+    usb->Speed = ohci_read_reg(portaddr) & PORT_LSDA ? USB_DEVICE_LOW_SPEED : USB_DEVICE_FULL_SPEED;
+
+    // Save the port number
+    usb->parent_port = port;
+
+
+    // Do generic USB device tree processing on the new device
+    usb->devnum = 0;
+    if (!usb_check_new_device(usb, &err))
+    {
+        //usb->devnum = port + 1; //BPM ocmmented out in orig.
+        if (usb_get_device_number(usb, &err))
+        {
+           	USB_PRINTF_ERR;
+            //"usbOhciRootHubConnectionStatusChange: usb_get_device_number() failed\n"
+            result = err;
+            goto usbrhcscexit;
+        }
+        if (usb_enumerate_device(usb, &err))
+        {
+            USB_PRINTF_ERR;
+            //"usbOhciRootHubConnectionStatusChange: usb_enumerate_device() failed\n"
+            result = err;
+
+            // enumeration failed, so return the device number to the device number table
+            if (usb_put_device_number(usb, &err))
+            {
+				    USB_PRINTF_ERR;
+                //"usbOhciRootHubConnectionStatusChange: usb_get_device_number() failed\n"
+                result = err;
+            }
+            goto usbrhcscexit;
+        }
+    }
+    else
+    {
+        USB_PRINTF_ERR;
+        //"usbOhciRootHubConnectionStatusChange: usb_check_new_device() failed\n"
+        result = err;
+    }
+usbrhcscexit:
+    return result;
+}
+
+
+/*** BeginHeader usbOhciCheckRootHubStatus */
+__xmem int usbOhciCheckRootHubStatus();
+/*** EndHeader */
+//
+// This function is called by the OHCI thread when the root hub connect
+// status has changed.  The function checks the status of each port and
+// proceeds accordindly.
+//
+_usbohci_debug
+__xmem int usbOhciCheckRootHubStatus()
+{
+    auto int num, result;
+    auto int maxport;
+    auto unsigned long portstatus;
+#GLOBAL_INIT{
+    firstTimeFlag = 1;
+}
+    num = 0; result = 0;
+    maxport = (int)ohci_read_reg(USB_OHCI_HC_RH_DESCA_ADDR) & 0xff;
+
+    if (maxport > MAX_ROOT_PORTS)
+    {
+        maxport = MAX_ROOT_PORTS;
+    }
+
+    // allow time for switch debouncing to settle
+    OSTimeDlyHMSM(0,0,0,SWITCH_DEBOUNCE_DELAY_MS);
+    //do		//SJH - only one port
+    //{
+	     portstatus =
+            ohci_read_reg(USB_OHCI_HC_RH_PORT_STAT_ADDR);
+
+		  firstTimeFlag =  (int)(firstTimeFlag & (portstatus & 1));
+#if USBOHCI_VERBOSE
+        printf("usbOhciCheckRootHubStatus: portstatus is 0x%08lx for port %d\n",
+                   portstatus, num);
+#endif
+
+        if (portstatus & PORT_PESC){
+            ohci_write_reg(USB_OHCI_HC_RH_PORT_STAT_ADDR, PORT_PESC);
+        }
+
+//        if (((portstatus & PORT_CSC) || firstTimeFlag)
+//           && !(portstatus & 0x200ul) )
+
+
+        if (( portstatus  & PORT_CSC )
+             || (firstTimeFlag)
+//           && !(portstatus & 0x200ul)
+        )
+
+        {
+            firstTimeFlag = 0;
+
+            // process the root hub connect status change event
+            ohci_write_reg(USB_OHCI_HC_RH_PORT_STAT_ADDR, PORT_CSC);
+            result = usbOhciRootHubConnectionStatusChange(num);
+				USB_RES_CHK("usbOhciCheckRootHubStatus: usbOhciRootHubConnectionStatusChange() failed", usbcrhsexit);
+        }
+        else {;}
+        DeviceData->lastportstatus[num] =
+            ohci_read_reg(USB_OHCI_HC_RH_PORT_STAT_ADDR);
+    //}
+    //while (++num < maxport);
+
+usbcrhsexit:
+    return result;
+}
+
+/*** BeginHeader usbOhciResetPort */
+__xmem int usbOhciResetPort(unsigned int port);
+/*** EndHeader */
+
+//
+// Reset a root hub port
+//
+_usbohci_debug
+__xmem int usbOhciResetPort(unsigned int port)
+{
+    auto int          result;
+    auto unsigned long portstatus, ms, POTPGT, descriptor_a;
+
+    result = 0;
+    portstatus = 0, ms=0, POTPGT=0, descriptor_a;
+
+
+    // Check for valid port number
+    USBOHCI_ASSERT(port < MAX_ROOT_PORTS);
+    if (port >= MAX_ROOT_PORTS)
+    {
+        USB_PRINTF_ERR;
+        //printf("usbOhciResetPort: Invalid port number\n");
+        result = USBH_INVALID_PORT_NUMBER;
+        goto usborpexit;
+    }
+
+    // There is minimum 100ms delay required by the USB specification
+    // before driving the bus to allow bus powered USB devices to be
+    // power stable.  Some devices need a longer power stable delay,
+    // so we wait delay more than 100ms
+    OSTimeDlyHMSM(0,0,0,150);
+
+    // Get the time required for a root hub port to reset and wait it out
+    portstatus = ohci_read_reg(USB_OHCI_HC_RH_PORT_STAT_ADDR);
+
+    descriptor_a = ohci_read_reg(USB_OHCI_HC_RH_DESCA_ADDR);
+    POTPGT       = (descriptor_a >> 24); // Power on to Power Good Time
+    ms           = POTPGT * 2;
+
+    //BPM:COIO
+    // ms *= 10;  // Allow extra time for port reset to settle
+
+    // Port Reset, POTPGT field in HcRhDescriptorA
+    ohci_write_reg(USB_OHCI_HC_RH_PORT_STAT_ADDR, PORT_PRS);
+
+    OSTimeDlyHMSM(0,0,0,(int)ms);
+
+    // check port status to see that the reset completed
+    portstatus = ohci_read_reg(USB_OHCI_HC_RH_PORT_STAT_ADDR);
+#if USBOHCI_VERBOSE
+    printf( "ohciResetPort: after port reset, portstatus=0x%08x\n", portstatus);
+#endif
+    if (portstatus & PORT_PESC)
+    {
+#if USBOHCI_VERBOSE
+        printf(  "ohciResetPort: port enable status change\n");
+#endif
+        ohci_write_reg(USB_OHCI_HC_RH_PORT_STAT_ADDR, PORT_PESC);
+    }
+    if (portstatus & PORT_CCS)
+    {
+#if USBOHCI_VERBOSE
+        printf(  "ohciResetPort: a device is connected\n");
+#endif
+    }
+    if (portstatus & PORT_CSC)
+    {
+#if USBOHCI_VERBOSE
+        printf(  "ohciResetPort: connect status change\n");
+#endif
+    }
+    if (portstatus & PORT_PRS)
+    {
+#if USBOHCI_VERBOSE
+        printf( "ohciResetPort: port reset not complete after %d ms\n", (int)ms);
+#endif
+        while (portstatus & PORT_PRS)
+        {
+            OSTimeDlyHMSM(0,0,0,MIN_SLEEP_INTERVAL_MS);
+            portstatus = ohci_read_reg(USB_OHCI_HC_RH_PORT_STAT_ADDR);
+        }
+#if USBOHCI_VERBOSE
+        printf(  "ohciResetPort: port reset finally completed\n");
+#endif
+    }
+    if (portstatus & PORT_PRSC)
+    {
+#if USBOHCI_VERBOSE
+        printf(  "ohciResetPort: port reset is complete.\n");
+#endif
+        ohci_write_reg(USB_OHCI_HC_RH_PORT_STAT_ADDR, PORT_PRSC);
+    }
+
+    // re-enable the port
+    ohci_write_reg(USB_OHCI_HC_RH_PORT_STAT_ADDR, PORT_PES);
+    portstatus = ohci_read_reg(USB_OHCI_HC_RH_PORT_STAT_ADDR);
+#if USBOHCI_VERBOSE
+    printf( "ohciResetPort: port enabled, portstatus=0x%08lx - %d\n", portstatus, port);
+#endif
+
+    if (portstatus & PORT_PRSC)
+    {
+#if USBOHCI_VERBOSE
+        printf("ohciResetPort: PortResetStatusChange not cleared\n");
+#endif
+        ohci_write_reg(USB_OHCI_HC_RH_PORT_STAT_ADDR, PORT_PRSC);
+    }
+
+usborpexit:
+    return result;
+}
+
+
+
+/*** BeginHeader usbOhciUsbDeallocate */
+int usbOhciUsbDeallocate(usbDevice __far * usbDev);
+/*** EndHeader */
+//
+// This function deallocates a usbDevice and frees the associated endpoints.
+//
+_usbohci_debug
+__xmem
+int usbOhciUsbDeallocate(usbDevice __far * usbDev)
+{
+    auto HCD_ENDPOINT_DESCRIPTOR __far *edData;
+    auto int result;
+    auto unsigned int i;
+    auto unsigned int status;
+    auto unsigned long intenable;
+    auto unsigned long control;
+
+    edData = NULL;
+    result = 0;
+
+    USB_NULL_PTR_CHKFAT(usbDev, USBH_NULL_POINTER, usbocidaexit);
+
+    edData= (HCD_ENDPOINT_DESCRIPTOR __far *)usbDev->hcEdData;
+#if USBOHCI_VERBOSE
+    printf("usbOhciUsbDeallocate: This device had %d EDs\n", edData->nEds);
+#endif
+    // Disable list processing
+    control = ohci_read_reg(USB_OHCI_HC_CONTROL_ADDR);
+    control &= ~(OHCI_CTL_CLE | OHCI_CTL_BLE | OHCI_CTL_PLE | OHCI_CTL_IR);
+    ohci_write_reg(USB_OHCI_HC_CONTROL_ADDR, control);
+
+    // Enable the SOF interrupt
+    intenable = ohci_read_reg(USB_OHCI_HC_INT_EN_ADDR);
+    intenable |= OHCI_INTR_SF;
+    ohci_write_reg(USB_OHCI_HC_INT_EN_ADDR, intenable);
+
+    // Wait for the SOF semaphore to confirm that list processing has stopped
+     usb_ucos_sem_pend(start_of_frame_sem,0);
+
+    // Disable the SOF interrupt
+    intenable &= (~OHCI_INTR_SF);
+    ohci_write_reg(USB_OHCI_HC_INT_DIS_ADDR, ~intenable);
+
+    for (i = 0; i < edData->nEds; i++)
+    {
+        // Remove EDs
+        result = usbOhciRemoveEd(edData->ed[i]);
+        if (result)
+        {
+            USB_PRINTF_ERR;
+            //printf(
+            //  "usbOhciUsbDeallocate: usbOhciRemoveEd() failed, i=%d, ed=%08lx\n",
+            //  i, edData->ed[i]);
+            goto usbocidaexit;
+        }
+    }
+
+    // Enable list processing
+    control |= OHCI_CTL_CLE | OHCI_CTL_BLE | OHCI_CTL_PLE ;
+    ohci_write_reg(USB_OHCI_HC_CONTROL_ADDR, control);
+
+	 //SJH - changed to use pools
+	 pffree(&usb_dev_list, usbDev);
+
+#if USBOHCI_VERBOSE
+    printf("usbOhciUsbDeallocate: EDs removed\n");
+#endif
+
+usbocidaexit:
+    return result;
+}
+
+/*** BeginHeader usbOhciRemoveEd */
+__xmem int usbOhciRemoveEd(HCD_ENDPOINT __far *ed);
+/*** EndHeader */
+//
+// This function frees the transfer descriptors linked to the endpoint
+// and then frees the endpoint.
+//
+_usbohci_debug
+__xmem int usbOhciRemoveEd(HCD_ENDPOINT __far *ed)
+{
+    auto unsigned long status;
+    auto HCD_TRANSFER_DESCRIPTOR __far *tailTd;
+    auto HCD_TRANSFER_DESCRIPTOR __far *td;
+    auto HCD_TRANSFER_DESCRIPTOR __far *nextTd;
+    auto long ntd;
+    auto int result;
+    auto long MPS;
+    auto usbDevice __far * usbDev;
+    auto HCD_ENDPOINT __far * nextEd;
+
+    td = NULL; tailTd = NULL;
+    nextTd = NULL;
+    ntd = 0ul; result = 0ul;
+    usbDev = NULL;
+
+    USB_NULL_PTR_CHKFAT(ed, USBH_NULL_POINTER, usbohcireexit);
+
+    USB_NULL_PTR_CHKFAT(ed->baseEd , USBH_NULL_POINTER, usbohcireexit);
+
+    usbDev = ed->usbDev;
+
+    status = ohci_read_mem(ed->status);
+    MPS = status >> 16ul & 0xfffUL;
+
+
+#if USBOHCI_VERBOSE
+    printf("ohciRemoveEd: ED=%08lx EpAddr=%08lx EpNum=%08lx MPS=%08lx\n",
+      (void  __far*)ed, (status & 0x7f), (status >> 7 & 0xf), MPS);
+
+    printf("ohciRemoveEd: Base ED=%08lx bandwidth=%08lx\n", (void __far*)ed->baseEd,
+               ed->baseEd->bandWidth);
+#endif
+
+    ed->baseEd->bandWidth -= MPS;
+
+    if (ed->request)
+    {
+#if USBOHCI_VERBOSE
+        printf("ohciRemoveEd: Freeing request=%08lx\n", (void __far*)ed->request);
+#endif
+        pffree(&usb_req_list, ed->request);
+    }
+
+    USB_NULL_PTR_CHKFAT(ed->prevEd, USBH_NULL_POINTER, usbohcireexit);
+
+    // Prevent host controller from processing this ED
+    // ed->prevEd->status|=ohci_context->ohci_read_mem(OHCI_ED_SKIP);//BPM:COIO
+
+    //
+    // Unlink the ED from the physical ED list.
+    //
+    if (ed->nextEd)
+    {
+        // Convert back from a physical to virtual address
+        nextEd =  (HCD_ENDPOINT __far *)ohci_read_address(ed->nextEd);
+
+        USB_NULL_PTR_CHKFAT(nextEd, USBH_NULL_POINTER, usbohcireexit);
+        nextEd->prevEd = ed->prevEd;
+        ed->prevEd->nextEd = ed->nextEd;
+    }
+    else
+        ed->prevEd->nextEd = 0;
+
+    USB_NULL_PTR_CHKFAT((void __far*)ed->headTd , USBH_NULL_POINTER, usbohcireexit);
+
+    USB_NULL_PTR_CHKFAT((void __far*)ed->tailTd , USBH_NULL_POINTER, usbohcireexit);
+
+    // Free up any ED's associated with this endpoint.
+    //
+    td = (HCD_TRANSFER_DESCRIPTOR __far *)(ohci_read_address(ed->headTd) & (~3UL));
+
+    USB_NULL_PTR_CHKFAT(td , USBH_NULL_POINTER, usbohcireexit);
+
+    tailTd = (HCD_TRANSFER_DESCRIPTOR __far *)ohci_read_address(ed->tailTd);
+
+    USB_NULL_PTR_CHKFAT(tailTd , USBH_NULL_POINTER, usbohcireexit);
+
+    while (td)
+    {
+        nextTd = (HCD_TRANSFER_DESCRIPTOR __far *)ohci_read_address(td->nextTd);
+
+        // Null pointer check not needed for nextTd, because
+        // that indicates it's the last TD on the list
+
+#if USBOHCI_VERBOSE
+        printf("usbOhciRemoveEd: %dth free td=%08lx\n", ntd, (void __far *) td);
+#endif
+        free_td(td);
+        ntd++;
+
+#if 0  //BPM:COIO
+        if (td == (HCD_TRANSFER_DESCRIPTOR __far*)ed->tailTd)
+            break;
+#else
+        // Replace the above code with the following code
+        if (td == tailTd)
+            break;
+#endif
+        td = nextTd;
+    }
+    // Clear the skip bit
+    // ed->prevEd->status &= ohci_read_mem(~OHCI_ED_SKIP);  //BPM:COIO
+
+    free_ed(ed);
+
+usbohcireexit:
+    return result;
+}
+
+/*** BeginHeader free_td */
+__xmem int free_td(void __far *td);
+/*** EndHeader */
+//
+// This function returns a transfer descriptor to the TD list for reuse.
+//
+__nodebug
+__xmem int free_td(void __far *td)
+{
+	//SJH - reimplemented to use pools
+	pffree(&td_list, td);
+	return 0;
+}
+
+/*** BeginHeader free_ed */
+__xmem int free_ed(void __far *ed);
+/*** EndHeader */
+//
+// This function returns an endpoint to the ED list for reuse
+//
+__nodebug
+__xmem int free_ed(void __far *ed)
+{
+	//SJH - reimplemented to use pools
+	pffree(&ed_list, ed);
+	return 0;
+}
+
+
+/***********************************************************************
+ Send or receive a control or bulk message on a "pipe"
+
+ This is the routine which is called to send out all
+ USB requests, it sets up the TD's and tells the OHCI
+ to send the TD's.
+ NOTE: A zero timeout indicates this function will kick off the
+ request but will not block, the callback routine will be called
+ from an ISR and will be passed the context.
+***********************************************************************/
+/*** BeginHeader usbOhciQueueGeneralRequest */
+int usbOhciQueueGeneralRequest(usbDevice __far *usb, unsigned long pipe,
+										 devrequest __far *cmd, char __far *data, long len,
+                               long __far *xferred, int timeout,
+                               USB_CALLBACK callback);
+/*** EndHeader */
+
+_usbohci_debug
+__xmem
+int usbOhciQueueGeneralRequest(usbDevice __far *usb, unsigned long pipe,
+										 devrequest __far *cmd, char  __far *data, long len,
+                               long __far *xferred, int timeout,
+                               USB_CALLBACK callback)
+{
+    //USBD_REQUEST request_block; //BPM:COIO
+    //USBD_REQUEST *request = &request_block; //BPM:COIO
+    auto int intsoff;
+    auto USBD_REQUEST __far * request;
+    auto HCD_ENDPOINT __far *ed;
+    auto HCD_ENDPOINT __far *baseEd;
+    auto HCD_TRANSFER_DESCRIPTOR __far *td;
+    // HCD_TRANSFER_DESCRIPTOR *firstTd = NULL; //BPM:COIO
+    auto HCD_TRANSFER_DESCRIPTOR __far *nextTd;
+    //HCD_TRANSFER_DESCRIPTOR *TD[MAX_TDS];   //BPM:COIO
+    auto HCD_TRANSFER_DESCRIPTOR __far *firstDataTd ;
+    auto HCD_TRANSFER_DESCRIPTOR __far *lastTd;
+    auto unsigned long dataTdInfo;
+    auto int numTDs;
+    auto long EndpointNumber, FunctionAddress, epType, epDir, xtra;
+    auto int ntd;
+    // unsigned int toggle, td_toggle; //BPM:COIO
+    auto unsigned long controlEp;
+    auto long int maxpacketsize;
+    // void *bufEnd = NULL; //BPM:COIO
+    auto unsigned int del_request_sem, result;
+    auto unsigned int status;
+    auto unsigned int general_request_sem_returned, async_request_sent;
+    auto long count;
+    auto int partial_td_found, toggle_carry_bit;
+    auto unsigned long curbuf, bufend;
+    auto HCD_TRANSFER_DESCRIPTOR __far *freetd;
+    auto unsigned int free_result;
+    auto char rcode;
+    auto int _Len;
+
+#if USBOHCI_VERBOSE > 1
+	printf("QGR: pipe=%08lX len=%ld timeout=%d\n",
+			pipe, len, timeout);
+#endif
+
+    request = NULL;
+    ed = NULL;
+    baseEd = NULL;
+    td = NULL;
+    nextTd = NULL;
+    firstDataTd = NULL;
+    lastTd = NULL;
+    numTDs = 0;
+    EndpointNumber = (pipe >> 15) & 0xf;
+    FunctionAddress = (pipe >> 8) & 0x7f;
+    epType = (pipe >> 30) & 3;
+    epDir = (pipe >> 7) & 1;
+    controlEp = FALSE;
+    del_request_sem = 0; result = 0;
+    general_request_sem_returned = 0;
+    async_request_sent = 0;
+    intsoff = 0;
+
+    // Only the first pointer argument MUST be non-NULL
+    USB_NULL_PTR_CHKFAT(usb, USBH_NULL_POINTER, usbqgrexit);
+
+
+#if USE_GENERAL_REQUEST_SEMAPHORE
+    if (timeout)
+    {
+  #if USBOHCI_VERBOSE > 2
+        //printf("pending general_request_sem\n");
+  #endif
+        usb_ucos_sem_pend(general_request_sem,0);
+  #if USBOHCI_VERBOSE > 2
+        //printf("general_request_sem pended\n");
+  #endif
+    }
+#endif
+
+	//SJH - changed to use mem pool.  Also calloc used to zero fields.
+    request = pfcalloc(&usb_req_list);
+
+    USB_NULL_PTR_CHK(request, USBH_NULL_POINTER, usbqgrexit);
+
+    if (!timeout)
+        request->callback = callback;
+    request->timeout = timeout;
+
+    if (cmd)
+        _f_memcpy(request->Setup, cmd, 8);
+
+    if (!USB_PIPE_OUT(pipe)) //&& (epType == USB_PIPE_TYPE_CONTROL))  //BPM:COIO JW: Allow short transfers for control and bulk IN
+        request->ShortXferOk = TRUE;
+
+    request->Status = USBD_NOT_DONE;
+    request->Buffer = data;
+    //request->BufferLength = 0;  //report back bytes transferred so far
+
+    if (timeout)
+    {
+#if USBOHCI_VERBOSE > 2
+        //printf("create request->sem\n");
+#endif
+         request->sem = OSSemCreate(0);
+			if( request->sem == NULL ){
+		      exception(USB_SEMAPHORE_ERROR);
+		      exit(USB_SEMAPHORE_ERROR);
+		   }
+    }
+
+    request->XferInfo = USB_PIPE_OUT (pipe) ? OHCI_TD_D_OUT : OHCI_TD_D_IN;
+    request->completed = usbOhciGeneralRequestCallback;
+    request->device_id = usb;
+    request->PeriodicXfer = FALSE;
+
+    INIT_LIST_HEAD(&request->HcdList);
+
+	maxpacketsize = 8 << ((word)pipe & 3);
+
+    // Try to add the new pipe
+    switch ((int)epType)
+    {
+      case (int)USB_PIPE_TYPE_CONTROL:
+        controlEp = TRUE;
+        baseEd = DeviceData->pEd[ED_CONTROL];
+        break;
+      case (int)USB_PIPE_TYPE_BULK:
+        baseEd = DeviceData->pEd[ED_BULK];
+        break;
+      case (int)USB_PIPE_TYPE_ISOCHRONOS:
+        baseEd = DeviceData->pEd[ED_ISOCHRONOUS];
+      default:
+        USB_PRINTF_ERR; //  "usbOhciQueueGeneralRequest: epType is invalid\n"
+        del_request_sem = 1;
+        result = USBH_INVALID_ENDPOINT_TYPE;
+        goto usbqgrexit;
+    }
+    result = usbOhciInsertEDForEndpoint(usb, maxpacketsize, USB_PIPE_SLOW (pipe), EndpointNumber,
+                                        FunctionAddress, epType, epDir, baseEd, FALSE);
+
+    if (!result)
+    {
+        result = usbOhciGetEd(usb, EndpointNumber, FunctionAddress, epType, epDir, baseEd, &ed);
+        if (!result)
+        {
+            USB_NULL_PTR_CHKFAT(ed, USBH_NULL_POINTER, usbqgrexit);
+        }
+        else
+        {
+            //"usbOhciQueueGeneralRequest: usbOhciGetEd() failed\n"
+            USB_PRINTF_ERR;
+            goto usbqgrexit;
+        }
+    }
+
+    TX_DISABLE;
+    intsoff = 1; // BPM
+
+    // Set the sKip bit
+    ed->status |= ohci_read_mem(OHCI_ED_SKIP);
+
+    // New code adds the new TDs to the tail TD which allows multiple threads to
+    // queue TDs to the same endpoint and is consistent with OHCI specification
+    td = (HCD_TRANSFER_DESCRIPTOR __far *)ed->tailTd;
+
+    USBOHCI_ASSERT(td != NULL);
+    if (td == NULL)
+    {
+        USB_PRINTF_ERR;
+        //"usbOhciQueueGeneralRequest: td is NULL\n"
+        result = USBH_NULL_POINTER;
+        goto usbqgrexit;
+    }
+
+    //firstTd = //BPM:COIO
+    request->TD[numTDs++] = td;
+    if (controlEp)
+    {
+        // Setup a TD for setup packet
+        InsertTailList(&request->HcdList, &td->RequestList);
+        td->request = request;
+        td->Endpoint = ed;
+        td->TransferCount = 0;
+
+        //
+        // Set the not accessed condition code, allow odd sized data,
+        // and set the data transfer type to SETUP.  Setup DATA always
+        // uses a DATA0 packet.
+        //
+        td->info = ohci_read_mem((OHCI_TD_CC_NEW | OHCI_TD_ROUND   |
+                                 OHCI_TD_D_SETUP | OHCI_TD_IOC_OFF |
+                                 td_force_toggle (0))
+                             );
+
+        td->curBuf = (unsigned long)request->Setup;
+        td->bufEnd = (unsigned long)(request->Setup + 7);
+
+        // link to a free TD for the control data input
+        result = alloc_td(&nextTd);
+        if (result)
+        {
+            USB_PRINTF_ERR;
+            // "usbOhciQueueGeneralRequest: alloc_td() failed\n"
+            goto usbqgrexit;
+        }
+#if USBOHCI_VERBOSE > 2
+        //printf("QGR (ctrl): nextTd=%08lx\n", nextTd);
+#endif
+        request->TD[numTDs++] = nextTd;
+
+        td->nextTd = nextTd;
+        lastTd = td;
+        td = nextTd;
+
+    }
+
+    //
+    // Setup TD(s) for data packets
+    //
+    _Len = 0;
+    while ((len > 0) || (lastTd == NULL))
+    {
+        InsertTailList(&request->HcdList, &td->RequestList);
+
+        td->request = request;
+        td->Endpoint = ed;
+
+        if (!firstDataTd)
+            firstDataTd = td;
+
+        if (len)
+        {
+            count = 0x2000 - ((int)data & 0xfff);
+            if (count < len)
+                count -= count % maxpacketsize;
+            else
+                count = len;
+        }
+        else
+            td->curBuf = td->bufEnd = count = 0;
+
+        td->TransferCount = count;
+
+        dataTdInfo = (OHCI_TD_CC_NEW) | (OHCI_TD_IOC_OFF) | request->XferInfo;
+        if ((len - count) || request->ShortXferOk)
+            dataTdInfo |= OHCI_TD_ROUND;
+        if (controlEp)
+            dataTdInfo |= td_force_toggle(1);
+        else
+        {
+            // This new code sets the bulk transfer data TDs to acquire
+            // the DATA0/1 toggle carry bit from the endpoint's head TD
+            dataTdInfo &= ~(2UL << 24);
+        }
+
+        td->info  = ohci_read_mem(dataTdInfo);
+
+        td->curBuf = (long)ohci_read_address(data);
+
+        td->bufEnd = (long)ohci_read_address((char __far*)data + count - 1);
+
+        data = count + (char __far *)data;
+        len -= (int)count;
+        _Len += (int)count;          //BPM kludge or fix?
+        result = alloc_td(&nextTd);
+        if (result)
+        {
+            USB_PRINTF_ERR;
+            //"usbOhciQueueGeneralRequest: alloc_td() failed\n"
+            goto usbqgrexit;
+        }
+#if USBOHCI_VERBOSE > 2
+        //printf("QGR0: nextTd=%08lx\n", nextTd);
+#endif
+
+        request->TD[numTDs++] = nextTd;
+
+        lastTd = td;
+
+        td->nextTd = nextTd;
+        td = nextTd;
+    } // End while
+
+
+    if (controlEp)
+    {
+        // Setup TD for status phase
+        // Point it at the newly allocated TD from above
+        InsertTailList(&request->HcdList, &td->RequestList);
+
+        td->request = request;
+        td->Endpoint = ed;
+        td->TransferCount = 0;
+
+        // The control status packet always uses a DATA1
+        td->info = ohci_read_mem((OHCI_TD_CC_NEW | OHCI_TD_IOC_OFF | td_force_toggle(1)));
+
+
+        if (request->XferInfo == OHCI_TD_D_OUT)
+            td->info |= ohci_read_mem(OHCI_TD_D_IN);
+
+        else
+            td->info |= ohci_read_mem(OHCI_TD_D_OUT);
+
+        td->nextTd = 0;         // end of TDs
+        td->curBuf = 0;         // no data in this packet
+        td->bufEnd = 0;
+
+        result = alloc_td(&nextTd);
+        if (result)
+        {
+            USB_PRINTF_ERR;
+            //"usbOhciQueueGeneralRequest: alloc_td() failed\n"
+            goto usbqgrexit;
+        }
+
+        request->TD[numTDs++] = nextTd;
+#if USBOHCI_VERBOSE > 2
+        //printf("QGR1 (control): nextTd=%08lx\n", nextTd);
+#endif
+
+        td->nextTd = nextTd;
+        lastTd = td;
+        td     = nextTd;
+
+    }
+
+    //
+    // Set the last td.info with interrupt delay of less than 6.
+    // This delay should be small as possible for maximum speed.
+    lastTd->info = lastTd->info &(~(7UL << 21));
+
+    // Set the headTd and tailTd in ed
+    ed->tailTd = (UINT32)ohci_read_address(td);
+
+    ed->status = ed->status & ohci_read_mem(~OHCI_ED_SKIP); // Clear sKip bit
+
+    request->numTDs = numTDs;
+
+    ohci_write_reg(USB_OHCI_HC_CMD_STAT_ADDR,
+    		ohci_read_reg(USB_OHCI_HC_CMD_STAT_ADDR) | (controlEp ? 2 : 4));
+
+    intsoff = 0; // BPM
+    TX_RESTORE;
+
+#if USE_GENERAL_REQUEST_SEMAPHORE
+    // When the following code is commented out, queue and
+    // process TDs for one endpoint at a time to be safe
+    if (timeout)
+    {
+#if USBOHCI_VERBOSE > 2
+        //printf("posting general_request_sem\n");
+#endif
+        usb_ucos_sem_post(general_request_sem);
+        //BPM-DEVIDEA add error handling
+        general_request_sem_returned = 1;
+    }
+#endif
+
+    if(timeout)
+    {
+    //get result from ISR using message queue, wait for WDH
+	    OSSemPend(request->sem, timeout, (char*)&result);
+	    if(result != OS_NO_ERR)
+	    {
+	        partial_td_found = 0; toggle_carry_bit = 0;
+
+	        if (result != OS_TIMEOUT) //BPM more work for non-uCOS!
+	        {
+	            USB_PRINTF_ERR;
+	            //"usbOhciQueueGeneralRequest: semaphorePend() failed, %d\n"
+	        }
+	        //abort transfer
+	        //set the sKip bit in the endpoint descriptor
+	        ed->status = ed->status | OHCI_ED_SKIP;
+
+	        // Use tx_thread_sleep() to wait for the current 1 ms frame to be over
+	        // before canceling the transfer. For systems that use 1 ms and
+	        // 10 ms ticks, the wait is 2 ms and 10 ms respectively
+	        OSTimeDlyHMSM(0,0,0,2); //MIN_SLEEP_INTERVAL_MS);  // need 2 ms
+
+	        if (xferred != NULL)
+	        {
+	            *xferred = (unsigned long)request->BufferLength;
+	        }
+
+	        if (numTDs > MAX_TDS)
+	        {
+	            USB_PRINTF_ERR;
+	            //"usbOhciQueueGeneralRequest: Number of TD out of range %d > max=%d\n\n", numTDs, MAX_TDS);
+	            result = USBH_MAX_TD_COUNT_EXCEEDED;
+	            goto usbqgrexit;
+	        }
+
+	       if (numTDs > 0)
+	        for (ntd = 0; ntd < numTDs - 1; ntd++)
+	        {
+	            td = request->TD[ntd];
+	            USB_NULL_PTR_CHK(td, USBH_NULL_POINTER, usbqgrexit);
+
+	            if (td->curBuf)
+	            {
+	                count = 0;
+
+	                if (partial_td_found)
+	                {
+	                   // Since a partially completed TD was found,
+	                   // the remaining TDs in the queue are unprocessed
+	                   // by the ISR, so call RemoveEntryList()
+	                   // for each unprocessed TD
+
+	                   // remove entry from USBD_REQUEST list
+	                   RemoveEntryList(&td->RequestList);
+	                    continue;
+	                }
+
+	                if ((USB_PIPE_OUT(pipe)) || ( (!USB_PIPE_OUT(pipe)) &&
+	                    (!(request->BufferLength % maxpacketsize)) ) )
+
+	                {
+	                  // We need to convert these to physical addresses
+	                   curbuf = (UINT32)ohci_read_mem(td->curBuf);
+	                   bufend = (UINT32)ohci_read_mem(td->bufEnd);
+
+	                   count = (((bufend ^ curbuf) & 0xfffff000ul) ? 0x00001000ul : 0) +
+	                             (bufend & 0xfff) - (curbuf & 0xfff) + 1;
+	                   td->TransferCount -= count;
+
+	                   if ((ohci_read_mem(td->info) & OHCI_TD_D) != OHCI_TD_D_SETUP)
+	                   {
+	                       // request->BufferLength += td->TransferCount; //BPM:COIO
+	                       *xferred += (int)td->TransferCount; //BPM int big enough?
+	                   }
+
+	                   if (td->TransferCount > 0)
+	                   {
+	                       // we have a partially transferred TD that was cancelled
+	                       // so we must save the toggle carry
+	                       partial_td_found = 1;
+	                       if ( (ohci_read_mem(td->info) >> 24) & 1 )
+	                           toggle_carry_bit = 1;
+	                       else
+	                           toggle_carry_bit = 0;
+	                   }
+	                   else
+	                   {
+	                       // if we find a TD that has transferred no data, we must
+	                       // save the toggle carry bit from the endpoint's head TD
+	                       if (ohci_read_mem(ed->headTd) & 2)
+	                           toggle_carry_bit = 1;
+	                       else
+	                           toggle_carry_bit = 0;
+	                   }
+	                       // Since this TD was cancelled and not processed by
+	                       // the ISR, we need to call RemoveEntryList()
+
+	                       // remove entry from USBD_REQUEST list
+	                       RemoveEntryList(&td->RequestList); //
+	                }
+	            }
+
+	            // if td->curbuf is 0, meaning that the entire transfer was completed
+	            // RemoveEntryList() is called by the ISR, so don't call it again
+	        }
+
+	        ed->headTd = ed->tailTd; // JW: Set headTd equal to tailTd means no more TDs to process
+
+	        // Copy the saved toggle carry bit to the endpoints new head TD
+	        if (toggle_carry_bit)
+	            ed->headTd |= ohci_read_mem(2);
+	        else
+	            ed->headTd &= ohci_read_mem(~2UL);
+
+	        // Clear both the halt and skip bits
+	        ed->status &= ohci_read_mem(~OHCI_ED_SKIP);
+	        request->Status = result = USBH_TIMEOUT;
+	    }
+	    else
+	    {
+	        result = (int)request->Status;
+	        if (result)
+	        {
+	            ed->headTd = ed->tailTd;    // JW: Set headTd equal to tailTd to prevent freeing duplicate TDs in ohciRemoveEd()
+	        }
+	        if (xferred != NULL)
+	            *xferred = (unsigned long)request->BufferLength;
+	    }
+
+
+	    if(OSSemDel(request->sem, OS_DEL_ALWAYS, &rcode) != (OS_EVENT *)0)
+	    {
+	        USB_PRINTF_ERR;
+	        //"usbOhciQueueGeneralRequest: tx_semaphore_delete failed for request->sem\n"
+	        result = USBH_SEMAPHORE_ACCESS_FAILED;
+	        goto usbqgrexit;
+	    }
+	#if USBOHCI_VERBOSE > 2
+	    printf("deleted request->sem\n");
+	#endif
+	    if (numTDs > MAX_TDS)
+	    {
+	        USB_PRINTF_ERR;
+	        //"usbOhciQueueGeneralRequest: Number of TD out of range %d > max=%d\n\n", numTDs, MAX_TDS);
+	        result = USBH_MAX_TD_COUNT_EXCEEDED;
+	        goto usbqgrexit;
+	    }
+
+	    //
+	    // Free TDs except the last one
+	    // the last TD will be used in the next transaction.
+	    // We must always have a blank TD on the transfer descriptor
+	    // queue.
+	    //
+	    if (numTDs > 0)
+	      for (ntd = 0; ntd < numTDs - 1; ntd++)
+       {
+           freetd = request->TD[ntd];
+
+           // trace(USBHOST_TRACE, TRACE_INFO, "usbOhciQueueGeneralRequest: Free td=%p ndtd=%d %d\n",
+          //(void *)freetd, ntd, numTDs - 1); //BPM:COIO
+           USBOHCI_ASSERT(freetd != NULL);
+
+           free_td(freetd);
+       }
+
+	    //status = tx_block_release(request); //BPM:COIO
+	    //if (status != TX_SUCCESS)
+	    //{
+	    //    trace(USBHOST_TRACE, TRACE_CRITICAL, "usbOhciQueueGeneralRequest: tx_block_release() failed for request\n");
+	    //    result = USBH_BLOCK_POOL_ACCESS_FAILED;
+	    //    goto usbqgrexit;
+	    //}
+    }  // if timeout
+    else // timeout is 0
+    {
+        //
+        // This was a nonblocking call, the response needs to be handled
+        // in the applications ISR callback.
+        //
+        if (xferred != NULL){
+           *xferred = _Len;    //BPM kludge or fix?
+           //  *xferred = 0;    // What if there is no ISR callback?
+
+        }
+        async_request_sent = 1;  //BPM-DEVIDEA NOT commented out in orig.!
+	     result = 0;
+    }
+
+usbqgrexit:
+    if(intsoff){
+       TX_RESTORE;
+    }
+    // Note: goto exit: calls appear after request is allocated through tx_block_allocate()
+    if (timeout)
+    {
+
+#if USE_GENERAL_REQUEST_SEMAPHORE
+        if (!general_request_sem_returned)
+        {
+            usb_ucos_sem_post(general_request_sem);
+#if USBOHCI_VERBOSE > 2
+            printf("posted general_request_sem\n");
+#endif
+        }
+#endif
+        if(del_request_sem)
+        {
+
+            if(OSSemDel(request->sem, OS_DEL_ALWAYS, &rcode) != (OS_EVENT *)0)
+            {
+                USB_PRINTF_ERR;
+                //"usbOhciQueueGeneralRequest: tx_semaphore_delete failed for request->sem\n");
+                result = USBH_SEMAPHORE_ACCESS_FAILED;
+            }
+#if USBOHCI_VERBOSE > 2
+            printf("request->sem deleted\n");
+#endif
+        }
+        if(request) pffree(&usb_req_list, request);
+    }
+    else
+    {
+        if (!async_request_sent && request)
+        {
+            pffree(&usb_req_list, request);
+        }
+    }
+    return result;
+}
+
+/*** BeginHeader usbOhciGetEd */
+__xmem int usbOhciGetEd(usbDevice __far * usb, long EndpointNumber, long FunctionAddress,
+                        long epType, long epDir, HCD_ENDPOINT __far *baseEd,
+                        HCD_ENDPOINT __far ** device_ed);
+/*** EndHeader */
+//
+//  Get an HCD_ENDPOINT structure for the specified endpoint number..
+//
+_usbohci_debug
+__xmem int usbOhciGetEd(usbDevice __far * usb, long EndpointNumber, long FunctionAddress,
+                        long epType, long epDir, HCD_ENDPOINT __far *baseEd,
+                        HCD_ENDPOINT __far ** device_ed)
+{
+    auto HCD_ENDPOINT __far *ed;
+    auto int result;
+    auto HCD_ENDPOINT __far *nextEd;
+    auto unsigned long status;
+    auto long endpoint;
+    auto long functionAddress;
+
+    USBOHCI_ASSERT(baseEd != NULL);
+    USBOHCI_ASSERT(usb != NULL);
+    USBOHCI_ASSERT(device_ed != NULL);
+
+    ed = NULL;
+    result = 0;
+
+    // Check for NULL pointers
+    if (usb == NULL || baseEd == NULL || device_ed == NULL)
+    {
+        USB_PRINTF_ERR;
+        //"usbOhciGetEd: Function arguments have a NULL pointer\n"
+        result = USBH_NULL_POINTER;
+        goto usbgedexit;
+    }
+
+    // Check for supported endpoint types
+    if (epType == USB_PIPE_TYPE_ISOCHRONOS)
+    {
+        USB_PRINTF_ERR;
+        //"usbOhciGetEd: ISOCHRONOUS transfers not supported\n"
+        result = USBH_ISOCHRONOUS_NOT_SUPPORTED;
+        goto usbgedexit;
+    }
+
+    ed = baseEd;
+
+    for (;;)
+    {
+	     nextEd = (HCD_ENDPOINT __far *)(unsigned long)ed->nextEd;
+   	  status = ohci_read_mem(ed->status);
+	     endpoint = status >> 7 & 0xf;
+   	  functionAddress = status & 0x7f;
+
+        if ((endpoint == EndpointNumber) && (functionAddress == FunctionAddress))
+        {
+            if (epType == USB_PIPE_TYPE_BULK)
+            {
+                // Check for ED direction to handle bulk endpoints with same endpoint number
+                if (epDir == ed->dir)
+                {
+                    break;
+                }
+            }
+            else
+            {
+                break;
+            }
+        }
+        if (!nextEd)
+        {
+        	   USB_PRINTF_ERR;
+            //"usbOhciGetEd: Could not find endpoint=%d address=%d\n"
+            ed = 0;
+            result = USBH_ENDPOINT_NOT_FOUND;
+            break;
+        }
+        ed = nextEd;
+    }
+    *device_ed = ed;
+
+usbgedexit:
+    return result;
+}
+
+
+/*** BeginHeader usbOhciInsertEDForEndpoint */
+__xmem  int usbOhciInsertEDForEndpoint(usbDevice __far * usb, long MaxPacketSize,
+                                long lowSpeed, long EndpointNumber,
+                                long FunctionAddress, long epType, long epDir,
+                                HCD_ENDPOINT __far *ed, unsigned short force);
+/*** EndHeader */
+//
+// Add a new endpoint descriptor for the UsbDevice.
+//
+_usbohci_debug
+__xmem  int usbOhciInsertEDForEndpoint(usbDevice __far * usb, long MaxPacketSize,
+                                long lowSpeed, long EndpointNumber,
+                                long FunctionAddress, long epType, long epDir,
+                                HCD_ENDPOINT __far *ed, unsigned short force)
+{
+    auto HCD_ENDPOINT_DESCRIPTOR __far *edData;
+    auto HCD_ENDPOINT __far *baseEd;
+    auto HCD_ENDPOINT __far *newed;
+    auto HCD_TRANSFER_DESCRIPTOR __far *td;
+    auto long Format;
+    auto int result;
+    auto unsigned  long status;
+    auto long endpoint;
+    auto long functionAddress;
+    auto unsigned  skipped;
+    auto long endpoint_linked;
+
+    edData = NULL;
+    baseEd = NULL;
+    Format = 0; result=0;
+
+    USBOHCI_ASSERT(usb != NULL);
+    USBOHCI_ASSERT(ed != NULL);
+    USBOHCI_ASSERT(MaxPacketSize > 0);
+
+    // Check for NULL pointers
+    if (usb == NULL || ed == NULL)
+    {
+        USB_PRINTF_ERR;
+        // "usbOhciInsertEDForEndpoint: Function arguments have a NULL pointer\n"
+        result = USBH_NULL_POINTER;
+        goto usbiedfefdext;
+    }
+
+    // Check for valid max packet size
+    if (MaxPacketSize <= 0)
+    {
+        USB_PRINTF_ERR;
+        //"usbOhciInsertEDForEndpoint: Invalid max packet size\n"
+        result = USBH_INVALID_PACKET_SIZE;
+        goto usbiedfefdext;
+    }
+
+    // Check for supported endpoint types
+    if (epType == USB_PIPE_TYPE_ISOCHRONOS)
+    {
+        USB_PRINTF_ERR;
+        //"usbOhciInsertEDForEndpoint: ISOCHRONOUS transfers not supported\n"
+        result = USBH_ISOCHRONOUS_NOT_SUPPORTED;
+        goto usbiedfefdext;
+    }
+
+//BPM:COIO
+//    trace(USBHOST_TRACE, TRACE_INFO, "usbOhciInsertEDForEndpoint: MaxPacketSize=%d lowSpeed=%d \
+//               EndpointNumber=%d FunctionAddress=%d epType=%d\n", MaxPacketSize,
+//               lowSpeed, EndpointNumber, FunctionAddress, epType);
+//
+
+    edData = (HCD_ENDPOINT_DESCRIPTOR __far *) usb->hcEdData;
+    baseEd = ed;
+#if USBOHCI_VERBOSE > 2
+	 printf("edData = %08lx\n",edData);
+#endif
+
+    // Parse the linked list of ED's
+    for (;;)
+    {
+	     status = (unsigned long)ohci_read_mem(ed->status);
+   	  endpoint = status >> 7 & 0xf;
+	     functionAddress = status & 0x7f;
+   	  skipped = (short)(status & OHCI_ED_SKIP);
+	     endpoint_linked = 0;
+
+        if( (endpoint == EndpointNumber) && (functionAddress == FunctionAddress))
+        {
+            if (epType == USB_PIPE_TYPE_BULK)
+            {
+                // Devices can have bulk endpoints with the same number, but
+                // different directions, so check for direction to be sure
+                if (ed->dir == epDir)
+                    endpoint_linked = 1;
+            }
+            else
+            {
+                endpoint_linked = 1;
+            }
+            if (endpoint_linked)
+            {
+                // Endpoint descriptor already linked.
+//BPM:COIO
+//                trace(USBHOST_TRACE, TRACE_INFO, "usbOhciInsertEDForEndpoint: Endpoint already exists, endpoint=%d address=%d ed=%p\n",
+//                            endpoint, functionAddress, (void *)ed);
+
+                ed->status = ohci_read_mem(((MaxPacketSize << 16) | (Format << 15) |
+                                                         (lowSpeed ? 1 << 13 : 0) | (EndpointNumber << 7) |
+                                                         FunctionAddress));
+                break;
+            }
+        }
+        if (!ed->nextEd || force)
+        {
+            if (!skipped)
+                ed->status |= ohci_read_mem(OHCI_ED_SKIP);   //Set sKip bit
+
+            result = alloc_ed(&newed);
+            USB_RES_CHK("usbOhciInsertEDForEndpoint: alloc_ed() failed\n",
+               usbiedfefdext);
+
+            edData->ed[edData->nEds] = newed;
+#if USBOHCI_VERBOSE > 2
+    			printf("newed = %08lx\n",newed);
+#endif
+				edData->nEds++;
+
+            newed->usbDev = usb; // track the instance of the usbDevice structure that uses the endpoint
+            newed->prevEd = ed;  // previous ed is uncached for easy access in usbOhciRemoveEd()
+
+            newed->status = ohci_read_mem((MaxPacketSize << 16 | Format << 15 |
+                                     (lowSpeed ? 1 << 13 : 0) | EndpointNumber << 7 | FunctionAddress | OHCI_ED_SKIP));
+            newed->dir = epDir;  // track the ED's direction
+
+            if (ed->nextEd)
+                newed->nextEd = ed->nextEd;
+
+            ed->nextEd = (unsigned long)newed;
+            newed->baseEd = baseEd;  // base ed is uncached for easy access in usbOhciRemoveEd()
+            baseEd->bandWidth += MaxPacketSize;
+
+            result = alloc_td(&td);
+            USB_RES_CHK("usbOhciInsertEDForEndpoint: alloc_td() failed\n",
+                 usbiedfefdext);
+
+
+            newed->headTd = (UINT32)ohci_read_address(td);
+            newed->tailTd = (UINT32)ohci_read_address(td);
+
+#if USBOHCI_VERBOSE > 2
+            printf(
+             "InsertEDForEndP: Add newed=%08lx ed=%08lx, newed->nextEd=%08lx, TD=%08lx\n",
+                (void __far *) newed, (void __far *) ed,
+                (void __far *) newed->nextEd,td);
+#endif
+            if (!skipped)
+                ed->status &= ohci_read_mem(~OHCI_ED_SKIP);  // Clear the skip bit
+
+            newed->status &= ohci_read_mem(~OHCI_ED_SKIP);
+
+            break;
+        }
+
+        ed = (HCD_ENDPOINT __far *)ed->nextEd;
+    }
+
+usbiedfefdext:
+    return result;
+
+}
+
+/*** BeginHeader usbOhciInterruptService */
+__xmem void usbOhciInterruptService();
+/*** EndHeader */
+
+
+// TD Error codes from the OHCI spec.
+const int OHCI_CC_ARRAY[] = {
+    USBD_NOERROR,
+    USBD_CRC,
+    USBD_BITSTUFFING,
+    USBD_DATATOGGLEMISMATCH,
+    USBD_STALL,
+    USBD_DEVICENOTRESPONDING,
+    USBD_PIDCHECKFAILURE,
+    USBD_UNEXPECTEDPID,
+    USBD_DATAOVERRUN,
+    USBD_DATAUNDERRUN,
+    -1,
+    -1,
+    USBD_BUFFEROVERRUN,
+    USBD_BUFFERUNDERRUN,
+    USBD_NOTACCESSED,
+    -1,
+    -1,
+    -1,
+    -1,
+    USBD_NOT_DONE,
+    USBD_CANCELING,
+    USBD_NORMAL_COMPLETION,
+    USBD_CANCELED,
+};
+
+int done_queue_td_request_mismatch;
+int isr_tx_block_release_failed;
+
+__nodebug
+__xmem void UODoCallbacks(char CC, USBD_REQUEST __far *Request, HCD_ENDPOINT __far *ed,
+							HCD_TRANSFER_DESCRIPTOR __far *td, long buffer_length)
+{
+	auto int resubmit;
+   auto int result, errMess;
+   auto unsigned int ntd;
+   auto HCD_TRANSFER_DESCRIPTOR __far *freetd;
+
+   //SJH - this code is factored out from ISR.
+
+   // Complete usbd request
+   resubmit = FALSE;
+   if (Request->timeout)
+   {
+       // Sync or periodic transfer
+       if (Request->completed)
+           resubmit = Request->completed(Request->Status,
+                      Request->Buffer,
+                      Request->BufferLength,
+                      (void __far *) Request->device_id,
+                      (TX_SEMAPHORE*) Request->sem); //BPM non ucos work needed
+   }
+   else
+   {
+       // Async transfer
+       if (Request->callback) {
+           Request->callback(Request->context, Request->Status, Request->BufferLength);
+
+           //SJH - this was only in CC != CC_NOERROR branch...
+           if (CC)
+           // If disconnecting and more TDs queued, clear halt bit to process them
+           if ( ((ed->headTd & ~0x3ul) != ed->tailTd) &&
+                 (Request->Status == USB_STATUS_DEVICENOTRESPONDING) )
+               ed->headTd &= ~1ul;
+       }
+   }
+
+   // Resubmit sync or periodic transfer if requested
+   if (resubmit)
+   {
+           //SJH - following ifelse test was only in CC == CC_NOERROR branch...
+   	 if (!CC) {
+       // If the TD transfer count is 0, restore the original request buffer
+       // length to compute the recycled TD's buffer end pointer.  A zero
+       // value for the request buffer length causes an underflow... JW
+       if (!td->TransferCount)
+           Request->BufferLength = buffer_length;
+       // If the TD transfer count is less than the expected transfer count,
+       // restore the original request buffer length to compute the recycled
+       // TD's buffer end pointer.  A TD transfer count less than the expected
+       // expected transfer count causes the recycled TD's bufEnd field to
+       // point to a memory address within the original buffer size, which
+       // results in a buffer overrun error... JW
+       else if (td->TransferCount < (unsigned int)buffer_length)
+       	  Request->BufferLength = buffer_length;
+		 }
+
+       result = usbOhciPutBackTd(td);
+       if (result)
+           USB_PRINTF_ERR;
+   	 // Zap pointer so as not to free below
+       Request = NULL;
+   }
+   else if (Request->PeriodicXfer)
+   {
+	   // Free periodic transfers
+       free_td(td);
+
+       // Don't free Request in ohciRemoveEd()
+       if (ed->request == Request)
+           ed->request = NULL;
+   }
+   else if (Request->timeout == 0)
+   {
+   	// Free async transfers
+       if (Request->numTDs > 0){
+          for (ntd = 0; ntd < Request->numTDs - 1; ntd++)
+          {
+              freetd = Request->TD[ntd];
+              USBOHCI_ASSERT(freetd != NULL);
+              free_td(freetd);
+          }
+       }
+   }
+   else
+   	Request = NULL;
+
+	#asm
+   ; if (Request) pffree(&usb_req_list, Request);
+	ld 	bcde,(sp+@sp+Request)
+	test	bcde
+	jr		z,.skip
+	push	ix
+	ld		ix,usb_req_list
+	lcall	pxfree_fast
+	pop	ix
+.skip:
+   #endasm
+
+}
+
+
+
+//
+// General OHCI interrupt handler.
+//
+
+//_usbohci_debug
+__nodebug
+__xmem void usbOhciInterruptService()
+{
+    auto unsigned long donehead;
+    auto unsigned long __far * ptr_donehead;
+    auto unsigned long intstatus;
+    auto unsigned long intenable;
+    auto unsigned int set_all_ints;
+    auto int result,errMess;
+    auto unsigned long current_value, suspend_count, status;
+    auto char *sem_name;
+    auto char CC;
+    auto HCD_TRANSFER_DESCRIPTOR __far * phy;
+    auto HCD_TRANSFER_DESCRIPTOR __far * phys;
+    auto unsigned long curbuf;
+    auto unsigned long bufend;
+    auto long val;
+    auto long count, buffer_length;
+
+    auto HCD_TRANSFER_DESCRIPTOR __far *td;
+    auto HCD_ENDPOINT __far *ed;
+    auto HCD_TRANSFER_DESCRIPTOR __far *tdlist;
+    auto USBD_REQUEST __far *Request;
+    auto HCD_TRANSFER_DESCRIPTOR __far *tn;
+    auto HCD_TRANSFER_DESCRIPTOR __far *headTd;
+    auto USB_LIST_ENTRY __far *tmp;
+	 auto OS_EVENT pevent;
+    auto OS_SEM_DATA pdata;
+
+#GLOBAL_INIT{
+	done_queue_td_request_mismatch = 0;
+	isr_tx_block_release_failed = 0;
+}
+    set_all_ints = 0;
+    result = 0;
+    sem_name = NULL;
+
+
+    // Disable ohci interrupts before clearing ohci interrupt status
+    ohci_write_reg(USB_OHCI_HC_INT_DIS_ADDR, (unsigned long)OHCI_INTR_MIE);
+
+    intstatus = ohci_read_reg(USB_OHCI_HC_INT_STAT_ADDR);
+
+    // Clear the General USB ISR Status Register
+	 ohci_write_reg(USB_OHCI_HC_INT_STAT_ADDR,  ohci_read_reg(USB_OHCI_HC_INT_STAT_ADDR));
+
+    intenable = ohci_read_reg(USB_OHCI_HC_INT_EN_ADDR);
+
+
+    // Pointer to the virtual address of the done head
+    ptr_donehead = &DeviceData->hcca->doneHead;
+    donehead = *ptr_donehead;
+    phy = (HCD_TRANSFER_DESCRIPTOR __far *)(donehead & ~3ul);
+
+    intstatus &= intenable;
+
+    if (!donehead)
+    {
+        if (!intstatus)
+        {
+            // Not our interrupt
+            goto usbexit_isr;
+        }
+    }
+    if (intstatus & OHCI_INTR_UE)
+    {
+#if USBOHCI_VERBOSE
+        printf("usbOhci ISR: Unrecoverable error, resetting OHCI controller\n");
+#endif
+        DeviceData->reset_ohci = TRUE;
+        usb_ucos_sem_post(root_hub_status_change_sem);
+        ohci_write_reg(USB_OHCI_HC_INT_STAT_ADDR, OHCI_INTR_UE);
+        goto usbexit_isr;
+    }
+    if (intstatus & OHCI_INTR_RHSC)
+    {
+        //
+        // This code only puts a semaphore token if the count is 0
+        // This prevents the ohci thread from enumerating multiple times
+        //
+
+#if USBOHCI_VERBOSE
+//         printf( "usbOhciInterruptService: Root hub status change occurred\n");
+#endif
+
+        if(!root_hub_status_change_sem->OSEventCnt) {
+#if USBOHCI_VERBOSE
+//            printf("rhsc post 2\n");
+#endif
+            usb_ucos_sem_post(root_hub_status_change_sem);
+        }
+        ohci_write_reg(USB_OHCI_HC_INT_STAT_ADDR, OHCI_INTR_RHSC);
+    }
+    if (intstatus & OHCI_INTR_SF)
+    {
+        //
+        // This code only puts a semaphore token if the count is 0.
+        // This prevents the ohci thread from removing a disconnected
+        // device's EDs and TDs without first waiting for the next
+        // SOF after the list enable bits in the HcControl register
+        // are disabled.
+        //
+
+        // printf("usbOhciInterruptService: Start of Frame occurred\n");
+
+        if(!start_of_frame_sem->OSEventCnt) {
+            usb_ucos_sem_post(start_of_frame_sem);
+        }
+        set_all_ints = 1;
+        ohci_write_reg(USB_OHCI_HC_INT_STAT_ADDR, OHCI_INTR_SF);
+    }
+    // Clear the Halt and Carry bits - JW
+    if (phy || (intstatus & OHCI_INTR_WDH))
+    {
+#if USBOHCI_VERBOSE > 2
+        printf("donehead = %08lx\n\n", donehead);
+#endif
+        td = NULL;
+        ed = NULL;
+        tdlist = NULL;
+        Request = NULL;
+
+        if (phy) {
+            // The list comes in reverse order
+            do
+            {
+                td = phy;
+					 phy = td->nextTd;
+                if (tdlist)
+                {
+                    phys = tdlist;
+			 		     td->nextTd = phys;
+                }
+                else
+                    td->nextTd = NULL;
+                tdlist = td;
+            }
+            while (phy);
+        }
+
+        while (tdlist)
+        {
+            td = tdlist;
+            Request = td->request;
+
+            ed = td->Endpoint;
+            // High 4 bits
+            CC = *((char __far *)&td->info + 3) >> 4;
+            //CC = (char)(td->info >> 28UL);
+
+            if (td->nextTd)
+                tdlist = td->nextTd;
+            else
+                tdlist = NULL;
+
+            if (!(ed->status & 0x8000uL))      // !ISOCHRONOUS
+            {
+                count = 0; buffer_length = 0;
+                if (td->curBuf)
+                {
+	                 // We need to convert these to physical addresses
+   	              curbuf = td->curBuf;
+      	           bufend = td->bufEnd;
+
+                    count = (((bufend ^ curbuf) & 0xfffff000ul) ? 0x00001000ul : 0) + (bufend & 0xfff) - (curbuf & 0xfff) + 1;
+                    buffer_length =  td->TransferCount; // keep track of TD buffer length
+                    td->TransferCount -= count;
+
+                }
+                if ((td->info & OHCI_TD_D) != OHCI_TD_D_SETUP)
+                {
+                    Request->BufferLength += td->TransferCount;
+                }
+
+                if (CC == CC_NOERROR)
+                {
+                    //
+                    // TD completed without error, remove it from USBD_REQUEST list,
+                    // if USBD_REQUEST list is now empty, then complete the request.
+                    //
+                    RemoveEntryList(&td->RequestList);
+                    if ( CheckForEmptyList(&Request->HcdList))
+                    {
+                        if (Request->Status != USBD_CANCELING){
+                            Request->Status = USBD_NORMAL_COMPLETION;
+                        }
+                        else
+                            Request->Status = USBD_CANCELED;
+
+								//SJH - factored out some common code into this function
+								UODoCallbacks(CC, Request, ed, td, buffer_length);
+                    }
+                    else
+                    {
+                        // Catch the next TD
+                        set_all_ints = 1;
+                    }
+                }
+                else
+                {
+#if 0  //BPM:COIO
+/*
+                    // According to section 4.3.1.3.7.2 of the Open Host Controller Interface specification release 1.0a,
+                    // if a STALL error occurs, the TD is retired, but the data toggle bits of the TD retain the values
+                    // they had at the start of the transaction.  When the TD is retired, the TD's data carry bit is
+                    // carried over in the data toggle carry bit in the headTD of the endpoint.  Therefore, there is no
+                    // need to reverse the data toggle carry bit.
+                    if (CC == CC_STALL)
+                    {
+                        //Reverse the data toggle bit for the next transaction
+                        if (((unsigned long)ed->headTd) & 0x02UL)
+                            ed->headTd &= ~0x02UL;
+                    }
+*/
+#endif
+                    //Go through the td list
+                    for(tn = (HCD_TRANSFER_DESCRIPTOR __far *)(ed->headTd & ~0x3ul);  // Clear halt and carry bits - JW
+                         tn != (HCD_TRANSFER_DESCRIPTOR __far *)ed->tailTd;
+                         tn = (HCD_TRANSFER_DESCRIPTOR __far *) tn->nextTd
+                       )
+                    {
+                    		if(Request != tn->request ||
+                          (CC == CC_DATAUNDERRUN &&
+                          Request->ShortXferOk &&
+                          Request->Status != USBD_CANCELING &&
+                          ((td->info >> 19UL) & 3UL) != ((tn->info >> 19UL) & 3UL)))
+                        {
+                            break;
+                        }
+                    }
+
+                    val = ed->headTd;
+                    ed->headTd = ((unsigned long)tn | (val & 0x03UL));
+
+                    //Removing all entries from the list
+                    tmp = Request->HcdList.next;
+
+                    while (tmp != &Request->HcdList)
+                    {
+                       tmp = tmp->next;
+                       if (tmp->prev)
+                            RemoveEntryList (tmp->prev);
+                    }
+
+                    headTd = (HCD_TRANSFER_DESCRIPTOR __far *)(ed->headTd & (~3ul));
+
+                    if (headTd->request == Request)
+                    {
+                        // In NET+OS 6.3 and earlier releases, this section of code was not commented
+                        // out since it follows the sample code in section 5.2.9 of the the Open Host
+                        // Controller Interface specification release 1.0a.  However, a more detailed
+                        // examination of the algorithms to process the OHCI controller's done queue
+                        // shows that once a TD completes with an error, all the subsequent TDs in
+                        // the user request's TD list are no longer processed, and the endpoint's
+                        // headTd points to the TD after the last TD of user request TD list.  If the
+                        // endpoint is accessed by one thread, then the headTD points to the last TD
+                        // of the endpoint.  If the endpoint is accessed by multiple threads, then
+                        // headTd can point to the last TD of the endpoint, or it could point to the
+                        // first TD of the next user request's TD list.  In all cases, the headTD's
+                        // request buffer address cannot be identical to the current done queue TD's
+                        // buffer address.  If this happens, we have a problem.  Thus, we replace the
+                        // code with a counter to allow for breakpoints should this condition occur.
+#if 0 //BPM:COIO
+/*
+                        InsertTailList(&Request->HcdList, &headTd->RequestList);
+                        ed->headTd &= ohci_read_mem(~1ul);
+
+                        // Prevent infinite semaphore wait in ohciQueueGeneralRequest() if cable disconnected during enumeration
+                        usb_ucos_sem_post(Request->sem);
+                        //BPM-DEVIDEA handle error!
+*/
+#endif
+                        done_queue_td_request_mismatch++;
+                    }
+                    else
+                    {
+                        if (Request->ShortXferOk && (CC == CC_DATAUNDERRUN))
+                        {
+                            if (Request->Status != USBD_CANCELING)
+                                Request->Status = USBD_NORMAL_COMPLETION;
+                            else
+                                Request->Status = USBD_CANCELED;
+                            ed->headTd &= ~1ul;
+                        }
+                        else if (Request->Status != USBD_CANCELING)
+                        {
+                            Request->Status = OHCI_CC_ARRAY[CC];
+                        }
+                        else
+                        {
+                            Request->Status = USBD_CANCELED;
+                        }
+
+                        // Complete usbd request
+                        // printf("usbOhciInterruptService: Transfer error, completed td=%p Request=%p Request->completed=%p \
+                        //         Request->BufferLength %ld\n", (void *)td, (void *)Request, (void *)Request->completed,
+                        //         Request->BufferLength);
+
+                        USBOHCI_ASSERT(Request->completed != NULL);
+
+								//SJH - factored out some common code into this function
+								UODoCallbacks(CC, Request, ed, td, buffer_length);
+                    }
+
+                    // Catch the next TD
+                    set_all_ints = 1;
+
+					 } // if CC error (else)
+
+            }  // End if (!(ed->status >> 15 & 1))
+            else
+            {
+                // Isochronous is not supported
+                // printf("usbOhciInterruptService: Isochronous transfers not supported\n");
+            }
+        }   // while tdlist
+
+        // Clear done head in hcca
+
+        *ptr_donehead = 0UL;
+
+        // Clear the write done head bit to allow OHCI to write to the HccaDoneHead
+        ohci_write_reg(USB_OHCI_HC_INT_STAT_ADDR, OHCI_INTR_WDH);
+    }
+    if (intstatus & OHCI_INTR_SO)
+    {
+        // printf( "usbOhciInterruptService: Schedule Overrun occurred\n");
+        ohci_write_reg(USB_OHCI_HC_INT_STAT_ADDR, OHCI_INTR_SO);
+    }
+    if (intstatus & OHCI_INTR_FNO)
+    {
+        // printf( "usbOhciInterruptService: Frame number overflow occurred\n");
+        ohci_write_reg(USB_OHCI_HC_INT_STAT_ADDR, OHCI_INTR_FNO);
+    }
+    if(set_all_ints)
+    {
+        // Enable the interrupts we care about
+        ohci_write_reg(USB_OHCI_HC_INT_EN_ADDR,
+                   OHCI_INTR_MIE |
+                   OHCI_INTR_RHSC | OHCI_INTR_RD |
+            		 OHCI_INTR_OC | OHCI_INTR_FNO |  OHCI_INTR_WDH |
+                   OHCI_INTR_SO |
+                   OHCI_INTR_UE);
+    }
+
+usbexit_isr:
+     ohci_write_reg(USB_OHCI_HC_INT_EN_ADDR,
+             (unsigned long)OHCI_INTR_MIE );
+}
+
+
+
+
+/*** BeginHeader usbOhciPutBackTd */
+__xmem int usbOhciPutBackTd(HCD_TRANSFER_DESCRIPTOR __far *td);
+/*** EndHeader */
+
+int interrupt_td_error_not_five;
+
+//
+// Put the TD back to the ED so that it may be recycled.
+//
+_usbohci_debug
+__xmem int usbOhciPutBackTd(HCD_TRANSFER_DESCRIPTOR __far *td)
+{
+	// This is called from ISR (and only from ISR).
+    auto USBD_REQUEST __far *request;
+    auto HCD_ENDPOINT __far *ed;
+    auto HCD_TRANSFER_DESCRIPTOR __far *intTd;
+    auto HCD_TRANSFER_DESCRIPTOR __far *extraTd;
+    auto unsigned long tdInfo, mask;
+    auto int resubmit, result;
+    auto int cc;
+#GLOBAL_INIT { interrupt_td_error_not_five = 0; }
+
+#if USBOHCI_VERBOSE
+    //printf("put back td %08lx\n",(long)td);
+#endif
+    request = NULL;
+    ed = NULL;
+    intTd = NULL;
+    extraTd = NULL;
+    resubmit = TRUE;
+    result = 0;
+
+    USB_NULL_PTR_CHKFAT(td, USBH_NULL_POINTER, usbpbdtexit)
+
+    request = td->request;
+
+    // Endpoint not swapped, not cached.
+    ed = (HCD_ENDPOINT __far *)td->Endpoint;
+
+    USB_NULL_PTR_CHKFAT(ed, USBH_NULL_POINTER, usbpbdtexit)
+
+    USB_NULL_PTR_CHKFAT((void __far *)ed->headTd, USBH_NULL_POINTER,
+                                                         usbpbdtexit)
+
+    USBOHCI_ASSERT(ed->request == request);
+    if (ed->request != request)
+    {
+  	     USB_PRINTF_ERR;
+		  //	"usbOhciPutBackTd: ed's request does not match!\n"
+        result = USBH_ENDPOINT_REQUEST_MISMATCH;
+        goto usbpbdtexit;
+    }
+
+    tdInfo = td->info;
+
+    // Set skip bit before modifying the headTD
+    ed->status |= ohci_read_mem(OHCI_ED_SKIP);
+
+    // trace(USBHOST_TRACE, TRACE_INFO, "usbOhciPutBackTd:ed:%p ed->headTd:%08x ed->tailTd:%08x td:%p td->info:%08x\n",
+    //  (void *)ed, (int)ohci_context->ohci_read_mem(ed->headTd), (int)ohci_context->ohci_read_mem(ed->tailTd),
+    //  (void *)td, (int)ohci_context->ohci_read_mem(td->info));
+
+    if (ed->headTd & 1)
+    {
+         cc = (int)(tdInfo >> 28);
+
+        // trace(USBHOST_TRACE, TRACE_INFO,  "usbOhciPutBackTd: ed->headTd has Halted bit set.\n");
+        // trace(USBHOST_TRACE, TRACE_INFO, "usbOhciPutBackTd: ed:%p ed->headTd:%08x ed->tailTd:%08x\n",
+       //(void *)ed, (int)ohci_context->ohci_read_mem(ed->headTd), (int)ohci_context->ohci_read_mem(ed->tailTd));
+
+        // trace(USBHOST_TRACE, TRACE_INFO, "usbOhciPutBackTd: td:%p td->info:0x%08x cc=%d\n", (void *)td,
+       // tdInfo, cc);
+
+#if 0   //BPM:COIO
+        // If the endpoint is halted, the original code puts the TD into the endpoint's
+        // head TD only if the the device is not responding, but then clears the halt
+        // bit of the head TD to reenable processing of the endpoint, which can have
+        // unpredicable results.  Putting the TD in the endpoint's head TD is OK on the
+        // assumption that an interrupt endpoint has at most two TDs at any one time.
+/*
+        if (cc == USB_STATUS_DEVICENOTRESPONDING)
+        {
+            // trace(USBHOST_TRACE, TRACE_CRITICAL,  "usbOhciPutBackTd: Device not responding, so remove this td=%p\n\n", (void *) td);
+
+            // Place it back int head so that ohciRemoveEd() can find it
+            td->nextTd = ed->tailTd; // Not cached
+
+            ed->headTd = td;
+
+            resubmit = FALSE;
+        }
+        ed->headTd &= ohci_read_address(~1UL);
+*/
+#else
+        // The new code puts the TD into the endpoint's head TD if the condition code
+        // (CC) value is non-zero and no longer clears the halt bit which keeps the
+        // host controller from processing the endpoint.  This approach prevents takes
+        // all possible error codes (CC) values and prevents TD leaks.  The new code
+        // also uses a counter to help track and debug cases where the TD's CC value is
+        // not USB_STATUS_DEVICENOTRESPONDING (or 5)
+        if (cc)
+        {
+            if (cc != USB_STATUS_DEVICENOTRESPONDING)
+            {
+                interrupt_td_error_not_five++;
+            }
+
+#if USBOHCI_VERBOSE
+            printf("usbOhciPutBackTd: interrupt TD processing error, so remove this td=%p\n\n", (void __far *) td);
+#endif
+            // Place it back into the head so that ohciRemoveEd() can find it
+            td->nextTd = (HCD_TRANSFER_DESCRIPTOR __far *)ed->tailTd; // Not cached
+
+            ed->headTd = (UINT32)td;
+
+            resubmit = FALSE;
+        }
+#endif
+
+    }
+
+    if (resubmit)
+    {
+        mask = ~0x3ul;
+
+        intTd = (HCD_TRANSFER_DESCRIPTOR __far *)(ed->headTd & mask);
+
+        USB_NULL_PTR_CHKFAT(intTd, USBH_NULL_POINTER, usbpbdtexit)
+        extraTd = td;
+
+        // Caution when removing memsets() for TDs and EDs, can cause crashes - JW
+        //*************************************************************************************
+        // In NET+OS 6.3 and earlier releases, this memset was commented out which caused
+        // problems in usbOhciInterruptService() when an interrupt endpoint TD is completed
+        // with an error.  Without the memset, the last TD in the endpoint still has a
+        // td->request value identical to td->request value of the completed TD in the done
+        // being processed.  This situation forces the ISR to execute the code inside the
+        // following code segment:
+        // if (headTd->request == Request)
+        // {
+        // }
+        // which is not correct.
+        //*************************************************************************************
+       _f_memset(extraTd, 0, sizeof(HCD_TRANSFER_DESCRIPTOR));
+
+        INIT_LIST_HEAD(&request->HcdList);
+        InsertTailList(&request->HcdList, &intTd->RequestList);
+
+        tdInfo |= (0xf0000000ul);
+
+        intTd->info   = tdInfo;
+
+       // Invalidate buffer from the data cache //Keep for future reference-BPM
+       // NABeforeDMA(NA_DEVICE_TO_MEMORY_DMA, NULL, request->Buffer, request->BufferLength);
+
+        intTd->curBuf = (UINT32)request->Buffer;
+        intTd->nextTd = extraTd;
+        intTd->bufEnd = (UINT32)(request->Buffer + request->BufferLength - 1);
+
+        intTd->TransferCount = request->BufferLength;   // Not part of actual TD
+        intTd->Endpoint = ed;
+        intTd->request = request;
+        request->BufferLength = 0;
+
+        ed->headTd = (UINT32)intTd;
+        ed->tailTd = (UINT32)extraTd;
+
+        // Clear the skip bit
+        ed->status &= ~OHCI_ED_SKIP;
+    }
+
+usbpbdtexit:
+    return result;
+}
+
+
+/*** BeginHeader usbOhciEnableAllInterrupts */
+
+__xmem void usbOhciEnableAllInterrupts();
+
+#define usbOhciEnableInterrupts() \
+  usbOhciEnableAllInterrupts()
+
+
+//BPM - NS9750 processor writes 0x80000002UL here
+#define usbOhciEnableUsbGlobalIsr() \
+  ohci_write_reg(USB_OHCI_HC_INT_EN_ADDR, 0x80000000UL)
+
+/*** EndHeader */
+
+_usbohci_debug
+__xmem void usbOhciEnableAllInterrupts()
+{
+
+    ohci_write_reg(USB_OHCI_HC_INT_EN_ADDR,
+                                              OHCI_INTR_MIE
+                                            | OHCI_INTR_RHSC
+                                            | OHCI_INTR_RD
+                                            | OHCI_INTR_OC
+                                            | OHCI_INTR_FNO
+                                            | OHCI_INTR_WDH
+                                            | OHCI_INTR_SO
+                                            | OHCI_INTR_UE
+                                              );
+#if USBOHCI_VERBOSE
+        printf("HW enable USB INT\n");
+#endif
+
+    usbOhciEnableUsbGlobalIsr();
+
+    return;
+}
+
+
+//
+// This routine is used to insert a request into the interrupt endpoint
+// descriptor table.
+//
+
+/*** BeginHeader usbOhciInsertInterruptEndpoint */
+__xmem int usbOhciInsertInterruptEndpoint(usbDevice __far * usb, unsigned long pipe,
+                                  usbDeviceIrq handler, int period,
+                                  void *device_id, int maxpacketsize,
+                                  void __far *buffer);
+/*** EndHeader */
+
+//
+// Put the TD back to the ED so that it may be recycled.
+//
+_usbohci_debug
+__xmem int usbOhciInsertInterruptEndpoint(usbDevice __far * usb, unsigned long pipe,
+                                  usbDeviceIrq handler, int period,
+                                  void *device_id, int maxpacketsize,
+                                  void __far *buffer)
+{
+    auto unsigned long WhichList;
+    auto HCD_ENDPOINT __far *interruptEd; // endpoint descriptor for this irq
+    auto HCD_ENDPOINT __far *ed;
+    auto int result;
+    auto long EndpointNumber;
+    auto long FunctionAddress;
+    auto long epType, epDir;
+    auto unsigned long pollingRate;
+    auto USBD_REQUEST __far *request;
+
+    interruptEd = NULL; // endpoint descriptor for this irq
+    ed = NULL;
+    result = 0;
+    EndpointNumber = (pipe >> 15) & 0xf;
+    FunctionAddress = (pipe >> 8) & 0x7f;
+    epType = (pipe >> 30) & 3; epDir = (pipe >> 7) & 1;
+    pollingRate = period;
+    request = NULL;
+
+
+    USBOHCI_ASSERT(usb != NULL);
+    USBOHCI_ASSERT(handler != NULL);
+    USBOHCI_ASSERT(device_id != NULL);
+    USBOHCI_ASSERT(buffer != NULL);
+
+    if (usb == NULL || handler == NULL || device_id == NULL || buffer == NULL)
+    {
+		  USB_PRINTF_ERR;
+        //"usbOhciInsertInterruptEndpoint: Function args have a NULL pointer\n"
+        result = USBH_NULL_POINTER;
+        goto usbiiepexit;
+    }
+
+    request = pfcalloc(&usb_req_list);
+    if (request == NULL)
+    {
+        USBOHCI_ASSERT(0);
+		  USB_PRINTF_ERR;
+	     //"usbOhciInsertInterruptEndpoint: malloc() failed\n"
+        result = USBH_MALLOC_FAILED;
+        goto usbiiepexit;
+    }
+
+    //_f_memset(request, 0x0, sizeof (USBD_REQUEST));
+
+    INIT_LIST_HEAD(&request->HcdList);
+
+    request->Status = USBD_NOT_DONE;
+    request->Buffer = buffer;
+    request->BufferLength = maxpacketsize;
+    request->ShortXferOk = TRUE;
+    request->PeriodicXfer = TRUE;
+    request->completed = handler;
+    request->device_id = device_id;
+
+    request->timeout = 0xFFFFFFFFul;
+
+    // Invalidate buffer from the data cache
+    // NABeforeDMA(NA_DEVICE_TO_MEMORY_DMA, NULL, buffer, maxpacketsize);
+
+    request->XferInfo = USB_PIPE_OUT(pipe) ? OHCI_TD_D_OUT : OHCI_TD_D_IN;
+
+    // Select the base ED to use and determine the scheduling period.
+    //
+    WhichList = ED_INTERRUPT_32ms;
+
+    while (WhichList >= pollingRate && (WhichList >>= 1))
+         continue;
+//@A1 if (WhichList == ED_ISOCHRONOUS) //BPM:COIO
+//@A1 {
+//@A1     /* Isochronous is not supported */
+//@A1     trace(USBHOST_TRACE, TRACE_CRITICAL, "usbOhciInsertInterruptEndpoint: Isochronous not supported\n");
+//@A1     result = USBH_ISOCHRONOUS_NOT_SUPPORTED;
+//@A1     goto exit;
+//@A1 }
+
+    // Determine which scheduling list has the least bandwidth
+    result = usbOhciCheckBandwidth(WhichList, &WhichList);
+
+    // Commit this endpoints bandwidth to the proper scheduling slot
+#if USBOHCI_VERBOSE
+    printf("usbOhciInsertInterruptEndpoint: pollingRate=%d WhichList=%d\n",
+            (int)pollingRate, (int)WhichList);
+
+    printf("usbOhciInsertInterruptEndpoint: period=%d WhichList=%d" \
+            " maxpacketsize=%d handler()=%p\n",
+         (int)period, (int)WhichList, (int)maxpacketsize, (void *)handler);
+#endif
+    interruptEd = DeviceData->pEd[(unsigned)WhichList];
+#if USBOHCI_VERBOSE
+    printf("interruptEd = %08lx\n",interruptEd);
+#endif
+    result = usbOhciInsertEDForEndpoint(usb, maxpacketsize, USB_PIPE_SLOW(pipe),
+                    EndpointNumber,FunctionAddress, epType, epDir, interruptEd,
+                    FALSE);
+    if (result)
+    {
+		  USB_PRINTF_ERR;
+        // "usbOhciInsertInterruptEndpoint: usbOhciCheckBandwidth() failed\n"
+        goto usbiiepexit;
+    }
+    if (!result)
+    {
+        result = usbOhciGetEd(usb, EndpointNumber, FunctionAddress, epType,
+                              epDir, interruptEd, &ed);
+        if (!result)
+        {
+            USBOHCI_ASSERT(ed != NULL);
+            if (ed == NULL)
+            {
+				    USB_PRINTF_ERR;
+                //"usbOhciInsertInterruptEndpoint: ed is NULL!!!\n"
+                result = USBH_NULL_POINTER;
+                goto usbiiepexit;
+            }
+        }
+        else
+        {
+		      USB_PRINTF_ERR;
+            //"usbOhciInsertInterruptEndpoint: usbOhciGetEd() failed\n"
+            goto usbiiepexit;
+        }
+    }
+    result = usbOhciRequestInterruptHandler(ed, request);
+    if (result)
+    {
+        USB_PRINTF_ERR;
+        //"usbOhciInsertInterruptEndpoint: RequestInterruptHandler() failed\n"
+    }
+usbiiepexit:
+    return result;
+}
+
+//
+// Request an interrupt handler for one "pipe" of a USB device.
+// period is desired polling interval in ms.  The closest, shorter
+// match will be used.  Powers of two from 1-32 are supported by OHCI.
+//
+/*** BeginHeader usbOhciRequestInterruptHandler */
+__xmem int usbOhciRequestInterruptHandler(HCD_ENDPOINT __far *ed,
+                                     USBD_REQUEST __far *request);
+/*** EndHeader */
+
+//
+// Put the TD back to the ED so that it may be recycled.
+//
+_usbohci_debug
+__xmem int usbOhciRequestInterruptHandler(HCD_ENDPOINT __far *ed,
+                                     USBD_REQUEST __far *request)
+{
+    auto HCD_TRANSFER_DESCRIPTOR __far *intTd;
+    auto HCD_TRANSFER_DESCRIPTOR __far *extraTd;
+    auto usbDevice __far * device;
+    auto int result;
+
+    intTd = NULL;
+    extraTd = NULL;
+    result = 0;
+    device = NULL;
+
+    USBOHCI_ASSERT(request != NULL);
+    USBOHCI_ASSERT(ed != NULL);
+
+    // Check for NULL pointers
+    if (ed == NULL || request == NULL)
+    {
+		  USB_PRINTF_ERR;
+        //"usbOhciRequestInterruptHandler: Function arguments have a NULL pointer\n"
+        result = USBH_NULL_POINTER;
+        goto usbrihexit;
+    }
+
+    device = ed->usbDev;
+	 INIT_LIST_HEAD(&request->HcdList);
+
+    ed->request = request;
+    ed->status = ed->status | OHCI_ED_SKIP;
+    USBOHCI_ASSERT(ed->headTd);
+
+    intTd = (HCD_TRANSFER_DESCRIPTOR __far *)((unsigned long)ed->headTd & (~0x3ul));
+
+    USB_NULL_PTR_CHKFAT(intTd, USBH_NULL_POINTER, usbrihexit)
+
+    result = alloc_td(&extraTd);
+    if (result)
+    {
+		  USB_PRINTF_ERR;
+        //"usbOhciRequestInterruptHandler: alloc_td() failed\n"
+        goto usbrihexit;
+    }
+#if USBOHCI_VERBOSE
+        printf("RIH: extraTd=%08lx\n", extraTd);
+#endif
+
+
+    InsertTailList(&request->HcdList, &intTd->RequestList);
+
+    intTd->request = request;
+    intTd->info = OHCI_TD_CC_NEW | OHCI_TD_ROUND | request->XferInfo;
+
+    intTd->curBuf = (long)request->Buffer;
+
+    intTd->nextTd = extraTd;
+
+    intTd->bufEnd = (UINT32)(char __far *)request->Buffer + request->BufferLength - 1;
+
+    intTd->TransferCount = request->BufferLength;
+    intTd->Endpoint = ed;
+    ed->headTd = (UINT32)intTd;
+    ed->tailTd = (UINT32)extraTd;
+
+    request->BufferLength = 0;  // Report back bytes transferred so far
+
+    request->ed = ed;
+    ed->status = ed->status & (~OHCI_ED_SKIP);
+
+usbrihexit:
+    return result;
+}
+
+
+/*************************************************************************
+ * This routine scans all the scheduling lists of frequency determined by the
+ * base list passed in and returns the worst bandwidth found (i.e. max in use
+ * by any given scheduling list) and the list which had the least bandwidth in
+ * use.
+ *
+ * List - must be a bas scheduling list, it must be one of ED_INTERRUPT_2ms,
+ * ED_INTERRUPT_4ms,....,ED_INTERRUPT_32ms,
+ *
+ * This routine is straight out of the OHCI spec.
+**************************************************************************/
+/*** BeginHeader usbOhciCheckBandwidth */
+__xmem int usbOhciCheckBandwidth(unsigned long List, unsigned long __far *BestList);
+/*** EndHeader */
+
+//
+// Put the TD back to the ED so that it may be recycled.
+//
+_usbohci_debug
+__xmem int usbOhciCheckBandwidth(unsigned long List, unsigned long __far *BestList)
+{
+    auto unsigned long LastList, BestBandwidth, WorstBandwidth;
+    auto int result;
+    auto unsigned long Bandwidth;
+    auto HCD_ENDPOINT __far *ed;
+
+    result = 0;
+
+    USB_NULL_PTR_CHKFAT(BestList, USBH_NULL_POINTER, usbcbwexit);
+
+    WorstBandwidth = 0UL;
+    BestBandwidth  = ~0UL;
+
+    for (LastList = List + List; List <= LastList; List++)
+    {
+        Bandwidth = 0UL;
+        ed = DeviceData->pEd[(unsigned)List];
+
+        // Sum bandwidth in use in this scheduling time.
+        do
+        {
+            Bandwidth += ed->bandWidth;
+            ed = ( HCD_ENDPOINT __far *)ed->nextEd;
+        }
+        while (!ed->nextEd);
+
+        // Remember best and worst
+        if (Bandwidth < BestBandwidth)
+        {
+            BestBandwidth = Bandwidth;
+            *BestList = List;
+        }
+        if (Bandwidth > WorstBandwidth)
+            WorstBandwidth = Bandwidth;
+    }
+
+#if USBOHCI_VERBOSE
+    printf(
+      "usbOhciCheckBandwidth: BestBandwidth=%08lx" \
+      "WorstBandwidth=%08lx BestList=%08lx\n",
+      (long)BestBandwidth, (long)WorstBandwidth, (long)*BestList);
+#endif
+    // Original code returned the value of WorstBandwidth, but it's not
+    // used in usbOhciInsertInterruptEndpoint(), so we don't returned
+    // the value of WorstBandwidth to the caller anymore
+usbcbwexit:
+    return result;
+}
+
+
+/*** BeginHeader usbOhciGeneralRequestCallback */
+
+__xmem int usbOhciGeneralRequestCallback(long status, void __far *buffer,
+          long bytesTransferred, void __far *device_id, TX_SEMAPHORE *sem);
+
+/*** EndHeader */
+//
+// This routine is called from the ISR usbOhciInterruptService()
+// after a request has been processed.
+//
+_usbohci_debug
+__xmem int usbOhciGeneralRequestCallback(long status, void __far *buffer,
+          long bytesTransferred, void __far *device_id, TX_SEMAPHORE *sem)
+{
+    OS_EVENT * semaphore;
+    char rc;
+
+    semaphore = NULL;
+
+    // This callback function is called by the ISR when processing bulk and
+    // control tranfers.  It's purpose is to put the semaphore token so the
+    // user thread waiting in usbOhciQueueGeneralRequest() can proceed.
+    // The buffer argument can be NULL or non-NULL.
+    USBOHCI_ASSERT(device_id != NULL);
+//BPM    USBOHCI_ASSERT(sem != NULL);
+
+    if (device_id == NULL || sem == NULL)
+    {
+		 USB_PRINTF_ERR;
+       //"usbOhciGeneralRequestCallback: Function arguments have a NULL pointer!\n");
+       goto usbgrcbexit;
+    }
+
+    // trace(USBHOST_TRACE, TRACE_DEBUG, "usbOhciGeneralRequestCallback: status=%x buffer=%p bytesTransferred=%d device_id=%p, sem=%p\n",
+    //  status, buffer, bytesTransferred, device_id, sem);
+    semaphore = (OS_EVENT *)sem;
+    if((rc=OSSemPost(semaphore)) != OS_NO_ERR){
+#if USBOHCI_VERBOSE
+ 		 printf( "USB: Sem Post error %d\n",(int)rc);
+#endif
+//       exception(USB_SEMAPHORE_ERROR);
+//       exit(USB_SEMAPHORE_ERROR);
+    }
+
+usbgrcbexit:
+    return FALSE;
+}
+
+
+
+
+
+
+/*** BeginHeader usb_ucos_sem_post */
+void usb_ucos_sem_post( void* usb_Mutex);
+/*** EndHeader */
+__nodebug //_usbohci_debug
+void usb_ucos_sem_post( void* usb_Mutex)
+{
+   auto rc;
+    // Signal semaphore free
+    if((rc=OSSemPost((OS_EVENT*)usb_Mutex)) != OS_NO_ERR){
+#if USBOHCI_VERBOSE
+ 		 printf( "USB: Sem Post error %d\n",rc);
+#endif
+       exception(USB_SEMAPHORE_ERROR);
+       exit(USB_SEMAPHORE_ERROR);
+    }
+}
+
+
+/*** BeginHeader usb_ucos_sem_pend */
+int usb_ucos_sem_pend( void* usb_Mutex, int timeout);
+/*** EndHeader */
+__nodebug //_usbohci_debug
+int usb_ucos_sem_pend( void* usb_Mutex, int timeout)
+{
+   auto int rc;
+
+	rc = 0;
+	// Wait for semaphore.  Returns 1 if timed out, else 0.
+	OSSemPend((OS_EVENT*)usb_Mutex, timeout, (char*)&rc);
+	if (rc == OS_TIMEOUT)
+		return 1;
+ #if USBOHCI_VERBOSE
+   if(rc != OS_NO_ERR)
+   {
+		printf( "USB: Mutex Pend error %d\n",rc);
+	}
+ #endif
+	return 0;
+}
+
+/*** BeginHeader usb_dump_ohci*/
+__xmem int usb_dump_ohci();
+/*** EndHeader */
+
+// Print out the OHCI register set (assume Little Endian)
+_usbohci_debug
+__xmem int usb_dump_ohci()
+{
+    printf("cmdstatus         [%08lx]\n",  ohci_read_reg(USB_OHCI_HC_CONTROL_ADDR));
+    printf("cmdstatus         [%08lx]\n",  ohci_read_reg(USB_OHCI_HC_CMD_STAT_ADDR));
+    printf("intrstatus        [%08lx]\n",  ohci_read_reg(USB_OHCI_HC_INT_STAT_ADDR));
+    printf("intrenable        [%08lx]\n",  ohci_read_reg(USB_OHCI_HC_INT_EN_ADDR));
+    printf("intrdisable       [%08lx]\n",  ohci_read_reg(USB_OHCI_HC_INT_DIS_ADDR));
+    printf("hcca              [%08lx]\n",   ohci_read_reg(USB_OHCI_HC_HCCA_ADDR));
+    printf("ed_periodcurrent  [%08lx]\n",  ohci_read_reg(USB_OHCI_HC_PERIODIC_CURRENT_ED_ADDR));
+    printf("ed_controlhead    [%08lx]\n",   ohci_read_reg(USB_OHCI_HC_CONTROL_HEAD_ED_ADDR));
+    printf("ed_controlcurrent [%08lx]\n", ohci_read_reg(USB_OHCI_HC_CONTROL_CURRENT_ED_ADDR));
+    printf("ed_bulkhead       [%08lx]\n",   ohci_read_reg(USB_OHCI_HC_BULK_HEAD_ED_ADDR));
+    printf("ed_bulkcurrent    [%08lx]\n",   ohci_read_reg(USB_OHCI_HC_BULK_CURRENT_ED_ADDR));
+    printf("donehead          [%08lx]\n",   ohci_read_reg(USB_OHCI_HC_DONE_HEAD_ADDR));
+    printf("fminterval        [%08lx]\n",  ohci_read_reg(USB_OHCI_HC_FM_INTERVAL_ADDR));
+    printf("fmremaining       [%08lx]\n",  ohci_read_reg(USB_OHCI_HC_FM_REMAIN_ADDR));
+    printf("fmnumber          [%08lx]\n",  ohci_read_reg(USB_OHCI_HC_FM_NUMBER_ADDR));
+    printf("periodicstart     [%08lx]\n",  ohci_read_reg(USB_OHCI_HC_PERIODIC_START_ADDR));
+    printf("lsthresh          [%08lx]\n",  ohci_read_reg(USB_OHCI_HC_LS_THRESHOLD_ADDR));
+
+    // Root Hub
+    printf("RootHub a            [%08lx]\n",  ohci_read_reg(USB_OHCI_HC_RH_DESCA_ADDR));
+    printf("RootHub b            [%08lx]\n",  ohci_read_reg(USB_OHCI_HC_RH_DESCB_ADDR));
+    printf("RootHub status       [%08lx]\n",  ohci_read_reg(USB_OHCI_HC_RH_STATUS_ADDR));
+    printf("RootHub portstatus 0 [%08lx]\n",  ohci_read_reg(USB_OHCI_HC_RH_PORT_STAT_ADDR));
+    return 1;
+}
+
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+

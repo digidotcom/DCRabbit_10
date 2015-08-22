@@ -1,0 +1,776 @@
+/*** BeginHeader _subfs */
+/* START LIBRARY DESCRIPTION ***************************************************
+subfs.lib
+   Copyright (c) 2010 Digi International Inc., All Rights Reserved
+
+   This software contains proprietary and confidential information of Digi
+   International Inc.  By accepting transfer of this copy, Recipient agrees
+   to retain this software in confidence, to prevent disclosure to others,
+   and to make no use of this software other than that for which it was
+   delivered.  This is a published copyrighted work of Digi International
+   Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+   prohibited.
+
+   Restricted Rights Legend
+
+   Use, duplication, or disclosure by the Government is subject to
+   restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+   Technical Data and Computer Software clause at DFARS 252.227-7031 or
+   subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+   Restricted Rights at 48 CFR 52.227-19, as applicable.
+
+   Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+
+DESCRIPTION:
+	Simple UserBlock File System.
+
+	This is a restricted filesystem which is capable of storing up
+	to 15 files in the UserID block.  It is restricted in that the
+	total filesystem size is limited to the fairly small userID block
+	(typically about 16kB), and files can only be (re)written in their
+	entirety (from a RAM buffer) and read in their entirety (to a RAM
+	buffer).
+
+	This should not be used as a general purpose filesystem.  Use FAT.LIB
+	for that.  SUBFS is intended for configuration and other small
+	quantities of data which rarely change (the routines to update the
+	userID block are *slow*).
+
+	Although SUBFS is designed for a maximum of 128kB userID block
+	size, the code in IDBLOCK.LIB currently uses 16 bit integers for
+	offsets and lengths, and hence is limited to 64kB userID blocks.
+
+	The intention for this library is to provide a level of organization
+	of the userID block which is easier to use than managing byte offsets
+	directly, but limited to fairly small data sets (such as SSL
+	certificates and configuration data).  All operations are atomic in
+	that they either fully succeed, or do not alter the saved data.
+
+	The start and end of the UserID block are out of bounds to SUBFS. The
+	start may contain existing customer data, and the end may contain
+	calibration constants and the like. SUBFS is a contiguous extent
+	in the UserID block, starting on a 512-byte boundary, and being an
+	integral number of 512 byte blocks.
+
+	The macros SUBFS_RESERVE_START and SUBFS_RESERVE_END define the
+	number of bytes to preserve at the start and end of the UserID block,
+	forever free from use by the SUBFS library.  These numbers will be
+	rounded up to a multiple of 512, and both default to 0.
+
+	The 1st block will contain a 16-byte header, and up to 15 16-byte file
+	header entries. The remainder of the 1st block (256 bytes) is a map of
+	block indices. If index N belongs to a file, its value M will indicate
+	the next block in the file, or M will be zero if there are no more blocks.
+	An index entry that is not in a file has a don't-care value.
+
+	The overall header contains a unique 8-byte "signature" so that the
+	start of SUBFS may be found by stepping through the UserID block in
+	512-byte steps. The rest of the header contains a field which indicates
+	the number of blocks in SUBFS.
+
+	Each file header entry contains a 12-byte file name (null padded on the
+	right), or is all nulls for unused entries. The remaining 4 bytes
+	indicate the total length of the file, and its starting block index.
+
+	Given the above values, the maximum number of files is 15, and the
+	maximum amount of data is (255*512) bytes. This is almost 128k, which
+	is larger than the currently largest UserID block size of 64k. Since
+	files are allocated in units of 512 bytes, a maximum of (511*15) bytes
+	may be wasted in the worst case.
+
+	If the userID block is ever expanded beyond 128k, then it will be necessary
+	to have another, independent, SUBFS in order to take advantage of the
+	space.  The file size of any one file will still be limited to a bit less
+	than 128k.
+
+Use with serial boot flash
+
+	All the routines herein may return -EAGAIN.  In this case, the routine should
+	be called again with no change to the parameters until a return code other
+	than -EAGAIN is returned.
+
+	This requirement arises because, with a serial boot flash, the serial port
+	used to communicate with the userID block storage (i.e. the serial boot
+	flash) may be in use by other processes.  In this case, the application
+	should use the -EAGAIN code to push processing of the other task in order
+	to free up the serial port.
+
+API FUNCTIONS:
+	subfs_avail()		- test for space availability
+	subfs_create()		- create or update entire file
+	subfs_update()		- update entire existing file
+	subfs_delete()		- delete file
+	subfs_len()			- get length, or test for existence, of file
+	subfs_read()		- read all or part of file
+
+CONFIGURATION MACROS:
+	#define SUBFS_RESERVE_START 0
+		Reserve this many bytes at start of userID block.  Must be multiple
+		of 512.  This may need to be used if updating firmware which already
+		stores data at start of userID block.
+
+	#define SUBFS_RESERVE_END  ZWORLD_RESERVED_SIZE
+		Reserve this many bytes at end of userID block.  Must be multiple
+		of 512.  This may need to be used if updating firmware which already
+		stores data at end of userID block.  If ZWORLD_RESERVED_SIZE
+		is defined, its value is used as the default for this macro,
+		otherwise the default is 0.
+
+
+Change History:
+		Jun 7  2010  SJH  Created
+
+*/
+
+#ifndef __SUBFS_LIB
+#define __SUBFS_LIB
+
+#ifdef SUBFS_DEBUG
+	#define _subfs_debug	__debug
+#else
+	#define _subfs_debug	__nodebug
+#endif
+
+#use "idblock_api.lib"
+
+#ifndef SUBFS_RESERVE_START
+	#define SUBFS_RESERVE_START 0
+#endif
+
+#ifndef SUBFS_RESERVE_END
+	#ifdef ZWORLD_RESERVED_SIZE
+		#define SUBFS_RESERVE_END ((ZWORLD_RESERVED_SIZE+511) & 0xFFE0)
+	#else
+		#define SUBFS_RESERVE_END 0
+	#endif
+#endif
+
+// Mapping of 16-byte directory entry.  There are 15 of these in the
+// header block.  An empty (zero length) file takes no space other than
+// its directory slot.  A file is empty if used=0, however sbx and lbu
+// should also be 0 in this case.  If not empty, the total file length
+// is (used-1)*512 + lbu.
+typedef struct SUBFSDirent {
+	char		name[12];		// File name, padded on right with nulls.  All nulls
+									// if no file in this slot.
+	char		sbx;				// Start block index (1..255, or 0 if empty)
+	char		used;				// Total used blocks (0..255)
+	unsigned	lbu;				// Bytes used in last block (1..512, or 0 if empty)
+	// 16 bytes in this struct
+} SUBFSDirent_t;
+
+// Map the data layout of the first block in SUBFS
+typedef struct SUBFSHdr {
+	char		signature[8];	// Start of SUBFS located by searching for this
+									// pattern at 512B boundaries.  Contents are
+									// "SUBFS001"
+	unsigned	nblocks;			// Total number of 512B blocks (including this one).
+	unsigned resv[3];
+	SUBFSDirent_t dir[15];	// Entry for each file (up to 15).
+	// Total bytes to this point is 256.  Remainder of header block is
+	// block chaining map i.e. each entry indicates the next block in the
+	// same file.  Entry 0 corresponds to the header block, and is thus not used.
+	// Otherwise, the entry index corresponds to the block index.  If the block
+	// belongs to a file, its value indicates the index of the next block in
+	// the file, or is zero for the last block.  If the block is not in a file,
+	// its value must be its own index (since a block could never be followed by
+	// itself).
+	char		map[256];
+	// 512 bytes to this point.
+} SUBFSHdr_t;
+
+// Static state info for SUBFS.  One global (far) instance of this.
+typedef struct SUBFSInfo {
+	int				init;			// True if SUBFS initialized
+	unsigned long	start_offs;	// Offset in UB to header block
+	SUBFSHdr_t		hdr;			// In-core copy of header block
+} SUBFSInfo_t;
+
+
+extern __far SUBFSInfo_t _subfs;
+
+/*** EndHeader ***********************************************/
+__far SUBFSInfo_t _subfs = { 0, };
+
+/*** BeginHeader _subfs_init */
+// force_format is true in order to ignore any existing file data.
+// This effectively formats the SUBFS if any file is ever written,
+// and the filesystem appears empty to the program.
+int _subfs_init(int force_format);
+/*** EndHeader */
+
+_subfs_debug
+int _subfs_init(int force_format)
+{
+	long offs, eo;
+	unsigned i;
+	int rc = -EAGAIN;
+
+	if (_subfs.init)
+		return 0;
+
+	offs = ((SUBFS_RESERVE_START-1)|511)+1;	// Round up to next mult 512
+	eo = savedUBI.blockSize - SUBFS_RESERVE_END & ~511;	// Round down
+	if (eo < offs+1024)	// Require at least one block other than the header
+		return -ENODEV;
+
+	__costate {
+	   // Now read the header and check signature
+	   _subfs.start_offs = offs;
+	   __waitfor((rc=readUserBlock(&_subfs.hdr, (unsigned)offs, sizeof(_subfs.hdr))) <= 0);
+	   if (rc < 0)
+	   	rc = -ENODEV;
+	   else {
+	      if (force_format || memcmp(_subfs.hdr.signature, "SUBFS001", 8)) {
+	         // Virgin FS.  Initialize in-core copy according to current parameters
+	      #ifdef SUBFS_VERBOSE
+	         printf("SUBFS: formatting SUBFS\n");
+	      #endif
+	         _f_memset(&_subfs.hdr, 0, sizeof(_subfs.hdr));
+	         _f_memcpy(_subfs.hdr.signature, "SUBFS001", 8);
+	         _subfs.hdr.nblocks = (unsigned)(eo - offs >> 9);
+	         for (i = 1; i < _subfs.hdr.nblocks; ++i)
+	            _subfs.hdr.map[i] = i;  // Mark block as free for allocation
+
+	         // Actually write the header block
+	         __waitfor((rc=writeUserBlock((unsigned)offs, &_subfs.hdr,
+	         						sizeof(_subfs.hdr))) <= 0);
+	         if (rc < 0)
+	            rc = -ENODEV;
+
+	      }
+	      _subfs.init = 1;
+	   }
+	}
+	return rc;
+}
+
+
+/*** BeginHeader _subfs_findslot */
+// Find slot given name.  If exists, returns 0 and *de points to it.
+// If not exists, but there is space for it, returns -ENOENT and
+// points *de to an empty slot to use.  If no more entries available,
+// returns -ENOENT and sets *de to NULL.  Can also return -ENODEV
+// if no SUBFS available.
+int _subfs_findslot(const char __far * name, SUBFSDirent_t __far * * de);
+/*** EndHeader */
+
+_subfs_debug
+int _subfs_findslot(const char __far * name, SUBFSDirent_t __far * * de)
+{
+	SUBFSDirent_t __far * mt;
+	SUBFSDirent_t __far * u;
+	int i;
+	int rc = -EAGAIN;
+
+	__costate {
+	   *de = NULL;
+	   __waitfor ((rc = _subfs_init(0)) != -EAGAIN);
+	   if (!rc) {
+	      if (!name || !*name || strlen(name) > sizeof(u->name))
+	         rc = -EINVAL;   // Cannot have NULL name, or too long
+	   }
+	   if (!rc) {
+	      u = _subfs.hdr.dir;
+	      mt = NULL;
+	      for (i = 0; i < 15; ++i, ++u) {
+	         if (!strncmp(name, u->name, sizeof(u->name))) {
+	            *de = u;
+	            goto _exit;
+	         }
+	         if (!*u->name && !mt)
+	            mt = u;
+	      }
+	      if (mt)
+	         *de = mt;
+	      rc = -ENOENT;
+	   }
+_exit:;
+	}
+	return rc;
+}
+
+
+/*** BeginHeader _subfs_getfree */
+// Get free slot.
+// Returns new block index and sets next block at that index, in the map,
+// to zero.  If none free, returns 0.
+unsigned _subfs_getfree(void);
+/*** EndHeader */
+
+_subfs_debug
+unsigned _subfs_getfree(void)
+{
+	unsigned bx;
+
+	for (bx = 1; bx < _subfs.hdr.nblocks; ++bx)
+		if (_subfs.hdr.map[bx] == bx) {
+			_subfs.hdr.map[bx] = 0;
+			return bx;
+		}
+	return 0;
+}
+
+
+/*** BeginHeader subfs_avail */
+/* START FUNCTION DESCRIPTION ********************************************
+subfs_avail                         <SUBFS.LIB>
+
+SYNTAX:			int subfs_avail(const char far * name)
+
+DESCRIPTION:	Determine how many blocks are available for file 'name',
+					which may be a new name, in which case all unallocated
+					storage is considered, or may exist, in which case all
+					unallocated storage plus the current size of the file is
+					considered.
+
+PARAMETER1:    Name of file to check, or a new name, null terminated.
+
+RETURN VALUE:  Number of available storage blocks (512 bytes each) which
+					are available, or
+					-ENOENT: no space available for new file
+					-EINVAL: not a valid file name
+					-ENODEV: userID block not available
+					-EAGAIN: not an error, call again with same parameter to
+					  complete this operation (only if board has a serial
+					  boot flash: application code can test for this using
+					  #if _SERIAL_BOOT_FLASH_)
+
+SEE ALSO:
+END DESCRIPTION **********************************************************/
+int subfs_avail(const char __far * name);
+/*** EndHeader */
+
+_subfs_debug
+int subfs_avail(const char __far * name)
+{
+	SUBFSDirent_t __far * de;
+	int rc;
+	unsigned nf, i;
+
+	__costate {
+	   __waitfor ((rc = _subfs_findslot(name, &de)) != -EAGAIN);
+	   if (!rc || rc == -ENOENT && de) {
+	      nf = 0;
+	      for (i = 1; i < _subfs.hdr.nblocks; ++i)
+	         if (_subfs.hdr.map[i] == i)
+	            ++nf;
+	      if (!rc)
+	         nf += de->used;
+	      rc = nf;
+	   }
+	}
+	return rc;
+}
+
+
+/*** BeginHeader subfs_create */
+/* START FUNCTION DESCRIPTION ********************************************
+subfs_create                         <SUBFS.LIB>
+
+SYNTAX:			int subfs_create(const char far * name,
+											const char far * data,
+											unsigned long len)
+
+DESCRIPTION:	Create and populate a new SUBFS file.  If the file already
+					exists, it is overwritten.
+
+PARAMETER1:    Name of file, up to 12 characters, null terminated.
+PARAMETER2:    File data.
+PARAMETER3:    Length of data.
+
+RETURN VALUE:	0: OK
+					-ENOSPC: insufficient space available
+					-ENOENT: already 15 files, cannot create new
+					-ENOMEM: insufficient temporary RAM
+					-EINVAL: not a valid file name, data NULL, or length
+					  too long (>= 64k).
+					-ENODEV: userID block not available
+					-EPERM: internal error writing to userID block
+					-EIO: I/O error when writing
+					-EAGAIN: not an error, call again with same parameter to
+					  complete this operation (only if board has a serial
+					  boot flash: application code can test for this using
+					  #if _SERIAL_BOOT_FLASH_)
+
+SEE ALSO:
+END DESCRIPTION **********************************************************/
+int subfs_create(const char __far * name, const char __far * data, unsigned long len);
+/*** EndHeader */
+
+_subfs_debug
+int subfs_create(const char __far * name, const char __far * data, unsigned long len)
+{
+	SUBFSDirent_t __far * de;
+	_SBF_STATIC int rc;
+	unsigned nbr, nba;	// number of blocks required, available
+	unsigned bx;	// block index
+	unsigned nbx;	// next block index
+	unsigned pbx;	// previous block index
+	unsigned blen;	// current block length
+	_SBF_STATIC struct {
+		// note: UB currently limited to 64k, so make only 128 entries.
+		// change to 256 if and when 128k UB.
+		unsigned sx;
+		unsigned dest_offs[128];
+		unsigned dest_bytes[128];
+		const void __far * source[2];	// Source only from header and data
+		unsigned numbytes[2];
+	} __far * p;	// Parameters for scatter
+
+	__costate {
+		if (len >= 65536 ||
+				!data) {
+			rc = -EINVAL;
+			goto _exit;
+		}
+
+	   // Since we are updating, re-initialize the SUBFS cached information.
+	   _subfs.init = 0;
+
+	   __waitfor ((rc = _subfs_findslot(name, &de)) != -EAGAIN);
+	   if (!de)
+	      goto _exit;
+	   nba = subfs_avail(name);   // Cannot fail, findslot catches it.
+	   nbr = (unsigned)(len+511 >> 9);
+	   if (nbr > nba) {
+	   	rc = -ENOSPC;
+	      goto _exit;         // No space left on FS
+	   }
+	   // New file will fit...
+
+	   // Get scatter work area
+	   p = _sys_malloc(sizeof(*p));
+	   if (!p) {
+	      rc = -ENOMEM;
+	      goto _exit;
+	   }
+
+	   if (rc != -ENOENT) {
+	      // An existing entry being overwritten.  For simplicity, go and
+	      // free all its current blocks.
+	      for (bx = de->sbx; bx; bx = nbx) {
+	         nbx = _subfs.hdr.map[bx];
+	         _subfs.hdr.map[bx] = bx;
+	      }
+	   }
+	   _f_strncpy(de->name, name, sizeof(de->name));
+	   de->used = nbr;
+	   de->sbx = 0;
+	   de->lbu = 0;
+
+
+	   p->source[0] = &_subfs.hdr;
+	   p->numbytes[0] = sizeof(_subfs.hdr);
+	   p->source[1] = data;
+	   p->numbytes[1] = (unsigned)len;
+	   p->dest_offs[0] = (unsigned)_subfs.start_offs;
+	   p->dest_bytes[0] = sizeof(_subfs.hdr);
+	   pbx = 0;
+	   for (p->sx = 1; p->sx <= nbr; ++p->sx) {
+	      bx = _subfs_getfree();
+	      if (p->sx == 1)
+	         de->sbx = bx;
+	      else
+	         _subfs.hdr.map[pbx] = bx;
+	      pbx = bx;
+	      p->dest_offs[p->sx] = (unsigned)(_subfs.start_offs + bx*512uL);
+	      if (p->sx == nbr) {
+	         blen = (unsigned)len & 0x1FF;
+	         if (!blen)
+	         	blen = 512;
+	      }
+	      else
+	         blen = 512;
+	      p->dest_bytes[p->sx] = blen;
+	   	de->lbu = blen;
+	   }
+	   __waitfor (
+	   	(rc = scatterUserBlockArray(
+	            p->dest_offs,
+	            p->dest_bytes,
+	            p->sx,
+	            (const void __far * const __far *)p->source,
+	            p->numbytes,
+	            1+(len != 0))) != -EAGAIN
+	           );
+	   _sys_free(p);
+
+	   if (rc) {
+	      // Failed write, force re-initialize.
+	      _subfs.init = 0;
+	      __waitfor (_subfs_init(0) != -EAGAIN);
+	   }
+	   else
+	   	rc = 0;
+_exit:;
+	}
+	return rc;
+}
+
+
+/*** BeginHeader subfs_delete */
+/* START FUNCTION DESCRIPTION ********************************************
+subfs_delete                         <SUBFS.LIB>
+
+SYNTAX:			int subfs_delete(const char far * name)
+
+DESCRIPTION:	Delete existing SUBFS file.
+
+PARAMETER1:    Name of file, up to 12 characters, null terminated.
+
+RETURN VALUE:	0: OK
+					-ENOENT: file not found
+					-EINVAL: not a valid file name
+					-ENODEV: userID block not available
+					-EIO: I/O error when writing
+					-EAGAIN: not an error, call again with same parameter to
+					  complete this operation (only if board has a serial
+					  boot flash: application code can test for this using
+					  #if _SERIAL_BOOT_FLASH_)
+
+SEE ALSO:
+END DESCRIPTION **********************************************************/
+int subfs_delete(const char __far * name);
+/*** EndHeader */
+
+_subfs_debug
+int subfs_delete(const char __far * name)
+{
+	SUBFSDirent_t __far * de;
+	int rc;
+	unsigned a, b;
+
+	__costate {
+	   // Since we are updating, re-initialize the SUBFS cached information.
+	   _subfs.init = 0;
+
+	   __waitfor ((rc = _subfs_findslot(name, &de)) != -EAGAIN);
+	   if (!rc) {
+	      for (a = de->sbx; a; a = b) {
+	         b = _subfs.hdr.map[a];
+	         _subfs.hdr.map[a] = a;  // Point to self, indicate free
+	      }
+	      _f_memset(de, 0, sizeof(*de));
+	      __waitfor ((rc = writeUserBlock((unsigned)_subfs.start_offs,
+	                                    &_subfs.hdr,
+	                                    sizeof(_subfs.hdr))) <= 0);
+	      if (rc < 0)
+	         rc = -EIO;
+	   }
+	}
+	return rc;
+}
+
+
+
+/*** BeginHeader subfs_len */
+/* START FUNCTION DESCRIPTION ********************************************
+subfs_len                         <SUBFS.LIB>
+
+SYNTAX:			long subfs_len(const char far * name)
+
+DESCRIPTION:	Get length of existing file.  Also used to test for
+					existence.
+
+PARAMETER1:    Name of file, up to 12 characters, null terminated.
+
+RETURN VALUE:	>= 0: length of file in bytes
+					-ENOENT: file not found
+					-EINVAL: not a valid file name
+					-ENODEV: userID block not available
+					-EAGAIN: not an error, call again with same parameter to
+					  complete this operation (only if board has a serial
+					  boot flash: application code can test for this using
+					  #if _SERIAL_BOOT_FLASH_)
+
+SEE ALSO:
+END DESCRIPTION **********************************************************/
+long subfs_len(const char __far * name);
+/*** EndHeader */
+
+_subfs_debug
+long subfs_len(const char __far * name)
+{
+	SUBFSDirent_t __far * de;
+	long rc;
+
+	__costate {
+	   __waitfor ((rc = _subfs_findslot(name, &de)) != -EAGAIN);
+	   if (!rc) {
+	      if (de->used)
+	         rc = (de->used-1)*512L + de->lbu;
+	   }
+	}
+	return rc;
+}
+
+
+
+/*** BeginHeader subfs_read */
+/* START FUNCTION DESCRIPTION ********************************************
+subfs_read                         <SUBFS.LIB>
+
+SYNTAX:			int subfs_read(const char far * name, char far * data,
+										unsigned long offset,
+										unsigned long far * lenp)
+
+DESCRIPTION:	Read all or part of existing file.
+
+PARAMETER1:    Name of file, up to 12 characters, null terminated.
+PARAMETER2:    Where to store file data.
+PARAMETER3:    Starting byte offset of first byte to read.
+PARAMETER4:    In/out parameter: on entry, set to length of data storage
+					area (parameter 2).  On exit, value will be set to length
+					of data actually read.
+
+RETURN VALUE:	0: OK
+					-EINVAL: not a valid file name, or lenp was NULL, or
+						data was NULL.
+					-ENODEV: userID block not available
+					-EIO: I/O error when reading
+					-EAGAIN: not an error, call again with same parameter to
+					  complete this operation (only if board has a serial
+					  boot flash: application code can test for this using
+					  #if _SERIAL_BOOT_FLASH_)
+
+SEE ALSO:
+END DESCRIPTION **********************************************************/
+int subfs_read(const char __far * name, char __far * data,
+			unsigned long offset, unsigned long __far * lenp);
+/*** EndHeader */
+
+_subfs_debug
+int subfs_read(const char __far * name, char __far * data,
+			unsigned long offset, unsigned long __far * lenp)
+{
+	_SBF_STATIC SUBFSDirent_t __far * de;
+	int rc;
+	unsigned sb;	// start block
+	_SBF_STATIC unsigned bo;	// block offset
+	_SBF_STATIC unsigned bx;	// block index
+	_SBF_STATIC unsigned nbx;	// next block index
+	_SBF_STATIC unsigned long len;
+	_SBF_STATIC unsigned bib;	// bytes in block
+
+	__costate {
+	   if (!lenp || offset < 0 || !data) {
+	   	rc = -EINVAL;
+	   	goto _exit;
+	   }
+	   len = *lenp;
+	   *lenp = 0;
+	   __waitfor ((rc = _subfs_findslot(name, &de)) != -EAGAIN);
+	   if (rc < 0)
+	      goto _exit;
+
+	   sb = (unsigned)(offset >> 9);
+	   bo = (unsigned)offset & 0x1FF;
+
+	   for (bx = de->sbx; bx; bx = nbx) {
+	      nbx = _subfs.hdr.map[bx];
+	      if (!sb)
+	         break;
+	      --sb;
+	   }
+
+	   do {
+	      if (nbx)
+	         bib = 512;
+	      else
+	         bib = de->lbu;
+	      if (!bx || bo >= bib) {
+	         // File ran out before getting to desired block, or last block
+	         // but not enough stored in last block.
+	         rc = 0;
+	         break;
+	      }
+	      if (len <= bib - bo) {
+	         // Read completely satisfied in this block
+	         __waitfor ((rc = readUserBlock(data,
+	         						(unsigned)(bo + bx*512uL + _subfs.start_offs),
+	                           (unsigned)len)) <= 0);
+	         *lenp += len;
+	         if (rc < 0)
+					rc = -EIO;
+	         break;
+	      }
+	      bib -= bo;
+	      __waitfor ((rc = readUserBlock(data,
+	      				(unsigned)(bo + bx*512uL + _subfs.start_offs),
+	      				bib)) <= 0);
+	      if (rc < 0) {
+	      	rc = -EIO;
+	         break;
+	      }
+	      *lenp += bib;
+	      data += bib;
+	      len -= bib;
+	      bo = 0;
+	      bx = nbx;
+	      nbx = _subfs.hdr.map[bx];
+	   } while (1);
+_exit:;
+	}
+	return rc;
+}
+
+
+/*** BeginHeader subfs_update */
+/* START FUNCTION DESCRIPTION ********************************************
+subfs_update                         <SUBFS.LIB>
+
+SYNTAX:			int subfs_update(const char far * name,
+											const char far * data,
+											unsigned long len)
+
+DESCRIPTION:	Overwrite an existing SUBFS file.
+
+PARAMETER1:    Name of file, up to 12 characters, null terminated.
+PARAMETER2:    File data.
+PARAMETER3:    Length of data.
+
+RETURN VALUE:	0: OK
+					-ENOSPC: insufficient space available
+					-ENOENT: already 15 files, cannot create new
+					-ENOMEM: insufficient temporary RAM
+					-EINVAL: not a valid file name, data NULL, or length
+					  too long (>= 64k).
+					-ENODEV: userID block not available
+					-EPERM: internal error writing to userID block
+					-EIO: I/O error when writing
+					-EAGAIN: not an error, call again with same parameter to
+					  complete this operation (only if board has a serial
+					  boot flash: application code can test for this using
+					  #if _SERIAL_BOOT_FLASH_)
+
+SEE ALSO:
+END DESCRIPTION **********************************************************/
+int subfs_update(const char __far * name, const char __far * data,
+		unsigned long len);
+/*** EndHeader */
+
+_subfs_debug
+int subfs_update(const char __far * name, const char __far * data,
+		unsigned long len)
+{
+	SUBFSDirent_t __far * de;
+	int rc;
+
+	__costate {
+	   __waitfor ((rc = _subfs_findslot(name, &de)) != -EAGAIN);
+	   if (!rc)
+	      __waitfor ((rc = subfs_create(name, data, len)) != -EAGAIN);
+	}
+	return rc;
+}
+
+
+/*** BeginHeader  */
+/*** EndHeader */
+
+
+/*** BeginHeader  ********************************************/
+#endif	// __SUBFS_LIB
+/*** EndHeader ***********************************************/
+

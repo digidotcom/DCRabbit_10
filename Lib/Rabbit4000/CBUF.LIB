@@ -1,0 +1,1003 @@
+/*
+ * Copyright (c) 2009 Digi International Inc., All Rights Reserved
+ *
+ * This software contains proprietary and confidential information of Digi
+ * International Inc.  By accepting transfer of this copy, Recipient agrees
+ * to retain this software in confidence, to prevent disclosure to others,
+ * and to make no use of this software other than that for which it was
+ * delivered.  This is a published copyrighted work of Digi International
+ * Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+ * prohibited.
+ *
+ * Restricted Rights Legend
+ *
+ * Use, duplication, or disclosure by the Government is subject to
+ * restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+ * Technical Data and Computer Software clause at DFARS 252.227-7031 or
+ * subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+ * Restricted Rights at 48 CFR 52.227-19, as applicable.
+ *
+ * Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+ *-----------------------------------------------------------------------------
+ */
+
+/* START LIBRARY DESCRIPTION ********************************************
+CBUF.LIB
+
+OVERVIEW:		The circular buffers here are standard rotating FIFO buffers.
+					They are currently used by the RS232 serial library to store
+					incoming and outgoing data, but they are general purpose.
+
+					One requirement is that the buffer capacity is always (2^n - 1).
+					For example, 3, 7, 15, 31, 63, 127, 255, 511, etc.
+
+					It should be safe to interrupt any buffer read with a write and
+					vice-versa.  You should never interrupt a read with another read
+					(including a buffer_flush), or a write with another write.  Try
+					to design your program so that only one task or ISR writes to
+					the circular buffer, and only one task or ISR reads from it.
+
+BUFFER STRUCTURE:
+					Each circular buffer has 8 bytes of header, and 2^n bytes
+					of data area, of which 2^n - 1 bytes are used to hold data at
+					any time.  The additional data-area byte provides a separator
+					for the tail index and the head. Therefore, when allocating
+					space for a buffer, you will need 2^n + 8 bytes.
+
+					The 8-byte header stores the following data:
+						byte		lock;			// read/write locks
+							#define CBUF_WRITE_BIT	0
+							#define CBUF_READ_BIT	1
+						byte		unused;
+						word		head;			// front, or head index of data
+						word		tail;			// back, or tail index of data
+						word		mask;			// 2^n - 1 mask
+
+					The header is followed by 2^n bytes of buffered data.  When
+					allocating space for a buffer with an X-byte capacity, you
+					need to allocate (X + CBUF_OVERHEAD) bytes.  CBUF_OVERHEAD is
+					nine -- eight bytes for the header, plus 1 for the separator.
+
+					The buffer is empty when (head == tail).
+					The buffer is full when ((head + mask) & mask == tail).
+
+FUNCTIONS:		Note that the buffer_xxx functions use far pointers to the
+					cbuf_t structure (cbuf_t far *).  Deprecated cbuf_xxx functions
+					that take near pointers (char *) exist for each buffer_xxx
+					function for backward compatability.
+
+					buffer_init			Initialize the circular buffer structure.
+					buffer_flush		Delete the contents of the buffer.
+
+					buffer_getch		Get a byte from the buffer.
+					buffer_putch		Put a byte into the buffer.
+					buffer_put			Put multiple bytes into the buffer.
+					buffer_get			Get multiple bytes from the buffer.
+					buffer_peek			Look at the first byte without deleting it.
+
+					buffer_wrlock		Attempt to set the write lock bit.
+					buffer_wrunlock	Release the write lock bit.
+					buffer_rdlock		Attempt to set the read lock bit.
+					buffer_rdunlock	Release the read lock bit.
+
+					buffer_length		Return capacity of buffer.
+					buffer_used			Return number of bytes stored in buffer.
+					buffer_free			Return number of unused bytes in buffer.
+											Note that free + used always equals length.
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader */
+#ifndef _CBUF_H
+#define _CBUF_H
+
+#ifdef CBUF_DEBUG
+	#define _cbuf_debug __debug
+#else
+	#define _cbuf_debug __nodebug
+#endif
+
+//set to at least as high as any routine that uses the buffer
+#ifndef CBUF_IP
+	#ifdef RS232_INT_LEVEL
+		#define CBUF_IP RS232_INT_LEVEL
+	#else
+		#define CBUF_IP 1
+	#endif
+#endif
+
+// Bytes are added to the tail and removed from the head of the buffer.
+// put: buffer[tail++] = ch; tail &= mask;
+// get: ch = buffer[head++]; head &= mask;
+//	free: (head + mask - tail) & mask
+// used: (tail - head) & mask
+typedef struct _cbuf
+{
+	byte		lock;			// read/write locks
+		#define CBUF_WRITE_BIT	0
+		#define CBUF_READ_BIT	1
+	byte		unused;		// unused byte, kept for backward compatability
+	word		head;			// front, or head index of data
+	word		tail;			// back, or tail index of data
+	word		mask;			// 2^n - 1 mask
+	byte		buffer[1];	// variable length (<mask> bytes + 1 separator byte)
+} cbuf_t;
+#define CBUF_OVERHEAD sizeof(cbuf_t)
+
+/*
+	CBUF_OVERHEAD is used when allocating memory for a circular buffer.  For a
+	cbuf that can hold X bytes, you need (X + CBUF_OVERHEAD) bytes of memory.
+
+	CBUF_OVERHEAD = 8-byte header, plus separator byte
+
+	For example, to set up a 31-byte circular buffer:
+
+	#define MY_BUF_SIZE 31			// must be 2^n -1
+	far char my_buf_space[MY_BUF_SIZE + CBUF_OVERHEAD];
+	cbuf_t far *my_buf;
+
+	my_buf = (cbuf_t far *)my_buf_space;
+	buffer_init( my_buf, MY_BUF_SIZE);
+*/
+
+/*** EndHeader */
+
+/*** BeginHeader cbuf_getch, buffer_getch */
+int cbuf_getch( char *buf);
+int buffer_getch( cbuf_t __far *buf);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+cbuf_getch                                                      <CBUF.LIB>
+						Deprecated -- use buffer_getch instead.
+
+SYNTAX:		   int cbuf_getch(char *circularBuffer);
+
+DESCRIPTION:  returns the first character of the data, indicated by head.
+
+PARAMETER1:   circularBuffer: Circular buffer.
+
+RETURN VALUE:	-1 if the buffer is empty, the character at the head index
+					if not.
+END DESCRIPTION **********************************************************/
+/* START FUNCTION DESCRIPTION ********************************************
+buffer_getch                                                    <CBUF.LIB>
+
+SYNTAX:	int buffer_getch( cbuf_t far *buf)
+
+DESCRIPTION:	Remove and return the first byte of the circular buffer.
+
+					This function can be called from an ISR.  It modifies the
+					registers AF, HL, DE and PY.  The serial ISR of RS232.LIB
+					assumes it will NOT modify BC or PX!  Also, it's safe to
+					optimize the call by skipping the [PUSH PX] before the call
+					and [ADD SP, 4] after.
+
+PARAMETER 1:	Pointer to circular buffer.
+
+RETURN VALUE:	-1 if the buffer is empty, or the byte removed from the head
+					of the buffer.
+
+SEE ALSO:	buffer_putch, buffer_get, buffer_put
+
+END DESCRIPTION **********************************************************/
+#asm __xmem _cbuf_debug
+cbuf_getch::
+	ldl	px, hl									; px points to the cbuf_t
+buffer_getch::
+	ld		hl, (px+[cbuf_t]+head)				; hl = head
+	ld		de, (px+[cbuf_t]+tail)				; de = tail
+
+	cp		hl, de									; head == tail?
+	jr		neq, .cbgc_nempty
+
+	; return -1
+	clr	hl
+	dec	hl
+	lret
+
+.cbgc_nempty:
+	; a = buffer[head]
+	ld		py, px+[cbuf_t]+buffer
+	ld		a, (py+hl)
+
+	; head = (head + 1) & mask
+	inc	hl
+	ld		de, (px+[cbuf_t]+mask)
+	and	hl, de
+	ld		(px+[cbuf_t]+head), hl
+
+	; return byte read from buffer
+	clr	hl
+	ld		l,a
+	lret
+#endasm
+
+/*** BeginHeader cbuf_putch, buffer_putch */
+int cbuf_putch( char *buf, int c);
+int buffer_putch( cbuf_t __far *buf, int ch);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+cbuf_putch                                                      <CBUF.LIB>
+						Deprecated -- use buffer_putch instead.
+
+SYNTAX:		   int cbuf_putch(char *circularBuffer, int chr);
+
+DESCRIPTION:  puts the character into the next available position. If the
+              buffer is full, chr is lost.
+
+PARAMETER1:   circularBuffer: Circular buffer.
+PARAMETER2:   chr           : Character to write is in low byte of the int
+
+RETURN VALUE:	0 if the buffer is full, 1 if the character can be placed.
+END DESCRIPTION **********************************************************/
+/* START FUNCTION DESCRIPTION ********************************************
+buffer_putch                                                    <CBUF.LIB>
+
+SYNTAX:	int buffer_putch( cbuf_t far *buf, int ch)
+
+DESCRIPTION:	Append a single byte to the circular buffer (if not full).
+
+					This function can be called from an ISR.  It modifies the
+					registers AF, HL, DE and PY.  The serial ISR of RS232.LIB
+					assumes it will NOT modify BC or PX!
+
+PARAMETER 1:	Pointer to circular buffer.
+
+PARAMETER 2:	Byte to append.
+
+RETURN VALUE:	0 if the buffer is full, 1 if the byte was appended.
+
+SEE ALSO: buffer_getch, buffer_get, buffer_put
+
+END DESCRIPTION **********************************************************/
+// This function is lcalled from assembly, so we must explicitly tag it xmem
+#asm __xmem _cbuf_debug
+cbuf_putch::
+	ldl	px, hl
+	ld		hl, (sp+3+2)						; l = byte to insert
+	jr		.common
+
+buffer_putch::
+	; px contains address of circular buffer from function call
+	ld		hl, (sp+3+4)						; l = byte to insert
+
+.common:
+	ld		a, l									; copy byte into A
+
+	; A useful feature of this buffer type is that we can copy the byte
+	; into the buffer, even if it's full.  The tail always points to an unused
+	; byte in the buffer.  This saves work later, since we can increment
+	; the tail, compare it to head and only save the updated tail if the buffer
+	; isn't full.
+	ld		py, px+[cbuf_t]+buffer
+	ld		hl, (px+[cbuf_t]+tail)
+	ld		(py+hl), a
+
+	; increment tail (wrapping as necessary)
+	ld		de, (px+[cbuf_t]+mask)
+	inc	hl
+	and	hl, de
+
+	; is buffer full?
+	ld		de, hl								; new tail is now in DE
+	ld		hl, (px+[cbuf_t]+head)
+	cp		hl, de
+	clr	hl										; retval = 0
+	jr		eq, .full							; if (tail + 1 == head), buffer is full
+
+.notfull:
+	; not full, OK to save off the new tail
+	ld		(px+[cbuf_t]+tail), de			; save off updated tail pointer
+	inc	hl										; retval = 1
+
+.full:
+	lret
+#endasm
+
+/*** BeginHeader cbuf_wrlock, cbuf_wrunlock, buffer_wrlock, buffer_wrunlock */
+int cbuf_wrlock( char *buf);
+void cbuf_wrunlock( char *buf);
+int buffer_wrlock( cbuf_t __far *buf);
+void buffer_wrunlock( cbuf_t __far *buf);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+cbuf_wrlock                                                     <CBUF.LIB>
+						Deprecated -- use buffer_wrlock instead.
+
+SYNTAX:		   int cbuf_wrlock(char *circularBuffer);
+
+DESCRIPTION:  Locks the write buffer by setting the write buffer lock bit.
+              If the buffer had already been locked the return value is 0,
+              indicating the attempt to put a lock on the buffer failed.
+
+PARAMETER1:   circularBuffer: Circular buffer to lock.
+
+RETURN VALUE:	0 if previously locked, 1 if previously unlocked
+END DESCRIPTION **********************************************************/
+/* START FUNCTION DESCRIPTION ********************************************
+buffer_wrlock                                                   <CBUF.LIB>
+
+SYNTAX:	int buffer_wrlock( cbuf_t far *buf)
+
+DESCRIPTION:	Sets the write lock bit for a given circular buffer.  Note that
+					none of the library functions check this bit -- it's intended
+					to be used by higher API layers that make use of this library.
+
+					This function can be called from an ISR.  It only modifies
+					the registers AF and HL.
+
+PARAMETER 1:	Pointer to circular buffer.
+
+
+RETURN VALUE:	1 if locking was successful, or 0 if buf is NULL or the write
+					lock was already set (the write lock remains set).
+
+SEE ALSO:	buffer_wrunlock, buffer_rdlock, buffer_rdunlock
+
+END DESCRIPTION **********************************************************/
+
+/* START _FUNCTION DESCRIPTION ********************************************
+cbuf_wrunlock                                                   <CBUF.LIB>
+						Deprecated -- use buffer_wrunlock instead.
+
+SYNTAX:		   int cbuf_wrunlock(char *circularBuffer);
+
+DESCRIPTION:  Unlocks the write buffer by clearing the write buffer lock bit.
+
+PARAMETER1:   circularBuffer: Circular buffer to unlock.
+
+RETURN VALUE:	None
+END DESCRIPTION **********************************************************/
+/* START FUNCTION DESCRIPTION ********************************************
+buffer_wrunlock                                                 <CBUF.LIB>
+
+SYNTAX:	void buffer_wrunlock( cbuf_t far *buf)
+
+DESCRIPTION:	Clears the write lock bit for a given circular buffer.  Note that
+					none of the library functions check this bit -- it's intended
+					to be used by higher API layers that make use of this library.
+
+					This function can be called from an ISR.  It only modifies
+					the registers AF and HL.
+
+PARAMETER 1:	Pointer to circular buffer.
+
+RETURN VALUE:	None.
+
+SEE ALSO:	buffer_wrlock, buffer_rdlock, buffer_rdunlock
+
+END DESCRIPTION **********************************************************/
+
+#asm __xmem _cbuf_debug
+cbuf_wrlock::
+	ldl	px, hl
+buffer_wrlock::
+	ipset	CBUF_IP
+	ld		a, (px+[cbuf_t]+lock)
+	bit	CBUF_WRITE_BIT, a
+	clr	hl
+	jr		nz, .return				; retval = 0, previously locked
+
+	set	CBUF_WRITE_BIT, a
+	ld		(px+[cbuf_t]+lock), a
+	inc	hl							; retval = 1, just locked it on this call
+.return:
+	ipres
+	lret
+#endasm
+
+#asm __xmem _cbuf_debug
+cbuf_wrunlock::
+	ldl	px, hl
+buffer_wrunlock::
+	ipset	CBUF_IP
+	ld		a, (px+[cbuf_t]+lock)
+	res	CBUF_WRITE_BIT, a
+	ld		(px+[cbuf_t]+lock), a
+	ipres
+	lret
+#endasm
+
+/*** BeginHeader cbuf_rdlock, cbuf_rdunlock, buffer_rdlock, buffer_rdunlock */
+int cbuf_rdlock( char *buf);
+void cbuf_rdunlock( char *buf);
+int buffer_rdlock( cbuf_t __far *buf);
+void buffer_rdunlock( cbuf_t __far *buf);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+cbuf_rdlock                                                     <CBUF.LIB>
+						Deprecated -- use buffer_rdlock instead.
+
+DESCRIPTION:  Locks the read buffer by setting the read buffer lock bit.
+              If the buffer had already been locked the return value is 0,
+              indicating the attempt to put a lock on the buffer failed.
+
+PARAMETER1:   circularBuffer: Circular buffer to lock.
+
+RETURN VALUE:	0 if previously locked, 1 if previously unlocked
+
+SEE ALSO:     circular buffers
+END DESCRIPTION **********************************************************/
+/* START FUNCTION DESCRIPTION ********************************************
+buffer_rdlock                                                   <CBUF.LIB>
+
+SYNTAX:	int buffer_rdlock( cbuf_t far *buf)
+
+DESCRIPTION:	Sets the read lock bit for a given circular buffer.  Note that
+					none of the library functions check this bit -- it's intended
+					to be used by higher API layers that make use of this library.
+
+					This function can be called from an ISR.  It only modifies
+					the registers AF and HL.
+
+PARAMETER 1:	Pointer to circular buffer.
+
+RETURN VALUE:	1 if locking was successful, or 0 if buf is NULL or the read
+					lock was already set (the read lock remains set).
+
+SEE ALSO:	buffer_rdunlock, buffer_wrlock, buffer_wrunlock
+
+END DESCRIPTION **********************************************************/
+
+/* START _FUNCTION DESCRIPTION ********************************************
+cbuf_rdunlock                                                   <CBUF.LIB>
+						Deprecated -- use buffer_rdunlock instead.
+
+SYNTAX:		   int cbuf_rdunlock(char *circularBuffer);
+
+DESCRIPTION:  Unlocks the read buffer by clearing the read buffer lock bit.
+
+PARAMETER1:   circularBuffer: Circular buffer to unlock.
+
+RETURN VALUE:	None
+END DESCRIPTION **********************************************************/
+/* START FUNCTION DESCRIPTION ********************************************
+buffer_rdunlock                                                 <CBUF.LIB>
+
+SYNTAX:	void buffer_rdunlock( cbuf_t far *buf)
+
+DESCRIPTION:	Clears the read lock bit for a given circular buffer.  Note that
+					none of the library functions check this bit -- it's intended
+					to be used by higher API layers that make use of this library.
+
+					This function can be called from an ISR.  It only modifies
+					the registers AF and HL.
+
+PARAMETER 1:	Pointer to circular buffer.
+
+RETURN VALUE:	None.
+
+SEE ALSO:	buffer_rdlock, buffer_wrlock, buffer_wrunlock
+
+END DESCRIPTION **********************************************************/
+
+#asm __xmem _cbuf_debug
+cbuf_rdlock::
+	ldl	px, hl
+buffer_rdlock::
+	ipset	CBUF_IP
+	ld		a, (px+[cbuf_t]+lock)
+	bit	CBUF_READ_BIT, a
+	clr	hl
+	jr		nz, .return				; retval = 0, previously locked
+
+	set	CBUF_READ_BIT, a
+	ld		(px+[cbuf_t]+lock), a
+	inc	hl							; retval = 1, just locked it on this call
+
+.return:
+	ipres
+	lret
+#endasm
+
+#asm __xmem _cbuf_debug
+cbuf_rdunlock::
+	ldl	px, hl
+buffer_rdunlock::
+	ipset	CBUF_IP
+	ld		a, (px+[cbuf_t]+lock)
+	res	CBUF_READ_BIT, a
+	ld		(px+[cbuf_t]+lock), a
+	ipres
+	lret
+#endasm
+
+/*** BeginHeader cbuf_init */
+void cbuf_init( char *buf, int datasize);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+cbuf_init                                                       <CBUF.LIB>
+						Deprecated -- use buffer_init instead.
+
+SYNTAX:		   int cbuf_init(char *circularBuffer, int dataSize);
+
+DESCRIPTION:  Zeros the locks, head and tail indices, and sets the mask to
+              the dataSize (2^n - 1), 1 less than the total data area.
+
+PARAMETER1:   circularBuffer: Circular buffer initialize.
+PARAMETER2:   dataSize      : size available to data, same as mask
+
+RETURN VALUE:	None
+END DESCRIPTION **********************************************************/
+_cbuf_debug
+void cbuf_init( char *buf, int datasize)
+{
+	buffer_init( (cbuf_t __far *) buf, datasize);
+}
+
+/*** BeginHeader buffer_init */
+int buffer_init( cbuf_t __far *buf, int datasize);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+buffer_init                                                     <CBUF.LIB>
+
+SYNTAX:	int buffer_init( cbuf_t far *buf, int datasize)
+
+DESCRIPTION:	Initialize the fields of the circular buffer.  Note that you
+					must initialize the cbuf_t structure before using it with any
+					other buffer_xxx() functions.  If you have ISRs pushing data
+					into the buffer, don't enable them until AFTER you've called
+					buffer_init.
+
+PARAMETER 1:	Address of buffer to use for the circular buffer.  This buffer
+					must be (datasize + CBUF_OVERHEAD) bytes long to hold the locks,
+					head, tail, size and buffered bytes.
+
+PARAMETER 2:	Maximum number of bytes to store in the circular buffer.  This
+					size must be at least 3, and a power of 2 minus 1 (2^n - 1).
+
+RETURN VALUE:	0 on success or -EINVAL if <buf> is NULL or <datasize> is
+					less than 3 or isn't a power of 2 minus 1 (2^n - 1).
+
+END DESCRIPTION **********************************************************/
+_cbuf_debug
+int buffer_init( cbuf_t __far *buf, int datasize)
+{
+	if (! buf || (datasize < 3) || (datasize & (datasize + 1)))
+	{
+		return -EINVAL;
+	}
+	buf->mask = datasize;
+	buf->lock = 0;
+	buf->head = buf->tail = 0;
+
+	return 0;
+}
+
+/*** BeginHeader cbuf_length, buffer_length */
+int cbuf_length( char *buf);
+int buffer_length( cbuf_t __far *buf);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+cbuf_length                                                     <CBUF.LIB>
+						Deprecated -- use buffer_length instead.
+
+SYNTAX:		   int cbuf_length(char *circularBuffer);
+
+DESCRIPTION:  Returns mask, the data capacity.
+
+PARAMETER1:   circularBuffer: Circular buffer.
+
+RETURN VALUE:	Mask
+END DESCRIPTION **********************************************************/
+/* START FUNCTION DESCRIPTION ********************************************
+buffer_length                                                   <CBUF.LIB>
+
+SYNTAX:	int buffer_length( cbuf_t far *buf)
+
+DESCRIPTION:	Returns the capacity of the circular buffer.
+
+					This function can be called from an ISR.  It only modifies
+					the register HL.
+
+PARAMETER 1:	Pointer to circular buffer.
+
+RETURN VALUE:	Maximum number of bytes that can be stored in the circular
+					buffer.
+
+SEE ALSO:	buffer_length, buffer_free
+
+END DESCRIPTION **********************************************************/
+
+#asm __xmem _cbuf_debug
+cbuf_length::
+	ldl	px, hl
+buffer_length::
+	ld		hl, (px+[cbuf_t]+mask)
+	lret
+#endasm
+
+/*** BeginHeader cbuf_used, buffer_used */
+int cbuf_used( char *buf);
+int buffer_used( cbuf_t __far *buf);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+cbuf_used                                                       <CBUF.LIB>
+						Deprecated -- use buffer_used instead.
+
+SYNTAX:		   int cbuf_used(char *circularBuffer);
+
+DESCRIPTION:  Calculates used up data space, (back-front+mask+1)&mask.
+
+PARAMETER1:   circularBuffer: Circular buffer.
+
+RETURN VALUE:	Number of bytes stored in the circular buffer.
+END DESCRIPTION **********************************************************/
+/* START FUNCTION DESCRIPTION ********************************************
+buffer_used                                                     <CBUF.LIB>
+
+SYNTAX:	int buffer_used( cbuf_t far *buf)
+
+DESCRIPTION:	Returns the number of bytes stored in the circular buffer.
+
+					This function can be called from an ISR.  It only modifies
+					the registers AF, HL and DE.
+
+PARAMETER 1:	Pointer to circular buffer.
+
+RETURN VALUE:	Number of bytes stored in the circular buffer.
+
+SEE ALSO:	buffer_length, buffer_free
+
+END DESCRIPTION **********************************************************/
+#asm __xmem _cbuf_debug
+cbuf_used::
+	ldl	px, hl
+buffer_used::
+	; calculate number of bytes used in buffer
+	ld		hl, (px+[cbuf_t]+tail)		; hl = tail
+	ld		de, (px+[cbuf_t]+head)		; de = head
+	sub	hl, de							; hl = tail - head
+	ld		de, (px+[cbuf_t]+mask)
+	and	hl, de							; hl = (tail - head) & mask
+
+	; hl is number of used bytes in buffer
+	lret
+#endasm
+
+/*** BeginHeader cbuf_free, buffer_free */
+int cbuf_free( char *buf);
+int buffer_free( cbuf_t __far *buf);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+cbuf_free                                                       <CBUF.LIB>
+						Deprecated -- use buffer_free instead.
+
+SYNTAX:		   int cbuf_free(char *circularBuffer);
+
+DESCRIPTION:  Calculates free data space, (front-back+mask)&mask.
+
+PARAMETER1:   circularBuffer: Circular buffer.
+
+RETURN VALUE:	Number of unused bytes in the circular buffer.
+END DESCRIPTION **********************************************************/
+/* START FUNCTION DESCRIPTION ********************************************
+buffer_free                                                     <CBUF.LIB>
+
+SYNTAX:	int buffer_free( cbuf_t far *buf)
+
+DESCRIPTION:	Returns the number of additional bytes that can be stored in
+					the circular buffer.
+
+					This function can be called from an ISR.  It only modifies
+					the registers AF, HL and DE.
+
+PARAMETER 1:	Pointer to circular buffer.
+
+RETURN VALUE:	Number of unused bytes in the circular buffer.
+
+SEE ALSO:	buffer_length, buffer_free
+
+END DESCRIPTION **********************************************************/
+
+#asm __xmem _cbuf_debug
+cbuf_free::
+	ldl	px, hl
+buffer_free::
+	; calculate number of unused bytes in buffer
+	ld		hl, (px+[cbuf_t]+head)		; hl = head
+	ld		de, (px+[cbuf_t]+tail)		; de = tail
+	sub	hl, de							; hl = head - tail
+	dec	hl									; hl = head - tail - 1
+	ld		de, (px+[cbuf_t]+mask)
+	and	hl, de							; hl = (head - tail - 1) & mask
+
+	; hl is number of unused bytes in buffer
+	lret
+#endasm
+
+/*** BeginHeader cbuf_flush, buffer_flush */
+int cbuf_flush( char *buf);
+void buffer_flush( cbuf_t __far *buf);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+cbuf_flush                                                      <CBUF.LIB>
+						Deprecated -- use buffer_flush instead.
+
+SYNTAX:		   int cbuf_flush(char *circularBuffer);
+
+DESCRIPTION:  Sets the head and tail indices to zero.
+
+PARAMETER1:   circularBuffer: Circular buffer.
+
+RETURN VALUE:	None
+END DESCRIPTION **********************************************************/
+/* START FUNCTION DESCRIPTION ********************************************
+buffer_flush                                                    <CBUF.LIB>
+
+SYNTAX:	void buffer_flush( cbuf_t far *buf)
+
+DESCRIPTION:	Flush the contents of the circular buffer.
+
+PARAMETER 1:	Pointer to circular buffer.
+
+					This function can be called from an ISR.  It only modifies
+					the register HL.
+
+RETURN VALUE:	None.
+
+END DESCRIPTION **********************************************************/
+// Note, old cbuf_flush always returned 1.
+#asm __xmem _cbuf_debug
+cbuf_flush::
+	ldl	px, hl
+buffer_flush::
+	; delete contents of buffer by setting head to tail
+	ld		hl, (px+[cbuf_t]+tail)
+	ld		(px+[cbuf_t]+head), hl
+	lret
+#endasm
+
+/*** BeginHeader cbuf_peek, buffer_peek */
+int cbuf_peek( char *buf);
+int buffer_peek( cbuf_t __far *buf);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+cbuf_peek                                                       <CBUF.LIB>
+						Deprecated -- use buffer_peek instead.
+
+SYNTAX:		   int cbuf_peek(char *circularBuffer);
+
+DESCRIPTION:  Returns the first byte of data.
+
+PARAMETER1:   circularBuffer: Circular buffer.
+
+RETURN VALUE:	-1 if the buffer is empty, 1st data character if not.
+END DESCRIPTION **********************************************************/
+/* START FUNCTION DESCRIPTION ********************************************
+buffer_peek                                                     <CBUF.LIB>
+
+SYNTAX:	int buffer_peek( cbuf_t far *buf)
+
+DESCRIPTION:	See what the first byte of the buffer is without deleting it.
+
+					This function can be called from an ISR.  It only modifies
+					the registers AF, HL, DE and PY.
+
+PARAMETER 1:	Pointer to circular buffer.
+
+RETURN VALUE:	The first byte in the buffer, or -1 if the buffer is empty.
+
+END DESCRIPTION **********************************************************/
+#asm __xmem _cbuf_debug
+cbuf_peek::
+	ldl	px, hl							; px points to the cbuf_t
+buffer_peek::
+	ld		hl, (px+[cbuf_t]+head)		; hl = head
+	ld		de, (px+[cbuf_t]+tail)		; de = tail
+
+	cp		hl, de							; head == tail?
+	jr		neq, .nempty
+
+	; return -1
+	clr	hl
+	dec	hl
+	jr		.done
+
+.nempty:
+	; a = buffer[head]
+	ld		py, px+[cbuf_t]+buffer
+	ld		a, (py+hl)
+
+	; return byte read from buffer
+	clr	hl
+	ld		l,a
+
+.done:
+	lret
+#endasm
+
+/*** BeginHeader cbuf_put, buffer_put */
+int cbuf_put( char *buf, char *s, int length);
+int buffer_put( cbuf_t __far *buf, const byte __far *source, int length);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+cbuf_put                                                        <CBUF.LIB>
+						Deprecated -- use buffer_put instead.
+
+SYNTAX:		   int cbuf_put(char *circularBuffer, char *chrs, int nchrs);
+
+DESCRIPTION:  puts as many of nchrs characters into the next available buffer
+              positions as possibleuntil all are written or until the buffer
+              is full.
+
+PARAMETER1:   circularBuffer: Circular buffer.
+PARAMETER2:   chrs          : array of characters to write
+PARAMETER3:   nchrs         : number of characters to write
+
+RETURN VALUE:	The number of characters successfully written.
+END DESCRIPTION **********************************************************/
+/* START FUNCTION DESCRIPTION ********************************************
+buffer_put                                                      <CBUF.LIB>
+
+SYNTAX:	int buffer_put( cbuf_t far *buf, const byte far *source, int length)
+
+DESCRIPTION:	Append multiple bytes to the end of a circular buffer.
+
+					This function can be called from an ISR.  It only modifies
+					the registers AF, HL, BC, DE, PY and PZ.
+
+PARAMETER 1:	Pointer to circular buffer.
+
+PARAMETER 2:	Pointer to bytes to insert into buffer.
+
+PARAMETER 3:	Number of bytes to insert.
+
+RETURN VALUE:	Actual number of bytes added to buffer; 0 if buffer is full.
+
+SEE ALSO: buffer_get, buffer_getch, buffer_putch
+
+END DESCRIPTION **********************************************************/
+// This function is lcalled from assembly, so we must explicitly tag it xmem
+#asm __xmem _cbuf_debug
+cbuf_put::
+	ldl	px, hl							; px = buf
+	ldl	py, (sp+3+2)					; py = source
+	ld		hl, (sp+3+4)					; hl = length
+	jr		.common
+
+buffer_put::
+	; px already contains a pointer to the circular buffer
+	ld		py, (sp+3+4)					; py = source
+	ld		hl, (sp+3+8)					; hl = length
+
+.common:
+	ld		bc, hl							; bc = # of bytes in write request
+	ld		hl, (px+[cbuf_t]+head)		; hl = head
+	ld		de, (px+[cbuf_t]+tail)		; de = tail
+	dec	hl
+	sub	hl, de							; hl = (head - 1) - tail
+	ld		de, (px+[cbuf_t]+mask)		; de = mask
+	and	hl, de							; hl = number of bytes free in cbuf
+	ld		de, hl							; de = number of bytes free in cbuf
+
+	ld		hl, bc							; hl = bytes to copy
+	cp		hl, de							; if hl > de, set hl to de
+	jr		lt, .lenok
+	ld		hl, de
+.lenok:
+	test	hl									; hl is number of bytes to copy
+	jr		z, .done							; nothing to copy, hl = 0 (retval)
+	push	hl									; save # of bytes to copy (retval)
+
+	ld		pz, px+[cbuf_t]+buffer		; pz = dest
+	ld		bc, hl							; bc = # of bytes to copy
+	ld		hl, (px+[cbuf_t]+tail)		; hl = tail
+	ld		de, (px+[cbuf_t]+mask)		; de = mask
+
+.wrloop:
+	ld		a, (py)							;
+	ld		py, py+1							; buffer[tail] = *source++
+	ld		(pz+hl), a						;
+
+	inc	hl									; tail = (tail + 1) & mask
+	and	hl, de
+
+	dwjnz	.wrloop
+
+	ld		(px+[cbuf_t]+tail), hl		; save updated value of tail
+
+	pop	hl									; return value is now stored HL
+
+.done:
+	lret
+#endasm
+
+/*** BeginHeader cbuf_get, buffer_get */
+int cbuf_get( char *buf, char *dest, int length);
+int buffer_get( cbuf_t __far *buf, byte __far *dest, int length);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+cbuf_get                                                        <CBUF.LIB>
+						Deprecated -- use buffer_get instead.
+
+SYNTAX:		   int cbuf_get(char *circularBuffer, char *chrs, nchrs);
+
+DESCRIPTION:  Reads nchrs characters into chrs, or until buffer is empty.
+
+PARAMETER1:   circularBuffer: Circular buffer.
+PARAMETER2:   chrs          : Character array into wich the data is read
+PARAMETER3:   nchrs         : Number of characters to read
+
+RETURN VALUE:	The number of characters actually read into chrs.
+END DESCRIPTION **********************************************************/
+/* START FUNCTION DESCRIPTION ********************************************
+buffer_get                                                      <CBUF.LIB>
+
+SYNTAX:	int buffer_get( cbuf_t far *buf, byte far *dest, int length)
+
+DESCRIPTION:	Read (and remove) multiple bytes from a circular buffer.
+
+					This function can be called from an ISR.  It only modifies
+					the registers AF, HL, BC, DE, PY and PZ.
+
+PARAMETER 1:	Pointer to circular buffer.
+
+PARAMETER 2:	Pointer to buffer to hold bytes from read.
+
+PARAMETER 3:	Maximum number of bytes to read from the circular buffer.
+
+RETURN VALUE:	Number of bytes extracted from <buf> and inserted into <dest>.
+
+SEE ALSO:	buffer_put, buffer_getch, buffer_putch
+
+END DESCRIPTION **********************************************************/
+#asm __xmem _cbuf_debug
+cbuf_get::
+	ldl	px, hl							; px = buf
+	ldl	py, (sp+3+2)					; py = dest
+	ld		hl, (sp+3+4)					; hl = length
+	jr		.common
+
+buffer_get::
+	; px already contains a pointer to the circular buffer
+	ld		py, (sp+3+4)					; py = dest
+	ld		hl, (sp+3+8)					; hl = length
+
+.common:
+	ld		bc, hl							; bc = # of bytes in read request
+	ld		hl, (px+[cbuf_t]+tail)		; hl = tail
+	ld		de, (px+[cbuf_t]+head)		; de = head
+	sub	hl, de							; hl = (tail - head)
+	ld		de, (px+[cbuf_t]+mask)		; de = mask
+	and	hl, de							; hl = number of bytes used in cbuf
+	ld		de, hl							; de = number of bytes used in cbuf
+
+	ld		hl, bc							; hl = bytes to copy
+	cp		hl, de							; if hl > de, set hl to de
+	jr		lt, .lenok
+	ld		hl, de
+.lenok:
+	test	hl									; hl is number of bytes to copy
+	jr		z, .done							; nothing to copy, hl = 0 (retval)
+	push	hl									; save # of bytes to copy (retval)
+
+	; set up registers for loop
+	ld		pz, px+[cbuf_t]+buffer		; pz = source
+	ld		bc, hl							; bc = # of bytes to copy
+	ld		hl, (px+[cbuf_t]+head)		; hl = head
+	ld		de, (px+[cbuf_t]+mask)		; de = mask
+
+.rdloop:
+	ld		a, (pz+hl)						;
+	ld		(py), a							; *dest++ = buffer[head]
+	ld		py, py+1							;
+
+	inc	hl									; head = (head + 1) & mask
+	and	hl, de
+
+	dwjnz	.rdloop
+
+	ld		(px+[cbuf_t]+head), hl		; save updated value of head
+
+	pop	hl									; return value is now stored HL
+
+.done:
+	lret
+#endasm
+
+/*** BeginHeader */
+#endif		// ndef _CBUF_H
+/*** EndHeader */

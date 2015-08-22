@@ -1,0 +1,455 @@
+/***********************
+
+sp_stream.lib
+
+implements a byte stream interface on the slave port
+
+**********************/
+
+/*** BeginHeader */
+#ifndef __SP_STREAM_LIB
+#define __SP_STREAM_LIB
+
+/*** EndHeader */
+
+
+/*** BeginHeader SPShandler */
+int SPShandler(char command, char datain, void *param);
+extern char sps_inbuf[];
+extern char sps_outbuf[];
+
+//passed in as a parameter to a stream handler
+typedef struct {
+	char *inbuf;
+	char *outbuf;
+	char wrfree_high;
+	char rdfree_high;
+	char wrused_high;
+	char rdused_high;
+	} SPStream;
+
+/*** EndHeader */
+
+//do not call, pass this to SPsetHandler
+__nodebug int SPShandler(char command, char datain, void *param)
+{
+	char response;
+	char return_data;
+	int temp;
+	SPStream *stream;
+
+	stream = (SPStream *)param;
+
+	switch(command)
+	{
+		case 1:	response = cbuf_putch(stream->inbuf, datain);
+					break;
+
+		case 2:	temp = cbuf_getch(stream->outbuf);
+					if(temp >= 0)
+					{
+						return_data = temp & 0xff;
+						response = 2;
+					}
+					else
+					{
+						response = 0;
+					}
+					break;
+
+		case 3:	response = cbuf_putch(stream->inbuf, datain);
+					temp = cbuf_getch(stream->inbuf);
+					if(temp >= 0)
+					{
+						return_data = temp & 0xff;
+						response |= 2;
+					}
+					break;
+
+		case 10:	temp = cbuf_free(stream->inbuf);
+					//save high byte
+					stream->wrfree_high = (temp >> 8) & 0xff;
+					return_data = temp & 0xff;
+					response = 1;
+					break;
+
+		case 11:	return_data = stream->wrfree_high;
+					response = 1;
+					break;
+
+		case 12:	temp = cbuf_free(stream->outbuf);
+					//save high byte
+					stream->rdfree_high = (temp >> 8) & 0xff;
+					return_data = temp & 0xff;
+					response = 1;
+					break;
+
+		case 13:	return_data = stream->rdfree_high;
+					response = 1;
+					break;
+
+		case 14:	temp = cbuf_used(stream->inbuf);
+					//save high byte
+					stream->wrused_high = (temp >> 8) & 0xff;
+					return_data = temp & 0xff;
+					response = 1;
+					break;
+
+		case 15:	return_data = stream->wrused_high;
+					response = 1;
+					break;
+
+		case 16:	temp = cbuf_used(stream->outbuf);
+					//save high byte
+					stream->rdused_high = (temp >> 8) & 0xff;
+					return_data = temp & 0xff;
+					response = 1;
+					break;
+
+		case 17:	return_data = stream->rdused_high;
+					response = 1;
+					break;
+
+		default:	response = 0xfe;
+	}
+	return 256*return_data + response;
+}
+
+/*** BeginHeader SPSread */
+int SPSread(SPStream *stream,
+				void *data,
+				int length,
+				unsigned long timeout);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+SPSread                   <SP_STREAM.LIB>
+
+SYNTAX:		   int SPSread(SPStream *stream,
+									void *data,
+									int length,
+									unsigned long tmout);
+
+DESCRIPTION:   Reads length bytes from the slave port input buffer or until
+					tmout milliseconds transpires between bytes. If there is no
+               data available when the function is called it will
+               return immediately. This function is non-reentrant.
+               This function will call SPtick() if the slave port is in
+               polling mode.
+PARAMETER1:		stream: a pointer to the stream state structure
+PARAMETER2:    data  : data structure to read from salve port buffer
+PARAMETER3:    length: number of bytes to read
+PARAMETER4:    tmout : milliseconds max wait for any byte from previous one.
+
+RETURN VALUE:	The number of bytes read from the buffer
+
+END DESCRIPTION **********************************************************/
+
+__nodebug int SPSread(SPStream *stream, void *data, int length, unsigned long tmout)
+{
+	unsigned long t;
+	char *dp;
+	int count;
+	int bytes_read;
+
+	dp = (char *)data;
+	t = MS_TIMER + tmout;
+	count = 0;
+	if(cbuf_rdlock(stream->inbuf))
+	{
+		while(count < length)
+		{
+			bytes_read = cbuf_get(stream->inbuf, dp + count, length - count);
+			if(bytes_read)
+			{
+				count += bytes_read;
+				t = MS_TIMER + tmout;
+			}
+			else
+			{
+				if(count == 0 || (long) (MS_TIMER - t) > 0)
+				{
+					cbuf_rdunlock(stream->inbuf);
+					return count;
+				}
+			}
+			if(sp_mode == SP_POLLING)
+			{
+				SPtick();
+			}
+		}
+		cbuf_rdunlock(stream->inbuf);
+		return count;
+	}
+	else
+	{
+		return 0;
+	}
+}
+
+/*** BeginHeader cof_SPSread */
+__scofunc int cof_SPSread(SPStream *stream,
+								void *data,
+								int length,
+								unsigned long timeout);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+cof_SPSread                   <SP_STREAM.LIB>
+
+SYNTAX:		   int cof_SPSread(SPStream *stream,
+								  		void *data,
+										int length,
+										unsigned long tmout);
+
+DESCRIPTION:   Reads length bytes from the slave port input buffer or until
+					tmout milliseconds transpires between bytes after the first
+					bute is read. It will yield to other tasks while waiting for
+					data. This function is non-reentrant.
+PARAMETER1:		stream: a pointer to the stream state structure
+PARAMETER2:    data  : data structure to read from salve port buffer
+PARAMETER3:    length: number of bytes to read
+PARAMETER4:    tmout : milliseconds max wait for any byte from previous one.
+
+RETURN VALUE:	The number of bytes read from the buffer
+
+END DESCRIPTION **********************************************************/
+
+__nodebug __scofunc int cof_SPSread(SPStream *stream,
+								void *data,
+								int length,
+								unsigned long tmout)
+{
+	unsigned long t;
+	char *dp;
+	int count;
+	int bytes_read;
+	static int havelock;
+
+	__abandon
+	{
+		if(havelock) cbuf_rdunlock(stream->inbuf);
+	}
+
+	havelock=0;
+	__waitfor(cbuf_rdlock(stream->inbuf));
+   havelock=1;
+
+	dp = (char *)data;
+	t = MS_TIMER + tmout;
+	count = 0;
+	while(1)
+	{
+		bytes_read = cbuf_get(stream->inbuf, dp + count, length - count);
+		if(bytes_read)
+		{
+			count += bytes_read;
+			t = MS_TIMER + tmout;
+		}
+		else
+		{
+			if(count > 0 && (long) (MS_TIMER - t) > 0)
+			{
+				cbuf_rdunlock(stream->inbuf);
+				return count;
+			}
+		}
+		if(count < length)
+		{
+			cbuf_rdunlock(stream->inbuf);
+			return count;
+		}
+		__yield;
+	}
+}
+
+
+/*** Beginheader SPSwrite */
+int SPSwrite(SPStream *stream, void *data, int length);
+/*** endheader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+SPSwrite                   <SP_STREAM.LIB>
+
+SYNTAX:		   int SPSwrite(SPStream *stream, void *data, int length);
+
+DESCRIPTION:   Transmits length bytes to salve port output buffer.
+               This function is non-reentrant.
+					If the slave port is in polling mode, this function
+					will call SPtick() while waiting for the output buffer
+					to empty.
+
+PARAMETER1:		stream: pointer to the stream state
+PARAMETER2:    data  : data structure to write to slave port
+PARAMETER3:    length: number of bytes to write
+
+RETURN VALUE:	The number of bytes successfully written to slave port
+
+END DESCRIPTION **********************************************************/
+
+__nodebug int SPSwrite(SPStream *stream, void *data, int length)
+{
+   static int bytesleft;
+   static char *p;
+
+   p = (char *)data;
+   bytesleft = length;
+   if (cbuf_wrlock(stream->outbuf))
+   {
+      while (bytesleft)
+      {
+         bytesleft -= cbuf_put(stream->outbuf, p+(length-bytesleft), bytesleft);
+         if(sp_mode == SP_POLLING)
+         {
+         	SPtick();
+         }
+      }
+      cbuf_wrunlock(stream->outbuf);
+   }
+   return length - bytesleft;
+}
+
+/*** Beginheader cof_SPSwrite */
+__scofunc int cof_SPSwrite(SPStream *stream, void *data, int length);
+/*** endheader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+cof_SPSwrite                   <SP_STREAM.LIB>
+
+SYNTAX:		   int cof_SPSwrite(SPStream *stream, void *data, int length);
+
+DESCRIPTION:   Transmits length bytes to salve port output buffer.
+               This function is non-reentrant.
+
+PARAMETER1:		stream: pointer to the stream state
+PARAMETER2:    data  : data structure to write to slave port
+PARAMETER3:    length: number of bytes to write
+
+RETURN VALUE:	The number of bytes successfully written to slave port
+
+END DESCRIPTION **********************************************************/
+
+__scofunc __nodebug int cof_SPSwrite(SPStream *stream, void *data, int length)
+{
+   static int bytesleft;
+   static char *p;
+	static int havelock;
+
+	__abandon
+	{
+		if(havelock) cbuf_wrunlock(stream->outbuf);
+	}
+
+	havelock=0;
+	__waitfor(cbuf_wrlock(stream->outbuf));
+   havelock=1;
+
+   p = (char *)data;
+   bytesleft = length;
+
+   while (1)
+   {
+      bytesleft -= cbuf_put(stream->outbuf, p+(length-bytesleft), bytesleft);
+		if(bytesleft == 0)
+		{
+		    cbuf_wrunlock(stream->outbuf);
+		    return length - bytesleft;
+      }
+      __yield;
+   }
+}
+
+
+
+/*** Beginheader SPSrdFree */
+int SPSrdFree(SPStream *stream);
+/*** endheader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+SPSrdFree                   <SP_STREAM.LIB>
+
+SYNTAX:		   int SPSrdFree(SPStream *stream);
+
+DESCRIPTION:   Returns the number of characters of unused data space in the
+               slave port input buffer. This function is non-reentrant.
+
+PARAMETER1:    stream: pointer to the stream state
+
+RETURN VALUE:	the number of chars it would take to fill the input buffer
+END DESCRIPTION **********************************************************/
+
+__nodebug int SPSrdFree(SPStream *stream)
+{
+	return (int)cbuf_free(stream->inbuf);
+}
+
+/*** Beginheader SPSwrFree */
+int SPSwrFree(SPStream *stream);
+/*** endheader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+SPSwrFree                   <SP_STREAM.LIB>
+
+SYNTAX:		   int SPSwrFree(SPStream *stream);
+
+DESCRIPTION:   Returns the number of characters of unused data space in the
+               slave port output buffer. This function is non-reentrant.
+
+PARAMETER1:    stream: pointer to the stream state
+
+RETURN VALUE:	the number of chars it would take to fill the output buffer
+END DESCRIPTION **********************************************************/
+
+__nodebug int SPSwrFree(SPStream *stream)
+{
+	return (int)cbuf_free(stream->outbuf);
+}
+
+/*** Beginheader SPSrdUsed */
+int SPSrdUsed(SPStream *stream);
+/*** endheader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+SPSrdUsed                   <SP_STREAM.LIB>
+
+SYNTAX:		   int SPSrdUsed(SPStream *stream);
+
+DESCRIPTION:   Returns the number of characters in the slave port input
+					buffer. This function is non-reentrant.
+
+PARAMETER1:    stream: pointer to the stream state
+
+RETURN VALUE:	the number of characters currently in the input buffer
+END DESCRIPTION **********************************************************/
+
+__nodebug int SPSrdUsed(SPStream *stream)
+{
+	return (int)cbuf_used(stream->inbuf);
+}
+
+/*** Beginheader SPSwrUsed */
+int SPSwrUsed(SPStream *stream);
+/*** endheader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+SPSwrUsed                   <SP_STREAM.LIB>
+
+SYNTAX:		   int SPSwrUsed(SPStream *stream);
+
+DESCRIPTION:   Returns the number of characters in the slave port output
+					buffer. This function is non-reentrant.
+
+PARAMETER1:    stream: pointer to the stream state
+
+RETURN VALUE:	the number of characters currently in the output buffer
+END DESCRIPTION **********************************************************/
+
+__nodebug int SPSwrUsed(SPStream *stream)
+{
+	return (int)cbuf_used(stream->outbuf);
+}
+
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

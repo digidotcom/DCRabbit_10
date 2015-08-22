@@ -1,0 +1,2483 @@
+/*
+	iDigi.lib -- front-end library for adding iDigi functionality to Rabbit
+
+	Usage:
+		Define macros as outlined in the following description.
+		Call idigi_init() near the start of your application main().
+		Call idigi_tick() in your main application loop.
+		See SAMPLES\TCPIP\IDIGI for further inspiration.
+
+	Copyright (c) 2008 Digi International Inc., All Rights Reserved
+
+	This software contains proprietary and confidential information of Digi
+	International Inc.  By accepting transfer of this copy, Recipient agrees
+	to retain this software in confidence, to prevent disclosure to others,
+	and to make no use of this software other than that for which it was
+	delivered.  This is a published copyrighted work of Digi International
+	Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+	prohibited.
+
+	Restricted Rights Legend
+
+	Use, duplication, or disclosure by the Government is subject to
+	restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+	Technical Data and Computer Software clause at DFARS 252.227-7031 or
+	subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+	Restricted Rights at 48 CFR 52.227-19, as applicable.
+
+	Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+ */
+
+/* START LIBRARY DESCRIPTION ************************************************
+
+iDigi for the Rabbit overview:
+------------------------------
+
+iDigi is a Digi International product which enables easy configuration and
+management of multiple remote devices.  It helps solve one of the most
+vexing problems facing those who deploy embedded devices in multiple
+remote sites, namely the ability to manage those devices, their network
+connectivity, and firmware updates.
+
+The Rabbit idigi.lib library implements most of the latest iDigi functionality
+including the ability to update and store network configurations, and
+execute custom functions via the do_command facility.
+
+Rabbit's iDigi implementation is comprised of the following API functions:
+
+  idigi_init() - initialize all of iDigi and start/maintain network
+    interfaces.
+  idigi_tick() - non-blocking driver for all iDigi functionality
+  idigi_status() - query current iDigi connectivity status
+  idigi_secure() - test if iDigi connection secured by TLS/SSL
+  idigi_register_target() - register a custom do_command target function
+  idigi_put() - use iDigi data services to save data on the iDigi server
+  idigi_ds_tick() - non-blocking processing of a PUT operation
+  web_error() - used to indicate errors to the server for custom targets.
+
+See the individual function help for details.
+
+
+Configuration macros:
+---------------------
+
+1) The following macros include various subsystems.  Their use can cause a
+   lot of extra code to be included, and hence use a lot of flash memory.
+
+#define   IDIGI_USE_TLS
+  		If defined, include SSL/TLS code for secure connections.  If defined,
+      the default is to trust the CA cert in
+      	include/ximport/Certs/digi2048ca.crt.
+      To use a non-default CA certificate, see the edp_set_tls()
+      function.  Note: if you are not already using Zserver.lib, then
+      you may also need to #define SSPEC_NO_STATIC to avoid compilation
+      errors.  Zserver.lib is required for TLS support.  It will be
+      automatically used if you have HTTP or FTP server code.  Do NOT define
+		SSPEC_NO_STATIC if your application includes the SSPEC_RESOURCETABLE_START
+      macro at any point.
+
+#define   IDIGI_USE_ADDP
+  		If defined, include ADDP for convenient device provisioning.  Note that
+  		an ADDP callback function is automatically installed which is compatible
+  		with iDigi.  Only the ADDP_PASSWORD macro needs to be defined.
+
+#define   IDIGI_USE_DS
+		If defined, include code to use iDigi Data Services.  iDigi DS allows
+		data to be stored on the iDigi server (such as log files) and also
+      to get arbitrary data from the server (initiated by the server).
+      As of Dynamic C 10.70, this function is provided by using the
+      underlying TCP connection to the server (EDP).  Previously, this was
+      implemented using HTTP PUT and was limited to only sending data to
+      the server.  By default, the EDP implementation is used because it
+      is more efficient.  If desired, the old HTTP method can be used if
+      you #define IDIGI_USE_HTTP_DS, however there is nothing to be
+      gained from doing this and is only for support of legacy code.
+
+  		If you define IDIGI_USE_HTTP_DS, this facility uses the HTTP client
+      library, it sets the HTTP client mode using
+      	httpc_set_mode(HTTPC_NONBLOCKING|HTTPC_AUTO_REDIRECT)
+  		The application should not change the non-blocking setting.
+
+#define   IDIGI_USE_FAT
+		If defined, include code to implement the File System Service.  This
+      allows the iDigi server to get, put, list and delete files on the
+      Rabbit, using the FAT filesystem.  FAT filesystem support has its
+      own requirements which must be fulfilled, such as having sufficient
+      free space on flash, and other hardware requirements.  The FAT
+      volume(s) are accessed with initial path /A (and /B for second
+      volume etc.).  As for IDIGI_USE_TLS, this macro causes zserver.lib
+      to be included: see the note above under IDIGI_USE_TLS for notes on
+      use of the SSPEC_NO_STATIC macro.
+
+      Use of this macro requires use of the following FAT macros, which
+      will be automatically defined:
+      	FAT_USE_FORWARDSLASH	- use Unix-style path delimiters
+         FAT_BLOCK - blocking I/O
+
+#define   IDIGI_USE_RPU
+  		If defined, include Remote Program Update library to allow firmware
+  		updates from the iDigi server.  In this case, you will also need to
+  		define the macros:
+	      _FIRMWARE_NAME_="MyFirmware"
+	      _FIRMWARE_VERSION_=0x0101
+		in the project settings "defines" box.
+
+	   The firmware name is not directly significant to iDigi, however it is
+	   used as a default for IDIGI_PRODUCT (see below).  It is recommended
+	   to define _FIRMWARE_NAME_ to be the same string as IDIGI_PRODUCT,
+	   provided the name is 19 characters or less.
+	   ***NOTE***: the length of the _FIRMWARE_NAME_ must not exceed 19
+	   characters otherwise firmware updates will fail. _FIRMWARE_VERSION_
+		should be two hex bytes (combined into 16 bits as shown).  The
+		version number should increment for each new firmware version so that
+		the user who upoads new firmware can easily confirm that the
+		new firmware is running. In the iDigi user interface, this version number
+		appears in the "Firmware Level" column, as a dotted decimal with two
+		leading zeros e.g. 0.0.1.1.
+
+#define   IDIGI_USE_XBEE
+		If defined, include XBee library support (SXA, Simple XBee API).
+
+2) The following macros define the device "personality".  The defined values
+   represent the defaults.  Your application can override these by defining
+   the macros before #use idigi.lib.
+
+   It is highly recommended to define at least IDIGI_PRODUCT to a non-default
+   value.  IDIGI_PRODUCT and _FIRMWARE_VERSION_ together define a unique
+	"key" for the iDigi server.  The server caches certain (static) information
+	about each device+firmware, keyed by this combination of values.
+
+#define IDIGI_PRODUCT _FIRMWARE_NAME_
+#define IDIGI_VENDOR "Unknown"
+#define IDIGI_VENDOR_ID "0"
+#define IDIGI_FIRMWARE_ID "1.00.00"
+	The default for IDIGI_PRODUCT is the value defined for _FIRMWARE_NAME_.
+	It is recommended to keep these macros the same.  iDigi uses IDIGI_PRODUCT
+	not _FIRMWARE_NAME_, however the latter macro is significant to the Remote
+	Program Update facility, which is used by iDigi to manage firmware updates.
+
+   The following are used as initial values.  They can be set using iDigi
+   web services or user interface.
+
+#define IDIGI_CONTACT "None"
+#define IDIGI_LOCATION "Unknown"
+#define IDIGI_DESCRIPTION "Unknown"
+
+
+3) These macros must be defined since they have no defaults.  The defined
+   values are provided as examples only.
+
+#define IDIGI_SERVER "sd1-na.idigi.com"
+
+	The iDigi server fully qualified domain name.  It may be the name of a global
+	string variable.  This is an initial default.  The iDigi server can set
+	this to a different value.  The macro IDIGI_SERVER_CURRENT returns the
+	current server FQDN string.
+
+#define IDIGI_SERVER_PASSWORD "idigi"
+
+	The password for accessing the server.  If never defined, the password is an
+	empty (zero length) string.  This is only used as an initial default.
+	The password (_RCI_Settings.devicesecurity.password) is usually
+	set via the iDigi server.
+
+either:
+#define IDIGI_USE_SUBFS
+or:
+#define IDIGI_USERBLOCK_OFFSET 0
+
+	If IDIGI_USE_SUBFS is defined, then the Simple UserID Block FileSystem
+	is used to manage the non-volatile configuration data.  It is recommended
+	to make use of SUBFS for storing the configuration data, since it makes
+	more efficient use of the limited userID block space. IDIGI_USE_SUBFS
+	was introduced in Dynamic C 10.66.  The previous version of iDigi in
+	10.64 only supported the IDIGI_USERBLOCK_OFFSET macro.
+
+	If SUBFS is not used, then define IDIGI_USERBLOCK_OFFSET to a
+	byte offset into the userID block at which to save the iDigi network
+	configuration and other settings.  If this is not defined, a warning is
+	issued, since the ability to remember settings over a reboot is important
+	to most applications.  With this macro, the application programmer manages
+	the offsets and sizes of objects in the userID block.  If the application
+	makes no other use of the userID block, then it is advantagous to allow
+	iDigi to access the entire block (set this macro to 0 and the following
+	macro to the entire userID block size i.e. SysIDBlock.userBlockSize).
+	Otherwise, it it recommended to use SUBFS.
+
+#define IDIGI_USERBLOCK_MAX_LEN 8192
+
+   Maximum amount of userID block storage dedicated to saving the iDigi
+   network and other settings.  This is used the first time the settings
+   are saved.  Thereafter, the length is saved in the storage area itself,
+   and will not be decreased, however it will be increased if this macro
+   value is increased.
+
+	This macro is only required if IDIGI_USERBLOCK_OFFSET is defined.
+	It is now recommended to use IDIGI_USE_SUBFS instead, in which case
+	the setting of IDIGI_USERBLOCK_MAX_LEN is ignored.
+
+#define IDIGI_PPP_IFACE		IF_PPP3
+
+	Specify a PPP interface number if iDigi is to be used over a PPP connection
+	(for example, a GPRS cellular modem).  For this to work, you also need
+	to define USE_PPP_SERIAL and the following macros.  If not defined, then
+	iDigi will not attempt to connect over any PPP interface, even if the
+	interface is available.
+
+	The following macros must be defined before including idigi.lib.
+	Values shown are typical examples.  If a default is identified, then
+	the macro need not be defined.  These macros provide only initial
+	"factory" defaults, however the values for IDIGI_PPP_SENDEXPECT,
+	IDIGI_PPP_PAP_ID, and IDIGI_PPP_PAP_PASSWORD can be changed via the iDigi
+	user interface.  The other macros are usually specific to the hardware
+	and are thus not advisable (or even possible) to change dynamically.
+
+			#define USE_PPP_SERIAL 			0x08
+			#define IDIGI_PPP_IFACE			IF_PPP3
+			-- the above two macros must correspond: IF_PPP0 corresponds to
+			   0x01, IF_PPP1 to 0x02 and so on.  IF_PPP0 through IF_PPP5
+			   refer to serial ports A through F respectively.  The macros
+			   are defined independently because it is possible to set more than
+			   one bit in USE_PPP_SERIAL.  If using PPP with iDigi, at *least*
+			   the bit corresponding to the iDigi serial port must be set.
+			   Currently, iDigi can only use one serial port.
+			   No defaults for these macros.
+
+			#define IDIGI_PPP_USE_DMA		txchan,rxchan
+			-- If defined, use DMA for the PPP interface.  The two values
+			   provided are global variables of type "dma_chan_t".  These
+			   variables must be initialized before the network or iDigi
+			   is initialized, using the DMAalloc() function in DMA.LIB.
+			   No default: without this macro, normal interrupt-driven
+			   serial port processing is used.  See also the notes
+			   associated with the IFS_USE_DMA parameter to the ifconfig()
+			   function.  The third sub-parameter of IFS_USE_DMA is set to
+			   zero for use with iDigi.
+
+			#define IDIGI_PPP_SPEED			115200
+			-- serial port speed (bits per second).  This is usually determined
+			   by the modem or DCE (data communications equipment) characteristics.
+			   Default: 115200
+
+
+			#define IDIGI_PPP_RTS_PORT		PCDR
+			#define IDIGI_PPP_RTS_PIN		2
+			#define IDIGI_PPP_CTS_PORT		PCDR
+			#define IDIGI_PPP_CTS_PIN		3
+			#define IDIGI_PPP_FLOWCONTROL 1
+			-- The above macros are used to define whether hardware flow control
+			   is used.  Define IDIGI_PPP_FLOWCONTROL to zero if not using
+			   hardware flow control.  Otherwise, the port and pin numbers
+			   must be defined.  The port definitions correspond to one of the
+			   Rabbit parallel ports (PADR, PBDR, ... PHDR) and the pin
+			   definition is the selected bit of that port (0..7).
+			   No defaults.
+
+			#define IDIGI_PPP_SENDEXPECT  "@AT OK ATDT1234567 #ogin"
+			#define IDIGI_PPP_HANGUP  		"ATH #carrier"
+			-- Chat scripts for the "dialout" and "hangup" procedure.  Consult
+			   documentation provided by the modem manufacturer and/or ISP.
+			   Also refer to documentation in CHAT.LIB.
+			   No defaults.
+
+			#define IDIGI_PPP_MODEMESCAPE	1
+			-- Whether to use the typical Hayes-compatible modem escape sequence
+			   before using the chat scripts.
+			   Default: 1
+
+			#define IDIGI_PPP_ACCEPTIP		1
+			-- Accept peer's idea of our IP address.
+			   Default: 1
+
+			#define IDIGI_PPP_ACCEPTDNS	1
+			-- Accept peer's DNS addresses.
+			   Default: 1
+
+			#define IDIGI_PPP_PAP_ID		""
+			#define IDIGI_PPP_PAP_PASSWORD ""
+			-- Login credentials for PAP.  If set to an empty string, PAP is
+			   not used.
+			   Default: empty strings.
+
+	Note that the hardware settings required for flow control are
+	automatically set up by idigi_init().  If this is not desired, then
+	you can #define IDIGI_DISABLE_FLOWCONTROL_SETUP, or you can
+	#define IDIGI_PPP_FLOWCONTROL 0
+
+#define IDIGI_IFACE_MASK  (1u<<IDIGI_PPP_IFACE | 1u<<IF_ETH0)
+
+	Specify the interface(s) that are controlled by iDigi.  This should be
+	a bitmask corresponding to the desired interface(s) (at least one).
+	If not defined, this defaults to the primary Ethernet and/or WiFi
+	interfaces if available, plus IDIGI_PPP_IFACE if that is defined.
+	Otherwise, define the value as a bitmask as shown above as an example.
+	You can also define this to be the name of a global unsigned integer
+	variable, however the variable is only accessed when iDigi is started.
+
+#define IDIGI_IFACE_CALLBACK  c_function_name
+
+	Specify a callback function which will be invoked at several stages
+	throughout the process of starting, stopping and running the iDigi
+	interface(s) and connection.  Default is undefined (no callback).
+
+	The function prototype is
+
+	  int my_callback(int code, int iface, int holding)
+
+	The first parameter, code, takes on one of the following values:
+
+	  IDIGI_CB_IFACE_COMING_UP
+	    Immediately prior to bringing the interface up.  This can be used
+	    to control modem signals such as DTR.
+	    Relevant return codes: IDIGI_CBR_OK, IDIGI_CBR_HOLD,
+	    	IDIGI_CBR_IFDOWN
+
+	  IDIGI_CB_IFACE_UP
+	    Immediately after interface up, but not yet connected to iDigi.
+	    Relevant return codes: IDIGI_CBR_OK
+
+	  IDIGI_CB_IFACE_COMING_DOWN
+	    Immediately prior to bringing the interface down.  Note that there
+	    is no indication of when an interface is fully down; it should be
+	    treated as unavailable when this code is seen.
+	    Relevant return codes: IDIGI_CBR_OK
+
+	  IDIGI_CB_PROBE_OK
+	    Immediately after probe TCP/IP connection to iDigi is established.
+	    Expects return code of IDIGI_CBR_OK to proceed with connection,
+	    or IDIGI_CBR_DISCONNECT to abandon it.
+	    Relevant return codes: IDIGI_CBR_OK
+
+	  IDIGI_CB_CONNECT
+	    Immediately after TCP/IP connection to iDigi is established and
+	    negotiated.
+	    Relevant return codes: IDIGI_CBR_OK
+
+	  IDIGI_CB_DISCONNECT
+	    Immediately after iDigi connection is terminated.
+	    Relevant return codes: IDIGI_CBR_OK
+
+	  IDIGI_CB_SELECT
+	    When attempted connection to iDigi server fails, the callback is
+	    consulted to determine the next interface to try.  The returned
+	    interface number must be one of those indicated by
+	    IDIGI_IFACE_MASK, or else it may be IF_ANY in order to simply
+	    select the next interface round-robin style.
+	    Return code: next interface number to try
+
+	  IDIGI_CB_TRY_NEW
+	    iDigi is trying the new configuration.  This happens
+	    when a configuration change (e.g. from the iDigi user interface)
+	    requires reconnecting to iDigi.
+	    Relevant return codes: IDIGI_CBR_OK
+
+	  IDIGI_CB_TRY_LKG
+	    iDigi is trying the last known good configuration.  This happens
+	    when a configuration change (e.g. from the iDigi user interface)
+	    causes a problem connecting.
+	    Relevant return codes: IDIGI_CBR_OK
+
+	  IDIGI_CB_RUN
+	    This state is provided every IDIGI_CB_INTERVAL when running with
+	    a working iDigi connection.
+	    Relevant return codes: IDIGI_CBR_OK, IDIGI_CBR_DISCONNECT
+
+	  IDIGI_CB_NOT_RUN
+	    As above, except the iDigi connection is not available (but the
+	    interface is up).
+	    Relevant return codes: IDIGI_CBR_OK, IDIGI_CBR_CONNECT,
+	                           IDIGI_CBR_IFDOWN
+
+	  IDIGI_CB_NOT_UP
+	    As above, except the interface is not up.
+	    Relevant return codes: IDIGI_CBR_OK, IDIGI_CBR_IFUP
+
+	The second parameter, iface, is the interface number of the relevant
+	network interface.
+
+	The third parameter, holding, is true if the previous invocation of the
+	callback returned the IDIGI_CBR_HOLD code.
+
+	The return value from the callback can be used to control some aspects
+	of iDigi.  Not all return codes are valid in all cases.  The above codes
+	list which return values are accepted (others are treated as if 'OK').
+	Recognized return values are:
+
+	  IDIGI_CBR_OK
+	    No action necessary
+
+	  IDIGI_CBR_HOLD
+	    No action necessary, but hold iDigi processing for this interface.
+	    This is used when the callback needs to wait for some event before
+	    continuing normal processing.  If this code is returned, iDigi will
+	    invoke this callback again on the next call to idigi_tick().  This
+	    allows for an event to be polled until completion.
+
+	  IDIGI_CBR_PROBE
+	    Tells the iDigi state machine to attempt a connection to the iDigi
+	    server on this interface.  If successful, any existing connection on
+	    another interface will be cleanly terminated, since only one
+	    active connection is allowed at any point.  If not successful, any
+	    existing connection is not disturbed.  This is useful when a less
+	    expensive interface (such as Ethernet) is preferable to use, when
+	    available, compared with a more expensive network such as GPRS.  If
+	    no PROBE is used, if a connection on the more expensive network
+	    is obtained, it will not be released even if the cheaper network
+	    subsequently becomes available.  If a probe is already running on
+	    another interface, that probe is cancelled (this is necessary because
+	    of the memory expense of keeping more than one TCP socket around
+	    just for probing).
+
+	  IDIGI_CBR_CONNECT
+	    Any existing connection (on another interface) is unconditionally
+	    terminated, and a new connection on this interface is attempted if
+	    not already connected.
+
+	  IDIGI_CBR_DISCONNECT
+	    Disconnect any current iDigi connection on this interface.
+
+	  IDIGI_CBR_IFUP
+	    Attempt to bring interface up.
+
+	  IDIGI_CBR_IFDOWN
+	    Bring interface down.
+
+
+#define IDIGI_CB_INTERVAL		15000
+
+	Specify an initial default calling interval (milliseconds) for sending
+	IDIGI_CB_RUN/NOT_RUN/NOT_UP state events to the above callback.  This
+	interval can be changed (on a per-interface level) by calling
+	idigi_cb_interval().  0 indicates no callback for these events.
+	Maximum value is 32767.
+
+
+4) Other macros
+
+#define IDIGI_MIN_CONNECT_TIMEOUT	30
+	Define to specify an initial connection timeout (sec), from the point at
+	which the network is brought up and an iDigi server connection is
+	attempted, to the establishment of an open connection.  Default 30
+	seconds.  If a backup configuration is available (i.e. a connection
+	was established using a previous configuration) then that backup
+	configuration will be attempted.
+
+#define IDIGI_MAX_CONNECT_TIMEOUT	300
+	Define to specify the maximum desired timeout for iDigi server connection.
+	This should be reasonably long to prevent unnecessary flipping between
+	network configurations in the case that e.g. a cable is disconnected.
+	The initial connection timeout (given by IDIGI_MIN_CONNECT_TIMEOUT) is
+	applied to the first connection attempt (e.g. after a reboot).  This macro
+	determines the timeout value for subsequent attempts.
+
+#define IDIGI_DEBUG
+	If defined, turns on debugging for all iDigi subsystems.
+
+#define IDIGI_VERBOSE
+	If defined, turns on debugging printfs for all iDigi subsystems.  This
+	can cause shortage of root constant space.  If so, add ROOT_SIZE_4K=9U
+	in the project defines box, and turn on the separate I and D option
+	in the compiler settings.
+
+#define IDIGI_IFACE_VERBOSE
+	If defined, causes messages related to the network interfaces and
+	iDigi connection to be printed.  This causes a lot less output than
+	IDIGI_VERBOSE, yet it is still useful for debugging connections.
+
+#define IDIGI_SUBFS_CURRENT "idigi_curr"
+#define IDIGI_SUBFS_BACKUP "idigi_back"
+	These macros are only used if IDIGI_USE_SUBFS defined.  They specify the
+	SUBFS file names of the current and backup configurations.
+
+#define IDIGI_BLOCK_ACTION
+	When saving or reading the non-volatile configuration settings from the
+	userID block, some boards (such as the RCM43xx series) which have a serial
+	boot flash require access to a serial port shared with other peripherals.
+	In this case, reading or writing the configuration data may be temporarily
+	blocked.  The value defined for this macro is inserted in the code which
+	repeatedly retries the serial port access.  If not defined, only tcp_tick()
+	will be called in order to maintain network connectivity.  If defined,
+	the defined statement is executed after each call to tcp_tick().  Do not
+	define the terminating semicolon.  E.g.
+		#define IDIGI_BLOCK_ACTION myBlockFunction()
+	will call the specified application function in order to drive any
+	required processing.  NOTE: do not call any iDigi API functions from
+	within the code invoked by this macro.  This will cause recursion and
+	possible stack overflow.
+
+   If IDIGI_USE_XBEE is defined, then the block action is also invoked
+   when waiting for command responses from the XBee.  In this case,
+   tcp_tick() and sxa_tick() are automatically called as well.  Note that
+   XBee devices can be relatively slow and can wait several seconds for
+   a long sequence of commands (such as may be required when a new XBee
+   device is discovered).
+
+#define _IDIGI_FORCE_FACTORY
+	This macro should only be used when developing an application.  If defined,
+	it ignores any saved settings in non-volatile storage.  Each run of the
+	program will start at "factory defaults".
+
+#define IDIGI_GROUP_MASK (0x2000)
+	Define this to override the default group mask for the iDigi "user".
+   For example, you might have defined an existing group for anonymous
+   access.
+
+   The iDigi user is a unique user ID which is used whenever the iDigi
+   server attempts to access the local filesystem.  Since this access
+   is mediated by Zserver.lib, it requires authentication just like any
+   other user.  The iDigi user is set up using a user name of "idigi"
+   and an empty password.  The server mask is SERVER_IDIGI.  Typically,
+   an application will need to define resource access rules e.g. using
+   something like
+   	sspec_addrule("/A/",			// File name prefix to match
+      		NULL,						// Realm (not applicable to iDigi)
+   			idigi_get_group(),	// Group mask (as specified by this macro)
+            idigi_get_group(),
+            SERVER_IDIGI,
+            0, NULL);
+   If setting other groups with the same access to /A/, then OR in their
+   group bit(s) to parameters 3 and 4.
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader _edp_inst, idigi_init */
+
+#define HAVE_IDIGI
+
+#ifndef TCPCONFIG
+	// iDigi takes care of all network config (except initial defaults,
+	// which are still done by macros as usual).
+	#define TCPCONFIG 9
+#endif
+
+// Required to properly support socket half-close
+#define TCP_NO_CLOSE_ON_LAST_READ
+
+#ifdef IDIGI_PPP_IFACE
+	#define IDIGI_PPP_IFACE_MASK (1u<<IDIGI_PPP_IFACE)
+	#ifndef IDIGI_PPP_SPEED
+		#define IDIGI_PPP_SPEED 115200
+	#endif
+	#ifndef IDIGI_PPP_FLOWCONTROL
+		#define IDIGI_PPP_FLOWCONTROL 0
+	#endif
+	#ifndef IDIGI_PPP_MODEMESCAPE
+		#define IDIGI_PPP_MODEMESCAPE 1
+	#endif
+	#ifndef IDIGI_PPP_ACCEPTIP
+		#define IDIGI_PPP_ACCEPTIP 1
+	#endif
+	#ifndef IDIGI_PPP_ACCEPTDNS
+		#define IDIGI_PPP_ACCEPTDNS 1
+	#endif
+	#ifndef IDIGI_PPP_PAP_ID
+		#define IDIGI_PPP_PAP_ID ""
+	#endif
+	#ifndef IDIGI_PPP_PAP_PASSWORD
+		#define IDIGI_PPP_PAP_PASSWORD ""
+	#endif
+#else
+	#define IDIGI_PPP_IFACE_MASK 0
+#endif
+#if ETHERNET_ONBOARD
+	#define IDIGI_ETH_IFACE_MASK (1u<<IF_ETH0)
+#else
+	#define IDIGI_ETH_IFACE_MASK 0
+#endif
+#if WIFI_ONBOARD
+	#define IDIGI_WIFI_IFACE_MASK (1u<<IF_WIFI0)
+#else
+	#define IDIGI_WIFI_IFACE_MASK 0
+#endif
+
+#ifndef IDIGI_IFACE_MASK
+	#define IDIGI_IFACE_MASK  \
+		(IDIGI_PPP_IFACE_MASK | IDIGI_ETH_IFACE_MASK | IDIGI_WIFI_IFACE_MASK)
+#endif
+
+#ifndef IDIGI_CB_INTERVAL
+	#define IDIGI_CB_INTERVAL 15000
+#endif
+
+#ifdef IDIGI_USE_FAT
+	// Necessary for zserver.
+	#define FAT_USE_FORWARDSLASH
+	#define FAT_BLOCK
+#endif
+
+#ifndef IDIGI_GROUP_MASK
+	#define IDIGI_GROUP_MASK	0x2000
+#endif
+
+#ifdef IDIGI_USE_TLS
+	#define EDP_USE_TLS
+	#ifndef SSL_MAX_CONNECTIONS
+		#define SSL_MAX_CONNECTIONS 3
+	#endif
+
+   // iDigi server requires AES (no RC4)
+	#define SSL_USE_AES
+   #ifndef MP_SIZE
+	   // iDigi server certs have large RSA keys
+	   #define MP_SIZE 258
+   #else
+   	#if MP_SIZE < 258
+      	#undef MP_SIZE
+         #define MP_SIZE 258
+      #endif
+   #endif
+
+
+#endif
+
+#ifdef IDIGI_USE_RPU
+	// Stuff to make it work on testing platform
+	#if _BOARD_TYPE_ == 0xFE00
+	   #define SF_SPI_CSPORT      PDDR
+	   #define SF_SPI_CSPIN       6
+	   #define SF_SERPORT         SBDR
+	   // serial port RXB and TXB are both hosted on parallel port D
+	   #define SERB_TXPORT        PDDR
+	   #define SERB_RXPORT        PDDR
+	   #define BU_IGNORE_BOARD_TYPE
+	#endif
+	//#define BU_TEMP_USE_SFLASH
+	#define EDP_USE_RPU	1
+#else
+	#define EDP_USE_RPU	0
+#endif
+
+#ifdef IDIGI_USE_ADDP
+	#ifndef ADDP_NAME
+		#define ADDP_NAME IDIGI_PRODUCT
+	#endif
+	#ifdef ADDP_CALLBACK_IF
+		#warns "IDIGI_USE_ADDP finds ADDP_CALLBACK_IF already defined."
+		#warns "Recommend use the default callback to be iDigi compatible."
+	#else
+		#define ADDP_CALLBACK_IF(iface,ip,mask,gw) idigi_addp_callback(iface,ip,mask,gw)
+	#endif
+	#ifdef ADDP_REBOOT_FUNCTION
+		#warns "IDIGI_USE_ADDP finds ADDP_REBOOT_FUNCTION already defined."
+		#warns "Recommend use the default callback to be iDigi compatible."
+	#else
+		#define ADDP_REBOOT_FUNCTION idigi_addp_reboot(0)
+	#endif
+	#ifndef MAX_UDP_SOCKET_BUFFERS
+		#define MAX_UDP_SOCKET_BUFFERS 2
+	#endif
+	#define USE_MULTICAST
+	#define USE_LINKLOCAL
+#endif
+
+#ifndef IDIGI_MIN_CONNECT_TIMEOUT
+	#define IDIGI_MIN_CONNECT_TIMEOUT 30
+#endif
+
+#ifndef IDIGI_MAX_CONNECT_TIMEOUT
+	#define IDIGI_MAX_CONNECT_TIMEOUT 300
+#endif
+
+#ifdef IDIGI_DEBUG
+	#define _idigi_debug __debug
+	#define RWEB_DEBUG
+	#define EDP_DEBUG
+	#define RCI_DEBUG
+	#define SAX2_DEBUG
+	#define HTTPC_DEBUG
+	#define SUBFS_DEBUG
+#else
+	#define _idigi_debug __nodebug
+#endif
+
+#ifdef IDIGI_VERBOSE
+	#define EDP_VERBOSE 3
+	#define RCI_VERBOSE 2
+#endif
+
+#ifndef IDIGI_BLOCK_ACTION
+	#define IDIGI_BLOCK_ACTION
+#endif
+
+#ifdef IDIGI_USE_SUBFS
+	#use "subfs.lib"
+	#ifdef IDIGI_USERBLOCK_OFFSET
+		// Undefine this to avoid conflicting code
+		#undef IDIGI_USERBLOCK_OFFSET
+	#endif
+	// Define primary and backup configuration
+	#ifndef IDIGI_SUBFS_CURRENT
+		#define IDIGI_SUBFS_CURRENT "idigi_curr"
+	#endif
+	#ifndef IDIGI_SUBFS_BACKUP
+		#define IDIGI_SUBFS_BACKUP "idigi_back"
+	#endif
+#else
+	// Not using SUBFS, use old-style manual userID block offsets...
+	#ifndef IDIGI_USERBLOCK_OFFSET
+	   #warns "No definition of IDIGI_USERBLOCK_OFFSET.  Settings will not be"
+	   #warns "able to be saved/restored to non-volatile storage."
+	#else
+	   #ifndef IDIGI_USERBLOCK_MAX_LEN
+	      #define IDIGI_USERBLOCK_MAX_LEN 8192
+	   #endif
+	   #if IDIGI_USERBLOCK_MAX_LEN < 8192
+	      #warns "IDIGI_USERBLOCK_MAX_LEN too small, setting to 8192"
+	      #undef IDIGI_USERBLOCK_MAX_LEN
+	      #define IDIGI_USERBLOCK_MAX_LEN 8192
+	   #endif
+	   #if IDIGI_USERBLOCK_MAX_LEN > 32767
+	      #error "IDIGI_USERBLOCK_MAX_LEN too great, must be <= 32767"
+	   #endif
+	#endif
+#endif
+
+// iDigi.lib installs an interface up/down callback
+#define USE_IF_CALLBACK
+
+#ifdef IDIGI_PPP_IFACE
+#if IDIGI_PPP_FLOWCONTROL
+#ifndef IDIGI_DISABLE_FLOWCONTROL_SETUP
+	#ifndef PFDR
+	   #define PFDR 0
+	#endif
+	#ifndef PGDR
+	   #define PGDR 0
+	#endif
+	#ifndef PHDR
+	   #define PHDR 0
+	#endif
+
+	#if PADR == IDIGI_PPP_CTS_PORT
+	   // parallel port A
+	 #if IDIGI_PPP_CTS_PORT == IDIGI_PPP_RTS_PORT
+	   #error "Parallel port A can't be shared between inputs and outputs."
+	 #endif
+	   #define IDIGI_CTS_SETUP WrPortI(SPCR, &SPCRShadow, 0x80);
+	#elif PBDR == IDIGI_PPP_CTS_PORT
+	   // parallel port B
+	   #define IDIGI_CTS_SETUP BitWrPortI(PBDDR, &PBDDRShadow, 0, IDIGI_PPP_CTS_PIN);
+	#elif PCDR == IDIGI_PPP_CTS_PORT
+	   // parallel port C
+	   #define IDIGI_CTS_SETUP BitWrPortI(PCFR, &PCFRShadow, 0, IDIGI_PPP_CTS_PIN);
+	                            // no DDR setup is possible
+	#elif PDDR == IDIGI_PPP_CTS_PORT
+	   // parallel port D
+	   #define IDIGI_CTS_SETUP BitWrPortI(PDFR, &PDFRShadow, 0, IDIGI_PPP_CTS_PIN); \
+	                            BitWrPortI(PDDDR, &PDDDRShadow, 0, IDIGI_PPP_CTS_PIN);
+	#elif PEDR == IDIGI_PPP_CTS_PORT
+	   // parallel port E
+	   #define IDIGI_CTS_SETUP BitWrPortI(PEFR, &PEFRShadow, 0, IDIGI_PPP_CTS_PIN); \
+	                            BitWrPortI(PEDDR, &PEDDRShadow, 0, IDIGI_PPP_CTS_PIN);
+	#elif PFDR && PFDR == IDIGI_PPP_CTS_PORT
+	   // parallel port F
+	   #define IDIGI_CTS_SETUP BitWrPortI(PFFR, &PFFRShadow, 0, IDIGI_PPP_CTS_PIN); \
+	                            BitWrPortI(PFDDR, &PFDDRShadow, 0, IDIGI_PPP_CTS_PIN);
+	#elif PGDR && PGDR == IDIGI_PPP_CTS_PORT
+	   // parallel port G
+	   #define IDIGI_CTS_SETUP BitWrPortI(PGFR, &PGFRShadow, 0, IDIGI_PPP_CTS_PIN); \
+	                            BitWrPortI(PGDDR, &PGDDRShadow, 0, IDIGI_PPP_CTS_PIN);
+	#elif PHDR && PHDR == IDIGI_PPP_CTS_PORT
+	   // parallel port G
+	   #define IDIGI_CTS_SETUP BitWrPortI(PHFR, &PHFRShadow, 0, IDIGI_PPP_CTS_PIN); \
+	                            BitWrPortI(PHDDR, &PHDDRShadow, 0, IDIGI_PPP_CTS_PIN);
+	#else
+	   #error "Invalid IDIGI_PPP_CTS_PORT selection!"
+	#endif
+
+	#if PADR == IDIGI_PPP_RTS_PORT
+	   // parallel port A
+	   #define IDIGI_RTS_SETUP BitWrPortI(PADR, &PADRShadow, 0, IDIGI_PPP_RTS_PIN); \
+	                            WrPortI(SPCR, &SPCRShadow, 0x84);
+	#elif PBDR == IDIGI_PPP_RTS_PORT
+	   // parallel port B
+	   #define IDIGI_RTS_SETUP BitWrPortI(PBDR, &PBDRShadow, 0, IDIGI_PPP_RTS_PIN); \
+	                            BitWrPortI(PBDDR, &PBDDRShadow, 1, IDIGI_PPP_RTS_PIN);
+	#elif PCDR == IDIGI_PPP_RTS_PORT
+	   // parallel port C
+	   #define IDIGI_RTS_SETUP BitWrPortI(PCFR, &PCFRShadow, 0, IDIGI_PPP_RTS_PIN); \
+	                            BitWrPortI(PCDR, &PCDRShadow, 0, IDIGI_PPP_RTS_PIN);
+	                            // no DDR setup is possible
+	#elif PDDR == IDIGI_PPP_RTS_PORT
+	   // parallel port D
+	   #define IDIGI_RTS_SETUP BitWrPortI(PDFR, &PDFRShadow, 0, IDIGI_PPP_RTS_PIN); \
+	                            BitWrPortI(PDDR, &PDDRShadow, 0, IDIGI_PPP_RTS_PIN); \
+	                            BitWrPortI(PDDDR, &PDDDRShadow, 1, IDIGI_PPP_RTS_PIN);
+	#elif PEDR == IDIGI_PPP_RTS_PORT
+	   // parallel port E
+	   #define IDIGI_RTS_SETUP BitWrPortI(PEFR, &PEFRShadow, 0, IDIGI_PPP_RTS_PIN); \
+	                            BitWrPortI(PEDR, &PEDRShadow, 0, IDIGI_PPP_RTS_PIN); \
+	                            BitWrPortI(PEDDR, &PEDDRShadow, 1, IDIGI_PPP_RTS_PIN);
+	#elif PFDR && PFDR == IDIGI_PPP_RTS_PORT
+	   // parallel port F
+	   #define IDIGI_RTS_SETUP BitWrPortI(PFFR, &PFFRShadow, 0, IDIGI_PPP_RTS_PIN); \
+	                            BitWrPortI(PFDR, &PFDRShadow, 0, IDIGI_PPP_RTS_PIN); \
+	                            BitWrPortI(PFDDR, &PFDDRShadow, 1, IDIGI_PPP_RTS_PIN);
+	#elif PGDR && PGDR == IDIGI_PPP_RTS_PORT
+	   // parallel port G
+	   #define IDIGI_RTS_SETUP BitWrPortI(PGFR, &PGFRShadow, 0, IDIGI_PPP_RTS_PIN); \
+	                            BitWrPortI(PGDR, &PGDRShadow, 0, IDIGI_PPP_RTS_PIN); \
+	                            BitWrPortI(PGDDR, &PGDDRShadow, 1, IDIGI_PPP_RTS_PIN);
+	#elif PHDR && PHDR == IDIGI_PPP_RTS_PORT
+	   // parallel port G
+	   #define IDIGI_RTS_SETUP BitWrPortI(PHFR, &PHFRShadow, 0, IDIGI_PPP_RTS_PIN); \
+	                            BitWrPortI(PHDR, &PHDRShadow, 0, IDIGI_PPP_RTS_PIN); \
+	                            BitWrPortI(PHDDR, &PHDDRShadow, 1, IDIGI_PPP_RTS_PIN);
+	#else
+	   #error "Invalid IDIGI_PPP_RTS_PORT selection!"
+	#endif
+#endif // not defined IDIGI_DISABLE_FLOWCONTROL_SETUP
+#endif // IDIGI_PPP_FLOWCONTROL != 0
+#endif // ifdef IDIGI_PPP_IFACE
+
+#ifdef IDIGI_IFACE_CALLBACK
+enum {
+	IDIGI_CB_IFACE_COMING_UP,
+	IDIGI_CB_IFACE_UP,
+	IDIGI_CB_IFACE_COMING_DOWN,
+	IDIGI_CB_PROBE_OK,
+	IDIGI_CB_CONNECT,
+	IDIGI_CB_DISCONNECT,
+	IDIGI_CB_SELECT,
+	IDIGI_CB_TRY_LKG,
+	IDIGI_CB_TRY_NEW,
+	IDIGI_CB_RUN,
+	IDIGI_CB_NOT_RUN,
+	IDIGI_CB_NOT_UP,
+};
+
+enum {
+	IDIGI_CBR_OK,
+	IDIGI_CBR_HOLD,
+	IDIGI_CBR_PROBE,
+	IDIGI_CBR_CONNECT,
+	IDIGI_CBR_DISCONNECT,
+	IDIGI_CBR_IFUP,
+	IDIGI_CBR_IFDOWN,
+};
+#endif
+
+#use "URL.LIB"
+#use "dcrtcp.lib"
+#ifdef IDIGI_USE_FAT
+	#use "fat16.lib"
+	#ifndef __ZSERVER_LIB
+		#use "zserver.lib"
+	#endif
+#endif
+#ifdef IDIGI_USE_TLS
+	#use "ssl_sock.lib"
+#endif
+#ifdef IDIGI_USE_RPU
+	#use "board_update.lib"
+#endif
+#use "edp.lib"
+#use "rci.lib"
+#ifdef IDIGI_USE_ADDP
+	#use "addp.lib"
+#endif
+#ifdef IDIGI_USE_HTTP_DS
+	#ifndef IDIGI_USE_DS
+   	#define IDIGI_USE_DS
+   #endif
+#endif
+#ifdef IDIGI_USE_DS
+	#ifdef IDIGI_USE_HTTP_DS
+		#use "http_client.lib"
+   #endif
+#endif
+
+
+#define IDIGI_SERVER_CURRENT \
+	_RCI_Settings.mgmtconnection[0].serverArray[0].serverAddress
+
+// Per-interface state for iDigi
+typedef struct _IDIGI_t {
+	enum {
+		_IDIGI_IFSTART,		// Start interface
+		_IDIGI_IFWAIT,			// Wait for interface up
+	   _IDIGI_INIT,			// Initialize EDP protocol
+	   _IDIGI_WAITUP,			// Waiting for iDigi connection
+	   _IDIGI_RUN,				// Run normal EDP
+	   _IDIGI_BOOT,			// Exit with boot request
+	   _IDIGI_RESTART,		// Restart EDP
+	   _IDIGI_RESTART_ALT,	// Restart EDP with alternate configuration i.e.
+	   							// switch between backup and normal.
+	   _IDIGI_DING,			// Reconfigure network request
+	   _IDIGI_FORCE_DING,	// Reconfigure network request, force interface down/up
+	   _IDIGI_PROBE,			// Probe interface for iDigi connection
+	   _IDIGI_PROBEWAIT,		// Wait for probe result
+		_IDIGI_IFSTEADY,		// Interface up, but not running EDP
+	   _IDIGI_IFDOWN			// Interface down
+	} state;
+	int	prev_state;			// Previous idigi_status() state
+
+	unsigned iface_mask;		// 1<<iface number
+	int	managed;				// True if this interface managed by iDigi
+	int	try_lkg;				// True if try last known good config
+	struct _IDIGI_t __far * next;	// Next managed interface (NULL if last or
+											// this is not managed)
+	int	holding;				// True if holding
+	int	hold_code;			// If holding, this is callback code
+	unsigned interval;		// Callback poll interval
+	unsigned itmr;				// Callback poll interval timer
+	int	itmr_running;		// Non-zero if timer running
+} IDIGI_t;
+extern __far IDIGI_t _idigi[IF_MAX];
+extern IDIGI_t __far * _idigi_cur;	// Current iDigi interface slection
+												// (points to one of the above)
+extern IDIGI_t __far * _idigi_first;// First managed interface
+
+extern __far EDP _edp_inst;				// Global EDP state
+int idigi_init(void);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+idigi_init                                           <IDIGI.LIB>
+
+SYNTAX:		int idigi_init(void)
+
+DESCRIPTION:	Initialize iDigi and the network.
+
+					Non-iDigi applications call sock_init() or related
+					functions to start up the network.  When using iDigi,
+					all network configuration is handled automatically
+					and the application should *not* call sock_init().
+
+					Registration of do_command targets should not be
+					performed until this function has been called.
+
+					This function should be called only once.
+
+RETURN VALUE:  0: OK
+					-ENOMEM: insufficient memory
+					-ENOENT: no interfaces were selected (via IDIGI_IFACE_MASK)
+					  to run the iDigi connection.  IDIGI_IFACE_MASK should be
+					  defined to a non-zero bitmask of interfaces e.g.
+					  #define IDIGI_IFACE_MASK (1 << IF_ETH0 | 1 << IF_PPP3)
+               -EIO: if IDIGI_USE_FAT, then an error occurred calling
+                 sspec_automount().  In a deployed application, this
+                 would normally be caused only if removable storage
+                 devices are implemented.  In this case, the application
+                 is responsible for resolving the situation and calling
+                 sspec_automount() when ready.
+					Any other: internal error, contact technical support
+
+               It is recommended to #define IDIGI_IFACE_VERBOSE when
+               initially developing an iDigi application, since this
+               helps show up some errors which can occur during
+               development which are not necessarily fatal at run-time.
+
+SEE ALSO:		idigi_tick, idigi_status, idigi_register_target
+
+END DESCRIPTION **********************************************************/
+
+__far EDP _edp_inst = {0,};				// Global EDP state
+__far IDIGI_t _idigi[IF_MAX];
+IDIGI_t __far * _idigi_cur;
+IDIGI_t __far * _idigi_first;
+
+_idigi_debug
+int idigi_init(void)
+{
+	int rc, i;
+	unsigned mask;
+	IDIGI_t __far * ip;
+
+#ifdef IDIGI_PPP_IFACE
+#if IDIGI_PPP_FLOWCONTROL
+#ifndef IDIGI_DISABLE_FLOWCONTROL_SETUP
+	IDIGI_CTS_SETUP
+	IDIGI_RTS_SETUP
+#endif
+#endif
+#endif
+
+	_idigi_cur = NULL;
+	ip = NULL;
+   for (i = 0, mask = 1; i < IF_MAX; ++i, mask <<= 1) {
+		_idigi[i].managed = (IDIGI_IFACE_MASK & mask) != 0;
+		// Arbitrarily select the lowest numbered interface to start with
+		if (_idigi[i].managed) {
+	      if (!_idigi_cur) {
+	         _idigi_cur = _idigi + i;
+	         edp_globals.iface = i;
+	         ip = _idigi_cur;
+	      }
+	      else {
+				ip->next = _idigi + i;
+				ip = ip->next;
+			}
+		}
+		_idigi[i].state = _idigi[i].managed ? _IDIGI_IFSTART : _IDIGI_IFDOWN;
+		_idigi[i].prev_state = _IDIGI_IFDOWN;
+		_idigi[i].iface_mask = mask;
+		_idigi[i].next = NULL;
+		_idigi[i].try_lkg = 0;
+		_idigi[i].interval = IDIGI_CB_INTERVAL;
+		_idigi[i].itmr_running = 0;
+		_idigi[i].holding = 0;
+	}
+	if (!_idigi_cur) {
+	#ifdef IDIGI_IFACE_VERBOSE
+      printf("idigi_init: no interfaces selected for iDigi!\n");
+   #endif
+		return -ENOENT;
+	}
+	_idigi_first = _idigi_cur;
+
+	// Start RCI and EDP
+	/* rci_init() does the following:
+		- register conditionals using web_register_conditional()
+		- register metadata (#ximported .json files) using web_register_metadata()
+		- calls web_init() which:
+			- calls  _web_register_default_extreps()
+			- copies compiler-generated #web var definitions to far storage
+			- augments the above with metadata via web_parse_metadata()
+		- calls rci_data_init() which:
+			- initializes constant parts of _RCI_State
+			- inits factory defaults based on application macros
+			- copies factory defaults to "stored settings"
+			- updated stored settings based on userID block data
+			- copies stored settings to "current" (i.e. _RCI_Settings)
+			- calls sock_init()
+			- configures the network based on settings via rci_config_network().
+	*/
+	rc = rci_init();
+   if (rc) {
+	#ifdef IDIGI_IFACE_VERBOSE
+      printf("idigi_init: error %d calling rci_init\n", rc);
+   #endif
+      return rc;
+   }
+
+	#ifdef IDIGI_USE_HTTP_DS
+	httpc_set_mode(HTTPC_AUTO_REDIRECT | HTTPC_NONBLOCKING);
+	#endif
+
+	#ifdef IDIGI_USE_ADDP
+   rc = addp_init( IF_ANY, NULL);
+   if (rc) {
+   #ifdef IDIGI_IFACE_VERBOSE
+      printf("idigi_init: Error %d calling addp_init\n", rc);
+   #endif
+      // Currently, ignore this error.  If ADDP doesn't init, then
+      // it's not necessarily a disaster.
+	}
+	#endif
+
+   #ifdef IDIGI_USE_FAT
+	// Note: sspec_automount automatically initializes all known filesystems.
+   rc = sspec_automount(SSPEC_MOUNT_ANY, NULL, NULL, NULL);
+	if (rc) {
+		#ifdef IDIGI_IFACE_VERBOSE
+      printf("idigi_init: error mounting FAT filesystem\n");
+	   #endif
+      // This is not a fatal error, since iDigi itself does not rely
+      // on FAT.  Any errors which occur from sspec_automount() indicate
+      // configuration errors, which should not occur in a deployed
+      // application.
+      return -EIO;
+	}
+   #endif
+
+	return 0;
+}
+
+/*** BeginHeader idigi_addp_callback */
+int idigi_addp_callback(int iface, unsigned long ip_addr, unsigned long netmask,
+	unsigned long gateway);
+/*** EndHeader  */
+
+// callback for ADDP library to change network settings.
+// We treat this like an RCI set_settings action=deferred.
+_idigi_debug
+int idigi_addp_callback(int iface, unsigned long ip_addr, unsigned long netmask,
+	unsigned long gateway)
+{
+	WebTrans_t wt;
+	int rc;
+	int dhcp;
+
+	rc = web_transaction_start(&wt);
+	if (rc < 0)
+		return rc;
+	web_transaction_set_group(&wt, RCI_GROUP);
+
+	#ifdef IDIGI_IFACE_VERBOSE
+   printf("iDigi: Network config requested via ADDP\n");
+   #endif
+	if (ip_addr) {
+		// Static setting, no DHCP
+		dhcp = 0;
+		rc = web_transaction_add_by_name(&wt,
+			"_RCI_Settings.interface[0].dhcp", &dhcp, WTA_BINARY, 0);
+		rc |= web_transaction_add_by_name(&wt,
+			"_RCI_Settings.interface[0].ip", &ip_addr, WTA_BINARY, 0);
+		rc |= web_transaction_add_by_name(&wt,
+			"_RCI_Settings.interface[0].subnet", &netmask, WTA_BINARY, 0);
+		rc |= web_transaction_add_by_name(&wt,
+			"_RCI_Settings.interface[0].gateway", &gateway, WTA_BINARY, 0);
+	}
+	else {
+		// Use DHCP
+		dhcp = 1;
+		rc = web_transaction_add_by_name(&wt,
+			"_RCI_Settings.interface[0].dhcp", &dhcp, WTA_BINARY, 0);
+	}
+	if (!rc) {
+		/*
+		--- don't save backup here, since ADDP can be working even if
+		    we don't have a successful iDigi connection.  Saving backup
+		    here may be replacing a good backup with a bad one!
+		if (!_RCI_State.device_stats.configUsed)
+	      rci_save_stored(1);
+	   */
+	   rc = web_transaction_execute(&wt, WTE_SET_SHADOW | WTE_NO_CURRENT);
+	   if (!rc)
+	      rci_save_stored(0);
+	   else {
+	      #ifdef IDIGI_IFACE_VERBOSE
+	      printf("iDigi: ADDP network config failed to apply\n");
+	      #endif
+	   }
+	}
+	else {
+      #ifdef IDIGI_IFACE_VERBOSE
+      printf("iDigi: ADDP network config settings rejected\n");
+      #endif
+	}
+
+	return 0;
+}
+
+/*** BeginHeader idigi_addp_reboot */
+void idigi_addp_reboot(int unused);
+/*** EndHeader  */
+
+// We treat this like RCI reboot command.
+_idigi_debug
+void idigi_addp_reboot(int unused)
+{
+	#ifdef IDIGI_IFACE_VERBOSE
+   printf("iDigi: Reboot requested via ADDP\n");
+   #endif
+   _RCI_Reboot = 1;
+   if (_idigi_cur->state == _IDIGI_RUN)
+      // Abort connection.  -1 code signals through to caller of edp_tick()
+      // that reboot requested (edp_tick return code will be  -NETERR_ABORT)
+      edp_close(&_edp_inst, -1);
+
+}
+
+
+/*** BeginHeader idigi_block_tick */
+void idigi_block_tick(void);
+/*** EndHeader  */
+void idigi_block_tick(void)
+{
+	// This function called when iDigi itself is waiting for something.
+   // It should call everything *except* any iDigi functions, otherwise
+   // stack overflow may result from recursion.
+   tcp_tick(NULL);
+#ifdef IDIGI_USE_XBEE
+	sxa_tick();
+#endif
+#ifdef IDIGI_USE_ADDP
+   addp_tick();
+#endif
+	// Macro defined by user, which allows the application to get something done
+   // while waiting.
+	IDIGI_BLOCK_ACTION;
+
+}
+
+
+/*** BeginHeader idigi_notify_update_network */
+int idigi_notify_update_network(void);
+/*** EndHeader  */
+/* START FUNCTION DESCRIPTION ********************************************
+idigi_notify_update_network                                   <IDIGI.LIB>
+
+SYNTAX:		int idigi_notify_update_network(void)
+
+DESCRIPTION:	This is not normally called by the application.  It
+					is used to notify idigi_tick() that a change has been
+					made to the network configuration, and requires further
+					action such as restarting a network interface.
+
+RETURN VALUE:  0
+
+SEE ALSO:	idigi_tick, idigi_init, idigi_status
+
+END DESCRIPTION **********************************************************/
+
+int idigi_notify_update_network(void)
+{
+	// This is called when RCI (or application) modifies _RCI_Settings
+	// and wants the change applied to the network (via
+	// rci_config_network()).  This is done indirectly, because the main
+	// iDigi state machine needs to be aware of the interface potentially
+	// coming down, and the reconfig might have to wait for a more
+	// propitious alignment of the planets.
+	edp_globals.ding_network = 1;
+	return 0;
+}
+
+/*** BeginHeader idigi_status, idigi_iface_status */
+int idigi_status(void);
+int idigi_iface_status(int iface);
+#define IDIGI_DOWN			0
+#define IDIGI_COMING_UP		1
+#define IDIGI_UP				2
+#define IDIGI_COMING_DOWN	3
+#define IDIGI_PROBING		4
+/*** EndHeader  */
+/* START FUNCTION DESCRIPTION ********************************************
+idigi_iface_status                                           <IDIGI.LIB>
+
+SYNTAX:		int idigi_iface_status(int iface)
+
+DESCRIPTION:	Return iDigi server connectivity status on a particular
+					interface.
+
+RETURN VALUE:  Integer code as follows:
+						IDIGI_DOWN: Not connected or not running iDigi on this
+						   interface.
+						IDIGI_COMING_UP: Attempting to connect
+						IDIGI_UP: Connected OK
+						IDIGI_COMING_DOWN: Temporarily bringing network down
+							for reconfiguration.
+						IDIGI_PROBING: Not currently running iDigi on this
+						   interface, however a possible connection is being
+						   tested.
+
+SEE ALSO:	idigi_init, idigi_tick, idigi_secure, idigi_status
+
+END DESCRIPTION **********************************************************/
+
+_idigi_debug
+int idigi_iface_status(int iface)
+{
+	if (edp_globals.iface != iface) {
+		// check for probing...
+		return IDIGI_DOWN;
+	}
+	switch (_idigi[iface].state) {
+	case _IDIGI_RUN:
+		return IDIGI_UP;
+	case _IDIGI_IFSTART:
+	case _IDIGI_IFWAIT:
+	case _IDIGI_INIT:
+	case _IDIGI_WAITUP:
+	case _IDIGI_RESTART:
+	case _IDIGI_RESTART_ALT:
+	case _IDIGI_DING:
+	case _IDIGI_FORCE_DING:
+		return IDIGI_COMING_UP;
+	case _IDIGI_BOOT:
+		return IDIGI_COMING_DOWN;
+	}
+	return IDIGI_DOWN;
+}
+
+
+/* START FUNCTION DESCRIPTION ********************************************
+idigi_status                                           <IDIGI.LIB>
+
+SYNTAX:		int idigi_status(void)
+
+DESCRIPTION:	Return iDigi server connectivity status.  This returns
+					the status for the current interface on which iDigi is
+					connected.
+
+RETURN VALUE:  Integer code as follows:
+						IDIGI_DOWN: Not connected or invalid state.
+						IDIGI_COMING_UP: Attempting to connect
+						IDIGI_UP: Connected OK
+						IDIGI_COMING_DOWN: Temporarily bringing network down
+							for reconfiguration.
+
+SEE ALSO:	idigi_init, idigi_tick, idigi_secure, idigi_iface_status
+
+END DESCRIPTION **********************************************************/
+
+_idigi_debug
+int idigi_status(void)
+{
+	return idigi_iface_status(edp_globals.iface);
+}
+
+
+/*** BeginHeader idigi_secure */
+int idigi_secure(void);
+/*** EndHeader  */
+/* START FUNCTION DESCRIPTION ********************************************
+idigi_secure                                           <IDIGI.LIB>
+
+SYNTAX:		int idigi_secure(void)
+
+DESCRIPTION:	Return TRUE if iDigi server connectivity is secured
+               via TLS/SSL.
+
+RETURN VALUE:  0 if not secure,
+					1 if secured via TLS
+
+SEE ALSO:	idigi_init, idigi_tick, idigi_status
+
+END DESCRIPTION **********************************************************/
+
+_idigi_debug
+int idigi_secure(void)
+{
+	return _idigi_cur->state == _IDIGI_RUN &&
+	       _edp_inst.secured == 2;
+}
+
+
+/*** BeginHeader idigi_tick */
+int idigi_tick(void);
+/*** EndHeader  */
+
+/* START FUNCTION DESCRIPTION ********************************************
+idigi_tick                                           <IDIGI.LIB>
+
+SYNTAX:		int idigi_tick(void)
+
+DESCRIPTION:	Drive all state machines for maintaining iDigi and the
+					network configuration.
+
+					Your main application loop should call this function
+					whenever possible.
+
+					Before calling, idigi_init() must have been called
+					successfully.
+
+RETURN VALUE:  Integer code as follows:
+						0: OK, keep calling
+						-NETERR_NONE: a remote configuration change has been
+							received which requires one or more network
+							interfaces to be temporarily shut down.  This
+							code can be ignored (treat like 0) or the application
+							can cleanly shut down any open connections before
+							calling idigi_tick() again.
+						-NETERR_ABORT: a reboot request has been received.
+						   Application should perform any clean-up, then
+						   reboot using exit(0) from main().  Alternatively,
+						   this request can be ignored, however this may cause
+						   a surprise to web services clients or iDigi
+						   user interface users.  Note that a reboot is
+						   requested after firmware updates.
+						Other: generally, these will be negative network error
+						   codes.  They can occur if the network is
+						   misconfigured and the iDigi server cannot be
+						   reached.  If ignored, idigitick() will try again in
+						   3 seconds.
+
+SEE ALSO:		idigi_init, idigi_status
+
+END DESCRIPTION **********************************************************/
+
+tcp_Socket _edp_sock;	// A TCP socket required for iDigi
+
+_idigi_debug
+void _idigi_change_iface(int new_iface)
+{
+	int i, p;
+	IDIGI_t __far * ic = _idigi_cur;
+	IDIGI_t __far * icnext;
+
+   i = (int)(ic - _idigi);
+	if (new_iface == IF_ANY) {
+	   // Try next interface which allows iDigi
+	#ifdef IDIGI_IFACE_CALLBACK
+	   i = IDIGI_IFACE_CALLBACK(IDIGI_CB_SELECT, i, 0);
+	#else
+	   i = IF_ANY;
+	#endif
+	   // Presume interface up without iDigi
+	   ic->state = _IDIGI_IFSTEADY;
+	   if (i == IF_ANY) {
+	      icnext = ic->next;
+	      if (!icnext)
+	         icnext = _idigi_first;
+	   }
+	   else {
+	      icnext = _idigi + i;
+	      if (!icnext->managed)
+	         icnext = ic;   // keep same if selection error
+	   }
+   }
+   else
+   	icnext = _idigi + new_iface;
+   i = (int)(icnext - _idigi);
+   //FIXME Also check probing...
+   p = ifpending(i);
+   icnext->state =
+   	p == IF_DOWN || p == IF_COMING_DOWN ? _IDIGI_IFSTART :
+   	p == IF_COMING_UP ? _IDIGI_IFWAIT :
+   	_IDIGI_INIT;
+   _idigi_cur = icnext;
+   edp_globals.iface = i;
+	//icnext->prev_state = IDIGI_DOWN;
+}
+
+
+_idigi_debug
+int idigi_tick(void)
+{
+	int rc, ps, retcode, pend, tryalt;
+	word iface_mask, i, coldstart;
+	IDIGI_t __far * ic;
+
+	// Drive network stack and ADDP
+	tcp_tick(NULL);
+
+	#ifdef IDIGI_USE_ADDP
+	addp_tick();
+	#endif
+
+   #ifdef IDIGI_USE_XBEE
+   sxa_tick();
+   #endif
+
+	ps = idigi_status();
+#ifdef IDIGI_IFACE_VERBOSE
+	if (ps != _idigi_cur->prev_state)
+   	printf("iDigi: status now %s\n",
+   		ps == IDIGI_COMING_UP ? "COMING_UP" :
+   		ps == IDIGI_UP ? "UP" :
+   		ps == IDIGI_COMING_DOWN ? "COMING_DOWN" :
+   		"DOWN");
+#endif
+
+	switch (ps) {
+	case IDIGI_COMING_UP:
+		if (_idigi_cur->prev_state != IDIGI_COMING_UP) {
+			edp_globals.btmr = _SET_TIMEOUT(IDIGI_MIN_CONNECT_TIMEOUT * 1000uL);
+		}
+		else {
+			if (_CHK_TIMEOUT(edp_globals.btmr)) {
+         	// Only try alternate configurations if have them.
+         	tryalt = rci_have_stored(0) && rci_have_stored(1);
+	      #ifdef IDIGI_IFACE_VERBOSE
+	         printf("iDigi: Timed out waiting for %s (iface %d)\n",
+	         	_idigi_cur->state == _IDIGI_IFWAIT ? "interface" : "connection",
+	         	edp_globals.iface);
+	      #endif
+	      	edp_close(&_edp_inst, 0);
+            if (tryalt)
+	      		_idigi_cur->try_lkg = !_idigi_cur->try_lkg;
+	      	// If we have another available interface which is up, try it
+	      	// first.  Select round-robin.
+	      _trynext:
+				_idigi_change_iface(IF_ANY);
+				_RCI_State.device_stats.configUsed = _idigi_cur->try_lkg;
+            //_idigi_cur->state = _IDIGI_FORCE_DING;
+            //_idigi_cur->state = _IDIGI_IFWAIT; // _IDIGI_DING;
+            edp_globals.btmr = _SET_TIMEOUT(IDIGI_MAX_CONNECT_TIMEOUT * 1000uL);
+	      	if (rci_have_stored(_RCI_State.device_stats.configUsed)) {
+	         #ifdef IDIGI_IFACE_VERBOSE
+	            printf("iDigi: Trying %s configuration (iface %d)\n",
+	            	_RCI_State.device_stats.configUsed ? "backup" : "normal",
+						edp_globals.iface);
+	         #endif
+	            rci_get_stored(_RCI_State.device_stats.configUsed);
+	            _f_memcpy((void __far *)&_RCI_Settings,
+	                     (void __far *)_RCI_Settings_stored, sizeof(_RCI_Settings));
+	         #ifdef IDIGI_IFACE_CALLBACK
+         		IDIGI_IFACE_CALLBACK(
+         			_RCI_State.device_stats.configUsed ?
+         				IDIGI_CB_TRY_LKG :
+         				IDIGI_CB_TRY_NEW
+         				, edp_globals.iface, 0);
+	         #endif
+            	_idigi_cur->state = _IDIGI_DING;
+	         }
+	         else if (tryalt) {
+	         	_idigi_cur->try_lkg = !_idigi_cur->try_lkg;
+            	goto _trynext;
+				}
+			}
+		}
+		break;
+	}
+	_idigi_cur->prev_state = ps;
+
+	retcode = 0;
+
+	// For each managed interface, drive its state machine
+	for (ic = _idigi_first; ic; ic = ic->next) {
+
+	   i = (int)(ic - _idigi);  // Interface number
+
+      #ifdef IDIGI_IFACE_CALLBACK
+      // Take care of the periodic callback
+      if (ic->itmr_running) {
+         if (_CHK_SHORT_TIMEOUT(ic->itmr)) {
+            ic->itmr_running = 0;
+            rc = IDIGI_CBR_OK;
+            switch (ic->state) {
+            case _IDIGI_RUN:
+            	rc = IDIGI_IFACE_CALLBACK(IDIGI_CB_RUN, i, 0);
+            	break;
+            case _IDIGI_IFSTEADY:
+            	rc = IDIGI_IFACE_CALLBACK(IDIGI_CB_NOT_RUN, i, 0);
+            	break;
+            case _IDIGI_IFDOWN:
+            	rc = IDIGI_IFACE_CALLBACK(IDIGI_CB_NOT_UP, i, 0);
+            	break;
+            // All other states are transitional, so there is no
+            // periodic callback.
+				}
+				if (rc == IDIGI_CBR_DISCONNECT || rc == IDIGI_CBR_IFDOWN) {
+					if (idigi_iface_status(i) == IDIGI_UP ||
+						 idigi_iface_status(i) == IDIGI_COMING_UP) {
+	               edp_close(&_edp_inst, ic->state == _IDIGI_RUN);
+	               // Block while closing cleanly
+	               while (edp_tick(&_edp_inst, NULL) == -EAGAIN) {
+   						idigi_block_tick();
+	               }
+	               IDIGI_IFACE_CALLBACK(IDIGI_CB_DISCONNECT, i, 0);
+	            }
+	         	ic->state = _IDIGI_IFSTEADY;
+	         	if (rc == IDIGI_CBR_IFDOWN) {
+	               IDIGI_IFACE_CALLBACK(IDIGI_CB_IFACE_COMING_DOWN, i, 0);
+	         		ifdown(i);
+	               // Block while closing cleanly
+	               while (ifpending(i) != IF_DOWN) {
+	                  tcp_tick(NULL);
+	               #ifdef IDIGI_USE_ADDP
+	                  addp_tick();
+	               #endif
+	               }
+	         		ic->state = _IDIGI_IFDOWN;
+	         	}
+				}
+				else if (rc == IDIGI_CBR_CONNECT &&
+							idigi_status() == IDIGI_DOWN) {
+					_idigi_change_iface(i);
+				}
+				else if (rc == IDIGI_CBR_IFUP) {
+					if (ifpending(i) != IF_UP)
+						ic->state = _IDIGI_IFSTART;
+					else
+						ic->state = _IDIGI_IFWAIT;
+				}
+         }
+      }
+      else {
+         if ((int)ic->interval > 0 &&
+              (ic->state==_IDIGI_RUN ||
+               ic->state==_IDIGI_IFSTEADY ||
+               ic->state==_IDIGI_IFDOWN)) {
+            ic->itmr_running = 1;
+            ic->itmr = _SET_SHORT_TIMEOUT(ic->interval);
+         }
+      }
+   	#endif
+
+
+	   switch (ic->state) {
+	   case _IDIGI_IFSTART:
+
+	   #ifdef IDIGI_IFACE_VERBOSE
+	   	if (!ic->holding)
+	      	printf("iDigi: Bringing interface %d up\n", i);
+	   #endif
+	   #ifdef IDIGI_IFACE_CALLBACK
+	      rc = IDIGI_IFACE_CALLBACK(IDIGI_CB_IFACE_COMING_UP, i, ic->holding);
+	      if (rc == IDIGI_CBR_HOLD) {
+	      	ic->holding = 1;
+	      	ic->hold_code = IDIGI_CB_IFACE_COMING_UP;
+	      	break;
+	      }
+	      else if (rc == IDIGI_CBR_IFDOWN) {
+	      	ic->holding = 0;
+	      	ic->state = _IDIGI_IFDOWN;
+	      	break;
+	      }
+	      ic->holding = 0;
+	   #endif
+	      ifup(i);
+
+	      ic->state = _IDIGI_IFWAIT;
+	      break;
+	   case _IDIGI_IFWAIT:
+	   	pend = ifpending(i);		 // Interface status
+	      if (pend == IF_UP) {
+	      #ifdef IDIGI_IFACE_VERBOSE
+	         printf("iDigi: Interface %d up\n", i);
+	      #endif
+	      #ifdef IDIGI_IFACE_CALLBACK
+	         IDIGI_IFACE_CALLBACK(IDIGI_CB_IFACE_UP, i, 0);
+	      #endif
+	         if (ic == _idigi_cur)
+	            // Want to try connection on this interface
+	            ic->state = _IDIGI_INIT;
+	         else
+	            // Keep up, but not running iDigi here
+	            ic->state = _IDIGI_IFSTEADY;
+	         break;
+	      }
+	      else if (pend != IF_COMING_UP) {
+	      #ifdef IDIGI_IFACE_VERBOSE
+	         printf("iDigi: Interface %d failed to come up\n", i);
+	      #endif
+	      	if (ic == _idigi_cur)
+	      		// Wanted to run iDigi.  Change to different iface.
+	      		// Current will set to IFSTEADY, then eventually IFDOWN.
+	      		_idigi_change_iface(IF_ANY);
+	      	else
+	      		// This will subsequently transition to IFDOWN.
+	      		ic->state = _IDIGI_IFSTEADY;
+	      }
+	      break;
+	   case _IDIGI_INIT:
+	      edp_init(&_edp_inst, &_edp_sock, i);
+	      rc = edp_tick(&_edp_inst, IDIGI_SERVER_CURRENT);
+	      if (rc != -EAGAIN) {
+	   #ifdef IDIGI_IFACE_VERBOSE
+	         printf("iDigi: Error %d calling edp_tick, restart in 5\n", rc);
+	   #endif
+	         ic->state = _IDIGI_RESTART;
+	         edp_globals.tmr = _SET_SHORT_TIMEOUT(5000);
+	         retcode = rc;
+	         break;
+	      }
+	      ic->state = _IDIGI_WAITUP;
+	   case _IDIGI_RUN:
+	   case _IDIGI_WAITUP:
+	      rc = edp_tick(&_edp_inst, NULL);
+	      if (rc == -EAGAIN) {
+	      	if (ic->state == _IDIGI_WAITUP) {
+            	// Not up until gone through initial negotiations up to
+               // point where we have server's message facility capabilities.
+	            if (_edp_inst.state == EDP_STATE_OPEN &&
+                   _edp_inst.peer_caps_1) {
+	            	ic->state = _IDIGI_RUN;
+	            #ifdef IDIGI_IFACE_CALLBACK
+	               IDIGI_IFACE_CALLBACK(IDIGI_CB_CONNECT, i, 0);
+	            #endif
+	            }
+	      	}
+	         // Seems to be running smoothly.
+	         // Action any pending network reconfig.
+	         if (edp_globals.ding_network) {
+	            ic->state = _IDIGI_DING;
+	            // This return code allows application to perform some
+	            // action before network is reconfigured.
+	            retcode = -NETERR_NONE;
+	         }
+	         break;
+	      }
+	      if (rc == -NETERR_ABORT) {
+	   #ifdef IDIGI_IFACE_VERBOSE
+	         printf("iDigi: Reboot requested\n");
+	   #endif
+	         ic->state = _IDIGI_BOOT;
+	         retcode = rc;
+	         break;
+	      }
+	   #ifdef IDIGI_IFACE_VERBOSE
+	      printf("iDigi: Error %d calling edp_tick, restart in 3\n", rc);
+	   #endif
+	      ic->state = _IDIGI_RESTART;
+	      edp_globals.tmr = _SET_SHORT_TIMEOUT(3000);
+	      retcode = rc;
+	      break;
+	   case _IDIGI_BOOT:
+	      // called again in this state means application ignores boot request,
+	      // so treat as restart.
+	   #ifdef IDIGI_IFACE_VERBOSE
+	      printf("iDigi: Reboot ignored, restarting\n");
+	   #endif
+	      ic->state = _IDIGI_INIT;
+	      break;
+	   case _IDIGI_RESTART:
+	      // Wait for 5/3-sec timeout
+	      if (!_CHK_SHORT_TIMEOUT(edp_globals.tmr))
+	         break;
+	      _idigi_change_iface(IF_ANY);
+	      break;
+	   case _IDIGI_FORCE_DING:
+	      coldstart = ic->iface_mask;
+	      goto _dingaling;
+	   case _IDIGI_DING:
+	      coldstart = 0;
+	   _dingaling:
+	      // Check if going to disrupt EDP session.  If so, close it cleanly.
+	      iface_mask = rci_config_test() | coldstart;
+	   #ifdef IDIGI_IFACE_VERBOSE
+	      printf("iDigi: network configure (bounce iface mask = 0x%04X)\n", iface_mask);
+	   #endif
+	      if (iface_mask & ic->iface_mask) {
+	      #ifdef IDIGI_IFACE_VERBOSE
+	         printf("iDigi: need to close EDP on iface %d\n", i);
+	      #endif
+	         edp_close(&_edp_inst, 1);
+	         // Block while closing cleanly
+	         while (edp_tick(&_edp_inst, NULL) == -EAGAIN) {
+   				idigi_block_tick();
+	         }
+	      #ifdef IDIGI_IFACE_CALLBACK
+	         IDIGI_IFACE_CALLBACK(IDIGI_CB_DISCONNECT, i, 0);
+	      #endif
+	      }
+      #ifdef IDIGI_IFACE_CALLBACK
+	      for (i = 0; i < IF_MAX; ++i)
+	         if (iface_mask & 1u<<i)
+         		IDIGI_IFACE_CALLBACK(IDIGI_CB_IFACE_COMING_DOWN, i, 0);
+      #endif
+	      rci_config_network(coldstart);
+	      ic->state = _IDIGI_RUN;
+	      for (i = 0; i < IF_MAX; ++i)
+	         if (iface_mask & 1u<<i) {
+	            _idigi[i].state = _IDIGI_IFSTART;
+	         }
+	      break;
+	   case _IDIGI_IFSTEADY:
+	   	// Things can happen outside our control, so handle such events.
+	   	pend = ifpending(i);		 // Interface status
+	   	switch (pend) {
+	   	case IF_COMING_UP:
+		   #ifdef IDIGI_IFACE_VERBOSE
+	      	printf("iDigi: interface %d unexpectedly coming up\n", i);
+		   #endif
+	   		ic->state = _IDIGI_IFWAIT;
+	   		break;
+	   	case IF_DOWN:
+	   	case IF_COMING_DOWN:
+		   #ifdef IDIGI_IFACE_VERBOSE
+	      	printf("iDigi: interface %d unexpectedly down\n", i);
+		   #endif
+      	#ifdef IDIGI_IFACE_CALLBACK
+        		IDIGI_IFACE_CALLBACK(IDIGI_CB_IFACE_COMING_DOWN, i, 0);
+      	#endif
+	   		ic->state = _IDIGI_IFDOWN;
+	   		break;
+	   	}
+	   	break;
+	   case _IDIGI_IFDOWN:
+	   	pend = ifpending(i);		 // Interface status
+	   	switch (pend) {
+	   	case IF_UP:
+	   	case IF_COMING_UP:
+		   #ifdef IDIGI_IFACE_VERBOSE
+	      	printf("iDigi: interface %d unexpectedly up\n", i);
+		   #endif
+	   		ic->state = _IDIGI_IFWAIT;
+	   		break;
+	   	}
+	   	break;
+	   }  // Switch
+
+	} // loop over all managed interfaces
+
+	return retcode;
+}
+
+/*** BeginHeader idigi_put */
+typedef struct DataSvcsState
+{
+#ifdef IDIGI_USE_HTTP_DS
+	enum {
+		_DSS_INIT,
+		_DSS_RUN,
+		_DSS_HEADERS,
+		_DSS_BODY,
+		_DSS_CLOSE
+	} state;
+	int retcode;			// Server response code (e.g. 201 if created OK)
+	const char __far * data;
+	word len;
+	tcp_Socket * tsock;	// TCP socket (dynamically allocated in root)
+	httpc_Socket hsock;	// HTTP client state structure
+	char url[257];
+#else
+	#ifdef IDIGI_USE_DS
+   enum {
+		_DSS_INIT = 0,
+		_DSS_PAYLOAD,
+		_DSS_RESP,
+		_DSS_DONE,
+   } state;
+	edp_trans_t __far * trans;
+   const char __far * name;
+   const char __far * contenttype;
+   const void __far * data;
+   longword len;
+   longword togo;
+   int archive;
+   int append;
+   int result;
+   #else
+	int dummy;
+   #endif
+#endif
+} DataSvcsState_t;
+
+int idigi_put(DataSvcsState_t __far * dss, const char __far * name, int secure,
+					const char __far * contenttype, const void __far * data, word len);
+/*** EndHeader  */
+
+/* START FUNCTION DESCRIPTION ********************************************
+idigi_put                                           <IDIGI.LIB>
+
+SYNTAX:	int idigi_put(DataSvcsState_t far * dss, const char far * name,
+					int secure, const char far * contenttype, const void far * data,
+					word len);
+
+DESCRIPTION: 	Use iDigi data services to put file to the server.
+
+					This function is only available if you #define IDIGI_USE_DS.
+
+               Since Dynamic C 10.70, the implementation of data services
+               has been enhanced to use the existing iDigi connection
+               rather than HTTP PUT.  A new API function, idigi_upload()
+               has been created to make available the enhanced features
+               of this method.  This function still works, however new
+               code should use idigi_upload().
+
+					Only one PUT operation may be in progress at the same time!
+					Attempting multiple operations will result in application
+					crash.
+
+					NOTE: Some of the required parameters for communicating with
+					the server are taken from the current RCI state.  These
+					parameters are:
+					  _RCI_Settings.mgmtglobal.dataServiceEnabled
+					  		If not set TRUE, then this function will fail with
+					  		return code -EPERM.  Defaults to TRUE.
+               The following are only if IDIGI_USE_HTTP_DS is defined
+               (otherwise the new EDP-based method is used which does not
+               require these settings):
+					  _RCI_Settings.mgmtglobal.dataServicePort
+					  		Default 80.  Sever port number for plaintext requests.
+					  _RCI_Settings.mgmtglobal.dataServiceSecurePort
+					  		Default 443.  Sever port number for secure requests.
+					  _RCI_Settings.mgmtglobal.dataServiceURL
+					  		Defaults to "/ws/device", and is a prefix to the "name"
+					  		parameter.
+					  _RCI_Settings.mgmtglobal.dataServiceToken
+					  		Defaults to "cwm_ds"
+
+PARAMETER 1:   Pointer to uninitialized state structure.  This will be
+					initialized by this routine, then it must be passed to
+					idigi_ds_tick() until it returns something other than
+					-EAGAIN.
+
+PARAMETER 2:   Resource name to create, relative to the device-specific root.
+               For example, "foo.xml" to create a file /foo.xml, or
+               "bar/baz.txt" to create a file baz.txt in folder /bar.
+
+               If IDIGI_USE_HTTP_DS:
+               	This name should be URL encoded (e.g. spaces should be %20
+               	and so on).
+               Otherwise:
+               	The name should not be encoded.
+
+               To avoid problems, don't use non-alphanumeric characters
+               in file names.
+
+PARAMETER 3:   TRUE if secure connection to be used, else will use plaintext
+               connection.  This can only be set TRUE if IDIGI_USE_TLS is
+               defined.  If not using HTTP PUT (IDIGI_USE_HTTP_DS) then this
+               parameter is basically ignored since the security is
+               forced to be whatever is specified by IDIGI_USE_TLS.
+
+PARAMETER 4:	String to send as "Content-Type".  Use NULL for default of
+               "text/plain".  This string must not be changed until
+					idigi_ds_tick() completes.
+
+					NOTE: for IDIGI_USE_HTTP_DS, the iDigi server ignores the
+               specified content type, and infers the content type from the
+               filename extension.  It is recommended to pass NULL for this
+               parameter.  If not using HTTP PUT, then this parameter is
+               used by the server, or if NULL then the server will use the
+               old default behavior (e.g. use the file name extension).
+
+PARAMETER 5:	Data to put.  This data must remain unmodified in-place until
+					idigi_ds_tick() completes.
+
+PARAMETER 6:	Length of data to put (typically strlen(data)).  A maximum of
+					65535 bytes is supported.  (idigi_upload() supports
+               arbitrary length data including data generated on-the-fly).
+
+RETURN VALUE:  Integer code as follows:
+						 0: Success.  Call idigi_ds_tick() until it completes.
+                   -EINVAL: null pointer for name or data
+						 -ENOMEM: could not allocate local resources
+						 -EPERM: not permitted because
+						 		_RCI_Settings.mgmtglobal.dataServiceEnabled
+						 		is not set TRUE.
+						 -EACCES: no access becasue 'secure' parameter TRUE
+						      but no TLS connection is available.
+                   -E2BIG: probably 'name' or 'contenttype' is too long.
+						 Other: any return code from httpc_put_ext().
+
+SEE ALSO:		httpc_put_ext, url_encodestr, idigi_upload
+
+END DESCRIPTION **********************************************************/
+#ifndef IDIGI_USE_DS
+	#error "idigi_put requires IDIGI_USE_DS to be defined"
+#endif
+#ifdef IDIGI_USE_TLS
+	#ifdef IDIGI_USE_HTTP_DS
+	   #if SSL_MAX_CONNECTIONS < 2
+	      #warns "Use of idigi_put requires at least 2 TLS sessions"
+	      #warns "Increase value of SSL_MAX_CONNECTIONS"
+	   #endif
+   #endif
+#endif
+
+
+
+const far edp_msg_handler_t  _idigi_put = {
+	MSG_SVC_DATA, 16000u, 0,
+	_idigi_put_tick,
+   NULL,
+   _idigi_put_close
+};
+
+
+
+
+_idigi_debug
+int idigi_put(DataSvcsState_t __far * dss, const char __far * name, int secure,
+					const char __far * contenttype, const void __far * data, word len)
+{
+	int rc;
+#ifdef IDIGI_USE_HTTP_DS
+	static tcp_Socket tsock_inst;
+#else
+	edp_trans_t __far * t;
+#endif
+
+   if (!name || !data)
+   	return -EINVAL;
+
+#ifndef IDIGI_USE_TLS
+	if (secure)
+		return -EACCES;
+#endif
+	if (!_RCI_Settings.mgmtglobal.dataServiceEnabled)
+		return -EPERM;
+
+#ifdef IDIGI_USE_HTTP_DS
+	rc = snprintf(dss->url, sizeof(dss->url)-1, "http%s://%s:%s@%s:%u%s/%ls",
+		secure ? "s" : "",
+		_RCI_Settings.mgmtglobal.deviceId,
+		_RCI_Settings.mgmtglobal.dataServiceToken,
+		IDIGI_SERVER_CURRENT,
+		secure ? _RCI_Settings.mgmtglobal.dataServiceSecurePort :
+					_RCI_Settings.mgmtglobal.dataServicePort,
+		_RCI_Settings.mgmtglobal.dataServiceURL,
+		name
+		);
+	if (rc >= sizeof(dss->url)) {
+	   #ifdef IDIGI_VERBOSE
+	   printf("idigi_put: URL too long! (name is %d long, can only be %d)\n",
+	   		strlen(name), strlen(name) - (rc - sizeof(dss->url) + 1));
+	   #endif
+	   return -E2BIG;
+	}
+	#ifdef IDIGI_VERBOSE
+	printf("idigi_put: to URL %ls\n", dss->url);
+	#endif
+	dss->state = _DSS_INIT;
+	dss->tsock = &tsock_inst;
+
+	rc = httpc_init(&dss->hsock, dss->tsock);
+	if (rc)
+		goto _erret;
+	dss->data = data;
+	dss->len = len;
+	rc = httpc_put_url(&dss->hsock, dss->url, data, data ? len : 0, contenttype);
+	if (rc != -EAGAIN)
+		goto _erret;
+	dss->state = _DSS_RUN;
+	return 0;
+
+_erret:
+   return rc;
+#else
+	// New messaging service implementation
+   _f_memset(dss, 0, sizeof(*dss));
+   if (strlen(name) > 255 ||
+       contenttype && strlen(contenttype) > 255)
+   	return -E2BIG;
+   t = edp_msg_open(&_idigi_put);
+   if (!t) {
+	#ifdef IDIGI_VERBOSE
+   	printf("idigi_put: failed open\n");
+   #endif
+   	return -ENOMEM;
+   }
+	t->context = dss;
+   dss->trans = t;
+   dss->name = name;
+   dss->contenttype = contenttype;
+   dss->data = data;
+   dss->len = len;
+   dss->result = -EAGAIN;
+	return 0;
+#endif
+}
+
+
+/*** BeginHeader _idigi_put_tick */
+void _idigi_put_tick(edp_trans_t __far * t);
+/*** EndHeader  */
+
+_idigi_debug
+void _idigi_put_tick(edp_trans_t __far * t)
+{
+	DataSvcsState_t __far * dss = t->context;
+   struct {
+   	char opcode;
+      char pathlen;
+   } s1;
+   struct {
+   	char parmcount;
+      char append_id;
+      char append_val;
+      char archive_id;
+      char archive_val;
+      char content_id;
+      char content_len;
+   } s2;
+   struct {
+   	char opcode;
+      char status;
+   } s3;
+   word w;
+
+	switch (dss->state) {
+   case _DSS_INIT:
+   	// All these writes should happen without buffer overrun
+      dss->togo = dss->len;
+   	s1.opcode = 0;
+      s1.pathlen = strlen(dss->name);
+   	edp_msg_write(t, &s1, sizeof(s1));
+   	edp_msg_write(t, dss->name, s1.pathlen);
+		s2.parmcount = 2;
+      s2.append_id = 0x02;
+      s2.append_val = dss->append != 0;
+      s2.archive_id = 0x01;
+      s2.archive_val = dss->archive != 0;
+		s2.content_id = 0x00;
+      if (dss->contenttype) {
+      	s2.parmcount = 3;
+      	s2.content_len = strlen(dss->contenttype);
+   		edp_msg_write(t, &s2, sizeof(s2));
+     		edp_msg_write(t, dss->contenttype, s2.content_len);
+      }
+      else
+   		edp_msg_write(t, &s2, sizeof(s2)-2);
+      dss->state = _DSS_PAYLOAD;
+      // fall through
+   case _DSS_PAYLOAD:
+		w = edp_msg_writable(t);
+      if (w > 1) {
+      	if (--w > dss->togo)
+         	w = (word)(dss->togo);
+         if (w) {
+	         edp_msg_write(t, (const char __far *)dss->data + (dss->len - dss->togo), w);
+	         dss->togo -= w;
+         }
+         if (!dss->togo) {
+         	edp_msg_close(t);
+         	dss->state = _DSS_RESP;
+         }
+      }
+   	break;
+   case _DSS_RESP:
+   	if (edp_msg_readable(t) > 2) {
+			edp_msg_read(t, &s3, sizeof(s3));
+         switch (s3.status) {
+         // Following code translation to be compatible with HTTP PUT responses
+         case 0x00: dss->result = 200;	break;	// OK
+         case 0x01: dss->result = 400; break;	// bad request
+         case 0x02: dss->result = 503; break;	// temporarily unavailable
+         default: dss->result = 500; break;	// server error
+         }
+         dss->state = _DSS_DONE;
+      }
+   	break;
+   default:	// _DSS_DONE
+   	if ((w=edp_msg_readable(t)) > 1)
+      	// Discard the status message
+      	edp_msg_read(t, NULL, w-1);
+      break;
+   }
+}
+
+/*** BeginHeader _idigi_put_close */
+void _idigi_put_close(edp_trans_t __far * t);
+/*** EndHeader  */
+_idigi_debug
+void _idigi_put_close(edp_trans_t __far * t)
+{
+	DataSvcsState_t __far * dss = t->context;
+   if (dss->result == -EAGAIN)
+   	dss->result = -EIO;	// Transaction cancelled
+}
+
+
+/*** BeginHeader idigi_upload */
+
+int idigi_upload(DataSvcsState_t __far * dss,
+						const char __far * name,
+						const char __far * contenttype,
+                  const void __far * data,
+                  longword len,
+                  word options);
+#define IDIGI_DS_OPTION_APPEND	0x0001
+#define IDIGI_DS_OPTION_ARCHIVE	0x0002
+/*** EndHeader  */
+
+/* START FUNCTION DESCRIPTION ********************************************
+idigi_upload                                           <IDIGI.LIB>
+
+SYNTAX:	int idigi_upload(DataSvcsState_t far * dss,
+						const char far * name,
+						const char far * contenttype,
+                  const void far * data,
+                  longword len,
+                  word options);
+
+DESCRIPTION: 	Use iDigi data services to put file to the server.
+
+					This function is only available if you #define IDIGI_USE_DS.
+
+					NOTE: Some of the required parameters for communicating with
+					the server are taken from the current RCI state.  These
+					parameters are:
+					  _RCI_Settings.mgmtglobal.dataServiceEnabled
+					  		If not set TRUE, then this function will fail with
+					  		return code -EPERM.  Defaults to TRUE.
+
+PARAMETER 1:   Pointer to uninitialized state structure.  This will be
+					initialized by this routine, then it must be passed to
+					idigi_ds_tick() until it returns something other than
+					-EAGAIN.
+
+PARAMETER 2:   Resource name to create, relative to the device-specific root.
+               For example, "foo.xml" to create a file /foo.xml, or
+               "bar/baz.txt" to create a file baz.txt in folder /bar.
+
+PARAMETER 3:	String to send as "Content-Type".  Use NULL to allow server to
+					select based on filename extension etc.  This string must not
+               be changed until idigi_ds_tick() completes.
+
+PARAMETER 4:	Data to put.  This data must remain unmodified in-place until
+					idigi_ds_tick() completes.
+
+PARAMETER 5:	Length of data to put.
+
+PARAMETER 6:	Option flags, selected from zero or more of the following
+					values ORed together (or 0 if none):
+						IDIGI_DS_OPTION_APPEND - append data to existing file
+                  IDIGI_DS_OPTION_ARCHIVE - server should archive this data
+
+RETURN VALUE:  Integer code as follows:
+						 0: Success.  Call idigi_ds_tick() until it completes.
+                   -EINVAL: null pointer for name or data
+						 -ENOMEM: could not allocate local resources
+						 -EPERM: not permitted because
+						 		_RCI_Settings.mgmtglobal.dataServiceEnabled
+						 		is not set TRUE.
+                   -E2BIG: probably 'name' or 'contenttype' is too long.
+
+SEE ALSO:		idigi_ds_tick
+
+END DESCRIPTION **********************************************************/
+#ifndef IDIGI_USE_DS
+	#error "idigi_upload requires IDIGI_USE_DS to be defined"
+#endif
+
+const far edp_msg_handler_t  _idigi_upload = {
+	MSG_SVC_DATA, 16000u, 0,
+	_idigi_put_tick,
+   NULL,
+   _idigi_put_close
+};
+
+_idigi_debug
+int idigi_upload(DataSvcsState_t __far * dss,
+						const char __far * name,
+						const char __far * contenttype,
+                  const void __far * data,
+                  longword len,
+                  word options)
+{
+	edp_trans_t __far * t;
+
+   if (!name || !data)
+   	return -EINVAL;
+
+	if (!_RCI_Settings.mgmtglobal.dataServiceEnabled)
+		return -EPERM;
+
+   if (strlen(name) > 255 ||
+       contenttype && strlen(contenttype) > 255)
+   	return -E2BIG;
+
+   _f_memset(dss, 0, sizeof(*dss));
+   t = edp_msg_open(&_idigi_upload);
+   if (!t) {
+	#ifdef IDIGI_VERBOSE
+   	printf("idigi_upload: failed open\n");
+   #endif
+   	return -ENOMEM;
+   }
+	t->context = dss;
+   dss->trans = t;
+   dss->name = name;
+   dss->contenttype = contenttype;
+   dss->data = data;
+   dss->len = len;
+   dss->append = options & IDIGI_DS_OPTION_APPEND;
+   dss->archive = options & IDIGI_DS_OPTION_ARCHIVE;
+   dss->result = -EAGAIN;
+	return 0;
+}
+
+
+/*** BeginHeader idigi_ds_tick */
+int idigi_ds_tick(DataSvcsState_t __far * dss);
+/*** EndHeader  */
+
+/* START FUNCTION DESCRIPTION ********************************************
+idigi_ds_tick                                           <IDIGI.LIB>
+
+SYNTAX:		int idigi_ds_tick(DataSvcsState_t far * dss);
+
+DESCRIPTION: 	Use iDigi data services to put file (or folder) to the server.
+
+					This function is only available if you #define IDIGI_USE_DS.
+
+					Call idigi_put() or idigi_upload() first to initialize the
+               state structure.
+
+					This function is used to continue and complete the process,
+					which may take a relatively long time.
+
+					Always call this function with the same DataSvcsState_t
+					structure, until it returns something other than -EAGAIN.
+					If you do not complete the process in this manner, then
+					there may be a resource leak.
+
+PARAMETER 1:   Pointer to state structure initialized by idigi_put() or
+					idigi_upload().
+
+
+RETURN VALUE:  Integer code as follows:
+						 positive value: PUT completed, with this code returned by
+						   the server.  Typically, on success, this will be:
+						     201: resource created
+						   May also get the following error codes:
+						     400: bad request
+						     403: access forbidden (bad credentials)
+						     503: service unavailable
+						 -EAGAIN: not complete, call again with unchanged data.
+						 -EINVAL: bad parameter: dss appears not to be initialized
+						   correctly.
+                   -EIO: transaction cancelled or protocol error or
+                        lost connection to server.
+						 Other: any return code from httpc_put_ext().
+
+SEE ALSO:		httpc_put_ext, url_encodestr, idigi_upload
+
+END DESCRIPTION **********************************************************/
+#ifndef IDIGI_USE_DS
+	#error "idigi_ds_tick requires IDIGI_USE_DS to be defined"
+#endif
+
+_idigi_debug
+int idigi_ds_tick(DataSvcsState_t __far * dss)
+{
+#ifdef IDIGI_USE_HTTP_DS
+	char	hdr[256];
+	int rc;
+
+	switch (dss->state) {
+	case _DSS_RUN:
+		rc = httpc_put_ext(&dss->hsock, NULL, 0, NULL, NULL,
+         						dss->data, dss->len, NULL);
+      if (rc != -EAGAIN) {
+      	if (rc) {
+      		goto _erret;
+      	}
+      	dss->state = _DSS_HEADERS;
+      	return -EAGAIN;
+      }
+		break;
+	case _DSS_HEADERS:
+		if (dss->hsock.state == HTTPC_STATE_HEADER) {
+			rc = httpc_read_header(&dss->hsock, hdr, sizeof(hdr));
+			if (rc < 0)
+				goto _erret;
+		}
+		else
+			dss->state = _DSS_BODY;
+		break;
+	case _DSS_BODY:
+		if (dss->hsock.state == HTTPC_STATE_BODY) {
+			rc = httpc_read_body(&dss->hsock, hdr, sizeof(hdr));
+			if (rc < 0)
+				goto _erret;
+		}
+		else {
+			dss->retcode = dss->hsock.response;
+			dss->state = _DSS_CLOSE;
+		}
+		break;
+	case _DSS_CLOSE:
+		rc = httpc_close(&dss->hsock);
+		if (rc != -EAGAIN)
+			return dss->retcode;
+		break;
+	default:
+		return -EINVAL;
+	}
+	return -EAGAIN;
+_erret:
+	while (httpc_close(&dss->hsock) == -EAGAIN);
+	return rc;
+#else
+	return dss->result;
+#endif
+}
+
+/*** BeginHeader idigi_register_target */
+int idigi_register_target(char __far * name, char __far * request, char __far * reply);
+/*** EndHeader  */
+/* START FUNCTION DESCRIPTION ********************************************
+idigi_register_target                                           <IDIGI.LIB>
+
+SYNTAX:		int idigi_register_target(char far * name,
+					char far * request, char far * reply)
+
+DESCRIPTION:	Register an iDigi do_command target.
+
+					Example:
+
+					struct {
+						int a;
+						char b[20];
+					} request;
+					#web request
+					// example validity checker:
+					#web request ($request.a != 13 || \
+					   web_error("13 is unlucky for 'a'!"))
+
+					struct {
+						float b;
+						int z[4];
+					} reply;
+					#web reply
+
+					void actionRequest(void);
+					#web_update request actionRequest
+					void actionRequest(void) {
+						reply.b = request.a + 3.14159;
+						...
+					}
+
+					int main() {
+						idigi_init();
+						idigi_register_target("myTarget", "request", "reply");
+						...
+					}
+
+					NOTE: all parameters must point to static storage,
+					since only the pointers are stored in the registered
+					target table.
+
+PARAMETER 1:	The name of the target, as it would appear in the target
+					attribute of the <do_command> element.  If a target
+					of this name is already registered, its entry is
+					updated with the following parameters.  Otherwise, it
+					is created.
+PARAMETER 2:	Name of the variable which is filled in by the request
+               parameters.  This variable must be a structure, unless the
+               command has no relevant parameter data, in which case it
+               should be the name of a simple int variable.
+               The variable must be registered to RabbitWeb via a
+               #web directive.
+
+               All targets must have a request parameter.  Your
+               application defines a callback function which is invoked
+               for each do_command received for that target.  Use
+               #web_update to register the callback function against
+               the relevant request parameter variable.
+
+               If multiple targets use the same request parameter
+               variable, then the update function should update all
+               possible reply variables, since it won't know which
+               target was actually specified by the server.
+PARAMETER 3:	Name of the variable which is used to generate reply data.
+					This may be NULL if there is no reply data.  Otherwise,
+					it must be the name of a structure variable (not a simple
+					int etc.!) which has been registered in its entirety
+					using #web.  This variable is used to define the structure
+					of any data returned in the reply.  As such, it need not
+					have any guard or update callbacks of its own.  It will
+					usually be manipulated directly by the update function of
+					the request variable in order to generate the reply.
+
+RETURN VALUE:  Integer code as follows:
+						0: OK
+						-ENOMEM: more than IDIGI_MAX_TARGETS registered.
+					IDIGI_MAX_TARGETS defaults to 10, but you can
+					#define it to a larger value before #use idigi.lib.
+
+SEE ALSO:	idigi_init, idigi_tick, web_error
+
+END DESCRIPTION **********************************************************/
+
+// Note that parameters should point to static storage; only the pointers are stored.
+// request cannot be NULL (it must be a valid RabbitWeb variable name),
+// however reply may be NULL if there is no relevant return data.
+// If request is a struct, then XML structure inside the <do_command> element
+// maps directly to the struct members.  If request is a plain "int" variable,
+// then there is no relevant request data, however a dummy transaction which
+// sets that variable to zero is generated for the purpose of invoking the
+// update function for that variable (otherwise nothing would get done!)
+_idigi_debug
+int idigi_register_target(char __far * name, char __far * request, char __far * reply)
+{
+	return rci_register_target(name, request, reply);
+}
+
+
+/*** BeginHeader idigi_get_group */
+unsigned idigi_get_group(void);
+/*** EndHeader  */
+/* START FUNCTION DESCRIPTION ********************************************
+idigi_get_group                                           <IDIGI.LIB>
+
+SYNTAX:		unsigned idigi_get_group(void)
+
+DESCRIPTION:	Return Zserver authorization group for the iDigi server.
+					This will be the effective value of the macro
+               IDIGI_GROUP_MASK, however this function should be
+					used instead of referring to the macro, for upwards
+               compatibility.
+
+RETURN VALUE:  iDigi group mask
+
+SEE ALSO:	idigi_init
+
+END DESCRIPTION **********************************************************/
+
+_idigi_debug
+unsigned idigi_get_group(void)
+{
+	return IDIGI_GROUP_MASK;
+}
+
+
+

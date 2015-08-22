@@ -1,0 +1,4454 @@
+/* START LIBRARY DESCRIPTION *********************************************
+BL4S1xx.LIB
+
+DESCRIPTION:
+	This library provides an API for the BL4S1xx single board computers
+   family which use the Rabbit I/O chip (RIO).  One Rabbit I/O chip
+   is used to drive the SBC's digital I/O structure. This adds significant
+   run time configurability to these single board computers.
+
+   This library offers functions to simplify the use of the on-board ADC,
+   RS232 port, and Rabbitnet port.  There are functions for the setup
+   and use of the digital I/O.
+
+CONFIGURATION MACROS:
+	The following macros may be defined (before #use of BL4S1xx.lib):
+
+   #define BL_USER_INIT
+      Tells the library that the user code will be supplying the array
+      of initialization codes for the digital outputs initialization.
+      This is a constant character array of size BL_DIGITAL_OUT and
+      must be named bl_init.  This array should also be declared
+      before the #use of the BL4S1xx library.
+      The configuration values are:
+         RSB_LOW for defining an output that starts out low
+         RSB_HI  for defining an output that starts out high
+
+   #define BL_IRQ_PRIORITY
+      Sets the priority of RIO based digital interrupt sources on the
+      Rabbit processor.  This is a value from 1 to 3, with 1 being the
+      lowest priority and 3 being the highest.  Default if not defined
+      is to use priority 1.
+
+   #define BL_POLL_MODE
+   	Defining BL_POLL_MODE disables the use of hardware interrupts and
+      signifies the intention to poll for pending RIO interrupts using
+      the tickISR() function.
+
+   #define BL_NO_RT_ERRORS
+      Defining BL_NO_RT_ERRORS will disable the BL4S1xx function from
+      generating runtime exceptions on detected errors.  Errors will
+      still be checked, but will only be reported through return codes
+      from the functions, leaving runtime error handling to the program
+      which called the function.
+
+   #define BL_LIMIT_ERRORS
+      Defining BL_LIMIT_ERRORS will disable most of the error checking
+      on parameters passed to BL4S1xx functions.  This will improve the
+      speed of the code, but will not catch all errors.  It is not
+      advisable to set this define during program development.
+
+   #define BL_DEBUG
+      Defining BL_DEBUG will enable debugging for BL4S1xx series functions
+
+REVISION HISTORY:
+
+	Rev 1.0	MRS		Initial release.
+
+	Copyright © 2008 Digi International Inc., All Rights Reserved
+
+	This software contains proprietary and confidential information of Digi
+	International Inc.  By accepting transfer of this copy, Recipient agrees
+	to retain this software in confidence, to prevent disclosure to others,
+	and to make no use of this software other than that for which it was
+	delivered.  This is a published copyrighted work of Digi International
+	Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+	prohibited.
+
+	Restricted Rights Legend
+
+	Use, duplication, or disclosure by the Government is subject to
+	restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+	Technical Data and Computer Software clause at DFARS 252.227-7031 or
+	subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+	Restricted Rights at 48 CFR 52.227-19, as applicable.
+
+	Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+
+END DESCRIPTION **********************************************************/
+
+/*** Beginheader */
+#ifndef __BL4S1xx_LIB
+#define __BL4S1xx_LIB
+
+#if (!BL4S100_SERIES)
+	#error "BL4S1xx.LIB only supports BL4S1xx series boards."
+#endif
+
+// define BL_DEBUG to enable debugging for BL4S1xx series functions
+//#define BL_DEBUG
+
+#ifdef BL_DEBUG
+	#define _bl_nodebug __debug
+#else
+	#define _bl_nodebug __nodebug
+#endif
+
+#use "idblock_api.lib"
+
+// define BL_LIMIT_ERRORS to disable some of the error checking
+//#define BL_LIMIT_ERRORS
+
+// define BL_NO_RT_ERRORS to disable runtime error checking
+//#define BL_NO_RT_ERRORS
+
+#ifdef BL_NO_RT_ERRORS
+  #define BL_ERROR(Z) return Z
+#else
+  #define BL_ERROR(Z) {exception(Z); return Z;}
+#endif
+
+///////////////////////
+// ADC configuration //
+///////////////////////
+
+#define ADCSXSR 			SCSR // Serial port status register
+#define ADCSXCR 			SCCR // Serial port control register
+#define ADCSXCRSHADOW 	SCCRShadow
+#define ADCSXER 			SCER // Serial port extended register
+#define ADCSXERSHADOW 	SCERShadow
+#define ADCSXDR 			SCDR // Serial port data register
+#define ADCSXDLR 			SCDLR // Serial port divider low register
+#define ADCSXDHR 			SCDHR // Serial port divider high register
+
+// use BUFEN as ADC Chip Select pin
+#define ADCCS_LOW    ioi ld a,(GOCR) $ set 1, a $ res 0, a $ ioi ld (GOCR), a
+#define ADCCS_HIGH   ioi ld a,(GOCR) $ or 0x03 $ ioi ld (GOCR), a
+
+// ADC busy macros
+#define ADC_BUSY _riosbc_get_pin(&(rsb_pin[20]))
+#define ADCBUSYADDR 10 // (RIO block #) * 2
+#define ADCBUSYBIT 5   // bit 1 + 4 to make upper nibble
+
+// SPI Clock Rate ~5.0Mbits/sec
+#define SPI_CLK 5000000.0
+
+// ADC Read/Write operation
+#define RD_REG       0x40
+#define WR_REG       0x00
+
+// ADC Word length
+#define BITS16       0x20
+#define BITS8        0x00
+
+// ADC Mode
+#define DIRECTMODE   0x80
+#define REGISTERMODE 0x00
+
+// ADC control bytes for mode of operation
+#define SINGLE_ENDED 0x08
+#define DIFFERENTIAL 0x00
+
+// Gain #defines
+#define GAIN_X1      0        // gaincode for gain=1
+#define GAIN_X2      1        // gaincode for gain=2
+#define GAIN_X4      2        // gaincode for gain=4
+#define GAIN_X5      3        // gaincode for gain=5
+#define GAIN_X8      4        // gaincode for gain=8
+#define GAIN_X10     5        // gaincode for gain=10
+#define GAIN_X16     6        // gaincode for gain=16
+#define GAIN_X20     7        // gaincode for gain=20
+
+// set gain for milliamp mode
+#ifndef mAMP_GAINCODE
+	#define mAMP_GAINCODE	GAIN_X8
+#endif
+
+// size of calibration data
+#define  CAL_ANALOG_SIZE  sizeof(calib_t)
+#define  MAX_GAINS        8
+
+#define	CAL_ADC_SE0		(4096*GetIDBlockSize()-ZWORLD_RESERVED_SIZE)
+// Note: CAL_ADC_SE1 is not supported for BL4S1xx Series
+#define  CAL_ADC_DIFF  	(CAL_ADC_SE0 + (CAL_ANALOG_SIZE * BL_ANALOG_IN * \
+								BL_MAX_GAINS))
+#define  CAL_ADC_MA   	(CAL_ADC_DIFF + (CAL_ANALOG_SIZE * \
+								(BL_ANALOG_IN / 2) * BL_MAX_GAINS))
+
+// ADC instruction byte OR macros
+#define ADLSBYTE      0x00		// LS byte register
+#define ADMSBYTE      0x01		// MS byte register
+#define ADPGAREG      0x02		// PGA valid register
+#define ADCNTLREG     0x03		// AD control register
+#define ADGAINMUXREG  0x04		// Gain Mux register
+#define ADDIOSTATEREG 0x05		// Digital I/O state register
+#define ADDIOCNTLREG  0x06		// Digital I/O control register
+#define ADREFOSCREG   0x07		// Ref Osc register
+#define ADFREQREG     0x08		// Frequency register
+#define ADCALREG      0x09		// Calibrate ADC register
+#define ADSICREG      0x18		// Serial interface control register
+#define ADIDREG       0x1F		// Id register
+
+// ADS7870 readback modes to be used with ADCNTLREG
+#define ADMODE0	0x00			// mode 0 read instruction req'd or bit
+#define ADMODE1	0x04			// mode 1 MS byte first instruction or bit
+#define ADMODE2	0x08			// mode 2 LS byte first instruction or bit
+#define ADMODE3	0x0C			// mode 3 MS byte only instruction or bit
+
+// ADC modes for user selection
+#define SE0_MODE		0x00     //  Single-Ended unipolar (0 - 20V Max.)
+#define SE1_MODE		0x10		//  Note: not supported in BL4S1xx Series
+#define DIFF_MODE    0x20     //  Differential bipolar  (±20V Max.)
+#define mAMP_MODE    0x30     //  4-20ma operation
+
+// Masks for the Gain and Mode for ADC
+#define BL_GAIN_MASK 0x0F
+#define BL_MODE_MASK 0xF0
+
+// ADC ranges
+#define MAXDACCOUNT	((1 << (ADC_RESOLUTION - 1)) - 1)
+#define MINDACCOUNT	0
+
+// ADC Error Codes and ranges
+#define BL_ERRCODESTART (-4096)
+#define BL_EINVAL     	(BL_ERRCODESTART - 1)
+#define BL_TIMEOUT    	(BL_ERRCODESTART - 2)
+#define BL_OVERFLOW   	(BL_ERRCODESTART - 3)
+#define BL_WRONG_MODE 	(BL_ERRCODESTART - 4)
+#define BL_BADPARAM   	(BL_ERRCODESTART - 5)
+#define BL_NOT_CAL    	(BL_ERRCODESTART - 6)
+#define BL_SPIBUSY    	(BL_ERRCODESTART - 7)
+
+////////////////////////////////////////
+// SERIAL and RabbitNet Configuration //
+////////////////////////////////////////
+
+// Defaults for RS232 handshaking RTS/CTS
+#define SERD_RTS_SHADOW PEDRShadow
+#define SERD_RTS_PORT 	PEDR  //RTS I/O control port E
+#define SERD_RTS_BIT 	2		//RTS of serial port D, on PE2
+#define SERD_CTS_PORT 	PEDR  //CTS I/O control port E
+#define SERD_CTS_BIT 	3		//CTS of serial port D, on PE3
+
+// include the RabbitNet library for RabbitNet enabled boards
+#ifdef BL4S1XX_RNET
+	#use "RN_CFG_BL4S1xx.LIB"
+#endif
+
+///////////////////////
+// RIO configuration //
+///////////////////////
+
+#define BL_IOBASE 0x0000        // Base address for external I/O addresses
+
+#define PORTA_AUX_IO          // Required for RIO SBC Library
+#define RSB_MAX_RIOS 	 1    // Number of RIO's on the SBC
+#define RSB_MAX_PINS 	 26   // Number of I/O pins on the SBC
+#define RSB_DIGITAL_IN 	 12   // Number of pins w/ digital input ability
+#define RSB_DIGITAL_OUT  8    // Number of pins w/ digital output drive only
+#define RSB_ANALOG_IN 	 8    // Number of pins w/ analog input ability
+#define RSB_ANALOG_4TO20 4		// Number of above pins w/ 4-20 mA loop ability
+#define RSB_ANALOG_OUT 	 0 	// Number of pins w/ analog output drivers
+#define RSB_AUX_BASE 	 BL_IOBASE  // Base address of Aux I/O Bus
+#define RSB_GB_PORT 		 0		// G//B output on Aux Address lines
+#define RSB_IOBCV 		 0x48 // Bank control setup value for RIO I/O Bank
+#ifdef  BL_POLL_MODE
+	#define RSB_POLL_MODE
+#else
+	#define RSB_EXT_INT1       // Set RIO Library to use External Int 1
+#endif
+#ifndef BL_IRQ_PRIORITY
+  #define BL_IRQ_PRIORITY 1   // Set IRQ priority to 1
+#endif
+
+#define RIO_CLOCK_FREQ 		20000000L 	// frequency of the RIO clock
+#define RIO_PRESCALE_FREQ	100000L 	 	// frequency of RIO after prescalar
+#define BL_PWM_MAX_FREQ		50000.0		// Maximum frequency for Pulse Modulation
+#define BL_PWM_MIN_FREQ		2.0      	// Minimum frequency for Pulse Modulation
+
+#define BL_BIND_LEAD     0x40     // bind to leading edge of pin output ORed in
+#define BL_BIND_TRAIL    0x20     // bind to trailing edge of pin output
+#define BL_BIND_PIN_MASK 0x1F     // mask for pin number portion of binding
+
+#define BL_SAME_CHANNEL 0x40     // Sets same channel for begin/end capture
+
+#define BL_DIGITAL_IN   RSB_DIGITAL_IN
+#define BL_DIGITAL_OUT  RSB_DIGITAL_OUT
+#define BL_ANALOG_IN    RSB_ANALOG_IN
+#define BL_ANALOG_4TO20 RSB_ANALOG_4TO20
+#define BL_ANALOG_OUT   RSB_ANALOG_OUT
+#define BL_MAX_DAC      0                // Maximum overall DAC channels
+#define BL_MAX_GAINS    8                // Maximun number of ADC Gain codes
+
+#use "RIO_SBC.lib"
+
+// Map of RIO Index, channel, and port to RSB_IOdef/RSB_IOpin index
+extern const __far char rsb_map[RSB_MAX_RIOS][RSB_MAX_BLOCKS][RSB_BLOCK_PINS];
+
+// select digital input and digital output pin
+#define DI_PIN(X) (&(rsb_pin[(X)]))
+#define DO_PIN(X) (&(rsb_pin[(X)+BL_DIGITAL_IN]))
+
+// set global sync pin
+#define SET_GS(X) BitWrPortI(PDDR,&PDDRShadow,X,4)
+
+/*** EndHeader */
+
+//------------------------------------------------------------------------
+//		ADC Gain Table
+//------------------------------------------------------------------------
+/* START FUNCTION DESCRIPTION ********************************************
+ADC_GAINS																	<BL4S1xx.LIB>
+
+Description:
+	The BL4S1xx series SBCs have an ADS7870 ADC onboard that has an integrated
+   programable gain amplifier.  The table below specifices the different
+   voltage ranges for Single Ended Unipolar, Differential, and 4-20mA modes
+   using the different gains.
+
+                                    Value Range
+                              Single Ended   Differential
+   Gain Code   Macro          Unipolar       Bipolar       Voltage Range
+   ---------   -----          ------------   ------------  --------------
+        0      GAIN_X1        0-20 V         ± 20 V         0-20 V
+        1      GAIN_X2        0-10 V         ± 10 V         0-10 V
+        2      GAIN_X4        0-5 V          ± 5 V          0-5 V
+        3      GAIN_X5        0-4 V          ± 4 V          0-4 V
+        4      GAIN_X8*       0-2.5 V        ± 2.5 V        0-2.5 V
+        5      GAIN_X10       0-2 V          ± 2 V          0-2 V
+        6      GAIN_X16       0-1.25 V       ± 1.25 V       0-1.25 V
+        7      GAIN_X20       0-1 V          ± 1 V          0-1 V
+
+	   * mAMP_GAINCODE is the only gain code for 4-20mA operation.
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader _gainTable */
+
+// Array of different gains
+const int _gainTable[BL_MAX_GAINS] = {1, 2, 4, 5, 8, 10, 16, 20};
+/*** EndHeader */
+
+//------------------------------------------------------------------------
+//		API global variable section
+//------------------------------------------------------------------------
+/*** Beginheader __brdInitFlag, __numcycles_1us, __tdivisor */
+
+// Variables for API function usage
+extern int __brdInitFlag;
+extern int __numcycles_1us;
+extern long __tdivisor;
+
+// ADC calibration data structure
+typedef struct
+{
+	float gain;
+	int offset;
+} calib_t;
+
+extern char ADC_Command[BL_ANALOG_IN];
+extern calib_t ADC_Cal_Table[BL_ANALOG_IN];
+
+// Board I/O Definition structure
+// RIO,C1,B1,C2,B2, TYPE, POLARITY, SHADOW PTR.
+const struct RSB_IOdef bl_def[RSB_MAX_PINS] = {
+ { 0, 0, 0, 0, 0, RSB_TYPE_DIGIN ,   0, NULL }, // Config. DI  0
+ { 0, 0, 1, 0, 0, RSB_TYPE_DIGIN ,   0, NULL }, // Config. DI  1
+ { 0, 0, 2, 0, 0, RSB_TYPE_DIGIN ,   0, NULL }, // Config. DI  2
+ { 0, 1, 0, 0, 0, RSB_TYPE_DIGIN ,   0, NULL }, // Config. DI  3
+ { 0, 1, 1, 0, 0, RSB_TYPE_DIGIN ,   0, NULL }, // Config. DI  4
+ { 0, 1, 2, 0, 0, RSB_TYPE_DIGIN ,   0, NULL }, // Config. DI  5
+ { 0, 2, 0, 0, 0, RSB_TYPE_DIGIN ,   0, NULL }, // Config. DI  6
+ { 0, 2, 1, 0, 0, RSB_TYPE_DIGIN ,   0, NULL }, // Config. DI  7
+ { 0, 3, 0, 0, 0, RSB_TYPE_DIGIN ,   0, NULL }, // Config. DI  8
+ { 0, 3, 1, 0, 0, RSB_TYPE_DIGIN ,   0, NULL }, // Config. DI  9
+ { 0, 6, 0, 0, 0, RSB_TYPE_DIGIN ,   0, NULL }, // Config. DI  10
+ { 0, 7, 0, 0, 0, RSB_TYPE_DIGIN ,   0, NULL }, // Config. DI  11
+ { 0, 0, 0, 2, 2, RSB_TYPE_DIGOUT,   1, NULL }, // Config. SNKO0
+ { 0, 0, 0, 2, 3, RSB_TYPE_DIGOUT,   1, NULL }, // Config. SNKO1
+ { 0, 0, 0, 3, 2, RSB_TYPE_DIGOUT,   1, NULL }, // Config. SNKO2
+ { 0, 0, 0, 3, 3, RSB_TYPE_DIGOUT,   1, NULL }, // Config. SNKO3
+ { 0, 0, 0, 4, 2, RSB_TYPE_DIGOUT,   1, NULL }, // Config. SNKO4
+ { 0, 0, 0, 4, 3, RSB_TYPE_DIGOUT,   1, NULL }, // Config. SNKO5
+ { 0, 0, 0, 5, 2, RSB_TYPE_DIGOUT,   1, NULL }, // Config. SNKO6
+ { 0, 0, 0, 5, 3, RSB_TYPE_DIGOUT,   1, NULL }, // Config. SNKO7
+ { 0, 5, 1, 0, 0, RSB_TYPE_DIGIN ,   0, NULL }, // Config. ADC_BUSY
+ { 0, 0, 0, 4, 1, RSB_TYPE_DIGOUT,   0, NULL }, // Config. RNET_EN
+ { 0, 0, 0, 5, 0, RSB_TYPE_DIGOUT,   0, NULL }, // Config. Not Connected
+ { 0, 0, 0, 0, 3, RSB_TYPE_DIGOUT,   0, NULL }, // Config. RAD_BOOT_MODE
+ { 0, 1, 3, 1, 3, RSB_TYPE_DIGINOUT, 0, NULL }, // Config. ADC_PROG_CLK
+ { 0, 4, 0, 4, 0, RSB_TYPE_DIGINOUT, 0, NULL }, // Config. ADC_PROG_DATA
+};
+
+// internal RIO pin indices
+#define BL_ADC_BUSY_INDEX			20
+#define BL_RNET_EN_INDEX			21
+#define BL_RAD_BOOT_MODE_INDEX	23
+#define BL_ADC_PROG_CLK_INDEX		24
+#define BL_ADC_PROG_DATA_INDEX	25
+
+#ifndef BL_USER_INIT
+const char bl_init[BL_DIGITAL_OUT] =
+{
+	RSB_HI,   // Config. SNKO0
+	RSB_HI,   // Config. SNKO1
+	RSB_HI,   // Config. SNKO2
+	RSB_HI,   // Config. SNKO3
+	RSB_HI,   // Config. SNKO4
+	RSB_HI,   // Config. SNKO5
+	RSB_HI,   // Config. SNKO6
+	RSB_HI,   // Config. SNKO7
+};
+#endif
+
+const char bl_internal_init[RSB_MAX_PINS - (BL_DIGITAL_IN + BL_DIGITAL_OUT)] =
+{
+	RSB_INP,  // Config. ADC_BUSY
+	RSB_LOW,  // Config. RNET_EN
+	RSB_LOW,  // Config. LED
+	RSB_HI,   // Config. RAD_BOOT_MODE
+	RSB_INP,  // Config. ADC_PROG_CLK
+	RSB_INP   // Config. ADC_PROG_DATA
+};
+
+// Map of RIO Index, Block and Channel to position in rsb_IOpin & blm_def
+const __far char rsb_map[RSB_MAX_RIOS][RSB_MAX_BLOCKS][RSB_BLOCK_PINS] =
+{
+  // RIO 0
+  {  0,  1,  2, 23,	 3,  4,  5, 24,	 6,  7, 12, 13,    8,  9, 14, 15,
+    25, 21, 16, 17,  22, 20, 18, 19,   10, 10, 10, 10,   11, 11, 11, 11 }
+};
+
+// Defines for counter function
+#define BL_UP_COUNT     RSB_UP_COUNT     // Continuous up count mode
+#define BL_DOWN_COUNT   RSB_DOWN_COUNT   // Up/down counter mode
+#define BL_MATCH_ENABLE RSB_MATCH_ENABLE // Stop on any match mode
+#define BL_EDGE_RISE    RSB_POL_RISING   // Up count/sync on rising edge
+#define BL_EDGE_FALL    RSB_POL_FALLING  // Up count/sync on falling edge
+#define BL_EDGE_BOTH    RSB_POL_EITHER   // Up count/sync on either edge
+
+// Defines for capture functions (some edge/event defines used by counter also)
+#define BL_CNT_RUN       RSB_CNT_RUN        // Continuous count mode
+#define BL_CNT_BEGIN_END RSB_CNT_BEGIN_END  // Start on begin, count until end
+#define BL_CNT_TIL_END   RSB_CNT_TIL_END    // Count until end event detected
+#define BL_CNT_ON_BEGIN  RSB_CNT_ON_BEGIN   // Count while BEGIN signal active
+
+#define BL_EVENT_RISE RSB_EDGE_RISE      // Begin/End/Down event on rising edge
+#define BL_EVENT_FALL RSB_EDGE_FALL      // Begin/End/Down event on falling edge
+#define BL_EVENT_BOTH RSB_EDGE_BOTH      // Begin/End/Down event on either edge
+#define BL_BEGIN_HIGH RSB_BEGIN_HIGH     // Begin active while signal is high
+#define BL_BEGIN_LOW  RSB_BEGIN_LOW      // Begin active while signal is low
+
+#define BL_PRESCALE   RSB_PRESCALE      // Use prescaled clock
+#define BL_SAVE_LIMIT RSB_SAVE_LIMIT    // Save current limit register value
+
+// Defines for external interrupt function
+#define BL_IRQ_RISE RSB_FUNC_RISING   // Interrupt event on rising edge
+#define BL_IRQ_FALL RSB_FUNC_FALLING  // Interrupt event on falling edge
+#define BL_IRQ_BOTH RSB_FUNC_EITHER   // Interrupt events on both edges
+
+// Interrupt enable flags
+#define BL_IER_DQE     RSB_IER_DQE		  // Decrement/Quadrature/End
+#define BL_IER_IIB     RSB_IER_IIB		  // Increment/Inphase/Begin
+#define BL_IER_ROLL_D  RSB_IER_ROLL_D	  // Counter rollover on decrement
+#define BL_IER_ROLL_I  RSB_IER_ROLL_I	  // Counter rollover on increment
+#define BL_IER_MATCH3  RSB_IER_MATCH3	  // Match 3 condition
+#define BL_IER_MATCH2  RSB_IER_MATCH2	  // Match 2 condition
+#define BL_IER_MATCH1  RSB_IER_MATCH1	  // Match 1 condition
+#define BL_IER_MATCH0  RSB_IER_MATCH0	  // Match 0 condition
+
+// Defines for getMatch function
+#define BL_TRAIL_ONLY  1   // Primary match register, used by PxM's and counter
+#define BL_LEAD_ONLY   2   // Secondary match register, used by PPM only
+
+// Assembly macro which delays 'Z' cycles of the RIO prescaled clock
+#define BL_RIO_DELAY(Z) \
+	   ld    bc,_cexpr((Z * 1000000 / (7 * RIO_PRESCALE_FREQ)) + 1) $ \
+	   ld    de,(__numcycles_1us) $ \
+	   mul $ dwjnz @PC
+
+/*** Endheader */
+
+// Function execution flags
+int __brdInitFlag;
+int __numcycles_1us;
+long __tdivisor;					//ADC divisor
+
+// Storage for Calibration Values
+char ADC_Command[BL_ANALOG_IN];
+calib_t ADC_Cal_Table[BL_ANALOG_IN];
+
+/**************************************************************************
+ Internal function for condensing all of the global inits in one location
+ in a function that will always be compiled into the program.
+**************************************************************************/
+_bl_nodebug
+void _bl_global_init(void)
+{
+	#GLOBAL_INIT {
+	   // flag to indicate brdInit being called
+	   __brdInitFlag = FALSE;
+
+	   // Number of CPU cycles required to obtain a period of 1 usec
+	   __numcycles_1us = (int)(19200L*32*freq_divider/1000000L)+1;
+
+      // initialize ADC configuration
+      memset(ADC_Command, 0xFF, BL_ANALOG_IN);
+	}
+}
+
+////////////////////////////
+// Analog Input Functions //
+////////////////////////////
+
+#asm __root __nodebug
+;;;entry data byte must be in l
+_txadcbyte::
+	ld		a,l
+   ioi	ld (ADCSXDR),a		;load instruction byte first into transmit data reg
+	ld		a,0x8C				;use pport C, transmit only
+	ioi	ld (ADCSXCR),a		;transmit byte
+.txshiftdone:					;wait for empty shift reg
+	ioi	ld	a,(ADCSXSR)
+	bit	2,a
+	jp		nz,.txshiftdone
+	ret
+#endasm
+
+
+#asm __root __nodebug
+;;;exit data byte will be in l
+_rxadcbyte::
+	ld		a,0x00
+	ioi	ld (ADCSXDR),a		;load 0x00 byte first into transmit data reg
+	ld		a,0xCC				;receive byte, using pport C, by transmitting 0
+	ioi	ld (ADCSXCR),a
+.rxdatafull:
+	ioi	ld	a,(ADCSXSR)
+	bit	7,a
+	jr		z,.rxdatafull
+.rxdata:
+	ioi	ld a,(ADCSXDR)		;get byte from receive data reg
+	ld		l,a
+	ret
+#endasm
+
+/*** BeginHeader  _ads7870command */
+int _ads7870command(unsigned int cmd, unsigned int wrdata);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_ads7870command															<BL4S1xx.LIB>
+
+SYNTAX:			int _ads7870command(unsigned int cmd, unsigned int wrdata)
+
+DESCRIPTION: 	This driver is for the ADS7870 and is designed to serially
+					clock an instruction byte and serially read from or write
+               the command to the designated register of the ADS7870.
+
+               Refer to an ADS7870 specification for addressing registers.
+
+PARAMETER1:  	The instruction byte will initiate a read/write operation
+					at eight or sixteen bits on the designated register address.
+
+PARAMETER2:		Command data configures the registers addressed by the
+					instruction byte. Enter 0 if performing a read operation.
+
+RETURN VALUE:	- Write Operation returns a zero value.
+					- Read operation returns the data read from the ADC chip.
+
+SEE ALSO:		anaInConfig, _txadcbyte, _rxadcbyte
+
+END DESCRIPTION **********************************************************/
+
+_bl_nodebug
+int _ads7870command(unsigned int cmd, unsigned int wrdata)
+{
+#asm __nodebug
+	ld		hl,(sp+@sp+cmd)
+	ld		iy,.write8			;assume mainly 8-bit write operations
+	bit	6,l					;check for write or read operation
+	jr		z,.start				;
+	ld		iy,.read8
+	bit	5,l					;check for 16-bit or 8-bit read
+	jr		z,.start
+	ld		iy,.read16
+
+.start:
+	ADCCS_LOW					;enable ADC CS
+
+	call	_txadcbyte			;send instruction byte to ads7870
+   jp		(iy)
+
+.read8:
+	call	_rxadcbyte			;received clocked data
+	ld		h,0					;return value in hl
+	jr		.done
+.read16:
+	call	_rxadcbyte			;received clocked data
+	ld		h,l					;return value in hl
+	jr		.done
+
+.write8:
+	ld		hl,(sp+@sp+wrdata)
+	call	_txadcbyte			;send command byte as designated by instruction byte
+	clr	hl						;return 0
+
+.done:
+	ADCCS_HIGH					;disable ADC CS
+
+#endasm
+}
+
+/*** BeginHeader anaInDriver */
+int anaInDriver(unsigned int cmd);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+anaInDriver																	<BL4S1xx.LIB>
+
+SYNTAX:			int anaInDriver(unsigned int cmd)
+
+DESCRIPTION:	Reads the voltage of an analog input channel by serial
+					clocking an 8-bit command to the ADS7870 device by
+               its Direct Mode method.  anaInConfig() use Register
+               Mode method.  This function assumes that Mode2 (least significant
+               byte first) and the A/D device oscillator have been enabled.
+               See anaInConfig() for setup.
+
+					After the last data bit is transfered, the conversion
+					begins immediately.
+
+					An exception error will occur if Direct Mode bit D7 is
+					not set.
+
+					This function is non-reentrant.
+
+PARAMETER1:		The cmd parameter contains a gain code and a channel code
+					as follows:
+
+					D7		D6 - D4		D3 - D0
+					--		---------	------------
+					1	   gain_code	channel_code
+
+	Use the following calculation and tables below to determine cmd:
+
+					cmd = 0x80 | (gain_code*16) + channel_code
+
+	Please see the function help (Ctrl-H) on ADC_GAINS for gain table.
+
+	            ===========================================
+	            channel_code   Differential input lines
+	            ------------   ----------------------------
+	                0          +AIN0    -AIN1
+	                1          +AIN2    -AIN3
+	                2          +AIN4    -AIN5
+	                3          +AIN6    -AIN7
+	                4          -AIN0    +AIN1
+	                5          -AIN2    +AIN3
+	                6          -AIN4    +AIN5
+	                7          -AIN6    +AIN7
+
+	                           Single-ended      milliamp
+	                           input lines       input lines
+	                           -------------------------------
+	                8          +AIN0             +AIN0
+	                9          +AIN1             +AIN1
+	               10          +AIN2             +AIN2
+	               11          +AIN3             +AIN3
+	               12          +AIN4
+	               13          +AIN5
+	               14          +AIN6
+	               15          +AIN7
+	            ==============================================
+
+RETURN VALUE:  A value corresponding to the voltage on the analog input
+               channel, which will be in the range of -2048 to 2047 if
+               a valid reading was taken.  Otherwise, it will be set to
+               an error code of BL_ERRCODESTART or less as follows:
+
+	             BL_TIMEOUT conversion incomplete, busy bit timeout
+	             BL_OVERFLOW overflow or out of range
+
+               System errors:  (can create run-time error unless disabled)
+                 -ERR_ANA_INVAL Invalid parameter value
+
+SEE ALSO:		anaInConfig, anaIn, brdInit
+
+END DESCRIPTION **********************************************************/
+#ifndef ADC_ONBOARD
+	#fatal "The target does not have an ADC onboard."
+#endif
+
+_bl_nodebug
+int anaInDriver(unsigned int cmd)
+{
+   auto int rawdata;
+
+#ifndef BL_LIMIT_ERRORS
+	//this is a direct mode only, but we only care if we aren't converting
+	if (!__brdInitFlag || !(cmd&0x80))
+   {
+		BL_ERROR(-ERR_ANA_INVAL);
+	}
+#endif
+
+// start driver code
+#asm __nodebug
+.start:
+	ADCCS_LOW							;enable ADC CS
+
+	ld		hl,(sp+@sp+cmd)
+	call	_txadcbyte					; send instruction in hl to convert channel
+
+#ifndef ADC_X1CYC_DELAY
+// If ADC_X1CYC_DELAY is defined, then the data read from the ADC
+// will be data converted from the previous ADC cycle, otherwise
+// it will be data converted during this cycle.
+
+   ; Wait for busy to go high
+   ; >2usec delay  = (__numcycles_1us/2) * code cycles
+   ld    a,(__numcycles_1us)
+   ld    b,a
+   srl   b
+.busydelay:
+   djnz  .busydelay     ; Code = 5 cycles
+
+.waitnext:
+	ld		bc,1		// ~29us timeout for ADS7870 (should only take 20us)
+   // __numcycles_1us = number clocks needed for 1 usec
+	ld		de,(__numcycles_1us)
+   // total min time spent checking:
+   // total_clocks = BC * ____numcycles_1us * 29
+   mul
+.waitend:
+	ld		a, RSB_PORT3 				  ; 4
+	ioe	ld (ADCBUSYADDR), a       ; 11
+   ioe	ld a, (ADCBUSYADDR + 1)   ; 11
+   bit 	ADCBUSYBIT,a  				  ; 4
+	jr		z,.read16					  ; 7 look for conversion end logic low
+	dwjnz	.waitend              	  ; 7 cycles
+   ld		hl,_cexpr(BL_TIMEOUT)	  ; over-time
+   jr		.done
+#endif
+
+.read16:
+   call	_rxadcbyte					; read first byte in hl, assumes mode2 (LS byte
+											; first) and LS bit for SPI
+	ld		e,l							; save upper byte
+	call	_rxadcbyte					; read LS byte
+	ld		h,e							; restore upper byte
+
+.checkovr:								; check for valid or analog over-range
+   sra	h 								; shift right, preserve sign, c = bit 0
+   rr		l								; shift value right one bit
+   										; c goes to bit 7, bit 0 goes to c
+   jr		c,.overrange            ; check if c (was bit zero) shows error
+
+; convert to 12-bit data (bit shift to the right), one shift done above.
+; this will preserve the sign.
+	sra	h
+   rr		l
+	sra	h
+   rr		l
+	sra	h
+   rr		l
+
+   jr		.done
+.overrange:
+	ld		hl,_cexpr(BL_OVERFLOW); over-range
+	jr		.done
+.done:
+	ADCCS_HIGH							; disable ADC CS
+	ld 	(sp+@sp+rawdata), hl
+#endasm
+
+	return rawdata;
+}
+
+/*** BeginHeader anaInConfig */
+int anaInConfig(int channel, int opmode);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+anaInConfig			  														<BL4S1xx.LIB>
+
+SYNTAX: 			int anaInConfig(int channel, int opmode)
+
+DESCRIPTION:  	Configures an ADC input channel for a given mode of
+					operation. This function must be called before accessing
+               the ADC chip. This function is non-reentrant.
+
+               Channels pairs for differential mode are:
+               -----------------
+               Channels 0 & 1
+               Channels 2 & 3
+               Channels 4 & 5
+               Channels 6 & 7
+
+               The modes of operation are as follows:
+               --------------------------------------
+					- Single-Ended unipolar 0 - 20V
+					- Differential bipolar ±20V
+					- 4-20ma operation
+
+               Note:  When a pin in a differential pair is changed to a non-
+               differential pin, the paired pin is also configured to the
+               opmode passed in.
+
+PARAMETER1:		Channel number 0 - 7
+
+PARAMETER2:   	Select the mode of operation for the ADC channel pair.
+               Values are as follows:
+
+            	SE0_MODE   = Single-Ended unipolar 0 - 20V
+		   		*SE1_MODE  = Not Support on BL4S1xx Series
+		   		DIFF_MODE  = Differential bipolar ±20V
+					mAMP_MODE  = 4-20ma operation
+
+RETURN VALUE:	0 on success
+					-EINVAL: invalid parameter
+
+SEE ALSO:     	brdInit, anaInCalib, anaIn, anaInVolts, anaInmAmps,
+					anaInDiff
+
+END DESCRIPTION **********************************************************/
+
+_bl_nodebug
+int anaInConfig(int channel, int opmode)
+{
+	auto char ch_pair;
+
+#ifndef BL_LIMIT_ERRORS
+   if (!__brdInitFlag || channel < 0 || channel >= BL_ANALOG_IN
+   	 || (opmode != SE0_MODE && opmode != DIFF_MODE && opmode != mAMP_MODE)
+       || (opmode == mAMP_MODE && channel >= BL_ANALOG_4TO20))
+   {
+      // The brdInit function hasn't been executed, channel/opmode is invalid
+      BL_ERROR(-EINVAL);
+   }
+#endif
+
+	// calculate the channel pair for this channel
+   ch_pair = channel ^ 0x01;
+
+   // configure current channel
+   ADC_Command[channel] = ~BL_MODE_MASK | opmode;
+
+	// configure the DIFF_MODE channel pair to DIFF_MODE as well
+   if (opmode == DIFF_MODE)
+   {
+	  	ADC_Command[ch_pair] = (char) (~BL_MODE_MASK | DIFF_MODE);
+   } else if ((ADC_Command[ch_pair] & BL_MODE_MASK) == DIFF_MODE)
+   {
+   	// configure previous DIFF_MODE pair the same as the current channel
+   	ADC_Command[ch_pair] = ~BL_MODE_MASK | opmode;
+   }
+
+	return 0;
+}
+
+/*** BeginHeader anaInCalib */
+int anaInCalib(int channel, int opmode, int gaincode,
+               int value1, float volts1,
+               int value2, float volts2);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+anaInCalib																	<BL4S1xx.LIB>
+
+SYNTAX:			int anaInCalib(int channel, int opmode, int gaincode,
+                              int value1, float volts1,
+                              int value2, float volts2)
+
+DESCRIPTION:   Calibrates the response of a given ADC channel as a linear
+					function by using two conversion points provided by the
+               user. Gain and offset constants are calculated and placed
+               into flash. This function is non-reentrant.
+
+               Note: Recommend using the 10 & 90% points of the MAX
+               voltage range when calibrating a channel.
+
+
+PARAMETER1:		ADC channel number 0 to 7, AIN0-AIN7.
+
+               CH  	Single-Ended 	  Differential       4-20ma
+		    		--		------------   ----------------   	-------
+		 			0	  	   AIN0 			+AIN0  and  -AIN1  	 AIN0
+					1        AIN1                              AIN1
+		 			2	  	   AIN2 			+AIN2  and  -AIN3     AIN2
+		 			3	  	   AIN3                              AIN3
+		 			4	  	   AIN4 			+AIN4  and  -AIN5
+		 			5	  	   AIN5
+					6	  	   AIN6 			+AIN6  and  -AIN7
+		 			7	  	   AIN7
+
+PARAMETER2:   	Select the mode of operation for the ADC channel
+               calibration data being read. Values are as follows:
+
+            	SE0_MODE  = Single-Ended unipolar 0 - 20V
+		   		*SE1_MODE = Not Supported for BL4S1xx Series
+		   		DIFF_MODE = Differential bipolar ±20V
+					mAMP_MODE = 4-20ma operation
+
+PARAMETER3:		Gaincode of 0 to 7. 	Please see the function help (Ctrl-H)
+					on ADC_GAINS for gain table.
+
+PARAMETER4:		The first ADC value.
+
+PARAMETER5:		The voltage corresponding to the first ADC value.
+
+PARAMETER6:		The second ADC value.
+
+PARAMETER7:		The voltage corresponding to the second ADC value.
+
+RETURN VALUE:	0, if sucessful.
+               -EINVAL = invalid parameter
+               -ERR_ANA_CALIB = error writing calbration constants
+
+SEE ALSO: 		brdInit, anaInConfig, anaIn, anaInmAmps, anaInDiff,
+               anaInVolts
+
+END DESCRIPTION **********************************************************/
+
+_bl_nodebug
+int anaInCalib(int channel, int opmode, int gaincode,
+               int value1, float volts1,
+               int value2, float volts2)
+{
+	auto float gain;
+   auto int offset;
+   auto calib_t cal_data;
+   auto int flash_err;
+
+#ifndef BL_LIMIT_ERRORS
+   if (!__brdInitFlag || channel < 0 || channel >= BL_ANALOG_IN
+   	 || (opmode != SE0_MODE && opmode != DIFF_MODE && opmode != mAMP_MODE)
+       || (opmode == mAMP_MODE && (channel >= BL_ANALOG_4TO20
+       									  || gaincode != mAMP_GAINCODE))
+       || (volts1 == volts2) || (value1 == value2))
+   {
+      // The brdInit function hasn't been executed, channel/opmode is invalid
+      // no difference in voltages
+      BL_ERROR(-EINVAL);
+   }
+#endif
+
+	if (opmode == DIFF_MODE)
+   {
+   	// clear lowest bit to get lower channel in pair
+   	channel = channel & ~1;
+   }
+
+	offset = (int)((volts2*value1 - volts1*value2)/(volts2-volts1));
+	if (offset == value1)
+	{
+		gain = volts2/(offset-value2);
+	}
+	else
+	{
+		gain = volts1/(offset-value1);
+	}
+
+   cal_data.gain = gain;
+	cal_data.offset = offset;
+
+   flash_err = _anaInEEWr(channel, opmode, gaincode, &cal_data);
+   if (flash_err) { BL_ERROR(-ERR_ANA_CALIB); }  //check for errors
+
+   // reset the gaincode, so that the constants will be reloaded
+   ADC_Command[channel] |= BL_GAIN_MASK;
+  	return 0;
+}
+
+/*** BeginHeader anaIn */
+int anaIn(int channel, int gaincode);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+anaIn																			<BL4S1xx.LIB>
+
+SYNTAX:        int anaIn(int channel, int gaincode)
+
+DESCRIPTION:   Reads the state of an analog input channel.
+					This function is non-reentrant.
+
+PARAMETER1:		ADC channel number 0 to 7, AIN0-AIN7.
+
+               CH  	Single-Ended 	  Differential       4-20ma
+		    		--		------------   ----------------   	-------
+		 			0	  	   AIN0 			+AIN0  and  -AIN1  	 AIN0
+					1        AIN1                              AIN1
+		 			2	  	   AIN2 			+AIN2  and  -AIN3     AIN2
+		 			3	  	   AIN3                              AIN3
+		 			4	  	   AIN4 			+AIN4  and  -AIN5
+		 			5	  	   AIN5
+					6	  	   AIN6 			+AIN6  and  -AIN7
+		 			7	  	   AIN7
+
+
+PARAMETER2:    Gaincode of 0 to 7. 	Please see the function help (Ctrl-H)
+					on ADC_GAINS for gain table.
+
+RETURN VALUE:  A value corresponding to the voltage on the analog input
+               channel, which will be:
+
+               0-2047 for 11 bit A/D conversions,
+
+               or a value of BL_ERRCODESTART or less which indicates
+               an error condition:
+                ADC operation errors: (will not create run-time error)
+	                BL_TIMEOUT conversion incomplete, busy bit timeout
+	                BL_OVERFLOW overflow or out of range
+                   BL_WRONG_MODE  ADC is in wrong mode (run anaInConfig)
+                System errors:  (can create run-time error unless disabled)
+                  -ERR_ANA_CALIB Fault detected in reading calibration factor
+                  -ERR_ANA_INVAL Invalid parameter value
+
+SEE ALSO: 		brdInit, anaInConfig, anaInCalib, anaInmAmps, anaInDiff,
+               anaInVolts
+
+END DESCRIPTION **********************************************************/
+
+_bl_nodebug
+int anaIn(int channel, int gaincode)
+{
+	auto int cmd;
+
+#ifndef BL_LIMIT_ERRORS
+   if (!__brdInitFlag || channel < 0 || channel >= BL_ANALOG_IN
+   	 || gaincode < 0 || gaincode >= BL_MAX_GAINS)
+   {
+      // The brdInit function hasn't been executed or
+      // ADC channel or gaincode out of range
+      BL_ERROR(-ERR_ANA_INVAL);
+   }
+#endif
+
+   if ((ADC_Command[channel] & BL_MODE_MASK) == DIFF_MODE)
+   {
+      channel >>= 1;
+
+      // Return the rawdata value from the given AD channel.
+      cmd = DIRECTMODE + DIFFERENTIAL + (gaincode<<4) + channel;
+   }
+   else  // Opmode MUST be unipolar or 4-20ma.
+   {
+      // Return the rawdata value from the given AD channel.
+      cmd = DIRECTMODE + SINGLE_ENDED + (gaincode<<4) + channel;
+   }
+
+   return anaInDriver(cmd);
+}
+
+/*** BeginHeader anaInVolts */
+float anaInVolts(int channel, int gaincode);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+anaInVolts		 															<BL4S1xx.LIB>
+
+SYNTAX:     	float anaInVolts(int channel, int gaincode)
+
+DESCRIPTION:   Reads the state of a single-ended analog input channel
+					and uses the previously set calibration constants to
+               convert it to volts. Voltage ranges given in the table
+               below are nominal ranges that will be returned.  However,
+               values outside these ranges can often be seen before the
+               return of a BL_OVERFLOW error.  This function is
+               non-reentrant.
+
+               Note:
+               -----
+               If the gaincode for a given channel has changed from the
+               previous cycle then the following code accesses will occur.
+
+               1. The user block will be read to get the calibration
+                  constants for the new gain value.
+
+PARAMETER1:	 	ADC channel of 0 - 7, AIN00 - AIN07.
+
+PARAMETER2:    Gaincode of 0 to 7. 	Please see the function help (Ctrl-H)
+					on ADC_GAINS for gain table.
+
+RETURN VALUE:	A voltage value corresponding to the voltage that's on the
+					analog input channel, or a value of less than BL_ERRCODESTART
+					indicating an error condition:
+                  BL_NOT_CAL     ADC is not calibrated for this channel/gain
+                  BL_OVERFLOW    ADC overflow
+                  BL_TIMEOUT     ADC timeout
+                  BL_WRONG_MODE  ADC is in wrong mode (run anaInConfig)
+                System errors:  (can create run-time error unless disabled)
+                  -ERR_ANA_CALIB Fault detected in reading calibration factor
+                  -ERR_ANA_INVAL Invalid parameter value
+
+SEE ALSO: 		brdInit, anaInConfig, anaIn, anaInmAmps, anaInDiff,
+               anaInCalib
+
+END DESCRIPTION **********************************************************/
+
+_bl_nodebug
+float anaInVolts(int channel, int gaincode)
+{
+	auto int rawdata, flash_err;
+
+#ifndef BL_LIMIT_ERRORS
+   if (!__brdInitFlag || channel < 0 || channel >= BL_ANALOG_IN)
+   {
+      // The brdInit function hasn't been executed or channel out of range
+      BL_ERROR(-ERR_ANA_INVAL);
+   }
+
+   if ((ADC_Command[channel] & BL_MODE_MASK) != SE0_MODE)
+   {
+      // channel isn't configured for ADC Single Ended Mode
+		return BL_WRONG_MODE;
+   }
+#endif
+
+   if ((ADC_Command[channel] & BL_GAIN_MASK) != gaincode)
+   {
+      flash_err = _anaInEERd(channel, SE0_MODE, gaincode,
+      							  &ADC_Cal_Table[channel]);
+
+		// reset shadow of flash constants for mode.
+      ADC_Command[channel] |= BL_GAIN_MASK;
+
+      if (flash_err) { BL_ERROR(-ERR_ANA_CALIB); }  //check for errors
+      if (((long)(ADC_Cal_Table[channel].gain)) == 0x80000000)
+      {
+         // Return channel not calibrated at this gain error code
+         return BL_NOT_CAL;
+      }
+
+	   ADC_Command[channel] &= ~BL_GAIN_MASK;
+	   ADC_Command[channel] |= gaincode;
+   }
+
+	rawdata  = anaIn(channel, gaincode);
+	if (rawdata <= BL_ERRCODESTART)		// check for error condition
+   {
+		return rawdata;           			// if error detected, return error
+   }
+	rawdata  = ADC_Cal_Table[channel].offset - rawdata;
+	return ADC_Cal_Table[channel].gain * rawdata;
+}
+
+/*** BeginHeader anaInDiff */
+float anaInDiff(int channel, int gaincode);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+anaInDiff		  															<BL4S1xx.LIB>
+
+SYNTAX:        float anaInDiff(int channel, int gaincode)
+
+DESCRIPTION:	Reads the state of differential analog input channels and
+					uses the	previously set calibration constants to convert
+               it to volts. Voltage ranges given in the table below are
+               the nominal ranges that will be returned.  However, values
+               outside these ranges can often be seen before the return
+               of a BL_OVERFLOW error.  This function is non-reentrant.
+
+               Note:
+               -----
+               If the gaincode for a given channel has changed from the
+               previous cycle, then the flash will be read to get the
+               calibration constants for the new gain value.
+
+PARAMETER1:		channel 0, 2, 4, or 6 as indicated by the differential
+					positive line input. See below.
+
+					==============================================
+					 Channel		Differential inputs
+					----------	-------------------------------
+						 0			+AIN0 	-AIN1
+						 2			+AIN2 	-AIN3
+						 4			+AIN4 	-AIN5
+						 6			+AIN6 	-AIN7
+					==============================================
+
+PARAMETER2:    Gaincode of 0 to 7. 	Please see the function help (Ctrl-H)
+					on ADC_GAINS for gain table.
+
+RETURN VALUE:	A voltage value corresponding to the voltage that's on the
+					analog input channel pair, or a value of less than
+               BL_ERRCODESTART indicating an error condition:
+                  BL_NOT_CAL     ADC is not calibrated for this channel/gain
+                  BL_OVERFLOW    ADC overflow
+                  BL_TIMEOUT     ADC timeout
+                  BL_WRONG_MODE  ADC is in wrong mode (run anaInConfig)
+                System errors:  (can create run-time error unless disabled)
+                  -ERR_ANA_CALIB Fault detected in reading calibration factor
+                  -ERR_ANA_INVAL Invalid parameter value
+
+SEE ALSO: 		brdInit, anaInConfig, anaIn, anaInmAmps, anaInVolts,
+               anaInCalib
+
+END DESCRIPTION **********************************************************/
+
+_bl_nodebug
+float anaInDiff(int channel, int gaincode)
+{
+	auto int rawdata, flash_err;
+   auto calib_t cal_data;
+   auto int base_channel;
+
+   base_channel = channel & ~1;
+
+#ifndef BL_LIMIT_ERRORS
+   if (!__brdInitFlag || channel < 0 || channel >= BL_ANALOG_IN)
+   {
+      // The brdInit function hasn't been executed or channel out of range
+
+      BL_ERROR(-ERR_ANA_INVAL);
+   }
+
+   if ((ADC_Command[base_channel]    & BL_MODE_MASK) != DIFF_MODE ||
+      (ADC_Command[base_channel + 1] & BL_MODE_MASK) != DIFF_MODE)
+   {
+      // channel is incorrect for ADC Diff mode
+      return BL_WRONG_MODE;
+   }
+#endif
+
+   if ((ADC_Command[base_channel] & BL_GAIN_MASK) != gaincode)
+   {
+   	flash_err = _anaInEERd(base_channel, DIFF_MODE, gaincode,
+      				  			 &ADC_Cal_Table[base_channel]);
+
+		// reset shadow of flash constants for mode.
+      ADC_Command[channel] |= BL_GAIN_MASK;
+
+      if (flash_err) { BL_ERROR(-ERR_ANA_CALIB); }  // check for errors
+      if (((long)(ADC_Cal_Table[channel].gain)) == 0x80000000)
+      {
+         // Return channel not calibrated at this gain error code
+         return BL_NOT_CAL;
+      }
+      ADC_Command[base_channel] &= ~BL_GAIN_MASK;
+	   ADC_Command[base_channel] |= gaincode;
+   }
+
+	rawdata = anaIn(base_channel, gaincode);
+	if (rawdata <= BL_ERRCODESTART)			// check for error condition
+   {
+		return rawdata;           				// if detected, return error
+   }
+
+	rawdata  = ADC_Cal_Table[base_channel].offset - rawdata;
+	return ADC_Cal_Table[base_channel].gain * rawdata;
+}
+
+/*** BeginHeader anaInmAmps */
+float anaInmAmps(int channel);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+anaInmAmps		 															<BL4S1xx.LIB>
+
+SYNTAX:			float anaInmAmps(int channel)
+
+DESCRIPTION:   Reads the state of an analog input channel and uses the
+					previously set calibration constants to convert it to
+               current milliamp floating point value. The nominal range
+               is 0mA to 20mA, although it is possible to receive values
+               outside this range before a BL_OVERFLOW error is returned.
+               This function is non-reentrant.
+
+PARAMETER1:		Channel is 0 to 3, AIN0 - AIN3:
+
+RETURN VALUE:	A current value corresponding	to the current on	the analog
+               input channel or a value of BL_ERRCODESTART or less which
+               indicates an error condition:
+                ADC operation errors: (will not create run-time error)
+                  BL_NOT_CAL     ADC is not calibrated for this channel/gain
+                  BL_OVERFLOW    ADC overflow
+                  BL_TIMEOUT     ADC timeout
+                  BL_WRONG_MODE  ADC is in wrong mode (run anaInConfig)
+                System errors:  (can create run-time error unless disabled)
+                  -ERR_ANA_CALIB Fault detected in reading calibration factor
+                  -ERR_ANA_INVAL Invalid parameter value
+
+SEE ALSO: 		brdInit, anaInConfig, anaIn, anaInDiff, anaInVolts,
+               anaInCalib
+
+END DESCRIPTION **********************************************************/
+
+_bl_nodebug
+float anaInmAmps(int channel)
+{
+	auto int rawdata, flash_err;
+   auto calib_t cal_data;
+
+#ifndef BL_LIMIT_ERRORS
+   if (!__brdInitFlag || channel < 0 || channel >= BL_ANALOG_4TO20)
+   {
+      // The brdInit function hasn't been executed or channel out of range
+      BL_ERROR(-ERR_ANA_INVAL);
+   }
+
+   if ((ADC_Command[channel] & BL_MODE_MASK) != mAMP_MODE)
+   {
+	   // channel is incorrect for mAmp mode
+      return BL_WRONG_MODE;
+   }
+#endif
+
+   if ((ADC_Command[channel] & BL_GAIN_MASK) != mAMP_GAINCODE)
+   {
+   	flash_err = _anaInEERd(channel, mAMP_MODE, mAMP_GAINCODE,
+      							  &ADC_Cal_Table[channel]);
+
+		// reset shadow of flash constants for mode.
+      ADC_Command[channel] |= BL_GAIN_MASK;
+
+      if (flash_err) { BL_ERROR(-ERR_ANA_CALIB); }  // check for errors
+      if (((long)(ADC_Cal_Table[channel].gain)) == 0x80000000)
+      {
+         // Return channel not calibrated at this gain error code
+         return BL_NOT_CAL;
+      }
+      ADC_Command[channel] &= ~BL_GAIN_MASK;
+	   ADC_Command[channel] |= mAMP_GAINCODE;
+   }
+
+	rawdata  =  anaIn(channel, mAMP_GAINCODE);
+	if (rawdata <= BL_ERRCODESTART) 			// check for error condition
+	{
+		return rawdata;           				// if detected, return error
+   }
+
+ 	rawdata  = ADC_Cal_Table[channel].offset - rawdata;
+	return ADC_Cal_Table[channel].gain * rawdata;
+}
+
+/*** BeginHeader anaInRdCalib */
+int anaInRdCalib(int channel, int opmode, int gaincode, calib_t *pcal_data);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+anaInRdCalib		 														<BL4S1xx.LIB>
+
+SYNTAX:			anaInRdCalib(int channel, int opmode, int gaincode,
+                          calib_t *pcal_data)
+
+DESCRIPTION:   Reads the calibration constants, gain and offset,  from
+               the user blockon the flash. This function is non-reentrant.
+
+PARAMETER1:		ADC channel number 0 to 7, AIN0-AIN7.
+
+               CH  	Single-Ended 	  Differential       4-20ma
+		    		--		------------   ----------------   	-------
+		 			0	  	   AIN0 			+AIN0  and  -AIN1  	 AIN0
+					1        AIN1                              AIN1
+		 			2	  	   AIN2 			+AIN2  and  -AIN3     AIN2
+		 			3	  	   AIN3                              AIN3
+		 			4	  	   AIN4 			+AIN4  and  -AIN5
+		 			5	  	   AIN5
+					6	  	   AIN6 			+AIN6  and  -AIN7
+		 			7	  	   AIN7
+
+PARAMETER2:   	Select the mode of operation for the ADC channel
+               calibration data being read. Values are as follows:
+
+            	SE0_MODE  (0) = Single-Ended, unipolar 0 - 20V
+		   		*SE1_MODE  (1) = Not supported for BL4S1xx Series
+		   		DIFF_MODE (2) = Differential, bipolar ±20V
+					mAMP_MODE (3) = 4-20ma operation
+
+PARAMETER3:    Gaincode of 0 to 7. 	Please see the function help (Ctrl-H)
+					on ADC_GAINS for gain table.
+
+PARAMETER4:	 	Calibration structure pointer to gain and offset values.
+
+RETURN VALUE:   0 = successful
+               -1 invalid address or range
+               -2 No valid user block found (block version 3 or later)
+               -3 flash writing error
+               -EINVAL = invalid parameter
+
+SEE ALSO:		_anaInEEWr, _anaInEERd , anaInCalib, _anaInAddr
+
+END DESCRIPTION **********************************************************/
+
+_bl_nodebug
+int anaInRdCalib(int channel, int opmode, int gaincode, calib_t *pcal_data)
+{
+	auto int flash_address;
+
+#ifndef BL_LIMIT_ERRORS
+   if (channel < 0 || channel >= BL_ANALOG_IN ||
+   	 (opmode != SE0_MODE && opmode != DIFF_MODE && opmode != mAMP_MODE)
+   	 || ((opmode == mAMP_MODE) && channel >= BL_ANALOG_4TO20) ||
+       gaincode < 0 || gaincode >= MAX_GAINS)
+   {
+      // channel, opmode, or gaincode is incorrect for ADC
+      BL_ERROR(-EINVAL);
+   }
+#endif
+
+	return _anaInEERd(channel, opmode, gaincode, pcal_data);
+}
+
+
+/*** BeginHeader _anaInEERd */
+int _anaInEERd(int channel, int opmode, int gaincode, calib_t *pcal_data);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+anaInEERd		 															<BL4S1xx.LIB>
+
+SYNTAX:			_anaInEERd(int channel, int opmode, int gaincode,
+                          calib_t *pcal_data)
+
+DESCRIPTION:   Reads the calibration constants, gain and offset,  from
+               the user blockon the flash. This function is non-reentrant.
+
+PARAMETER1:		ADC channel number 0 to 7, AIN0-AIN7.
+
+               CH  	Single-Ended 	  Differential       4-20ma
+		    		--		------------   ----------------   	-------
+		 			0	  	   AIN0 			+AIN0  and  -AIN1  	 AIN0
+					1        AIN1                              AIN1
+		 			2	  	   AIN2 			+AIN2  and  -AIN3     AIN2
+		 			3	  	   AIN3                              AIN3
+		 			4	  	   AIN4 			+AIN4  and  -AIN5
+		 			5	  	   AIN5
+					6	  	   AIN6 			+AIN6  and  -AIN7
+		 			7	  	   AIN7
+
+PARAMETER2:   	Select the mode of operation for the ADC channel
+               calibration data being read. Values are as follows:
+
+            	SE0_MODE  (0) = Single-Ended, unipolar 0 - 20V
+		   		*SE1_MODE  (1) = Not supported for BL4S1xx Series
+		   		DIFF_MODE (2) = Differential, bipolar ±20V
+					mAMP_MODE (3) = 4-20ma operation
+
+PARAMETER3:    Gaincode of 0 to 7. 	Please see the function help (Ctrl-H)
+					on ADC_GAINS for gain table.
+
+PARAMETER4:	 	Calibration structure pointer to gain and offset values.
+
+RETURN VALUE:   0 = successful write to user block.
+               -1 invalid address or range
+               -2 No valid user block found (block version 3 or later)
+               -3 flash writing error
+               -EINVAL = invalid parameter
+
+SEE ALSO:		_anaInEEWr, anaInCalib, _anaInAddr, anaInRdCalib
+
+END DESCRIPTION **********************************************************/
+
+_bl_nodebug
+int _anaInEERd(int channel, int opmode, int gaincode, calib_t *pcal_data)
+{
+	auto int flash_address;
+
+	// calculate flash address
+	flash_address = _anaInAddr(channel, opmode, gaincode);
+   if (flash_address < 0)
+   {
+   	BL_ERROR(flash_address);
+   }
+
+   // read calibration constants from flash
+   return readUserBlock(pcal_data, flash_address, CAL_ANALOG_SIZE);
+}
+
+/*** BeginHeader _anaInEEWr */
+int _anaInEEWr(int channel, int opmode, int gaincode, calib_t *pcal_data);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_anaInEEWr		 															<BL4S1xx.LIB>
+
+SYNTAX:			int _anaInEEWr(int channel, int opmode, int gaincode,
+						            calib_t *pcal_data)
+
+DESCRIPTION:   Writes the calibration constants, gain and offset, to
+               the user block on the flash.
+               This functio is non-reentrant.
+
+					NOTE: This is an internal function not intended for
+               for use by the application program.
+
+PARAMETER1:		ADC channel number 0 to 7, AIN0-AIN7.
+
+               CH  	Single-Ended 	  Differential       4-20ma
+		    		--		------------   ----------------   	-------
+		 			0	  	   AIN0 			+AIN0  and  -AIN1  	 AIN0
+					1        AIN1                              AIN1
+		 			2	  	   AIN2 			+AIN2  and  -AIN3     AIN2
+		 			3	  	   AIN3                              AIN3
+		 			4	  	   AIN4 			+AIN4  and  -AIN5
+		 			5	  	   AIN5
+					6	  	   AIN6 			+AIN6  and  -AIN7
+		 			7	  	   AIN7
+
+PARAMETER2:   	Select the mode of operation for the ADC channel
+               calibration data being read. Values are as follows:
+
+            	SE0_MODE  (0) = Single-Ended, unipolar 0 - 20V
+		   		*SE1_MODE  (1) = Not supported for BL4S1xx Series
+		   		DIFF_MODE (2) = Differential, bipolar ±20V
+					mAMP_MODE (3) = 4-20ma operation
+
+PARAMETER3:    Gaincode of 0 to 7. 	Please see the function help (Ctrl-H)
+					on ADC_GAINS for gain table.
+
+PARAMETER4:	 	Calibration structure pointer to gain and offset values.
+
+RETURN VALUE:	 0, successful write to flash.
+					-EINVAL, invalid address or range
+               -2, No valid user block found (block version 3 or later)
+ 				   -3, flash writing error
+
+SEE ALSO:		_anaInEERd, anaInCalib, anaInAddr
+
+END DESCRIPTION **********************************************************/
+
+_bl_nodebug
+int _anaInEEWr(int channel, int opmode, int gaincode, calib_t *pcal_data)
+{
+	auto int flash_address;
+
+	// calculate flash address
+	flash_address = _anaInAddr(channel, opmode, gaincode);
+   if (flash_address < 0)
+   {
+   	return flash_address;
+   }
+
+   // read calibration constants from flash
+   return writeUserBlock(flash_address, pcal_data, CAL_ANALOG_SIZE);
+}
+
+/*** BeginHeader _anaInAddr */
+int _anaInAddr(int channel, int opmode, int gaincode);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_anaInAddr		 															<BL4S1xx.LIB>
+
+SYNTAX:			_anaInAddr(int channel, int opmode, int gaincode)
+
+DESCRIPTION:   Calculate the address of the calibration constants, gain and
+					offset,  from the flash.
+
+PARAMETER1:		ADC channel number 0 to 7, AIN0-AIN7.
+
+               CH  	Single-Ended 	  Differential       4-20ma
+		    		--		------------   ----------------   	-------
+		 			0	  	   AIN0 			+AIN0  and  -AIN1  	 AIN0
+					1        AIN1                              AIN1
+		 			2	  	   AIN2 			+AIN2  and  -AIN3     AIN2
+		 			3	  	   AIN3                              AIN3
+		 			4	  	   AIN4 			+AIN4  and  -AIN5
+		 			5	  	   AIN5
+					6	  	   AIN6 			+AIN6  and  -AIN7
+		 			7	  	   AIN7
+
+PARAMETER2:   	Select the mode of operation for the ADC channel
+               calibration data being read. Values are as follows:
+
+            	SE0_MODE  (0) = Single-Ended, unipolar 0 - 20V
+		   		*SE1_MODE  (1) = Not supported for BL4S1xx Series
+		   		DIFF_MODE (2) = Differential, bipolar ±20V
+					mAMP_MODE (3) = 4-20ma operation
+
+PARAMETER3:    Gaincode of 0 to 7. 	Please see the function help (Ctrl-H)
+					on ADC_GAINS for gain table.
+
+RETURN VALUE:	 0, success
+				    -EINVAL, invalid address or range
+
+SEE ALSO:		_anaInEEWr, anaInEERd, anaInCalib
+
+END DESCRIPTION **********************************************************/
+
+_bl_nodebug
+int _anaInAddr(int channel, int opmode, int gaincode)
+{
+   switch(opmode)
+   {
+	   case SE0_MODE:
+	      // Calculate the offset into the user block of where the
+	      // calibration constants are stored for a given A/D channel.
+	      return  CAL_ADC_SE0
+	      		  + gaincode * (CAL_ANALOG_SIZE * BL_ANALOG_IN)
+	      		  + channel * CAL_ANALOG_SIZE;
+
+	   case DIFF_MODE:
+	      // Calculate the offset into the user block of where the calibration
+	      // constants are stored for a given A/D channel.
+	      return CAL_ADC_DIFF
+	      		 + gaincode * (CAL_ANALOG_SIZE * (BL_ANALOG_IN / 2))
+	      // adjust channel number to a pair number
+	      		 + (channel >> 1) * CAL_ANALOG_SIZE;
+
+	   case mAMP_MODE:
+	      // Calculate the offset into the user block of where the calibration
+	      // constants are stored for a given A/D channel.
+	      return CAL_ADC_MA
+	      		 + channel * CAL_ANALOG_SIZE;
+	      break;
+
+	   case SE1_MODE:
+	      // not supported for BL4S1xx Series
+	   default:
+	      return -EINVAL;
+   }
+}
+
+/////////////////////////////
+// Digital Input Functions //
+/////////////////////////////
+
+/*** BeginHeader setDigIn */
+int setDigIn(int channel);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+setDigIn			 															<BL4S1xx.LIB>
+
+SYNTAX:			int setDigIn(int channel)
+
+DESCRIPTION:   Sets the input channel to be a general digital input.
+               This function is non-reentrant.
+
+PARAMETER1:		Input channel to be set, 0 - 11.
+
+					0  - 11 = channels DIN0 - DIN11.
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value.
+
+SEE ALSO:		brdInit, digIn, digInBank
+
+END DESCRIPTION **********************************************************/
+
+_bl_nodebug
+int setDigIn(int channel)
+{
+	auto int rc;
+
+#ifndef BL_LIMIT_ERRORS
+	if(!__brdInitFlag || channel < 0 || channel >= BL_DIGITAL_IN)
+	{
+		// the brdInit function hasn't been executed or channel invalid
+      BL_ERROR(-EINVAL);
+   }
+#endif
+
+   // set the channel to be a Digital Input
+   rc = _riosbc_set_function(DI_PIN(channel), RSB_FUNC_DIGIN, 0);
+   if (rc < 0){ BL_ERROR(rc); }  // check for errors
+   return rc;
+}
+
+
+/*** BeginHeader digIn */
+int digIn(int channel);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+digIn				  															<BL4S1xx.LIB>
+
+SYNTAX:			int digIn(int channel)
+
+DESCRIPTION:   Reads the state of any digital input channel.
+               This function is non-reentrant.
+
+PARAMETER1:		Input channel to be read, 0 - 11.
+
+					0  - 11 = channels DIN0 - DIN11.
+
+RETURN VALUE:	The logic state of the specified channel.
+					0 = Logic low.
+               1 = Logic High.
+               -EINVAL: channel value is out of range
+               -EPERM:  channel functionality does not permit this operation
+
+SEE ALSO:		brdInit, setDigIn, digInBank
+
+END DESCRIPTION **********************************************************/
+
+_bl_nodebug
+int digIn(int channel)
+{
+	auto int rc;
+
+#ifndef BL_LIMIT_ERRORS
+	if(!__brdInitFlag || channel < 0 || channel >= BL_DIGITAL_IN)
+   {
+		// the brdInit function hasn't been executed or channel invalid
+      BL_ERROR(-EINVAL);
+	}
+#endif
+
+   rc = _riosbc_get_pin(DI_PIN(channel));
+   if (rc < 0){ BL_ERROR(rc); }  // check for errors
+   return rc;
+}
+
+
+/*** BeginHeader digInBank */
+int digInBank(int bank);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+digInBank		 															<BL4S1xx.LIB>
+
+SYNTAX:			int digInBank(int bank)
+
+DESCRIPTION:   Reads the state of 12 digital input channels DIN0-DIN11 in two
+					banks of 8.
+               This function is non-reentrant.
+
+Parameter1:		Bank of inputs to read.
+
+RETURN VALUE:	Data read from digital input bank.
+
+					Data Format Bank 0:
+               ------------
+         (LSB) D0 	= DIN0
+               D1 	= DIN1
+               D2 	= DIN2
+               D3 	= DIN3
+               D4 	= DIN4
+               D5 	= DIN5
+               D6		= DIN6
+         (MSB) D7		= DIN7
+
+					Data Format Bank 1:
+               ------------
+         (LSB) D0		= DIN8
+					D1 	= DIN9
+					D2 	= DIN10
+					D3 	= DIN11
+					D4 	= Not Used
+					D5 	= Not Used
+					D6 	= Not Used
+			(MSB) D7 	= Not Used
+
+               -EINVAL: invalid parameter value
+
+SEE ALSO:		brdInit, digIn, setDigIn
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+int digInBank(int bank)
+{
+	auto int data;
+
+#ifndef BL_LIMIT_ERRORS
+	if(!__brdInitFlag || bank < 0 || bank > ((BL_DIGITAL_IN + 7) >> 3))
+	{
+		// the brdInit function hasn't been executed or bank invalid
+      BL_ERROR(-EINVAL);
+	}
+#endif
+
+	// get data from groups of channels
+   if (bank == 0)
+   {
+      data = _riosbc_get_block(DI_PIN(0)) & 0x07;
+      data |= (_riosbc_get_block(DI_PIN(3)) & 0x07) << 3;
+      data |= (_riosbc_get_block(DI_PIN(6)) & 0x03) << 6;
+   }
+   else
+   {
+      data = _riosbc_get_block(DI_PIN(8)) & 0x03;
+		data |= _riosbc_get_pin(DI_PIN(10)) << 2;
+		data |= _riosbc_get_pin(DI_PIN(11)) << 3;
+   }
+
+ 	return data;
+}
+
+/*** BeginHeader setExtInterrupt */
+int setExtInterrupt(int channel, char edge, int handle);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+setExtInterrupt               <BL4S1xx.LIB>
+
+SYNTAX:    int setExtInterrupt(int channel, char edge, int handle)
+
+DESCRIPTION:	Sets the given channel to be an interrupt.  The interrupt can
+					be configured as a rising edge, falling edge, or either
+               edge.
+
+               Note: The RIO supports a maximum of two external interrupt
+               channels per block, due to the existence of just two edge
+               detection circuits per block.
+
+PARAMETER1:		Input channel to be configured as an interrupt.
+
+PARAMETER2:		Edge of the interrupt:
+               BL_IRQ_RISE = Interrupt event on rising edge
+               BL_IRQ_FALL = Interrupt event on falling edge
+               BL_IRQ_BOTH = Interrupt events on both edges
+
+PARAMETER3:    Handle for the ISR handler to service this interrupt.
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+               -EPERM:  pin type does not permit this function
+               -EACCES: resource needed by this function is not available
+               -EFAULT: internal data fault detected
+
+SEE ALSO:		brdInit, digIn, setDigIn
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+int setExtInterrupt(int channel, char edge, int handle)
+{
+   auto int rc;
+   auto struct RSB_IOpin *ptr;
+
+#ifndef BL_LIMIT_ERRORS
+	if(!__brdInitFlag || channel < 0 || channel >= BL_DIGITAL_IN)
+	{
+		// the brdInit function hasn't been executed or channel invalid
+      BL_ERROR(-EINVAL);
+	}
+#endif
+
+	// set function of the channel
+   ptr = DI_PIN(channel);
+   rc = _riosbc_set_function(ptr, RSB_FUNC_INTERRUPT, edge);
+   if (rc){ BL_ERROR(rc); }  // check for errors
+
+   // Set the Interrupt Enable return value based on IIB or DQE usage
+   _riosbc_set_ier(handle, ((rsb_rio[ptr->index].block[ptr->block1].ic_use &
+               _rsb_bitmap[ptr->bit1]) ? BL_IER_IIB: BL_IER_DQE));
+   if (rc){ BL_ERROR(rc); }  // check for errors
+
+   return 0;
+}
+
+
+/*** BeginHeader setDecoder */
+int setDecoder(int channel_a, int channel_b, int channel_index,
+                 char index_polarity);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+setDecoder			  														<BL4S1xx.LIB>
+
+SYNTAX:    int setDecoder(int channel_a, int channel_b, int channel_index,
+                           char index_polarity)
+
+DESCRIPTION:	Sets up the Quadrature Decoder functionality on the given
+               channels. The quadrature decoder can optionally utilize an
+               index channel.
+
+PARAMETER1:		Channel to use as A input (also known as in-phase or I)
+
+PARAMETER2:    Channel to use as B input (also known as Quadrature or Q)
+
+PARAMETER3:    Channel to use as Index input
+                 (-1 if not used, NOTE: Count may still be reset by Sync
+                    signals existing or setup on the same RIO & Block)
+
+PARAMETER4:    Polarity of the index channel.
+					0 for index on low level
+               non-zero for index on hi level
+               (not used when channel_index set to -1)
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+               -EACCES: resource needed by this function is not available
+
+SEE ALSO:		brdInit, getCounter, resetCounter
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+int setDecoder(int channel_a, int channel_b, int channel_index,
+                 char index_polarity)
+{
+	auto int rc;
+
+#ifndef BL_LIMIT_ERRORS
+	if(!__brdInitFlag || channel_a < 0 || channel_a >= BL_DIGITAL_IN ||
+   	channel_b < 0 || channel_b >= BL_DIGITAL_IN ||
+      channel_index >= BL_DIGITAL_IN)
+   {
+   	// the brdInit function hasn't been executed or channel invalid
+      BL_ERROR(-EINVAL);
+   }
+#endif
+
+  	rc = _riosbc_set_decoder(DI_PIN(channel_a), DI_PIN(channel_b),
+          (channel_index < 0 ? NULL : DI_PIN(channel_index)), index_polarity);
+   if (rc < 0){ BL_ERROR(rc); }  // check for errors
+   return rc;
+}
+
+/*** BeginHeader setCounter */
+int setCounter(int channel, int mode, int edge, word options);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+setCounter			  														<BL4S1xx.LIB>
+
+SYNTAX:    int setCounter(int channel, int mode, int edge, word options)
+
+DESCRIPTION:   Sets up the channel as a counter input, with selectable
+               modes and edge settings.  The counter will increment or
+               decrement on each selected edge event.  Use getCounter()
+               to read the current count and resetCounter() to force a
+               reset of the counter.
+
+PARAMETER1:		Channel to use for the up count input.
+
+PARAMETER2:    Mode of the counter:
+                  BL_UP_COUNT     = Continuous up count mode
+                  BL_DOWN_COUNT   = Up/down counter mode (2 pins used)
+                  BL_MATCH_ENABLE = Continuous up count mode with count
+                                     stopping on any match event
+PARAMETER3:    Edge setting for the up count event:
+                  BL_EDGE_RISE   = Up count on rising edge
+                  BL_EDGE_FALL   = Up count on falling edge
+                  BL_EDGE_BOTH   = Up count on either edge
+
+PARAMETER4:    Options based on mode:  (N/A if continuous up mode selected)
+                - If up/down mode is selected (parameter 2), options has down
+                	count channel (can't be same pin as up count) and event
+                  edge settings ORed together.
+                   Low 4 bits is channel number for down count input
+                   BL_EVENT_RISE   = Down count on rising edge
+                   BL_EVENT_FALL   = Down count on falling edge
+                   BL_EVENT_BOTH	  = Down count on either edge
+                - If BL_MATCH_ENABLE mode is selected (parameter 2), options has
+                	the match count to stop at. (Sets other match reg's on block
+                  to max.)
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value or pin usage
+               -EPERM:  pin type does not permit this function
+               -EACCES: resource needed by this function is not available
+               -EFAULT: internal data fault detected
+               positive number: Mode Conflict - See Appendix xx
+
+SEE ALSO:		brdInit, getCounter, resetCounter
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+int setCounter(int channel, int mode, int edge, word options)
+{
+   auto struct RSB_IOpin *chPtr, *chPtr2;
+   auto int rc;
+
+#ifndef BL_LIMIT_ERRORS
+	if(!__brdInitFlag || channel < 0 || channel >= BL_DIGITAL_IN ||
+        mode > BL_DOWN_COUNT || (mode == BL_DOWN_COUNT &&
+            (options & 0x0F) >= BL_DIGITAL_IN))
+	{
+		// the brdInit function hasn't been executed or mode or channel invalid
+      BL_ERROR(-EINVAL);
+	}
+#endif
+
+   chPtr = DI_PIN(channel);     // get pointer to channel's pin struct
+   if (mode & BL_DOWN_COUNT)
+   {
+      // Up/down count mode, get pointer to down count channel
+      chPtr2 = DI_PIN(options & 0x0F);
+      if ((chPtr->block1 != chPtr2->block1) || (chPtr->bit1 == chPtr2->bit1))
+      {  // Up and down count channels NOT on same block or attempt to
+         BL_ERROR(-EINVAL); // use the same pin for both up and down count.
+      }
+	   // Set counter input functionality to down count channel
+      rc = _riosbc_set_function(chPtr2, RSB_FUNC_COUNTER_INPUT, 0);
+      if (rc) { BL_ERROR(rc); }  // check for errors
+   }
+
+   // Set counter input functionality to the given channel
+   rc = _riosbc_set_function(chPtr, RSB_FUNC_COUNTER_INPUT, 0);
+   if (rc){ BL_ERROR(rc); }  // check for errors
+
+   // Always reset counter and add in edge selection
+   mode |= RSB_COUNT_RESET | edge;
+   // Additional setup based on mode setting
+   if (mode & BL_DOWN_COUNT)
+   {
+      // Set the up count input using main channel (remove down mode flag)
+      rc = _riosbc_set_counter(chPtr, mode ^ BL_DOWN_COUNT);
+      if (rc < 0){ BL_ERROR(rc); }  // check for errors
+      // Set down count ptr as main channel
+      chPtr = chPtr2;
+      // Setup the down count mode
+      mode = RSB_COUNT_RESET | BL_DOWN_COUNT | ((options & BL_EVENT_BOTH) >> 8);
+   }
+   else if (mode & BL_MATCH_ENABLE)
+   {
+      // Max out all match registers if using stop on match
+      mode |= RSB_MAX_MATCHES;
+   }
+   // Setup counter and return with result in rc
+   rc = _riosbc_set_counter(chPtr, mode);
+   if ((mode & BL_MATCH_ENABLE) && (rc == 0)) {
+      // Set match register to value in options
+      rc = _riosbc_set_match(chPtr, 0, options);
+      chPtr->match = RSB_RES_MATCH0;    // Show use of Match 0 for active value
+      // Reset counter to latch match value into block
+	   WrPortE(chPtr->addr1, NULL, RSB_CMD);
+	   WrPortE(chPtr->addr1 + 1, NULL, RSB_CMD_ZERO);
+   }
+   if (rc < 0){ BL_ERROR(rc); }  // check for errors
+   return rc;
+}
+
+/*** BeginHeader setCapture */
+int setCapture(int channel, int mode, int edge, word options);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+setCapture			  														<BL4S1xx.LIB>
+
+SYNTAX:    int setCapture(int channel, int mode, int edge, word options)
+
+DESCRIPTION:   Sets up the channel as an event capture input, with
+               selectable modes and edge settings.  The counter will run
+               from a gated main or prescaled clock signal based on the
+               run criteria of the selected mode, and begin/end events
+               can be set to capture the count at the time of these
+               events.  Optionally, a second channel can be set (which
+               shares the same RIO channel input block as 'channel') for
+               two signal begin/end event detection.  Use getBegin()
+               and getEnd() to read the captured count values and
+               resetCounter() to force a reset of the counter.
+
+PARAMETER1:    Channel to use for the begin event input for all modes except
+                BL_CNT_TIL_END, then it specifies the end event input.
+
+PARAMETER2:    Mode of the counter/timer:
+                  BL_CNT_RUN       = Continuous count mode
+                  BL_CNT_BEGIN_END = Start count on begin event, continue
+                                      to count until end event detected.
+	                   NOTE: If an end event occurs before the begin event,
+	                         the count will begin then end immediately on
+	                         the begin event and end count will equal to 1.
+	                         Begin will be 0 or 1 based on the edge which
+	                         triggered the event (0=rising, 1=falling).
+                  BL_CNT_TIL_END   = Count until end event detected
+                  BL_CNT_ON_BEGIN  = Count while BEGIN signal is active
+
+PARAMETER3:    Edge/state setting for the begin event for all modes except
+                BL_CNT_TIL_END, then it specifies the end event
+                  BL_EVENT_RISE  = Begin event on rising edge
+                  BL_EVENT_FALL  = Begin event on falling edge
+                  BL_EVENT_BOTH  = Begin event on any edge
+                The following two settings are only for the BL_CNT_ON_BEGIN mode
+                  BL_BEGIN_HIGH = Begin active while signal is high
+                  BL_BEGIN_LOW  = Begin active while signal is low
+
+PARAMETER4:    Options based on mode:
+                - If BL_CNT_TIL_END, then begin input & edge can be selected.
+                - All other modes, then end input & edge can be selected.
+                - For all modes, the prescale clock and save limit flags
+                  can be used (OR in).
+                For input & edge selection use:
+                  Low 5 bits for channel to use for begin/end input
+                  BL_SAME_CHANNEL  = Begin & End both from same channel
+                  BL_EVENT_RISE    = Begin/end event on rising edge
+                  BL_EVENT_FALL    = Begin/end event on falling edge
+                  BL_EVENT_BOTH    = Begin/end event on any edge
+                For clock and limit options use:
+                  BL_PRESCALE   = Use prescaled clock
+                  BL_SAVE_LIMIT = Save current limit register value
+                                   (Otherwise limit set to 0xFFFF)
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+               -EPERM:  pin type does not permit this function
+               -EACCES: resource needed by this function is not available
+               -EFAULT: internal data fault detected
+               positive number: Mode Conflict - See Appendix xx
+
+SEE ALSO:		brdInit, getBegin, getEnd, getCounter, resetCounter
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+int setCapture(int channel, int mode, int edge, word options)
+{
+   auto struct RSB_IOpin *chPtr, *optPtr;
+   auto int rc;
+   auto word flags;
+
+#ifndef BL_LIMIT_ERRORS
+	if(!__brdInitFlag || channel < 0 || channel >= BL_DIGITAL_IN ||
+           (mode & (~BL_CNT_ON_BEGIN)) || (edge & (~BL_BEGIN_HIGH)))
+	{
+		// the brdInit function hasn't been executed or mode or channel invalid
+      BL_ERROR(-EINVAL);
+	}
+#endif
+
+   chPtr = DI_PIN(channel);		// get pointer to channel's pin struct
+
+   flags = mode | RSB_CAPT_RESET | (options & (BL_PRESCALE | BL_SAVE_LIMIT));
+   if ((options & BL_EVENT_BOTH) && !(options & BL_SAME_CHANNEL))
+   {
+      // Optional secondary channel, get ptr. and make sure RIO/block matches
+      optPtr = DI_PIN(options & 0x1F);
+      if (chPtr->block1 != optPtr->block1)
+      {
+         BL_ERROR(-EINVAL);
+      }
+   }
+	else {
+      optPtr = chPtr;    // Same channel or no options, just copy pointer
+   }
+
+   // Setup remaining flags based on mode
+   if (mode == BL_CNT_TIL_END)
+   {
+      // If edge is for down count, cannot have state based value or no edge
+      if (!edge || (edge & 0x2000)) BL_ERROR(-EINVAL);
+      // Add flags to specify end edge and channel
+      flags |= (edge >> 8) | RSB_SEL_PORT0 | chPtr->bit1;
+      // See if begin event is also specified
+      if (options & BL_EVENT_BOTH)
+      {
+         // Add flags to specify begin edge and port channel
+         flags |= (options & BL_EVENT_BOTH)
+         			| ((optPtr->bit1 + RSB_SEL_PORT0) << 8);
+      }
+   }
+   else
+   {
+      if (edge)
+      {
+	      // Add flags to specify begin edge and channel
+	      flags |= edge | ((chPtr->bit1 + RSB_SEL_PORT0) << 8);
+		}
+      else if (mode != BL_CNT_RUN)
+      {
+            BL_ERROR(-EINVAL);    // Need begin event/state on begin based modes
+      }
+
+      // See if end event is also specified
+      if (options & BL_EVENT_BOTH)
+      {
+         // Add flags to specify end edge and port channel
+         flags |= ((options & BL_EVENT_BOTH) >> 8) \
+         		| RSB_SEL_PORT0 | optPtr->bit1;
+      }
+   }
+
+   if (optPtr != chPtr) {
+      // Set additional event input as a digital input pin
+      rc = _riosbc_set_function(optPtr, RSB_FUNC_DIGIN, 0);
+      if (rc) {BL_ERROR(rc);}
+   }
+
+   // Setup functionality of the pin
+   rc = _riosbc_set_function(chPtr, RSB_FUNC_CAPTURE_INPUT, mode);
+   if (rc == 0) {
+      // Setup capture input and return with result
+      rc = _riosbc_set_capture(chPtr, flags);
+   }
+   if (rc < 0){ BL_ERROR(rc); }  // check for errors
+   return rc;
+}
+
+
+/*** BeginHeader getCounter */
+int getCounter(int channel, word *count);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+getCounter			 														<BL4S1xx.LIB>
+
+SYNTAX:    int getCounter(int channel, word *count)
+
+DESCRIPTION:	Reads the current count of the counter register within
+					the counter block hosting the given channel.
+
+PARAMETER1:		A digital input channel which uses the desired counter block.
+
+PARAMETER2:		Pointer to word variable to place count register reading
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+               -EPERM:  pin type does not permit this function
+
+SEE ALSO:		brdInit, setCounter, setDecoder, setCapture, resetCounter
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+int getCounter(int channel, word *count)
+{
+   auto struct RSB_IOpin* chPtr;
+   auto int rc;
+
+#ifndef BL_LIMIT_ERRORS
+	if(!__brdInitFlag || channel < 0 || channel >= BL_DIGITAL_IN)
+	{
+		// the brdInit function hasn't been executed or channel invalid
+      BL_ERROR(-EINVAL);
+	}
+#endif
+
+   chPtr = DI_PIN(channel);		// get pointer to channel's pin struct
+
+	rc = _riosbc_get_count(chPtr, count);
+	if (rc < 0){ BL_ERROR(rc); }  // check for errors
+
+   return rc;
+}
+
+/*** BeginHeader getBegin */
+int getBegin(int channel, word *begin);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+getBegin  																	<BL4S1xx.LIB>
+
+SYNTAX:    int getBegin(int channel, word *begin)
+
+DESCRIPTION:	Reads the current value of the begin register within
+					the counter block hosting the given channel.
+
+PARAMETER1:		Digital input channel which uses the desired counter block.
+
+PARAMETER2:		Pointer to word variable to place begin register reading
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+               -EPERM:  pin type does not permit this function
+
+SEE ALSO:		brdInit, setCapture, resetCounter, getEnd
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+int getBegin(int channel, word *begin)
+{
+   auto struct RSB_IOpin* chPtr;
+   auto int rc;
+
+#ifndef BL_LIMIT_ERRORS
+	if(!__brdInitFlag || channel < 0 || channel >= BL_DIGITAL_IN)
+	{
+		// the brdInit function hasn't been executed or channel invalid
+      BL_ERROR(-EINVAL);
+	}
+#endif
+
+   chPtr = DI_PIN(channel);		// get pointer to channel's pin struct
+
+	rc = _riosbc_get_begin(chPtr, begin);
+   if (rc < 0){ BL_ERROR(rc); }  // check for errors
+
+   return rc;
+}
+
+/*** BeginHeader getEnd */
+int getEnd(int channel, word *end);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+getEnd   																	<BL4S1xx.LIB>
+
+SYNTAX:    int getEnd(int channel, word *end)
+
+DESCRIPTION:	Reads the current value of the end register within
+					the counter block hosting the given channel.
+
+PARAMETER1:		A digitla input channel which uses the desired counter block.
+
+PARAMETER2:		Pointer to word variable to place end register reading
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+               -EPERM:  pin type does not permit this function
+
+SEE ALSO:		brdInit, setCapture, resetCounter, getBegin
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+int getEnd(int channel, word *end)
+{
+   auto struct RSB_IOpin* chPtr;
+   auto int rc;
+
+#ifndef BL_LIMIT_ERRORS
+	if(!__brdInitFlag || channel < 0 || channel >= BL_DIGITAL_IN)
+	{
+		// the brdInit function hasn't been executed or channel invalid
+      BL_ERROR(-EINVAL);
+	}
+#endif
+
+   chPtr = DI_PIN(channel);		// get pointer to channel's pin struct
+
+	rc = _riosbc_get_end(chPtr, end);
+   if (rc < 0){ BL_ERROR(rc); }  // check for errors
+
+   return rc;
+}
+
+/*** BeginHeader resetCounter */
+int resetCounter(int channel);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+resetCounter																<BL4S1xx.LIB>
+
+SYNTAX:    int resetCounter(int channel)
+
+DESCRIPTION:	Resets the current count of the counter register within
+					the counter block hosting the given channel.
+
+PARAMETER1:		An input channel which uses the desired counter block
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+               -EPERM:  pin type does not permit this function
+
+SEE ALSO:		brdInit, getCounter, setDecoder
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+int resetCounter(int channel)
+{
+   auto int rc;
+
+#ifndef BL_LIMIT_ERRORS
+	if(!__brdInitFlag || channel < 0 || channel >= BL_DIGITAL_IN)
+	{
+		// the brdInit function hasn't been executed or channel invalid
+      BL_ERROR(-EINVAL);
+	}
+#endif
+
+	rc = _riosbc_clear_count(DI_PIN(channel));
+   if (rc < 0){ BL_ERROR(rc); }  // check for errors
+
+	return rc;
+}
+
+
+/*** BeginHeader setLimit */
+int setLimit(int channel, word limit);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+setLimit																		<BL4S1xx.LIB>
+
+SYNTAX:    int setLimit(int channel, word limit)
+
+DESCRIPTION:   Sets the new value of the limit register within the
+               counter block hosting the given channel.  This new value
+               will take effect on the next counter overflow or by
+               resetting the counter (a call to resetCounter()).
+
+PARAMETER1:		A digital input channel which uses the desired counter block
+
+PARAMETER2:    New value for the limit register
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+               -EPERM:  pin type does not permit this function
+
+SEE ALSO:		brdInit, setCapture, resetCounter
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+int setLimit(int channel, word limit)
+{
+   auto struct RSB_IOpin* chPtr;
+   auto int rc;
+
+#ifndef BL_LIMIT_ERRORS
+	if(!__brdInitFlag || channel < 0 || channel >= BL_DIGITAL_IN)
+	{
+		// the brdInit function hasn't been executed or channel invalid
+      BL_ERROR(-EINVAL);
+	}
+#endif
+
+   chPtr = DI_PIN(channel);		// get pointer to channel's pin struct
+
+	rc = _riosbc_set_limit(chPtr, limit);
+   if (rc < 0){ BL_ERROR(rc); }  // check for errors
+
+	return rc;
+}
+
+/*** BeginHeader setSyncIn */
+int setSyncIn(int channel, int source, int edge);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+setSyncIn																	<BL4S1xx.LIB>
+
+SYNTAX:    int setSyncIn(int channel, int source, int edge)
+
+DESCRIPTION:	Sets the sync for the block the digital input channel is
+					associated with.
+
+               Note: When synchronizing more than one block to the
+               same sync signal (global or external), each block has its
+               own independent edge detection circuit.  These circuits
+               will sync to the edge within plus or minus one count of
+               the block's current clock source (main or prescale).
+               This means synchronized blocks may have a small offset
+               when compared to each other.
+
+PARAMETER1:		Input channel that is on the block that will have its sync
+					set.
+
+PARAMETER2:    Source of the sync signal.
+					-1 to use the RIO chip's Global Sync signal
+               OR Input capable channel to use as an external Sync signal
+
+PARAMETER3:    Edge of the sync signal.
+               BL_EDGE_RISE = Synchronize event on rising edge
+               BL_EDGE_FALL = Synchronize event on falling edge
+               BL_EDGE_BOTH = Synchronize events on both edges
+               OR        0  = Remove Sync on this block
+                                (if source of external sync is given,
+                                 it will be set to a digital input)
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+               -EPERM:  pin type does not permit this function
+               -EACCES: resource needed by this function is not available
+               -EFAULT: internal data fault detected
+
+SEE ALSO:		brdInit, setSyncOut
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+int setSyncIn(int channel, int source, int edge)
+{
+   auto struct RSB_IOpin *chPtr, *srcPtr;
+   auto int rc;
+
+#ifndef BL_LIMIT_ERRORS
+	if(!__brdInitFlag || channel < 0 || channel >= BL_DIGITAL_IN
+            || source >= BL_DIGITAL_IN || (edge & (~BL_EDGE_BOTH)))
+	{
+		// the brdInit function hasn't been executed or channel or source/edge
+      // invalid
+      BL_ERROR(-EINVAL);
+	}
+#endif
+
+   chPtr = DI_PIN(channel);		// get pointer to channel's pin struct
+
+   if (source < 0)
+   {
+   	if (edge)
+      {
+	      // Set global sync on host block of channel
+	      rc = _riosbc_block_sync(chPtr, edge | RSB_SEL_GLOBAL);
+		}
+      else
+      {
+	      // Turn off global sync on host block of channel
+	      rc = _riosbc_block_sync(chPtr, 0);
+      }
+   }
+   else
+   {
+      srcPtr = DI_PIN(source);   // get pointer to source pin struct
+
+      if (chPtr->block1 != srcPtr->block1)
+      {
+         // Channel and Source not hosted by same Block
+         BL_ERROR(-EINVAL);  // report error
+      }
+      if (edge)
+      {
+         rc = _riosbc_set_function(srcPtr, RSB_FUNC_SYNC, edge << 3);
+		}
+      else
+      {
+         // Verify source pin is an external sync input
+         if (srcPtr->function != RSB_FUNC_SYNC)
+         {
+            rc = -EINVAL;
+         }
+         else
+         {
+	         // Turn off external sync on host block of channel
+	         rc = _riosbc_block_sync(chPtr, 0);
+	         if(!rc)
+	         {
+	           // Set external sync pin to a digital input
+	           rc = _riosbc_set_function(srcPtr, RSB_FUNC_DIGIN, 0);
+	         }
+         }
+      }
+   }
+
+	// delay long enough for 4 prescalar clock cycles on the RIO
+   #asm __nodebug
+   	BL_RIO_DELAY(4)
+   #endasm
+
+   if (rc < 0){ BL_ERROR(rc); }  // check for errors
+   return rc;
+}
+
+/*** BeginHeader globalSync */
+int globalSync(void);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+globalSync																	<BL4S1xx.LIB>
+
+SYNTAX:    int globalSync(void)
+
+DESCRIPTION:	Sends a single pulse to the global sync inputs of all
+               RIO chips.
+
+               Note: When synchronizing more than one block to the
+               same sync signal (global or external), each block has its
+               own independent edge detection circuit.  These circuits
+               will sync to the edge within plus or minus one count of
+               the block's current clock source (main or prescale).
+               This means synchronized blocks may have a small offset
+               when compared to each other.
+
+RETURN VALUE:  0 on success
+               -EPERM: brdInit was not run before calling this function
+
+SEE ALSO:		brdInit
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+int globalSync(void)
+{
+#ifndef BL_LIMIT_ERRORS
+	if(!__brdInitFlag)
+	{
+		// the brdInit function hasn't been executed
+      return -EINVAL;
+	}
+#endif
+
+	// Generating a rising edge for edge trigger
+   SET_GS(0);
+   SET_GS(1);
+	// delay long enough for 3 prescalar clock cycles on the RIO
+	#asm __nodebug
+		BL_RIO_DELAY(3)
+   #endasm
+   SET_GS(0);
+
+   return 0;
+}
+
+//////////////////////////////
+// Digital Output Functions //
+//////////////////////////////
+
+/*** BeginHeader setDigOut */
+int setDigOut(int channel, int state);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+setDigOut																	<BL4S1xx.LIB>
+
+SYNTAX:     	int setDigOut(int channel, int state)
+
+DESCRIPTION:   Configures the output channel as a simple digital output.
+               The output state of the channel is also initialized to
+               logic 0 or logic 1 based on the state parameter.  The
+               digOut function should be used to control the output
+               state after configuration as it is more efficient.
+					This function is non-reentrant.
+
+PARAMETER1:	 	Digital output channel 0 - 7.
+
+PARAMETER2:		Set output to one of the following states:
+              	0 = Connects the load to GND.
+            	1 = Puts the output in a high-impedance state.
+
+RETURN VALUE:	0 on success.
+               -EINVAL: invalid parameter value
+
+SEE ALSO: 		brdInit, digOut, digOutBank
+
+END DESCRIPTION **********************************************************/
+
+_bl_nodebug
+int setDigOut(int channel, int state)
+{
+   auto struct RSB_IOpin *chPtr;
+   auto int rc;
+
+#ifndef BL_LIMIT_ERRORS
+	if(!__brdInitFlag || channel < 0 ||	channel >= BL_DIGITAL_OUT)
+	{
+		// the brdInit function hasn't been executed or channel invalid
+      BL_ERROR(-EINVAL);
+	}
+#endif
+
+   chPtr = DO_PIN(channel);
+
+	// set state of the channel
+	rc = _riosbc_set_pin(chPtr, state);
+   if (rc < 0){ BL_ERROR(rc); }  // check for errors
+
+	// set function of the channel
+   rc = _riosbc_set_function(chPtr, RSB_FUNC_DIGOUT, 0);
+   if (rc){ BL_ERROR(rc); }  // check for errors
+
+   return rc;
+}
+
+/*** BeginHeader digOut */
+int digOut(int channel, int state);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+digOut																		<BL4S1xx.LIB>
+
+SYNTAX:     	int digOut(int channel, int state)
+
+DESCRIPTION:   Sets the state of a configurable Digital Out channel
+					DOut0–DOut7 to a logic 0 or a logic 1. This function will
+               only allow control of channels that are configured to be a
+               general digital output by the setDigOut function.
+               This function is non-reentrant.
+
+PARAMETER1:	 	Digital output channel 0 - 7.
+
+PARAMETER2:		Set output to one of the following states:
+              	0 = Connects the load to GND.
+            	1 = Puts the output in a high-impedance state.
+
+RETURN VALUE:	0 on success.
+               -EINVAL: invalid parameter value
+               -EPERM:  pin function not set to digital output
+
+SEE ALSO: 		brdInit, setDigOut, digOutBank
+
+END DESCRIPTION **********************************************************/
+
+_bl_nodebug
+int digOut(int channel, int state)
+{
+	auto int rc;
+#ifndef BL_LIMIT_ERRORS
+ 	if(!__brdInitFlag  || channel < 0 || channel >= BL_DIGITAL_OUT)
+   {
+      // the brdInit function hasn't been executed or channel invalid
+      BL_ERROR(-EINVAL);
+   }
+   if (DO_PIN(channel)->function != RSB_FUNC_DIGOUT)
+   {
+      // Pin is not set to digital output function
+      BL_ERROR(-EPERM);
+   }
+#endif
+
+	// set state of the RIO based channel and return
+   rc = _riosbc_set_pin(DO_PIN(channel), state);
+   if (rc < 0){ BL_ERROR(rc); }  // check for errors
+
+   return rc;
+}
+
+/*** BeginHeader digOutBank */
+int digOutBank(int bank, int data);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+digOutBank																	<BL4S1xx.LIB>
+
+SYNTAX:     	int digOutBank(int bank, int data)
+
+DESCRIPTION:   Sets the state (logic 0 or logic 1) of a bank of 8
+               digital output pins to the states contained in 'data'.
+               This function only updates the channels that are
+               configured to be digital outputs by the setDigOut
+               function. Channels configured to other functions will
+               not be affected.
+               This function is non-reentrant.
+
+PARAMETER1:		Bank of digital output channels being set.  Only bank 0 is
+					supported.
+
+PARAMETER2:		Data value to be written to the specified digital output
+					bank, the data format and bitwise value is as follows:
+
+					Data    Bank
+               Bits     0
+               --------------
+         (LSB) D0  ->  DOut0
+               D1  ->  DOut1
+               D2  ->  DOut2
+               D3  ->  DOut3
+               D4  ->  DOut4
+               D5  ->  DOut5
+               D6	 ->  DOut6
+         (MSB) D7	 ->  DOut7
+
+               Bitwise value:
+               --------------
+               0 = Connects the load to GND.
+            	1 = Puts the output in a high-impedance state.
+
+RETURN VALUE:  0 on success
+					-EINVAL if parameter invalid or board not initialized
+
+SEE ALSO: 		brdInit, digOut, setDigOut
+
+END DESCRIPTION **********************************************************/
+
+_bl_nodebug
+int digOutBank(int bank, int data)
+{
+
+#ifndef BL_LIMIT_ERRORS
+ 	if(!__brdInitFlag || bank != 0)
+	{
+   	// the brdInit function hasn't been executed or bank invalid
+      BL_ERROR(-EINVAL);
+   }
+#endif
+
+   _riosbc_set_block(DO_PIN(0), ((data & 0x03) << 2) | 0xC0);
+   _riosbc_set_block(DO_PIN(2),  (data & 0x0C) 		  | 0xC0);
+   _riosbc_set_block(DO_PIN(4), ((data & 0x30) >> 2) | 0xC0);
+   _riosbc_set_block(DO_PIN(6), ((data & 0xC0) >> 4) | 0xC0);
+   return 0;
+}
+
+/*** BeginHeader setPWM */
+int setPWM(int channel, float frequency, float duty, int invert, int bind);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+setPWM																		<BL4S1xx.LIB>
+
+SYNTAX:    int setPWM(int channel, float frequency, float duty,
+							   int invert, int bind)
+
+DESCRIPTION:	Sets up a Pulse Width Modulated (PWM) signal on the ouput
+					channel with the specified frequency and duty cycle. The
+               output of the PWM can be inverted. The duty of the PWM can
+               be bound to a PWM/PPM on another channel on the same RIO
+               block so that they share an edge.
+
+PARAMETER1:		Digital Output channel to use for PWM.
+
+PARAMETER2:    Frequency of the PWM in Hz.  Should be in the range (2Hz-50kHz)
+               Use -1 to preserve the existing frequency on the RIO block.
+
+PARAMETER3:    Duty cycle of the PWM.  Should be in the range [0-100] percent.
+               Use -1 and bind to use bound edge to set the duty.
+               NOTE: A 0% or 100% duty will produce the smallest or largest duty
+                     possible, which is 1 count (smallest) or the limit register
+                     minus one count (largest). If you need a true 0% or 100%
+                     duty, use setDigOut, or pulseDisable to set a steady state.
+
+PARAMETER4:    Whether the PWM is inverted.  Normal starts with the output
+					high and inverted starts with the output low.
+										  __       __
+					0: noninverted	 |  |_____|  |_____|
+               				        _____    _____
+               1: inverted		 |__|     |__|     |
+
+PARAMETER5:    Use BL_BIND_LEAD or BL_BIND_TRAIL ORed with another digital
+					output channel hosted by the same RIO and block to enable
+               binding for the trailing edge of the PWM on this channel.
+               Bindings allow PWMs and PPMs to align their leading and trailing
+               edges.  Note that PWM's only allow binding to their trailing
+               edge.
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+               -EPERM:  pin type does not permit this function
+               -EACCES: resource needed by this function is not available
+               -EFAULT: internal data fault detected
+               positive number: Mode Conflict - See Appendix xx
+
+SEE ALSO:		brdInit, setFreq, setDuty, setSyncIn, setSyncOut, pulseEnable,
+					pulseDisable, setPPM
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+int setPWM(int channel, float frequency, float duty, int invert, int bind)
+{
+	auto int rc;
+
+#ifndef BL_LIMIT_ERRORS
+ 	if(!__brdInitFlag || channel < 0 || channel >= BL_DIGITAL_OUT
+   	|| duty > 100)
+	{
+	   // the brdInit function hasn't been executed or channel invalid
+      BL_ERROR(-EINVAL);
+   }
+#endif
+
+   rc = _setPxM(DO_PIN(channel), RSB_FUNC_PWM, frequency, 0, duty, invert,
+			           0, bind);
+   if (rc < 0){ BL_ERROR(rc); }  // check for errors
+
+   return rc;
+}
+
+/*** BeginHeader setPPM */
+int setPPM(int channel, float frequency, float offset, float duty, int invert,
+			  int bind_offset, int bind_duty);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+setPPM			  															<BL4S1xx.LIB>
+
+SYNTAX:    int setPPM(int channel, float frequency, float offset,
+					float duty,	int invert, int bind_offset, int bind_duty)
+
+DESCRIPTION:   Sets up a Pulse Position Modulation (PPM) signal on the
+					ouput channel with the specified frequency and duty cycle.
+               The output of the PPM can be inverted. The offset and duty
+               of the PPM can be bound to a PWM/PPM on another channel on
+               the same RIO block so that they share an edge.
+
+PARAMETER1:		Digital output channel to use for PPM.
+
+PARAMETER2:    Frequency of the PPM.  Should be in the range (2Hz-50kHz).
+					Use -1 to preserve the existing frequency on the RIO block.
+
+PARAMETER3:    Offset of the PPM.  Should be in the range [0-100] percent.
+					Use -1 and bind_offset to use bound edge to set the offset.
+               NOTE: A zero offset will produce the smallest offset
+                     possible which is one count. If you must have
+                     a zero offset, use setPWM instead of setPPM.
+
+PARAMETER4:    Duty cycle of the PPM.  Should be in the range [0-100] percent.
+					Use -1 and bind_duty to use bound edge to set the duty.
+
+               Note: PPM will not wrap around period of PPM.  If offset is
+               set to 25%, duty in range 75-100% will have the same effect.
+					The same waveform as a wrapped PPM can be created using
+               an inverted PWM.
+               Offset = 25%, duty = 75-100%
+                  ________    ________    ________
+               __|        |__|        |__|        |
+
+PARAMETER5:    Whether the PPM is inverted.  Normal will start low, go
+					high at the offset and stay high for the duration of the
+               duty.  Inverted will start high, go low at the offset
+               and stay low for the duration of the duty.
+										    __      __
+					0: noninverted	 __|  |____|  |____|
+               				    __    ____    ____
+               1: inverted		   |__|    |__|    |
+
+PARAMETER6:    Use BL_BIND_LEAD or BL_BIND_TRAIL ORed with another digital
+					output channel hosted by the same RIO and block to enable
+               binding for the leading edge of the PPM on this channel.
+               Bindings allow PWMs and PPMs to align their leading and trailing
+               edges.
+
+PARAMETER7:    Use BL_BIND_LEAD or BL_BIND_TRAIL ORed with another digital
+					output channel hosted by the same RIO and block to enable
+               binding for the trailing edge of the PPM on this channel.
+               Bindings allow PWMs and PPMs to align their leading and trailing
+               edges.
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+               -EPERM:  pin type does not permit this function
+               -EACCES: resource needed by this function is not available
+               -EFAULT: internal data fault detected
+               positive number: Mode Conflict - See Appendix xx
+
+SEE ALSO:		brdInit, setFreq, setOffset, setDuty, setSyncIn, setSyncOut,
+					pulseEnable, pulseDisable, setPWM
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+int setPPM(int channel, float frequency, float offset, float duty, int invert,
+			  int bind_offset, int bind_duty)
+{
+	auto int rc;
+
+#ifndef BL_LIMIT_ERRORS
+ 	if(!__brdInitFlag || channel < 0 || channel >= BL_DIGITAL_OUT ||
+   	duty > 100 || offset > 100)
+	{
+   	// the brdInit function hasn't been executed or channel invalid
+      BL_ERROR(-EINVAL);
+   }
+#endif
+
+   rc = _setPxM(DO_PIN(channel), RSB_FUNC_PPM, frequency, offset, duty,
+			           invert, bind_offset, bind_duty);
+   if (rc < 0){ BL_ERROR(rc); }  // check for errors
+
+   return rc;
+}
+
+/*** BeginHeader _setPxM */
+int _setPxM(struct RSB_IOpin* chPtr, int function, float frequency,
+				float offset, float duty, int mode,int bind_offset, int bind_duty);
+/*** EndHeader */
+
+/**************************************************************************
+ Internal function for setting of PWM and PPM outputs on any RIO-based
+ pin.  Uses mostly the same parameters as setPPM, with the exception of
+ the first 2 parameters.  The chPtr is a pointer to the RIO-based pin to
+ setup the PWM/PPM function on.  This can be any output capable RIO pin.
+ The function parameter must be set to RSB_FUNC_PWM or RSB_FUNC_PPM.
+ The offset and bind_offset parameters should be set to zero if the
+ function is set to RSB_FUNC_PWM.  For non-PushPull pins, the mode
+ parameter is simply the inversion flag.  Otherwise, it defines the two
+ states for the on and off segments of the PWM/PPM signal.
+**************************************************************************/
+_bl_nodebug
+int _setPxM(struct RSB_IOpin* chPtr, int function, float frequency,
+				float offset, float duty, int mode,int bind_offset, int bind_duty)
+{
+   auto struct RSB_IOpin *bindPtr;
+   auto struct _RSB_BLOCK_USE *use;
+   auto long freq_calc, offset_calc, duty_calc;
+   auto word rsb_mode;
+   auto int rc;
+   auto int flags;  // this variable is used in _riosbc_set_function
+   auto char i;
+   auto float freq_ratio;
+
+   // save a pointer to the channel's block usage for later
+   use = &(rsb_rio[chPtr->index].block[chPtr->block2]);
+   rsb_mode = 0;
+
+   if (mode)
+   {
+		// set inversion in rsb_mode
+   	rsb_mode |= RSB_PWM_INVERT;
+   }
+
+   // calculate frequency, or use existing frequency on the block, in +1 state
+   if (frequency < 0)
+   {
+   	// use the existing frequency on the block
+      if (use->mode & RSB_MODE_PRESCALE)
+      {
+      	rsb_mode |= BL_PRESCALE;
+      }
+      freq_calc = use->clr + 1;
+	}
+   else if (frequency > RIO_CLOCK_FREQ / 65536.0)
+   {
+      if (frequency >= BL_PWM_MAX_FREQ)
+      {
+         // Clamp to the maximum frequency
+         freq_calc = (long) ((RIO_CLOCK_FREQ / BL_PWM_MAX_FREQ) + 0.5);
+      }
+      else
+      {
+         // Calculate limit value for desired frequency from main clock
+         freq_calc = (long) ((RIO_CLOCK_FREQ / frequency) + 0.5);
+      }
+   }
+   else
+   {
+      // set source for block clock to prescaled RIO clock
+      rsb_mode |= BL_PRESCALE;
+	   if (frequency > BL_PWM_MIN_FREQ)
+	   {
+         // Calculate limit value for desired frequency from prescaled clock
+         freq_calc = (long) ((RIO_PRESCALE_FREQ / frequency) + 0.5);
+	   }
+      else
+      {
+         // Clamp to the minimum frequency
+         freq_calc = (long) ((RIO_PRESCALE_FREQ / BL_PWM_MIN_FREQ) + 0.5);
+	   }
+	}
+
+   if (! (bind_duty || bind_offset))
+   {
+#ifndef BL_LIMIT_ERRORS
+      if (duty < 0 || offset < 0)
+      {
+         // you have to have a duty assigned in the function call
+         // for a new PWM or a PWM that is no longer bound
+         return -EINVAL;
+      }
+#endif
+      flags = 0;
+   }
+   else
+   {
+	   if (bind_duty)
+	   {
+	      // precalculate some values
+	      bindPtr = DO_PIN(bind_duty & BL_BIND_PIN_MASK);
+
+	      if (bindPtr->block2 != chPtr->block2)
+	      {
+	         // the bind channel needs to be on the same block
+            BL_ERROR(-EINVAL);
+	      }
+
+	      if (bind_duty & BL_BIND_LEAD)
+	      {
+	         // we are binding to the lead edge of a PPM
+            if (bindPtr->function != RSB_FUNC_PPM)
+	         {
+	            // the binding channel must be a PPM
+               return -EINVAL;
+	         }
+
+	         // calculate the match register used for binding
+	         flags = 0x04 | ((bindPtr->match & 0x18) >> 3);
+	      }
+         else if (bind_duty & BL_BIND_TRAIL)
+	      {
+	         // we are binding to the trailing edge of a PPM or PWM
+            if (bindPtr->function != RSB_FUNC_PPM &&
+	             bindPtr->function != RSB_FUNC_PWM)
+	         {
+	            // the binding channel must be a PPM or PWM
+               return -EINVAL;
+	         }
+
+	         // calculate the match register used for binding
+	         flags = 0x04 | (bindPtr->match & 0x03);
+	      }
+         else
+         {
+	         // we are not binding to any edge?
+            return -EINVAL;
+	      }
+	   }
+      else
+      {
+         if (duty < 0) { return -EINVAL; }
+		   flags = 0;
+      }
+	   if (bind_offset)
+	   {
+	      // precalculate some values
+	      bindPtr = DO_PIN(bind_offset & BL_BIND_PIN_MASK);
+
+         if (bindPtr->block2 != chPtr->block2)
+	      {
+	         // the bind channel needs to be on the same block
+            return -EINVAL;
+	      }
+
+	      if (bind_offset & BL_BIND_LEAD)
+	      {
+	         // we are binding to the lead edge of a PPM
+            if (bindPtr->function != RSB_FUNC_PPM)
+	         {
+	            // the binding channel must be a PPM
+               return -EINVAL;
+	         }
+
+	         // calculate the match register used for binding
+	         flags |= 0x20 | (bindPtr->match & 0x18);
+	      }
+         else if (bind_offset & BL_BIND_TRAIL)
+	      {
+	         // we are binding to the trailing edge of a PPM or PWM
+            if (bindPtr->function != RSB_FUNC_PPM &&
+	             bindPtr->function != RSB_FUNC_PWM)
+	         {
+	            // the binding channel must be a PPM or PWM
+               return -EINVAL;
+	         }
+
+	         // calculate the match register used for binding
+	         flags |= 0x20 | ((bindPtr->match & 0x03) << 3);
+	      }
+         else
+         {
+	         // we are not binding to any edge?
+            return -EINVAL;
+	      }
+	   }
+      else
+      {
+         if (offset < 0) { return -EINVAL; }
+      }
+	}
+
+   // Note: offset_calc will be actual offset count + 1 for calculations.
+   if (offset < 0)
+   {
+      // base the offset on the offset of the current matching register
+      offset_calc = (long) use->mx[(flags & 0x18)>> 3] + 1;
+   }
+   else
+   {
+      // calculate the offset, in +1 state
+      offset_calc = (long) ((offset * 0.01) * freq_calc + 0.5);
+   }
+
+   // Note: duty_calc will be actual duty count + 1 for calculations.
+   if (duty < 0)
+   {
+      // base the duty on the duty of the current matching register, in +1 state
+      duty_calc = (long) use->mx[flags & 0x03] + 1;
+   }
+   else
+   {
+      // calculate the duty, with the offset, in +1 state
+      duty_calc = (long) (((duty * 0.01) * freq_calc + 0.5) + offset_calc);
+   }
+
+   // watch for overflow on the duty
+	if (function == RSB_FUNC_PWM)
+   {
+	   // watch for duty <= 0
+	   if (duty_calc <= 0)
+	   {
+	      duty_calc = 1;
+	   }
+
+   	// duty must be less than the limit (freq_calc) for PWM
+      if (duty_calc >= freq_calc)
+      {
+         duty_calc = freq_calc - 1;
+      }
+   }
+   else
+   {
+	   // make sure offset is in plus one state, when it is a zero.
+	   if (offset_calc < 1)
+	   {
+	      offset_calc = 1;
+	   }
+
+	   // make sure the offset leaves room for the duty
+	   if (offset_calc >= freq_calc)
+	   {
+	      offset_calc = freq_calc - 1;
+	   }
+
+	   // watch for duty <= offset, will give an unexpected signal
+	   if (duty_calc <= offset_calc)
+	   {
+	      duty_calc = offset_calc + 1;
+	   }
+
+   	// duty must be less than or equal to the limit (freq_calc) for PPM
+      if (duty_calc > freq_calc)
+      {
+         duty_calc = freq_calc;
+      }
+	}
+
+   rc = _riosbc_set_function(chPtr, function, flags);
+   if (rc){ BL_ERROR(rc); }  // check for errors
+
+   // set all calculated variables to final values (not +1 state).
+	--freq_calc;
+   --offset_calc;
+	--duty_calc;
+
+   // set frequency of the block
+   if (freq_calc != use->clr)
+   {
+	   // calculate ratio
+	   freq_ratio = ((float) (freq_calc + 1)) / ((float) use->clr + 1);
+
+      rc = _riosbc_set_limit(chPtr, (unsigned) freq_calc);
+      if (rc < 0){ BL_ERROR(rc); }  // check for errors
+
+	   // rescale the offset and duty of all of the PWMs and PPMs
+	   for (i = 0; i < 4; ++i)
+	   {
+       	// update the match register if it is used by another PWM or PPM.
+	      if (use->mx_use[i] && use->mx_use[i] != _rsb_bitmap[chPtr->bit2])
+	      {
+	         _riosbc_set_block_pair(0, chPtr->block2, RSB_MATCH0 + (i << 1),
+	         		(unsigned) ((freq_ratio * ((float)use->mx[i] + 1)) - 0.5),
+	               &(use->mx[i]));
+	      }
+	   }
+   }
+
+   if (function == RSB_FUNC_PWM)
+   {
+       // Setup PWM output on the configurable I/O channel
+       rc = _riosbc_set_pwm(chPtr, (unsigned) duty_calc, rsb_mode);
+      if (rc < 0){ BL_ERROR(rc); }  // check for errors
+   }
+   else
+   {
+		// Setup PPM output on the configurable I/O channel
+   	rc = _riosbc_set_ppm(chPtr, (unsigned) offset_calc, (unsigned) duty_calc,
+      							rsb_mode);
+      if (rc < 0){ BL_ERROR(rc); }  // check for errors
+   }
+
+   return rc;
+}
+
+
+/*** BeginHeader setFreq */
+int setFreq(int channel, float frequency);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+setFreq			  															<BL4S1xx.LIB>
+
+SYNTAX:    int setFreq(int channel, float frequency)
+
+DESCRIPTION:	Sets the frequency of all of the PWMs or PPMs on the same
+					block as the channel.  Will preserve the duty and offset
+               percentages for all of the channels on the same block.
+
+PARAMETER1:		All channels on the same block as the channel parameter will
+					have their frequency set.  Duty and offset percentages will
+               be maintained.
+
+PARAMETER2:    Frequency of the PWMs and PPMs.  Should be in the range
+					(2Hz-50KHz)
+					Use -1 to preserve the existing frequency on the RIO block.
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+
+SEE ALSO:		brdInit, setPWM, setPPM, setOffset, setDuty, setSyncIn,
+					setSyncOut, pulseEnable, pulseDisable
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+int setFreq(int channel, float frequency)
+{
+	auto struct RSB_IOpin* chPtr;
+   auto struct _RSB_BLOCK_USE *use;
+   auto char i;
+   auto char block;
+   auto long freq_calc;
+   auto char mode;
+   auto float freq_ratio;
+   auto int rc;
+
+#ifndef BL_LIMIT_ERRORS
+ 	if(!__brdInitFlag || channel < 0 || channel >= BL_DIGITAL_OUT)
+	{
+      BL_ERROR(-EINVAL);
+   }
+#endif
+
+	// get pointer to channel
+   chPtr = DO_PIN(channel);
+
+   // save a pointer to the channel's block usage for later
+   use = &(rsb_rio[0].block[chPtr->block2]);
+
+   // calculate frequency, or use existing frequency on the block, in +1 state
+   if (frequency <= 0)
+   {
+   	// use the existing frequency on the block
+      return 0;
+	}
+   else if (frequency > RIO_CLOCK_FREQ / 65536.0)
+   {
+   	mode = 0; // use the main RIO clock
+      if (frequency >= BL_PWM_MAX_FREQ)
+      {
+         // Clamp to the maximum frequency
+         freq_calc = (long) ((RIO_CLOCK_FREQ / BL_PWM_MAX_FREQ) + 0.5);
+      }
+      else
+      {
+         // Calculate limit value for desired frequency from main clock
+         freq_calc = (long) ((RIO_CLOCK_FREQ / frequency) + 0.5);
+      }
+   }
+   else
+   {
+      // set source for block clock to prescaled RIO clock
+      mode = 1; // use the prescaled RIO clock
+	   if (frequency > BL_PWM_MIN_FREQ)
+	   {
+         // Calculate limit value for desired frequency from prescaled clock
+         freq_calc = (long) ((RIO_PRESCALE_FREQ / frequency) + 0.5);
+	   }
+      else
+      {
+         // Clamp to the minimum frequency
+         freq_calc = (long)((RIO_PRESCALE_FREQ / BL_PWM_MIN_FREQ) + 0.5);
+	   }
+	}
+
+   // store block of channel
+   block = chPtr->block2;
+
+   // calculate ratio
+   freq_ratio = ((float) freq_calc) / (((float) use->clr) + 1);
+
+   // rescale the offset and duty of all of the PWMs and PPMs
+   // Note: this will have rounding errors and may have other consequences.
+   for (i = 0; i < 4; ++i)
+   {
+      // update the match register if it is used by another PWM or PPM.
+      if (use->mx_use[i])
+      {
+    		_riosbc_set_block_pair(0, block, RSB_MATCH0 + (i << 1),
+         				(unsigned) (freq_ratio * ((float)use->mx[i] + 1) - 0.5),
+                     &(use->mx[i]));
+      }
+   }
+
+   // set mode of block to incorporate whether the prescalar is used
+   if (mode && (use->mode | ~RSB_MODE_PRESCALE))
+   {
+   	// prescalar needs to be set
+	   _riosbc_set_block_reg(0, block, RSB_MODE,
+	   						use->mode | RSB_MODE_PRESCALE,
+	                     &(use->mode));
+	}
+   else if (!mode && (use->mode & RSB_MODE_PRESCALE))
+   {
+    	// prescalar needs to be cleared
+	   _riosbc_set_block_reg(0, block, RSB_MODE,
+	   						use->mode & ~RSB_MODE_PRESCALE,
+	                     &(use->mode));
+   }
+
+   // set block frequency
+   rc = _riosbc_set_limit(chPtr, (unsigned) (freq_calc - 1));
+	if (rc < 0){ BL_ERROR(rc); }  // check for errors
+
+	return rc;
+}
+
+/*** BeginHeader setDuty */
+int setDuty(int channel, float duty);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+setDuty			  															<BL4S1xx.LIB>
+
+SYNTAX:    int setDuty(int channel, float duty)
+
+DESCRIPTION:	Sets the duty of the PWM or PPM on the digital output
+					channel.  Will affect any PWM/PPM which has been bound
+               to this channel's trailing edge.
+
+PARAMETER1:		Digital output channel that is configured as a PWM or PPM that
+					is getting its duty set (0-7).
+
+PARAMETER2:    Duty of the PWM/PPM.  Should be in the range [0-100] percent.
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+               -EPERM:  channel function does not permit this operation
+
+SEE ALSO:  brdInit, setPWM, setPPM, setOffset, setFreq, setSyncIn, setSyncOut,
+				pulseEnable, pulseDisable
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+int setDuty(int channel, float duty)
+{
+	auto struct RSB_IOpin* chPtr;
+   auto struct _RSB_BLOCK_USE *use;
+   auto long offset_calc, freq_calc, duty_calc;
+   auto int rc;
+
+#ifndef BL_LIMIT_ERRORS
+ 	if(!__brdInitFlag || channel < 0 || channel >= BL_DIGITAL_OUT
+   	|| duty > 100)
+	{
+      BL_ERROR(-EINVAL);
+   }
+#endif
+
+	// get pointer to channel
+   chPtr = DO_PIN(channel);
+
+   // save a pointer to the channel's block usage for later
+   use = &(rsb_rio[chPtr->index].block[chPtr->block2]);
+
+   if (chPtr->function == RSB_FUNC_PPM)
+   {
+   	// lookup offset in +1 state.
+   	offset_calc = (long) use->mx[(chPtr->match & 0x18) >> 3] + 1;
+   }
+   else if (chPtr->function == RSB_FUNC_PWM)
+   {
+   	offset_calc = 0;
+   }
+   else
+   {
+      BL_ERROR(-EPERM);
+   }
+
+	// get the current limit for the block, in +1 state.
+   freq_calc = (long) use->clr + 1;
+
+   // calculate the new duty value, in +1 state.
+   duty_calc = offset_calc + (long) ((duty * 0.01) * freq_calc + 0.5);
+
+   // watch for overflow on the duty
+	if (chPtr->function == RSB_FUNC_PWM)
+   {
+	   // watch for duty <= 0
+	   if (duty_calc <= 0)
+	   {
+	      duty_calc = 1;
+	   }
+
+   	// duty must be less than the limit (freq_calc) for PWM
+      if (duty_calc >= freq_calc)
+      {
+         duty_calc = freq_calc - 1;
+      }
+   }
+   else
+   {
+	   // watch for duty <= offset, will give an unexpected signal
+	   if (duty_calc <= offset_calc)
+	   {
+	      duty_calc = offset_calc + 1;
+	   }
+
+   	// duty must be less than or equal to the limit (freq_calc) for PPM
+      if (duty_calc > freq_calc)
+      {
+         duty_calc = freq_calc;
+      }
+	}
+
+   rc = _riosbc_set_match(chPtr, chPtr->match & 0x03,
+   							  (unsigned) (duty_calc - 1));
+   if (rc < 0){ BL_ERROR(rc); }  // check for errors
+
+	return rc;
+}
+
+/*** BeginHeader setOffset */
+int setOffset(int channel, float offset);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+setOffset		  															<BL4S1xx.LIB>
+
+SYNTAX:    int setOffset(int channel, float offset)
+
+DESCRIPTION:	Sets the offset of the PPM on the channel.  This function
+					will not affect the position of the trailing edge of the
+               PPM and so will change the duty percentage of the PPM.  If
+               the offset is set past the current position of the trailing
+               edge of the PPM (set by the duty), the PPM will start at
+               the offset and wrap around to the position of what was the
+               trailing edge.  Will affect any PWM/PPM which has been bound
+               to this channel's leading edge.
+
+PARAMETER1:		Digital output channel with PPM that is getting its offset set.
+
+PARAMETER2:    Offset of the PPM.  Should be in the range [0-100] percent.
+               NOTE: A zero offset will produce the smallest offset
+                     possible which is one count. If you must have
+                     a zero offset, use setPWM instead of setPPM.
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+               -EPERM:  channel functionality does not permit this operation
+
+SEE ALSO:		brdInit, setPWM, setPPM, setFreq, setDuty, setSyncIn, setSyncOut,
+					pulseEnable, pulseDisable
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+int setOffset(int channel, float offset)
+{
+	auto struct RSB_IOpin* chPtr;
+   auto struct _RSB_BLOCK_USE *use;
+   auto int rc;
+   auto long duty_calc, offset_calc, freq_calc;
+
+#ifndef BL_LIMIT_ERRORS
+ 	if(!__brdInitFlag || channel < 0 || channel >= BL_DIGITAL_OUT
+   	|| offset > 100)
+	{
+      BL_ERROR(-EINVAL);
+   }
+#endif
+
+	// get pointer to channel
+   chPtr = DO_PIN(channel);
+
+   // save a pointer to the channel's block usage for later
+   use = &(rsb_rio[chPtr->index].block[chPtr->block2]);
+
+#ifndef BL_LIMIT_ERRORS
+	if (chPtr->function != RSB_FUNC_PPM)
+   {
+      BL_ERROR(-EPERM);
+   }
+#endif
+
+   // lookup value of limit register, in +1 state.
+   freq_calc = (long) use->clr + 1;
+
+   // calculate offset, in +1 state
+   offset_calc = (long) (freq_calc * (offset * 0.01) + 0.5);
+
+   // make sure the offset leaves room for the duty
+   if (offset_calc >= freq_calc)
+   {
+   	offset_calc = freq_calc - 1;
+   }
+   else if (offset_calc < 1)
+   {
+   	offset_calc = 1;
+   }
+
+   // lookup value of duty in +1 state.
+   duty_calc = (long) use->mx[chPtr->match & 0x03] + 1;
+
+   // watch for duty <= offset, will give an unexpected signal
+   if (duty_calc <= offset_calc)
+   {
+   	duty_calc = offset_calc + 1;
+
+	   // update the PPM duty
+      rc = _riosbc_set_match(chPtr, chPtr->match & 0x03,
+      							  (unsigned) (duty_calc - 1));
+      if (rc < 0){ BL_ERROR(rc); }  // check for errors
+   }
+
+   // set PPM offset
+   rc = _riosbc_set_match(chPtr, (chPtr->match & 0x18) >> 3,
+   	  						  (unsigned) (offset_calc - 1));
+   if (rc < 0){ BL_ERROR(rc); }  // check for errors
+
+   return rc;
+}
+
+/*** BeginHeader pulseDisable */
+int pulseDisable(int channel, int state);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+pulseDisable	  															<BL4S1xx.LIB>
+
+SYNTAX:    int pulseDisable(int channel, int state)
+
+DESCRIPTION:   Disables a PWM/PPM output and sets the output to the state.
+				   Pin can be restored to the same PWM/PPM operation as before
+               by calling pulseEnable.
+
+PARAMETER1:		Digital output channel that is getting its PWM/PPM
+					disabled.
+
+PARAMETER2:    State that the digital output will be set to (0/1).
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+               -EPERM:  channel function does not permit this operation
+
+SEE ALSO:  brdInit, setPWM, setPPM, pulseEnable
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+int pulseDisable(int channel, int state)
+{
+	auto struct RSB_IOpin* chPtr;
+	auto int rc;
+
+#ifndef BL_LIMIT_ERRORS
+ 	if(!__brdInitFlag || channel < 0 || channel >= BL_DIGITAL_OUT)
+	{
+      BL_ERROR(-EINVAL);
+   }
+#endif
+
+	// get pointer to channel
+   chPtr = DO_PIN(channel);
+
+	// disable the PWM/PPM output
+   rc = _riosbc_pulse_disable(chPtr, state);
+   if (rc < 0){ BL_ERROR(rc); }  // check for errors
+
+   return rc;
+}
+
+/*** BeginHeader pulseEnable */
+int pulseEnable(int channel);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+pulseEnable		  															<BL4S1xx.LIB>
+
+SYNTAX:    int pulseEnable(int channel)
+
+DESCRIPTION:   Enables a disabled PWM/PPM output.  Pin is restored to
+               the same PWM/PPM operation as before being disabled.
+
+PARAMETER1:		Digital output channel that is getting its PWM/PPM
+					re-enabled. (0-7)
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+               -EPERM:  channel function does not permit this operation
+
+SEE ALSO:  brdInit, setPWM, setPPM, pulseDisable
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+int pulseEnable(int channel)
+{
+	auto struct RSB_IOpin* chPtr;
+	auto int rc;
+
+#ifndef BL_LIMIT_ERRORS
+ 	if(!__brdInitFlag || channel < 0 || channel >= BL_DIGITAL_OUT)
+	{
+      BL_ERROR(-EINVAL);
+   }
+#endif
+
+	// get pointer to channel
+   chPtr = DO_PIN(channel);
+
+	// disable the PWM/PPM output
+   rc = _riosbc_pulse_enable(chPtr, 0);
+   if (rc < 0){ BL_ERROR(rc); }  // check for errors
+
+   return rc;
+}
+
+/*** BeginHeader getMatch */
+int getMatch(int channel, int source);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+getMatch                        										<BL4S1xx.LIB>
+
+SYNTAX:    int getMatch(int channel, int source)
+
+DESCRIPTION:   Returns block match register usage for the given channel.
+               May optionally be filtered to specific sources by the
+               source parameter.
+
+PARAMETER1:    Output channel to get match information on.
+
+PARAMETER2:    Source filter
+                  BL_TRAIL_ONLY will filter only the 'Trail' match register
+                  BL_LEAD_ONLY will filter only the 'Lead' match register
+                   Note: Counters will only use the 'Trail' match register
+
+RETURN VALUE:  Bit Flags showing match usage on success:
+	                BL_IER_MATCH0 bit set if using Match register 0
+	                BL_IER_MATCH1 bit set if using Match register 1
+	                BL_IER_MATCH2 bit set if using Match register 2
+	                BL_IER_MATCH3 bit set if using Match register 3
+               OR
+                   -EINVAL: if invalid channel value
+
+SEE ALSO:      brdInit, setPWM, setPPM, setCounter
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+int getMatch(int channel, int source)
+{
+   auto struct RSB_IOpin *chPtr;
+   auto int rc;
+
+#ifndef BL_LIMIT_ERRORS
+   if(!__brdInitFlag || channel < 0 || channel >= BL_DIGITAL_OUT)
+   {
+      // the brdInit function hasn't been executed as of yet or channel invalid
+      BL_ERROR(-EINVAL);
+   }
+#endif
+
+   chPtr = DO_PIN(channel);     // get pointer to channel's pin struct
+
+   rc = 0;
+   if ((!source || source == BL_TRAIL_ONLY) && (chPtr->match & RSB_RES_MATCH0))
+   {
+      rc |= _rsb_bitmap[chPtr->match & 3];
+   }
+   if ((!source || source == BL_LEAD_ONLY) && (chPtr->match & RSB_SET_MATCH0))
+   {
+      rc |= _rsb_bitmap[(chPtr->match >> 3) & 3];
+   }
+   return rc;
+}
+
+/*** BeginHeader setSyncOut */
+int setSyncOut(int channel, int source, int edge);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+setSyncOut																	<BL4S1xx.LIB>
+
+SYNTAX:    int setSyncOut(int channel, int source, int edge)
+
+DESCRIPTION:	Sets the sync for the block the digital output channel is
+					associated with.
+
+               Note: When synchronizing more than one block to the
+               same sync signal (global or external), each block has its
+               own independent edge detection circuit.  These circuits
+               will sync to the edge within plus or minus one count of
+               the block's current clock source (main or prescale).
+               This means synchronized blocks may have a small offset
+               when compared to each other.
+
+PARAMETER1:		Output channel that is on the block that will have its
+					sync set.
+
+PARAMETER2:    Source of the sync signal.
+					-1 to use the RIO chip's Global Sync signal
+               OR Input capable channel to use as an external Sync signal
+
+PARAMETER3:    Edge of the sync signal.
+               BL_EDGE_RISE = Synchronize event on rising edge
+               BL_EDGE_FALL = Synchronize event on falling edge
+               BL_EDGE_BOTH = Synchronize events on both edges
+               OR        0  = Remove Sync on this block
+                                (if source of external sync is given,
+                                 it will be set to a digital input)
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+               -EPERM:  pin type does not permit this function
+               -EACCES: resource needed by this function is not available
+               -EFAULT: internal data fault detected
+
+SEE ALSO:		brdInit, setSyncIn
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+int setSyncOut(int channel, int source, int edge)
+{
+   auto struct RSB_IOpin *chPtr, *srcPtr;
+   auto int rc;
+
+#ifndef BL_LIMIT_ERRORS
+	if(!__brdInitFlag || channel < 0 || channel >= BL_DIGITAL_OUT
+            || source >= BL_DIGITAL_IN || (edge & (~BL_EDGE_BOTH)))
+	{
+		// the brdInit function hasn't been executed or source/edge or channel
+      // invalid
+      BL_ERROR(-EINVAL);
+	}
+#endif
+
+   chPtr = DO_PIN(channel);		// get pointer to channel's pin struct
+
+   if (source < 0)
+   {
+   	if (edge)
+      {
+	      // Set global sync on host block of channel
+	      rc = _riosbc_block_sync(chPtr, edge | RSB_SEL_GLOBAL);
+		}
+      else
+      {
+	      // Turn off global sync on host block of channel
+	      rc = _riosbc_block_sync(chPtr, 0);
+      }
+   }
+   else
+   {
+      srcPtr = DI_PIN(source);   // get pointer to source pin struct
+
+      if (chPtr->block2 != srcPtr->block1)
+      {
+         // Channel and Source not hosted by same Block
+         BL_ERROR(-EINVAL);  // report error
+      }
+      if (edge)
+      {
+         rc = _riosbc_set_function(srcPtr, RSB_FUNC_SYNC, edge << 3);
+		}
+      else
+      {
+         // Verify source pin is an external sync input
+         if (srcPtr->function != RSB_FUNC_SYNC)
+         {
+            rc = -EINVAL;
+         }
+         else
+         {
+	         // Turn off external sync on host block of channel
+	         rc = _riosbc_block_sync(chPtr, 0);
+	         if(!rc)
+	         {
+	           // Set external sync pin to a digital input
+	           rc = _riosbc_set_function(srcPtr, RSB_FUNC_DIGIN, 0);
+	         }
+         }
+      }
+   }
+
+	// delay long enough for 4 prescalar clock cycles on the RIO
+   #asm __nodebug
+   	BL_RIO_DELAY(4)
+   #endasm
+
+   if (rc < 0){ BL_ERROR(rc); }  // check for errors
+   return rc;
+}
+
+/*** BeginHeader ledOut*/
+void ledOut(int led, int value);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+ledOut                              								<BL4S1xx.LIB>
+
+SYNTAX:			void ledOut(int led, int value);
+
+DESCRIPTION:	Placeholder to prevent compile-time errors.  There are
+					no LED's to blink on a BL4S1xx.
+
+PARAMETER:		N/A
+
+RETURN VALUE:	none.
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+void ledOut (int led, int value)
+{
+	#warnt "There are no LED's on a BL4S1xx to blink."
+}
+
+//////////////////////
+// Serial Functions //
+//////////////////////
+
+/*** BeginHeader serMode */
+int serMode(int mode);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+serMode			  															<BL4S1xx.LIB>
+
+SYNTAX:       	int serMode(int mode)
+
+DESCRIPTION:   This function sets serial interfaces to be used by your
+					application program. This function must be called after
+               executing the serXopen function(s) and before using any
+               of	the other serial port functions. This function is non-
+               reentrant.
+
+PARAMETER1:		Defines the serial port configuration, modes are as
+					follows.
+
+               Mode     Serial D        Serial F
+               ----     --------        --------
+               0        RS232, 3 wire   RS232, 3 wire
+               1        RS232, 5 wire
+
+RETURN VALUE:	0  = Valid mode selected.
+					-EINVAL: invalid mode setting
+
+SEE ALSO:		serX functions
+
+END DESCRIPTION **********************************************************/
+
+
+_bl_nodebug
+int serMode(int mode)
+{
+#ifndef BL_LIMIT_ERRORS
+ 	if(!__brdInitFlag)
+	{
+      BL_ERROR(-EINVAL);
+   }
+#endif
+
+#ifdef BL4S1XX_RS232
+	if (mode == 0)
+   {
+    	// set up 3-wire serial for serial port F
+		BitWrPortI(PEFR, &PEFRShadow, 1, 2);
+
+      // turn off flow control for serial D
+      serDflowcontrolOff();
+   }
+   else
+   {
+    	// set up 5-wire serial
+		BitWrPortI(PEFR, &PEFRShadow, 0, 2);
+
+		// enable flow control
+		serDflowcontrolOn();
+   }
+   return 0;
+#else
+	#error "No serial port on this SBC."
+	return -EINVAL;
+#endif
+}
+
+/////////////////////////////////
+// Interrupt Handler Functions //
+/////////////////////////////////
+
+/*** BeginHeader addISRIn */
+int addISRIn(int channel, int ier, void (*handler)());
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+addISRIn			  															<BL4S1xx.LIB>
+
+SYNTAX:			int addISRIn(int channel, int ier, void (*handler)())
+
+DESCRIPTION:	Adds an interrupt handler for the interrupts specified
+               in ier for the given RIO block hosting the given
+               input pin.  The ISR is always disabled when
+               created.  To enable the ISR, call enableISR.  The ISR
+               handler function is responsible for clearing the
+               interrupt(s) within the hosting RIO block when called.
+
+PARAMETER1:    Digital input channel to bind to ISR, 0 - 11.
+
+PARAMETER2:    ier - Bit mask of interrupt(s) this handler services
+                   BL_IER_DQE    - Decrement/Quadrature/End
+                   BL_IER_IIB    - Increment/Inphase/Begin
+                   BL_IER_ROLL_D - Counter rollover on decrement
+                   BL_IER_ROLL_I - Counter rollover on increment
+                   BL_IER_MATCH3 - Match 3 condition
+                   BL_IER_MATCH2 - Match 2 condition
+                   BL_IER_MATCH1 - Match 1 condition
+                   BL_IER_MATCH0 - Match 0 condition
+
+PARAMETER3:    handler - Pointer to the interrupt service function
+
+RETURNS:       On Success, returns the handler ID number (0..RSB_MAX_ISR-1)
+                -EINVAL  Invalid parameter given
+                -ENOSPC  No more room in ISR table (increase RSB_MAX_ISR)
+
+SEE ALSO:      addISROut, tickISR, enableISR, setIER
+
+END DESCRIPTION **********************************************************/
+
+_bl_nodebug
+int addISRIn(int channel, int ier, void (*handler)())
+{
+	auto int rc;
+	auto struct RSB_IOpin* chPtr;
+#ifndef BL_LIMIT_ERRORS
+   if (!__brdInitFlag || channel < 0 || channel >= BL_DIGITAL_IN)
+   {
+      BL_ERROR(-EINVAL);
+   }
+#endif
+
+   // set channel pointer for digital input
+   chPtr = DI_PIN(channel);
+
+   // setup the ISR function for the given channel
+   rc = _riosbc_add_isr(0, chPtr->block1, ier, handler);
+   if (rc < 0){ BL_ERROR(rc); }  // check for errors
+   return rc;
+}
+
+/*** BeginHeader addISROut */
+int addISROut(int channel, int ier, void (*handler)());
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+addISROut		  															<BL4S1xx.LIB>
+
+SYNTAX:			int addISROut(int channel, int ier, void (*handler)())
+
+DESCRIPTION:	Adds an interrupt handler for the interrupts specified
+               in ier for the given RIO block hosting the given
+               output pin.  The ISR is always disabled when
+               created.  To enable the ISR, call enableISR.  The ISR
+               handler function is responsible for clearing the
+               interrupt(s) within the hosting RIO block when called.
+
+PARAMETER1:    Digital output channel to bind to ISR, 0 - 7.
+
+PARAMETER2:    ier - Bit mask of interrupt(s) this handler services
+                   BL_IER_DQE    - Decrement/Quadrature/End
+                   BL_IER_IIB    - Increment/Inphase/Begin
+                   BL_IER_ROLL_D - Counter rollover on decrement
+                   BL_IER_ROLL_I - Counter rollover on increment
+                   BL_IER_MATCH3 - Match 3 condition
+                   BL_IER_MATCH2 - Match 2 condition
+                   BL_IER_MATCH1 - Match 1 condition
+                   BL_IER_MATCH0 - Match 0 condition
+
+PARAMETER3:    handler - Pointer to the interrupt service function
+
+RETURNS:       On Success, returns the handler ID number (0..RSB_MAX_ISR-1)
+                -EINVAL  Invalid parameter given
+                -ENOSPC  No more room in ISR table (increase RSB_MAX_ISR)
+
+SEE ALSO:      addISRIn, tickISR, enableISR, setIER
+
+END DESCRIPTION **********************************************************/
+
+_bl_nodebug
+int addISROut(int channel, int ier, void (*handler)())
+{
+	auto int rc;
+	auto struct RSB_IOpin* chPtr;
+
+#ifndef BL_LIMIT_ERRORS
+   if (!__brdInitFlag || channel < 0 || channel >= BL_DIGITAL_OUT)
+   {
+		BL_ERROR(-EINVAL);
+   }
+#endif
+
+   // set channel pointer for digital input
+   chPtr = DO_PIN(channel);
+
+   // setup the ISR function for the given channel
+   rc = _riosbc_add_isr(0, chPtr->block2, ier, handler);
+   if (rc < 0){ BL_ERROR(rc); }  // check for errors
+   return rc;
+}
+
+/*** BeginHeader setIER */
+int setIER(int isr_handle, int ier);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+setIER			  													    	<BL4S1xx.LIB>
+
+SYNTAX:     int setIER(int isr_handle, int ier)
+
+DESCRIPTION:	Sets the IER mask for an interrupt handler.  Note that
+               the interrupt handler must be currently disabled to set
+               the IER value.  Disabling the ISR can be done by calling
+               enableISR with a zero in the enable parameter.
+
+PARAMETER1:    isr_handle - Index to the desired ISR
+
+PARAMETER2:    ier - Bit mask of interrupts this handler services
+                     (Bit positions match RIO IER and Status registers)
+
+RETURNS:       0 on Success
+                -EINVAL  Invalid parameter given
+                -EPERM   Handler is enabled, can't change IER
+
+SEE ALSO:      addISRIn, addISROut, enableISR, tickISR
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+int setIER(int isr_handle, int ier)
+{
+	auto int rc;
+   rc = _riosbc_set_ier(isr_handle, ier);
+   if (rc < 0){ BL_ERROR(rc); }  // check for errors
+   return rc;
+}
+
+
+/*** BeginHeader enableISR */
+int enableISR(int isr_handle, int enable);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+enableISR		  															<BL4S1xx.LIB>
+
+SYNTAX:     int enableISR(int isr_handle, int enable)
+
+DESCRIPTION:	Enables or disables an interrupt handler.
+
+PARAMETER1:    isr_handle - Index to the desired ISR
+
+PARAMETER2:    enable - Non-zero enables the ISR, zero disables the ISR
+
+RETURNS:       0 on Success
+                -EINVAL  Invalid parameter given
+
+SEE ALSO:      addISRIn, addISROut, setIER, tickISR
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+int enableISR(int isr_handle, int enable)
+{
+	auto int rc;
+   rc = _riosbc_enable_isr(isr_handle, enable);
+   if (rc < 0){ BL_ERROR(rc); }  // check for errors
+   return rc;
+}
+
+
+/*** BeginHeader tickISR */
+void tickISR(void);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+tickISR			 															<BL4S1xx.LIB>
+
+SYNTAX:     void tickISR(void)
+
+DESCRIPTION:	Polls the RIO chip(s) for ISR events if interrupts are
+               not being used.  Any enabled ISR events will be passed
+               on to the appropriate ISR handler.
+
+SEE ALSO:      addISRIn, addISROut enableISR, setIER
+
+END DESCRIPTION **********************************************************/
+_rsb_debug
+void tickISR(void)
+{
+   _riosbc_process_irq();
+}
+
+
+//////////////////////
+// XBee Functions //
+//////////////////////
+
+/*** BeginHeader _zb_reset */
+void _zb_reset (int reset);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_zb_reset									  <BL4S1xx.LIB>
+
+SYNTAX:       	void _zb_reset(int reset)
+
+DESCRIPTION:   This function asserts the reset pin on the XBee using the RIO.
+               It is safe to call this function before brdInit.
+
+PARAMETER1:    Reset signal.
+					0 = Not Reset (set inactive high)
+               1 = Reset (set active low)
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+void _zb_reset (int reset)
+{
+   int addr;
+
+	if (!__brdInitFlag)
+   {
+       // If user hasn't called brdInit(), manually set up the necessary I/O
+       // lines to write to the RIO.
+       WrPortI(SPCR, &SPCRShadow, 0x8C);      //sets all bits to output
+       WrPortI(PBDDR, &PBDDRShadow, 0xFD);
+       WrPortI(PBDR,  &PBDRShadow,  0xFD);
+       WrPortI(RSB_IOBCR, NULL, RSB_IOBCV);
+       // CLK pin set to peripheral clock / 2
+       // STATUS and /WDTOUT normal; /BUFEN set high
+       WrPortI(GOCR,  &GOCRShadow,  0x43);
+
+      // Use direct write (without shadow) if board is not initialized
+      addr = bl_def[BL_RAD_BOOT_MODE_INDEX].rio +
+      	 (bl_def[BL_RAD_BOOT_MODE_INDEX].block2 << 1) + BL_IOBASE;
+      WrPortE(addr, NULL, RSB_PORT0 + bl_def[BL_RAD_BOOT_MODE_INDEX].bit2);
+      WrPortE(addr + 1, NULL,
+          ((reset ^ bl_def[BL_RAD_BOOT_MODE_INDEX].polarity)
+          ? RSB_USE_LOW : RSB_USE_HIGH));
+   }
+   else
+   {
+      // Use RIO library (with shadow) to assert /RESET on XBee
+      _riosbc_set_pin(&(rsb_pin[BL_RAD_BOOT_MODE_INDEX]), !reset);
+	}
+}
+
+/*** BeginHeader ads7870_power */
+void ads7870_power (int on);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+ads7870_power																  <BL4S1xx.LIB>
+
+SYNTAX:       	void ads7870_power (int on)
+
+DESCRIPTION:   This function turns the BL4S1xx SBC's ADS7870 ADC on and off.
+
+PARAMETER1:		0 = power off
+               1 = power on
+
+END DESCRIPTION **********************************************************/
+_bl_nodebug
+void ads7870_power (int on)
+{
+	// turn the ADS7870 ADC off by disabling its internal clock (set ADREFOSCREG
+	// to 0x00).  Turn it back on with 0x3C (enable clock, use 2.5V reference)
+	_ads7870command(WR_REG|BITS8|ADREFOSCREG, on ? 0x3C : 0x00);
+}
+
+//////////////////////////
+// Board Initialization //
+//////////////////////////
+
+/*** BeginHeader brdInit */
+void brdInit(void);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+brdInit			  															<BL4S1xx.LIB>
+
+SYNTAX:			void brdInit (void)
+
+DESCRIPTION:	This function initializes parallel ports A through E for
+					the BL4S1xx series SBCs.  It initializes the RIO and the
+               ADC as well.  This function must be called before calling
+               any of the other BL4S1xx functions.
+
+-------------------------------------------------------------------------------
+   General information and I/O initialization for the BL4S1xx.
+-------------------------------------------------------------------------------
+
+Port  Function				             I/O      I/O State
+====  ===========================   ======   ============================
+PA0   RIO_D0                        In/Out   Bus Data Line
+PA1   RIO_D1	                     In/Out   Bus Data Line
+PA2   RIO_D2	                     In/Out   Bus Data Line
+PA3   RIO_D3	                     In/Out   Bus Data Line
+PA4   RIO_D4	                     In/Out   Bus Data Line
+PA5   RIO_D5	                     In/Out   Bus Data Line
+PA6   RIO_D6	                     In/Out   Bus Data Line
+PA7   RIO_D7	                     In/Out   Bus Data Line
+
+PB0   PB0_SCLKB                     Output   High
+PB1   PB1_CLKA						      Input    Driven by PIC10F200
+PB2   RIO_PI	                     Output   Bus Address Line
+PB3   RIO_CHA0          	         Output   Bus Address Line
+PB4   RIO_CHA1                      Output   Bus Address Line
+PB5   RIO_CHA2                      Output   Bus Address Line
+PB6   RIO_/CS                       Output   Bus Address Line
+PB7   RIO_GC   			            Output   Bus Address Line
+
+PC0   TXD (RS232/RabbitNet/1-Wire)  Output   High
+PC1   RXD (RS232/RabbitNet/1-Wire)  Input    Pulled-up by core
+PC2   TXC (ADC_SDI)                 Output   High
+PC3   RXC (ADC_SDO)                 Input    Pulled-up by core
+PC4   TXB (serial flash)			   Output   High
+PC5   RXB (serial flash)				Input    Pulled-up by core
+PC6   TXA (Programing Cable)			Output   High
+PC7   RXA (Programing Cable)			Input    Pulled-up by core
+
+PD0   RNET_CLK   				         Output   Clock signal
+PD1   XBee 1-Button  	            Input	   Driven by Button
+PD2   ADC_CLK     	               Output   Clock signal
+PD3   XBee REDUCE_POWER	       		Input		Wake-up from XBee
+PD4   RIO_GS			     	         Output   Low
+PD5   XBee RAD_/CTS     	      	Input    Driven by XBee
+PD6   TXE (XBee RAD_TX)       	   Output   High
+PD7   RXE (XBee RAD_RX)          	Input    Pulled-up by core
+
+PE0   A20     			               Output   Address Line Bit 20
+PE1   RIO_INT        	            Input    Pulled up by RIO
+PE2   TXF_RTS_/CS							Output   Low
+PE3   RXF_CTS						      Input    Driven by RS232
+PE4   /SERF_CS                	   Output   High
+PE5   E_LINK                     	Output   High (LED off)
+PE6   XBee RAD_/RTS           		Output   Low
+PE7   E_ACT		               		Output   High (LED off)
+
+BUFEN	ADC_/CS                       Output	High
+
+CLK	CLK (to RIO chip)					OUTPUT   CPU Clock
+
+PARAMETER:    	None
+
+RETURN VALUE:	None
+
+SEE ALSO:      Please refer to the user manual for a complete listing
+               of all API functions for the BL4S1xx controller.
+
+END DESCRIPTION **********************************************************/
+__nodebug
+void brdInit(void)
+{
+   auto float clkrate;
+   auto char bl_pins_init[RSB_MAX_PINS];
+
+   //---------------------------------------------------------------------
+   // Port A configuration
+   //
+   // PA0   RIO_D0 	 In/Out   Bus Data Line
+   // PA1   RIO_D1 	 In/Out   Bus Data Line
+   // PA2   RIO_D2 	 In/Out   Bus Data Line
+   // PA3   RIO_D3 	 In/Out   Bus Data Line
+   // PA4   RIO_D4 	 In/Out   Bus Data Line
+   // PA5   RIO_D5 	 In/Out   Bus Data Line
+   // PA6   RIO_D6 	 In/Out   Bus Data Line
+   // PA7   RIO_D7 	 In/Out   Bus Data Line
+   // Initialize port A & B for Aux I/O BUS operation.
+   //---------------------------------------------------------------------
+	// enable external data bus.
+	WrPortI(SPCR, &SPCRShadow, 0x8C);		//sets all bits to output
+
+   //---------------------------------------------------------------------
+   // Port B configuration
+   //
+   // PB0   PB0_SCLKB     Output   High
+   // PB1   PB1_CLKA		  Input    Driven by PIC10F200
+   // PB2   RIO_PI	     Output   Bus Address Line
+   // PB3   RIO_CHA0      Output   Bus Address Line
+   // PB4   RIO_CHA1      Output   Bus Address Line
+   // PB5   RIO_CHA2      Output   Bus Address Line
+   // PB6   RIO_/CS       Output   Bus Address Line
+   // PB7   RIO_GC   	  Output   Bus Address Line
+   // PB0 is initialized as ADC serial clock in ADC initialization.
+   // PB2-7 is initialized for Aux I/O BUS operation via SPCR register.
+   //---------------------------------------------------------------------
+	// Set port B pins PB0, PB2-7 lines to be outputs, PB1 as an input.
+   WrPortI(PBDDR, &PBDDRShadow, 0xFD);
+   // Set all of the outputs high.
+   WrPortI(PBDR,  &PBDRShadow,  0xFD);
+
+   //---------------------------------------------------------------------
+   // Port C configuration
+	//
+	// PC0   TXD (RS232/RabbitNet/1-Wire)  Output   High
+	// PC1   RXD (RS232/RabbitNet/1-Wire)  Input    Pulled-up by core
+	// PC2   TXC (ADC_SDI)                 Output   High
+	// PC3   RXC (ADC_SDO)                 Input    Pulled-up by core
+	// PC4   TXB (serial flash)			   Output   High
+	// PC5   RXB (serial flash)				Input    Pulled-up by core
+	// PC6   TXA (Programing Cable)			Output   High
+	// PC7   RXA (Programing Cable)			Input    Pulled-up by core
+	//
+   // PC2 and PC3 will be enabled in ADC configuration.
+   //---------------------------------------------------------------------
+	// all pins drive high and low
+	WrPortI(PCDCR, &PCDCRShadow, 0x00);
+	// set all of the Tx lines as outputs, even the ADC lines.
+	WrPortI(PCDDR, &PCDDRShadow,  0x55);
+	// PC0 as TXD and PC2 as TXC
+   WrPortI(PCALR, &PCALRShadow, PCALRShadow & 0xCC);
+   // PC4 as TXB and PC6 as TXA
+   WrPortI(PCAHR, &PCAHRShadow, PCAHRShadow & 0xCC);
+	// PC6, PC4, PC0 set to alternate outputs, Tx (PC2 set in ADC configuration)
+	WrPortI(PCFR,  &PCFRShadow,  ((PCFRShadow & 0x0C) | 0x51));
+
+   //---------------------------------------------------------------------
+   // Port D configuration
+	//
+	//  PD0   RNET_CLK   			 Output   Clock signal
+	//  PD1   XBee 1-Button  	    Input	 Driven by Button
+	//  PD2   ADC_CLK     	       Output   Clock signal
+	//  PD3   XBee REDUCE_POWER	 Input	 Wake-up from XBee
+	//  PD4   RIO_GS			     	 Output   Low
+	//  PD5   XBee RAD_/CTS     	 Input    Driven by XBee
+	//  PD6   TXE (XBee RAD_TX)    Output   High
+	//  PD7   RXE (XBee RAD_RX)    Input    Pulled-up by core
+	//
+   // PD5-7 are setup in XBee configuration, so don't touch them here.
+   //---------------------------------------------------------------------
+	// set port transfer clock to be CLK/2
+	WrPortI(PDCR,  &PDCRShadow,  0x00);
+   // Set all pins to push-pull; don't touch PD5-7
+	WrPortI(PDDCR, &PDDCRShadow, PDDCRShadow & 0xE0);
+	// no need to change bits on PDDR
+	// set PD0, PD2 and PD4 as outputs, PD1 and PD3 as inputs; don't touch PD5-7
+	WrPortI(PDDDR, &PDDDRShadow, (PDDDRShadow & 0xE0) | 0x15 );
+
+   //---------------------------------------------------------------------
+   // Port E configuration
+   //
+   //  PE0   A20     			            Output   Address Line Bit 20
+   //  PE1   RIO_INT        	            Input    Pulled up by RIO
+   //  PE2   TXF_RTS_/CS						Output   High
+   //  PE3   RXF_CTS						      Input    Driven by RS232
+   //  PE4   /SERF_CS                	   Output   High
+   //  PE5   E_LINK                     	Output   High (LED off)
+   //  PE6   XBee RAD_/RTS           		Output   Low
+   //  PE7   E_ACT		               	Output   High (LED off)
+   //
+   // PE6 will be setup in XBee configuration.
+   //---------------------------------------------------------------------
+   // set port transfer clock to be CLK/2
+   WrPortI(PECR,  &PECRShadow,  0x00);
+   // Set all pins to push-pull
+   WrPortI(PEDCR, &PEDCRShadow, 0x00);
+	// set PE0 as A20 and PE2 could be TXF, TXF enabled in sermode function
+   WrPortI(PEALR, &PEALRShadow, 0x31);
+   // Set PE2, PE4, PE5, PE7 High; don't touch other pins
+	WrPortI(PEDR,  &PEDRShadow,  (PEDRShadow & 0xFF) | 0xB4);
+   // Set PE1, PE3 as inputs; Set PE0, PE2, PE4, PE5, PE6, PE7 as outputs
+	WrPortI(PEDDR, &PEDDRShadow, 0xF5);
+   // enable PE0 as A20; don't touch PE2 and PE6
+	WrPortI(PEFR,  &PEFRShadow,  ((PEFRShadow & 0x42) | 0x01));
+
+   //---------------------------------------------------------------------
+   // Initialize RIO clock and ADC Chip select
+   //
+	// BUFEN	ADC_/CS                       Output	High
+	// CLK	CLK (to RIO chip)					OUTPUT   CPU Clock
+   //---------------------------------------------------------------------
+	// CLK pin set to peripheral clock / 2
+   // STATUS and /WDTOUT normal; /BUFEN set high
+   WrPortI(GOCR,	&GOCRShadow,  0x43);
+
+	// add internal pins to RIO init array
+   memset(bl_pins_init, RSB_INP, BL_DIGITAL_IN);
+   memcpy(bl_pins_init + BL_DIGITAL_IN, bl_init, BL_DIGITAL_OUT);
+   memcpy(bl_pins_init + (BL_DIGITAL_IN + BL_DIGITAL_OUT), bl_internal_init,
+          RSB_MAX_PINS - (BL_DIGITAL_IN + BL_DIGITAL_OUT));
+
+   if (_riosbc_init(bl_def, bl_pins_init))
+   {
+     printf("RIO initialization failed, invalid board definition.\n");
+     exit(-EINVAL);
+   }
+
+   // Set RIO to prescale frequency
+   _riosbc_set_clk_prescale(0,
+   								 (char)((RIO_CLOCK_FREQ / RIO_PRESCALE_FREQ) - 1));
+
+// Initialize ADC
+#ifdef ADC_ONBOARD
+   // Setup PC2/PC3 as TXB/RXB
+   BitWrPortI(PCDDR, &PCDDRShadow, 1, 2);
+   BitWrPortI(PCFR,  &PCFRShadow,  1, 2);
+   BitWrPortI(PCDDR, &PCDDRShadow, 0, 3);
+   BitWrPortI(PCFR,  &PCFRShadow,  0, 3);
+
+   // use internal clock for serial B
+   WrPortI (ADCSXCR, &ADCSXCRSHADOW, 0x0C );
+   // Set clock polarity - Falling edge, LSB
+   WrPortI (ADCSXER, &ADCSXERSHADOW, 0x30);
+
+	// setup sclk
+	clkrate = SPI_CLK / 16.0;
+	// calculation is async baud (16 clocks/bit), we need sync (1 clock/bit)
+	__tdivisor = (long)((2.0 * freq_divider * 19200.0/clkrate + 0.5) - 1);
+
+   // Set serial clock speed for serial B
+   WrPortI (ADCSXDLR, NULL, (char) __tdivisor);
+	WrPortI (ADCSXDHR, NULL, (char) (__tdivisor >> 8) | 0x80);
+
+   // clear queue in ADC, by doing 8 reads in a row
+   #asm __nodebug
+	   ADCCS_LOW                     ; enable ADC CS
+	   ld    b, 8
+	   .doRead:
+	   call  _rxadcbyte              ;received clocked data
+	   djnz  .doRead
+	   ADCCS_HIGH                    ; disable ADC CS
+   #endasm
+
+   // setup the SPI on the ADC
+   _ads7870command(WR_REG|BITS8|ADSICREG, 0x81);
+
+   // enable internal clock, reference = 2.5V
+   _ads7870command(WR_REG|BITS8|ADREFOSCREG, 0x3C);
+
+   //make it Mode 1, most significant byte first
+   _ads7870command(WR_REG|BITS8|ADCNTLREG, ADMODE1);
+#endif
+
+#ifndef BL_POLL_MODE
+   // Enable RIO Interrupts on PE1 with BL_IRQ_PRIORITY setting
+   WrPortI(I1CR, &I1CRShadow, BL_IRQ_PRIORITY + 4);
+   _riosbc_irq_enable(0,1);
+#endif
+
+	__brdInitFlag = TRUE;
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+

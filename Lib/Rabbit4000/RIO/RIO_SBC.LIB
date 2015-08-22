@@ -1,0 +1,3999 @@
+/* START LIBRARY DESCRIPTION *********************************************
+RIO_SBC.LIB
+
+DESCRIPTION:
+	This library provides an API for single board computers built around the
+   Rabbit I/O chip (RIO).  One or more Rabbit I/O chips may be used as part
+   of the SBC's I/O structure. This library supports parallel access to the
+   RIO (via parallel ports A and B in auxiliary I/O bus mode).  The RIO SBC
+   library will assume a parallel interface with P//I as A0, CHA[0..2] as
+   A1..A3 and G//B as A5.  If more than one RIO, A4 and A5 will be used as
+   RIO addressing as needed.  If more than two RIO's are specified, G//B
+   will be moved from A5 to the processor port and pin to be specified.
+
+   The control structure of the board was built to allow definition of ADC,
+   DAC and processor based I/O as well.  This library will only control the
+   RIO based I/O.  Board level libraries can support the same structure for
+   controlling non-RIO I/O.  This allows all board I/O to be governed by a
+   single defining structure.
+
+
+CONFIGURATION MACROS:
+	The following macros should be defined before #use rio_sbc.lib:
+
+   #define RSB_AUX_BASE
+      Base address of the start of the I/O bank to use for RIO access
+
+   #define RSB_MAX_RIOS
+      Number of RIO's on the SBC (up to 4)
+
+   #define RSB_MAX_PINS
+      Number of I/O pins on the SBC
+
+   // Define one or the other of the following two defines
+   #define RSB_GB_PORT
+      Internal Port hosting the GB output (Set to zero if on RIO Address A5)
+   OR
+   #define RSB_GB_LATCH
+      External I/O Port Latch hosting the GB output
+
+   #define RSB_GB_PIN
+      Pin number of GB output (Not used if GB output on RIO Address A5)
+
+   #define RSB_GB_SHADOW
+      Pointer to shadow for GB host port
+
+   #define RSB_ICR
+      Interrupt control register value (defaults to 9 - PE0/1 with priority 1)
+       (Rising edge '10' bits in appropriate bit position + RIO irq priority)
+
+   #define RSB_EXT_INT0 or
+   #define RSB_EXT_INT1 or
+   #define RSB_POLL_MODE
+   	RSB_POLL_MODE disables the use of hardware interrupts and signifies
+      the intention to poll the RIO library using the _riosbc_tick() function.
+
+   	Note that you may call rio_set_handler() for all RIO blocks that
+   	are to have a block event handler.  The handlers will also be
+   	called from rio_tick if you are not using interrupts.
+
+   #define RSB_MAX_ISR
+      RSB_MAX_ISR defines the number of ISR handles available for mapping
+      ISR's to RIO blocks and ISR flags.  Remember that a single ISR handle
+      can only service flags from a single RIO block.  If you need an ISR
+      to handle interrupts from multiple blocks, you will need a handle for
+      the ISR for each RIO block it will support.
+
+   #define RSB_DEBUG
+   	Enable single stepping within C code in this library.
+
+   #define RSB_ASMDEBUG
+   	Enable single-stepping within assembler code in this library.
+
+   #define RSB_VERBOSE
+   	Print verbose error and debug messages.  Useful for application
+   	development.
+
+
+REVISION HISTORY:
+	Rev 1.0    WTS	  Initial release
+
+
+ Copyright (c) 2008 Digi International Inc., All Rights Reserved
+
+ This software contains proprietary and confidential information of Digi
+ International Inc.  By accepting transfer of this copy, Recipient agrees
+ to retain this software in confidence, to prevent disclosure to others,
+ and to make no use of this software other than that for which it was
+ delivered.  This is an published copyrighted work of Digi International
+ Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+ prohibited.
+
+ Restricted Rights Legend
+
+ Use, duplication, or disclosure by the Government is subject to
+ restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+ Technical Data and Computer Software clause at DFARS 252.227-7031 or
+ subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+ Restricted Rights at 48 CFR 52.227-19, as applicable.
+
+ Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+
+END DESCRIPTION *************************************************************/
+
+/*** BeginHeader rsb_rio, rsb_pin */
+#ifndef RIOSBC_H
+#define RIOSBC_H
+
+#define PORTA_AUX_IO
+
+#ifdef RSB_DEBUG
+	#define _rsb_debug __debug
+#else
+	#define _rsb_debug __nodebug
+#endif
+
+#include <errno.h>
+
+#ifndef PORTA_AUX_IO
+ 	#fatal "RIO_SBC.LIB requires PORTA_AUX_IO to be defined and initialized."
+#endif
+
+#ifdef RSB_GB_PORT
+ #ifndef RSB_GB_LATCH
+  #if RSB_GB_PORT == 0
+   #define RSB_GLOBAL RSB_AUX_BASE+32
+   #define SET_GB(X) X
+  #else
+   #define RSB_GLOBAL RSB_AUX_BASE
+   #define SET_GB(X) BitWrPortI(RSB_GB_PORT, &RSB_GB_SHADOW, X, RSB_GB_PIN)
+  #endif
+ #else
+  #fatal "You cannot define both RSB_GB_PORT and RSB_GB_LATCH."
+ #endif
+#else
+ #ifdef RSB_GB_LATCH
+   #define RSB_GLOBAL RSB_AUX_BASE
+   #define SET_GB(X) BitWrPortE(RSB_GB_LATCH, &RSB_GB_SHADOW, X, RSB_GB_PIN)
+ #else
+  #fatal "You must define one of RSB_GB_PORT or RSB_GB_LATCH to use RIO_SBC.lib."
+ #endif
+#endif
+
+#ifndef RSB_ICR          // Only used if RSB_EXT_INT0 or RSB_EXT_INT1 defined
+	#define RSB_ICR	9	 // Default RIO Ext. Interrupt Priority & Pin (PE0 or 1)
+#endif
+
+#ifndef RSB_MAX_ISR        // Sets maximum ISR handles available
+   #define RSB_MAX_ISR  4  //  Default to 4 if not specified
+#endif
+
+// Find proper I/O Bank Control Register from RIO Base Address
+#define RSB_IOBCR IB0CR + (RSB_AUX_BASE >> 13)
+
+// Bank control setup value for RIO I/O Bank
+// Set RIO bus to aux I/O bus, 7 wait states and allow writes
+#define RSB_IOBCV 0x48
+
+#define RSB_RIO_OFFSET  0x0010  // Offset of individual RIO chip base addresses
+
+#define RSB_BLOCK_PINS  4   // Maximum number of pins per RIO block
+#define RSB_MAX_BLOCKS  8   // Maximum number of blocks per RIO chip
+
+// Macro to clear all IRQ sources serviced by ISR Handler (X)
+#define RSB_CLEAR_ALL_IRQ(X) \
+   WrPortE(_rsb_isr[X].addr, NULL, RSB_STATUS); \
+   WrPortE(_rsb_isr[X].addr+1, NULL, _rsb_isr[X].ier)
+
+// Macro to clear specified IRQ sources (Y) serviced by ISR Handler (X)
+#define RSB_CLEAR_IRQ(X,Y)  \
+   WrPortE(_rsb_isr[X].addr, NULL, RSB_STATUS); \
+   WrPortE(_rsb_isr[X].addr+1, NULL, Y)
+
+// Macro to read status (Y) of IRQ sources serviced by ISR Handler (X)
+#define RSB_READ_STATUS(X,Y)  \
+   WrPortE(_rsb_isr[X].addr, NULL, RSB_STATUS); \
+   Y=RdPortE(_rsb_isr[X].addr+1)
+
+// RIO Register map
+//  For one or two RIO's:
+//    A5 selects global (1) or RIO block (0)
+//    A4 selects between the RIO's (if two)
+//  For three or four RIO's:
+//    A4 thru A5 selects between the RIO's (0-3)
+//
+//  For global:
+//    A0 thru A4 select global address
+//  For RIO block:
+//    A1 thru A3 select RIO block (0-7)
+//    A0 selects pointer (0) or indirect (1)
+
+// Global RIO registers (one set per RIO)
+#define RSB_MCR	RSB_GLOBAL   	// Master Control Register
+#define RSB_MSR	RSB_GLOBAL+1  	// Master Status Reg
+#define RSB_MPR	RSB_GLOBAL+2  	// Master Prescale Register
+#define RSB_MADR	RSB_GLOBAL+3  	// Master Alternate Data Reg
+#define RSB_MPCR	RSB_GLOBAL+4  	// Master Protection Comand Reg
+#define RSB_MPPR	RSB_GLOBAL+5  	// Master Protection Prescale Reg
+
+// Internal registers, duplicated for each RIO block.  Accessed via
+// the Indirect Register, with the block register address placed in
+// the Pointer Register. The addresses for two byte registers have the
+// pointer automatic increment enabled by setting the MSB to 1.
+#define RSB_CMD		0x00	// Command
+#define RSB_MODE		0x01	// Mode
+#define RSB_IER		0x02	// Interrupt Enable/Query
+#define RSB_STATUS	0x03	// Status
+#define RSB_TOGGLE	0x04	// Counter Toggle
+#define RSB_SYNC		0x05	// Sync Control
+#define RSB_INC		0x06	// Increment/Inphase/Begin Control
+#define RSB_DEC		0x07	// Decrement/Quadrature/End Control
+#define RSB_STAT0		0x08	// Status 0 Control
+#define RSB_PORT0		0x0C	// Port 0 Control
+#define RSB_PORT3		0x0F	// Port 3 Control
+#define RSB_MATCH0	0x90	// Match 0 LSB
+#define RSB_LIMIT		0x98	// Count Limit LSB
+#define RSB_BEGIN		0x9A	// Count Begin LSB
+#define RSB_END		0x9C	// Count End LSB
+#define RSB_VALUE		0x9E	// Count Value LSB
+#define RSB_AUTO_INC 0x80  // Indirect Register Auto Increment bit
+
+// Register bit mappings
+//  - Master Control Register (write)
+#define RSB_MCR_RESET	0x80		// Software reset
+#define RSB_MCR_IRQ_EN	0x03		// Master interrupt enable (with Sync bit)
+#define RSB_MCR_IRQ_DIS 0x02     // Master interrupt disable (just Sync bit)
+
+//  - Command Register (write)
+#define RSB_CMD_ZERO		0x80		// Reset counter to zeros
+#define RSB_CMD_SYNC		0x40		// Force SYNC condition
+#define RSB_CMD_INC		0x20		// Force increment
+#define RSB_CMD_BEGIN	0x20		// Force begin (alias)
+#define RSB_CMD_DEC		0x10		// Force decrement
+#define RSB_CMD_END		0x10		// Force end (alias)
+
+//  - Mode Register (write)
+#define RSB_MODE_PRESCALE	0x08	// Use prescaler (for timer and input sampling)
+#define RSB_MODE_MASK		0x07	// Mask for following mode settings
+#define RSB_MODE_DISABLE	0x00	// Disable block counter/timer (low power)
+#define RSB_MODE_IIB_COUNT	0x01	// Count on Increment/InPhase/Begin (no end)
+#define RSB_MODE_IIB_MATCH	0x02	// Count on Inc/InPhase/Begin, until any match
+#define RSB_MODE_UP_DN  	0x03	// Count up on increment, down on decrement
+   // Note: the above counter modes require edge detection modes for the
+   // relevant begin/end signals.  If set to level modes, then counter
+   // will increment/decrement on every clock while the condition holds
+   // (thus behaving more like timer than counter).
+#define RSB_MODE_TIMER		0x04	// Free-running timer
+#define RSB_MODE_TIL_END	0x05	// Count continuously until end condition
+#define RSB_MODE_BEGIN_END	0x06	// Count from begin to end condition
+#define RSB_MODE_ON_BEGIN	0x07	// Count continuously while begin condition
+
+//  Interrupt Enable Register (bits enable (1) or disable (0) given interrupt)
+//  Status Register (read for pending interrupts, write 1 to bit to clear int.)
+//  Note: Read MSR (master status) to determine if any block has a pending
+//        interrupt - the set bit positions show the block(s) with interrupts.
+#define RSB_IER_DQE		0x80		// Decrement/Quadrature/End
+#define RSB_IER_IIB		0x40		// Increment/Inphase/Begin
+#define RSB_IER_ROLL_D	0x20		// Counter rollover on decrement
+#define RSB_IER_ROLL_I	0x10		// Counter rollover on increment
+#define RSB_IER_MATCH3	0x08		// Match 3 condition
+#define RSB_IER_MATCH2	0x04		// Match 2 condition
+#define RSB_IER_MATCH1	0x02		// Match 1 condition
+#define RSB_IER_MATCH0	0x01		// Match 0 condition
+//  - Sync Control Register
+//  - Increment/Inphase/Begin Control Register
+//  - Decrement/Quadrature/End Control Register
+#define RSB_SYNC_RESET  	0x80  // Set to reset counter to 0 - Sync Reg. only
+#define RSB_POL_MASK			0x38	// Sync/IIB/DQE signal polarity selection mask
+#define RSB_POL_DISABLED	0x00	//  Disabled
+#define RSB_POL_RISING		0x08	//  Rising edge
+#define RSB_POL_FALLING		0x10	//  Falling edge
+#define RSB_POL_EITHER		0x18	//  Either edge
+#define RSB_POL_QUADRATURE	0x20	//  Quadrature (only on ICR and DCR registers)
+#define RSB_POL_WHILE_LOW	0x30	//  While low
+#define RSB_POL_WHILE_HIGH 0x38	//  While high
+#define RSB_SEL_MASK			0x07	// Sync/IIB/DQE signal source selection mask
+#define RSB_SEL_NONE			0x00	//  No selection
+#define RSB_SEL_GLOBAL		0x03	//  Use Global Sync signal
+#define RSB_SEL_PORT0		0x04	//  Use port 0
+#define RSB_SEL_PORT1		0x05	//  Use port 1
+#define RSB_SEL_PORT2		0x06	//  Use port 2
+#define RSB_SEL_PORT3		0x07	//  Use port 3
+//  - Status x Control Register (x is Port)
+#define RSB_SET_MASK			0x38	// Status X set condition mask
+#define RSB_SET_NONE			0x00	//  not set by internal condition
+#define RSB_SET_ROLLOVER	0x10	//  counter rollover
+#define RSB_SET_SYNC			0x18	//  sync signal
+#define RSB_SET_MATCH0		0x20	//  match 0
+#define RSB_SET_MATCH1		0x28	//  match 1
+#define RSB_SET_MATCH2		0x30	//  match 2
+#define RSB_SET_MATCH3		0x38	//  match 3
+#define RSB_RES_MASK			0x07	// Status X reset condition mask
+#define RSB_RES_NONE			0x00	//  not set by internal condition
+#define RSB_RES_ROLLOVER	0x02	//  counter rollover
+#define RSB_RES_SYNC			0x03	//  sync signal
+#define RSB_RES_MATCH0		0x04	//  match 0
+#define RSB_RES_MATCH1		0x05	//  match 1
+#define RSB_RES_MATCH2		0x06	//  match 2
+#define RSB_RES_MATCH3		0x07	//  match 3
+//  - Port x Control Register (x is Port)
+#define RSB_IO_MASK			0xF0	// Mask for writes/reads of ports 0-3 as I/O
+#define RSB_USE_MASK 		0x07	// Mask for following port pin usage setting
+#define RSB_USE_INPUT		0x00	//  input (also 1 and 2, but these reserved)
+#define RSB_USE_TOGGLE		0x02	//  output reflects status x & toggle signal
+#define RSB_USE_STATUS		0x03	//  output reflects status x
+#define RSB_USE_SEQUENCE	0x04	// Sequence through P0CR,P1CR,P2CR,P3CR,
+                                 //  selecting bit (x+4) of each register to
+                                 //  determine the output state for this port.
+                                 //  Sequence steps on each counter rollover
+#define RSB_USE_OUTPUT		0x05	//  use bit (x+4) of P3CR to set output state
+#define RSB_USE_LOW			0x06	//  output always low
+#define RSB_USE_HIGH 		0x07	//  output always high
+
+#define RSB_IO_BASED       0xE0  // Block value to show pin is Ext. I/O based
+#define RSB_CPU_BASED      0xF0  // Block value to show pin is CPU port based
+
+// -----  _riosbc_set_function option flags  -----
+#define RSB_FUNC_RISING    0x40  // Flag for rising edge on Ext. IRQ/Sync
+#define RSB_FUNC_FALLING   0x80  // Flag for falling edge on Ext. IRQ/Sync
+#define RSB_FUNC_EITHER    0xC0  // Flags for either edge on Ext. IRQ/Sync
+#define RSB_FUNC_EXT_CLK 0x0100  // Flag for selecting external clock input
+
+#define RSB_END_MATCH0		0x04	// Manually sets end to match register 0
+#define RSB_END_MATCH1		0x05	// Manually sets end to match register 1
+#define RSB_END_MATCH2		0x06	// Manually sets end to match register 2
+#define RSB_END_MATCH3		0x07	// Manually sets end to match register 3
+#define RSB_OFF_MATCH0     0x20  // Manually sets offset to match reg. 0
+#define RSB_OFF_MATCH1     0x28  // Manually sets offset to match reg. 1
+#define RSB_OFF_MATCH2     0x30  // Manually sets offset to match reg. 2
+#define RSB_OFF_MATCH3     0x38  // Manually sets offset to match reg. 3
+#define RSB_SHARE0			0x04	// Allows sharing of resources with pin 0
+#define RSB_SHARE1			0x05	// Allows sharing of resources with pin 1
+#define RSB_SHARE2			0x06	// Allows sharing of resources with pin 2
+#define RSB_SHARE3			0x07	// Allows sharing of resources with pin 3
+
+// -----  _riosbc_set_pwm and _riosbc_set_ppm option flags  -----
+#define RSB_PWM_KEEP_SYNC  0x01  // Keep existing block sync settings
+#define RSB_PWM_EXT_CLK		0x02	// Use External Clock mode
+#define RSB_PWM_INVERT     0x20  // PWM/PPM mode, invert output or +180 phase
+#define RSB_PWM_TOGGLE     0x40  // PWM/PPM mode, AND output with toggle bit
+#define RSB_PRESCALE       0x80  // Select prescaled clock (PWM/PPM/Capture)
+#define RSB_SINK_SEL      0x100  // Select sinking driver on pushpull output
+
+// -----  _riosbc_set_counter option flags  -----
+#define RSB_KEEP_LIMIT		0x40  // Keep existing limit register setting
+#define RSB_MAX_MATCHES		0x20  // Set all match registers to max (0xFFFF)
+#define RSB_COUNT_RESET		0x04  // Reset the block counter
+#define RSB_DOWN_COUNT		0x02  // Enable down count functionality on pin
+#define RSB_MATCH_ENABLE	0x01  // Enable counter halting on any match
+#define RSB_UP_COUNT       0x00  // Continous up count
+
+// -----  _riosbc_set_capture option flags  -----
+
+#define RSB_CAPT_RESET     0x8000	//  Reset counter flag
+#define RSB_SAVE_LIMIT     0x4000	//  Leave existing limit, don't max out
+#define RSB_BEGIN_HIGH     0x3800	//  Begin events while signal is high
+#define RSB_BEGIN_LOW      0x3000	//  Begin events while signal is low
+#define RSB_EDGE_BOTH      0x1800   //  Begin events on both edges
+#define RSB_EDGE_FALL      0x1000	//  Begin event on falling edge
+#define RSB_EDGE_RISE      0x0800	//  Begin event on rising edge
+#define RSB_BEGIN_PORT3	   0x0700	//  Use port 3
+#define RSB_BEGIN_PORT2	   0x0600	//  Use port 2
+#define RSB_BEGIN_PORT1	   0x0500	//  Use port 1
+#define RSB_BEGIN_PORT0	   0x0400	//  Use port 0
+#define RSB_BEGIN_GLOBAL   0x0300	//  Use Global Sync signal
+#define RSB_CNT_ON_BEGIN   0x0060	// Count continuously while begin condition
+#define RSB_CNT_BEGIN_END	0x0040	// Count from begin to end condition
+#define RSB_CNT_TIL_END	   0x0020	// Count continuously until end condition
+#define RSB_CNT_RUN        0x0000  	// Free-running counter
+
+/*
+  RIOSBC Board I/O Hardware Definition structure
+ */
+struct RSB_IOdef
+{
+   char rio;       // Index of host RIO (0xFF = CPU host, > 0x0F = I/O based)
+   char block1;     // Primary block on the RIO (Port or I/O addr if not RIO)
+   char bit1;      // Primary pin control bit
+   char block2;     // Secondary block on the RIO (Port or I/O addr if not RIO)
+   char bit2;      // Secondary pin control bit
+   char type;      // Pintype definition of hardware capability
+   char polarity;  // Polarity (0 = Non-inverting, 1 = Inverting)
+   char *shadow;   // Optional pointer for a shadow register
+};
+
+/*
+  RIOSBC block register usage and shadow structure
+ */
+struct _RSB_BLOCK_USE
+{
+	char		mode;      // Shadow of Counter mode register
+   char     mr_use;    // Bitmask of pins that use the block counter
+
+   char     polarity;  // Bitmask of pin inversion at the hardware level
+
+	char		ier;       // Current interrupt enables
+
+	char		toggle;
+	char		scr;       // Sync control register shadow
+   char     sc_use;    // Bitmask of pins that use the synch signal
+   char		icr;       // Increment/In-Phase/Begin (IIB) control register shadow
+   char     ic_use;    // Bitmask of pins that use the IIB signal
+   char		dcr;       // Decrement/Quadrature/End (DQE) control register shadow
+   char     dc_use;    // Bitmask of pins that use the DQE signal
+
+   char		pxcr[RSB_BLOCK_PINS];   // Shadow of Port control registers (0..3)
+
+   char		sxcr[RSB_BLOCK_PINS];   // Shadow of status X control regs. (0..3)
+   char		sx_use[RSB_BLOCK_PINS]; // Bitmask of pins that use the status flags
+   word		mx[RSB_BLOCK_PINS];     // Shadow of Match X registers (0..3)
+   char		mx_use[RSB_BLOCK_PINS]; // Bitmask of pins that use the match flags
+
+   word		clr;       // Shadow of Count Limit register
+   char     clr_use;   // Bitmask of pins that use the limit register setting
+   char     br_use;    // Bitmask of pins that use the begin register
+   char     er_use;    // Bitmask of pins that use the end register
+};
+
+/*
+  RIOSBC RIO register usage and shadow structure
+ */
+struct RSB_RIO_USE
+{
+   word        base;     // Base address of this RIO chip
+   char        mpr;      // Shadow of the master prescale register
+   char        ppr;      // Shadow of the protection prescale register
+   char        ipr[3];   // Interrupt priority registers (bit for each block)
+   // Usage & shadow structure for RIO blocks
+   struct _RSB_BLOCK_USE block[RSB_MAX_BLOCKS];
+};
+
+/*
+ * The following structure represents a port pin on the RIO based SBC board.
+ */
+struct RSB_IOpin {
+   char type;          // Type of hardware circuitry connected to this pin
+   char pin;           // Pin number within the type grouping
+   char function;      // Functionality assigned to this pin
+   char *name;         // User-defined name for this pin
+   char index;         // Index of the RIO or ADC/DAC chip hosting this pin
+                       // If set to zero, it is hosted by the processor
+   char block1;        // Primary Timer/counter or ADC/DAC block used by pin
+   char bit1;          // Primary Bit position in block (sink on push-pull)
+   unsigned int addr1; // Primary I/O address for this pin
+   char block2;        // Secondary Timer/counter or ADC/DAC block used by pin
+   char bit2;          // Secondary Bit position  (source on push-pull)
+   unsigned int addr2; // Secondary I/O address for this pin
+   char match;         // Pin Match register(s) (Bits 2-0 primary, 3-5 sec.)
+                       // Use RSB_SET_MATCHn for primary, RSB_RES_MATCHn for sec.
+   char irq_mask;      // Mask of interrupts associated with this pin
+   void (*irq_hnd)();  // Pointer to the IRQ handler for this pin
+   char polarity;      // Polarity (circuit-defined option)
+   char *dr_shadow;    // Pointer to the shadow register for write data
+   char *cr_shadow;    // Pointer to the shadow register for write control
+   void *ramdata;      // Pointer to variable (RAM-based) info about this pin
+   void *more;         // Pointer to more constant information about this pin
+};
+
+/*
+ * This structure lists block resource needs for available RIO pin functions
+ */
+struct _RSB_RIO_RES {
+   char mode_begin;     // Begining of valid mode range (0 if mode not used)
+   char mode_end;       // Ending of valid mode range   (0 if mode not used)
+                        //                FOR ALL USAGE BYTES
+   char iib;            // IIB usage         0 = Not Used
+   char dqe;            // DQE usage         1 = 1 Required
+   char stat;           // STATx usage       2 = 2 Required
+   char match;          // MATCHx usage      3 = Optional usage
+   char lbe;            // See RSB_L... enumerations below
+};
+
+// Enumeration of Limit, Begin and End register usage
+enum {
+   _RSB_LBE_NONE,    // Limit, Begin and End not needed
+   _RSB_BE_ONLY,     // Limit not needed, Begin or End needed
+   _RSB_L_ONLY,      // Limit needed, Begin and End not needed
+   _RSB_L_BE_OPT,    // Limit needed, Begin and End are optional
+   _RSB_LBE_ALL      // Limit, Begin and End are all needed
+};
+
+/*
+ * The following enumerated values represent different types of pins on a
+ * RIO SBC board, and are used in the RSB_IOPin structure element 'type'.
+ */
+enum {
+   // Digital input types
+   RSB_TYPE_DIGIN,       // Digital input only pin
+   RSB_TYPE_DIGINOUT,    // Configurable digital input/output
+   // Digital output only types
+   RSB_TYPE_DIGOUT,      // Digital output only pin
+   RSB_TYPE_PUSHPULL,    // Push-pull or sinking/sourcing output
+   // Analog input types
+   RSB_TYPE_ANAIN,       // Analog input
+   // Analog output types
+   RSB_TYPE_ANAOUT,      // Analog output
+   RSB_TYPE_MAX          // Number of I/O Types available
+};
+
+/*
+ * The following enumerated values represent different functionality that
+ * can be assigned to pins on the RIO SBC board, and are used in the
+ * RSB_IOPin structure element 'function'.
+ */
+enum {
+   // Digital Input group
+   RSB_FUNC_DIGIN,          // Digital input
+   RSB_FUNC_SYNC,           // External sync input
+   RSB_FUNC_INTERRUPT,      // External interrupt input
+   RSB_FUNC_CAPTURE_INPUT,  // Event/Pulse capture timer input
+   RSB_FUNC_COUNTER_INPUT,  // Event/Pulse counter input
+   RSB_FUNC_DECODER_INPUT,  // Quadrature decoder input
+   // Digital Output group
+   RSB_FUNC_DIGOUT,         // Digital output
+   RSB_FUNC_SEQUENCE,       // Sequencing output
+   RSB_FUNC_PWM,            // Pulse Width Modulation output
+   RSB_FUNC_PPM,            // Pulse Position Modulation output
+   // Analog Input group
+   RSB_FUNC_ANAIN,          // Analog voltage input
+   RSB_FUNC_4TO20MA,        // Analog 4-20mA current input (to ground)
+   // Analog Output group
+   RSB_FUNC_ANAOUT,         // Analog voltage output
+
+   RSB_FUNC_MAX             // Number of Functions available
+};
+
+// Initialization settings for digital I/O
+enum {
+   RSB_LOW,    // Output in low state
+   RSB_HI,     // Output in hi state
+   RSB_TRI,    // Output in tri-state (Hi-Z)
+   RSB_INP     // Input
+};
+
+// This structure holds data on an interrupt service routine handle
+typedef struct {
+   char enable;         // Enable flag for ISR handler
+   char rio;            // Index to the host RIO chip
+   char block;          // Bitmap to the host block within the RIO
+   char ier;            // Interrupt enable register (selects interrupts)
+   int  addr;           // Pre-computed address to the RIO block pointer reg.
+   void (*handler)();   // Pointer to the interrupt handler function
+} _RSB_ISR_HANDLE;
+
+
+extern struct RSB_RIO_USE rsb_rio[RSB_MAX_RIOS];  // RIO usage & shadows
+extern struct RSB_IOpin rsb_pin[RSB_MAX_PINS];   // I/O Pin control structure
+extern _RSB_ISR_HANDLE _rsb_isr[RSB_MAX_ISR];  // ISR Handle sturcture
+extern char _rsb_lock_nest;	                  // Lock nest count for ext. int.
+
+extern const char _rsb_bitmap[];                       // Bit position map
+extern const char _rsb_pinmap[];                       // Block pin map
+extern const __far struct _RSB_RIO_RES _rsb_resources[]; // Block Resource needs
+
+// ***>> NOTE: This array must be defined by external library or program <<***
+// Map of RIO Index, block, and port to RSB_IOdef/RSB_IOpin index
+extern const __far char rsb_map[RSB_MAX_RIOS][RSB_MAX_BLOCKS][RSB_BLOCK_PINS];
+
+/*** EndHeader */
+
+struct RSB_RIO_USE rsb_rio[RSB_MAX_RIOS]; // RIO usage & shadow structure
+struct RSB_IOpin rsb_pin[RSB_MAX_PINS];   // I/O Pin control structure
+_RSB_ISR_HANDLE _rsb_isr[RSB_MAX_ISR];    // ISR Handle sturcture
+char _rsb_lock_nest;		                  // Lock nest count for external int.
+
+const char _rsb_bitmap[] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80};
+const char _rsb_pinmap[] = {0x10, 0x20, 0x40, 0x80};
+
+const __far struct _RSB_RIO_RES _rsb_resources[] = {
+//ModeB,ModeE,IIB,DQE,STx,MAx,LBE
+ {  0,    0,   0,  0,  0,  0, _RSB_LBE_NONE },  // RSB_FUNC_DIGIN
+ {  1,    7,   3,  3,  0,  0, _RSB_BE_ONLY  },  // RSB_FUNC_SYNC
+ {  0,    0,   3,  3,  0,  0, _RSB_BE_ONLY  },  // RSB_FUNC_INTERRUPT
+ {  4,    7,   3,  3,  0,  0, _RSB_L_BE_OPT },  // RSB_FUNC_CAPTURE_INPUT
+ {  1,    3,   3,  3,  0,  3, _RSB_L_BE_OPT },  // RSB_FUNC_COUNTER_INPUT
+ {  3,    3,   1,  1,  0,  0, _RSB_LBE_ALL  },  // RSB_FUNC_DECODER_INPUT
+ {  0,    0,   0,  0,  0,  0, _RSB_LBE_NONE },  // RSB_FUNC_DIGOUT
+ {  1,    7,   0,  0,  0,  0, _RSB_L_ONLY   },  // RSB_FUNC_SEQUENCE
+ {  4,    4,   0,  0,  1,  1, _RSB_L_ONLY   },  // RSB_FUNC_PWM
+ {  4,    4,   0,  0,  2,  2, _RSB_L_ONLY   }   // RSB_FUNC_PPM
+};
+
+
+
+/*** BeginHeader _riosbc_init */
+int _riosbc_init(const struct RSB_IOdef *r, const char *init);
+void _rsb_release(struct RSB_IOpin *pin);
+int _rsb_conflict(char rio, char block, char pin, char function, char flags);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_init						<RIO_SBC.LIB>
+
+SYNTAX:		 int _riosbc_init(const RSB_IOdef *r, const char *init)
+
+DESCRIPTION: Initializes the rsb_rio and rsb_pin structures with the board's
+             hardware configuration.  The board's I/O definition is passed
+				 to this function through an RSB_IOdef structure.  Port enabling
+             and initialization of the aux I/O bus should be performed in
+             the board initialization and completed before calling this
+             function.  Bus timing is set in this function from RSB_IOBCV.
+
+				 This function also uses the following #defined values:
+                 RSB_MAX_RIOS  - Number of RIO's on the SBC (up to 4)
+                 RSB_MAX_PINS  - Number of I/O pins on the SBC
+                 RSB_GB_PORT   - Port hosting the GB output (Zero if I/O A5)
+                 RSB_GB_PIN    - Pin number of GB output    (N/A if I/O A5)
+                 RSB_GB_SHADOW - Shadow variable for GB port
+                 RSB_IOBCR     - Bank control register for RIO I/O Bank
+                 RSB_IOBCV     - Bank control setup value for RIO I/O Bank
+
+                 RSB_EXT_INT0 or
+                 RSB_EXT_INT1 or
+                 RSB_POLL_MODE - Sets External IRQ to use, or polling mode
+
+             Note: You can #define RSB_VERBOSE to get error messages
+                   printed out by the library, as a debugging aid.  Do not
+                   define this for production code.
+
+PARAMETER1:		Pointer to board definition structure of type RSB_IOdef
+               which describes the I/O hardware setup of the SBC.
+
+PARAMETER2:		Pointer to character array containing initialization codes
+               for each digital I/O channel.
+
+RETURN VALUE:	0 on success
+               -ENODEV: bad parameter, or mode not supported.
+               -EACCES: attempt to setup CPU I/O while support disabled.
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_init(const struct RSB_IOdef *r, const char *init)
+{
+	auto word i;
+   auto char c, *ptr;
+   auto const char *iptr;
+   auto struct RSB_IOpin *pin;
+   auto const struct RSB_IOdef *def;
+
+#ifdef RSB_EXT_INT0
+  #ifdef RSB_EXT_INT1
+    #fatal "Cannot have both RSB_EXT_INT0 and RSB_EXT_INT1 defined."
+  #endif
+  #ifdef RSB_POLL_MODE
+    #fatal "Cannot have both RSB_EXT_INT0 and RSB_POLL_MODE defined."
+  #endif
+   // Disable External Interrupt 0 during initialization
+	WrPortI(I0CR, &IOCRShadow, IOCRShadow & 0xFC);
+   // Attach Reset Vector to RIO ISR handler
+	SetVectExtern4000(0, _riosbc_ext0_isr);
+#else
+	#ifdef RSB_EXT_INT1
+     #ifdef RSB_POLL_MODE
+       #fatal "Cannot have both RSB_EXT_INT1 and RSB_POLL_MODE defined."
+     #endif
+	  // Disable External Interrupt 1 during initialization
+	  WrPortI(I1CR, &I1CRShadow, I1CRShadow & 0xFC);
+     // Attach Reset Vector to RIO ISR handler
+	  SetVectExtern4000(1, _riosbc_ext1_isr);
+   #else
+     #ifndef RSB_POLL_MODE
+       #fatal "Must define one of RSB_EXT_INT0, RSB_EXT_INT1 or RSB_POLL_MODE."
+     #endif
+   #endif
+#endif
+
+   // Setup I/O port timing (Port setup should be done by board init)
+   WrPortI(RSB_IOBCR, NULL, RSB_IOBCV);
+
+	// Set G//B pin to Global address
+   SET_GB(1);
+
+   // Reset all RIO chips
+   for (i = 0; i < RSB_MAX_RIOS; ++i) {
+	   WrPortE(RSB_MCR + (RSB_RIO_OFFSET * i), NULL, RSB_MCR_RESET);
+   }
+
+   // Clear all RSB data structures
+   memset(rsb_rio, 0, sizeof(rsb_rio));
+   memset(rsb_pin, 0, sizeof(rsb_pin));
+   memset(_rsb_isr, 0, sizeof(_rsb_isr));
+   _rsb_lock_nest = 0;
+
+	// Set G//B pin to Block address
+   SET_GB(0);
+
+   // Setup RIO base addresses
+   for (i = 0; i < RSB_MAX_RIOS; ++i)
+   {
+      rsb_rio[i].base = RSB_AUX_BASE + (i * 16);
+   }
+
+   // Initialize the RIO's and the pin structure
+   for (i = 0, pin = rsb_pin, def = r, iptr = init; i < RSB_MAX_PINS;
+              ++pin, ++def, ++iptr, ++i)
+   {
+      // Copy common initializations to pin structure
+      pin->index = def->rio;
+      pin->bit1  = def->bit1;
+      pin->bit2  = def->bit2;
+      pin->type  = def->type;
+
+      // Handle non-digital I/O based pins here
+      if (pin->type >= RSB_TYPE_ANAIN) {
+        // Check for invalid pin type, return error if it is
+        if (pin->type >= RSB_TYPE_MAX) return -ENODEV;
+        pin->block1 = def->block1;
+        pin->block2 = def->block2;
+        pin->dr_shadow = def->shadow;
+        pin->function = def->polarity;
+        continue;
+      }
+
+      // Process digital I/O blocks
+      pin->polarity = def->polarity;
+      pin->function = (*iptr == RSB_INP ? RSB_FUNC_DIGIN : RSB_FUNC_DIGOUT);
+      // Setup block 1
+      if (def->block1 < RSB_MAX_BLOCKS) {
+        // If RIO based, set address from RIO/block #'s
+        pin->block1 = def->block1;
+        pin->addr1 = rsb_rio[def->rio].base + (def->block1 << 1);
+        if (pin->type == RSB_TYPE_DIGIN) {
+           // Set data register shadow to block 1, port 3 if input only
+	        pin->dr_shadow = &rsb_rio[def->rio].block[def->block1].pxcr[3];
+        }
+      }
+      else if (def->block1 < PBDR) {
+        // If Aux I/O based, def->block1 has offset
+        pin->block1 = RSB_IO_BASED;   // Set as Aux I/O Latch/Buffer based pin
+        pin->addr1 = RSB_AUX_BASE + ((RSB_MAX_RIOS-1) << 4) + (def->block1 << 1);
+      }
+      else {
+        // If Processor based, def->block1 has port's data reg address
+#ifdef RSB_USE_CPU_IO
+        pin->block1 = RSB_CPU_BASED;  // Set as a processor based pin
+        pin->addr1 = def->block1;     // Save CPU port data reg address
+        _rsb_init_cpu_io(pin->addr1, pin->bit1, def->shadow, def->type, RSB_INP);
+#else
+        return -EACCES;
+#endif
+      }
+
+      // Setup block 2
+      if (def->block2 < RSB_MAX_BLOCKS) {
+        // If RIO based, set address from RIO/block #'s
+        pin->block2 = def->block2;
+        if (pin->type > RSB_TYPE_DIGIN) {
+           // Setup output specific data on block2/bit2 related variables
+	        pin->addr2 = rsb_rio[def->rio].base + (def->block2 << 1);
+	        // control (cr_shadow) is bit2's shadow unless this is pushpull output
+	        c = (pin->type == RSB_TYPE_PUSHPULL ? def->bit1 : def->bit2);
+	        pin->cr_shadow = &rsb_rio[def->rio].block[def->block2].pxcr[c];
+	        // data (dr_shadow) is always port 3's shadow
+	        pin->dr_shadow = &rsb_rio[def->rio].block[def->block2].pxcr[3];
+           // echo polarity to polarity mask for the block
+	        if (pin->polarity) {
+	           rsb_rio[pin->index].block[pin->block2].polarity |=
+                        _rsb_pinmap[pin->bit2];
+	        }
+        }
+      }
+      else {
+        // If Aux I/O based, def->block2 has offset
+        if (def->block2 < PBDR) {
+          pin->block2 = RSB_IO_BASED;   // Set as Aux I/O Latch/Buffer based pin
+          pin->addr2 = RSB_AUX_BASE+((RSB_MAX_RIOS-1) << 4) + (def->block2 << 1);
+          BitWrPortE(pin->addr2, def->shadow, (*iptr == RSB_HI), pin->bit2);
+        }
+        else {
+          // If Processor based, def->block2 has port's data reg address
+#ifdef RSB_USE_CPU_IO
+          pin->block2 = RSB_CPU_BASED;  // Set as a processor based pin
+          pin->addr2 = def->block2;     // Save CPU port data reg address
+          _rsb_init_cpu_io(pin->addr2, pin->bit2, def->shadow, def->type,
+                              *iptr);
+#else
+	       return -EACCES;
+#endif
+        }
+        // Use control shadow for latch/port based shadow register
+        pin->cr_shadow = def->shadow;
+        if (pin->type < RSB_TYPE_DIGOUT) {
+           // Setup data register for RIO based input side of pin
+	        pin->dr_shadow = &rsb_rio[def->rio].block[def->block1].pxcr[3];
+        }
+      }
+
+      // Write setup values out to RIO chips
+      switch (pin->type)
+      {
+        case RSB_TYPE_DIGIN:
+        case RSB_TYPE_DIGINOUT:
+          // See if block1 is RIO based
+          if (pin->block1 < 8) {
+            // Get pointer to port control register shadow
+            ptr = &rsb_rio[def->rio].block[pin->block1].pxcr[pin->bit1];
+            // Set block1, bit1 as a digital input
+            WrPortE(pin->addr1, NULL, RSB_PORT0 + pin->bit1);
+            // Masking off low nibble is enough since input setting is zero
+            WrPortE(pin->addr1 + 1, ptr, (*ptr & RSB_IO_MASK));
+          }
+          // RSB_TYPE_DIGINOUT will drop through to configure output
+          if (pin->type == RSB_TYPE_DIGIN) break;
+
+        case RSB_TYPE_DIGOUT:
+          // See if block2 is RIO based
+          if (pin->block2 < 8) {
+            // Get pointer to port control register shadow
+            ptr = &rsb_rio[def->rio].block[pin->block2].pxcr[pin->bit2];
+
+            // Save pin initialization setting to pin bit in Port 3 shadow
+            // This takes into account any polarity inversion on the pin
+            WrPortE(pin->addr2, NULL, RSB_PORT3);
+            BitWrPortE(pin->addr2 + 1, pin->dr_shadow,
+                (*iptr > RSB_HI ? 1 : *iptr) ^ def->polarity,
+                   pin->bit2 + 4);
+
+            // Set block2, bit2 as a digital output
+            WrPortE(pin->addr2, NULL, RSB_PORT0 + pin->bit2);
+            WrPortE(pin->addr2 + 1, ptr, (*ptr & RSB_IO_MASK) | RSB_USE_OUTPUT);
+          }
+          break;
+
+        case RSB_TYPE_PUSHPULL:
+          if (pin->block1 < 8 && pin->block1 == pin->block2 && !(pin->bit1 & 1)
+                 && *iptr != RSB_INP && (pin->bit1 + 1) == pin->bit2)
+          {
+            // Turn on pin protection for the pair
+            SET_GB(1);
+            WrPortE(RSB_MPCR + (pin->index * RSB_RIO_OFFSET), NULL,
+                     (pin->block1 << 1) + (pin->bit2 & 1));
+            SET_GB(0);
+            if (pin->bit1) {
+              // If bit1/bit2 are ports 2&3 then bit2 IS Port 3.
+              // Retain 2 low data bits not used by this pair & set output
+              //  and shift initialization state value to bits 6 & 7.
+              c = ((*(pin->dr_shadow) & 0x30) | RSB_USE_OUTPUT +
+                        ((*iptr == RSB_TRI ? 0 : *iptr + 1) << 6));
+            }
+            else {
+              // Retain 2 hi data bits not used by this pair and
+              //   shift initialization state value to bits 4 & 5.
+              c = ((*(pin->dr_shadow) & 0xCF) |
+                         ((*iptr == RSB_TRI ? 0 : *iptr + 1) << 4));
+            }
+            // Set init state (and port 3 to output if hi pair on block)
+            WrPortE(pin->addr2, NULL, RSB_PORT3);
+            WrPortE(pin->addr2 + 1, pin->dr_shadow, c);
+            // Setup bit1 as an output
+            WrPortE(pin->addr1, NULL, RSB_PORT0 + pin->bit1);
+            WrPortE(pin->addr1 + 1, pin->cr_shadow, RSB_USE_OUTPUT);
+            if (!pin->bit1) {
+               // Setup bit2 as an output (if not already done)
+              WrPortE(pin->addr2, NULL, RSB_PORT0 + 1);
+              WrPortE(pin->addr2 + 1, pin->cr_shadow + 1, RSB_USE_OUTPUT);
+            }
+          }
+          else {
+            // Push-pull pins MUST be RIO based and can't initialize as inputs
+            //  and also MUST be paired as pins 0 & 1 or 2 & 3
+            return -ENODEV;
+          }
+          break;
+
+        default:   // Invalid pin type, return error
+          return -ENODEV;
+      }
+   }
+
+#ifdef RSB_VERBOSE
+   printf("_riosbc_init() Initialization complete.\n");
+#endif
+	return 0;
+}
+
+// Internal function that releases any block resources that are in use
+// by the given pin, or group of pins.  The pin(s) are then set to either a
+// digital input, or if an output only type then to a digital output.
+// Pins that are grouped (decoder), will be released as a group.  Resources
+// that still have other pins on the block using them will not be freed.
+// (ie. Releasing one of two PWM's on a block will not free the timer)
+_rsb_debug
+void _rsb_release(struct RSB_IOpin *pin)
+{
+   auto int i, j, x, addr;
+   auto struct _RSB_BLOCK_USE *use;
+
+   // Setup block usage and function resource pointers
+   if (pin->function < RSB_FUNC_DIGOUT) {
+      use = &(rsb_rio[pin->index].block[pin->block1]);
+      x = _rsb_bitmap[pin->bit1];
+      addr = pin->addr1;
+   }
+   else {
+      use = &(rsb_rio[pin->index].block[pin->block2]);
+      x = _rsb_bitmap[pin->bit2];
+      addr = pin->addr2;
+   }
+
+   // See if the pin is using the counter/timer
+   if (use->mr_use & x) {
+      // Release mode usage and stop the counter if nothing else is using it
+      use->mr_use ^= x;
+      if (!use->mr_use) {
+        WrPortE(addr, NULL, RSB_MODE);
+        WrPortE(addr + 1, &(use->mode), 0);
+      }
+      else if (pin->function == RSB_FUNC_COUNTER_INPUT &&
+                 use->mode == RSB_MODE_UP_DN && use->dc_use == x)
+      {
+         // Releasing down count pin, set counter mode to up count only
+         WrPortE(addr, NULL, RSB_MODE);
+         WrPortE(addr + 1, &(use->mode), RSB_MODE_IIB_COUNT);
+      }
+   }
+
+   // See if the pin is using any sync functions
+   if (use->sc_use & x) {
+      // Release sync usage and reset sync if nothing else is using it
+      use->sc_use ^= x;
+      if (!use->sc_use) {
+        WrPortE(addr, NULL, RSB_SYNC);
+        WrPortE(addr + 1, &(use->scr), 0);
+      }
+   }
+
+   // See if the pin is using any IIB functions
+   if (use->ic_use & x) {
+      // Release IIB usage and reset IIB if nothing else is using it
+      use->ic_use ^= x;
+      if (!use->ic_use) {
+        WrPortE(addr, NULL, RSB_INC);
+        WrPortE(addr + 1, &(use->icr), 0);
+      }
+   }
+
+   // See if the pin is using any DQE functions
+   if (use->dc_use & x) {
+      // Release DQE usage and reset DQE if nothing else is using it
+      use->dc_use ^= x;
+      if (!use->dc_use) {
+        WrPortE(addr, NULL, RSB_DEC);
+        WrPortE(addr + 1, &(use->dcr), 0);
+      }
+   }
+
+   // See if the pin is using any STATx functions
+   for (i = 4; i--; ) {
+     if (use->sx_use[i] & x) {
+       // Release STATx usage and reset STATx if nothing else is using it
+       use->sx_use[i] ^= x;
+       if (!use->sx_use[i]) {
+         WrPortE(addr, NULL, RSB_STAT0 + i);
+         WrPortE(addr + 1, &(use->sxcr[i]), 0);
+       }
+     }
+   }
+
+   // See if the pin is using any MATCHx functions
+   for (i = 4; i--; ) {
+     if (use->mx_use[i] & x) {
+       // Release MATCHx usage and reset MATCHx if nothing else is using it
+       use->mx_use[i] ^= x;
+       if (!use->mx_use[i]) {
+         WrPortE(addr, NULL, RSB_MATCH0 + (i << 1));
+         WrPortE(addr + 1, (char *)&(use->mx[i]), 0xFF);
+         WrPortE(addr + 1, ((char *)&(use->mx[i])) + 1, 0xFF);
+       }
+     }
+   }
+   pin->match = 0;   // Clear match settings within pin structure
+
+   // See if the pin is using the Limit register
+   if (use->clr_use & x) {
+      use->clr_use ^= x;    // Release Limit register usage
+   }
+
+   // See if the pin is using the Begin register
+   if (use->br_use & x) {
+      use->br_use ^= x;    // Release Begin register usage
+   }
+
+   // See if the pin is using the End register
+   if (use->er_use & x) {
+      use->er_use ^= x;    // Release End register usage
+   }
+
+   // Set block to simple input or output function
+   if (pin->type < RSB_TYPE_DIGOUT) {
+      // Release digital input capable pin - Set to digin
+      pin->function = RSB_FUNC_DIGIN;
+	   WrPortE(pin->addr1, NULL, RSB_PORT0 + pin->bit1);
+	   WrPortE(pin->addr1 + 1, &(use->pxcr[pin->bit1]),
+                  (use->pxcr[pin->bit1] & RSB_IO_MASK));
+      if (pin->type == RSB_TYPE_DIGINOUT) {
+         // If port has an output, make sure it's driver is not on
+	      WrPortE(pin->addr2, NULL, RSB_PORT0 + pin->bit2);
+	      WrPortE(pin->addr2 + 1, &(use->pxcr[pin->bit2]),
+                  (use->pxcr[pin->bit2] & RSB_IO_MASK));
+      }
+   }
+   else
+   {
+      // Release digital output only pin - Set to digout low/tri state
+      if (pin->type == RSB_TYPE_PUSHPULL) {
+         i = (pin->bit1 ? 0x3F : 0xCF);
+      }
+      else {
+         i = ~_rsb_pinmap[pin->bit2];
+      }
+      pin->function = RSB_FUNC_DIGOUT;
+      WrPortE(addr, NULL, RSB_PORT3);
+      WrPortE(addr + 1, &(use->pxcr[3]), use->pxcr[3] & i);
+      WrPortE(addr, NULL, RSB_PORT0 + pin->bit2);
+      WrPortE(addr + 1, &(use->pxcr[pin->bit2]),
+                  (use->pxcr[pin->bit2] & RSB_IO_MASK) | RSB_USE_OUTPUT);
+      if (pin->type == RSB_TYPE_PUSHPULL) {
+         // If pushpull make sure sink driver is off also
+         WrPortE(addr, NULL, RSB_PORT0 + pin->bit1);
+         WrPortE(addr + 1, &(use->pxcr[pin->bit1]),
+                  (use->pxcr[pin->bit1] & RSB_IO_MASK) | RSB_USE_OUTPUT);
+      }
+   }
+
+   return;
+}
+
+// Internal function that checks for block resource conflicts between
+// current block settings, and the desired functionality passed in.
+// Returns 0 if no conflict detected.  If mode conflicts are found, returns
+// bit map of ports in bits 0..3 with set bits showing ports that conflict
+// with the function given.  Returns -EACCES if there are no mode conflicts,
+// but resources needed are not available.  Returns -EINVAL if any parameters
+// are out of range.  Returns -EPERM if pin is not released.
+_rsb_debug
+int _rsb_conflict(char rio, char chn, char pin, char function,
+                               char flags)
+{
+   auto char share;
+   auto int i, j, x, rc;
+   auto struct RSB_IOpin *p;
+   auto struct _RSB_BLOCK_USE *use;
+   auto const __far struct _RSB_RIO_RES *res;
+
+   // Check for invalid parameters
+   if (rio > RSB_MAX_RIOS || chn > 7 || pin > 3 || function >= RSB_FUNC_ANAIN)
+   {
+      return -EINVAL;
+   }
+   // Check for non-released pin error
+   p = &(rsb_pin[rsb_map[rio][chn][pin]]);
+   if (p->function != RSB_FUNC_DIGIN && p->function != RSB_FUNC_DIGOUT)
+   {
+      return -EPERM;
+   }
+   // Never a conflict with simple digital input or output
+   if (function == RSB_FUNC_DIGIN || function == RSB_FUNC_DIGOUT) return 0;
+
+   // Init to no conflicts, Setup block usage and function resource pointers
+   rc = 0;
+   use = &(rsb_rio[rio].block[chn]);
+   res = &(_rsb_resources[function]);
+
+   // Look for mode conflicts
+   x = use->mode & 7;
+   if (x && (res->mode_begin || res->mode_end))
+   {
+      if (x < res->mode_begin || x > res->mode_end)
+      {
+	      for (i = 0, j = use->mr_use; j && i < 4; j >>= 1, ++i)
+	      {
+	         if (j & 1)
+	         {
+	           // Setup pointer to pin that is using the mode register
+	           p = &(rsb_pin[rsb_map[rio][chn][i]]);
+	           // See if pin using mode needs specific mode setting
+	           if (_rsb_resources[p->function].mode_begin > 1 &&
+	                _rsb_resources[p->function].mode_end < 7)
+	           {
+	             // Mode conflict detected, return bitmap for conflicting pins
+	             return use->mr_use;
+	           }
+	         }
+	      }
+      }
+	   if ((function == RSB_FUNC_CAPTURE_INPUT && (flags || x != RSB_MODE_TIMER))
+           || (function == RSB_FUNC_COUNTER_INPUT && x != RSB_MODE_IIB_COUNT))
+      {
+         return -EACCES;   // Capture & Counter modes don't share counter
+                           //  except for capture with free running counter
+      }                    //  or up/down counter which uses 2 pins
+   }
+   share = (flags & 4 ? _rsb_bitmap[flags & 3] : 0);
+
+   // If IIB/DQE are used by this function, check for availability
+   if (!rc && (res->iib || res->dqe))
+   {
+     // Setup IIB/DQE requirements for specific capture modes if needed
+     if (function == RSB_FUNC_CAPTURE_INPUT && flags) {
+        i = (flags == RSB_CNT_TIL_END ? 0 : 1);
+        j = (flags == RSB_CNT_ON_BEGIN ? 0 : 1);
+     }
+     else {
+        // Default to table requirements for all others
+	     i = res->iib;
+	     j = res->dqe;
+     }
+
+     // See if IIB is in use and not sharable
+     if (use->ic_use && use->ic_use != share)
+     {
+       // If DQE also in use OR settings require IIB, then set error
+       rc = (use->dc_use && use->dc_use != share ? -EACCES :
+              (i && i != 3 ? -EACCES : 0));
+     }
+     else
+     {
+       // IIB OK, see if DQE required and if so, if available
+       if (j && j != 3 && use->dc_use && use->dc_use != share)
+       {
+         rc = -EACCES;   // DQE required and not available
+       }
+     }
+   }
+
+   // If match register(s) are used by this function, check for availability
+   if (!rc && res->match)
+   {
+     // Use manual match settings and PWM or PPM function to get number
+     //  of match registers on auto assignment
+     j = (!((flags & 4) && ((function == RSB_FUNC_PWM) ||
+                            (function == RSB_FUNC_PPM)))) ? 1 : 0;
+     if (!(flags & 0x20) && (function == RSB_FUNC_PPM)) j++;
+     if (j)
+     {
+        // j is number of match registers needed, scan for availability
+	     for (i = 4; i-- && j; )
+        {
+	       if (!use->mx_use[i]) j--;
+	     }
+	     if (j) rc = -EACCES;   // Not enough match registers available
+     }
+   }
+
+   return rc;
+}
+
+/*** BeginHeader _rsb_init_cpu_io */
+void _rsb_init_cpu_io(int addr, char pin, char *shadow, char type,
+                                   char init);
+/*** EndHeader */
+// Internal function that sets the port pin specified by the port data
+// register address 'addr' and the bit position 'pin' to the I/O type given
+// by 'type'. The pin will be initialized to the setting given by 'init'.
+// The pointer 'shadow' points to the shadow register for the port data
+// register.  The 'addr' parameter must be one of PBDR, PCDR, PDDR or PEDR.
+// The 'type' must be a valid RSB_TYPE_.. and 'init' must be a valid RIO SBC
+// initialization setting (RSB_LOW, RSB_HI, RSB_TRI, or RSB_INP).
+_rsb_debug
+void _rsb_init_cpu_io(int addr, char pin, char *shadow, char type,
+                                   char init)
+{
+   auto char c, mask, ddr, *ddr_shadow;
+
+   mask = _rsb_bitmap[pin];
+   if (addr == PCDR) {
+      ddr = 1;  // Offset for Data Direction Register
+      ddr_shadow = &PCDDRShadow;
+      WrPortI(PCFR, &PCFRShadow, (PCFRShadow & ~mask));
+   }
+   else {
+      ddr = 7;  // Offset for Data Direction Register
+      if (addr == PBDR) {
+         ddr_shadow = &PBDDRShadow;
+   	}
+      else {
+        if (addr == PDDR) {
+          ddr_shadow = &PDDDRShadow;
+          WrPortI(PDFR, &PDFRShadow, (PDFRShadow & ~mask));
+     	  }
+        else {
+          ddr_shadow = &PEDDRShadow;
+          WrPortI(PEFR, &PEFRShadow, (PEFRShadow & ~mask));
+        }
+      }
+   }
+
+   if (init == RSB_INP) {
+      c = *ddr_shadow & ~mask;  // Shut off mask bit to set input function
+   }
+   else {
+      c = *ddr_shadow | mask;  // Turn on mask bit to set output function
+   }
+   WrPortI(addr + ddr, ddr_shadow, c);
+}
+
+
+/*** BeginHeader _riosbc_set_clk_prescale */
+int _riosbc_set_clk_prescale(char rio, unsigned char prescale);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_set_clk_prescale				<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_set_clk_prescale(char rio, unsigned char prescale)
+
+DESCRIPTION:	Sets the master clock prescale register for the RIO chip.
+               This value sets the prescale clock frequency available to
+               all blocks on the RIO chip.  The prescale frequency is:
+
+                master clock frequency / (n + 1) = prescale frequency
+
+               where n is the prescale register value.
+
+PARAMETER1:		Index value of the desired RIO chip
+PARAMETER2:    Character value with clock prescale value
+
+RETURNS:       0 on Success
+               -EINVAL: invalid parameter value
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_set_clk_prescale(char rio, unsigned char prescale)
+{
+   if (rio >= RSB_MAX_RIOS) {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_set_clk_prescale(%d) Invalid RIO index.\n", rio);
+#endif
+      return -EINVAL;
+   }
+
+   // Set Global/Block output to Global if not included in the address
+   SET_GB(1);
+
+   // Write the byte to the Master Clock Prescale Register and shadow
+   WrPortE(RSB_MPR + (RSB_RIO_OFFSET * rio), &(rsb_rio[rio].mpr), prescale);
+
+   // Set Global/Block output back to Block if not included in the address
+   SET_GB(0);
+
+#ifdef RSB_VERBOSE
+   printf("_riosbc_set_clk_prescale(%d) Prescale = %d.\n", rio, prescale);
+#endif
+   return 0;
+}
+
+/*** BeginHeader _riosbc_set_prot_prescale */
+int _riosbc_set_prot_prescale(char rio, word prescale);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_set_prot_prescale			<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_set_prot_prescale(char rio, word prescale)
+
+DESCRIPTION:	Sets the protection prescale register for a block.
+
+PARAMETER1:		Index to RIO chip
+PARAMETER2:    Master protection prescale value (0..255)
+                Sets a protection prescale count of 1 to 256
+
+RETURNS:       0 on Success
+               -EINVAL: invalid parameter value
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_set_prot_prescale(char rio, word prescale)
+{
+   if (rio >= RSB_MAX_RIOS) return -EINVAL;
+
+   // Set Global/Block output to Global if not included in the address
+   SET_GB(1);
+
+   // Write the byte to the Master Protection Prescale Register and shadow
+   WrPortE(RSB_MPCR + (RSB_RIO_OFFSET * rio), &rsb_rio[rio].ppr, prescale);
+
+   // Set Global/Block output back to Block if not included in the address
+   SET_GB(0);
+
+   return 0;
+}
+
+/*** BeginHeader _riosbc_set_limit */
+int _riosbc_set_limit(struct RSB_IOpin *pin, word limit);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_set_limit						<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_set_limit(struct RSB_IOpin *pin, word limit)
+
+DESCRIPTION:	Sets the counter limit registers for a block.  The value
+               sets the wrap or reset point for the counter, which will
+               vary the frequency setting of PWM/PPM outputs and will
+               also change counter and capture rollover.  The limit
+               register setting affects the frequency of all pins on the
+               block that are set to PWM/PPM outputs. New limit settings
+               do not take effect until the next counter rollover or reset.
+
+PARAMETER1:		Pointer to a pin which uses the limit register
+PARAMETER2:    Word value with counter limit
+
+RETURNS:       0 on Success
+               -EPERM: Pin does not use the limit register, not permitted
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_set_limit(struct RSB_IOpin *pin, word limit)
+{
+   auto char b, *ptr;
+   auto unsigned int addr;
+
+   // Check if pin uses the limit register
+   if (_rsb_resources[pin->function].lbe <= _RSB_BE_ONLY)
+   {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_set_limit(%d,%d,%d) Invalid function (%d).\n",
+                   pin->index, pin->block2, pin->bit2, pin->function);
+#endif
+      return -EPERM;
+   }
+
+   // Setup block and block address values based on pin functionality
+   if (pin->function < RSB_FUNC_DIGOUT) {
+	   b =  pin->block1;
+      addr = pin->addr1;
+   }
+   else {
+	   b =  pin->block2;
+      addr = pin->addr2;
+   }
+   if (b > RSB_MAX_BLOCKS) {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_set_limit(%d,%d) Non-RIO based pin.\n", pin->index, b);
+#endif
+      return -EPERM;
+   }
+
+   // Write the word to the Block Limit Registers and shadow
+   ptr = (char *)&rsb_rio[pin->index].block[b].clr;
+   WrPortE(addr, NULL, RSB_LIMIT);
+   WrPortE(addr + 1, ptr, limit);
+   WrPortE(addr + 1, ptr + 1, limit >> 8);
+   // Move pointer to RSB_STATUS to get away from latching addresses
+   WrPortE(pin->addr1, NULL, RSB_STATUS);
+#ifdef RSB_VERBOSE
+   printf("_riosbc_set_limit(%d,%d) Limit = %u.\n", pin->index, b, limit);
+#endif
+   return 0;
+}
+
+/*** BeginHeader _riosbc_set_match */
+int _riosbc_set_match(struct RSB_IOpin *pin, char index, word match);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_set_match						<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_set_match(struct RSB_IOpin *pin, char index,
+                                   word match)
+
+DESCRIPTION:	Sets one of four match registers for a block.  This
+               value is primarily used to set a transition point for
+               PWM/PPM outputs.  This setting may affect multiple pins
+               on the block.  New match settings do not take effect
+               until the next counter rollover or reset.
+
+PARAMETER1:		Pointer to a pin which uses the match register
+PARAMETER2:    Index for the desired match register (0..3)
+PARAMETER3:    Word value with new match count
+
+RETURNS:       0 on Success
+               -EPERM: Pin does not use the match register, not permitted
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_set_match(struct RSB_IOpin *pin, char index, word match)
+{
+   auto char b, mask, *ptr;
+   auto unsigned int addr;
+
+   // Setup block and block address values based on pin functionality
+   if (pin->function < RSB_FUNC_DIGOUT) {
+	   b =  pin->block1;
+      addr = pin->addr1;
+      mask = _rsb_bitmap[pin->bit1];
+   }
+   else {
+	   b =  pin->block2;
+      addr = pin->addr2;
+      mask = _rsb_bitmap[pin->bit2];
+   }
+
+   // Check that block is hosted by a RIO chip
+   if (b > RSB_MAX_BLOCKS) {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_set_match(%d,%d) Non-RIO based pin.\n", pin->index, b);
+#endif
+      return -EPERM;
+   }
+
+   // Check if pin uses the match register specified by index
+   if ((rsb_rio[pin->index].block[b].mx_use[index] & mask) == 0)
+   {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_set_limit(%d,%d) Invalid match index (%d).\n",
+                   pin->index, b, index);
+#endif
+      return -EPERM;
+   }
+
+   // Write the word to the Block Match Registers and shadow
+   ptr = (char *)&rsb_rio[pin->index].block[b].mx[index];
+   WrPortE(addr, NULL, RSB_MATCH0 + (index << 1));
+   WrPortE(addr + 1, ptr, match);
+   WrPortE(addr + 1, ptr + 1, match >> 8);
+#ifdef RSB_VERBOSE
+   printf("_riosbc_set_match(%d,%d,%d) Match = %u.\n", pin->index, b,
+             index, match);
+#endif
+   return 0;
+}
+
+/*** BeginHeader _riosbc_set_toggle */
+int _riosbc_set_toggle(struct RSB_IOpin *pin, word duty);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_set_toggle						<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_set_toggle(struct RSB_IOpin *pin, word duty)
+
+DESCRIPTION:	Sets the toggle duty cycle and rate for a block.  This
+               signal can be used to modulate the 'ON' pulse for PWM and
+               PPM outputs.  It only affects PWM and PPM blocks that
+               enable the modulation.  It is shared by all PWM/PPM pins
+               on the same RIO block, so changing the toggle setting on
+               one PWM/PPM output will also change it for other PWM/PPM
+               outputs on the same block.  It does not affect
+               pins used for digital output or any input functions.
+
+               NOTE: 'duty' is not given as a percentage etc.  See the
+               parameter description below.
+
+               The toggle function uses the LSBs of the block counter.
+               The highest toggle rate will be equal to the rate at which the
+               counter LSB changes, i.e. the counter 'clock' divided by 2.
+
+               For a given duty setting, the maximum toggle frequency will be
+               determined by the most significant bit set in the duty parameter.
+
+PARAMETER1:		Pointer to a pin set to the PWM/PPM function
+PARAMETER2:    Duty cycle setting as follows: (F is the counter clock rate)
+
+               parameter
+               value       duty     frequency  max left shift
+               ---------   -------  ---------  --------------
+                 0         100%     --             --
+                 1         50%      F/2            7
+                 3         25%      F/4            6
+                 7         1/8      F/8            5
+                 15        1/16     F/16           4
+                 31        1/32     F/32           3
+                 63        1/64     F/64           2
+                 127       1/128    F/128          1
+                 255       1/256    F/256          0
+
+               In addition, the 'duty' values may be shifted left by one or
+               more positions.  This will reduce the toggling rate by the
+               corresponding power of 2.  For example, '3' gives 25% duty
+               at F/4, whereas '12' ( == 3<<2) also gives 25% duty, but at
+               F/16.  NOTE: shifting left such that the parameter value
+               exceeds 255 is not valid so, for example, the maximum allowable
+               shift for 25% duty is 6 positions (giving 0xC0 or 192).  There
+               is only one allowable setting for 1/256 duty.  Because of this,
+               the minimum frequency is always F/256.
+
+               Other values (i.e. with a non-contiguous set of 1-bits) should
+               not normally be used, since the output waveform will exhibit
+               sub-harmonics.
+
+RETURNS:       0 on Success
+               -EINVAL: invalid parameter value
+
+SEE ALSO:      _riosbc_set_function, _riosbc_set_pwm, _riosbc_set_ppm
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_set_toggle(struct RSB_IOpin *pin, word duty)
+{
+   if (pin->function == RSB_FUNC_PWM || pin->function == RSB_FUNC_PPM)
+   {
+      // Write the byte to the Block Toggle Register and shadow
+      WrPortE(pin->addr2, NULL, RSB_TOGGLE);
+      WrPortE(pin->addr2+1, &rsb_rio[pin->index].block[pin->block2].toggle, duty);
+      return 0;
+   }
+   else
+   {
+      return -EINVAL;
+   }
+}
+
+/*** BeginHeader _riosbc_irq_enable */
+int _riosbc_irq_enable(char rio, char enable);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_irq_enable						<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_irq_enable(char rio, char enable)
+
+DESCRIPTION:	Enables/disables RIO interrupts on a chip level.
+
+PARAMETER1:		Index of the RIO chip to enable/disable interrupts
+PARAMETER2:    Zero disables interrupts, non-zero enables interrupts
+
+RETURNS:       0 on Success
+               -EINVAL: invalid parameter value
+
+SEE ALSO:      _riosbc_set_isr, _riosbc_set_irq_priority, _riosbc_tick
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_irq_enable(char rio, char enable)
+{
+   if (rio >= RSB_MAX_RIOS) return -EINVAL;
+
+   // Setup interrupt enable bit with synchronous timing bit
+   enable = (enable ? 3 : 2);
+
+   // Set Global/Block output to Global if not included in the address
+   SET_GB(1);
+
+   // Write the byte to the Master Control Register
+   WrPortE(RSB_MCR + (RSB_RIO_OFFSET * rio), NULL, enable);
+
+   // Set Global/Block output back to Block if not included in the address
+   SET_GB(0);
+
+   return 0;
+}
+
+/*** BeginHeader _riosbc_irq_mask */
+int _riosbc_irq_mask(struct RSB_IOpin *pin, char mask);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_irq_mask						<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_irq_mask(struct RSB_IOpin *pin, char mask)
+
+DESCRIPTION:	Sets the IRQ enable mask within the RSB_IOpin structure and
+               writes the mask to the block's interrupt enable register.
+               This shows which interrupts will be handled by the interrupt
+               handler for this pin.
+
+PARAMETER1:		Pointer to the RSB_IOpin structure of the desired I/O pin
+PARAMETER2:    Mask value for IRQ’s within the RSB_IOpin structure
+
+RETURNS:       0 on Success
+               -EINVAL: invalid pin, not hosted by a RIO chip
+
+SEE ALSO:      _riosbc_set_isr, _riosbc_set_irq_priority, _riosbc_tick
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_irq_mask(struct RSB_IOpin *pin, char mask)
+{
+   auto int addr;
+
+   if (pin->type > RSB_TYPE_PUSHPULL) return -EINVAL;
+   WrPortE(pin->addr, NULL, RSB_IER);
+   WrPortE(pin->addr + 1, &pin->irq_mask, mask);
+   return 0;
+}
+
+/*** BeginHeader _riosbc_set_decoder */
+int _riosbc_set_decoder(struct RSB_IOpin *A, struct RSB_IOpin *B,
+                         struct RSB_IOpin *index, char ixpol);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_set_decoder					<RIO_SBC.LIB>
+
+SYNTAX:    int _riosbc_set_decoder(struct RSB_IOpin *A, struct RSB_IOpin *B,
+                                   struct RSB_IOpin *index, char ixpol)
+
+DESCRIPTION:	Sets up the Quadrature Decoder functionality on the given
+               pins.  All pins must have input capability and be on the
+               same RIO and block.  Pins given will be released from any
+               current functionality.  Pins will have their functionality
+               set to RSB_FUNC_DECODER_INPUT on success.  This function
+               does not require the pre-setting of functionality by the
+               _riosbc_set_function routine before being called.
+
+               In encoder documentation, the A input of this function can
+               refer to any of the following: A, I, or In-Phase signal
+               The B input of this function can refer to any of the
+               following: B, Q, or Quadrature signal
+
+PARAMETER1:		Pointer to RSB_IOpin structure to use for the A input (I)
+PARAMETER2:    Pointer to RSB_IOpin structure to use for the B input (Q)
+PARAMETER3:    Pointer to RSB_IOpin structure to use for the index input
+                 (NULL if not used)
+PARAMETER4:    Index polarity: 0 for index on low level
+                               non-zero for index on hi level
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid pin combination
+               -EPERM:  pin type does not permit this operation
+               -EACCES: access to required resource denied
+                        (conflicting with other pin on this block)
+
+SEE ALSO:      _riosbc_set_function, _riosbc_get_count
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_set_decoder(struct RSB_IOpin *A, struct RSB_IOpin *B,
+                                    struct RSB_IOpin *index, char ixpol)
+{
+   auto char bits, *ptr;
+   auto word addr;
+   auto struct _RSB_BLOCK_USE *use;
+
+   // Make sure all pins have input capability
+   if (A->type >= RSB_TYPE_DIGOUT || B->type >= RSB_TYPE_DIGOUT ||
+       (index && index->type >= RSB_TYPE_DIGOUT)) {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_set_decoder(%d,%d,%d,%d,%d) Invalid pin type.\n",
+                   A->index, A->block1, A->bit1, B->bit1, index->bit1);
+#endif
+      return -EPERM;
+   }
+   // Make sure all pins are on the same RIO block
+   if (A->block1 != B->block1 || A->index != B->index || (index &&
+       (A->block1 != index->block1 || A->index != index->index))) {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_set_decoder(%d,%d,%d,%d) Not on same RIO/block.\n",
+                   A->index, A->block1, B->block1, index->block1);
+#endif
+      return -EINVAL;
+   }
+
+   // Clear any current functionality and resources from these pins
+   _rsb_release(A);
+   _rsb_release(B);
+   bits = _rsb_bitmap[A->bit1] | _rsb_bitmap[B->bit1];
+   if (index) {
+      _rsb_release(index);
+      bits |= _rsb_bitmap[index->bit1];
+   }
+
+   // Check for conflicts with Decoder Input resource needs
+   if (_rsb_conflict(A->index, A->block1, A->bit1, RSB_FUNC_DECODER_INPUT, 0))
+   {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_set_decoder(%d,%d,%d,%d,%d) Resource conflict.\n",
+                   A->index, A->block1, A->bit1, B->bit1, index->bit1);
+#endif
+      return -EACCES;
+   }
+
+   // Setup decoder inputs A(in-phase) & B(quadrature)
+   // Set counter mode to up/down counter
+   A->function = RSB_FUNC_DECODER_INPUT;
+   B->function = RSB_FUNC_DECODER_INPUT;
+   addr = A->addr1;
+   use = &(rsb_rio[A->index].block[A->block1]);
+   WrPortE(addr, NULL, RSB_MODE);
+   WrPortE(addr + 1, &(use->mode), RSB_MODE_UP_DN);
+   // Set Increment and Decrement Controls to Quadrature mode + A & B pins
+   WrPortE(addr, NULL, RSB_INC);
+   WrPortE(addr + 1, &(use->icr), RSB_SEL_PORT0 + A->bit1);
+   WrPortE(addr + 1, &(use->icr), RSB_POL_QUADRATURE+RSB_SEL_PORT0 + A->bit1);
+   WrPortE(addr, NULL, RSB_DEC);
+   WrPortE(addr + 1, &(use->dcr), RSB_SEL_PORT0 + B->bit1);
+   WrPortE(addr + 1, &(use->dcr), RSB_POL_QUADRATURE+RSB_SEL_PORT0 + B->bit1);
+   // Set limit register to maximum
+   ptr = (char *)&(use->clr);
+   WrPortE(addr, NULL, RSB_LIMIT);
+   WrPortE(addr + 1, ptr, 0xFF);
+   WrPortE(addr + 1, ptr + 1, 0xFF);
+   // Reset counter register
+   WrPortE(addr, NULL, RSB_CMD);
+   WrPortE(addr + 1, NULL, RSB_CMD_ZERO);
+   // Show register usage in resource control variables
+   rsb_rio[A->index].block[A->block1].mr_use |= bits;
+   rsb_rio[A->index].block[A->block1].ic_use |= bits;
+   rsb_rio[A->index].block[A->block1].dc_use |= bits;
+
+   // Setup decoder index, if a pin is specified
+   if (index) {
+	   index->function = RSB_FUNC_DECODER_INPUT;
+      // Set counter reset on sync of given polarity from the index pin
+      WrPortE(index->addr1, NULL, RSB_SYNC);
+      WrPortE(index->addr1 + 1, &(use->scr),
+               RSB_SYNC_RESET + (ixpol ? RSB_POL_WHILE_HIGH : RSB_POL_WHILE_LOW)
+                + RSB_SEL_PORT0 + index->bit1 );
+      // Show register usage in resource control variable
+      use->sc_use |= _rsb_bitmap[index->bit1];
+#ifdef RSB_VERBOSE
+      printf("_riosbc_set_decoder(%d,%d,%d,%d,%d) Decoder set.\n",
+                   A->index, A->block1, A->bit1, B->bit1, index->bit1);
+   } else {
+      printf("_riosbc_set_decoder(%d,%d,%d,%d,-1) Decoder set.\n",
+                   A->index, A->block1, A->bit1, B->bit1);
+#endif
+   }
+   return 0;
+}
+
+/*** BeginHeader _riosbc_set_pwm */
+int _riosbc_set_pwm(struct RSB_IOpin *pin, word end, word mode);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_set_pwm						<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_set_pwm(struct RSB_IOpin *pin, word end, word mode)
+
+DESCRIPTION:	Sets up the I/O pin for PWM output with the given end
+               count and mode settings.  This function requires the
+               pre-setting of pin functionality to PWM by the
+               _riosbc_set_function routine before being called.
+               If using an external sync, this pin must be setup before
+               calling this function as well.
+
+PARAMETER1:		Pointer to the RSB_IOpin structure of the desired I/O pin
+PARAMETER2:    Counter match value for the desired end cycle of the PWM
+PARAMETER3:    Bits to control the mode settings for the PWM output
+                             Bits   8  7  6  5  4  3  2  1  0
+           • pushpull sink select --+  |  |  |  |  |  |  |  | (RSB_SINK_SEL)
+           • prescale clock select ----+  |  |  |  |  |  |  | (RSB_PRESCALE)
+           • AND w/ toggle signal --------+  |  |  |  |  |  | (RSB_PWM_TOGGLE)
+           • invert output ------------------+  |  |  |  |  | (RSB_PWM_INVERT)
+           • edge select (for sync) ------------+--+  |  |  |
+           • sync/clock select -----------------------+--+--+
+
+            For pushpull sink select, it selects use of the sinking driver,
+              otherwise PWM setting will be applied to the sourcing driver
+              on a pushpull type pin. Ignored for non-pushpull pins.
+            For prescaling of internal clock, OR in RSB_PRESCALE.
+            For application of the toggle signal, OR in RSB_PWM_TOGGLE
+            To invert the PWM signal, OR in RSB_PWM_INVERT
+            Use LOW 5 bits for sync/clock selection:
+              For sync select, OR in RSB_SEL_GLOBAL or RSB_SEL_PORTx (ext. sync)
+              For edge select, OR in RSB_POL_RISING, RSB_POL_FALLING or
+                                     RSB_POL_EITHER
+              To keep existing block sync settings, use RSB_PWM_KEEP_SYNC
+                  (No edge setting necessary)
+
+              For external clock select set bits with RSB_PWM_EXT_CLK
+               NOTE: External counter on same block must already be setup
+                     Ext. clock select and Sync select are mutually exclusive
+            If sync or ext. clock are not used, low 5 bits should be zero
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+               -EPERM:  pin functionality does not permit this operation
+               -EACCES: resource needed by PWM is not available
+
+SEE ALSO:      _riosbc_set_function, _riosbc_set_limit, _riosbc_set_toggle
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_set_pwm(struct RSB_IOpin *pin, word end, word mode)
+{
+   auto char i, j, *ptr, *shadow;
+   auto word addr;
+   auto struct _RSB_BLOCK_USE *use;
+
+   if (pin->function != RSB_FUNC_PWM)
+   {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_set_pwm(%d,%d,%d) invalid function (%d).\n",
+                   pin->index, pin->block2, pin->bit2, pin->function);
+#endif
+      return -EPERM;
+   }
+
+   // Setup bit index, end cycle pointer and block usage pointer
+   if (mode & RSB_SINK_SEL) {
+      if (pin->type != RSB_TYPE_PUSHPULL) {
+#ifdef RSB_VERBOSE
+		   printf("_riosbc_set_pwm(%d,%d,%d) not pushpull output (mode = %04x).\n",
+                   pin->index, pin->block2, pin->bit2, mode);
+#endif
+         return -EPERM;
+      }
+      i = pin->bit1;
+      addr = pin->addr1;
+   }
+   else {
+      i = pin->bit2;
+      addr = pin->addr2;
+   }
+   j = _rsb_bitmap[i];
+   ptr = (char *)&end;
+   use = &(rsb_rio[pin->index].block[pin->block2]);
+
+   // See if sync required, and if so, that resources needed are available
+   if ((mode & 7) && ((mode & 7) > 2)) {
+     // Make sure valid edge selection is in bits 3 & 4
+     if ((mode & 0x18) == 0) {
+#ifdef RSB_VERBOSE
+		   printf("_riosbc_set_pwm(%d,%d,%d) Invalid sync edge (mode = %04x).\n",
+                   pin->index, pin->block2, pin->bit2, mode);
+#endif
+        return -EINVAL;
+     }
+     if (mode & 4) {
+       // External sync selected, see that it is set to correct function
+       if (rsb_pin[rsb_map[pin->index][pin->block2][mode & 3]].function !=
+             RSB_FUNC_SYNC) {
+#ifdef RSB_VERBOSE
+		   printf("_riosbc_set_pwm(%d,%d,%d) ext. sync mismatch (mode = %04x).\n",
+                   pin->index, pin->block2, pin->bit2, mode);
+#endif
+         return -EACCES;
+       }
+
+       // See if sync already in use. If so, it must match with mode bits
+       if (use->sc_use) {
+         if ((use->scr & 0x3F) != (mode & 0x1F)) {
+#ifdef RSB_VERBOSE
+   		  printf("_riosbc_set_pwm(%d,%d,%d) block sync mismatch (mode = %04x).\n",
+                   pin->index, pin->block2, pin->bit2, mode);
+#endif
+           return -EACCES;
+         }
+       }
+       else {
+         // Setup sync register
+         WrPortE(addr, NULL, RSB_SYNC);
+         WrPortE(addr + 1, &(use->scr), mode & 7);
+         WrPortE(addr + 1, &(use->scr), (mode & 0x1F) | RSB_SYNC_RESET);
+       }
+       // Tie this pin to sync resource
+       use->sc_use |= j;
+     }
+   }
+   else {
+     if (mode & 7) {
+       // External clock mode selected, see that counter is in proper mode
+       if ((mode & 2) && use->mode != 1) {
+#ifdef RSB_VERBOSE
+		   printf("_riosbc_set_pwm(%d,%d,%d) clock mode invalid (mode = %04x).\n",
+                   pin->index, pin->block2, pin->bit2, mode);
+#endif
+          return -EINVAL;
+       }
+     }
+     else
+       if (use->sc_use) {
+#ifdef RSB_VERBOSE
+		   printf("_riosbc_set_pwm(%d,%d,%d) block sync not off (mode = %04x).\n",
+                   pin->index, pin->block2, pin->bit2, mode);
+#endif
+          return -EINVAL;
+       }
+   }
+
+   // Invert the PWM Invert flag if polarity inversion required on pin
+   if (pin->polarity) mode ^= RSB_PWM_INVERT;
+
+   // Setup match register referenced by m with end count parameter
+   j = pin->match & 3;
+   shadow = (char *)&(use->mx[j]);
+   WrPortE(addr, NULL, RSB_MATCH0 + (j << 1));
+   WrPortE(addr + 1, shadow, *ptr);
+   WrPortE(addr + 1, shadow + 1, *(ptr + 1));
+
+   // Reset the counter to latch limit and match settings if not running yet
+   if (!use->mode) {
+      WrPortE(addr, NULL, RSB_CMD);
+      WrPortE(addr + 1, NULL, RSB_CMD_ZERO);
+   }
+
+   // Skip timer setup if using external PWM clock source
+   if ((mode & 7) != RSB_PWM_EXT_CLK) {
+	   // Set mode 4 (w/ prescale selector if prescale bit set in mode parameter)
+	   WrPortE(addr, NULL, RSB_MODE);
+	   WrPortE(addr + 1, &(use->mode), (mode & RSB_PRESCALE ?
+	              RSB_MODE_PRESCALE | RSB_MODE_TIMER : RSB_MODE_TIMER));
+   }
+
+   // Set status bit operation based on inverted output bit in mode parameter
+   WrPortE(addr, NULL, RSB_STAT0 + i);
+   j = (mode & RSB_PWM_INVERT ? (RSB_SET_MATCH0 | RSB_RES_ROLLOVER) + (j << 3) :
+   										(RSB_RES_MATCH0 | RSB_SET_ROLLOVER) + j);
+   WrPortE(addr + 1, &(use->sxcr[i]), j);
+
+   // Set port pin to use the status bit and setup ANDing of Toggle if
+   //  the toggle bit is set in mode parameter
+   WrPortE(addr, NULL, RSB_PORT0 + i);
+   j = (use->pxcr[i] & RSB_IO_MASK) + (mode & RSB_PWM_TOGGLE ?
+                                           RSB_USE_TOGGLE : RSB_USE_STATUS);
+   WrPortE(addr + 1, &(use->pxcr[i]), j);
+
+#ifdef RSB_VERBOSE
+   printf("_riosbc_set_pwm(%d,%d,%d) PWM SET: end=%04x, mode=%04x.\n",
+            pin->index, pin->block2, pin->bit2, end, mode);
+#endif
+   return 0;
+}
+
+/*** BeginHeader _riosbc_set_ppm */
+int _riosbc_set_ppm(struct RSB_IOpin *pin, word offset, word end, word mode);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_set_ppm						<RIO_SBC.LIB>
+
+SYNTAX:  int _riosbc_set_ppm(struct RSB_IOpin *pin, word offset, word end,
+                              word mode)
+
+DESCRIPTION:	Sets up the I/O pin for PPM output with the given offset,
+               end count and mode settings.  The mode setting allows
+               changing of default operation, a zero selects the defaults.
+               The sync select uses the RSB_SEL_GLOBAL or RSB_SEL_PORTx
+               defines to select the global sync or a port input sync.
+               The other bits allow enabling toggle masking, 180 degree
+               phase shift (inversion), or main clock (bypass prescaler).
+
+               NOTE: This function requires the pre-setting of the pin
+               functionality to PPM Output by the _riosbc_set_function
+               routine before being called.  If using an external sync,
+               this pin must be setup before calling this function.
+
+PARAMETER1:		Pointer to the RSB_IOpin structure of the desired I/O pin
+PARAMETER2:    Sets the Match Register controlling the offset of the PPM
+PARAMETER3:    Sets the Match Register controlling the end count of the PPM
+PARAMETER4:    Bits to control the mode settings for the PWM output
+                             Bits   8  7  6  5  4  3  2  1  0
+           • pushpull sink select --+  |  |  |  |  |  |  |  | (RSB_SINK_SEL)
+           • prescale clock select ----+  |  |  |  |  |  |  | (RSB_PRESCALE)
+           • AND w/ toggle signal --------+  |  |  |  |  |  | (RSB_PWM_TOGGLE)
+           • invert output ------------------+  |  |  |  |  | (RSB_PWM_INVERT)
+           • edge select (for sync) ------------+--+  |  |  |
+           • sync/clock select -----------------------+--+--+
+
+            For pushpull sink select, it selects use of the sinking driver,
+              otherwise PPM setting will be applied to the sourcing driver
+              on a pushpull type pin. Ignored for non-pushpull pins.
+            For prescaling of internal clock, OR in RSB_PRESCALE.
+            For application of the toggle signal, OR in RSB_PWM_TOGGLE
+            To invert the PPM signal, OR in RSB_PWM_INVERT
+            Use LOW 5 bits for sync/clock selection:
+              For sync select, OR in RSB_SEL_GLOBAL or RSB_SEL_PORTx (ext. sync)
+              For edge select, OR in RSB_POL_RISING, RSB_POL_FALLING or
+                                     RSB_POL_EITHER
+              To keep existing block sync settings, use RSB_PWM_KEEP_SYNC
+                  (No edge setting necessary)
+
+              For external clock select set bits with RSB_PWM_EXT_CLK
+               NOTE: External counter on same block must already be setup
+                     Ext. clock select and Sync select are mutually exclusive
+            If sync or ext. clock are not used, low 5 bits should be zero
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value or sync/clock mismatch
+               -EPERM:  pin functionality does not permit this operation
+
+SEE ALSO:      _riosbc_set_function, _riosbc_set_limit, _riosbc_set_toggle
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_set_ppm(struct RSB_IOpin *pin, word offset, word end,
+                                 word mode)
+{
+   auto char i, j, *ptr, *shadow;
+   auto word addr;
+   auto struct _RSB_BLOCK_USE *use;
+
+   if (pin->function != RSB_FUNC_PPM)
+   {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_set_ppm(%d,%d,%d) invalid function (%d).\n",
+                   pin->index, pin->block2, pin->bit2, pin->function);
+#endif
+      return -EPERM;
+   }
+
+   // Setup bit index, end cycle pointer and block usage pointer
+
+   if (mode & RSB_SINK_SEL) {
+      if (pin->type != RSB_TYPE_PUSHPULL) {
+#ifdef RSB_VERBOSE
+		   printf("_riosbc_set_ppm(%d,%d,%d) not pushpull output (mode = %04x).\n",
+                   pin->index, pin->block2, pin->bit2, mode);
+#endif
+         return -EPERM;
+      }
+      i = pin->bit1;
+      addr = pin->addr1;
+   }
+   else {
+      i = pin->bit2;
+      addr = pin->addr2;
+   }
+   j = _rsb_bitmap[i];
+   ptr = (char *)&end;
+   use = &(rsb_rio[pin->index].block[pin->block2]);
+
+   // See if sync required, and if so, that resources needed are available
+   if ((mode & 7) && ((mode & 7) > 2)) {
+     // Make sure valid edge selection is in bits 3 & 4
+     if ((mode & 0x18) == 0) {
+#ifdef RSB_VERBOSE
+		   printf("_riosbc_set_ppm(%d,%d,%d) Invalid sync edge (mode = %04x).\n",
+                   pin->index, pin->block2, pin->bit2, mode);
+#endif
+        return -EINVAL;
+     }
+     if (mode & 4) {
+       // External sync selected, see that it is set to correct function
+       if (rsb_pin[rsb_map[pin->index][pin->block2][mode & 3]].function !=
+             RSB_FUNC_SYNC) {
+#ifdef RSB_VERBOSE
+		   printf("_riosbc_set_ppm(%d,%d,%d) ext. sync mismatch (mode = %04x).\n",
+                   pin->index, pin->block2, pin->bit2, mode);
+#endif
+         return -EACCES;
+       }
+
+       // See if sync already in use. If so, it must match with mode bits
+       if (use->sc_use) {
+         if ((use->scr & 0x3F) != (mode & 0x1F)) {
+#ifdef RSB_VERBOSE
+   		  printf("_riosbc_set_ppm(%d,%d,%d) block sync mismatch (mode = %04x).\n",
+                   pin->index, pin->block2, pin->bit2, mode);
+#endif
+           return -EACCES;
+         }
+       }
+       else {
+         // Setup sync register
+         WrPortE(pin->addr1, NULL, RSB_SYNC);
+         WrPortE(pin->addr1 + 1, &(use->scr), mode & 7);
+         WrPortE(pin->addr1 + 1, &(use->scr), (mode & 0x1F) | RSB_SYNC_RESET);
+       }
+       // Tie this pin to sync resource
+       use->sc_use |= j;
+     }
+   }
+   else {
+     if (mode & 7) {
+       // External clock mode selected, see that counter in proper mode
+       if ((mode & 2) && use->mode != 1) {
+#ifdef RSB_VERBOSE
+		   printf("_riosbc_set_ppm(%d,%d,%d) clock mode invalid (mode = %04x).\n",
+                   pin->index, pin->block2, pin->bit2, mode);
+#endif
+          return -EINVAL;
+       }
+     }
+     else
+       if (use->sc_use) {
+#ifdef RSB_VERBOSE
+		   printf("_riosbc_set_ppm(%d,%d,%d) block sync not off (mode = %04x).\n",
+                   pin->index, pin->block2, pin->bit2, mode);
+#endif
+          return -EINVAL;
+       }
+   }
+
+   // Invert the PWM Invert flag if polarity inversion required on pin
+   if (pin->polarity) mode ^= RSB_PWM_INVERT;
+
+   // Write the end count parameter to the end match register
+   j = pin->match & 3;
+   shadow = (char *)&(use->mx[j]);
+   WrPortE(addr, NULL, RSB_MATCH0 + (j << 1));
+   WrPortE(addr + 1, shadow, *ptr);
+   WrPortE(addr + 1, shadow + 1, *(ptr + 1));
+
+   // Write the offset count parameter to the offset match register
+   j = (pin->match >> 3) & 3;
+   ptr = (char *)&offset;
+   shadow = (char *)&(use->mx[j]);
+   WrPortE(addr, NULL, RSB_MATCH0 + (j << 1));
+   WrPortE(addr + 1, shadow, *ptr);
+   WrPortE(addr + 1, shadow + 1, *(ptr + 1));
+
+   // Reset the counter to latch limit and match settings if not running yet
+   if (!use->mode) {
+      WrPortE(addr, NULL, RSB_CMD);
+      WrPortE(addr + 1, NULL, RSB_CMD_ZERO);
+   }
+
+   // Skip timer setup if using external PWM clock source
+   if ((mode & 7) != RSB_PWM_EXT_CLK) {
+	   // Set mode 4 (w/ prescale selector if prescale bit set in mode parameter)
+	   WrPortE(addr, NULL, RSB_MODE);
+	   WrPortE(addr + 1, &(use->mode), (mode & RSB_PRESCALE ?
+	                  RSB_MODE_PRESCALE | RSB_MODE_TIMER : RSB_MODE_TIMER));
+   }
+
+   // Set status bit state from matches (reverse match registers if inverting)
+   j = pin->match;
+   j = (mode & RSB_PWM_INVERT ? (j >> 3) + ((j & 7) << 3) : j);
+   WrPortE(addr, NULL, RSB_STAT0 + i);
+   WrPortE(addr + 1, &(use->sxcr[i]), j);
+
+   // Set port pin to use the status bit and setup ANDing of Toggle if
+   //  the toggle bit is set in mode parameter
+   WrPortE(addr, NULL, RSB_PORT0 + i);
+   j = (use->pxcr[i] & RSB_IO_MASK) + (mode & RSB_PWM_TOGGLE ?
+                                          RSB_USE_TOGGLE : RSB_USE_STATUS);
+   WrPortE(addr + 1, &(use->pxcr[i]), j);
+
+#ifdef RSB_VERBOSE
+   printf("_riosbc_set_ppm(%d,%d,%d) PPM Set: offset=%04x, end=%04x, mode=%04x.\n",
+            pin->index, pin->block2, pin->bit2, offset, end, mode);
+#endif
+   return 0;
+}
+
+/*** BeginHeader _riosbc_pulse_disable */
+int _riosbc_pulse_disable(struct RSB_IOpin *pin, char state);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_pulse_disable					<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_pulse_disable(struct RSB_IOpin *pin, char state)
+
+DESCRIPTION:	Disabled PWM/PPM output and sets to a given steady state.
+               This is a convenient way of gating a pulsed signal
+               without the need to re-setup operating paramters.
+               Does not function on pushpull type pins.
+
+PARAMETER1:		Pointer to RSB_IOpin structure for the desired I/O pin
+PARAMETER2:		Steady state of output pin (0 = low, non-zero = high)
+
+RETURN VALUE:  0 on success
+               -EPERM:  pin functionality does not permit this operation
+
+SEE ALSO:      _riosbc_pulse_enable, _riosbc_set_pwm, _riosbc_set_ppm
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_pulse_disable(struct RSB_IOpin *pin, char state)
+{
+   // Make sure pin is setup as a PWM or PPM output
+   if (pin->function != RSB_FUNC_PWM && pin->function != RSB_FUNC_PPM ||
+        pin->type == RSB_TYPE_PUSHPULL) {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_pulse_disable(%d,%d,%d) invalid function (%d).\n",
+                   pin->index, pin->block2, pin->bit2, pin->function);
+#endif
+      return -EPERM;
+   }
+
+   // Make sure state is 0 or 1
+   if (state) state = 1;
+   WrPortE(pin->addr2, NULL, RSB_PORT0 + pin->bit2);
+   WrPortE(pin->addr2 + 1, pin->cr_shadow,
+              (*pin->cr_shadow & RSB_IO_MASK) |
+                  (state ^ pin->polarity ? RSB_USE_HIGH : RSB_USE_LOW));
+#ifdef RSB_VERBOSE
+   printf("_riosbc_pulse_disable(%d,%d,%d) set to %0x.\n",
+                   pin->index, pin->block2, pin->bit2, state);
+#endif
+   return 0;
+}
+
+/*** BeginHeader _riosbc_pulse_enable */
+int _riosbc_pulse_enable(struct RSB_IOpin *pin, char toggle);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_pulse_enable					<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_pulse_enable(struct RSB_IOpin *pin, char toggle)
+
+DESCRIPTION:	Enables a disabled PWM/PPM output.  Pin is restored to
+               the same PWM/PPM operation as before being disabled.
+               Toggle ANDing is not stored and is set by toggle flag.
+               Does not function on pushpull type pins.
+
+PARAMETER1:		Pointer to RSB_IOpin structure for the desired I/O pin
+PARAMETER2:		True/false flag which enables/disables toggle ANDing
+
+RETURN VALUE:  0 on success
+               -EPERM:  pin functionality does not permit this operation
+
+SEE ALSO:      _riosbc_pulse_disable, _riosbc_set_pwm, _riosbc_set_ppm
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_pulse_enable(struct RSB_IOpin *pin, char toggle)
+{
+   // Make sure pin is setup as a PWM or PPM output
+   if (pin->function != RSB_FUNC_PWM && pin->function != RSB_FUNC_PPM ||
+        pin->type == RSB_TYPE_PUSHPULL) {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_pulse_enable(%d,%d,%d) invalid function (%d).\n",
+                   pin->index, pin->block2, pin->bit2, pin->function);
+#endif
+      return -EPERM;
+   }
+
+   WrPortE(pin->addr2, NULL, RSB_PORT0 + pin->bit2);
+   WrPortE(pin->addr2 + 1, pin->cr_shadow,
+              (*pin->cr_shadow & RSB_IO_MASK) |
+                 (toggle ? RSB_USE_TOGGLE : RSB_USE_STATUS));
+#ifdef RSB_VERBOSE
+   printf("_riosbc_pulse_enable(%d,%d,%d) set to %0x.\n",
+                   pin->index, pin->block2, pin->bit2, toggle);
+#endif
+   return 0;
+}
+
+/*** BeginHeader _riosbc_set_sequence */
+int _riosbc_set_sequence(struct RSB_IOpin *pin, char sequence);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_set_sequence					<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_set_sequence(struct RSB_IOpin *pin, char sequence)
+
+DESCRIPTION:	Sets the output sequence for the given I/O pin.  The
+               sequence is stored across registers for Port 0 thru Port 3
+               as described in section 4.3.3 of the RIO manual.  The
+               sequence steps from bit 0 thru 3 then back to 0 on
+               increment rollover events.  The pin must already be set
+               as a sequencing output before calling this function.
+
+PARAMETER1:		Pointer to RSB_IOpin structure for the desired I/O pin
+PARAMETER2:    4 bit output sequence for the given I/O pin in bits 0-3
+
+RETURN VALUE:  0 on success
+               -EPERM:  pin functionality does not permit this operation
+
+SEE ALSO:      _riosbc_set_function, _riosbc_set_limit
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_set_sequence(struct RSB_IOpin *pin, char sequence)
+{
+   auto char i, bit;
+   auto struct _RSB_BLOCK_USE *use;
+
+   // Make sure pin is setup as a sequencing output
+   if (pin->function != RSB_FUNC_SEQUENCE) {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_set_sequence(%d,%d,%d) invalid function (%d).\n",
+                   pin->index, pin->block2, pin->bit2, pin->function);
+#endif
+      return -EPERM;
+   }
+
+   // Setup bit position within port registers to write sequence
+   bit = pin->bit2 + 4;
+   // Get pointer to the host block usage structure
+   use = &(rsb_rio[pin->index].block[pin->block2]);
+   // Write sequence to proper bit in each PORTn register
+#ifdef RSB_VERBOSE
+   printf("_riosbc_set_sequence(%d,%d,%d) set to %02x.\n",
+                   pin->index, pin->block2, pin->bit2, sequence);
+#endif
+   for (i = 0; i < RSB_BLOCK_PINS; sequence >>= 1) {
+	   WrPortE(pin->addr2, NULL, RSB_PORT0 + i);
+      BitWrPortE(pin->addr2 + 1, use->pxcr[i++], sequence & 1, bit);
+   }
+   return 0;
+}
+
+/*** BeginHeader _riosbc_set_counter */
+int _riosbc_set_counter(struct RSB_IOpin *pin, word flags);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_set_counter						<RIO_SBC.LIB>
+
+SYNTAX:  int _riosbc_set_counter(struct RSB_IOpin *pin, word flags)
+
+DESCRIPTION:	Sets up the pin as a counter input, with selectable
+               edge settings.  The counter will increment on each
+               selected edge event.  Flag settings also allow the
+               pin to be used as a down count input, which will change
+               the counter mode and will decrement the counter on the
+               selected edge event.  Up/Down counting requires the use
+               of two pins and the up count input must be set first,
+               then the down count input (two calls to this function).
+               Up/Down counting and Match usage cannot be used
+               simultaneously.
+
+               NOTE: This function requires the pre-setting of the pin(s)
+               functionality to Counter Input by the _riosbc_set_function
+               routine before being called.
+
+PARAMETER1:		Pointer to the RSB_IOpin structure of the desired I/O pin
+PARAMETER2:    Bits to control the counter operation
+                          Bits   7  6  5  4  3  2  1  0
+               RESERVED          X  |  |  |  |  |  |  |
+            • keep limit reg -------+  |  |  |  |  |  | (RSB_KEEP_LIMIT)
+            • max all match regs-------+  |  |  |  |  | (RSB_MAX_MATCHES)
+            • edge select ----------------+--+  |  |  |
+            • reset count ----------------------+  |  | (RSB_COUNT_RESET)
+            • down count enable -------------------+  | (RSB_DOWN_COUNT)
+            • match enable ---------------------------+ (RSB_MATCH_ENABLE)
+
+            Use RSB_KEEP_LIMIT to disable the automatic setting of the
+             limit register to 0xFFFF.
+            For edge select, OR in RSB_POL_RISING, RSB_POL_FALLING or
+                                     RSB_POL_EITHER
+            Reset count causes a counter reset.
+            Match enable causes the counter to disable on any match.
+             You can also use RSB_MAX_MATCHES to set all match registers
+              to maximum value (0xFFFF) when match enable is set.
+            Down count enable sets the counter to up/down count mode and
+             sets this pin as the down count input.  The up count pin
+             should already be set by a previous call to this function.
+            NOTE: Match enable cannot be used with up/down counting.
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value or block/pin usage
+               -EPERM:  pin functionality does not permit this operation
+
+SEE ALSO:      _riosbc_set_function, _riosbc_clr_ctr, _riosbc_set_toggle
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_set_counter(struct RSB_IOpin *pin, word flags)
+{
+   auto char i, j, *shadow;
+   auto word addr;
+   auto struct _RSB_BLOCK_USE *use;
+
+   if (pin->function != RSB_FUNC_COUNTER_INPUT)
+   {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_set_counter(%d,%d,%d) invalid function (%d).\n",
+                   pin->index, pin->block1, pin->bit1, pin->function);
+#endif
+      return -EPERM;   // Must be setup as counter input before calling
+   }
+   if (((flags & 3) == 3) || ((flags & 0x21) == 0x20))
+   {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_set_counter(%d,%d,%d) invalid flags (%04x).\n",
+                   pin->index, pin->block1, pin->bit1, flags);
+#endif
+      return -EINVAL;  // Can't enable match and up/down count together
+   }
+
+   // Setup bit index, end cycle pointer and block usage pointer
+   j = _rsb_bitmap[pin->bit1];
+   addr = pin->addr1;
+   use = &(rsb_rio[pin->index].block[pin->block1]);
+
+   if ((flags & RSB_DOWN_COUNT) && ((use->mode != RSB_MODE_IIB_COUNT) ||
+         ((use->icr & 3) == pin->bit1))) {
+      // Up count must already be setup on a different pin on the
+      //  same block as the down count pin
+      return -EINVAL;
+   }
+
+   // Set limit register to max count unless RSB_KEEP_LIMIT is set
+   if ((flags & RSB_KEEP_LIMIT) == 0)
+   {
+	   shadow = (char *)&(use->clr);
+	   WrPortE(addr, NULL, RSB_LIMIT);
+	   WrPortE(addr + 1, shadow++, 0xFF);
+	   WrPortE(addr + 1, shadow, 0xFF);
+   }
+
+   // Set match register usage flags and match registers to max if requested
+   if (flags & RSB_MATCH_ENABLE) {
+	   for (i = RSB_BLOCK_PINS; i--; )
+	   {
+	      use->mx_use[i] |= j;
+	      if (flags & RSB_MAX_MATCHES)
+	      {
+	         shadow = (char *)&(use->mx[i]);
+	         WrPortE(addr, NULL, RSB_MATCH0 + (i << 1));
+	         WrPortE(addr + 1, shadow++, 0xFF);
+	         WrPortE(addr + 1, shadow, 0xFF);
+	      }
+	   }
+   }
+
+   // Reset counter register if requested
+   if (flags & RSB_COUNT_RESET)
+   {
+	   WrPortE(addr, NULL, RSB_CMD);
+	   WrPortE(addr + 1, NULL, RSB_CMD_ZERO);
+   }
+
+   // Create control byte from edge bits and bit number
+   i = (flags & 0x18) + 4 + pin->bit1;
+   if (flags & RSB_DOWN_COUNT)
+   {  // Set DCE control for down count input
+	   WrPortE(addr, NULL, RSB_DEC);
+	   WrPortE(addr + 1, &(use->dcr), i & 7);
+	   WrPortE(addr + 1, &(use->dcr), i);
+      use->dc_use |= j;
+   }
+   else
+   {  // Set IIB control for up count input
+	   WrPortE(addr, NULL, RSB_INC);
+	   WrPortE(addr + 1, &(use->icr), i & 7);
+	   WrPortE(addr + 1, &(use->icr), i);
+      use->ic_use |= j;
+   }
+
+   // Set counter mode based on flags
+   WrPortE(addr, NULL, RSB_MODE);
+   WrPortE(addr + 1, &(use->mode), (flags & 3) + 1);
+
+#ifdef RSB_VERBOSE
+   printf("_riosbc_set_counter(%d,%d,%d) set to flags %04x.\n",
+                   pin->index, pin->block1, pin->bit1, flags);
+#endif
+   return 0;
+}
+
+/*** BeginHeader _riosbc_set_capture */
+int _riosbc_set_capture(struct RSB_IOpin *pin, word flags);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_set_capture						<RIO_SBC.LIB>
+
+SYNTAX:  int _riosbc_set_capture(struct RSB_IOpin *pin, word flags)
+
+DESCRIPTION:	Sets up the pin as a pulse capture input, with selectable
+               begin/end settings.  The counter will increment at either
+               the master clock rate, or the prescaled clock rate from
+               the specified begin condition until the specified end
+               condition.  The count is captured in either the begin or
+               end register, or both.  The counter can be automatically
+               reset while being setup by setting the reset counter flag.
+               The limit register of the counter is automatically set to
+               0xFFFF to allow for maximum count ability.  To preserve
+               the limit setting (sharing block with PWM/PPM), use the
+               RSB_SAVE_LIMIT flag.
+
+               NOTE: This function requires the pre-setting of the pin
+               functionality to Capture Input by the _riosbc_set_function
+               routine before being called.
+
+PARAMETER1:		Pointer to the RSB_IOpin structure of the desired I/O pin
+PARAMETER2:    Bits to control the count conditions and capture operation
+                    Bits 15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
+       • reset counter ---+  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+       • save limit value ---+  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+       • begin event select ----+--+--+  |  |  |  |  |  |  |  |  |  |  |
+       • begin signal input -------------+--+--+  |  |  |  |  |  |  |  |
+       • use prescale clock ----------------------+  |  |  |  |  |  |  |
+       • count mode ---------------------------------+--+  |  |  |  |  |
+       • end edge select ----------------------------------+--+  |  |  |
+       • end signal input ---------------------------------------+--+--+
+
+            Use RSB_CAPT_RESET to reset the counter.
+            Use RSB_SAVE_LIMIT to skip setting the limit register to 0xFFFF.
+            Select the Begin event or condition with:
+              RSB_BEGIN_HIGH or RSB_BEGIN_LOW for hi/low state detect
+              RSB_EDGE_BOTH \
+              RSB_EDGE_FALL  > for rising/falling/both edge detect
+              RSB_EDGE_RISE /
+            Select the Begin signal input with RSB_BEGIN_PORTn where n
+             is pin number on the block or RSB_BEGIN_GLOBAL to use
+             the global sync line.
+            Use RSB_PRESCALE to select the pre-scaled clock instead of main
+            Select counter operating mode with:
+              RSB_CNT_ON_BEGIN  - Counts while begin state exists
+                                  (Use RSB_BEGIN_HIGH or RSB_BEGIN_LOW)
+              RSB_CNT_BEGIN_END - Start count on begin event, stop on end
+              RSB_CNT_TIL_END   - Count continuously until end event
+              RSB_CNT_RUN       - Count continuously
+            Select End event with:
+              RSB_POL_RISING  \
+              RSB_POL_FALLING  > for rising/falling/both edge detect
+              RSB_POL_EITHER  /
+              RSB_SEL_GLOBAL  - To use global sync line for end event
+              RSB_SEL_PORTn   - Where n is the port number of the end input
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+               -EPERM:  pin functionality does not permit this operation
+
+SEE ALSO:      _riosbc_set_function, _riosbc_clr_ctr, _riosbc_set_toggle
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_set_capture(struct RSB_IOpin *pin, word flags)
+{
+   auto char i, j, *shadow;
+   auto word addr;
+   auto struct _RSB_BLOCK_USE *use;
+
+   if (pin->function != RSB_FUNC_CAPTURE_INPUT)
+   {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_set_capture(%d,%d,%d) invalid function (%d).\n",
+                   pin->index, pin->block1, pin->bit1, pin->function);
+#endif
+      return -EPERM;   // Must be setup as capture input before calling
+   }
+
+   // Setup bit index, end cycle pointer and block usage pointer
+   j = _rsb_bitmap[pin->bit1];
+   addr = pin->addr1;
+   use = &(rsb_rio[pin->index].block[pin->block1]);
+
+   if ((flags & RSB_SAVE_LIMIT) == 0)
+   {
+	   // Set limit register to max count and reset counter
+	   shadow = (char *)&(use->clr);
+	   WrPortE(addr, NULL, RSB_LIMIT);
+	   WrPortE(addr + 1, shadow++, 0xFF);
+	   WrPortE(addr + 1, shadow, 0xFF);
+	   WrPortE(addr, NULL, RSB_CMD);
+	   WrPortE(addr + 1, NULL, RSB_CMD_ZERO);
+   }
+
+   // See if begin event is being used
+   if (flags & RSB_BEGIN_PORT3)
+   {  // Set IIB control for detecting begin event
+	   WrPortE(addr, NULL, RSB_INC);
+	   WrPortE(addr + 1, &(use->icr), (flags >> 8) & 7);
+	   WrPortE(addr + 1, &(use->icr), (flags >> 8) & 0x3F);
+      use->ic_use |= j;
+   }
+
+   // See if end event is being used
+   if (flags & RSB_SEL_PORT3)
+   {  // Set DCE control for detecting end event
+	   WrPortE(addr, NULL, RSB_DEC);
+	   WrPortE(addr + 1, &(use->icr), flags & 7);
+	   WrPortE(addr + 1, &(use->dcr), flags & 0x1F);
+      use->dc_use |= j;
+   }
+
+   // Reset counter register if requested
+   if (flags & RSB_CAPT_RESET)
+   {
+	   WrPortE(addr, NULL, RSB_CMD);
+	   WrPortE(addr + 1, NULL, RSB_CMD_ZERO);
+   }
+
+   // Set counter mode based on flags
+   i = ((flags >> 5) & 3) + ((flags & RSB_PRESCALE) ?
+                       RSB_MODE_PRESCALE | RSB_MODE_TIMER : RSB_MODE_TIMER);
+   WrPortE(addr, NULL, RSB_MODE);
+   WrPortE(addr + 1, &(use->mode), i);
+
+#ifdef RSB_VERBOSE
+   printf("_riosbc_set_capture(%d,%d,%d) set to flags %04x.\n",
+                   pin->index, pin->block1, pin->bit1, flags);
+#endif
+   return 0;
+}
+
+/*** BeginHeader _riosbc_set_function */
+int _riosbc_set_function(struct RSB_IOpin *pin, word function, word flags);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_set_function					<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_set_function(struct RSB_IOpin *pin, char function
+                                      char flags)
+
+DESCRIPTION:	Sets the functionality desired for the given I/O pin.
+               This routine must be called for each pin before attempting
+               to use the other function control routines.  The only
+               exception is the _riosbc_set_decode function which groups
+               the pins needed for the decoder functionality. Interrupt
+               and sync functions require the edge setting to be placed
+               in the option flags parameter.  (See below)
+               The block counter/timer is always considered sharable,
+               when possible. For other resources, such as match registers
+               or sync signal, sharing must be explicitly allowed by setting
+               the sharing criteria within the option flags parameter.
+
+PARAMETER1:		Pointer to RSB_IOpin structure for the desired I/O pin
+PARAMETER2:    Valid RSB_FUNC_* value from the enumerated list
+PARAMETER3:    Flags to modify options of pin settings/resource sharing
+                                    Bits   8  7  6  5  4  3  2  1  0
+            • external clock (PWM/PPM) ----+  |  |  |  |  |  |  |  |
+            • edge select (ext int & sync)----+--+  |  |  |  |  |  |
+            • manual offset match setting ----------+--+--+  |  |  |
+            • manual end match/share setting ----------------+--+--+
+
+            To allow external clock for PWM/PPM use RSB_FUNC_EXT_CLK
+            For edge select, OR in RSB_FUNC_RISING, RSB_FUNC_FALLING or
+                                     RSB_FUNC_EITHER
+            NOTE: edge select needed for external int and sync functions
+            Otherwise, bits 6 & 7 should be set to zero.
+
+            On non-PWM/PPM pins:
+             The low 3 bits are used for the share setting, which allows
+             resources to be shared with pin n stated by using RSB_SHAREn.
+            For PWM/PPM pins:
+             If using auto match assignment, set the low 6 bits to zero.
+             For manual override of automatic match register settingOR
+              Use RSB_END_MATCHn to manually set the End Match register
+
+              Use RSB_OFF_MATCHn to manually set the Offset Match register
+               In both cases 'n' is the match register number to be used.
+            Care must be taken in the manual assignment of end and offset
+            registers and counts.  This mechanism allows sharing of match
+            registers to synchronize edges on PWM/PPM signals, but shared
+            match counts can be changed by any pin using them.
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+               -EPERM:  pin type does not permit this function
+               -EACCES: resource needed by this function is not available
+               -EFAULT: internal data fault detected
+               positive number: Mode Conflict - lower nibble has a bitmap of
+                   ports on block that require an incompatible counter mode.
+
+SEE ALSO:      _riosbc_set_decoder
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_set_function(struct RSB_IOpin *pin, word function,
+                                      word flags)
+{
+   auto char i, j, m, share, *shadow;
+   auto int addr, rc;
+   auto struct _RSB_BLOCK_USE *use;
+   auto const __far struct _RSB_RIO_RES *res;
+
+   // Make sure function is valid and pin pointer is valid
+   if (function >= RSB_FUNC_MAX || (pin-rsb_pin) >= RSB_MAX_PINS) {
+      return -EINVAL;
+   }
+
+   // Handle Analog functions with simple pin type verification
+   if (function >= RSB_FUNC_ANAIN)
+   {
+      if (function < RSB_FUNC_ANAOUT) {
+         if (pin->type != RSB_TYPE_ANAIN) {
+#ifdef RSB_VERBOSE
+	         printf("_riosbc_set_function type/function mismatch (%d/%d).\n",
+                      pin->type, function);
+#endif
+            return -EPERM;
+         }
+      }
+      else {
+         if (pin->type != RSB_TYPE_ANAOUT) {
+#ifdef RSB_VERBOSE
+	         printf("_riosbc_set_function type/function mismatch (%d/%d).\n",
+                      pin->type, function);
+#endif
+            return -EPERM;
+         }
+      }
+#ifdef RSB_VERBOSE
+      printf("_riosbc_set_function(%d,%d,%d) set to function %d.\n",
+                   pin->index, pin->block1, pin->bit1, function);
+#endif
+      pin->function = function;
+      return 0;
+   }
+   else {
+      // Digital function being set, is this an analog pin?
+      if (pin->type >= RSB_TYPE_ANAIN) {
+#ifdef RSB_VERBOSE
+         printf("_riosbc_set_function type/function mismatch (%d/%d).\n",
+                   pin->type, function);
+#endif
+         return -EPERM;
+      }
+   }
+
+   // RIO based function, compare resource needs with resource usage
+   if (function < RSB_FUNC_DIGOUT) {
+      if (pin->type >= RSB_TYPE_DIGOUT) return -EPERM;
+      i = pin->bit1;
+      j = pin->block1;
+      if (j >= RSB_MAX_BLOCKS) {
+         if (function != RSB_FUNC_DIGIN) {
+#ifdef RSB_VERBOSE
+	         printf("_riosbc_set_function(%d,%d,%d) type/function mismatch (%d).\n",
+                   pin->index, pin->block1, pin->bit1, function);
+#endif
+            return -EPERM;   // Non-RIO pins only support basic input function
+         }
+      }
+      else {
+	      use = &(rsb_rio[pin->index].block[pin->block1]);
+      }
+      addr = pin->addr1;
+   }
+   else {
+      if (pin->type == RSB_TYPE_DIGIN) return -EPERM;
+      i = pin->bit2;
+      j = pin->block2;
+      if (j >= RSB_MAX_BLOCKS) {
+         if (function != RSB_FUNC_DIGOUT) {
+#ifdef RSB_VERBOSE
+	         printf("_riosbc_set_function(%d,%d,%d) type/function mismatch (%d).\n",
+                   pin->index, pin->block2, pin->bit2, function);
+#endif
+            return -EPERM;   // Non-RIO pins only support basic output function
+         }
+      }
+      else {
+	      use = &(rsb_rio[pin->index].block[pin->block2]);
+      }
+      addr = pin->addr2;
+   }
+
+   if (pin->function != RSB_FUNC_DIGIN && pin->function != RSB_FUNC_DIGOUT) {
+      _rsb_release(pin);
+   }
+   else if (pin->type == RSB_TYPE_DIGINOUT && pin->function == RSB_FUNC_DIGOUT
+                && function != RSB_FUNC_DIGOUT)
+   {
+      // Configurable I/O - Set output driver as an input to disable it
+      if (pin->block2 < RSB_MAX_BLOCKS) {
+		   WrPortE(pin->addr2, NULL, RSB_PORT0 + pin->bit2);
+			WrPortE(pin->addr2+1, pin->cr_shadow, (*pin->cr_shadow & RSB_IO_MASK));
+      }
+      else {
+        if (pin->block2 == RSB_IO_BASED) {
+          // Output side is an Aux I/O Latch based pin, to disable the
+          //  driver, set the bit to the opposite state of polarity
+          BitWrPortE(pin->addr2, pin->cr_shadow, pin->polarity ^ 1, pin->bit2);
+        }
+        else {
+#ifdef RSB_USE_CPU_IO
+          // Output side is Processor based, to disable the driver,
+          //   set the bit to the opposite state of polarity
+          BitWrPortI(pin->addr2, pin->cr_shadow, pin->polarity ^ 1, pin->bit2);
+#else
+#ifdef RSB_VERBOSE
+          printf("_riosbc_set_function(%d,%d,%d) CPU pin hosting not enabled.\n",
+                   pin->index, pin->block2, pin->bit2, function);
+#endif
+	       return -EFAULT;
+#endif
+        }
+      }
+   }
+   if (j >= RSB_MAX_BLOCKS) {
+      if (function == RSB_FUNC_DIGOUT) {
+         pin->function = RSB_FUNC_DIGOUT;
+         return 0;   // No need for resource management on non-RIO outputs
+      }
+      else {
+         return -EFAULT;
+      }
+   }
+	rc = _rsb_conflict(pin->index, j, i, function, flags);
+   if (!rc) {
+      m = 0;
+      res = &(_rsb_resources[function]);
+      shadow = &use->pxcr[i];
+      share = (flags & 4 ? _rsb_bitmap[flags & 3] : 0);
+      switch (function)
+      {
+        case RSB_FUNC_SYNC:            // External sync input
+          if ((flags & 0xC0) == 0) {
+             rc = -EINVAL;
+             break;
+          }
+          if (use->sc_use == 0 || use->sc_use == share) {
+             // Show use of Sync and set to desired edge and port
+             use->sc_use |= _rsb_bitmap[i];
+             m = RSB_SYNC_RESET | ((flags & 0xC0) >> 3) + 4 + i;
+			    WrPortE(addr, NULL, RSB_SYNC);
+			    WrPortE(addr + 1, &use->scr, m & 7);
+			    WrPortE(addr + 1, &use->scr, m);
+             // Drop into input setting
+          }
+          else {
+             rc = -EACCES;
+             break;
+          }
+
+        case RSB_FUNC_DIGIN:           // Digital input
+        case RSB_FUNC_DECODER_INPUT:   // Quadrature decoder input
+		    WrPortE(addr, NULL, RSB_PORT0 + i);
+		    WrPortE(addr + 1, shadow, (*shadow & RSB_IO_MASK));
+          break;
+
+        case RSB_FUNC_INTERRUPT:       // External interrupt input
+          if ((flags & 0xC0) == 0) {
+             rc = -EINVAL;
+             break;
+          }
+          if (use->dc_use == 0) {
+             // Show use of DQE event and set to desired edge and port
+             use->dc_use = _rsb_bitmap[i];
+             m = ((flags & 0xC0) >> 3) + 4 + i;
+			    WrPortE(addr, NULL, RSB_DEC);
+			    WrPortE(addr + 1, &use->dcr, m & 7);
+			    WrPortE(addr + 1, &use->dcr, m);
+          }
+          else if (use->ic_use == 0) {
+             // Show use of IIB event and set to desired edge and port
+             use->ic_use = _rsb_bitmap[i];
+             m = ((flags & 0xC0) >> 3) + 4 + i;
+			    WrPortE(addr, NULL, RSB_INC);
+			    WrPortE(addr + 1, &use->icr, m & 7);
+			    WrPortE(addr + 1, &use->icr, m);
+          }
+          else {
+             rc = -EACCES;
+             break;
+          }
+		    WrPortE(addr, NULL, RSB_PORT0 + i);
+		    WrPortE(addr + 1, shadow, (*shadow & RSB_IO_MASK));
+          break;
+
+        case RSB_FUNC_COUNTER_INPUT:   // Event/Pulse counter input
+        case RSB_FUNC_CAPTURE_INPUT:   // Event/Pulse capture input
+          use->mr_use |= _rsb_bitmap[i];
+		    WrPortE(addr, NULL, RSB_PORT0 + i);
+		    WrPortE(addr + 1, shadow, (*shadow & RSB_IO_MASK));
+          break;
+
+        case RSB_FUNC_DIGOUT:          // Digital output
+		    WrPortE(addr, NULL, RSB_PORT0 + i);
+		    WrPortE(addr + 1, shadow, ((*shadow & RSB_IO_MASK) | RSB_USE_OUTPUT));
+          break;
+
+        case RSB_FUNC_SEQUENCE:        // Sequencing output
+		    WrPortE(addr, NULL, RSB_PORT0 + i);
+		    WrPortE(addr + 1,shadow,((*shadow & RSB_IO_MASK) | RSB_USE_SEQUENCE));
+          break;
+
+        case RSB_FUNC_PPM:     // Pulse Position Modulation output
+          // Check if both manual match assignments set in flags
+          if ((flags & (RSB_END_MATCH0 | RSB_OFF_MATCH0)) ==
+          				  (RSB_END_MATCH0 | RSB_OFF_MATCH0)) {
+          	 // Both set, so they must be using different registers
+             if (((flags >> 3) & 3) != (flags & 3)) {
+                pin->match = flags & 0x3F;
+                use->mx_use[flags & 3] |= _rsb_bitmap[i];
+                use->mx_use[(flags >> 3) & 3] |= _rsb_bitmap[i];
+                break;
+             }
+             else {
+                // Can't set both end and offset to same match register
+                rc = -EINVAL;
+                break;
+             }
+          }
+          if (flags & RSB_OFF_MATCH0) {
+             m = (flags & 0x38);
+	          use->mx_use[(flags >> 3) & 3] |= _rsb_bitmap[i];
+          }
+          else {
+	          // Find available match register for offset
+	          for (j = 0; j < RSB_BLOCK_PINS; ++j)
+	          {
+	             if (use->mx_use[j] == 0) break;
+	          }
+	          if (j == RSB_BLOCK_PINS) {
+	            // ADD VERBOSE
+	            rc = -EACCES; // open match registers < 2, not enough for PPM
+	            break;
+	          }
+	          // Assign Match register j to be used by bit i
+	          use->mx_use[j] |= _rsb_bitmap[i];
+	          m = (j + 4) << 3;
+#ifdef RSB_VERBOSE
+             j = pin->block2;
+#endif
+	          if (flags & RSB_END_MATCH0) {
+	             pin->match = m | (flags & 7);
+	             use->mx_use[flags & 3] |= _rsb_bitmap[i];
+	             break;
+	          }
+          }
+          // Drop into PWM function setting to get second match register
+
+        case RSB_FUNC_PWM:     // Pulse Width Modulation output
+          if (flags & RSB_END_MATCH0) {
+             pin->match = flags & 7;
+	          use->mx_use[flags & 3] |= _rsb_bitmap[i];
+             break;
+          }
+          // Find open match register
+          for (j = 0; j < RSB_BLOCK_PINS; ++j)
+          {
+             if (use->mx_use[j] == 0) break;
+          }
+          if (j == RSB_BLOCK_PINS) {
+            if (function == RSB_FUNC_PPM) {
+               // Release Match register that was just assigned to this pin
+               for (j = RSB_BLOCK_PINS; j--; ) {
+                  if (use->mx_use[j] & _rsb_bitmap[i]) {
+                     use->mx_use[j] ^= _rsb_bitmap[i];
+                  }
+               }
+            }
+            rc = -EACCES;    // No open match register found, show error
+            break;
+          }
+          // Assign Match register j to be used by bit i
+          use->mx_use[j] |= _rsb_bitmap[i];
+          pin->match = m | 4 | j;
+          use->mr_use |= _rsb_bitmap[i];
+#ifdef RSB_VERBOSE
+          j = pin->block2;
+#endif
+          break;
+      }
+      if (!rc) pin->function = function;
+   }
+
+#ifdef RSB_VERBOSE
+   printf("_riosbc_set_function(%d,%d,%d), f/f(%d,%02x) returns %d.\n",
+                   pin->index, j, i, function, flags, rc);
+#endif
+   return rc;
+}
+
+/*** BeginHeader _riosbc_set_pin */
+int _riosbc_set_pin(struct RSB_IOpin *pin, char value);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_set_pin						<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_set_pin(struct RSB_IOpin *pin, char state)
+
+DESCRIPTION:	Sets the output state of a digital output capable pin.
+
+PARAMETER1:		Pointer to RSB_IOpin structure for the desired I/O pin
+PARAMETER2:    Valid output state for the current pin
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+               -EPERM:  pin type does not permit this operation
+
+SEE ALSO:      _riosbc_set_function
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_set_pin(struct RSB_IOpin *pin, char value)
+{
+   auto char bit;
+   static const char trimap[3] = {0x10, 0x20, 0};
+
+ 	if (value > RSB_TRI) {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_set_pin(%d,%d,%d) called with bad value (%d).\n",
+                pin->index, pin->block2, pin->bit2, value);
+#endif
+      return -EINVAL;
+   }
+   if (pin->type == RSB_TYPE_DIGIN) {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_set_pin(%d,%d,%d) on incorrect pin type (%d).\n",
+                pin->index, pin->block2, pin->bit2, pin->type);
+#endif
+      return -EPERM;
+   }
+   if (pin->type == RSB_TYPE_PUSHPULL) {
+      if (pin->bit1) {
+         bit = (*(pin->dr_shadow) & 0x3F) | (trimap[value] << 2);
+      }
+      else {
+         bit = (*(pin->dr_shadow) & 0xCF) | trimap[value];
+      }
+      WrPortE(pin->addr2, NULL, RSB_PORT3);
+      WrPortE(pin->addr2 + 1, pin->dr_shadow, bit);
+   }
+   else {
+   	if (value > RSB_HI) value = RSB_HI;
+      value ^= pin->polarity;
+      if (pin->block2 < RSB_MAX_BLOCKS) {
+	      WrPortE(pin->addr2, NULL, RSB_PORT3);
+	      BitWrPortE(pin->addr2 + 1, pin->dr_shadow, value, pin->bit2 + 4);
+      }
+      else {
+#ifdef RSB_USE_CPU_IO
+         if (pin->block2 == RSB_IO_BASED) {
+            BitWrPortE(pin->addr2, pin->cr_shadow, value, pin->bit2);
+         }
+         else {
+            BitWrPortI(pin->addr2, pin->cr_shadow, value, pin->bit2);
+         }
+#else
+         BitWrPortE(pin->addr2, pin->cr_shadow, value, pin->bit2);
+#endif
+      }
+   }
+#ifdef RSB_VERBOSE
+      printf("_riosbc_set_pin(%d,%d,%d) set to state %d.\n", pin->index,
+                 pin->block2, pin->bit2, value);
+#endif
+   return 0;
+}
+
+/*** BeginHeader _riosbc_get_pin */
+int _riosbc_get_pin(struct RSB_IOpin *pin);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_get_pin						<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_get_pin(struct RSB_IOpin *pin)
+
+DESCRIPTION:	Gets the input state of a digital input pin.
+
+PARAMETER1:		Pointer to RSB_IOpin structure for the desired I/O pin
+
+RETURN VALUE:  0 or 1
+               -EPERM:  pin functionality does not permit this operation
+
+SEE ALSO:      _riosbc_set_function
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_get_pin(struct RSB_IOpin *pin)
+{
+   auto int val;
+
+   if (pin->function >= RSB_FUNC_DIGOUT) {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_get_pin(%d,%d,%d) set to incorrect function (%d).\n",
+                pin->index, pin->block1, pin->bit1, pin->function);
+#endif
+      return -EPERM;
+   }
+
+   if (pin->block1 < RSB_MAX_BLOCKS) {
+	   WrPortE(pin->addr1, NULL, RSB_PORT0 + pin->bit1);
+	   val = RdPortE(pin->addr1 + 1);
+   }
+   else {
+#ifdef RSB_USE_CPU_IO
+      if (pin->block1 == RSB_IO_BASED) {
+         val = RdPortE(pin->addr2);
+      }
+      else {
+         val = RdPortI(pin->addr2);
+      }
+#else
+      val = RdPortE(pin->addr2);
+#endif
+   }
+
+#ifdef RSB_VERBOSE
+   printf("_riosbc_get_pin(%d,%d,%d) returned state %d.\n", pin->index,
+             pin->block1, pin->bit1, ((val & _rsb_pinmap[pin->bit1]) ? 1 : 0));
+#endif
+   return ((val & _rsb_pinmap[pin->bit1]) ? 1 : 0);
+}
+
+/*** BeginHeader _riosbc_set_block */
+int _riosbc_set_block(struct RSB_IOpin *pin, char setting);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_set_block  					<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_set_block(struct RSB_IOpin *pin, char setting)
+
+DESCRIPTION:	Sets the output levels of all selected digital output
+               pins on the given block.  Does not function on
+               push-pull pin types.
+
+PARAMETER1:		Pointer to RSB_IOpin structure for the desired I/O pin
+PARAMETER2:    Setting: bits 7..4 are a mask of the bits to be written
+                        bits 3..0 contain the value to write to the bits
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+               -PERM: invalid pin type or function, not permitted
+
+SEE ALSO:      _riosbc_set_function
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_set_block(struct RSB_IOpin *pin, char setting)
+{
+   auto char bit, mask, x;
+
+   if (pin > &rsb_pin[RSB_MAX_PINS - 1]) return -EINVAL;
+   if (pin->function != RSB_FUNC_DIGOUT || pin->block2 > RSB_MAX_BLOCKS) {
+#ifdef RSB_VERBOSE
+      if (pin->block2 > RSB_MAX_BLOCKS) {
+         printf("_riosbc_get_block called with non-RIO pin pointer.\n");
+      }
+      printf("_riosbc_set_block(%d,%d,%d) set to incorrect function (%d).\n",
+                pin->index, pin->block2, pin->bit2, pin->function);
+#endif
+      return -EPERM;
+   }
+
+   if (pin->type == RSB_TYPE_PUSHPULL) return -EPERM;
+
+   mask = setting & RSB_IO_MASK;
+   x = (setting << 4) ^ rsb_rio[pin->index].block[pin->block2].polarity;
+   x = (*pin->dr_shadow & (~mask)) |  (x & mask);
+   WrPortE(pin->addr2, NULL, RSB_PORT3);
+   WrPortE(pin->addr2 + 1, pin->dr_shadow, x);
+#ifdef RSB_VERBOSE
+   printf("_riosbc_set_block(%d,%d) set to setting %02x (%02x).\n",
+                pin->index, pin->block2, setting, x);
+#endif
+   return 0;
+}
+
+/*** BeginHeader _riosbc_get_block */
+int _riosbc_get_block(struct RSB_IOpin *pin);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_get_block					<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_get_block(struct RSB_IOpin *pin)
+
+DESCRIPTION:   Gets the input levels of all digital input pins that share
+               the block with the given pin.
+
+PARAMETER1:		Pointer to RSB_IOpin structure for the desired I/O pin
+
+RETURN VALUE:  0 - 15: Bits 3..0 which correspond to pins 3..0 on the
+                         block
+               -EINVAL: invalid parameter value
+               -EPERM:  pin functionality does not permit this operation
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_get_block(struct RSB_IOpin *pin)
+{
+#ifdef RSB_VERBOSE
+   auto int val;
+#endif
+
+   if (pin > &rsb_pin[RSB_MAX_PINS - 1]) {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_get_block called with bad pin pointer.\n");
+#endif
+      return -EINVAL;
+   }
+   if (pin->type >= RSB_TYPE_DIGOUT || pin->block1 > RSB_MAX_BLOCKS) {
+#ifdef RSB_VERBOSE
+      if (pin->block1 > RSB_MAX_BLOCKS) {
+         printf("_riosbc_get_block called with non-RIO pin pointer.\n");
+      }
+      else {
+	      printf("_riosbc_get_block(%d,%d,%d) set to incorrect function (%d).\n",
+                pin->index, pin->block1, pin->bit1, pin->function);
+      }
+#endif
+      return -EPERM;
+   }
+
+   WrPortE(pin->addr1, NULL, RSB_PORT3);
+#ifdef RSB_VERBOSE
+   val = RdPortE(pin->addr1 + 1) >> 4;
+   printf("_riosbc_get_block(%d,%d) returned state %x.\n", pin->index,
+                 pin->block1, val);
+   return val;
+#else
+   return RdPortE(pin->addr1 + 1) >> 4;
+#endif
+}
+
+/*** BeginHeader _riosbc_get_begin */
+int _riosbc_get_begin(struct RSB_IOpin *pin, word *begin);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_get_begin						<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_get_begin(struct RSB_IOpin *pin, word *begin)
+
+DESCRIPTION:	Gets the Count Begin register for the host block of pin.
+
+PARAMETER1:		Pointer to RSB_IOpin structure for the desired I/O pin
+
+PARAMETER2:		Pointer to word variable to place begin register reading
+
+RETURN VALUE:  Begin Register value
+               -EPERM:  function not permitted on this pin
+
+SEE ALSO:      _riosbc_get_count, _riosbc_get_end, _riosbc_clear_count
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_get_begin(struct RSB_IOpin *pin, word *begin)
+{
+   if (pin->function >= RSB_FUNC_DIGOUT || pin->block1 > RSB_MAX_BLOCKS) {
+#ifdef RSB_VERBOSE
+      if (pin->block1 > RSB_MAX_BLOCKS) {
+         printf("_riosbc_get_begin called with non-RIO pin pointer.\n");
+      }
+      else {
+	      printf("_riosbc_get_begin(%d,%d,%d) set to incorrect function (%d).\n",
+                pin->index, pin->block1, pin->bit1, pin->function);
+      }
+#endif
+     return -EPERM;
+   }
+
+   // Read Begin register using auto increment
+   WrPortE(pin->addr1, NULL, RSB_BEGIN);
+   *begin = RdPortE(pin->addr1 + 1);
+   *(((char*)begin) + 1) = (char)RdPortE(pin->addr1 + 1);
+   // Move pointer to RSB_STATUS to get away from latching addresses
+   WrPortE(pin->addr1, NULL, RSB_STATUS);
+#ifdef RSB_VERBOSE
+   printf("_riosbc_get_begin(%d,%d) returned %u.\n", pin->index, pin->block1,
+             *begin);
+#endif
+   return 0;
+}
+
+/*** BeginHeader _riosbc_get_count */
+int _riosbc_get_count(struct RSB_IOpin *pin, word *count);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_get_count						<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_get_count(struct RSB_IOpin *pin, word *count)
+
+DESCRIPTION:	Gets the Count Value register for the host block of pin.
+
+PARAMETER1:		Pointer to RSB_IOpin structure for the desired I/O pin
+
+PARAMETER2:		Pointer to word variable to place count register reading
+
+RETURN VALUE:  Counter value
+               -EPERM:  pin functionality does not permit this operation
+
+SEE ALSO:      _riosbc_set_decoder, _riosbc_set_counter, _riosbc_set_capture,
+               _riosbc_get_begin, _riosbc_get_end, _riosbc_clear_count
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_get_count(struct RSB_IOpin *pin, word *count)
+{
+   if (pin->function >= RSB_FUNC_DIGOUT || pin->block1 > RSB_MAX_BLOCKS) {
+#ifdef RSB_VERBOSE
+      if (pin->block1 > RSB_MAX_BLOCKS) {
+         printf("_riosbc_get_count called with non-RIO pin pointer.\n");
+      }
+      else {
+	      printf("_riosbc_get_count(%d,%d,%d) set to incorrect function (%d).\n",
+                pin->index, pin->block1, pin->bit1, pin->function);
+      }
+#endif
+     return -EPERM;
+   }
+
+   // Read Count register using auto increment
+   WrPortE(pin->addr1, NULL, RSB_VALUE);
+   *count = RdPortE(pin->addr1 + 1);
+   *(((char*)count) + 1) = (char)RdPortE(pin->addr1 + 1);
+#ifdef RSB_VERBOSE
+   printf("_riosbc_get_count(%d,%d) returned %u.\n", pin->index, pin->block1,
+             *count);
+#endif
+   return 0;
+}
+
+/*** BeginHeader _riosbc_get_end */
+int _riosbc_get_end(struct RSB_IOpin *pin, word *end);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_get_end						<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_get_end(struct RSB_IOpin *pin, word *end)
+
+DESCRIPTION:	Gets the Count End register for the host block of the
+               input pin.
+
+PARAMETER1:		Pointer to RSB_IOpin structure for the desired I/O pin
+
+PARAMETER2:		Pointer to word variable to place end register reading
+
+RETURN VALUE:  End register value
+               -EPERM:  pin functionality does not permit this operation
+
+SEE ALSO:      _riosbc_get_begin, _riosbc_get_count, _riosbc_clear_count
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_get_end(struct RSB_IOpin *pin, word *end)
+{
+   if (pin->function >= RSB_FUNC_DIGOUT || pin->block1 > RSB_MAX_BLOCKS) {
+#ifdef RSB_VERBOSE
+      if (pin->block1 > RSB_MAX_BLOCKS) {
+         printf("_riosbc_get_end called with non-RIO pin pointer.\n");
+      }
+      else {
+	      printf("_riosbc_get_end(%d,%d,%d) set to incorrect function (%d).\n",
+                pin->index, pin->block1, pin->bit1, pin->function);
+      }
+#endif
+     return -EPERM;
+   }
+
+   // Read End register with auto increment
+   WrPortE(pin->addr1, NULL, RSB_END);
+   *end = RdPortE(pin->addr1 + 1);
+   *(((char*)end) + 1) = (char)RdPortE(pin->addr1 + 1);
+   // Move pointer to RSB_STATUS to get away from latching addresses
+   WrPortE(pin->addr1, NULL, RSB_STATUS);
+#ifdef RSB_VERBOSE
+   printf("_riosbc_get_end(%d,%d) returned %u.\n", pin->index, pin->block1, *end);
+#endif
+   return 0;
+}
+
+/*** BeginHeader _riosbc_clear_count */
+int _riosbc_clear_count(struct RSB_IOpin *pin);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_clear_count						<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_clear_count(struct RSB_IOpin *pin)
+
+DESCRIPTION:	Clears the Counter for the host block of the pin.  On
+               configurable I/O pins, the counter which is reset is based
+               on current pin functionality.  This only affects pins that
+               are hosted on multiple blocks.
+
+PARAMETER1:		Pointer to RSB_IOpin structure for the desired I/O pin
+
+RETURN VALUE:  0 on success
+               -EPERM:  pin functionality does not permit this operation
+
+SEE ALSO:      _riosbc_get_begin, _riosbc_get_count, _riosbc_get_end
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_clear_count(struct RSB_IOpin *pin)
+{
+   auto int addr;
+
+   if (pin->function >= RSB_FUNC_ANAIN || pin->block1 > RSB_MAX_BLOCKS) {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_clear_count called with non-RIO pin pointer.\n");
+#endif
+     return -EPERM;
+   }
+
+   addr = (pin->function < RSB_FUNC_DIGOUT ? pin->addr1 : pin->addr2);
+   WrPortE(addr, NULL, RSB_CMD);
+   WrPortE(addr + 1, NULL, RSB_CMD_ZERO);
+#ifdef RSB_VERBOSE
+   printf("_riosbc_clear_count(%d,%d) called.\n", pin->index, pin->block1);
+#endif
+   return 0;
+}
+
+/*** BeginHeader _riosbc_block_sync */
+int _riosbc_block_sync(struct RSB_IOpin *pin, char value);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_block_sync						<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_block_sync(struct RSB_IOpin *pin, char value)
+
+DESCRIPTION:	Sets the Synch Control register for the host block of pin.
+               If selecting an external sync, the pin referenced in value
+               must already be set to RSB_FUNC_SYNC by rsb_set_function.
+               Updates usage structures to show sync usage by pins.
+
+               Note that when synchronizing more than one block to the
+               same sync signal (global or external), each block has its
+               own independent edge detection circuit.  These circuits
+               will sync to the edge within plus or minus one count of
+               the block's current clock source (main or prescale).
+               This means synchronized blocks may have a small offset
+               when compared to each other.
+
+PARAMETER1:		Pointer to RSB_IOpin structure for the desired I/O pin
+PARAMETER2:    Value for the Synch Control register of the block
+                (if zero, it clears the Synch Control register)
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid value for sync control
+               -EPERM:  pin functionality does not permit this operation
+
+SEE ALSO:      _riosbc_get_begin, _riosbc_get_count, _riosbc_clear_count
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_block_sync(struct RSB_IOpin *pin, char value)
+{
+   auto char bit, block;
+   auto int addr;
+   auto struct _RSB_BLOCK_USE *use;
+
+   if (pin->function >= RSB_FUNC_ANAIN)
+   {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_block_sync called with non-RIO pin pointer.\n");
+#endif
+      return -EPERM;
+   }
+   if (((value & 0x30) == 0x20) || ((value & 7) == 1) || ((value & 7) == 2))
+   {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_block_sync(%d,%d,%d) called with bad value (%02x).\n",
+                pin->index, pin->block1, pin->block2, value);
+#endif
+   	return -EINVAL;
+   }
+
+   if (pin->function < RSB_FUNC_DIGOUT)
+   {  // Set pin location values for the input side
+	   addr = pin->addr1;
+	   bit = pin->bit1;
+      block = pin->block1;
+   }
+   else
+   {  // Set pin location values for the output side
+	   addr = pin->addr2;
+	   bit = pin->bit2;
+      block = pin->block2;
+   }
+   if (block > RSB_MAX_BLOCKS || ((value & 4) &&
+       (rsb_pin[rsb_map[pin->index][block][value&3]].function == RSB_FUNC_SYNC)))
+   {
+#ifdef RSB_VERBOSE
+      printf("_riosbc_block_sync called with invalid pin pointer.\n");
+#endif
+   	return -EPERM;
+   }
+
+   use = &(rsb_rio[pin->index].block[block]);
+
+   if (value) {
+	   // Set usage bit for pin which will be using the sync signal
+	   use->sc_use |= _rsb_bitmap[bit];
+
+	   // Add sync reset bit if sync source is given
+      value |= RSB_SYNC_RESET;
+   }
+   else {
+	   // Clear usage bits for pins which were using the sync signal
+	   use->sc_use = 0;
+   }
+   WrPortE(addr, NULL, RSB_SYNC);
+   WrPortE(addr + 1, &(use->scr), value & 7);
+   WrPortE(addr + 1, &(use->scr), value);
+#ifdef RSB_VERBOSE
+   printf("_riosbc_block_sync(%d,%d) set to %02x.\n", pin->index, block, value);
+#endif
+   return 0;
+}
+
+
+// ********* RIO Supplemental routines
+
+/*** BeginHeader _riosbc_tick */
+void _riosbc_tick(void);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_tick						<RIO_SBC.LIB>
+
+SYNTAX:     void _riosbc_tick(void)
+
+DESCRIPTION:	Polls the RIO chip(s) for ISR events if interrupts are
+               not being used.  Any enabled ISR events will be passed
+               on to the appropriate ISR handler.
+
+SEE ALSO:      _riosbc_add_isr, _riosbc_enable_isr, _riosbc_set_ier
+
+**************************************************************************/
+_rsb_debug
+void _riosbc_tick(void)
+{
+   _riosbc_process_irq();
+   return;
+}
+
+
+/*** BeginHeader _riosbc_add_isr */
+int _riosbc_add_isr(int rio, int block, int ier, void (*handler)());
+/*** EndHeader */
+/*************************************************************************
+
+SYNTAX:     int _riosbc_add_isr(int rio, int block, int ier,
+                   void (*handler)())
+
+DESCRIPTION:	Adds an interrupt handler for the interrupts specified
+               in ier for the given RIO and block.  After adding, the
+               ISR must be enabled using _riosbc_enable_isr.
+
+PARAMETER1:    rio - Index to the desired RIO chip  (0..RSB_MAX_RIOS-1)
+
+PARAMETER2:    block - Index to the desired RIO block (0..7)
+
+PARAMETER3:    ier - Bit mask of interrupts this handler services
+                     (Bit positions match RIO IER and Status registers)
+
+PARAMETER4:    handler - Pointer to the interrupt service function
+
+RETURNS:       On Success, returns the handler ID number (0..RSB_MAX_ISR-1)
+                -EINVAL  Invalid parameter given
+                -ENOSPC  No more room in ISR table (increase RSB_MAX_ISR)
+
+SEE ALSO:      _riosbc_tick, _riosbc_enable_isr, _riosbc_set_ier
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_add_isr(int rio, int block, int ier, void (*handler)())
+{
+   char *ptr;
+   int i;
+   _RSB_ISR_HANDLE *isr;
+
+   // Verify all parameters are valid
+   if (rio < 0 || rio >= RSB_MAX_RIOS || block < 0 || block > RSB_MAX_BLOCKS
+        || handler == NULL)
+   {
+      return -EINVAL;
+   }
+
+   // Find next opening in ISR table
+   for (i = 0; i < RSB_MAX_ISR; ++i)
+   {
+      if (_rsb_isr[i].handler == NULL) break;
+   }
+   // See if no opening found
+   if (i >= RSB_MAX_ISR) return -ENOSPC;
+
+   // Add ISR handler to opening
+   isr = &(_rsb_isr[i]);
+   isr->rio     = rio;
+   isr->block   = _rsb_bitmap[block];
+   isr->ier     = ier;
+   isr->addr    = RSB_AUX_BASE + (rio * RSB_RIO_OFFSET) + (block << 1);
+   isr->handler = handler;
+
+   return i;
+}
+
+
+/*** BeginHeader _riosbc_set_ier */
+int _riosbc_set_ier(int isr_handle, int ier);
+/*** EndHeader */
+/*************************************************************************
+
+SYNTAX:     int _riosbc_set_ier(int isr_handle, int ier)
+
+DESCRIPTION:	Sets the IER mask for an interrupt handler which is
+                disabled.
+
+PARAMETER1:    isr_handle - Index to the desired ISR
+
+PARAMETER2:    ier - Bit mask of interrupts this handler services
+                     (Bit positions match RIO IER and Status registers)
+
+RETURNS:       0 on Success
+                -EINVAL  Invalid parameter given
+                -EPERM   Handler enabled, cannot change IER
+
+SEE ALSO:      _riosbc_tick, _riosbc_add_isr, _riosbc_enable_isr
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_set_ier(int isr_handle, int ier)
+{
+   char *ptr;
+   _RSB_ISR_HANDLE *isr;
+
+   // Check that isr_handle is in range
+   if (isr_handle < 0 || isr_handle >= RSB_MAX_ISR) return -EINVAL;
+
+   // Setup pointer to the ISR handler
+   isr = &(_rsb_isr[isr_handle]);
+
+   // Check that the specified ISR is defined in the ISR array
+   if (isr->block == 0) return -EINVAL;
+
+   // Check that the specified ISR is disabled
+   if (isr->enable) return -EPERM;
+
+   // Setup pointer to IER shadow for the hosting RIO & block
+   ptr = &(rsb_rio[isr->rio].block[(isr->addr & 0x0E) >> 1].ier);
+
+   // Set interrupt enable flags for the ISR handler
+   if (isr->ier & isr->enable) {
+     *ptr &= ~isr->ier;   // Previous IER value, turn off previous bits
+   }
+   isr->ier = ier;        // Save new IER bits for this handler
+
+   if (isr->enable) {
+	   ier |= *ptr;        // Add new IER bits to existing bits from others
+
+	   // Update IER mask bits in the IER of the RIO block
+	   WrPortE(isr->addr, NULL, RSB_IER);
+	   WrPortE(isr->addr + 1, ptr, ier);
+   }
+
+   return 0;
+}
+
+
+/*** BeginHeader _riosbc_enable_isr */
+int _riosbc_enable_isr(int isr_handle, int enable);
+/*** EndHeader */
+/*************************************************************************
+
+SYNTAX:     int _riosbc_enable_isr(int isr_handle, int enable)
+
+DESCRIPTION:	Enables or disables an interrupt handler.
+
+PARAMETER1:    isr_handle - Index to the desired ISR
+
+PARAMETER2:    enable - Non-zero enables the ISR, zero disables the ISR
+
+RETURNS:       0 on Success
+                -EINVAL  Invalid parameter given
+
+SEE ALSO:      _riosbc_tick, _riosbc_add_isr, _riosbc_set_ier
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_enable_isr(int isr_handle, int enable)
+{
+   char *ptr, ier;
+   _RSB_ISR_HANDLE *isr;
+
+   // Check that isr_handle is in range
+   if (isr_handle < 0 || isr_handle >= RSB_MAX_ISR) return -EINVAL;
+
+   // Setup pointer to the ISR handler
+   isr = &(_rsb_isr[isr_handle]);
+
+   // Check that the specified ISR is defined in the ISR array
+   if (isr->block == 0) return -EINVAL;
+
+   // Setup pointer to IER shadow for the hosting RIO & block
+   ptr = &(rsb_rio[isr->rio].block[(isr->addr & 0x0E) >> 1].ier);
+
+   if (enable) {
+      // Turn on enable flag before changing IER
+      _rsb_isr[isr_handle].enable = 1;
+      ier = *ptr | isr->ier;
+   } else {
+      ier = *ptr & (~isr->ier);
+	}
+
+   // Update IER mask bits in the IER of the RIO block
+   WrPortE(isr->addr, NULL, RSB_IER);
+   WrPortE(isr->addr + 1, ptr, ier);
+
+   if (!enable) {
+      // Turn off enable flag after changing IER
+      _rsb_isr[isr_handle].enable = 0;
+   }
+
+   return 0;
+}
+
+
+/*** BeginHeader _riosbc_process_irq */
+__root void _riosbc_process_irq(void);
+/*** EndHeader */
+/*************************************************************************
+  Internal function     		<RIO_SBC.LIB>
+
+SYNTAX:     void _riosbc_process_irq(void)
+
+DESCRIPTION:	Processes pending interrupts from all RIO chips.
+
+SEE ALSO:      _riosbc_tick, _riosbc_ext0_isr, _riosbc_ext1_isr
+
+**************************************************************************/
+_rsb_debug
+__root void _riosbc_process_irq(void)
+{
+   char status[RSB_MAX_RIOS];
+
+#asm
+#ifdef RSB_GB_PORT
+  #if RSB_GB_PORT == 0
+   xor  a
+   ex   af,af'  ; set zero flag in 'AF
+  #else
+   ld   hl, _rsb_bitmap+RSB_GB_PIN
+   ld   a, (RSB_GB_SHADOW)
+   and  a, (hl)
+   ex   af,af'  ; save zero flag in 'AF
+  #endif
+#else
+    ld   hl, _rsb_bitmap+RSB_GB_PIN
+    ld   a, (RSB_GB_SHADOW)
+    and  a, (hl)
+    ex   af,af'  ; save zero flag in 'AF
+#endif
+
+    ; Setup status array pointer in IX
+    ld  hl, @sp+status   ; Get base offset of the status array
+    add hl, sp           ; Create status array base pointer
+    ld  ix, hl           ; Save status array base pointer in IX
+
+; Main IRQ loop to scan all RIO status registers and process all ISR handles
+_rsbpi_loop:
+
+; Turn on Global access bit through C macro
+c   SET_GB(1);
+
+    ; Read status of all RIO's to find blocks with IRQ's pending
+    ld  b, RSB_MAX_RIOS  ; Set up total number of RIO's
+    ld  c, 0             ; Clear overall status accumulator
+    ld  de, RSB_MSR      ; Get first RIO MSR address in DE
+    ld  hl, ix           ; Get status array base pointer in HL
+    jr  _rsbpi_get_status
+_rsbpi_status_loop:
+    ex  de', hl          ; Save status array pointer
+    ld  hl,0x0010        ; Load RIO address increment value
+    add hl,de            ; Increment MSR pointer to next RIO chip
+    ld  de,hl            ; Save MSR pointer to DE
+    ex  de', hl          ; Get status array pointer back
+    inc hl               ; And increment to next location
+_rsbpi_get_status:
+ioe ld  a, (de)          ; Read Master Status Register of RIO chip
+    ld  (hl), a          ; Save MSR value to status array
+    or  a, c
+    ld  c, a             ; OR status into overall status in C
+    djnz _rsbpi_status_loop  ; Get status from next RIO chip if not done
+
+    push bc              ; Save overall status (AF,DE,HL & IY are OK to lose)
+; Turn off Global access bit through C macro (go to block addressing)
+c   SET_GB(0);
+    pop bc               ; Restore overall status into C
+
+    ; Check if any RIO interrupts are pending with overall status in C
+    ld  a, c
+    or  a
+    jp  z, _rsbpi_exit   ; No pending interrupts, we can exit
+
+    ; Scan ISR handles to find an interrupt handler function
+    ld  b, RSB_MAX_ISR   ; Get number of ISR handles in table
+    ld  iy, _rsb_isr     ; Set to base of ISR handle table
+    ld  de, sizeof(_RSB_ISR_HANDLE)
+_rsbpi_process_loop:
+	 ld  a, (iy+[_RSB_ISR_HANDLE]+enable)
+    or  a
+    jr  z, _rsbpi_next_isr
+
+    ; ISR handle is enabled, see if it has IRQ flags raised
+    ld  a, (iy+[_RSB_ISR_HANDLE]+rio)   ; Get RIO index for this handle
+    ld  a, (ix+a)                       ; Get status for this RIO chip
+    and a, (iy+[_RSB_ISR_HANDLE]+block) ; AND with block mask for this handle
+    jr  z, _rsbpi_next_isr              ; If block not active, go to next ISR
+
+    ; RIO block for this handler has IRQ flags raised, see if right one(s)
+    ld  hl, (iy+[_RSB_ISR_HANDLE]+addr) ; Get RIO block pointer address in HL
+ioe ld  c, (hl)                         ; Get current block pointer value in C
+ioe ld  (hl), RSB_STATUS                ; Set block pointer to Status register
+    inc hl                              ; Move to RIO block indirect register
+ioe ld  a, (hl)                         ; Read block Status value into A
+    and a, (iy+[_RSB_ISR_HANDLE]+ier)   ; Mask with IER for this ISR handle
+    jr  z, _rsbpi_restore_ptr           ; No flags matching IER? Go restore ptr.
+
+_rsbpi_call_isr:
+    ; Qualified IRQ found, call ISR for this handle
+    dec  hl                   ; Move HL back to RIO block pointer address
+    push hl                   ; Save HL to stack
+    ex   af,af'               ; Get zero flag from entry Global/Block state
+    ld   a, c                 ; Combine with original block pointer value
+    push af                   ; Save combined values to stack
+    ld   hl, (iy+[_RSB_ISR_HANDLE]+handler)
+    call (hl)                 ; Call user supplied ISR handler
+    pop  af                   ; Get combined zero flag and block pointer
+    ld   c, a                 ; Save original block pointer to C
+    ex   af,af'               ; Move zero flag back to AF'
+    pop  hl                   ; Get RIO block pointer address back in HL
+ioe ld  (hl), c               ; Restore the block pointer to original value
+    jp  _rsbpi_loop           ; Loop back to see if all IRQ flags are now clear
+
+_rsbpi_restore_ptr:
+ioe ld  (hl), c               ; Restore the block pointer to original value
+
+_rsbpi_next_isr:
+    add iy,de                 ; Move handle pointer to next ISR handle
+    djnz _rsbpi_process_loop  ; Then loop if another ISR handle to process
+
+    ;No enabled ISR found, scan status flags and shut off non-serviced IRQ's
+    ld  c, RSB_MAX_RIOS-1
+_rsbpi_clear_loop:
+    ld  a, c                  ; Get RIO index in A
+    ld  a, (ix+a)             ; Load block IRQ status from this RIO chip
+    or  a                     ; See if any IRQ's pending on this RIO chip
+    jr  z, _rsbpi_clear_next
+
+    ; Scan ISR handles to find any handler associated with this RIO chip
+    ld  h, a             ; Save block IRQ flags for this RIO chip
+    ld  b, RSB_MAX_ISR   ; Get number of ISR handles in table
+    ld  iy, _rsb_isr     ; Set to base of ISR handle table
+    ld  de, sizeof(_RSB_ISR_HANDLE)
+_rsbpi_rio_scan:
+    ld  a, (iy+[_RSB_ISR_HANDLE]+rio)   ; Get RIO index for this handle
+    cp  c
+    jr  nz, _rsbpi_next_handle
+
+    // This handle uses RIO pointed to by count C
+    ld  a, (iy+[_RSB_ISR_HANDLE]+block) ; Get block mask for this handle
+    and a, h                            ; AND block flags for current RIO chip
+    jr  z, _rsbpi_next_handle           ; Jump if block flags don't fit mask
+
+    ld  a, (iy+[_RSB_ISR_HANDLE]+enable) ; Get enable flag for this handle
+    or  a                                ; Set zero flag from value
+    jr  nz, _rsbpi_test_flags
+
+    // Disabled handle matches with IRQ flag, shut off IRQ at RIO level
+    ld  hl, (iy+[_RSB_ISR_HANDLE]+addr) ; Get RIO block pointer address in HL
+ioe ld  d, (hl)                         ; Get current block pointer value in D
+ioe ld  (hl), RSB_IER                   ; Set block pointer to IER register
+    inc hl                              ; Move to RIO block indirect register
+    ld  a, (iy+[_RSB_ISR_HANDLE]+ier)   ; Get IER mask for this ISR handle
+    cpl                                 ; Invert the mask
+ioe and (hl)                            ; AND with block IER value
+ioe ld  (hl), a                         ; Save new masked IER value to block
+    dec hl                              ; Move to RIO block pointer register
+ioe ld  (hl), RSB_STATUS                ; Set block pointer to Status register
+    inc hl                              ; Move to RIO block indirect register
+    ld  a, (iy+[_RSB_ISR_HANDLE]+ier)   ; Get IER mask for this ISR handle
+ioe ld  (hl), a                         ; Shut of IRQ's tied to this handle
+    jr  _rsbpi_restore_offset           ; Restore DE offset and block pointer
+
+_rsbpi_test_flags:
+    ; RIO block for this handler has IRQ flags raised, see if right one(s)
+    ld  hl, (iy+[_RSB_ISR_HANDLE]+addr) ; Get RIO block pointer address in HL
+ioe ld  d, (hl)                         ; Get current block pointer value in D
+ioe ld  (hl), RSB_STATUS                ; Set block pointer to Status register
+    inc hl                              ; Move to RIO block indirect register
+ioe ld  a, (hl)                         ; Read block Status value into A
+    and a, (iy+[_RSB_ISR_HANDLE]+ier)   ; Mask with IER for this ISR handle
+    jr  z, _rsbpi_restore_offset        ; No match w/ IER? Restore offset & ptr
+
+    // Recent ISR occured with handle match, jump back to call ISR
+    ld  c, d                            ; Move current block pointer value to C
+    jr  _rsbpi_call_isr                 ; And jump back to call ISR
+
+_rsbpi_restore_offset:
+    dec hl                              ; Back up to block pointer address
+ioe ld  (hl), d                         ; Restore original block pointer value
+    ld  de, sizeof(_RSB_ISR_HANDLE)     ; Restore DE to handle offset value
+_rsbpi_next_handle:
+    add iy, de                          ; Move handle pointer to next handle
+    djnz _rsbpi_rio_scan                ; Loop back if more handles to check
+
+_rsbpi_clear_next:
+    dec c                               ; Decrement RIO counter
+    jp  m, _rsbpi_loop                  ; Done with all? Go to main loop
+    jr  _rsbpi_clear_loop               ; Loop back if more RIO's to clear
+
+_rsbpi_exit:
+    ex  af,af'
+    jr  z, _rsbpi_ret
+; Restore Global/Block output back to Global if needed
+c  SET_GB(1);
+_rsbpi_ret:
+#endasm
+}
+
+
+/*** BeginHeader _riosbc_ext0_isr */
+void _riosbc_ext0_isr(void);
+/*** EndHeader */
+/*************************************************************************
+  Internal function     		<RIO_SBC.LIB>
+
+SYNTAX:     void _riosbc_ext0_isr()
+
+DESCRIPTION:	External interrupt handler for INT0, will call the
+               function _riosbc_process_irq to process all pending
+               RIO interrupts.
+
+SEE ALSO:      _riosbc_process_irq, _riosbc_tick
+
+**************************************************************************/
+__nodebug __root __interrupt void _riosbc_ext0_isr()
+{
+   _riosbc_process_irq();
+}
+
+
+/*** BeginHeader _riosbc_ext1_isr */
+void _riosbc_ext1_isr(void);
+/*** EndHeader */
+/*************************************************************************
+  Internal function     		<RIO_SBC.LIB>
+
+SYNTAX:     void _riosbc_ext1_isr()
+
+DESCRIPTION:	External interrupt handler for INT1, will call the
+               function _riosbc_process_irq to process all pending
+               RIO interrupts.
+
+SEE ALSO:      _riosbc_process_irq, _riosbc_tick
+
+**************************************************************************/
+__debug __root __interrupt void _riosbc_ext1_isr()
+{
+   _riosbc_process_irq();
+}
+
+
+/*** BeginHeader _riosbc_get_block_reg */
+int _riosbc_get_block_reg(char rio, char block, char reg);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_get_block_reg						<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_get_block_reg(char rio, char block, char reg)
+
+DESCRIPTION:	Gets the block register requested.  Returns the byte read
+               from the register.
+
+PARAMETER1:		Index of the RIO chip
+PARAMETER2:    Index of the RIO block
+PARAMETER3:    Address of the register
+
+RETURN VALUE:  Value of register
+               -EINVAL: invalid parameter value
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_get_block_reg(char rio, char block, char reg)
+{
+   auto int val, addr;
+
+   if (rio >= RSB_MAX_RIOS || block > 7) return -EINVAL;
+   // Write register address to block pointer and read desired register
+   addr = rsb_rio[rio].base + (block << 1);
+   WrPortE(addr++, NULL, reg);
+   val = RdPortE(addr);
+   return val;
+}
+
+/*** BeginHeader _riosbc_set_block_reg */
+int _riosbc_set_block_reg(char rio, char block, char reg, word value,
+                           char* shadow);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_set_block_reg						<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_set_block_reg(char rio, char block, char reg,
+                                       word value, char* shadow)
+
+DESCRIPTION:	Sets the one byte block register requested.  This
+               function does not set the shadow register if the shadow
+               pointer is set to NULL.
+
+PARAMETER1:		Index of the RIO chip
+PARAMETER2:    Index of the RIO block
+PARAMETER3:		Address of the register
+PARAMETER4:		Value to be written to the register
+PARAMETER5:		Shadow register for the block register (NULL if not used)
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_set_block_reg(char rio, char block, char reg, word value,
+                                    char* shadow)
+{
+   auto int addr;
+
+   if (rio >= RSB_MAX_RIOS || block > 7) return -EINVAL;
+   // Write register address to block pointer and read desired register
+   addr = rsb_rio[rio].base + (block << 1);
+   WrPortE(addr++, NULL, reg);
+   WrPortE(addr, shadow, value);
+   return 0;
+}
+
+/*** BeginHeader _riosbc_set_block_pair */
+int _riosbc_set_block_pair(char rio, char block, char reg, word value,
+                            word* shadow);
+/*** EndHeader */
+/*************************************************************************
+_riosbc_set_block_pair					<RIO_SBC.LIB>
+
+SYNTAX:     int _riosbc_set_block_pair(char rio, char block, char reg,
+                                        word value, word* shadow)
+
+DESCRIPTION:	Sets the two byte block register pair requested.  The reg
+               pointer is to the LSB register, which is always followed by
+               the MSB register (reg + 1) within the block.
+
+PARAMETER1:    Index of the RIO chip
+PARAMETER2:    Index of the RIO block
+PARAMETER3:    Address of the LSB register for the two byte write
+PARAMETER4:    Value to be written to the register
+PARAMETER5:		Shadow registers for the block register (NULL if not used)
+               NOTE: shadow is a pointer to a WORD value, not char.
+
+RETURN VALUE:  0 on success
+               -EINVAL: invalid parameter value
+
+**************************************************************************/
+_rsb_debug
+int _riosbc_set_block_pair(char rio, char block, char reg,
+                                       word value, word* shadow)
+{
+   auto int addr;
+
+   if (rio >= RSB_MAX_RIOS || block > 7) return -EINVAL;
+   // Write register address to block pointer and read desired register
+   addr = rsb_rio[rio].base + (block << 1);
+   WrPortE(addr++, NULL, reg | RSB_AUTO_INC);
+   WrPortE(addr, (char *)shadow, value);
+   WrPortE(addr, (shadow ? ((char *)shadow) + 1 : NULL), value >> 8);
+   return 0;
+}
+
+
+/*** BeginHeader  */
+#endif
+/*** EndHeader */
+

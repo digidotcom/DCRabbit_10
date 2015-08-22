@@ -1,0 +1,1650 @@
+/* START LIBRARY DESCRIPTION *********************************************
+RNET.LIB
+Copyright (c) 2003 Rabbit Semiconductor Inc
+
+DESCRIPTION:	Support for RabbitNet boards.
+
+SUPPORT LIBS:
+
+REVISION HISTORY:
+	02/23/04 pel	Added RN1600 timing and default to use original
+   					microcode timing.	See _rn_enumerate_port().
+	01/20/04	pel	Added support for RN1100, RN1200, RN1300, RN1400 device
+   					timing. See _rn_enumerate_port().
+	12/29/03	pel	Minimized rn_devtable from 256 to RN_MAX_PORT size.
+	10/14/03 pel	Changed char statusbyte in rnDataRec,rn_devstruct,
+   					rnDeviceInfo structures to an int so that functions
+                  return -1 (device no connect)	at runtime.
+	09/20/03 ek    Reduced execessive Rabbitnet DATA-DATA delay period for
+   					DIO board. (Enhancement only)
+	09/18/03 ek		Added additional delay for rabbitnet CMD/DATA accesses.
+	06/20/03 pel	One second, not two required for reset.
+	05/06/03	pel	Initial creation.
+
+END DESCRIPTION **********************************************************/
+
+/********************************************************************
+	This library contains api's for rabbit net.
+
+
+	STATUS Byte Read-only (bits are cleared with each command)
+	========================================================
+	7,6	Device State
+			00 - Reserved
+			01	- Ready
+			10	- Busy
+			11	- Device not connected
+	--------------------------------------------------------
+	5		Device Type
+			0	- Slave
+			1	- Hub
+	--------------------------------------------------------
+	4		Communication State
+			0	- No error
+			1	- Error on last MOSI transmit
+	--------------------------------------------------------
+	3		ADC Change
+			0	- No ADC update
+			1	- ADC update since last command
+	--------------------------------------------------------
+	2		Reserved
+			0	- Always read
+	--------------------------------------------------------
+	1		Command Reject
+			0	- Last command accepted and executed
+			1	- Last command undefined and not excuted
+	--------------------------------------------------------
+	0		HW and SW Watchdog Timer
+			0	- Not expired
+			1	- Expired and issued board reset
+	--------------------------------------------------------
+
+	C1R06 Communication Status, Read Only
+	Bit flags are set if error occurs.  Cleared when read.
+	========================================================
+	7		- SPI transfer
+	--------------------------------------------------------
+	6		- Write collision
+	--------------------------------------------------------
+	5		- Overrun
+	------------------------------------------------------
+	4		- Mode Fault
+	--------------------------------------------------------
+	3		- Compare error
+	--------------------------------------------------------
+	2,1,0	- Reserved
+	--------------------------------------------------------
+
+	C1R07 Watchdog Status, Read Only
+	Bit flags are set.  Cleared when read.
+	========================================================
+	7		- Hard reset occurred
+	--------------------------------------------------------
+	6		- Soft reset occurred
+	--------------------------------------------------------
+	5		- Hardware watchdog enabled
+	--------------------------------------------------------
+	4		- Software watchdog enabled
+	--------------------------------------------------------
+	3,2,1,0	- Reserved
+	--------------------------------------------------------
+
+
+********************************************************************/
+
+/*** Beginheader */
+#ifndef __RNET_LIB
+#define __RNET_LIB
+/*** Endheader */
+
+/*** Beginheader */
+
+#use rnet_driver.lib
+
+///// Common Command Set
+/// regnum is octal
+/// datalen is byte count
+/////
+/// read commands
+#define C1R00	{regnum=0100; datalen=5;} 	//timing
+#define C1R01	{regnum=0101; datalen=2;} 	//Product ID
+#define C1R02	{regnum=0102; datalen=1;}	//Product Revision
+#define C1R03	{regnum=0103; datalen=2;}	//Code Revision
+#define C1R04	{regnum=0104; datalen=4;}	//Signature
+#define C1R05	{regnum=0105; datalen=1;}	//Soft Watchdog
+#define C1R06	{regnum=0106; datalen=1;}	//Communication Status
+#define C1R07	{regnum=0107; datalen=1;}	//Reset and Watchdog Status
+/// write commands
+#define C0R00	{regnum=0000; datalen=2;} 	//echo byte returned in 2nd byte
+#define C0R02	{regnum=0002; datalen=3; key0=0x56; key1=0xAE;}	//Product Revision
+#define C0R03	{regnum=0003; datalen=2; key0=0x56; key1=0xAE;}	//download microcode
+#define C0R04	{regnum=0004; datalen=6; key0=0x56; key1=0xAE;}	//serial number
+#define C0R05	{regnum=0005; datalen=1;}	//SW watchdog timeout
+#define C0R07	{regnum=0007; datalen=1;}	//Reset and Watchdog
+
+#define WCMD 0077
+#define RCMD 0100
+#define HOS	 0200
+#define HB   0300
+#define NOCONNECT -1
+#define RNHUB 1
+#define RNDEVICE 0
+
+#define RNDEVSTATE 0xC0
+#define RNBUSY	0x80
+#define RNCMDREJ	0x02
+#define RNWDTO	0x01
+#define RNREADY 0x40
+
+#define ITNCONSTANT  (614400.0*freq_divider/(float)7000000l)
+
+#define RNPRINTDEBUG 0		//internal use only
+#define RNEMUDEBUG 0		//internal use only - emulator
+/*** Endheader */
+
+/*** Beginheader rn_devtable, rn_spi, rd_devinfo */
+
+///// device table entry
+typedef struct
+{
+	unsigned int handle;			//full handle of the entry for validation
+   //char initstatus;           //initialization status
+   int initstatus;           //initialization status
+	char portnum;              //controller port number
+	char pna;						//physical node address
+   int dtype;                 //device type 0=device, 1=hub, -1=no connect
+	int productid;             //product identification
+	char productrev;           //product revision
+	int coderev;               //microcode revision
+   char signature[4];         //serial number
+	char tcs;						//assert chip select to command time
+	char tcd;						//command to data time
+	char tdd;						//data to data time
+	char tds;						//data to deassert chip select
+	char tmc;						//max chip select active
+	char tsr;						//chip select to chip select time
+	char tcshos;					//hub output to chip select time
+	char thos;						//hub output to device chip select time
+	char cmdtiming[RN_MAX_DATA+1];		//match timing for data write/read
+} rn_devstruct;
+
+
+///// port table entry
+typedef struct
+{
+	char controltx;
+	char controlrx;
+	char controlreg;
+	char statusreg;
+	char datareg;
+	char portnum;
+} rn_spistruct;
+
+
+///// search structure
+typedef struct
+{
+	unsigned int flags;			//status flags
+#define RN_MATCH_PORT		0x0001		//match port bitmask
+#define RN_MATCH_PNA			0x0002		//match physical node address
+#define RN_MATCH_HANDLE		0x0004		//match instance (reg 3)
+#define RN_MATCH_PRDID		0x0008		//match id/version (reg 1)
+#define RN_MATCH_PRDREV		0x0010		//match product revision
+#define RN_MATCH_CODEREV	0x0020		//match code revision
+#define RN_MATCH_SN			0x0040		//match serial number
+#define RN_EXCLUSIONS		0x0100		//reject if in exclusion list
+#define RN_ADD_TO_EXCL		0x1000		//if found, add to exclusion list
+
+	int handle;
+	unsigned int ports;			//port bitmask
+   char pna;
+	int productid;
+	char productrev;
+	int coderev;
+   char serialnum[4];
+	unsigned int nexcl;			//number of exclusions in following list
+	unsigned int maxexcl;		//max allowable entries in list
+	unsigned int *exclusions;	//pointer to array of handles
+} rn_search;
+
+
+typedef struct
+{
+	//char statusbyte;
+	int statusbyte;
+	char tcs;						//assert chip select to command time
+	char tcd;						//command to data time
+	char tdd;						//data to data time
+	char tds;						//data to deassert chip select
+	char tmc;						//max chip select active
+	int productid;
+	char productrev;
+	int coderev;
+   char signature[4];
+} rnDeviceInfo;
+
+typedef struct
+{
+	int statusbyte; 				//status byte from RIO
+	int productid; 				//product ID for RIO is 0xF0 for device; 0x10 for Hub
+} rnRioInfo;
+
+typedef struct
+{
+	int statusbyte;
+   char miso[RN_MAX_DATA-1];
+} rnDataRec;
+
+typedef struct
+{
+	char cmd;
+   char mosi[RN_MAX_DATA-1];
+} rnDataSend;
+
+
+extern rn_spistruct rn_spi[RN_MAX_PORT];
+//extern rn_devstruct rn_devtable[256];
+extern rn_devstruct rn_devtable[RN_MAX_PORT];		//12/29/03
+extern const char rd_devinfo[15];
+extern const char rd_RIOinfo[4];
+/*** EndHeader */
+
+
+const char rd_devinfo[]= {RCMD|0000,
+   					 	 0xff, 0xff, 0xff, 0xff,
+   					 	 0xff, 0xff, 0xff, 0xff,
+   					 	 0xff, 0xff, 0xff, 0xff,
+   					 	 0xff, 0xff
+   					 	 };
+const char rd_RIOinfo[]={RCMD | 0001,
+								0xff,0xff,0xff};
+
+rn_spistruct rn_spi[RN_MAX_PORT];
+//rn_devstruct rn_devtable[256];
+rn_devstruct rn_devtable[RN_MAX_PORT];  	//12/29/03
+
+/*** BeginHeader rn_msDelay */
+void rn_msDelay (unsigned int delay);
+/*** EndHeader */
+
+__nodebug
+void rn_msDelay(unsigned int delay)
+{
+	auto unsigned long done_time;
+
+	done_time = MS_TIMER + delay;
+   while( (long) (MS_TIMER - done_time) < 0 );
+}
+
+
+/*** BeginHeader rn_init */
+int rn_init(char portflag, char servicetype);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+rn_init						<RNET.LIB>
+
+SYNTAX:	int rn_init(char portflag, char servicetype);
+
+DESCRIPTION:	Reset, initializes or disables a specified RabbitNet
+					port on a controller.  During initialization, the network
+					is reset then enumerated and relevant tables are filled in
+               for RabbitNet function calls, which rely on the tables for
+               device information.  Reset will take approximately 2 seconds.
+               If the port is already initialized, calling this function
+               forces a re-enumeration of all devices on that port.
+
+               This function should be called first before using
+               other RabbitNet functions.
+
+	After initialization, a device table consisting of device
+ 	entries can be addressed and the following information
+  	can be inspected.
+
+	unsigned int handle;			//full handle of the entry for validation
+   char initstatus;           //initialization status
+	char portnum;              //controller port number
+	char pna;						//physical node address
+   int dtype;                 //device type 0=device, 1=hub, -1=no connect
+	int productid;             //product identification
+	char productrev;           //product revision
+	int coderev;               //microcode revision
+   char signature[4];         //serial number
+	char tcs;						//assert chip select to command time
+	char tcd;						//command to data time
+	char tdd;						//data to data time
+	char tds;						//data to deassert chip select
+	char tmc;						//max chip select active
+	char tsr;						//chip select to chip select time
+	char tcshos;					//hub output to chip select time
+	char thos;						//hub output to device chip select time
+	char cmdtiming[RN_MAX_DATA+1];		//match timing for data write/read
+
+
+  	For example:
+   auto rn_devstruct *de_addr;
+   auto int handle;
+
+	handle = rn_device(0000);				//port 0, downstream port 00
+   de_addr = (rn_devstruct *)handle;	//get the entry address
+   if (de_addr->dtype == -1)
+   	printf("no device found);
+
+
+PARAMETER1:		Each bit represents RabbitNet port on a controller,
+					from 0 to the maximum number of ports.  A set bit
+					requires a service.  If portflag = 0x03, both RabbitNet
+					ports 0 and 1 will need be serviced.
+
+PARAMETER2:		Enables or disables each RabbitNet port as set by the
+					port flags.
+					0 = disable port
+					1 = enable port
+
+RETURN VALUE:	0
+
+SEE ALSO:
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int rn_init(char portflag, char servicetype)
+{
+	auto int i, tdivisor;
+
+	rn_sp_info();
+
+	if (servicetype)
+	{
+		for (i=0; i<RN_MAX_PORT; i++)
+		{
+			if (portflag&1)
+			{
+				rn_sp_disable(i);
+				rn_spi[i].controltx = rnportinfo[i].controltx;
+				rn_spi[i].controlrx = rnportinfo[i].controlrx;
+				rn_spi[i].controlreg = rnportinfo[i].controlreg;
+				rn_spi[i].statusreg = rnportinfo[i].statusreg;
+				rn_spi[i].datareg = rnportinfo[i].datareg;
+				rn_spi[i].portnum = i;
+
+				//ramp up to desired rate
+				rn_sp_init(i, rnportinfo[i].clockrate);
+
+				_rn_enumerate_port(i);
+
+			}
+			portflag = portflag>>1;
+		}
+	}
+	else
+	{
+		for (i=0; i<RN_MAX_PORT; i++)
+		{
+			if (portflag&1)
+			{
+				rn_sp_close(i);
+			}
+			portflag = portflag>>1;
+		}
+	}
+
+	return 0;
+}
+
+
+/*** BeginHeader rn_device */
+int rn_device(char pna);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+rn_device						<RNET.LIB>
+
+SYNTAX:	int rn_device(char pna);
+
+DESCRIPTION:	Returns an address index to device information from given a
+					physical node address.
+					This function will check device information for valid
+               device connection.
+
+PARAMETER1:		Physical node address, indicated as a byte.
+
+					7	6	5	4	3	2	1	0
+					|	|	|	|	|	|	|	|
+					|	|	|	|	|	+--+--+--- Level 2 Downstream Port
+					|	|	|	|	|
+					|	|	+--+--+------------ Level 1 Downstream Port
+					|	|
+					+--+--------------------- Port number
+
+RETURN VALUE:	Address index to device information,
+					-1, device information indicates no connection
+
+SEE ALSO: 	rn_find
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int rn_device(char pna)
+{
+	auto char tmp_pna;
+
+	tmp_pna = pna>>6;
+	if (rn_devtable[tmp_pna].dtype == NOCONNECT)
+		return NOCONNECT;
+	else
+		return ((int)&rn_devtable[tmp_pna]);
+}
+
+
+
+/*** BeginHeader rn_echo */
+
+int rn_echo(int handle, char sendecho, char *recdata);
+
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+rn_echo						<RNET.LIB>
+
+SYNTAX:		int rn_echo(int handle, char sendecho, char *recdata);
+
+DESCRIPTION:	Device sends back the character the controller sent.
+					This function will first check device information for
+               valid device connection.
+
+PARAMETER1:		Address index to device information. Use rn_device()
+					or rn_find() to establish handle.
+PARAMETER2:		Character to echo back.
+PARAMETER3:		Return address of the character from the device.
+
+RETURN VALUE:	-1, device information indicates no connection
+               or status byte from previous command.
+
+END DESCRIPTION **********************************************************/
+__nodebug
+int rn_echo(int handle, char senddata, char *retdata)
+{
+	auto rn_devstruct *devaddr;
+	auto int regnum, datalen;
+   auto rnDataSend ds;
+   auto rnDataRec dr;
+
+	devaddr = (rn_devstruct *)handle;
+   if (devaddr->dtype == NOCONNECT)
+   	return NOCONNECT;
+
+	C0R00;
+	//assemble data
+   ds.cmd = WCMD&regnum;
+   memset(ds.mosi, senddata, datalen);
+  	datalen++;
+
+#ifdef RN_ACCESS_PROTECTION
+	if (RN_ACCESS_FN(devaddr->portnum)) return RN_SPIBUSY;
+#endif
+	rn_sp_enable(devaddr->portnum);
+ 	_mosi_driver(datalen, &ds, &dr, &devaddr->cmdtiming, &rn_spi[devaddr->portnum]);
+	rn_sp_disable(devaddr->portnum);
+#ifdef RN_ACCESS_PROTECTION
+	RN_RELEASE_FN(devaddr->portnum);
+#endif
+
+	*retdata = dr.miso[1];
+	return (dr.statusbyte);
+}
+
+/*** BeginHeader rn_write */
+
+int rn_write(int handle, int regno, char *data, int datalen);
+
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+rn_write						<RNET.LIB>
+
+SYNTAX:	int rn_write(int handle, int regno, char *data, int datalen);
+
+DESCRIPTION:	Writes a string to the specified device and register.
+					Waits for results.
+					This function will first check device information for
+               valid device connection.
+
+PARAMETER1:		Address index to device information. Use rn_device()
+					or rn_find() to establish handle.
+PARAMETER2:		Command register number as designated by each device.
+PARAMETER3:		Address of string to write to the device.
+PARAMETER4:		Size of data to write, 0 to 15 max data byte length.
+					Note: 0 data length will transmit the one-byte command
+               register number.
+
+RETURN VALUE:	-1, device information indicates no connection
+               or status byte from previous command.
+               -2, if data length is greater than 15.
+
+SEE ALSO: 	rn_read
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int rn_write(int handle, int regno, char *data, int datalen)
+{
+	auto rn_devstruct *devaddr;
+   auto rnDataSend ds;
+   auto rnDataRec dr;
+
+	devaddr = (rn_devstruct *)handle;
+   if (devaddr->dtype == NOCONNECT)
+   	return NOCONNECT;
+
+   if (datalen > (RN_MAX_DATA-1))
+   	return -2;
+
+	//assemble data
+   ds.cmd = WCMD&regno;
+	memcpy(ds.mosi, data, datalen);
+   datalen++;
+
+#ifdef RN_ACCESS_PROTECTION
+	if (RN_ACCESS_FN(devaddr->portnum)) return RN_SPIBUSY;
+#endif
+	rn_sp_enable(devaddr->portnum);
+ 	_mosi_driver(datalen, &ds, &dr, &devaddr->cmdtiming, &rn_spi[devaddr->portnum]);
+	rn_sp_disable(devaddr->portnum);
+#ifdef RN_ACCESS_PROTECTION
+	RN_RELEASE_FN(devaddr->portnum);
+#endif
+
+   return (dr.statusbyte);
+}
+
+/*** BeginHeader rn_read */
+
+int rn_read(int handle, int regno, char *recdata, int datalen);
+
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+rn_read					<RNET.LIB>
+
+SYNTAX:	int rn_read(int handle, int regno, char *recdata, int datalen);
+
+DESCRIPTION:	Reads a string from the specified device and register.
+					Waits for results.
+					This function will first check device information for valid
+               device connection.
+
+PARAMETER1:		Address index to device information. Use rn_device()
+					or rn_find() to establish handle.
+PARAMETER2:		Command register number as designated by each device.
+PARAMETER3:		Address of string to read from the device.
+PARAMETER4:		Size of data to read, 0 to 15 max data byte length.
+
+               Note: 0 data length will transmit the one-byte register
+               command.
+
+RETURN VALUE:	-1, device information indicates no connection
+               or status byte from previous command.
+               -2, if data length is greater than 15.
+SEE ALSO: 	rn_write
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int rn_read(int handle, int regno, char *recdata, int datalen)
+{
+	auto rn_devstruct *devaddr;
+   auto rnDataSend ds;
+   auto rnDataRec dr;
+
+	devaddr = (rn_devstruct *)handle;
+   if (devaddr->dtype == NOCONNECT)
+   	return NOCONNECT;
+
+   if (datalen > (RN_MAX_DATA-1))
+   	return -2;
+
+	//assemble data
+   ds.cmd = RCMD|regno;
+   memset(ds.mosi, ds.cmd, datalen);
+   datalen++;
+
+#ifdef RN_ACCESS_PROTECTION
+	if (RN_ACCESS_FN(devaddr->portnum)) return RN_SPIBUSY;
+#endif
+	rn_sp_enable(devaddr->portnum);
+ 	_mosi_driver(datalen, &ds, &dr, &devaddr->cmdtiming, &rn_spi[devaddr->portnum]);
+	rn_sp_disable(devaddr->portnum);
+#ifdef RN_ACCESS_PROTECTION
+	RN_RELEASE_FN(devaddr->portnum);
+#endif
+
+	memcpy(recdata, dr.miso, datalen-1);
+   return (dr.statusbyte);
+}
+
+/*** BeginHeader rn_sw_wdt */
+int rn_sw_wdt(int handle, float timeout);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+rn_sw_wdt 				<RNET.LIB>
+
+SYNTAX:  int rn_sw_wdt(int handle, float timeout);
+
+DESCRIPTION:	Sets software watchdog timeout period.
+					Call this function prior to enabling the software watchdog
+               timer.
+
+					This function will first check device information for
+               valid device connection.
+
+PARAMETER1:		Address index to device information. Use rn_device()
+					or rn_find() to establish handle.
+PARAMETER2:		Enter timeout period	from 0.025 to 6.375 seconds, in
+					increments of 0.025 seconds.  Entering a zero value
+               will disable the software watchdog timer.
+
+RETURN VALUE:	-1, device information indicates no connection
+               or status byte from previous command.
+
+SEE ALSO:	rn_hitwd, rn_enable_wdt
+
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int rn_sw_wdt(int handle, float timeout)
+{
+	auto int regnum, datalen;
+	auto rn_devstruct *devaddr;
+   auto rnDataSend ds;
+   auto rnDataRec dr;
+   auto float f;
+
+	devaddr = (rn_devstruct *)handle;
+   if (devaddr->dtype == NOCONNECT)
+   	return NOCONNECT;
+
+   if (timeout >= 0.025)
+   {
+		//assemble data for sw timeout
+		C0R05;
+   	ds.cmd = WCMD&regnum;
+      ds.mosi[0] = (char)(timeout/(0.025));   //delay in increments of 25msec
+	}
+   else
+   {
+		//assemble data to find wdog status
+		C1R07;
+	   ds.cmd = RCMD|regnum;
+      ds.mosi[0] = 0xff;
+   	datalen++;
+
+#ifdef RN_ACCESS_PROTECTION
+      if (RN_ACCESS_FN(devaddr->portnum)) return RN_SPIBUSY;
+#endif
+		rn_sp_enable(devaddr->portnum);
+		_mosi_driver(datalen, &ds, &dr, &devaddr->cmdtiming, &rn_spi[devaddr->portnum]);
+		rn_sp_disable(devaddr->portnum);
+#ifdef RN_ACCESS_PROTECTION
+      RN_RELEASE_FN(devaddr->portnum);
+#endif
+
+      //disable wdog
+      C0R07;
+   	ds.cmd = WCMD&regnum;
+		ds.mosi[0] = dr.miso[0]&0xef;
+	}
+
+  	datalen++;
+#ifdef RN_ACCESS_PROTECTION
+	if (RN_ACCESS_FN(devaddr->portnum)) return RN_SPIBUSY;
+#endif
+	rn_sp_enable(devaddr->portnum);
+	_mosi_driver(datalen, &ds, &dr, &devaddr->cmdtiming, &rn_spi[devaddr->portnum]);
+	rn_sp_disable(devaddr->portnum);
+#ifdef RN_ACCESS_PROTECTION
+	RN_RELEASE_FN(devaddr->portnum);
+#endif
+
+   return (dr.statusbyte);
+}
+
+
+/*** BeginHeader rn_enable_wdt */
+int rn_enable_wdt(int handle, int wdttype);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+rn_enable_wdt 				<RNET.LIB>
+
+SYNTAX:  int rn_enable_wdt(int handle, int wdttype);
+
+DESCRIPTION:	Enables the hardware and/or software watchdog timers on
+					a device.  The device microcode will keep the hardware
+               watchdog timer updated but will hard reset if time expires.
+               Hardware watchdog cannot be disabled except by a device
+               hard reset.  Software watchdog timer must be updated by
+               controller code. The device will soft reset if the timeout
+               expires, previously set by rn_sw_wdt().
+
+					This function will first check device information for
+               valid device connection.
+
+PARAMETER1:		Address index to device information. Use rn_device()
+					or rn_find() to establish handle.
+PARAMETER2:		0=enables both hardware and software watchdog timers.
+					1=enables hardware watchdog timer.
+					2=enables software watchdog timer.
+
+RETURN VALUE:	-1, device information indicates no connection
+               or status byte from previous command.
+
+SEE ALSO:	rn_hitwd, rn_sw_wdt
+
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int rn_enable_wdt(int handle, int wdttype)
+{
+	auto int regnum, datalen;
+	auto rn_devstruct *devaddr;
+   auto rnDataSend ds;
+   auto rnDataRec dr;
+
+	devaddr = (rn_devstruct *)handle;
+   if (devaddr->dtype == NOCONNECT)
+   	return NOCONNECT;
+
+	C0R07;
+	//assemble data to enable timers
+   ds.cmd = WCMD&regnum;
+  	datalen++;
+
+	if (wdttype==0)
+   	ds.mosi[0] = 0x30;	//sw and hw enable
+	if (wdttype==1)
+   	ds.mosi[0] = 0x20;	//hw enable
+	if (wdttype==2)
+   	ds.mosi[0] = 0x10;	//sw enable
+
+#ifdef RN_ACCESS_PROTECTION
+	if (RN_ACCESS_FN(devaddr->portnum)) return RN_SPIBUSY;
+#endif
+	rn_sp_enable(devaddr->portnum);
+ 	_mosi_driver(datalen, &ds, &dr, &devaddr->cmdtiming, &rn_spi[devaddr->portnum]);
+	rn_sp_disable(devaddr->portnum);
+#ifdef RN_ACCESS_PROTECTION
+	RN_RELEASE_FN(devaddr->portnum);
+#endif
+
+   return (dr.statusbyte);
+}
+
+
+/*** BeginHeader rn_hitwd */
+int rn_hitwd(int handle, char *count);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+rn_hitwd 				<RNET.LIB>
+
+SYNTAX:  int rn_hitwd(int handle, char *count);
+
+DESCRIPTION:	Hits software watchdog.  Set timeout period and enable
+					software watchdog prior to using this function.
+
+					This function will first check device information for
+               valid device connection.
+
+PARAMETER1:		Address index to device information. Use rn_device()
+					or rn_find() to establish handle.
+PARAMETER2:    Return current count of software watchdog timer.
+					Note: Equivalent time left in seconds = count*0.025.
+
+RETURN VALUE:	-1, device information indicates no connection
+               or status byte from previous command.
+
+SEE ALSO:	rn_enable_wdt, rn_sw_wdt
+
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int rn_hitwd(int handle, char *count)
+{
+	auto int regnum, datalen;
+	auto rn_devstruct *devaddr;
+   auto rnDataSend ds;
+   auto rnDataRec dr;
+
+	devaddr = (rn_devstruct *)handle;
+   if (devaddr->dtype == NOCONNECT)
+   	return NOCONNECT;
+
+	C1R05;
+	//assemble data
+  	ds.cmd = RCMD|regnum;
+   ds.mosi[0] = 0xff;
+  	datalen++;
+
+#ifdef RN_ACCESS_PROTECTION
+	if (RN_ACCESS_FN(devaddr->portnum)) return RN_SPIBUSY;
+#endif
+	rn_sp_enable(devaddr->portnum);
+	_mosi_driver(datalen, &ds, &dr, &devaddr->cmdtiming, &rn_spi[devaddr->portnum]);
+	rn_sp_disable(devaddr->portnum);
+#ifdef RN_ACCESS_PROTECTION
+	RN_RELEASE_FN(devaddr->portnum);
+#endif
+
+   *count = dr.miso[0];
+
+   return (dr.statusbyte);
+}
+
+/*** BeginHeader rn_reset */
+int rn_reset(int handle, int resettype);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+rn_reset						<RNET.LIB>
+
+SYNTAX:	int rn_reset(int handle, int resettype);
+
+DESCRIPTION:	Sends reset sequence to specified device. Reset will take
+					approximately 25 msec before device starts executing microcode.
+               Allow 1 second before accessing device after reset.
+               Use rn_rst_status() to clear reset status.
+					This function will first check device information for
+               valid device connection.
+
+PARAMETER1:		Address index to device information. Use rn_device()
+					or rn_find() to establish handle.
+PARAMETER2:		0=hard reset. Equivalent to power-up. All logic is reset.
+					1=soft reset. Microprocessor logic is reset.
+
+RETURN VALUE:	-1, device information indicates no connection
+               or status byte from previous command.
+
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int rn_reset(int handle, int resettype)
+{
+	auto int regnum, datalen;
+	auto rn_devstruct *devaddr;
+   auto rnDataSend ds;
+   auto rnDataRec dr;
+
+	devaddr = (rn_devstruct *)handle;
+   if (devaddr->dtype == NOCONNECT)
+   	return NOCONNECT;
+
+	//assemble data
+	C0R07;
+  	datalen++;
+   ds.cmd = WCMD&regnum;
+	if (resettype)
+   	ds.mosi[0] = 0x40;		//soft reset
+	else
+   	ds.mosi[0] = 0x80;		//hard reset
+
+	//reset
+#ifdef RN_ACCESS_PROTECTION
+	if (RN_ACCESS_FN(devaddr->portnum)) return RN_SPIBUSY;
+#endif
+	rn_sp_enable(devaddr->portnum);
+ 	_mosi_driver(datalen, &ds, &dr, &devaddr->cmdtiming, &rn_spi[devaddr->portnum]);
+	rn_sp_disable(devaddr->portnum);
+#ifdef RN_ACCESS_PROTECTION
+	RN_RELEASE_FN(devaddr->portnum);
+#endif
+
+//   rn_msDelay(27);
+
+   return (dr.statusbyte);
+}
+
+/*** BeginHeader rn_rst_status */
+int rn_rst_status(int handle, char *retdata);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+rn_rst_status 				<RNET.LIB>
+
+SYNTAX:  int rn_rst_status(int handle, char *retdata);
+
+DESCRIPTION:   If the watchdog timeout bit is set in the status byte, use
+					this function to determine which reset occurred.
+               Note:  Watchdogs are enabled if bits are set.
+
+PARAMETER1:		Address index to device information. Use rn_device()
+					or rn_find() to establish handle.
+PARAMETER2:    Return address of the reset byte. A set bit
+					indicates which reset occured.  This register is cleared
+               when read.
+
+		7	6	5	4	3	2	1	0
+		|	|	|	|	|	|	|	|
+		|	|	|	|	+--+--+--+--- Reserved
+		|	|	|  +--------------- SW watchdog enabled
+		|	|  +------------------ HW watchdog enabled
+		|  +--------------------- SW reset occurred
+		+------------------------ HW reset occurred
+
+RETURN VALUE:	Status byte from previous command.
+
+SEE ALSO:
+
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int rn_rst_status(int handle, char *retdata)
+{
+	auto int regnum, datalen;
+	auto rn_devstruct *devaddr;
+   auto rnDataSend ds;
+   auto rnDataRec dr;
+
+	devaddr = (rn_devstruct *)handle;
+   if (devaddr->dtype == NOCONNECT)
+   	return NOCONNECT;
+
+	C1R07;
+   datalen++;
+	ds.cmd = RCMD|regnum;
+	ds.mosi[0] = 0xff;
+
+#ifdef RN_ACCESS_PROTECTION
+	if (RN_ACCESS_FN(devaddr->portnum)) return RN_SPIBUSY;
+#endif
+	rn_sp_enable(devaddr->portnum);
+	_mosi_driver(datalen, &ds, &dr, &devaddr->cmdtiming, &rn_spi[devaddr->portnum]);
+	rn_sp_disable(devaddr->portnum);
+#ifdef RN_ACCESS_PROTECTION
+	RN_RELEASE_FN(devaddr->portnum);
+#endif
+
+   *retdata = dr.miso[0];
+
+   return (dr.statusbyte);
+}
+
+/*** BeginHeader rn_comm_status */
+int rn_comm_status(int handle, char *retdata);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+rn_comm_status 				<RNET.LIB>
+
+SYNTAX:  int rn_comm_status(int handle, char *retdata);
+
+DESCRIPTION:   If the communication error bit is set in the status byte,
+					use this function to determine the error.
+
+PARAMETER1:		Address index to device information. Use rn_device()
+					or rn_find() to establish handle.
+PARAMETER2:    Return address of the communication byte. A set bit
+					indicates which error occured.  This register is cleared
+               when read.
+
+		7	6	5	4	3	2	1	0
+		|	|	|	|	|	|	|	|
+		|	|	|	|	|	+--+--+--- Reserved
+		|	|	|	|	+------------ Data compare error detected by device
+		|	|	|  +--------------- Mode fault, device detected hardware fault
+		|	|  +------------------ Overrun MOSI
+		|  +--------------------- Write collision MISO
+		+------------------------ Data available and waiting to be processed MOSI
+
+RETURN VALUE:	Status byte from previous command.
+
+SEE ALSO:
+
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int rn_comm_status(int handle, char *retdata)
+{
+	auto int regnum, datalen;
+	auto rn_devstruct *devaddr;
+   auto rnDataSend ds;
+   auto rnDataRec dr;
+
+	devaddr = (rn_devstruct *)handle;
+   if (devaddr->dtype == NOCONNECT)
+   	return NOCONNECT;
+
+	//assemble data
+	C1R06;
+   datalen++;
+  	ds.cmd = RCMD|regnum;
+   ds.mosi[0] = 0xff;
+
+#ifdef RN_ACCESS_PROTECTION
+	if (RN_ACCESS_FN(devaddr->portnum)) return RN_SPIBUSY;
+#endif
+	rn_sp_enable(devaddr->portnum);
+	_mosi_driver(datalen, &ds, &dr, &devaddr->cmdtiming, &rn_spi[devaddr->portnum]);
+	rn_sp_disable(devaddr->portnum);
+#ifdef RN_ACCESS_PROTECTION
+	RN_RELEASE_FN(devaddr->portnum);
+#endif
+
+   *retdata = dr.miso[0];
+
+   return (dr.statusbyte);
+}
+
+
+/*** BeginHeader _rn_xpcbrev */
+
+int _rn_xpcbrev(char pna, char letter);
+
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_rn_xpcbrev						<RNET.LIB>
+
+SYNTAX:  int _rn_xpcbrev(char pna, char letter);
+
+DESCRIPTION:   Internal.
+					Writes pcb rev number.  Must issue a hard reset and
+               clear reset control register after calling this function.
+
+PARAMETER1:    Physical node address is used because rn_init() may not have
+					detected the device to establish an address.
+PARAMETER2:		Revision letter of PCB
+
+RETURN VALUE:	-1, device information indicates no connection
+               or status byte from previous command.
+
+SEE ALSO:		rn_reset, rn_rst_status
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int _rn_xpcbrev(char pna, char letter)
+{
+	auto int regnum, datalen, portnum;
+   auto char key0, key1;
+   auto char dbuf[16];
+   auto rnDataSend ds;
+   auto rnDataRec dr;
+
+	//setup download timing
+	for (datalen=0; datalen<16; datalen++)
+	{
+   	dbuf[datalen] = (char)(18*ITNCONSTANT);
+	}
+
+   portnum = pna>>6;
+
+	//assemble data
+	C0R02;
+   datalen++;
+  	ds.cmd = WCMD&regnum;
+   ds.mosi[0] = key0;
+   ds.mosi[1] = key1;
+   ds.mosi[2] = letter;
+
+#ifdef RN_ACCESS_PROTECTION
+	if (RN_ACCESS_FN(portnum)) return RN_SPIBUSY;
+#endif
+	rn_sp_enable(portnum);
+	_mosi_driver(datalen, &ds, &dr, dbuf, &rn_spi[portnum]);
+	rn_sp_disable(portnum);
+#ifdef RN_ACCESS_PROTECTION
+	RN_RELEASE_FN(portnum);
+#endif
+
+   rn_msDelay(12);
+   return (dr.statusbyte);
+}
+
+/*** BeginHeader _rn_xsn */
+
+int _rn_xsn(char pna, char *sn);
+
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_rn_xsn						<RNET.LIB>
+
+SYNTAX:  int _rn_xsn(char pna, char *sn);
+
+DESCRIPTION:   Internal.
+					Writes serial number. Must issue a hard reset and
+               clear reset control register after calling this function.
+
+PARAMETER1:    Physical node address is used because rn_init() may not have
+					detected the device to establish an address.
+PARAMETER2:		Address of serial number string.
+
+RETURN VALUE:	-1, device information indicates no connection
+               or status byte from previous command.
+
+SEE ALSO:		rn_reset, rn_rst_status
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int _rn_xsn(char pna, char *sn)
+{
+	auto int regnum, datalen, portnum;
+   auto char key0, key1;
+   auto char dbuf[16];
+   auto rnDataSend ds;
+   auto rnDataRec dr;
+
+	//setup download timing
+	for (datalen=0; datalen<16; datalen++)
+	{
+   	dbuf[datalen] = (char)(18*ITNCONSTANT);
+	}
+
+   portnum = pna>>6;
+
+	//assemble data
+	C0R04;
+   datalen++;
+  	ds.cmd = WCMD&regnum;
+   ds.mosi[0] = key0;
+   ds.mosi[1] = key1;
+   memcpy(&ds.mosi[2], sn, 4);  //hard code 4 byte 8 digit serial number
+
+#ifdef RN_ACCESS_PROTECTION
+	if (RN_ACCESS_FN(portnum)) return RN_SPIBUSY;
+#endif
+	rn_sp_enable(portnum);
+	_mosi_driver(datalen, &ds, &dr, dbuf, &rn_spi[portnum]);
+	rn_sp_disable(portnum);
+#ifdef RN_ACCESS_PROTECTION
+	RN_RELEASE_FN(portnum);
+#endif
+
+   rn_msDelay(12);
+   return (dr.statusbyte);
+}
+
+/*** BeginHeader _rn_download */
+
+int _rn_download(char pna, long data);
+
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_rn_download						<RNET.LIB>
+
+SYNTAX:  int rn_download(char pna, long data);
+
+DESCRIPTION:   Internal.
+					Downloads microcode consisting of ST7 S-records to the
+               specified device.  This will overwrite existing microcode
+               in the device, except for serial number, product ID,
+               calibrations, etc. When the download is complete, the device
+               will self-issue a hard reset.  Wait at least 2 seconds before
+               accessing again. Call rn_init() to initialize device.
+
+PARAMETER1:    Physical node address is used because rn_init() may not have
+					detected the device to establish an address.
+PARAMETER2:		Address of #ximport of the S-record file to download.
+
+RETURN VALUE:	-1, device information indicates no connection
+               or status byte from previous command.
+
+SEE ALSO:		rn_reset, rn_rst_status
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int _rn_download(char pna, long data)
+{
+	auto int regnum, datalen, pflag, portnum, count;
+   auto long begptr, endptr, length;
+   auto char sbuf[50], key0, key1;
+   auto char rbuf[50];
+   auto char dbuf[50];
+	auto rn_devstruct *devaddr;
+
+	//setup download timing
+	for (datalen=0; datalen<50; datalen++)
+	{
+   	dbuf[datalen] = (char)(18*ITNCONSTANT);
+	}
+
+   portnum = pna>>6;
+
+	//assemble data
+   C0R03;
+   datalen++;
+   sbuf[0] = WCMD&regnum;
+   sbuf[1] = key0;
+   sbuf[2] = key1;
+
+   /// send three bytes first
+#ifdef RN_ACCESS_PROTECTION
+	if (RN_ACCESS_FN(portnum)) return RN_SPIBUSY;
+#endif
+	rn_sp_enable(portnum);
+ 	_mosi_driver(datalen, sbuf, rbuf, dbuf, &rn_spi[portnum]);
+	rn_sp_disable(portnum);
+#ifdef RN_ACCESS_PROTECTION
+	RN_RELEASE_FN(portnum);
+#endif
+
+   if (rbuf[0] == 0xff)
+   {
+      return -1;
+   }
+
+   if ((rbuf[0]&0xc2) != 0x40)
+   {
+      return rbuf[0];
+   }
+
+	pflag = 1;
+ 	xmem2root(&length, data, sizeof(long));
+  	begptr = endptr = data+sizeof(long);
+
+   while (endptr < (data+sizeof(long)+length))
+   {
+   	//get the whole line and parse for eoln
+		xmem2root(sbuf, begptr, 50);
+
+  	   for (datalen=0; datalen<50; datalen++, endptr++)
+   	{
+   		if (sbuf[datalen] == '\n')
+	     	{
+	     		endptr++;
+     	  		break;
+	     	}
+     	}
+
+     	if (!strncmp(&sbuf[4], "E000", 4))		//stop at start of parameter area
+      {
+      	pflag = 1;
+         rn_msDelay(1000);
+      }
+
+ 		if (!strncmp(&sbuf[4], "F700", 4))		//stop at start of parameter area
+      {
+      	pflag = 0;
+      }
+
+  	   if (!strncmp(sbuf, "S9", 2))				//parse until eof
+  	   {
+     		pflag = 1;
+        	datalen = (int)((data+sizeof(long)+length)-begptr);
+		}
+
+      begptr = endptr;
+
+		if (pflag)
+      {
+      	if (RNPRINTDEBUG)
+         {
+	      	count = 1;
+				printf("\x1B=%c%cSending ==> %c%c%c%c", 0x20, 0x2E, sbuf[4],
+      	   			sbuf[5],sbuf[6],sbuf[7]);
+         }
+	  	 	/// send record one line at a time
+         do {
+#ifdef RN_ACCESS_PROTECTION
+            if (RN_ACCESS_FN(portnum)) return RN_SPIBUSY;
+#endif
+				rn_sp_enable(portnum);
+			 	_mosi_driver(datalen, sbuf, rbuf, dbuf, &rn_spi[portnum]);
+				rn_sp_disable(portnum);
+#ifdef RN_ACCESS_PROTECTION
+            RN_RELEASE_FN(portnum);
+#endif
+	         rn_msDelay(12);
+	      	if (RNPRINTDEBUG)
+   	      {
+					printf("\x1B=%c%cReceived ==> %x %c%c%c%c %d  ", 0x20, 0x2F,
+            			rbuf[0],rbuf[1],rbuf[2],rbuf[3],rbuf[4], count++);
+            }
+//			}	while (rbuf[0]&0x80);    //check for busy and reject
+			}	while ((rbuf[0]&RNDEVSTATE)==RNBUSY);    //check for busy (pel 10/15/03)
+
+			/**** later
+	      // wait for device to finish processing record
+   	   sbuf[0] = 0x00;
+   	   do {
+	   	  	_mosi_driver(2, sbuf, rbuf, sbuf, &rn_spi[portnum]);
+            //printf("wait\n");
+	      }  while (rbuf[0]&0xc0 == 0x80);
+			****/
+		}
+   }
+
+ 	return (rbuf[0]);
+}
+
+
+
+/*** BeginHeader rn_find */
+int rn_find(rn_search *srch);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+rn_find						<RNET.LIB>
+
+SYNTAX:	int rn_find(rn_search *srch);
+
+DESCRIPTION:	Locates the first active device from the device table which
+					matches the search criteria.
+
+PARAMETER1:		Search criteria structure rn_search:
+
+	unsigned int flags;			//status flags see MATCH macros below
+	unsigned int ports;			//port bitmask
+   char pna						//physical node address
+	int productid;				//product id
+	char productrev;				//product rev
+	int coderev;					//code rev
+	long serialnum;				//serial number
+
+Use 3 maximum for search criteria:
+
+	RN_MATCH_PORT		//match port bitmask
+	RN_MATCH_PNA		//match physical node address
+	RN_MATCH_HANDLE	//match instance (reg 3)
+	RN_MATCH_PRDID		//match id/version (reg 1)
+	RN_MATCH_PRDREV	//match product revision
+	RN_MATCH_CODEREV	//match code revision
+	RN_MATCH_SN			//match serial number
+
+
+For example:
+
+		rn_search newdev;
+
+		newdev.flags = RN_MATCH_PORT|RN_MATCH_SN;
+		newdev.ports = 0x03;  		//search ports 0 and 1
+		newdev.serialnum = E3446C01L;
+		handle = rn_find(&newdev);
+
+
+RETURN VALUE:	Returns address index of the first device matching the criteria
+					-1 if none found.
+
+
+SEE ALSO: 		rn_device
+
+
+END DESCRIPTION **********************************************************/
+
+__nodebug
+int rn_find(rn_search *srch)
+{
+	auto int tflag, matchflag, portnum, dpna, maxport, i;
+	auto rn_devstruct *devaddr;
+
+//   for (dpna=0000; dpna<=0377; dpna++)
+   for (dpna=0; dpna<RN_MAX_PORT; dpna++)     //12/29/03
+	{
+ 		//devaddr = (rn_devstruct *)(rn_device(dpna));
+		if (rn_devtable[dpna].dtype == RNDEVICE)
+      {
+			matchflag = srch->flags;
+			for (tflag=0x01; tflag<=0x80; tflag<<=1)
+ 			{
+  				switch (tflag&(srch->flags))
+  				{
+  					case RN_MATCH_PORT:		//port
+  						if ((1 << rn_devtable[dpna].portnum) & srch->ports)
+  						{
+  							matchflag = matchflag^RN_MATCH_PORT;
+  						}
+  						break;
+  					case RN_MATCH_PNA:		//pna
+  						if (rn_devtable[dpna].pna == srch->pna)
+						{
+	  						matchflag = matchflag^RN_MATCH_PNA;
+	  					}
+						break;
+  	  				case RN_MATCH_HANDLE:	//handle
+						if (rn_devtable[dpna].handle == srch->handle)
+  						{
+  							matchflag = matchflag^RN_MATCH_HANDLE;
+  						}
+  						break;
+  					case RN_MATCH_PRDID:		//product id
+  						if (rn_devtable[dpna].productid == srch->productid)
+  						{
+							matchflag = matchflag^RN_MATCH_PRDID;
+	 					}
+		  					break;
+					case RN_MATCH_PRDREV:	//product rev
+  						if (rn_devtable[dpna].productrev == srch->productrev)
+  						{
+  							matchflag = matchflag^RN_MATCH_PRDREV;
+  						}
+  						break;
+  					case RN_MATCH_CODEREV:	//code rev
+  						if (rn_devtable[dpna].coderev == srch->coderev)
+  						{
+	  							matchflag = matchflag^RN_MATCH_CODEREV;
+	  					}
+	  					break;
+					case RN_MATCH_SN:			//signature
+  	 					if (!strncmp(rn_devtable[dpna].signature, srch->serialnum, 4))
+  						{
+  							matchflag = matchflag^RN_MATCH_SN;
+  						}
+						break;
+	  			}  //end switch
+	  		} //end for tflag
+
+			if (matchflag == 0)
+			{
+				//i= rn_device(dpna);  //match found
+            //return (i);
+				return ((int)&rn_devtable[dpna]);
+			}
+      } //end if dtype
+
+	} //end for dpna
+	if (matchflag)
+	{
+		return -1;			//nothing found
+	}
+}
+
+
+/*** BeginHeader _rn_enumerate_port */
+
+int _rn_enumerate_port(int portnum);
+
+
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+
+SYNTAX:	int _rn_enumerate_port(int portnum);
+
+DESCRIPTION:	Internal.
+					Starting with RabbitNet controller port 0, a hub output
+					query is sent to find device and hub connections.  As hubs
+					and devices	are encountered their timing, product id,
+					product rev, code	rec, serial number and location are
+					recorded into a dynamic	table.
+
+PARAMETER1:	 RabbitNet port number to query.
+
+RETURN VALUE: 	0, if device found
+               -1, if no connection found
+
+SEE ALSO: 	rn_init
+
+END DESCRIPTION **********************************************************/
+__nodebug
+int _rn_enumerate_port(int portnum)
+{
+	auto unsigned long t1;
+	auto int i,j;
+	auto char devl1;
+	auto float itnconst;
+	auto char dtime[RN_MAX_DATA+1];
+   //static const char hos77[] = {HOS|0077, WCMD&0007, 0x80, 0xff};
+   static const char hos77[] = {WCMD&0007, 0x80, 0xff};	//resets device
+   static const char hbhb[] = {HB, HB, 0x10, 0xff};
+   auto rnDataRec rdr;
+   auto rnDataSend rds;
+   auto rnDeviceInfo rdi;
+	auto char tCS, tCD, tDD, tDS, tMC;
+
+   auto rnRioInfo rri;
+
+	///calculate iteration timing constant
+	itnconst = ITNCONSTANT;
+   // num_iterations = microsec*itnconst;
+	for (i=0; i<=RN_MAX_DATA; i++)
+	{
+		dtime[i] = (char)(30*itnconst);		//30 usec
+	}
+
+#if (RNEMUDEBUG == 0)
+	//hard reset and wait 1 seconds
+   rds.cmd = 0007;
+   rds.mosi[0] = 0x80;
+#ifdef RN_ACCESS_PROTECTION
+	if (RN_ACCESS_FN(portnum)) return RN_SPIBUSY;
+#endif
+	rn_sp_enable(portnum);
+ 	_mosi_driver(2, &rds, &rdr, dtime, &rn_spi[portnum]);
+	rn_sp_disable(portnum);
+#ifdef RN_ACCESS_PROTECTION
+	RN_RELEASE_FN(portnum);
+#endif
+
+   rn_msDelay(1000);
+#endif
+ 	//check status and clear register
+   rds.cmd = 0107;
+#ifdef RN_ACCESS_PROTECTION
+	if (RN_ACCESS_FN(portnum)) return RN_SPIBUSY;
+#endif
+	rn_sp_enable(portnum);
+  	_mosi_driver(2, &rds, &rdr, dtime, &rn_spi[portnum]);
+	rn_sp_disable(portnum);
+#ifdef RN_ACCESS_PROTECTION
+	RN_RELEASE_FN(portnum);
+#endif
+
+
+   //devl1 = portnum<<6;
+   devl1 = portnum;      //12/29/03
+
+	/// check bits 7,6 for no connection
+   /// check bit 4 comm error
+   /// check bit 2 for rejected command
+	if ((rdr.statusbyte&0xD2) != 0x40)
+	{
+		rn_devtable[devl1].initstatus = rdr.statusbyte;
+		rn_devtable[devl1].dtype = NOCONNECT;
+		rn_devtable[devl1].handle = 0x0000;
+		return NOCONNECT;
+	}
+
+	/// check bit 5 for hub or device at level 1
+	if ((rdr.statusbyte&0x20) == RNDEVICE)
+	{
+
+#ifdef RN_ACCESS_PROTECTION
+      if (RN_ACCESS_FN(portnum)) return RN_SPIBUSY;
+#endif
+      rn_sp_enable(portnum);
+ 		_mosi_driver(sizeof(rd_RIOinfo), (void *)rd_RIOinfo, &rri, dtime, &rn_spi[portnum]);
+  		rn_sp_disable(portnum);
+#ifdef RN_ACCESS_PROTECTION
+      RN_RELEASE_FN(portnum);
+#endif
+		rdi.productid=(int)rri.productid;
+       //check to see if it's a RIO device; if yes, only product ID is needed
+       //if not, then read RabbitNet Device information
+      if(rri.productid!=RIO_PRDID)
+      {
+#ifdef RN_ACCESS_PROTECTION
+         if (RN_ACCESS_FN(portnum)) return RN_SPIBUSY;
+#endif
+			rn_sp_enable(portnum);
+ 			_mosi_driver(sizeof(rd_devinfo), (void *)rd_devinfo, &rdi, dtime, &rn_spi[portnum]);
+  			rn_sp_disable(portnum);
+#ifdef RN_ACCESS_PROTECTION
+         RN_RELEASE_FN(portnum);
+#endif
+      }
+
+		///device detected at port level
+		rn_devtable[devl1].handle = (int)&rn_devtable[devl1];
+		rn_devtable[devl1].dtype = RNDEVICE;
+		rn_devtable[devl1].pna = (portnum<<6);
+		rn_devtable[devl1].portnum = portnum;
+
+		//overrides ucode timing; see individual card libs (pel 01/20/04)
+      switch (rdi.productid)
+      {
+      	case RN1100: _RN1100TIME; break;
+      	case RN1200: _RN1200TIME; break;
+      	case RN1300: _RN1300TIME; break;
+      	case RN1400: _RN1400TIME; break;
+      	case RN1600: _RN1600TIME; break;
+         default:	//to original microcode timing
+				tCS = rdi.tcs;
+				tCD = rdi.tcd;
+				tDD = rdi.tdd;
+				tDS = rdi.tds;
+				tMC = rdi.tmc;
+         break;
+      }
+
+		rn_devtable[devl1].initstatus = rdi.statusbyte;
+		rn_devtable[devl1].tcs = tCS;		//rdi.tcs;
+		rn_devtable[devl1].tcd = tCD;		//rdi.tcd;
+		rn_devtable[devl1].tdd = tDD;		//rdi.tdd;
+		rn_devtable[devl1].tds = tDS;		//rdi.tds;
+		rn_devtable[devl1].tmc = tMC;		//rdi.tmc;
+
+      ///get rest of important info
+		rn_devtable[devl1].productid = rdi.productid;
+		rn_devtable[devl1].productrev = rdi.productrev;
+		rn_devtable[devl1].coderev = rdi.coderev;
+		rn_devtable[devl1].signature[0] = rdi.signature[0];
+		rn_devtable[devl1].signature[1] = rdi.signature[1];
+		rn_devtable[devl1].signature[2] = rdi.signature[2];
+		rn_devtable[devl1].signature[3] = rdi.signature[3];
+
+      ///get device timing and assemble iterations
+		rn_devtable[devl1].cmdtiming[0] = (char)(tCS*itnconst);	//(char)(rdi.tcs*itnconst);
+
+		rn_devtable[devl1].cmdtiming[1] = (char)(tCD*itnconst);	//(char)(rdi.tcd*itnconst);
+		for (i=2; i<=RN_MAX_DATA; i++)
+		{
+			rn_devtable[devl1].cmdtiming[i] = (char)(tDD*itnconst);	//(char)(rdi.tdd*itnconst);
+		}
+		return RNDEVICE;
+	}
+	else
+	{
+		rn_devtable[devl1].dtype = RNHUB;
+		rn_sp_disable(portnum);
+  		return NOCONNECT;
+	}
+
+}
+
+
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+

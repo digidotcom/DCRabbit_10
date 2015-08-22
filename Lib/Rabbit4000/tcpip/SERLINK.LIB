@@ -1,0 +1,4071 @@
+/***********************************************************
+MAINTAINER NOTE:
+  This library is a replacement for the library formerly
+  known as PPPLINK.LIB.
+  If you make a fix in this library, make the same fix in
+  lib\ppp\PPPLINK.LIB.
+************************************************************/
+
+/*** BeginHeader  ********************************************/
+// Note: we use the original (PPPLINK) naming convention,
+// to prevent inadvertently including _both_ old and new libs.
+#ifndef __PPPLINK_LIB
+#define __PPPLINK_LIB
+/*** EndHeader ***********************************************/
+
+/* START LIBRARY DESCRIPTION ***************************************************
+SERLINK.LIB
+	Copyright (c) 2006, Rabbit Semiconductor.
+
+DESCRIPTION:
+	PPPLINK AHDLC and raw serial (VSPD) packet driver
+
+SUPPORT LIB'S:
+
+REVISION HISTORY:
+12-JUL-04 sjh	Created, based on original ppplink.lib.  Now supports
+               new unified packet driver semantics.
+21-JUL-05 sjh	Changed to use single xmem buffers.
+               Renamed to SERLINK.LIB to more correctly reflect the use
+               of this library _independent_ of PPP as such.
+               Added Rabbit4000 DMA support.
+12-JAN-07 tg   Changed .abortframe from calling _rxx_startframe to now
+					call _rxx_init to prevent start & stop flags from becoming
+					off sync. when a bad CRC occurs.
+END DESCRIPTION ***************************************************************/
+
+/*** BeginHeader _PPPLINKController, _VSPDController */
+// When this library is included, ppp.lib has already been included (unless only
+//  VSPD).
+
+#define USE_PPPLINK (USE_PPP_SERIAL|USE_VSPD)	// Union of two interface types
+
+#if !USE_PPP_SERIAL
+	#define _NO_PPP				// If defined means we don't need PPP support
+	               				//  (VSPD uses raw mode only).
+	#ifndef PPP_NO_MODEM
+		#define PPP_NO_MODEM		// Implies no need for modem, either.
+	#endif
+#endif
+
+// IOCTL command codes for PPP over async serial interfaces
+#define PD_PPPLINK_ASYMAP   303	// longword map.  Set async char escape map.
+#define PD_PPPLINK_SPEED    304	// longword *bps.  Set/get async speed in bps.
+                               	//  If *bps==0, then just queries the current
+                               	//  setting.  Otherwise, *bps is adjusted on
+                               	//  return to indicate the real setting
+                               	//  achievable by the divider.
+#define PD_PPPLINK_FLOWIN   305	// char * type, word * port, char * pinmask.
+                               	//  Turn on/off inbound flow control for serial
+                               	//  port.  *type is one of FLOWCTL_NONE,
+                               	//  FLOWCTL_RTS, FLOWCTL_SOFT, FLOWCTL_QUERY.
+                               	//  If *type==FLOWCTL_RTS then *port is the
+                               	//  desired parallel port I/O address, *pinmask
+                               	//  is the bitmask to use, e.g. 0x40 for bit 6.
+                               	//  Since the RTS pin is set to an output, a
+                               	//  shadow register needs to be determined.
+                               	//  This is done based on the port I/O address.
+                               	//  If *type==FLOWCTL_QUERY then all parameters
+                               	//  are filled in with the current values.
+#define PD_PPPLINK_FLOWOUT  306	// char * type, word * port, char * pinmask.
+                               	//  Turn on/off outbound flow control for
+                               	//  serial port.  *type is one of FLOWCTL_NONE,
+                               	//  FLOWCTL_CTS, FLOWCTL_SOFT, FLOWCTL_QUERY.
+                               	//  If *type==FLOWCTL_CTS then *port is the
+                               	//  desired parallel port I/O address, *pinmask
+                               	//  is the bitmask to use, e.g. 0x40 for bit 6.
+                               	//  The CTS pin is set to an input.
+#define PD_PPPLINK_USEMODEM 307	// int * use.  If use is NULL, return the
+                               	//  usemodem switch.  Else, set switch to *use.
+#define PD_PPPLINK_SENDEX   308	// char * sendexpect.  If NULL, return value
+                               	//  may be cast to char* to see current string.
+                               	//  Else sendexpect string is set from
+                               	//  parameter.
+#define PD_PPPLINK_HANGUP   309	// char * hangup.  If NULL, return value may be
+                               	//  cast to char* to see current string.  Else
+                               	//  hangup string is set from parameter.
+#define PD_PPPLINK_MODEMESC 310	// int * esc.  If esc is NULL, return the
+                               	//  modemescape switch. Else, set the
+                               	//  modemescape switch to *esc.
+#define PD_PPPLINK_FLAGS    311	// word * flgs, word mask.  If flgs is NULL,
+                               	//  return the current flag settings. Else, set
+                               	//  flags to *flgs (only bits in mask are
+                               	//  affected).  Currently, the only flag
+                               	//  setting is PPPPORT_ALT which is only
+                               	//  applicable for serial ports A or B, which
+                               	//  can route their outputs to (alternative)
+                               	//  parallel port D instead of C.
+#define PD_PPPLINK_SENDRAW  312	// char * packet, int len.  Similar to
+                               	//  PD_PPP_SENDCTL, except is used for raw
+                               	//  (e.g. ascii) data for controlling a modem
+                               	//  etc.  Returns 1 iff success.
+#define PD_PPPLINK_RXMODE   313	// int mode.  Set receive mode: Mode=0 for
+                               	//  AHDLC mode; mode=1 for raw receives.
+#define PD_DMA              314	// dma_chan_t rxchan, dma_chan_t txchan, word
+                               	//  ioaddr.  Set DMA channels.
+#define PD_SERIAL           315	// <none>.  Revert to using default serial ISR.
+
+// Flow control ioctl subcommand words
+#define FLOWCTL_NONE        0		// We don't need no ed-U-cation; we don't need
+                             		//  no flow con-trol. (Sorry, Pink)
+#define FLOWCTL_RTS         1		// For inbound only.
+#define FLOWCTL_CTS         1		// For outbound only - this is more useful for
+                             		// ppplink.
+		// The above 2 are aliased
+#define FLOWCTL_SOFT        2		// NOT IMPLEMENTED! - uses XON/XOFF.
+#define FLOWCTL_QUERY       3		// Report the current flow control setting.
+
+#ifndef SERLINK_INT_LEVEL
+	#define SERLINK_INT_LEVEL 1
+#endif
+
+#ifndef PKT_POOL_IPSET
+	#define PKT_POOL_IPSET SERLINK_INT_LEVEL
+#endif
+
+#if PKT_POOL_IPSET < SERLINK_INT_LEVEL
+	#fatal "PKT_POOL_IPSET must be >= SERLINK_INT_LEVEL."
+#endif
+
+#ifdef PPPLINK_DEBUG
+	#define _ppplink_debug __debug
+#else
+	#define _ppplink_debug __nodebug
+#endif
+
+// App can define this to remove modem handling code
+//#define PPP_NO_MODEM
+
+#ifndef PPP_NO_MODEM
+	#use "chat.lib"		// Allow chatting with modem
+#endif
+
+// For modem escape sequence: initial and final delay in ms.  Most modems use a
+// min timeout of about one second.  The default is slightly larger than this to
+// make sure the modem recognizes it.
+#ifndef PSS_ESCAPE_TIME
+	#define PSS_ESCAPE_TIME 1250
+#endif
+// For modem escape sequence: delay between each of the three '+' chars.  Modems
+// expect a 'human' typing rate, so the default setting is half a second.
+#ifndef PSS_ESCAPE_TIME_PLUS
+	#define PSS_ESCAPE_TIME_PLUS 500
+#endif
+
+#ifndef PSS_SENDBUF_SIZE
+	#define PSS_SENDBUF_SIZE 50
+#endif
+
+#ifndef PPP_NO_MODEM
+	typedef struct
+	{
+		ChatState sendexpect;
+		char *sendexpect_string;    	// For login
+		char *hangup_string;        	// For hanging up the modem.
+		int chatting;
+	#define PPPLINK_CHAT_NONE     0	// Not currently chatting
+	#define PPPLINK_CHAT_LOGIN    1	// Login sequence
+	#define PPPLINK_CHAT_HANGUP   2	// Logout/Hangup sequence
+		int change;
+		int connected;
+		int escape;
+		int escaping_flag;          	// set if in the middle of doing an escape
+		int escape_state;
+	#define MODEM_ESCAPE_IDLE     0
+	#define MODEM_ESCAPE_DELAY1   1	// Wait before first '+'
+	#define MODEM_ESCAPE_PLUS12   2	// Wait between 1st and 2nd '+'
+	#define MODEM_ESCAPE_PLUS23   3	// Wait between 2nd and 3rd '+'
+	#define MODEM_ESCAPE_DELAY2   4	// Wait after 3rd '+'
+		word escape_timeout;
+	} ModemState;
+#endif
+
+//time to wait for connection after dialing(in sec)
+#ifndef PSS_MODEM_CONNECT_WAIT
+	#define PSS_MODEM_CONNECT_WAIT 40
+#endif
+
+//size of expect serial buffer
+#ifndef PSS_MODEM_MAX_EXPECT
+	#define PSS_MODEM_MAX_EXPECT 200
+#endif
+
+#ifdef PPP_PARALLEL
+	// Define the parallel port to use, plus macros which switch between input
+	// and output state
+ #ifndef PPPP_PORT
+	// Default uses parport A.
+	#define PPPP_PORT             PADR
+	// These macros are allowed to use register AF, but must preserve others.
+	#define PPPP_WRITE            ld a,0x84 $ ioi ld (SPCR),a $ ld (SPCRShadow),a
+	#define PPPP_READ             ld a,0x80 $ ioi ld (SPCR),a $ ld (SPCRShadow),a
+ #endif
+
+	// NOTE: the following defaults make use of parport C bits 0-3 as the control
+	// lines. This precludes use of serial ports C and D.
+
+	// Define the write strobe bit: parallel port number, bit number and shadow
+	// reg.  This is assumed to be an active high pulse, once the data is output
+	// on PPPP_PORT.
+ #ifndef PPPP_WSTROBE
+	#define PPPP_WSTROBE          PCDR
+	#define PPPP_WSTROBE_SHADOW   PCDRShadow
+	#define PPPP_WSTROBE_MASK     0x01		// Bit zero
+	#define PPPP_WSTROBE_BIT      0
+ #endif
+
+	// Define the read strobe bit: parallel port number, bit number and shadow
+	// reg. This is assumed to be active low.  The pin is brought low; the data
+	// is read from PPPP_PORT; then the pin is brought high (inactive).
+ #ifndef PPPP_RSTROBE
+	#define PPPP_RSTROBE          PCDR
+	#define PPPP_RSTROBE_SHADOW   PCDRShadow
+	#define PPPP_RSTROBE_MASK     0x04		// Bit 2
+	#define PPPP_RSTROBE_BIT      2
+ #endif
+
+	// Define the bit to test for whether there is space in the external device
+	// Tx buffer.  Assumed to be high when there is NOT space.  If low, then can
+	// accept another byte.
+ #ifndef PPPP_TXFULL
+	#define PPPP_TXFULL           PCDR
+	#define PPPP_TXFULL_MASK      0x08		// Bit 3
+	#define PPPP_TXFULL_BIT       3
+ #endif
+
+	// Define the bit to test for whether there is data available in the external
+	// device Rx buffer.  Assumed to be high when there is NOT data.  If low,
+	// then can read another byte.
+ #ifndef PPPP_RXEMPTY
+	#define PPPP_RXEMPTY          PCDR
+	#define PPPP_RXEMPTY_MASK     0x02		// Bit 1
+	#define PPPP_RXEMPTY_BIT      1
+ #endif
+
+	// Define some macros used by the code.
+	#define PPPP_DO_WSTROBE       ld a,(PPPP_WSTROBE_SHADOW) $ \
+	                              or PPPP_WSTROBE_MASK $ \
+	                              ioi ld (PPPP_WSTROBE),a $ \
+	                              and 255-PPPP_WSTROBE_MASK $ \
+	                              ioi ld (PPPP_WSTROBE),a
+#endif //PPP_PARALLEL
+
+// Rabbit 4000 output:
+//             Default   | ALT       | ALT2
+// ----------------------+-----------+----------
+// SERA/SERB:  PORTC 6/4 | PORTD 6/4 |
+// SERC/SERD:  PORTC 2/0 |           |
+// SERE/SERF:  PORTC 6/2 | PORTD 6/2 | PORTE 6/2
+#define PPPPORT_ALT  0x04	// Use alternate 1 settings above (SERA/B/E/F).
+#define PPPPORT_ALT2 0x08	// Use alternate 2 settings above (SERE/F).
+
+typedef struct {
+   word addctl;         // Address/control field (0xFF03)
+   word protocol;       // PPP protocol field (0x00C1)
+} pppserial_ll_hdr;
+
+
+typedef struct
+{
+	// This struct is same as first part of _PPPLINKConfig.  Since that struct is
+	// rather large, we don't want to have full-size const initializers (since
+	// all other fields are zero).  Thus, we have only the non-zero const fields
+	// in here.
+	const NetControllerDevice *ncd;
+	word iface;             // Interface number.
+	int  iobase;            // I/O base address.  This is the data register for
+	                        //  serial ports.
+	char drivebit;          // Output driver bit for par port control.
+	char timerport;         // I/O addr for relevant timer A.
+	char *timershadow;      // Shadow reg for above.
+	char flags;
+#define IS_VSPD 0x02       // This is a Virtual Serial Packet Driver (VSPD)
+                           //  interface.
+} _PPPLINKConfigConst;
+
+typedef struct
+{
+   //========= Following fields must match _PPPLINKConfigConst =========//
+	NetControllerDevice *ncd;
+	word iface;             // Interface number.
+	int  iobase;            // I/O base address.  This is the data register for
+	                        //  serial ports.
+	char drivebit;          // Output driver bit for par port control.
+	char timerport;         // I/O addr for relevant timer A.
+	char *timershadow;      // Shadow reg for above.
+	char flags;
+   //=========== Above fields must match _PPPLINKConfigConst ===========//
+	int  (*io_init)();
+#ifndef _NO_PPP
+	struct _PPPState *ppp;  // PPP stuff.  PPPState::state points back to this
+	                        //  struct.
+	char asymapflag;        // 0 if the async map is all zeros, 0xFF if all 1's,
+	                        //  else consult asymap table.  This improves the tx
+	                        //  efficiency.
+#endif
+	// Following fields must be set up before calling ppplink_open().
+	longword baud;          // Desired BPS rate.
+	char outflowcontrol;    // Whether CTS (outbound) flow control required.  If
+	                        //  set, then the following 2 fields must be set.
+	                        //  Active LOW is assumed.
+	word ctsport;           // I/O address for CTS pin.
+	char ctspin;            // Bitmask for reading CTS pin.
+	char inflowcontrol;     // Whether RTS (inbound) flow control required.  If
+	                        //  set, then the following 3 fields must be set.
+	                        //  Active LOW.  Note: The driver does not currently
+	                        //  toggle the RTS pin in operation, however it is
+	                        //  set to the appropriate (asserted) state while the
+	                        //  interface is active.
+	word rtsport;           // I/O address for RTS pin.
+	char rtspin;            // Bitmask for writing RTS pin.
+	char *rtsshadow;        // Shadow reg for RTS port.
+	char rxoverrun;         // Set non-zero if overrun.
+	char rxoversize;        // Set non-zero if frame too big.
+	char rxnobuf;           // Set non-zero if no buffer for frame.
+	char rxcrcerr;          // Count of CRC errors.
+	char mode;              // This is set to either PPPLINK_HDLC (for HDLC frame
+	                        // mode) or PPPLINK_RAW (for raw data receive).  For
+	                        // VSPD drivers, this should always be 'raw'.
+#define PPPLINK_HDLC 0
+#define PPPLINK_RAW  1
+	char sending;           // Non-zero when ISR is transmitting a packet.  If
+	                        //  zero, then app must call _tx_restart when the
+	                        //  next frame is scheduled for transmission.
+	char stalled;           // Non-zero when Tx ISR could not send because of
+	                        //  CTS, and the transmit shift register is idle.  If
+	                        //  zero, the ISR automatically keeps transmitting
+	                        //  the next char (if any).  If polling
+	                        //  (ppplink_receive()) sees this is non-zero, then
+	                        //  it must restart the transmitter ISR by calling
+	                        //  _tx_restart.
+	char sendfd;            // Non-zero if need to send frame delimiter first.
+	word txdmamask;         // Single-bit mask for transmit DMA channel - zero if
+	                        //  not using Tx DMA (16 channels for Rabbit 6000).
+	char txdmachan;         // The same, as channel number (0-7 on Rabbit
+	                        //  4000/5000 or 0-15 on Rabbit 6000).
+	// Do not change order of following 2 fields!
+	char txin;              // Offset in txbuf of where next char to tx goes.
+	long txbuf;             // Segmented address of transmit transfer buffer.
+	                        //  This buffer starts on a 256-byte boundary, but
+	                        //  the LSB is incremented to keep track of the next
+	                        //  char to write to the serial port.  The 2nd LSB
+	                        //  will always be 0xE? and the MSBs are the segment
+	                        //  (XPC) value.  The data stored in the transfer
+	                        //  buffer is in raw form. Buffer is EMPTY iff
+	                        //  txin == LSB(txbuf), and FULL iff
+	                        //  (txin-LSB(txbuf)) mod 256 == 255.
+	void *txistate;         // Address in transmit ISR.  This is used to short-
+	                        //  cut runtime testing in the ISR.
+	// Transmit state machine control.
+	void *txxstate;         // Execution point for transmitter.
+	word txxcrc;            // Running CRC.
+	long txxsource;         // Segmented source address.
+	word txxsrclen;         // Remaining source length.
+	char txxasymapflag;     // For a control packet, this is always 0xFF (escape
+	                        //  all).  Otherwise, it is set to the asymapflag
+	                        //  value.
+	ll_prefix __far *txxpkt;  // The current packet being transmitted.
+	char txctl;             // Set 0x01 if next packet (txpkt) is a control (LCP
+	                        //  etc.) packet.  Set 0x80 if next packet is 'raw'
+	                        //  (i.e. no framing or escapes) - this overrides
+	                        //  0x01.  Else set 0 for normally escaped and framed
+	                        //  packets (IP etc.).  Note that ISR resets this to
+	                        //  zero when the frame is accepted for transmit.
+	ll_prefix __far *txpkt;   // Next packet to transmit.  When application see
+	                        //  that this is 0, then it can be set to the next
+	                        //  outgoing packet.  The app must also set 'sending'
+	                        //  if this is done.  (If sending was 0, then the app
+	                        //  also has to call the ISR explicitly to start
+	                        //  things moving).
+	ll_prefix __far *txpktctl;// Next control packet to transmit.  This is a
+	                        //  priority packet, and is assumed to be a control
+	                        //  packet.  If both txpkt and txpktctl are not NULL,
+	                        //  then this packet takes priority.
+	char sendctl;           // This flag is only used by ppplink_sendpacket and
+	                        //  friends.  Tell the sender whether or not the next
+	                        //  packet to be queued is a control packet.
+	word txcount;           // This counts the number of characters which have
+	                        //  been queued in the transfer buffer, for
+	                        //  transmission.  VSPD drivers use this for the
+	                        //  pseudo-ACK value for TCP streams.
+	char receiving;         // Non-Z when ISR is able to call ppplink_move2app.
+	word rxdmamask;         // Single-bit mask for receive DMA channel - zero if
+	                        //  not using Rx DMA (16 channels for Rabbit 6000).
+	char rxdmachan;         // The same, as channel number (0-7 on Rabbit
+	                        //  4000/5000 or 0-15 on Rabbit 6000).
+	// Do not change order of following 2 fields!
+	char rxin;              // Offset in rxbuf of where to put next rx'd char.
+	long rxbuf;             // Segmented address of receive transfer buffer.  See
+	                        //  txbuf comment, rxbuf works in the same manner.
+	// Receive state machine control
+	void *rxxstate;         // Execution point for receiver.
+	word rxxcrc;            // Running CRC.
+	long rxxdest;           // Segmented dest address.
+	word rxxdstlen;         // Remaining dest length.
+	ll_prefix __far * rxxpkt; // Current packet being received (not ready yet).
+	                        //  When end of frame seen, this is marked as 'ready'
+	                        //  so that pkt_received() will see it.  If raw mode,
+	                        //  then the packet is marked ready (and in-band).
+#ifdef PPPLINK_DEBUG
+	word txchars;
+	word rxchars;
+	word txframes;
+	word rxframes;
+	word txisrcount;
+	word rxisrcount;
+	word rxlastcrc;
+#endif
+	//110
+#ifndef _NO_PPP
+	char asymap[32];        // Non-zero to escape this char on transmit.  This
+	                        //  table is only consulted if asymapflag is neither
+	                        //  0x00 nor 0xFF.
+	char abort_flag;        // Used when 'coming up' status fails, and we need to
+	                        //  clean up.
+#endif
+	// Async modem settings...
+#ifndef PPP_NO_MODEM
+	char havelink;          // This basically reflects the CONNECTED or DCD state
+	                        //  of the modem.
+	char usemodem;
+	ModemState modem;
+#endif
+	long txbufp;            // Physical transfer buffer addresses.
+	long rxbufp;
+	// Receive DMA buffer descriptors
+	DMABufDesc12 rxbd1;     // Dummy 1-byte move to allow polling the rest.
+	DMABufDesc12 rxbd2;     // First half of rx transfer buffer.
+	DMABufDesc   rxbd3;     // Second half of rx transfer buffer.  Links back to
+	                        //  rxbd2 for endless transfer.
+	DMABufDesc12 txbd1;     // Points to a single 0x7E char for start of frame
+	                        //  (AHDLC only).
+	DMABufDesc12 txbd2;     // Points to start of tx transfer buffer (for AHDLC)
+	                        // or first part of raw frame.
+	DMABufDesc12 txbd3;     // In raw mode, points to 2nd part of raw frame (if
+	                        // necessary).
+} _PPPLINKConfig;
+
+#if USING_PPP_SERIAL
+	_PPPLINKConfig _ppp_serial_conf[USING_PPP_SERIAL];
+#endif
+#if USING_VSPD
+	_PPPLINKConfig _vspd_conf[USING_VSPD];
+#endif
+
+#define HAVE_SEREF 1
+
+// Pointers to STATIC storage used by ISRs to get serial parameters.  These
+// point to the appropriate _ppp_serial_conf array element, so that ISRs know
+// where to get the data.
+_PPPLINKConfig *_pss_A, *_pss_B, *_pss_C, *_pss_D, *_pss_E, *_pss_F;
+
+#define _pss _pss_A	// Dummy short name for assembler - resolves to pointer
+                   	//  instance, any will do.
+
+// Segmented (tbuf) and physical (pbuf) addresses of transfer buffers (xalloc'd)
+long _ppp_serial_tbuf;
+long _ppp_serial_pbuf;
+long _vspd_tbuf;
+long _vspd_pbuf;
+
+#if USING_PPP_SERIAL
+extern const NetControllerDevice _PPPLINKController;
+#endif
+#if USING_VSPD
+extern const NetControllerDevice _VSPDController;
+#endif
+
+// These macros are used by net.lib to properly initialize all instances.  Each
+// macro is a C initializer (with trailing comma if not null).  First element
+// points to NetControllerDevice, second is a void pointer which points to the
+// specific state structure for the instance, third field is instance number.
+#if USING_PPP_SERIAL >= 1
+	#define PPP_SERIAL_TABLE1 \
+	                 { &_PPPLINKController, (void *) (_ppp_serial_conf + 0), 0 },
+#else
+	#define PPP_SERIAL_TABLE1
+#endif
+#if USING_PPP_SERIAL >= 2
+	#define PPP_SERIAL_TABLE2 \
+	                 { &_PPPLINKController, (void *) (_ppp_serial_conf + 1), 1 },
+#else
+	#define PPP_SERIAL_TABLE2
+#endif
+#if USING_PPP_SERIAL >= 3
+	#define PPP_SERIAL_TABLE3 \
+	                 { &_PPPLINKController, (void *) (_ppp_serial_conf + 2), 2 },
+#else
+	#define PPP_SERIAL_TABLE3
+#endif
+#if USING_PPP_SERIAL >= 4
+	#define PPP_SERIAL_TABLE4 \
+	                 { &_PPPLINKController, (void *) (_ppp_serial_conf + 3), 3 },
+#else
+	#define PPP_SERIAL_TABLE4
+#endif
+#if USING_PPP_SERIAL >= 5
+	#define PPP_SERIAL_TABLE5 \
+	                 { &_PPPLINKController, (void *) (_ppp_serial_conf + 4), 4 },
+#else
+	#define PPP_SERIAL_TABLE5
+#endif
+#if USING_PPP_SERIAL >= 6
+	#define PPP_SERIAL_TABLE6 \
+	                 { &_PPPLINKController, (void *) (_ppp_serial_conf + 5), 5 },
+#else
+	#define PPP_SERIAL_TABLE6
+#endif
+
+#if USING_VSPD >= 1
+	#define VSPD_TABLE1 { &_VSPDController, (void *) (_vspd_conf + 0), 0 },
+#else
+	#define VSPD_TABLE1
+#endif
+#if USING_VSPD >= 2
+	#define VSPD_TABLE2 { &_VSPDController, (void *) (_vspd_conf + 1), 1 },
+#else
+	#define VSPD_TABLE2
+#endif
+#if USING_VSPD >= 3
+	#define VSPD_TABLE3 { &_VSPDController, (void *) (_vspd_conf + 2), 2 },
+#else
+	#define VSPD_TABLE3
+#endif
+#if USING_VSPD >= 4
+	#define VSPD_TABLE4 { &_VSPDController, (void *) (_vspd_conf + 3), 3 },
+#else
+	#define VSPD_TABLE4
+#endif
+#if USING_VSPD >= 5
+	#define VSPD_TABLE5 { &_VSPDController, (void *) (_vspd_conf + 4), 4 },
+#else
+	#define VSPD_TABLE5
+#endif
+#if USING_VSPD >= 6
+	#define VSPD_TABLE6 { &_VSPDController, (void *) (_vspd_conf + 5), 5 },
+#else
+	#define VSPD_TABLE6
+#endif
+
+
+//#ifdef PPPLINK_DEBUG
+#if 1
+	#define _jr jp
+	#define _djnz dec b $ jp nz,
+#else
+	#define _jr	jr
+	#define _djnz	djnz
+#endif
+/*** EndHeader */
+
+#if USING_PPP_SERIAL
+// Pointer to this is stored in IFTEntry.ncd field - basically, pointers to
+// specific driver functions.
+const NetControllerDevice _PPPLINKController =
+{
+	sizeof (_PPPLINKConfig),        	// sizeof_state
+	NCD_POLL | NCD_TXCOPY | NCD_P2P,	// flags
+	0,                              	// sizeof_hwa - none for ppplink
+	USING_PPP_SERIAL,               	// instances
+	#pragma nowarn warns
+	ppplink_receive,                	// receive()
+	#pragma nowarn warns
+	ppplink_sendpacket,             	// sendpacket()
+	#pragma nowarn warns
+	ppplink_ioctl,                  	// ioctl()
+#ifdef PKTDRV_DEBUG
+	#pragma nowarn warns
+	ppplink_prt_nicreg,             	// prtregs()
+#else
+	#pragma nowarn warns
+	NULL,
+#endif
+	#pragma nowarn warns
+	ppplink_ifctl,                   	// ifctl()
+	#pragma nowarn warns
+	ppplink_set_hdr
+	#pragma nowarn warns
+};
+#endif
+
+#if USING_VSPD
+const NetControllerDevice _VSPDController =
+{
+	sizeof (_PPPLINKConfig),        	// sizeof_state - uses same state as PPPLINK
+	NCD_POLL | NCD_TXCOPY,          	// flags
+	0,                              	// sizeof_hwa - none for VSPD
+	USING_VSPD,                     	// instances (share with PPPLINK)
+	#pragma nowarn warns
+	vspd_receive,                   	// receive()
+	#pragma nowarn warns
+	vspd_sendpacket,                	// sendpacket()
+	#pragma nowarn warns
+	vspd_ioctl,                     	// ioctl()
+#ifdef PKTDRV_DEBUG
+	#pragma nowarn warns
+	ppplink_prt_nicreg,             	// prtregs()
+#else
+	#pragma nowarn warns
+	NULL,
+#endif
+	#pragma nowarn warns
+	vspd_ifctl,                     	// ifctl()
+	#pragma nowarn warns
+	vspd_set_hdr
+	#pragma nowarn warns
+};
+#endif
+
+/*** BeginHeader ppplink_open */
+// pss must be set up with necessary fields:
+//   portflags: Set PPPPORT_ALT to use parallel port D pins for SERA/SERB.
+//     For the Rabbit 4000, set PPPPORT_ALT2 to select parallel port E.
+//   outflowcontrol/inflowcontrol : set non-zero if hardware flow control, in
+//     which case also set: rtsport, rtspin, rtsshadow, ctsport, ctspin.
+// pss must also point to static storage, since the address is saved for ISR
+// usage of the given serial port.
+// Note that all baud rates must be high enough that timer A1 is not required
+// for prescaling (R2000 and R3000 only - R4000 uses dedicated prescalers).
+// Returns 0 if OK, non-zero if error.
+int ppplink_open(_PPPLINKConfig * pss);
+/*** EndHeader */
+
+_ppplink_debug
+int ppplink_open(_PPPLINKConfig * pss)
+{
+	auto word t;
+	auto int i;
+
+
+	// Disable interrupt vector while changing things
+	ppplink_close(pss);
+   ppplink_disableport(pss);
+
+   // Assume no hardware flow control
+   pss->txistate = _txi_noflowctl;
+
+   // Initial transmit/receive execution states
+   pss->txxstate = _txx_init;
+   if (pss->flags & IS_VSPD) {
+	   pss->rxxstate = _rxx_initraw;
+	   pss->mode = PPPLINK_RAW;
+   }
+#ifndef _NO_PPP
+   else {
+	   pss->rxxstate = _rxx_init;
+	   pss->mode = PPPLINK_HDLC;
+   }
+#endif
+
+   pss->receiving = 1;		// Allow ISR to call ppplink_move2app
+   pss->sending = 0;		// Don't have anything to send
+
+   ppplink_speed(pss, &pss->baud);	// Don't change the current speed
+   ppplink_flowin(pss, &pss->inflowcontrol, &pss->rtsport, &pss->rtspin);  // ...or the flow control
+   ppplink_flowout(pss, &pss->outflowcontrol, &pss->ctsport, &pss->ctspin);  // ...in or out
+#ifndef _NO_PPP
+   ppplink_asymap(pss, 0xFFFFFFFFuL);
+#endif
+
+	ppplink_isrinit(pss);
+
+   // let 10 x baud timer time out before using port
+   t = _SET_SHORT_TIMEOUT((word)(100000/pss->baud + 1));
+   while (!_CHK_SHORT_TIMEOUT(t)) ;
+
+	ppplink_enableport(pss);
+
+   return 0;
+}
+
+/*** BeginHeader ppplink_whichISR  */
+__xmem void ppplink_whichISR(void);
+/*** EndHeader */
+
+#asm __xmem
+ppplink_whichISR::
+	; Convert IY->iobase to ISR address in DE, and interrupt vector base in HL.
+	; Internal routine.
+	ld		a,(iy+[_pss]+iobase)
+	cp		SADR
+	jr		z,.porta
+	cp		SBDR
+	jr		z,.portb
+	cp		SCDR
+	jr		z,.portc
+	cp		SDDR
+	jr		z,.portd
+	cp		SEDR
+	jr		z,.porte
+	cp		SFDR
+	jr		z,.portf
+	jr		.portc		; This is bad, but let's pick something
+.porta:
+	ld		de,PPPSerialAISR
+	ld		hl,INTVEC_BASE+SERA_OFS
+	lret
+.portb:
+	ld		de,PPPSerialBISR
+	ld		hl,INTVEC_BASE+SERB_OFS
+	lret
+.portc:
+	ld		de,PPPSerialCISR
+	ld		hl,INTVEC_BASE+SERC_OFS
+	lret
+.portd:
+	ld		de,PPPSerialDISR
+	ld		hl,INTVEC_BASE+SERD_OFS
+	lret
+.porte:
+	ld		de,PPPSerialEISR
+	ld		hl,INTVEC_BASE+SERE_OFS
+	lret
+.portf:
+	ld		de,PPPSerialFISR
+	ld		hl,INTVEC_BASE+SERF_OFS
+	lret
+#endasm
+
+/*** BeginHeader ppplink_close  */
+void ppplink_close(_PPPLINKConfig * pss);
+/*** EndHeader */
+
+_ppplink_debug
+void ppplink_close(_PPPLINKConfig * pss)
+{
+#asm _ppplink_debug
+	ld		iy,(sp+@SP+pss)
+	ld		hl,(iy+[_pss]+iobase)
+
+	ld		de,4
+	add	hl,de						; Point to control register
+ioi ld	(hl),0x00				; Disable interrupts
+.setidle:
+#endasm
+	// Free up any tx or rx buffers in use
+	if (pss->txxpkt) {
+   	pkt_buf_release(pss->txxpkt);
+      pss->txxpkt = NULL;
+   }
+	if (pss->txpkt) {
+   	pkt_buf_release(pss->txpkt);
+      pss->txpkt = NULL;
+   }
+	if (pss->txpktctl) {
+   	pkt_buf_release(pss->txpktctl);
+      pss->txpktctl = NULL;
+   }
+	if (pss->rxxpkt) {
+   	pkt_buf_release(pss->rxxpkt);
+      pss->rxxpkt = NULL;
+   }
+}
+
+/*** BeginHeader ppplink_isrinit  */
+__xmem void ppplink_isrinit(_PPPLINKConfig * pss);
+/*** EndHeader */
+
+#asm __xmem
+;
+; ppplink_isrinit.  On entry, HL points to PSS
+;
+ppplink_isrinit::
+		ld		iy, hl
+		lcall	ppplink_whichISR
+		ipset	3						; Disable all interrupts
+		ld		(hl), 0xC3			; Make it a JP intruction
+		inc	hl
+		ld		(hl), e
+		inc	hl
+		ipres
+		ld		(hl), d
+		lret
+#endasm
+
+/*** BeginHeader ppplink_disableport  */
+__xmem void ppplink_disableport(_PPPLINKConfig * pss);
+/*** EndHeader */
+
+#asm __xmem
+ppplink_disableport::
+		ld		iy, hl
+		ld		a, (iy+[_pss]+iobase)
+		ld		b, (iy+[_pss]+drivebit)
+		cp		SADR
+		jr		z, .portsAnB
+
+		cp		SBDR
+		jr		z, .portsAnB
+
+		cp		SEDR
+		jr		z, .portsEnF
+
+		cp		SFDR
+		jr		z, .portsEnF
+
+		; Serial ports C and D can use only parallel port C.
+.use_parallel_port_c:
+		; Set parallel port C pin as constant logic "high".
+		ipset	3
+		ld		a, (PCDRShadow)
+		or		b
+		ld		(PCDRShadow), a
+		ipres
+ioi	ld		(PCDR), a
+		ld		a, b
+		cpl
+		ld		b, a
+		ipset	3
+		ld		a, (PCFRShadow)
+		and	b
+		ld		(PCFRShadow), a
+		ipres
+ioi	ld		(PCFR), a
+		lret
+
+.portsAnB:
+		; Serial port A or B, check whether alternate I/O pins used.
+		ld		a, (iy+[_pss]+flags)
+		and	PPPPORT_ALT
+		jr		z, .use_parallel_port_c
+
+.use_parallel_port_d:
+		; Set parallel port D pin as constant logic "high".
+		ipset	3
+		ld		a, (PDDRShadow)
+		or		b
+		ld		(PDDRShadow), a
+		ipres
+ioi	ld		(PDDR), a
+		ld		a, b
+		cpl
+		ld		b, a
+		ipset	3
+		ld		a, (PDFRShadow)
+		and	b
+		ld		(PDFRShadow), a
+		ipres
+ioi	ld		(PDFR), a
+		lret
+
+.portsEnF:
+		; Serial port E or F, check whether alternate I/O pins used.
+		ld		a, (iy+[_pss]+flags)
+		and	PPPPORT_ALT | PPPPORT_ALT2
+		jr		z, .use_parallel_port_c
+
+		and	PPPPORT_ALT
+		jr		nz, .use_parallel_port_d
+
+.use_parallel_port_e:
+		; Set parallel port E pin as constant logic "high".
+		ipset	3
+		ld		a, (PEDRShadow)
+		or		b
+		ld		(PEDRShadow), a
+		ipres
+ioi	ld		(PEDR), a
+		ld		a, b
+		cpl
+		ld		b, a
+		ipset	3
+		ld		a, (PEFRShadow)
+		and	b
+		ld		(PEFRShadow), a
+		ipres
+ioi	ld		(PEFR), a
+		lret
+#endasm
+
+/*** BeginHeader ppplink_enableport  */
+__xmem void ppplink_enableport(_PPPLINKConfig * pss);
+/*** EndHeader */
+
+#asm __xmem
+ppplink_enableport::
+		ld		iy, hl
+		ld		b, (iy+[_pss]+drivebit)
+		ld		hl, (iy+[_pss]+iobase)	; Get port number (SADR, SBDR etc.)
+		ld		a, L
+		ex		de, hl
+		ld		hl, 4
+		add	hl, de						; Now DE -> data reg, HL -> control reg
+		cp		SCDR
+		jr		z, .portsCnD
+
+		cp		SDDR
+		jr		z, .portsCnD
+
+		cp		SEDR
+		jr		z, .portsEnF
+
+		cp		SFDR
+		jr		z, .portsEnF
+
+.portsAnB:
+		; If port A or B, check whether alternate I/O pins used (parallel port D)
+		ld		a, (iy+[_pss]+flags)
+		and	PPPPORT_ALT
+		jp		nz, .AnB_pportD
+
+		; set up parallel port C alternate output register for serial port A or B
+		ld		a, (iy+[_pss]+iobase)	; Get port number (SADR, SBDR etc.)
+		cp		SADR
+		jr		nz, .pc_txb_setup
+
+.pc_txa_setup:
+		ipset	3
+		ld		a, (PCAHRShadow)
+		and	0xCF
+		jr		.update_PCAHR
+
+.pc_txb_setup:
+		ipset	3
+		ld		a, (PCAHRShadow)
+		and	0xFC
+		jr		.update_PCAHR
+
+.portsCnD:
+		; set up parallel port C alternate output register for serial port C or D
+		ld		a, (iy+[_pss]+iobase)	; Get port number (SADR, SBDR etc.)
+		cp		SCDR
+		jr		nz, .pc_txd_setup
+
+.pc_txc_setup:
+		ipset	3
+		ld		a, (PCALRShadow)
+		and	0xCF
+		jr		.update_PCALR
+
+.pc_txd_setup:
+		ipset	3
+		ld		a, (PCALRShadow)
+		and	0xFC
+		jr		.update_PCALR
+
+.portsEnF:
+		; Serial port E or F, check whether alternate I/O pins are used
+		ld		a, (iy+[_pss]+flags)
+		and	PPPPORT_ALT
+		jp		nz, .EnF_pportD
+
+		ld		a, (iy+[_pss]+flags)
+		and	PPPPORT_ALT2
+		jp		nz, .EnF_pportE
+
+		; set up parallel port C alternate output register for serial port E or F
+		ld		a, (iy+[_pss]+iobase)	; Get port number (SADR, SBDR etc.)
+		cp		SEDR
+		jr		nz, .pc_txf_setup
+
+.pc_txe_setup:
+		ipset	3
+		ld		a, (PCAHRShadow)
+		or		0x30
+.update_PCAHR:
+		ld		(PCAHRShadow), a
+		ipres
+ioi	ld		(PCAHR), a
+		jr		.use_parallel_port_c
+
+.pc_txf_setup:
+		ipset	3
+		ld		a, (PCALRShadow)
+		or		0x30
+.update_PCALR:
+		ld		(PCALRShadow), a
+		ipres
+ioi	ld		(PCALR), a
+.use_parallel_port_c:
+		; Note that any serial port may be assigned to parallel port C I/O pins.
+		ipset	3
+		ld		a, (PCDRShadow)
+		or		b
+		ld		(PCDRShadow), a
+		ipres
+ioi	ld		(PCDR), a					; Set serial Tx line to idle level
+		ipset	3
+		ld		a, (PCFRShadow)
+		or		b
+		ld		(PCFRShadow), a
+		ipres
+ioi	ld		(PCFR), a					; Select parallel port C pin a serial output
+		ipset	3
+		ld		a, (PCDDRShadow)
+		or		b
+		ld		(PCDDRShadow), a
+		ipres
+ioi	ld		(PCDDR), a
+		ld		a, b
+		cpl
+		ld		b, a
+		ipset	3
+		ld		a, (PCDCRShadow)
+		and	b
+		ld		(PCDCRShadow), a
+		ipres
+ioi	ld		(PCDCR), a					; Set serial Tx line to normal push/pull
+		; enable interrupts for port, set 8N1, non-alternate pins
+		ld		b, _cexpr(0x00 | SERLINK_INT_LEVEL)
+		jp		.clearisr
+
+.AnB_pportD:
+		; set up parallel port D alternate output register for serial port A or B
+		ld		a, (iy+[_pss]+iobase)	; Get port number (SADR, SBDR etc.)
+		cp		SADR
+		jr		nz, .pd_txb_setup
+
+.pd_txa_setup:
+		ipset	3
+		ld		a, (PDAHRShadow)
+		and	0xCF
+		jr		.update_PDAHR
+
+.pd_txb_setup:
+		ipset	3
+		ld		a, (PDAHRShadow)
+		and	0xFC
+		jr		.update_PDAHR
+
+.EnF_pportD:
+		; set up parallel port D alternate output register for serial port E or F
+		ld		a, (iy+[_pss]+iobase)	; Get port number (SADR, SBDR etc.)
+		cp		SEDR
+		jr		nz, .pd_txf_setup
+
+.pd_txe_setup:
+		ipset	3
+		ld		a, (PDAHRShadow)
+		or		0x30
+.update_PDAHR:
+		ld		(PDAHRShadow), a
+		ipres
+ioi	ld		(PDAHR), a
+		jr		.use_parallel_port_d
+
+.pd_txf_setup:
+		ipset	3
+		ld		a, (PDALRShadow)
+		or		0x30
+		ld		(PDALRShadow), a
+		ipres
+ioi	ld		(PDALR), a
+.use_parallel_port_d:
+		ipset	3
+		ld		a, (PDDRShadow)
+		or		b
+		ld		(PDDRShadow), a
+		ipres
+ioi	ld		(PDDR), a					; Set serial Tx line to idle level
+		ipset	3
+		ld		a, (PDFRShadow)
+		or		b
+		ld		(PDFRShadow), a
+		ipres
+ioi	ld		(PDFR), a					; Select parallel port D pin a serial output
+		ipset	3
+		ld		a, (PDDDRShadow)
+		or		b
+		ld		(PDDDRShadow), a
+		ipres
+ioi	ld		(PDDDR), a					; Ensure parallel port D pin an output
+		ld		a, b
+		cpl
+		ld		b, a
+		ipset	3
+		ld		a, (PDDCRShadow)
+		and	b
+		ld		(PDDCRShadow), a
+		ipres
+ioi	ld		(PDDCR), a					; Set serial Tx line to normal push/pull
+		; enable interrupts for port, set 8N1, alternate pins
+		ld		b, _cexpr(0x10 | SERLINK_INT_LEVEL)
+		jp		.clearisr
+
+.EnF_pportE:
+		; set up parallel port E alternate output register for serial port E or F
+		ld		a, (iy+[_pss]+iobase)	; Get port number (SADR, SBDR etc.)
+		cp		SEDR
+		jr		nz, .pe_txf_setup
+
+.pe_txe_setup:
+		ipset	3
+		ld		a, (PEAHRShadow)
+		or		0x30
+		ld		(PEAHRShadow), a
+		ipres
+ioi	ld		(PEAHR), a
+		jr		.use_parallel_port_e
+
+.pe_txf_setup:
+		ipset	3
+		ld		a, (PEALRShadow)
+		or		0x30
+		ld		(PEALRShadow), a
+		ipres
+ioi	ld		(PEALR), a
+.use_parallel_port_e:
+		ipset	3
+		ld		a, (PEDRShadow)
+		or		b
+		ld		(PEDRShadow), a
+		ipres
+ioi	ld		(PEDR), a					; Set serial Tx line to idle level
+		ipset	3
+		ld		a, (PEFRShadow)
+		or		b
+		ld		(PEFRShadow), a
+		ipres
+ioi	ld		(PEFR), a					; Select parallel port E pin a serial output
+		ipset	3
+		ld		a, (PEDDRShadow)
+		or		b
+		ld		(PEDDRShadow), a
+		ipres
+ioi	ld		(PEDDR), a					; Ensure parallel port E pin is an output
+		ld		a, b
+		cpl
+		ld		b, a
+		ipset	3
+		ld		a, (PEDCRShadow)
+		and	b
+		ld		(PEDCRShadow), a
+		ipres
+ioi	ld		(PEDCR), a					; Set serial Tx line to normal push/pull
+		; enable interrupts for port, set 8N1, alternate pins
+		ld		b, _cexpr(0x20 | SERLINK_INT_LEVEL)
+.clearisr:
+		; If in DMA mode, clear the interrupt enable bits
+		ld		a, (iy+[_pss]+rxdmamask+0)
+#if CPU_ID_MASK(_CPU_ID_) >= R6000
+		or		(iy+[_pss]+rxdmamask+1)
+#else
+		or		a
+#endif
+		jr		z, .cont
+
+		ld		a, b
+		and	0xFC
+		ld		b, a
+.cont:
+ioi	ld		a, (de)						; Read and discard any pending Rx characters
+ioi	ld		a, (de)						;  (done four times because at least some of
+ioi	ld		a, (de)						;  the Rabbit 3000+ CPU's serial ports have
+ioi	ld		a, (de)						;  a four byte FIFO).
+ioi	ld		(hl), b
+		lret
+#endasm
+
+/*** BeginHeader PPPSerialAISR, PPPSerialBISR, PPPSerialCISR, PPPSerialDISR,
+                 PPPSerialEISR, PPPSerialFISR */
+__root void PPPSerialAISR();
+__root void PPPSerialBISR();
+__root void PPPSerialCISR();
+__root void PPPSerialDISR();
+__root void PPPSerialEISR();
+__root void PPPSerialFISR();
+
+__root void PPPDMAIsrRxA();
+__root void PPPDMAIsrRxB();
+__root void PPPDMAIsrRxC();
+__root void PPPDMAIsrRxD();
+__root void PPPDMAIsrRxE();
+__root void PPPDMAIsrRxF();
+__root void PPPDMAIsrTxA();
+__root void PPPDMAIsrTxB();
+__root void PPPDMAIsrTxC();
+__root void PPPDMAIsrTxD();
+__root void PPPDMAIsrTxE();
+__root void PPPDMAIsrTxF();
+
+// ISR state points
+__root void _txi_norm(void);
+__root void _txi_noflowctl(void);
+// Transmitter control points
+__root void _tx_restart(void);
+
+#if defined MCOS
+   #define _PPPCOMMONISRENTRY \
+      ex af, af' $ push af $ ld a,(OSLockNesting) $ inc a $ jr z,@pc+5 $ \
+      ld (OSLockNesting),a $ ex af, af' $ push bcde $ push jkhl $ \
+      ld hl, lxpc $ push hl $ exx $ push bcde $ push jkhl $ push pw $ \
+      push px $ push py $ push pz $ exp $ push pw $ push px $ push py $ push pz
+
+   #define _PPPCOMMONISREXIT \
+      pop pz $ pop py $ pop px $ pop pw $ exp $ pop pz $ pop py $ pop px $ \
+      pop pw $ pop jkhl $ pop bcde $ exx $ pop hl $ ld lxpc, hl $ pop jkhl $ \
+      pop bcde $ ex af, af' $ ld a,(OSLockNesting) $ or a $ jr z,@pc+6 $ \
+      dec a $ ld (OSLockNesting),a $ pop af $ ex af, af'
+#else
+   #define _PPPCOMMONISRENTRY \
+      ex af, af' $ push af $ ex af, af' $ push bcde $ push jkhl $ \
+      ld hl, lxpc $ push hl $ exx $ push bcde $ push jkhl $ push pw $ \
+      push px $ push py $ push pz $ exp $ push pw $ push px $ push py $ push pz
+
+   #define _PPPCOMMONISREXIT \
+      pop pz $ pop py $ pop px $ pop pw $ exp $ pop pz $ pop py $ pop px $ \
+      pop pw $ pop jkhl $ pop bcde $ exx $ pop hl $ ld lxpc, hl $ pop jkhl $ \
+      pop bcde $ ex af, af' $ pop af $ ex af, af'
+#endif
+
+#define _PPPCOMMONISREXIT2 \
+   pop ix $ pop iy $ pop af
+
+#define _PPPDMAISRENTRYRX(p) \
+   push af $ push iy $ push ix $ ld ix,(_pss_##p) $ jp .dmacommonRx
+
+#define _PPPDMAISRENTRYTX(p) \
+   push af $ push iy $ push ix $ ld ix,(_pss_##p) $ jp .dmacommonTx
+
+#define _PPPRESTARTISRENTRY \
+   push af $ push iy $ push ix
+
+#define _PPPSERISRENTRY(p) \
+   push af $ push iy $ push ix $ ioi ld a, (S##p##SR) $ ld iy, S##p##DR $ \
+   ld ix, (_pss_##p) $ jp .isrcommon
+/*** EndHeader */
+
+/*
+   On the Rabbit 4000+ there is the option of using DMA instead of direct serial
+   port access.
+   In this case, the transmit side is handled as follows:
+     - In raw mode:
+        The transmit DMA pulls data directly out of the network buffer, using up
+        to 3 linked descriptors.  Very simple and the ultimate efficiency.
+     - In AHDLC mode:
+        The transmit staging buffer is divided into two halves, 128 bytes each.
+        Frame data is escaped and copied to one half of the buffer and the DMA
+        for that half started.  If more frame data is available, it is prestaged
+        into the other half.  The Tx DMA interrupt basically signals that one
+        half of the staging buffer is now free.
+   The receive side is handled thus:
+     - In raw or AHDLC mode:
+        An endless loop of two receive descriptors is set up.  Thus there is a
+        DMA interrupt every 128 bytes incoming (however it can also be polled).
+        When new data is available, it is passed through the move2app state
+        machine as per the direct serial implementation.
+*/
+
+#asm __root __nodebug
+#if USE_PPPLINK & 0x01
+PPPDMAIsrRxA::
+	_PPPDMAISRENTRYRX(A)
+PPPDMAIsrTxA::
+	_PPPDMAISRENTRYTX(A)
+#else
+PPPDMAIsrRxA::
+PPPDMAIsrTxA::
+	ipres
+	ret
+#endif
+#if USE_PPPLINK & 0x02
+PPPDMAIsrRxB::
+	_PPPDMAISRENTRYRX(B)
+PPPDMAIsrTxB::
+	_PPPDMAISRENTRYTX(B)
+#else
+PPPDMAIsrRxB::
+PPPDMAIsrTxB::
+	ipres
+	ret
+#endif
+#if USE_PPPLINK & 0x04
+PPPDMAIsrRxC::
+	_PPPDMAISRENTRYRX(C)
+PPPDMAIsrTxC::
+	_PPPDMAISRENTRYTX(C)
+#else
+PPPDMAIsrRxC::
+PPPDMAIsrTxC::
+	ipres
+	ret
+#endif
+#if USE_PPPLINK & 0x08
+PPPDMAIsrRxD::
+	_PPPDMAISRENTRYRX(D)
+PPPDMAIsrTxD::
+	_PPPDMAISRENTRYTX(D)
+#else
+PPPDMAIsrRxD::
+PPPDMAIsrTxD::
+	ipres
+	ret
+#endif
+#if USE_PPPLINK & 0x10
+PPPDMAIsrRxE::
+	_PPPDMAISRENTRYRX(E)
+PPPDMAIsrTxE::
+	_PPPDMAISRENTRYTX(E)
+#else
+PPPDMAIsrRxE::
+PPPDMAIsrTxE::
+	ipres
+	ret
+#endif
+#if USE_PPPLINK & 0x20
+PPPDMAIsrRxF::
+	_PPPDMAISRENTRYRX(F)
+PPPDMAIsrTxF::
+	_PPPDMAISRENTRYTX(F)
+#else
+PPPDMAIsrRxF::
+PPPDMAIsrTxF::
+	ipres
+	ret
+#endif
+
+.dmacommonRx:
+	; Restore automatically updated (by Rabbit 6000 and 5000 CPUs) frameStatus
+	;  items, which this ISR otherwise ignores.
+	push	ix								; copy this serial port's _pss_X address
+	pop	iy								; IY = &_pss_X
+	push	de								; temporarily preserve DE content
+	ld		de, [_pss]+rxbd1			; DE = offset to _pss_X.rxbd1
+	add	iy, de						; IY = &_pss_X.rxbd1
+	ld		(iy+[DMABufDesc12]+frameStatus), 0x10
+	ld		de, [_pss]+rxbd2-[_pss]+rxbd1	; DE = difference between rxbd2, rxbd1
+	add	iy, de						; IY = &_pss_X.rxbd2
+	ld		(iy+[DMABufDesc]+frameStatus), 0x10
+	ld		de, [_pss]+rxbd3-[_pss]+rxbd2	; DE = difference between rxbd3, rxbd2
+	add	iy, de						; IY = &_pss_X.rxbd3
+	ld		(iy+[DMABufDesc]+frameStatus), 0x10
+	pop	de								; recover DE content
+	; Test if currently pushing to app. If so, then don't do anything more.
+	ld		a, (ix+[_pss]+receiving)
+	or		a
+	jp		z, .isr_exit_2
+
+	_PPPCOMMONISRENTRY
+	; Poll the DMA
+	lcall	ppplink_pollDMA
+	push	hl
+	ld		hl, lxpc
+	ex		jk, hl
+	ld		hl, (ix+[_pss]+rxbuf+2)
+	ld		lxpc, hl
+	pop	hl
+	jp		.push_app
+
+.dmacommonTx:
+	_PPPCOMMONISRENTRY
+	; Restore automatically updated (by Rabbit 6000 and 5000 CPUs) frameStatus
+	;  items, which this ISR otherwise ignores.
+	push	ix								; copy this serial port's _pss_X address
+	pop	iy								; IY = &_pss_X
+	ld		de, [_pss]+txbd1			; DE = offset to _pss_X.txbd1
+	add	iy, de						; IY = &_pss_X.txbd1
+	ld		(iy+[DMABufDesc12]+frameStatus), 0x10
+	ld		de, [_pss]+txbd2-[_pss]+txbd1	; DE = difference between txbd2, txbd1
+	add	iy, de						; IY = &_pss_X.txbd2
+	ld		(iy+[DMABufDesc]+frameStatus), 0x10
+	ld		de, [_pss]+txbd3-[_pss]+txbd2	; DE = difference between txbd3, txbd2
+	add	iy, de						; IY = &_pss_X.txbd3
+	ld		(iy+[DMABufDesc]+frameStatus), 0x10
+	ld		a, (ix+[_pss]+txin)
+	ld		(ix+[_pss]+txbuf), a		; Assume transmitted all (make out=in)
+	jp		.isr_dotxstate
+
+#if USE_PPPLINK & 0x01
+PPPSerialAISR::
+	_PPPSERISRENTRY(A)
+#else
+PPPSerialAISR::
+	ipres
+	ret
+#endif
+#if USE_PPPLINK & 0x02
+PPPSerialBISR::
+	_PPPSERISRENTRY(B)
+#else
+PPPSerialBISR::
+	ipres
+	ret
+#endif
+#if USE_PPPLINK & 0x04
+PPPSerialCISR::
+	_PPPSERISRENTRY(C)
+#else
+PPPSerialCISR::
+	ipres
+	ret
+#endif
+#if USE_PPPLINK & 0x08
+PPPSerialDISR::
+	_PPPSERISRENTRY(D)
+#else
+PPPSerialDISR::
+	ipres
+	ret
+#endif
+#if USE_PPPLINK & 0x10
+PPPSerialEISR::
+	_PPPSERISRENTRY(E)
+#else
+PPPSerialEISR::
+	ipres
+	ret
+#endif
+#if USE_PPPLINK & 0x20
+PPPSerialFISR::
+	_PPPSERISRENTRY(F)
+#else
+PPPSerialFISR::
+	ipres
+	ret
+#endif
+
+; Entry point for restarting or starting new frame.
+;   IX addresses state struct.
+;
+_tx_restart::
+	ipset	SERLINK_INT_LEVEL
+	_PPPRESTARTISRENTRY
+	_PPPCOMMONISRENTRY
+	ld		hl, (ix+[_pss]+iobase)
+	ld		iy, hl
+	; If not currently sending, and the next frame is not 'raw', then write a
+	; frame start char (0x7E).
+	ld		a, (ix+[_pss]+sending)
+	ld		(ix+[_pss]+sending), 1	; Set sending to 1 anyway
+	or		a
+	jr		nz, .txrestart
+
+	; Was not sending
+	ld		a, (ix+[_pss]+txctl)
+	rla
+	jr		c, .txrestart
+
+	; Next frame is not raw: do frame delimiter
+	ld		a, (ix+[_pss]+txdmamask+0)
+#if CPU_ID_MASK(_CPU_ID_) >= R6000
+	or		(ix+[_pss]+txdmamask+1)
+#else
+	or		a
+#endif
+	jr		z, .notDMA1
+
+	ld		(ix+[_pss]+sendfd), 1	; Mark to insert frame delimiter
+	jr		.isr_dotxstate
+
+.notDMA1:
+	ioi	ld	(iy), 0x7E
+	jr		.txrestart		; Also clear any pending Tx interrupts, since we are
+								; processing below
+
+.isrcommon:
+	_PPPCOMMONISRENTRY
+	ld		c, a
+	rla
+	jp		c, .isr_rx		; Jump if receive interrupt
+
+.isr_tx:
+.txrestart:
+#ifdef PPPLINK_DEBUG
+	ld		hl, (ix+[_pss]+txisrcount)
+	inc	hl
+	ld		(ix+[_pss]+txisrcount), hl
+#endif
+	ld		a, (ix+[_pss]+txdmamask+0)
+#if CPU_ID_MASK(_CPU_ID_) >= R6000
+	or		(ix+[_pss]+txdmamask+1)
+#else
+	or		a
+#endif
+	jr		nz, .isr_dotxstate
+
+	ioi	ld	(iy+3), a			; SxSR : clear interrupt
+	; Switch depending on previous state (_txi_norm; _txi_stalled; txi_noflowctl)
+.isr_dotxstate:
+   ld		hl,(ix+[_pss]+txistate)
+   jp		(hl)
+
+_txi_norm::
+   ld		hl,(ix+[_pss]+txin)	; Get txin (L) and LSB of txbuf [i.e. txout] (H)
+   ld		a,L
+   sub	h
+   jr		nz,.checkflow
+   ld		a,(ix+[_pss]+sending)
+   or		a
+   jp		z,.isr_exit				; Already running the 'get next chunk' process
+   push	ip
+   ipres								; Re-enable interrupts
+   ld		(ix+[_pss]+sending),0	; Do this while still 'privileged'
+   push	bc							; Save C (interrupt request bits)
+   ; The buffer is empty, so we set txin and txout to zero so that the move2tx routine does not
+   ; have to handle wrap-around.
+   clr	hl
+   ld		(ix+[_pss]+txin),hl
+
+   lcall	ppplink_move2tx		; Move next chunk to transfer buffer
+   pop	bc
+   pop	ip
+   _jr		z,.isr_exit
+.checkflow:
+	; See if sender de-asserting CTS
+#ifdef PPPLINK_DEBUG_CTS
+	; In debug mode, fake it for 1/4 ISR count
+	ld		a,(ix+[_pss]+txisrcount)
+   and	0xC0
+   cp		0xC0
+   jr		z,.ctsrevoke
+#endif
+   ld		hl,(ix+[_pss]+ctsport)		; CTS parallel port (HL) and pin (A)
+   ld		a,(ix+[_pss]+ctspin)
+   ioi	and	(hl)
+   jr		z,.noflowctl					; Jump if CTS asserted (inverted logic)
+.ctsrevoke:
+   ; CTS revoked: start idle state when transmitter drained
+   ld		(ix+[_pss]+stalled),1
+   ld		hl,_txi_stalled
+	ld		(ix+[_pss]+txistate),hl		; State for checking CTS
+   jp		.isr_exit
+
+_txi_stalled::
+	; Check for asserted CTS
+#ifdef PPPLINK_DEBUG_CTS
+	; In debug mode, fake it until 0xFF ISR count
+	ld		a,(ix+[_pss]+txisrcount)
+   cp		0xFF
+#else
+   ld		hl,(ix+[_pss]+ctsport)		; CTS parallel port (HL) and pin (A)
+   ld		a,(ix+[_pss]+ctspin)
+   ioi	and	(hl)
+#endif
+   jp		nz,.isr_exit						; Jump if CTS still not asserted (inverted logic)
+   ; Otherwise, we are all set to go again
+   ld		(ix+[_pss]+stalled),0
+   ld		hl,_txi_norm
+	ld		(ix+[_pss]+txistate),hl		; Normal state
+   jr		.noflowctl
+
+_txi_noflowctl::
+	; This code is identical to the above (from _txi_norm) except that the flow control check is bypassed
+   ld		hl,(ix+[_pss]+txin)	; Get txin (L) and LSB of txbuf [i.e. txout] (H)
+   ld		a,L
+   sub	h
+   jr		nz,.noflowctl
+   ld		a,(ix+[_pss]+sending)
+   or		a
+   jp		z,.isr_exit				; Already running the 'get next chunk' process
+                              ; jr is not always in range depending on compile mode.
+   push	ip
+   ipres								; Re-enable interrupts
+   ld		(ix+[_pss]+sending),0	; Do this while still 'privileged'
+   clr	hl
+   ld		(ix+[_pss]+txin),hl
+   lcall	ppplink_move2tx		; Move next chunk to transfer buffer.  If there is any more data,
+   									; NZ flag will be set so then we try sending.  Otherwise, we return.
+                              ; In the latter case, the application needs to call this ISR explicitly
+                              ; to get things moving again when there is another packet.
+   pop	ip
+   jr		z,.isr_exit
+
+.noflowctl:
+	; Get here when OK to transmit next char
+	push	hl
+	ld		hl, lxpc
+	ex		jk, hl
+	ld		hl, (ix+[_pss]+txbuf+2)		; Get XPC for transfer buffer segment
+	ld		lxpc, hl
+	pop	hl
+
+	; If DMA mode, construct a DMA descriptor and fire off.
+	ld		a, (ix+[_pss]+txdmamask+0)
+#if CPU_ID_MASK(_CPU_ID_) >= R6000
+	or		(ix+[_pss]+txdmamask+1)
+#else
+	or		a
+#endif
+	jr		z, .isr_notDMAtx
+
+	push	bcde
+	push	px
+	ld		de, [_pss]+txbd2		; DE = offset to _pss_X.txbd2
+	ld		hl, ix					; HL = &_pss_X
+	add	hl, de					; HL = &_pss_X.txbd2(.frameStatus)
+	ldl	px, hl					; PX = 0xFFFF0000 + &_pss_X.txbd2(.frameStatus)
+	ld		(hl), 0x10				; _pss_X.txbd2.frameStatus = set default DxSCR
+	inc	hl							; HL = &_pss_X.txbd2.chanControl
+	ld		(hl), 0x9C				; _pss_X.txbd2.chanControl = final descriptor
+	ld		hl, (ix+[_pss]+txin)
+	ld		h, 0
+	ld		(px+[DMABufDesc12]+bufLength), hl
+	ld		bcde, (px+[_pss]+txbufp-([_pss]+txbd2))
+	ld		(px+[DMABufDesc12]+srcAddress), bcde
+	; Check if need to send start frame delimiter first
+	ld		a, (ix+[_pss]+sendfd)
+	or		a
+	jr		z, .nosfd
+
+	xor	a
+	ld		(ix+[_pss]+sendfd), a
+	ld		px, px-12				; PX  = 0xFFFF0000 + &_pss_X.txbd1(.frameStatus)
+	ld		a, 0x10
+	ld		(px+[DMABufDesc12]+frameStatus), a	; set default DxSCR
+.nosfd:
+	convd	px							; PX = far &_pss_X.txbd1(.frameStatus)
+	ld		bcde, px					; BCDE = far &_pss_X.txbd1(.frameStatus)
+	ld		hl, D0IA0R
+	ld		a, (ix+[_pss]+txdmachan)
+#if CPU_ID_MASK(_CPU_ID_) >= R6000
+	cp		0x08
+	jr		c, .isr_notD8IA0R
+
+	ld		hl, D8IA0R
+.isr_notD8IA0R:
+#endif
+	; calculate channel offset from base DxIA0R address
+	rlca
+	rlca
+	rlca
+	rlca
+	; add channel offset to base DxIA0R address
+	add	a, L
+	ld		L, a
+	ioi	ld (hl), e				; DxIA0R = buffer descriptor address bits 7:0
+	inc	hl
+	ioi	ld (hl), d				; DxIA1R = buffer descriptor address bits 15:8
+	inc	hl
+	ioi	ld (hl), c				; DxIA2R = buffer descriptor address bits 23:16
+#if CPU_ID_MASK(_CPU_ID_) >= R6000
+	ld		hl, (ix+[_pss]+txdmamask)
+	ioi	ld (DMALLR), hl
+#else
+	ld		a, (ix+[_pss]+txdmamask)
+	ioi	ld (DMALR), a
+#endif
+	pop	px
+	pop	bcde
+	jr		.isr_DMArestxpc
+
+.isr_notDMAtx:
+	ld		hl,(ix+[_pss]+txbuf)			; Get buffer 'out' address (0xE???)
+	ld		a,(hl)
+   ioi	ld	(iy),a
+   inc	L
+   ld		(ix+[_pss]+txbuf),L			; Inc just the LSB.  This works because buffers are aligned on 256-byte bdry
+.isr_DMArestxpc:
+	ex		jk, hl
+	ld		lxpc, hl
+	ex		jk, hl
+
+.isr_exit:
+	_PPPCOMMONISREXIT
+.isr_exit_2:
+	_PPPCOMMONISREXIT2
+	ipres
+	ret
+
+.isr_rx:
+#ifdef PPPLINK_DEBUG
+	ld		hl,(ix+[_pss]+rxisrcount)
+	inc	hl
+	ld		(ix+[_pss]+rxisrcount),hl
+#endif
+	bit	6,c					; check for break or framing error
+   jr		z,.isr_testovf
+
+   ioi	ld a,(iy)			; discard dummy char
+   jr		.isr_exit
+
+.isr_testovf:
+	bit	5,c					; check overrrun
+	jr		z,.isr_rxcont
+
+	inc	(ix+[_pss]+rxoverrun)
+.isr_rxcont:
+	push	hl
+	ld		hl, lxpc
+	ex		jk, hl
+	ld		hl, (ix+[_pss]+rxbuf+2)
+	ld		lxpc, hl
+	pop	hl
+   ld		a,(ix+[_pss]+rxin)
+   ld		hl,(ix+[_pss]+rxbuf)
+   ld		c,L			; C is rxout
+   ld		l,a			; (H)L is rxin
+ioi ld	a,(iy)		; SxDR : read byte
+   nop					; Work around processor bug in original R2000 (1Q2T)
+   ld		(hl),a		; Store the Rx'd char
+   inc	L
+   ld		a,L
+   sub	c
+   jr		z,.rxrestxpc	; Skip following if buffer overflow.
+
+   ld		(ix+[_pss]+rxin),L
+   ; When we cross a 128-byte threshold (i.e. L == 0b?0000000) then push data to the app.  The app also
+   ; extracts data by polling.
+   ld		a,0x7F
+   and	L
+   jr		nz,.rxrestxpc
+
+.push_app:
+   ; Make sure not already processing
+   ld		a,(ix+[_pss]+receiving)
+   or		a
+   jr		z,.rxrestxpc		; Don't re-enter
+
+   push	ip
+   ipres
+   ld		(ix+[_pss]+receiving),0
+   push	bc
+   call	ppplink_move2app
+   pop	bc
+   ld		(ix+[_pss]+receiving),1
+   pop	ip
+
+.rxrestxpc:
+	ex		jk, hl
+	ld		lxpc, hl
+	ex		jk, hl
+   _jr		.isr_exit
+#endasm
+
+/*** BeginHeader ppplink_move2tx */
+__root __lcall__ void ppplink_move2tx(void);	// asm func.
+// State points
+__root void _txx_init(void);
+/*** EndHeader */
+#define _TXX_CHUNK	255		// Max bytes to buffer on stack (must be <= 255)
+#asm __root __nodebug
+
+; This is called from ISR when it is ready to move more data to the transmit
+; transfer buffer.  It runs with interrupts re-enabled.
+; On entry, IX=state struct.
+; AF,BC,HL,XPC can be used.  Others must be preserved.
+; Returns Z flag if no data could be transferred, else NZ and sets IX->sending.
+; This implements the transmit state machine for AHDLC.  Since this is basically
+; an xmem-xmem move, we use 255 bytes on the stack as a root staging buffer.
+; This is the most that can be transferred to the txbuf in one call; the ISR
+; calls us when the txbuf is empty.  The txin and txout pointers will both be
+; set to zero, so there is a straight run of 255 chars which can be inserted.
+; NB: this must be lcalled.
+ppplink_move2tx::
+	ld		hl, (ix+[_pss]+txxcrc)	; get running CRC
+	push	de
+	exx
+	push	bcde
+	push	hl							; Save alt regs
+	push	iy								; We need to preserve this too
+
+   ld		hl,-_TXX_CHUNK
+   add	hl,sp
+   ld		sp,hl
+   ex		de,hl	; DE is now dest for expanding HDLC escapes
+   ld		b,_TXX_CHUNK-1	; Remaining dest count: subtract 1 to account for possible expansion of last char
+
+   ld		hl,(ix+[_pss]+txxstate)	; Resumption address
+   ld		iy,hl
+
+   ld		hl,(ix+[_pss]+txxsrclen)	; Remaining source length
+   ex		de',hl
+
+	ld		hl, (ix+[_pss]+txxsource+2)
+	ld		lxpc, hl
+	ld		hl, (ix+[_pss]+txxsource)	; Source address (segmented)
+
+	; Entry to transmit state machine.  Register conditions are:
+   ;  IY = this state's execution address
+   ;  IX = pointer to _PPPLINKConfig
+   ;  B = remaining space in destination buffer (i.e. transmit transfer buffer, but we have copy on stack)
+   ;  DE = next char address in the transfer buffer
+   ; In states other than _txx_init, we also have valid values for
+   ;  HL' = running CRC  (BC' used as temp work for CRC etc.)
+   ;  xpc/HL = source address
+   ;  DE' = remaining count in source
+   ;  A = next char to put.  Also uses C.
+   jp		(iy)		; Go to appropriate state (one of the _txx_* labels)
+
+.loadbuf1:
+   ld		jkhl,(ix+[_pss]+txxpkt)
+   ld		py,jkhl
+   ld		hl,(py+[_llp_]+len1)
+   ex		de',hl					; Remaining length in source buffer
+   ld		a,(py+[_llp_]+data1+2)
+   ld		hl,(py+[_llp_]+data1)
+.lbret:
+   _LIN2SEG
+	ex		jk, hl
+	ld		(ix+[_pss]+txxsource+2), hl
+	ld		lxpc, hl					; Establish addressability
+	ex		jk, hl
+   ret
+
+.loadbuf2:
+   ld		jkhl,(ix+[_pss]+txxpkt)
+   ld		py,jkhl
+   ld		hl,(py+[_llp_]+len2)
+   ex		de',hl					; Remaining length in source buffer
+   ld		a,(py+[_llp_]+data2+2)
+   ld		hl,(py+[_llp_]+data2)
+   jr		.lbret
+
+.loadbuf3:
+   ld		jkhl,(ix+[_pss]+txxpkt)
+   ld		py,jkhl
+   ld		hl,(py+[_llp_]+len3)
+   ex		de',hl					; Remaining length in source buffer
+   ld		a,(py+[_llp_]+data3+2)
+   ld		hl,(py+[_llp_]+data3)
+   jr		.lbret
+
+#ifndef _NO_PPP
+; This subroutine moves a single byte to the dest buffer (maybe 2 if the char needs to be escaped)
+.move:
+	ex		de',hl		; HL has remaining source length
+   ld		a,h
+   or		L
+   _jr		z,.nomoresrc
+   dec	hl
+   ex		de',hl
+   ld		a,(hl)		; Get the char to move
+   inc	hl
+   ld		c,a
+   exx
+   ; Update the CRC
+	 xor	 L
+	 ld	 b,h
+	 bool	 hl
+	 ld	 L,a
+	 add	 hl,hl			;multiply by 2 since we are looking up int's
+	 							;HL now has ((oldCRC ^ newbyte) & 0xff) * 2
+	 							;this is the table offset
+	 ld	 a,b				;hold onto high byte of old CRC
+	 ld	 px, crc16_reflected_table
+	 ld	 bc, (px + hl)
+	 ld	 hl, bc
+	 xor	 L
+	 ld	 L,a				;XOR high byte of old with low byte of lookup result
+	exx
+.movec:					; Alternative entry point, where C is already set up with char to move, and no CRC.
+							; This is used when we are actually writing the CRC at the end of frame.
+	; Original data is in C
+   ; If it is 7E, 7D or is in escape map (<0x20) then issue 0x7D then (A^0x20)
+   ld		a,c
+   cp		0x7E
+   jr		z,.needsesc
+   cp		0x7D
+   jr		z,.needsesc
+   cp 	0x20
+   jr		c,.mayneedesc
+   ; Doesn't need escaping
+.moveput:
+   ld		(de),a
+   inc	de
+   dec	b
+   scf			; Still processing same source buffer
+   ret			; Z flag if out of source
+.moveputc:
+	ld		a,c
+   ld		(de),a
+   inc	de
+   dec	b
+   scf			; Still processing same source buffer
+   ret			; Z flag if out of source
+.needsesc:
+	ld		a,0x7D
+   ld		(de),a
+   inc	de
+   ld		a,c
+   xor	0x20
+   djnz	.moveput
+   ; adding extra char past 254th.  Need to explicitly set Z flag, since B will return as '-1'.
+   ld		(de),a
+   inc	de
+   dec	b
+   xor	a		; Set Z flag (Cy flag is don't care in this case)
+   ret
+.mayneedesc:
+	; Test char (in A and C, less than 0x20) against async escape map.  Short-cut this test
+   ; if (as is common) no chars <0x20 need to be escaped.
+   ld		a,(ix+[_pss]+txxasymapflag)
+   or		a
+   jr		z,.moveputc			; All zero, just move the char.
+   inc	a
+   jr		z,.needsesc			; asymapflag was 0xFF, hence always escape it
+   ld		a,c					; reload the char
+   exx
+   push	hl						; Have to spill this
+   ld		bc,[_pss]+asymap	; Offset
+   add	a,c
+   ld		c,a					; Then additional offset for char
+	ld		hl,ix
+   add	hl,bc
+   ld		a,(hl)
+   or		a
+   pop	hl
+   exx
+	jr		z,.moveputc
+   jr		.needsesc
+
+#endif // !_NO_PPP
+
+.nomoresrc:
+	; Return from .move/.moveraw.  Zet NZ flag to indicate we still have dest space, but clear C flag to
+   ; indicate caller needs to advance to next source buffer.
+   inc	a		; A was zero, so is now 1 (hence NZ).  NC was already set.
+   ret
+
+// Similar to .move, except does not do any escaping or CRCing.
+.moveraw:
+	ex		de',hl		; HL has remaining source length
+   ld		a,h
+   or		L
+   _jr		z,.nomoresrc
+   dec	hl
+   ex		de',hl
+   ld		a,(hl)		; Get the char to move
+   inc	hl
+   ld		(de),a
+   inc	de
+   dec	b
+   scf			; Still processing same source buffer
+   ret			; Z flag if out of source
+
+#ifndef _NO_PPP
+.havectlpkt:
+   ld		(ix+[_pss]+txxpkt),jkhl	; Move it to 'current' packet, and zero the 'next' packet.
+   ld		jkhl,0
+   ld		(ix+[_pss]+txpktctl),jkhl	; Zero 'next' packet to tell application that it can queue up a new ctl packet
+   bool	hl
+   jr		.contctlpkt					; Z flag is set
+#endif
+
+_txx_init::
+	; In this state, we start a new frame if there is one.  IX->txpkt points to the ll_prefix of the
+   ; next packet to send.
+#ifndef _NO_PPP
+   ld		jkhl,(ix+[_pss]+txpktctl)
+   test	jkhl
+   jr		nz,.havectlpkt
+#endif
+   ld		jkhl,(ix+[_pss]+txpkt)
+   test	jkhl
+   jp		z,.savestate	; Fast exit (with Z flag) if no next packet to transmit
+   ld		(ix+[_pss]+txxpkt),jkhl	; Move it to 'current' packet, and zero the 'next' packet.
+   ld		jkhl,0
+   ld		(ix+[_pss]+txpkt),jkhl	; Zero 'next' packet to tell application that it can queue up a new packet
+
+#ifdef _NO_PPP
+	jp		.rawpkt
+#else
+   ld		a,(ix+[_pss]+txctl)
+   rra						; Set C flag based on LSB (C set if contol packet)
+   bit	6,a				; Set Z flag based on (original) MSB (Z set if normal packet, else raw packet)
+   ld		(ix+[_pss]+txctl),0	; Reset this flag for next packet (defaults to 'normal')
+   ld		a,(ix+[_pss]+asymapflag)
+   jr		nc,.storeamf
+.contctlpkt:
+   ld		a,0xFF			; If ctl packet, force all escapes
+.storeamf:
+	ld		(ix+[_pss]+txxasymapflag),a
+   jp		nz,.rawpkt
+
+	; Set up the first source buffer
+   call	.loadbuf1
+
+   ld		hl',0xFFFF				; Init the CRC
+	ld		iy,_txx_data1			; Set next state
+   ; Note: we do _not_ need to send an initial 0x7E (flag byte) since we are either sending back-to-back
+   ; packets, or the application called _tx_restart which forces out a 0x7E for new frames.
+   ; Even if hardware flow control is used, it is still OK to send 1 byte.
+
+_txx_data1::
+	; In this state we are moving the first ll_prefix buffer.
+   call	.move
+   jp		z,.savestate			; Ran out of dest
+   jr		c,_txx_data1			; Still doing same source buffer
+   ; Else ran out of source, but still have dest space.  Advance to next buffer (and state)
+   call	.loadbuf2
+	ld		iy,_txx_data2
+
+_txx_data2::
+	; In this state we are moving the second ll_prefix buffer.
+   call	.move
+   jp		z,.savestate			; Ran out of dest
+   jr		c,_txx_data2			; Still doing same source buffer
+   ; Else ran out of source, but still have dest space.  Advance to next buffer (and state)
+	call	.loadbuf3
+   ld		iy,_txx_data3
+
+_txx_data3::
+	; In this state we are moving the third ll_prefix buffer.
+   call	.move
+   jp		z,.savestate			; Ran out of dest
+   jr		c,_txx_data3			; Still doing same source buffer
+   ; Else ran out of source, but still have dest space.  Since we have no more source buffers in this
+   ; ll_prefix (frame), we will see if there's another frame queued up.  But first, we need to terminate
+   ; the current frame by sending the CRC.  Note that we are guaranteed to fit the 1st CRC byte,
+   ; but need an extra state for the 2nd.
+   ld		iy,_txx_crc2
+   exx
+   ld		a,L		; CRC goes LSB first
+   exx
+   cpl				; Complement it
+   ld		c,a
+   call	.movec	; Move (without further CRCing!)
+	jp		z,.savestate
+_txx_crc2::
+   exx
+   ld		a,H		; MSB of CRC
+   exx
+   cpl
+   ld		c,a
+   call	.movec	; Move (without further CRCing!)
+   ld		iy,_txx_eof
+	_jr		z,.savestate
+_txx_eof::
+	; In this state, terminate the frame with an 0x7E then free up buffers.
+   ld		a,0x7E
+   ld		(de),a
+   inc	de
+   dec	b
+#endif // _NO_PPP
+
+.freeup:
+	; Free up the ll_prefix, since we are done with it.
+   ld		jkhl,(ix+[_pss]+txxpkt)
+   push	ix
+   ld		py,jkhl		; Needed for _pb_free
+   push	bc
+   push	de
+   lcall	_pb_free
+   pop	de
+   pop	bc
+   pop	ix
+	ld		jkhl,0
+   ld		(ix+[_pss]+txxpkt),jkhl
+   ld		iy,_txx_init
+   inc	b
+   dec	b
+   jp		nz,_txx_init	; If still space in dest, try moving next frame back-to-back.
+   ; Else we're done for now
+
+.savestate:
+   ; Save state for next entry
+   ld		(ix+[_pss]+txxsource),hl
+   ex		de',hl
+   ld		(ix+[_pss]+txxsrclen),hl
+   ld		hl,iy
+   ld		(ix+[_pss]+txxstate),hl
+
+   ; Copy temp buffer (on stack) to real buffer.
+   ld		a,_TXX_CHUNK-1
+   sub	b			; Subtract the remaining length (which could be -1 if one extra char was moved)
+   jr		z,.nodata
+   ld		c,a
+   ld		b,0		; BC = length of data to move [1.._TXX_CHUNK]
+   ld		hl,(ix+[_pss]+txcount)
+   add	hl,bc
+   ld		(ix+[_pss]+txcount),hl	; Update the total transfer count
+	ld		hl, (ix+[_pss]+txbuf+2)
+	ld		lxpc, hl
+	ld		hl, (ix+[_pss]+txbuf)
+   ex		de,hl		; xpc/DE is transfer buffer address - caller ensures this is start of buffer.
+   ld		h,b
+   ld		l,b		; Zero HL without touching flags
+   add	hl,sp		; HL points to start of stack buffer
+	ldir				; Copy the data
+   ld		(ix+[_pss]+txin),e	; Update the 'in' position
+
+.nodata:
+	; Z/NZ flag has been preserved from 'sub c' above (or from direct branch from _txx_init state)
+
+#if _TXX_CHUNK <= 127
+	add	sp, _TXX_CHUNK	; Discard temp buffer
+#elif _TXX_CHUNK <= 254
+	add	sp, 127
+	add	sp, _TXX_CHUNK-127	; Discard temp buffer
+#else
+	add	sp, 127
+	add	sp, 127
+	inc	sp
+#endif
+	pop	iy
+	pop	hl
+	pop	bcde
+	exx
+	pop	de
+	ld		(ix+[_pss]+txxcrc), hl
+	jr		nz, .sending
+	lret
+
+.sending:
+	ld		(ix+[_pss]+sending), 1	; Allow re-entry to this routine if there was data moved.
+	lret
+
+.rawpkt:
+	; Get here if in init state, and next packet is raw.
+   call	.loadbuf1
+   ld		iy,_txx_raw1
+_txx_raw1::
+	; In this state we are moving the first ll_prefix buffer.
+   call	.moveraw
+   jp		z,.savestate			; Ran out of dest
+   jr		c,_txx_raw1				; Still doing same source buffer
+   ; Else ran out of source, but still have dest space.  Advance to next buffer (and state)
+	call	.loadbuf2
+   ld		iy,_txx_raw2
+
+_txx_raw2::
+	; In this state we are moving the second ll_prefix buffer.
+   call	.moveraw
+   jp		z,.savestate			; Ran out of dest
+   jr		c,_txx_raw2				; Still doing same source buffer
+   ; Else ran out of source, but still have dest space.  Advance to next buffer (and state)
+	call	.loadbuf3
+   ld		iy,_txx_raw3
+
+_txx_raw3::
+	; In this state we are moving the third ll_prefix buffer.
+   call	.moveraw
+   jp		z,.savestate			; Ran out of dest
+   jr		c,_txx_raw3			; Still doing same source buffer
+   ; Else ran out of source, but still have dest space.
+   jp		.freeup				; Free this buffer, and try next.
+#endasm
+
+/*** BeginHeader ppplink_move2app */
+__root void ppplink_move2app(void);	// asm func.
+// State points
+#ifndef _NO_PPP
+__root void _rxx_init(void);
+#endif
+__root void _rxx_initraw(void);
+__root void _rx_finish(void);
+/*** EndHeader */
+#asm __root //__debug
+; This is called from ISR when it is ready to move data from the receive transfer buffer to the app.
+; It runs with interrupts re-enabled.
+; On entry, IX=state struct. XPC addresses the transfer buffer.
+; AF,BC,HL,IY,XPC can be used.  Others must be preserved.
+; This implements the receive state machine for AHDLC.  Since this is basically an xmem-xmem move,
+; we use 255 bytes on the stack as a root staging buffer.  Initially, the available transfer buffer
+; contents are copied out, and then the out pointer is set equal to in, which allows the receive ISR
+; to continue.
+ppplink_move2app::
+	ld		hl, (ix+[_pss]+rxxcrc)	; get running CRC
+	push	de
+	exx
+	push	bcde
+	push	hl							; Save alt regs
+
+   ; If in < out, then buffer wraps around so only move part in end of transfer buffer
+   ; Else data is contiguous.
+   ld		hl,(ix+[_pss]+rxin)		; L = in, H = out
+   ld		a,L
+   sub	H								; A = in-out
+   _jr		nc,.contig
+   ; in < out, so move 256-out
+   xor	a
+   sub	h
+.contig:
+	; A is length to process this time.
+   ld		c,a
+   ld		b,0							; now in BC
+   ld		hl,-255
+   add	hl,sp
+   ld		sp,hl
+   ex		de,hl	; DE is now dest for temp root copy
+   ld		hl,(ix+[_pss]+rxbuf)		; Source (xpc addresses it)
+   ldir
+   ld		(ix+[_pss]+rxbuf),L		; update out pointer for next time (this lets rx ISR continue)
+   clr	hl
+   add	hl,sp		; Point to temp buffer again; this is the source
+   ex		de,hl
+   ld		b,a		; Source count
+
+   ld		hl,(ix+[_pss]+rxxstate)	; Resumption state exec address
+   ld		iy,hl
+
+   ld		hl,(ix+[_pss]+rxxdstlen)	; Remaining dest length
+   ex		de',hl
+
+	ld		hl, (ix+[_pss]+rxxdest+2)
+	ld		lxpc, hl						; Establish dest addressability
+	ld		hl, (ix+[_pss]+rxxdest)	; Dest address (segmented)
+	ex		de, hl						; Now DE = dest, HL = source
+
+	; Entry to receive state machine.  Register conditions are:
+   ;  IY = this state's execution address
+   ;  IX = pointer to _PPPLINKConfig
+   ;  B = remaining source chars
+   ;  HL = next char address in source buffer (temp, on stack)
+   ; In states other than _txx_init, we also have valid values for
+   ;  HL' = running CRC  (BC' used as temp work for CRC etc.)
+   ;  xpc/DE = dest address
+   ;  DE' = remaining count in dest
+   ;  A = next char to put.  Also uses C.
+   ; In all states, at least 1 char is available for processing in the temp source buffer.  After the
+   ; last char is processed, the current state is saved and the routine returns.
+   jp		(iy)		; Go to appropriate state (one of the _rxx_* labels)
+
+#ifndef _NO_PPP
+.store:
+	; Subroutine to store char in C to (DE).  Returns Z if no more source (length is initially in B, which is dec'd)
+   ; Returns Cy if no dest buffer space.
+   ex		de',hl
+   ld		a,h
+   or		L
+   jr		nz,.again
+	; Ran out of this buffer, start next
+   ;call	.nextbuf
+   ;ret	c		; Return with Cy set if no more buffers
+   ; We have only single buffers now...
+   scf
+   ret
+.again:
+	; HL = remaining length (non-zero)
+   ; DE' = next source point
+   ; C = char to store
+   ; DE = dest point
+	dec	hl
+   ex		de',hl
+   ld		a,c
+	ld		(de),a
+   inc	de
+   exx
+   ; Update the CRC (in HL')
+	 xor	 L
+	 ld	 b,h
+	 bool	 hl
+	 ld	 L,a
+	 add	 hl,hl			;multiply by 2 since we are looking up int's
+	 							;HL now has ((oldCRC ^ newbyte) & 0xff) * 2
+	 							;this is the table offset
+	 ld	 a,b				;hold onto high byte of old CRC
+	 ld	 px, crc16_reflected_table
+	 ld	 bc, (px + hl)
+	 ld	 hl, bc
+	 xor	 L
+	 ld	 L,a				;XOR high byte of old with low byte of lookup result
+   exx
+   dec	b
+	ret						; Cy flag will be clear (from xor)
+#endif // _NO_PPP
+
+.storeraw:
+	; Subroutine to store char in C to (DE).
+   ; Returns Cy if no dest buffer space.
+   ; Similar to .store, but uses HL' to store last 2 chars instead of a CRC.
+   ; DE' has remaining dest count, which may be 0.  Check this first.
+	exx
+   ld		a,d
+   or		e
+   exx
+   ret	z		; Ran out of this buffer, return Z flag set
+   ld		a,c
+   exx
+   dec	de		; Dec remaining char count
+   ld		h,L
+   ld		l,a	; Shift last chars into HL' (H' is older, L' is most recent)
+   exx
+	; DE' = remaining length (non-zero)
+   ; HL = next source point
+   ; A = char to store
+   ; DE = dest point
+	ld		(de),a
+   inc	de
+	ret			; NZ flag still set from test
+
+.allocbuf:
+	; Allocate new Rx buffer.  If cannot get one, go back to init state to wait for the next frame delimiter.
+   push	bc
+   push	hl
+   push	ix
+   ex		af,af'
+   push	af
+
+.do_resv:
+   lcall	_pb_reserve
+	sbc	a,a
+   ld		e,a		; E will be 0xFF if no buffer
+   pop	af
+   ex		af,af'
+   pop	ix
+   pop	hl
+   pop	bc
+
+   inc	e
+   ret	z			; Return if failed to alloc (with Z flag)
+	; IY has ll_prefix of brand new buffer
+   ex		de,hl					; Preserve source point in DE
+   ld		jkhl,py
+   ld		(ix+[_pss]+rxxpkt),jkhl
+   ; Set up xpc+DE/DE' to be appropriate dest address and length (first buffer)
+   ld		hl,(py+[_llp_]+rlen1)
+   ex		de',hl
+   ld		hl,(py+[_llp_]+seg1)
+   ld		a,(py+[_llp_]+seg1+2)
+	; On the R4k, seg1 was stored as linear address.  Convert to segmented here
+	; FIXME: get rid of this abtruse obsolescence
+	_LIN2SEG
+	ex		jk, hl
+	ld		lxpc, hl
+	ld		(ix+[_pss]+rxxdest+2), hl
+	ex		jk, hl
+   ex		de,hl				; Now DE=dest, HL=source
+	ret	; NZ flag still set from inc e above!
+
+_rx_finish::
+	push	ix
+   push	hl
+   push	bc
+   ld		jkhl,(ix+[_pss]+rxxpkt)
+   ld		py,jkhl
+   ld		jkhl,0
+   ld		(ix+[_pss]+rxxpkt),jkhl	; Zero out pointer (almost done with this ll_prefix)
+   ex		de',hl
+   ld		de,0+MAX_MTU+MAX_OVERHEAD
+   ex		de,hl
+   or		a
+   sbc	hl,de					; HL is used length in buffer
+	ld		b,h
+   ld		c,L				; BC is now total length
+   ld		h,(ix+[_pss]+iface)
+   ld		l,LL_READY|LL_INBAND		; Assume raw packet
+   ld		e,0	; Zero IP header offset (ppp processing determines correct value)
+#ifndef _NO_PPP
+   ld		a,(ix+[_pss]+mode)
+	cp		PPPLINK_HDLC
+   jr		nz,.nothdlc
+   dec	bc
+   dec	bc						; BC is total length, minus 2 'cause we don't want to count the CRC
+   ld		l,LL_READY			; AHDLC (normal) packet
+.nothdlc:
+#endif
+   lcall	_pb_finish
+   pop	bc
+   pop	hl
+   pop	ix
+   ret
+
+#ifndef _NO_PPP
+_rxx_init::
+	; In this state we are waiting for a frame delimiter (0x7E).  When obtained, move to startframe.
+   ld		a,(hl)
+   inc	hl
+   cp		0x7E
+   jr		z,.gotfd1
+   djnz	_rxx_init
+	jp		.savestate
+.gotfd1:
+	ld		iy,_rxx_startframe
+	djnz	_rxx_startframe
+	jp		.savestate
+
+_rxx_startframe::
+	; Remain in this state while receiving 0x7E, else initialize a new packet buffer
+   ; and move to 'store' state.  Note that the non-0x7E char is not consumed in this state -- we fall
+   ; straight through to 'store' which then decides what to do with it (it might be 0x7D).
+   ld		a,(hl)
+   cp		0x7E
+   jr		nz,.gotstart
+   inc	hl
+   djnz	_rxx_startframe
+	jp		.savestate
+.gotstart:
+	call	.allocbuf		; Get a packet buffer
+   jr		nz,.allocOK
+   ; Failed to get rx packet buffer.
+   inc	(ix+[_pss]+rxnobuf)
+   ld		iy,_rxx_init
+   jp		(iy)
+
+.allocOK:
+   ld		hl',0xFFFF		; Init CRC
+	ld		iy,_rxx_store	; Note: HL is still pointing to the start char.
+
+_rxx_store::
+	; If 0x7E, end the frame and move back to startframe.  If 0x7D, move to escape; else store the
+   ; char and remain in this state.
+   ld		a,(hl)
+   inc	hl
+   cp		0x7E
+   jr		z,.endframe
+   cp		0x7D
+   jr		z,.esc
+.do_store:
+	ld		c,a
+   call	.store
+   jr		c,.discard	; Frame too large
+   jp		z,.savestate	; Ran out of source
+   jr		_rxx_store	; Not run out of dest
+.discard:
+   ; If frame too big, discard it and go back to init.
+   inc	(ix+[_pss]+rxoversize)
+	ld		iy,_rxx_init
+#endif // _NO_PPP
+.freeup:
+	push	iy
+	push	ix
+   push	hl
+   push	bc
+   ld		jkhl,(ix+[_pss]+rxxpkt)
+   ld		py,jkhl
+   lcall	_pb_free
+   pop	bc
+   ld		jkhl,0
+   ld		(ix+[_pss]+rxxpkt),jkhl
+   pop	hl
+   pop	ix
+   pop	iy
+   jp		(iy)
+
+#ifndef _NO_PPP
+.esc:
+	ld		iy,_rxx_escape
+	_djnz	_rxx_escape
+   _jr		.savestate
+
+.endframe:
+	; Is the CRC equal to 0xF0B8?
+   exx
+   ld		bc,-0xF0B8
+   add	hl,bc
+   bool	hl
+   exx
+   _jr		nz,.crcerror
+   ; Frame is valid, finalize it.
+   call	_rx_finish
+   ld		iy,_rxx_startframe
+   dec	b
+   jp		nz,_rxx_startframe
+   _jr		.savestate
+
+.crcerror:
+	inc	(ix+[_pss]+rxcrcerr)
+   _jr	.abortframe
+
+_rxx_escape::
+	; If 0x7E, abort the frame and move back to startframe.  Otherwise, XOR the char with 0x20 and
+   ; store it and move to store state.
+   ld		a,(hl)
+   inc	hl
+   cp		0x7E
+   _jr		z,.abortframe
+   xor	0x20
+   ld		iy,_rxx_store
+   jp		.do_store
+.abortframe:
+	ld		iy,_rxx_init
+   jp		.freeup
+#endif // _NO_PPP
+
+_rxx_initraw::
+	; On receipt of any char, allocate a new raw frame and store the char.  move to storeraw.
+   ; In raw mode, HL' is used to store the previous 2 chars processed instead of a CRC.
+	call	.allocbuf		; Get a packet buffer
+   ; If failed to get rx packet buffer (Z) discard any other chars in the buffer and return to the ISR.
+   jr		z,.savestate
+	ld		iy,_rxx_storeraw	; Note: HL is still pointing to the 1st char.
+
+_rxx_storeraw::
+	; Receive all chars, storing them in the raw frame until a max of ETH_MTU bytes are received in this
+   ; frame.  If this happens, mark the frame as ready and in-band, and move to initraw state.
+   ; Frame is also terminated by '\n' character, since this is a common ascii line-end convention
+   ld		c,(hl)
+   inc	hl
+   call	.storeraw
+   jr		z,.finraw		; Received ETH_MTU chars without delimiter
+   ld		a,c
+   cp		'\n'				; Delimiter?
+   jr		z,.finraw		; Yes, this also terminates the frame
+   djnz	_rxx_storeraw	; Not run out of dest
+   jr		.savestate
+.finraw:
+   ; Frame is valid, finalize it.
+   call	_rx_finish
+   ld		iy,_rxx_initraw
+   djnz	_rxx_initraw
+	; else fall through and save state
+.savestate:
+   ; Save state for next entry
+   ex		de,hl
+   ld		(ix+[_pss]+rxxdest),hl
+   ex		de',hl
+   ld		(ix+[_pss]+rxxdstlen),hl
+   ld		hl,iy
+   ld		(ix+[_pss]+rxxstate),hl
+
+	add	sp, 127	; Discard temp buffer
+	add	sp, 127	; Discard temp buffer
+	inc	sp			; Total discarded = 255
+	pop	hl
+	pop	bcde
+	exx
+	pop	de
+	ld		(ix+[_pss]+rxxcrc), hl
+	ret
+#endasm
+
+/*** BeginHeader ppplink_sendctl */
+int ppplink_sendctl(_PPPLINKConfig * nic, char * buf, word len);
+/*** EndHeader */
+
+_ppplink_debug
+int ppplink_sendctl(_PPPLINKConfig * nic, char * buf, word len)
+{
+	auto ll_Gather g;
+
+	if (nic->txpktctl && nic->txpkt)
+		return 1;		// Something already queued up
+   if (!nic->txpktctl)
+	   nic->sendctl = 0x01;	// Indicate control packet priority queue
+   else
+   	nic->txctl = 0x01;	// Else second best is normal queue with control flag
+
+   memset(&g, 0, sizeof(g));
+   g.iface = nic->iface;
+	g.data1 = (char __far *)paddr(buf);
+   g.len1 = len;
+   return ppplink_sendpacket(nic, &g);
+}
+
+/*** BeginHeader ppplink_sendraw */
+int ppplink_sendraw(_PPPLINKConfig * nic, char * buf, word len);
+/*** EndHeader */
+
+_ppplink_debug
+int ppplink_sendraw(_PPPLINKConfig * nic, char * buf, word len)
+{
+	auto ll_Gather g;
+
+	if (nic->txpkt)
+		return 1;		// Something already queued up
+   nic->txctl = 0x80;	// Indicate raw packet
+
+   memset(&g, 0, sizeof(g));
+   g.iface = nic->iface;
+	g.data1 = (char __far *)paddr(buf);
+   g.len1 = len;
+   return ppplink_sendpacket(nic, &g);
+}
+
+/*** BeginHeader ppplink_sendpacket */
+int ppplink_sendpacket(_PPPLINKConfig * nic, ll_Gather * g);
+/*** EndHeader */
+
+_ppplink_debug
+int ppplink_sendpacket(_PPPLINKConfig * nic, ll_Gather * g)
+{
+	// Queue packet in g for transmit.  The default is to send 'normal' packets e.g. IP.  Otherwise,
+   // the caller should set nic->txctl to 0x80 to send a raw frame, or 0x01 to send a control frame.
+   // The only thing special about 'control' frames is that all chars < 0x20 are escaped.  'raw'
+   // frames do no escaping or framing.
+	// First, need to add PPP headers
+	auto pppserial_ll_hdr __far * e;
+	auto ll_prefix __far * buf;
+   auto word totlen;
+   auto PPPState * ppp;
+   auto ll_prefix __far ** llpp;
+#ifdef PPPLINK_VERBOSE
+	auto word i;
+   auto ll_prefix __far * p;
+#endif
+
+	if (nic->sendctl) {
+	   if (nic->txpktctl)
+	      return 1;      // Something already queued up
+      llpp = &nic->txpktctl;
+      nic->sendctl = 0;
+   }
+   else {
+	   if (nic->txpkt)
+	      return 1;      // Something already queued up
+      llpp = &nic->txpkt;
+
+	   if (!nic->txctl) {
+	      // Not a raw or control frame i.e. do the IP framing
+	      // Fill in the address/protocol fields
+	      e = (pppserial_ll_hdr __far *)g->data1;
+
+	      // Serial PPP can compress address and/or protocol...
+	      e->protocol = 0x2100;
+
+	      ppp = nic->ppp;
+	      if (ppp->lcp.local_options.protocol_comp) {
+	         e = (pppserial_ll_hdr __far *)((char __far *)e + 1);
+	         ++g->data1;
+	         --g->len1;
+	      }
+
+	      if (ppp->lcp.local_options.address_comp) {
+	         g->data1 += 2;
+	         g->len1 -= 2;
+	      }
+	      else
+	         e->addctl = 0x03FF;  // 0xFF03 in network order
+	   }
+   }
+
+	totlen = g->len1 + g->len2 + g->len3;
+#ifdef PPPLINK_VERBOSE
+	printf("SERLINK: sendpacket totlen=%u i/f %u\n", totlen, nic->iface);
+#endif
+	if (!totlen)
+		return -1;	// Cannot transmit that zero length packet!
+	#asm _ppplink_debug
+	ld		hl,(sp+@sp+g)	; Point to ll_Gather struct
+   push	ix
+	lcall	_pb_resv_send
+   pop	ix
+   jr		nc,.ok
+   ld		py,0
+.ok:
+	ld		(sp+@sp+buf),py
+	#endasm
+	if (!buf) {
+#ifdef PPPLINK_VERBOSE
+		printf("SERLINK: sendpacket no buffer avail\n");
+      if (debug_on > 3) {
+	      printf("  txpkt=%06lX txxpkt=%06lX rxxpkt=%06lX\n", nic->txpkt, nic->txxpkt, nic->rxxpkt);
+	      for (i = 0, p = (ll_prefix __far *)pxfirst(&_pbuf_pool);
+	           i < ETH_MAXBUFS+1 && p;
+	           ++i, p = (ll_prefix __far *)pxnext(&_pbuf_pool, (long) p))
+	         printf("  p=%06lX p->ll_flags=%02X p->len=%u\n", p, p->ll_flags, p->len);
+      }
+#endif
+		return 1;	// Could not get a buffer
+   }
+#ifdef PPPLINK_VERBOSE
+	else if (debug_on > 3) {
+		printf("SERLINK: sendpacket using %08X\n", buf);
+   }
+#endif
+
+#ifdef PPPLINK_VERBOSE
+   if (debug_on > 5)
+   	_pkt_dump(buf);
+#endif
+
+   *llpp = buf;
+
+   if (!nic->sending) {
+#ifdef PPPLINK_VERBOSE
+	   if (debug_on > 2)
+	      printf("SERLINK: transmitter was idle\n");
+#endif
+      #asm _ppplink_debug
+      push	ix
+      ld		ix,(sp+@sp+nic+2)
+      call	_tx_restart
+      pop	ix
+      #endasm
+   }
+#ifdef PPPLINK_VERBOSE
+	else
+	   if (debug_on > 2)
+	      printf("SERLINK: transmitter was already running\n");
+#endif
+
+   return 0;
+
+}
+
+/*** BeginHeader vspd_sendpacket */
+int vspd_sendpacket(_PPPLINKConfig * nic, ll_Gather * g);
+/*** EndHeader */
+
+_ppplink_debug
+int vspd_sendpacket(_PPPLINKConfig * nic, ll_Gather * g)
+{
+	// Queue packet in g for transmit.
+	auto ll_prefix __far * buf;
+   auto word totlen;
+   auto ll_prefix __far ** llpp;
+#ifdef PPPLINK_VERBOSE
+	auto word i;
+   auto ll_prefix __far * p;
+#endif
+
+   if (nic->txpkt)
+      return 1;      // Something already queued up
+   nic->txctl = 0x80;	// Indicate raw packet
+   llpp = &nic->txpkt;
+
+
+	totlen = g->len1 + g->len2 + g->len3;
+#ifdef PPPLINK_VERBOSE
+	printf("SERLINK: sendpacket totlen=%u i/f %u\n", totlen, nic->iface);
+#endif
+	if (!totlen)
+		return -1;	// Cannot transmit that zero length packet!
+	#asm _ppplink_debug
+	ld		hl,(sp+@sp+g)	; Point to ll_Gather struct
+   push	ix
+	lcall	_pb_resv_send
+   pop	ix
+   jr		nc,.ok
+   ld		py,0
+.ok:
+	ld		(sp+@sp+buf),py
+	#endasm
+	if (!buf) {
+#ifdef PPPLINK_VERBOSE
+		printf("SERLINK: (VSPD) sendpacket no buffer avail\n");
+      if (debug_on > 3) {
+	      printf("  txpkt=%06lX txxpkt=%06lX rxxpkt=%06lX\n", nic->txpkt, nic->txxpkt, nic->rxxpkt);
+	      for (i = 0, p = (ll_prefix __far *)pxfirst(&_pbuf_pool);
+	           i < ETH_MAXBUFS+1 && p;
+	           ++i, p = (ll_prefix __far *)pxnext(&_pbuf_pool, p))
+	         printf("  p=%06lX p->ll_flags=%02X p->len=%u\n", p, p->ll_flags, p->len);
+      }
+#endif
+		return 1;	// Could not get a buffer
+   }
+#ifdef PPPLINK_VERBOSE
+	else if (debug_on > 3) {
+		printf("SERLINK: (VSPD) sendpacket using %08X\n", buf);
+   }
+#endif
+
+#ifdef PPPLINK_VERBOSE
+   if (debug_on > 5)
+   	_pkt_dump(buf);
+#endif
+
+   *llpp = buf;
+
+   if (!nic->sending) {
+#ifdef PPPLINK_VERBOSE
+	   if (debug_on > 2)
+	      printf("SERLINK: (VSPD) transmitter was idle\n");
+#endif
+      #asm _ppplink_debug
+      push	ix
+      ld		ix,(sp+@sp+nic+2)
+      call	_tx_restart
+      pop	ix
+      #endasm
+   }
+#ifdef PPPLINK_VERBOSE
+	else
+	   if (debug_on > 2)
+	      printf("SERLINK: (VSPD) transmitter was already running\n");
+#endif
+
+   return 0;
+
+}
+
+/*** BeginHeader ppplink_pollDMA */
+__xmem void ppplink_pollDMA(void);	// ASM only!
+/*** EndHeader */
+
+#asm __xmem
+; Poll DMA for received data.  IX points to _PPPLINKConfig.
+; Trashes A, BC, HL.
+; Updates the 'in' data pointer to reflect how far the DMA has reached.
+ppplink_pollDMA::
+#if CPU_ID_MASK(_CPU_ID_) >= R6000
+	ld		hl, (ix+[_pss]+rxdmamask)
+	test	hl
+	jr		z, .notDMA					; Ignore if not using DMA
+
+	ld		bc, hl						; BC = _DMApoll's channel mask
+#else
+	ld		a, (ix+[_pss]+rxdmamask+0)
+	or		a
+	jr		z, .notDMA					; Ignore if not using DMA
+
+	ld		c, a							; C = _DMApoll's channel mask
+#endif
+	ld		a,(ix+[_pss]+rxdmachan)	; A = _DMAPoll's channel number
+	call	_DMApoll
+	; Returns C = buffer count; HL = remaining in that buffer.
+	; Buffer count is odd if in the first half, even if in the second half.
+	; Each half buffer is 128 bytes.
+	; Thus the offset is ((~C&1)+1)*128-HL
+	; With mod256 arithmetic, this simplifies to ((C&1)<<7)-L
+	ld		a, c
+	and	1		; also clears Cy
+	rrca			; rotate into MSB to perform multiply
+	sub	a, L
+	ld		(ix+[_pss]+rxin), a
+.notDMA:
+	lret
+#endasm
+
+/*** BeginHeader ppplink_receive */
+__root int ppplink_receive(_PPPLINKConfig * nic);
+/*** EndHeader */
+
+_ppplink_debug
+__root int ppplink_receive(_PPPLINKConfig * nic)
+{
+
+	// This is driven from pkt_received roughly every tcp_tick().  We use this polling to flush any
+   // received data out of the transfer buffer (since the ISR initiates this only every 128 chars or so).
+   // Also, in raw receive mode we finish up any partly received raw packets, since these are only
+   // automatically finished after a '\n' is received, or ETH_MTU bytes are received -- the send/expect
+   // processing needs to be able to process data before these natural boundaries are reached (since
+   // a prompt is often given without a LF terminator).
+   // It has to be root because we need to change XPC
+#ifdef PPPLINK_VERBOSE
+	auto char x[2];
+#endif
+
+   #asm _ppplink_debug
+	push	ix
+   ld		ix,(sp+@sp+nic+2)
+   ld		(ix+[_pss]+receiving),0		; lock out ISR from re-entering
+   ; If DMA in use, poll it to update the 'in' pointer.
+	lcall	ppplink_pollDMA
+
+   ld		hl,(ix+[_pss]+rxin)
+#ifdef PPPLINK_VERBOSE
+   ld		(sp+@sp+x+2),hl
+#endif
+   ld		a,h
+   cp		L
+   jr		z,.nodata	; Skip if nothing in buffer
+	ex		jk, hl
+	ld		hl, lxpc
+	push	jkhl
+	ld		hl, (ix+[_pss]+rxbuf+2)
+	ld		lxpc, hl		; Establish addressability to transfer buffer
+	ex		jk, hl
+
+   call	ppplink_move2app
+	pop	jkhl
+	ld		lxpc, hl
+	ex		jk, hl
+
+.nodata:
+	; Now terminate partial raw packets if in that mode
+   ld		a,(ix+[_pss]+mode)
+   cp		PPPLINK_RAW
+   jr		nz,.skip
+   ld		jkhl,(ix+[_pss]+rxxpkt)
+   test	jkhl
+   jr		z,.skip
+   ld		hl,(ix+[_pss]+rxxdstlen)	; Remaining dest length
+   ex		de',hl
+	call	_rx_finish
+   ld		hl,_rxx_initraw
+   ld		(ix+[_pss]+rxxstate),hl
+.skip:
+   ld		(ix+[_pss]+receiving),1
+
+   ; Now restart transmitter if flow control stall
+   ld		a,(ix+[_pss]+stalled)
+   or		a
+   jr		z,.nostall
+   call	_tx_restart		; If CTS is now OK, then will send next char.
+.nostall:
+   pop	ix
+   #endasm
+#ifdef PPPLINK_VERBOSE
+	if (debug_on > 5 && x[0] != x[1])
+	{
+		printf("SERLINK: receive processed %u chars\n", (x[0]-x[1])&255);
+	}
+#endif
+	return 1;
+}
+
+/*** BeginHeader vspd_receive */
+int vspd_receive(_PPPLINKConfig * nic);
+/*** EndHeader */
+
+_ppplink_debug
+int vspd_receive(_PPPLINKConfig * nic)
+{
+
+	// This is similar to ppplink_receive, except is customized for raw-only packets.
+   // In particular, since there are no explicit acknowledgement packets, whenever
+   // data is transferred to the transfer buffer (for write), we use that count as the
+   // number of bytes acknowledged.
+   auto word ack;
+
+   #asm _ppplink_debug
+	push	ix
+   ld		ix,(sp+@sp+nic+2)
+
+   ; Generate pseudo-ACK
+   ; also short lock for read-and-reset of txcount field
+	ipset	SERLINK_INT_LEVEL
+   ld		hl,(ix+[_pss]+txcount)
+   ld		(sp+@sp+ack+2),hl
+   clr	hl
+   ipres
+   ld		(ix+[_pss]+txcount),hl		; still at IP SERLINK_INT_LEVEL for this.
+   pop	ix
+	#endasm
+
+   ppplink_receive(nic);
+
+
+#ifndef DISABLE_TCP
+   if (ack)
+   	tcp_stream_ack(ack, nic->iobase);
+#endif
+	return 1;
+}
+
+/*** BeginHeader ppp_serial_resetinterface */
+int ppp_serial_resetinterface(_PPPLINKConfig * ppplink, word instance, int iface);
+/*** EndHeader */
+
+static const _PPPLINKConfigConst _ppp_serial_config[USING_PPP_SERIAL] =
+{
+#if USE_PPP_SERIAL & 0x01
+	{
+	   &_PPPLINKController        	// ncd
+	  ,IF_PPP0                       // iface
+	  ,SADR                				// I/O base address (serial port data register)
+     ,0x40									// drivebit
+     ,TAT4R									// Timer
+     ,&TAT4RShadow						// Timer shadow
+	}
+#endif
+#if USE_PPP_SERIAL & 0x02
+	{
+	   &_PPPLINKController        	// ncd
+	  ,IF_PPP1                       // iface
+	  ,SBDR                				// I/O base address (serial port data register)
+     ,0x10									// drivebit
+     ,TAT5R									// Timer
+     ,&TAT5RShadow						// Timer shadow
+	}
+#endif
+#if USE_PPP_SERIAL & 0x04
+	{
+	   &_PPPLINKController        	// ncd
+	  ,IF_PPP2                       // iface
+	  ,SCDR                				// I/O base address (serial port data register)
+     ,0x04									// drivebit
+     ,TAT6R									// Timer
+     ,&TAT6RShadow						// Timer shadow
+	}
+#endif
+#if USE_PPP_SERIAL & 0x08
+	{
+	   &_PPPLINKController        	// ncd
+	  ,IF_PPP3                       // iface
+	  ,SDDR                				// I/O base address (serial port data register)
+     ,0x01									// drivebit
+     ,TAT7R									// Timer
+     ,&TAT7RShadow						// Timer shadow
+	}
+#endif
+// Following usable only on R3000
+#if USE_PPP_SERIAL & 0x10
+	{
+	   &_PPPLINKController        	// ncd
+	  ,IF_PPP4                       // iface
+	  ,SEDR                				// I/O base address (serial port data register)
+     ,0x40									// drivebit
+     ,TAT2R									// Timer
+     ,&TAT2RShadow						// Timer shadow
+	}
+#endif
+#if USE_PPP_SERIAL & 0x20
+	{
+	   &_PPPLINKController        	// ncd
+	  ,IF_PPP5                       // iface
+	  ,SFDR                				// I/O base address (serial port data register)
+     ,0x04									// drivebit
+     ,TAT3R									// Timer
+     ,&TAT3RShadow						// Timer shadow
+	}
+#endif
+};
+
+const LCPOptions ppp_default_local_LCP_for_serial = {
+	0x00000000,
+	PPP_MTU,
+	1,
+	1
+};
+
+const LCPOptions ppp_default_remote_LCP_for_serial = {
+	0xFFFFFFFF,
+	PPP_MTU,
+	0,
+	0
+};
+
+__nouseix _ppplink_debug
+int ppp_serial_resetinterface(_PPPLINKConfig * ppplink, word instance, int iface)
+{
+	auto long xsize;
+
+#GLOBAL_INIT { _ppp_serial_tbuf = 0; }
+
+   if (instance >= USING_PPP_SERIAL)
+   	return -6;	// No such instance
+
+   if (!_ppp_serial_tbuf) {
+   	// Allocate transfer buffers.  256 bytes for both tx and rx, for each instance.
+      // Requested to align on 256-byte boundary.
+      xsize = USING_PPP_SERIAL * 512;
+      _ppp_serial_pbuf = _xalloc(&xsize, 8, XALLOC_ANY);
+      #asm
+      ; Convert from linear to segmented form
+      ld		a,(_ppp_serial_pbuf+2)
+      ld		hl,(_ppp_serial_pbuf)
+      _LIN2SEG
+		ld		(_ppp_serial_tbuf), jkhl
+      #endasm
+
+   }
+
+   // Zero out most of it, then copy just the top (non-zero const part).
+   memset(ppplink, 0, sizeof(*ppplink));
+	memcpy(ppplink, _ppp_serial_config + instance, sizeof(_PPPLINKConfigConst));
+
+   // Note: interface numbers are "hard-assigned" for ppplink.  Thus, we perform check only here.
+#ifdef PPPLINK_VERBOSE
+   if (ppplink->iface != iface)
+   	printf("SERLINK: interface number not assigned correctly: is %u, should be %u\n", iface, ppplink->iface);
+#endif
+
+	// Set pointer for ISR
+   switch (ppplink->iobase) {
+   case SADR: _pss_A = ppplink; break;
+   case SBDR: _pss_B = ppplink; break;
+   case SCDR: _pss_C = ppplink; break;
+   case SDDR: _pss_D = ppplink; break;
+   case SEDR: _pss_E = ppplink; break;
+   case SFDR: _pss_F = ppplink; break;
+   }
+
+	/*
+	 * Setup the peripheral IO interface, and fill in the rest of the _PPPLINKConfig struct
+	 */
+	if (ppplink->io_init)
+		ppplink->io_init(ppplink);
+
+   // Set up transfer buffer addresses (segmented and non-segmented form)
+   ppplink->txbuf = _ppp_serial_tbuf + (instance << 9);
+   ppplink->txbufp = _ppp_serial_pbuf + (instance << 9);
+   ppplink->rxbuf = _ppp_serial_tbuf + (instance << 9) + 256;
+   ppplink->rxbufp = _ppp_serial_pbuf + (instance << 9) + 256;
+#ifdef PPPLINK_VERBOSE
+	printf("SERLINK: tx buf = %08LX (%04X:%04X), rx buf = %08LX (%04X:%04X)\n",
+	       ppplink->txbufp, (unsigned) ((ppplink->txbuf >> 16L) & 0xFFFFL),
+	       (unsigned) (ppplink->txbuf & 0xFFFFL),
+	       ppplink->rxbufp, (unsigned) ((ppplink->rxbuf >> 16L) & 0xFFFFL),
+	       (unsigned) (ppplink->rxbuf & 0xFFFFL));
+#endif
+
+   // Use an appropriate PPP state
+   ppplink->ppp = _ppp_states + instance;
+   // Also required that we store the PPP state in the interface table
+   _if_tab[iface].u.ppp.ppp_state = ppplink->ppp;
+   PPPinitialize(ppplink->ppp, ppplink, iface, ppplink->ncd,
+      &ppp_default_local_LCP_for_serial, &ppp_default_remote_LCP_for_serial);
+
+   return 0;
+}
+
+/*** BeginHeader vspd_resetinterface */
+int vspd_resetinterface(_PPPLINKConfig * ppplink, word instance, int iface);
+/*** EndHeader */
+
+static const _PPPLINKConfigConst _vspd_config[USING_VSPD] =
+{
+#if USE_VSPD & 0x01
+	{
+	   &_VSPDController        	// ncd
+	  ,IF_PPP0                       // iface
+	  ,SADR                				// I/O base address (serial port data register)
+     ,0x40									// drivebit
+     ,TAT4R									// Timer
+     ,&TAT4RShadow						// Timer shadow
+     ,IS_VSPD
+	}
+#endif
+#if USE_VSPD & 0x02
+	{
+	   &_VSPDController        	// ncd
+	  ,IF_PPP1                       // iface
+	  ,SBDR                				// I/O base address (serial port data register)
+     ,0x10									// drivebit
+     ,TAT5R									// Timer
+     ,&TAT5RShadow						// Timer shadow
+     ,IS_VSPD
+	}
+#endif
+#if USE_VSPD & 0x04
+	{
+	   &_VSPDController        	// ncd
+	  ,IF_PPP2                       // iface
+	  ,SCDR                				// I/O base address (serial port data register)
+     ,0x04									// drivebit
+     ,TAT6R									// Timer
+     ,&TAT6RShadow						// Timer shadow
+     ,IS_VSPD
+	}
+#endif
+#if USE_VSPD & 0x08
+	{
+	   &_VSPDController        	// ncd
+	  ,IF_PPP3                       // iface
+	  ,SDDR                				// I/O base address (serial port data register)
+     ,0x01									// drivebit
+     ,TAT7R									// Timer
+     ,&TAT7RShadow						// Timer shadow
+     ,IS_VSPD
+	}
+#endif
+// Following usable only on R3000
+#if USE_VSPD & 0x10
+	{
+	   &_VSPDController        	// ncd
+	  ,IF_PPP4                       // iface
+	  ,SEDR                				// I/O base address (serial port data register)
+     ,0x40									// drivebit
+     ,TAT2R									// Timer
+     ,&TAT2RShadow						// Timer shadow
+     ,IS_VSPD
+	}
+#endif
+#if USE_VSPD & 0x20
+	{
+	   &_VSPDController        	// ncd
+	  ,IF_PPP5                       // iface
+	  ,SFDR                				// I/O base address (serial port data register)
+     ,0x04									// drivebit
+     ,TAT3R									// Timer
+     ,&TAT3RShadow						// Timer shadow
+     ,IS_VSPD
+	}
+#endif
+};
+
+__nouseix _ppplink_debug
+int vspd_resetinterface(_PPPLINKConfig * ppplink, word instance, int iface)
+{
+	auto long xsize;
+
+#GLOBAL_INIT { _vspd_tbuf = 0; }
+
+   if (instance >= USING_VSPD)
+   	return -6;	// No such instance
+
+   if (!_vspd_tbuf) {
+   	// Allocate transfer buffers.  256 bytes for both tx and rx, for each instance.
+      // Requested to align on 256-byte boundary.
+      xsize = USING_VSPD * 512;
+      _vspd_pbuf = _xalloc(&xsize, 8, XALLOC_ANY);
+      #asm
+      ; Convert from linear to segmented form
+      ld		a,(_vspd_pbuf+2)
+      ld		hl,(_vspd_pbuf)
+      _LIN2SEG
+		ld		(_vspd_tbuf), jkhl
+      #endasm
+
+   }
+
+   // Zero out most of it, then copy just the top (non-zero const part).
+   memset(ppplink, 0, sizeof(*ppplink));
+	memcpy(ppplink, _vspd_config + instance, sizeof(_PPPLINKConfigConst));
+
+   // Note: interface numbers are "hard-assigned" for ppplink.  Thus, we perform check only here.
+#ifdef PPPLINK_VERBOSE
+   if (ppplink->iface != iface)
+   	printf("PPPLINK (VSPD): interface number not assigned correctly: is %u, should be %u\n", iface, ppplink->iface);
+#endif
+
+	// Set pointer for ISR
+   switch (ppplink->iobase) {
+   case SADR: _pss_A = ppplink; break;
+   case SBDR: _pss_B = ppplink; break;
+   case SCDR: _pss_C = ppplink; break;
+   case SDDR: _pss_D = ppplink; break;
+   case SEDR: _pss_E = ppplink; break;
+   case SFDR: _pss_F = ppplink; break;
+   }
+
+	/*
+	 * Setup the peripheral IO interface, and fill in the rest of the _PPPLINKConfig struct
+	 */
+	if (ppplink->io_init)
+		ppplink->io_init(ppplink);
+
+   // Set up transfer buffer addresses (segmented form)
+   ppplink->txbuf = _vspd_tbuf + (instance << 9);
+   ppplink->rxbuf = _vspd_tbuf + (instance << 9) + 256;
+   ppplink->txbufp = _vspd_pbuf + (instance << 9);
+   ppplink->rxbufp = _vspd_pbuf + (instance << 9) + 256;
+
+   // Set up some dummy interface parameters
+   _if_tab[iface].ipaddr = VSPD_LOCALHOST;
+   _if_tab[iface].mask = 0xFFFFFFFFuL;
+
+
+   return 0;
+}
+
+/*** BeginHeader ppplink_prt_nicreg */
+void ppplink_prt_nicreg(_PPPLINKConfig * nic);
+/*** EndHeader */
+
+#ifdef PKTDRV_DEBUG
+_ppplink_debug
+__nouseix void ppplink_prtnicreg(_PPPLINKConfig* cfg)
+{
+	int iobase;
+
+	iobase=cfg->iobase;
+
+}
+
+_ppplink_debug
+__nouseix void ppplink_prt_nicreg(_PPPLINKConfig * nic)
+{
+	LOCK_GLOBAL(TCPGlobalLock);
+	ppplink_prtnicreg(nic);
+	UNLOCK_GLOBAL(TCPGlobalLock);
+}
+
+#endif
+
+/*** BeginHeader ppplink_ioctl */
+int ppplink_ioctl(_PPPLINKConfig* nic, int cmd, ...);
+/*** EndHeader */
+
+_ppplink_debug
+int ppplink_ioctl(_PPPLINKConfig * nic, int cmd, ...)
+{
+	auto char * stack;
+   auto word mask;
+
+   stack = (char *)(&cmd + 1);
+	switch (cmd) {
+   case PD_HASFEATURE:
+		cmd = *(int *)stack;
+      return cmd >= PD_HASFEATURE && cmd <= PD_HAVELINK ||
+      		 cmd == PD_INBAND ||
+      		 cmd >= PD_PPP_SENDCTL && cmd <=
+					PD_SERIAL
+					;
+   case PD_INITIALIZE:
+   	return ppp_serial_resetinterface(nic, *(word *)stack, *(int *)(stack+sizeof(word)));
+   case PD_HAVELINK:
+   #ifndef PPP_NO_MODEM
+   	return nic->havelink;
+   #else
+   	return 1;	// If no modem support, assume always have link (no DCD or DSR line)
+   #endif
+   case PD_INBAND:
+   	return ppplink_inband(nic, *(ll_prefix __far **)stack);
+   case PD_PPP_SENDCTL:
+   	return ppplink_sendctl(nic, *(char **)stack, *(word *)(stack+sizeof(char *)));
+   case PD_PPP_SENDING:
+   	return nic->txpkt != NULL;
+   case PD_PPP_SENDINGCTL:
+   	return nic->txpktctl && nic->txpkt;
+   case PD_PPPLINK_ASYMAP:
+   	return ppplink_asymap(nic, *(longword *)stack);
+   case PD_PPPLINK_SPEED:
+   	return ppplink_speed(nic, *(longword **)stack);
+   case PD_PPPLINK_FLOWIN:
+   	return ppplink_flowin(nic, *(char **)stack, *(word **)(stack+sizeof(char*)),
+      								*(char **)(stack+(sizeof(char*)+sizeof(word *))));
+   case PD_PPPLINK_FLOWOUT:
+   	return ppplink_flowout(nic, *(char **)stack, *(word **)(stack+sizeof(char*)),
+      								*(char **)(stack+(sizeof(char*)+sizeof(word *))));
+   #ifndef PPP_NO_MODEM
+   case PD_PPPLINK_USEMODEM:
+   	if (*(int **)stack)
+      	nic->usemodem = **(int **)stack;
+   	return nic->usemodem;
+	case PD_PPPLINK_SENDEX:
+   	if (*(char **)stack)
+      	nic->modem.sendexpect_string = *(char **)stack;
+   	return (int)nic->modem.sendexpect_string;
+	case PD_PPPLINK_HANGUP:
+   	if (*(char **)stack)
+      	nic->modem.hangup_string = *(char **)stack;
+   	return (int)nic->modem.hangup_string;
+   case PD_PPPLINK_MODEMESC:
+   	if (*(int **)stack)
+      	nic->modem.escape = **(int **)stack;
+   	return nic->modem.escape;
+   #endif
+   case PD_PPPLINK_FLAGS:
+   	if (*(int **)stack) {
+      	mask = *(word *)(stack + sizeof(word *));
+         nic->flags &= ~mask;
+      	nic->flags |= (char)**(word **)stack & mask;
+      }
+   	return nic->flags;
+   case PD_PPPLINK_SENDRAW:
+   	return ppplink_sendraw(nic, *(char **)stack, *(word *)(stack+sizeof(char *)));
+   case PD_PPPLINK_RXMODE:
+   	return ppplink_rxmode(nic, *(word *)stack);
+	case PD_DMA:
+   	return ppplink_dma(nic, *(dma_chan_t *)stack,
+      				*(dma_chan_t *)(stack+sizeof(dma_chan_t)),
+                  *(word *)(stack+2*sizeof(dma_chan_t)));
+	case PD_SERIAL:
+   	return ppplink_serial(nic);
+   }
+   return 0;
+}
+
+/*** BeginHeader vspd_ioctl */
+int vspd_ioctl(_PPPLINKConfig* nic, int cmd, ...);
+/*** EndHeader */
+
+_ppplink_debug
+int vspd_ioctl(_PPPLINKConfig * nic, int cmd, ...)
+{
+	auto char * stack;
+   auto word mask;
+
+   stack = (char *)(&cmd + 1);
+	switch (cmd) {
+   case PD_HASFEATURE:
+		cmd = *(int *)stack;
+      return cmd >= PD_HASFEATURE && cmd <= PD_HAVELINK ||
+      		 cmd == PD_PPP_SENDING ||
+      		 cmd == PD_INBAND ||
+             cmd == PD_PPPLINK_SPEED ||
+             cmd == PD_PPPLINK_FLOWIN ||
+             cmd == PD_PPPLINK_FLOWOUT ||
+             cmd == PD_PPPLINK_FLAGS ||
+             cmd >= PD_DMA && cmd <= PD_SERIAL
+					;
+   case PD_INITIALIZE:
+   	return vspd_resetinterface(nic, *(word *)stack, *(int *)(stack+sizeof(word)));
+   case PD_HAVELINK:
+   	return 1;
+   case PD_INBAND:
+#ifndef DISABLE_TCP
+      if (ifpending(nic->iface) == IF_DOWN)
+			return 0;		// Don't process if interface down
+      // Otherwise, pass directly to TCP stream handler
+   	return tcp_stream_handler(*(ll_prefix __far **)stack, nic->iobase);
+#else
+		return 0;
+#endif
+   case PD_PPP_SENDING:
+   	return nic->txpkt != NULL;
+   case PD_PPPLINK_SPEED:
+   	return ppplink_speed(nic, *(longword **)stack);
+   case PD_PPPLINK_FLOWIN:
+   	return ppplink_flowin(nic, *(char **)stack, *(word **)(stack+sizeof(char*)),
+      								*(char **)(stack+(sizeof(char*)+sizeof(word *))));
+   case PD_PPPLINK_FLOWOUT:
+   	return ppplink_flowout(nic, *(char **)stack, *(word **)(stack+sizeof(char*)),
+      								*(char **)(stack+(sizeof(char*)+sizeof(word *))));
+   case PD_PPPLINK_FLAGS:
+   	if (*(int **)stack) {
+      	mask = *(word *)(stack + sizeof(word *));
+         nic->flags &= ~mask;
+      	nic->flags |= (char)**(word **)stack & mask;
+      }
+   	return nic->flags;
+	case PD_DMA:
+   	return ppplink_dma(nic, *(dma_chan_t *)stack,
+      				*(dma_chan_t *)(stack+sizeof(dma_chan_t)),
+                  *(word *)(stack+2*sizeof(dma_chan_t)));
+	case PD_SERIAL:
+   	return ppplink_serial(nic);
+   }
+   return 0;
+}
+
+/*** BeginHeader ppplink_inband */
+int ppplink_inband(_PPPLINKConfig* pss, ll_prefix __far * p);
+/*** EndHeader */
+
+_ppplink_debug
+int ppplink_inband(_PPPLINKConfig* pss, ll_prefix __far * p)
+{
+	// This is the handler for in-band packets received.  This only occurs when the receive mode is
+   // set to 'raw' i.e. when we are chatting with the modem or ISP's login process.
+   // If we are currently running a chat script, then we feed the chat machine with the inband packet
+   // contents.  Otherwise, the data is ignored.
+   // Internally, this may be called with a null ll_prefix.  This means just drive the chat state machine
+   // without any new data.
+#ifndef PPP_NO_MODEM
+	auto char buf[128];	// Process this many at a time
+	auto char sendbuf[PSS_SENDBUF_SIZE+1];
+   auto word offs;		// Current offset in inband packet
+   auto word len, plen;
+   auto int chat_state;
+	auto char *in_ptr;
+   auto word sendlen;
+
+#ifdef PPPLINK_VERBOSE
+	if (debug_on > 2 && p)
+	{
+		printf("SERLINK: got raw packet len=%u, chatting=%s\n", p->len,
+		       pss->modem.chatting == PPPLINK_CHAT_LOGIN ? "login" :
+		       pss->modem.chatting == PPPLINK_CHAT_HANGUP ? "hangup" :
+		       "none");
+   }
+#endif
+	if (pss->txpkt) {
+#ifdef PPPLINK_VERBOSE
+		//printf("SERLINK: ignored since transmitting\n");
+#endif
+   	return 0;
+   }
+   if (!pss->modem.chatting || pss->modem.escaping_flag) {
+#ifdef PPPLINK_VERBOSE
+		//printf("SERLINK: ignored since not chatting, or escaping\n");
+#endif
+   	return 0;
+   }
+   plen = p ? p->len : 0;
+   for (offs = 0; offs <= plen; offs += sizeof(buf)) {
+		len = plen - offs;
+      if (len > sizeof(buf))
+      	len = sizeof(buf);
+      if (len)
+      	_pkt_buf2root(p, buf, len, offs);
+      in_ptr = buf;
+	   switch (pss->modem.chatting) {
+	      case PPPLINK_CHAT_LOGIN:
+	         chat_state = chat_tick(&pss->modem.sendexpect,
+	                                &in_ptr,
+	                                &len,
+	                                sendbuf,
+	                                &sendlen);
+
+	         switch (chat_state) {
+	            case CHAT_SEND:
+	               ppplink_sendraw(pss, sendbuf, sendlen);
+	               break;
+	            case CHAT_OK:
+	               pss->modem.connected = 1;
+	               pss->modem.chatting = PPPLINK_CHAT_NONE;
+	               ppplink_rxmode(pss, PPPLINK_HDLC); //enter PPP mode
+	               break;
+	            case CHAT_TIMEOUT:
+	            case CHAT_ERROR:
+	               pss->modem.chatting = PPPLINK_CHAT_NONE;
+	               pss->abort_flag = 1;
+	               if(pss->usemodem)
+	                  pss->modem.change = 1;
+	         }
+	         break;
+	      case PPPLINK_CHAT_HANGUP:
+            chat_state = chat_tick(&pss->modem.sendexpect,
+                                &in_ptr,
+                                &len,
+                                sendbuf,
+                                &sendlen);
+            switch (chat_state) {
+			 		case CHAT_SEND:
+						ppplink_sendraw(pss, sendbuf, sendlen);
+                  break;
+					case CHAT_TIMEOUT:
+               case CHAT_ERROR:
+          	   case CHAT_OK:
+               	// For hangup, errors and success are basically treated the same.  Turning off
+                  // 'chatting' flag allows ifctl() to proceed.
+           			pss->modem.chatting = PPPLINK_CHAT_NONE;
+                  break;
+            }
+	         break;
+	   }
+   }
+#endif
+	return 0;
+}
+
+/*** BeginHeader ppplink_rxmode */
+int ppplink_rxmode(_PPPLINKConfig* nic, word mode);
+/*** EndHeader */
+
+_ppplink_debug
+int ppplink_rxmode(_PPPLINKConfig* nic, word mode)
+{
+	if (mode == nic->mode)
+   	return 0;
+   nic->receiving = 0;		// Lock out the ISR
+   if (nic->rxxpkt) {
+   	// Abort any pending packet
+      pkt_buf_release(nic->rxxpkt);
+      nic->rxxpkt = NULL;
+   }
+   switch (mode) {
+   case PPPLINK_HDLC:
+   	// Switch out of raw mode into HDLC (normal) mode
+      nic->rxxstate = _rxx_init;
+      break;
+   case PPPLINK_RAW:
+   	// Switch into raw mode, set 'previous 2 chars' to nulls.
+      nic->rxxstate = _rxx_initraw;
+      nic->rxxcrc = 0;
+      break;
+   }
+   nic->mode = (char)mode;
+   nic->receiving = 1;		// Allow ISR to process incoming data
+   return 0;
+}
+
+/*** BeginHeader ppplink_asymap */
+int ppplink_asymap(_PPPLINKConfig* nic, longword amap);
+/*** EndHeader */
+
+_ppplink_debug
+int ppplink_asymap(_PPPLINKConfig* nic, longword amap)
+{
+	auto word i;
+
+	if (!amap)
+	{	// no characters < '\x20' require escape (ignore asymap[])
+		nic->asymapflag = 0;
+	}
+	else if (0xFFFFFFFFuL == amap)
+	{	// all characters < '\x20' require escape (ignore asymap[])
+		nic->asymapflag = 0xFF;
+	}
+	else
+	{	// some characters < '\x20' require escape (refer to asymap[])
+		nic->asymapflag = 0x01;
+	}
+	for (i = 0; i < 32; ++i)
+	{
+		nic->asymap[i] = (char) (amap & 1);
+		amap >>= 1;
+	}
+	return 0;
+}
+
+/*** BeginHeader ppplink_speed */
+int ppplink_speed(_PPPLINKConfig* pss, longword * bps);
+/*** EndHeader */
+
+_ppplink_debug
+int ppplink_speed(_PPPLINKConfig* pss, longword * bps)
+{
+   auto longword divisor, temp;
+
+   if ((long)*bps < 1) {
+   	// Query only
+   	*bps = pss->baud;
+      return 0;
+   }
+
+	// (divisor+1) for 19200 baud is stored in BIOS variable "freq_divider"
+	//devnote: compiler don't like divisor = ((longword)freq_divider * 38400uL / *bps + 1 >> 1) - 1uL;
+   temp = (longword)freq_divider * 38400uL;
+   temp /= *bps;
+   temp += 1;
+   temp >>= 1;
+   divisor = temp - 1;
+
+   if (divisor < 0)
+   	divisor = 0;
+
+	if (divisor > 255) {
+#ifdef PPPLINK_VERBOSE
+		printf("SERLINK: speed %lubps too low, requires prescaler\n", *bps);
+#endif
+		return 1;
+	}
+   // Compute the real speed achievable by the divider
+   pss->baud = *bps = (longword)freq_divider * 19200uL / (divisor+1);
+
+#ifdef PPPLINK_VERBOSE
+	printf("SERLINK: baud rate %lu: setting divisor to %u\n", pss->baud, (int)divisor);
+#endif
+	WrPortI(pss->timerport, pss->timershadow, (char)divisor);
+   return 0;
+}
+
+/*** BeginHeader ppplink_flowin, ppplink_flowout, ppplink_setRTS */
+int ppplink_flowin(_PPPLINKConfig* nic, char * type, word * port, char * pinmask);
+int ppplink_flowout(_PPPLINKConfig* nic, char * type, word * port, char * pinmask);
+void ppplink_setRTS(_PPPLINKConfig* nic, int on);
+/*** EndHeader */
+
+_ppplink_debug
+int ppplink_flowin(_PPPLINKConfig* nic, char * type, word * port, char * pinmask)
+{
+	auto char * shadow;
+
+   if (*type == FLOWCTL_QUERY) {
+   	*type = nic->inflowcontrol;
+      if (port) {
+	      *port = nic->rtsport;
+	      *pinmask = nic->rtspin;
+      }
+      return 0;
+   }
+
+   if (*type != FLOWCTL_RTS)
+   	nic->inflowcontrol = *type = FLOWCTL_NONE;
+   else {
+      // Automatically determine the shadow register
+      if (port) {
+	      switch (*port) {
+	      case PADR: shadow = &PADRShadow; break;
+	      case PBDR: shadow = &PBDRShadow; break;
+	      case PCDR: shadow = &PCDRShadow; break;
+	      case PDDR: shadow = &PDDRShadow; break;
+	      case PEDR: shadow = &PEDRShadow; break;
+	      default:
+	#ifdef PPPLINK_VERBOSE
+	         printf("SERLINK: ppplink_flowcontrol: unknown RTS port %04X\n", *port);
+	#endif
+	         shadow = NULL;
+	      }
+	      if (shadow) {
+	         nic->rtsshadow = shadow;
+	         nic->rtsport = *port;
+	         nic->rtspin = *pinmask;
+	         nic->inflowcontrol = FLOWCTL_RTS;
+	         ppplink_setRTS(nic, 1);    // Assert RTS
+	      }
+	      else
+	         nic->inflowcontrol = *type = FLOWCTL_NONE;
+      }
+      else
+      	// port was NULL, don't change current port settings privided they are valid
+         if (nic->rtsport) {
+	      	nic->inflowcontrol = FLOWCTL_RTS;
+	         ppplink_setRTS(nic, 1);    // Assert RTS
+         }
+	}
+   return 0;
+}
+
+_ppplink_debug
+int ppplink_flowout(_PPPLINKConfig* nic, char * type, word * port, char * pinmask)
+{
+	auto char * shadow;
+
+   if (*type == FLOWCTL_QUERY) {
+   	*type = nic->outflowcontrol;
+      if (port) {
+	      *port = nic->ctsport;
+	      *pinmask = nic->ctspin;
+      }
+      return 0;
+   }
+
+	if (*type != FLOWCTL_CTS) {
+   	// Turning off
+      nic->outflowcontrol = *type = FLOWCTL_NONE;
+   	nic->txistate = _txi_noflowctl;
+   }
+   else {
+   	// Turning on
+      if (port) {
+	      nic->ctsport = *port;
+	      nic->ctspin = *pinmask;
+      }
+      if (nic->ctsport) {
+	      nic->outflowcontrol = FLOWCTL_CTS;
+	      nic->txistate = _txi_norm;
+      }
+   }
+   return 0;
+}
+
+_ppplink_debug
+void ppplink_setRTS(_PPPLINKConfig* nic, int on)
+{
+	#asm
+   ld		iy,(sp+@sp+nic)
+   ld		hl,(sp+@sp+on)
+   bool	hl
+   ld		b,L
+   ld		hl,(iy+[_pss]+rtsshadow)
+   ex		de,hl
+   ld		hl,(iy+[_pss]+rtsport)	; port in HL, pin in A
+   ld		a,(iy+[_pss]+rtspin)
+   ex		de,hl
+   ; HL = shadow, DE = I/O port, A = bitmask
+   djnz	.off
+   ; Turning on i.e. bring pin LOW
+   cpl
+   ipset 3
+	and	(hl)
+   ioi	ld	(de),a
+   ipres
+   ld		(hl),a
+   jr		.retn
+.off:
+	; Turning off
+   ipset	3
+   or		(hl)
+   ioi	ld	(de),a
+   ipres
+   ld		(hl),a
+.retn:
+   #endasm
+}
+
+/*** BeginHeader ppplink_ifctl */
+int ppplink_ifctl(_PPPLINKConfig* nic, int up, int change);
+/*** EndHeader */
+
+#ifndef PPP_NO_MODEM
+_ppplink_debug
+int ppplink_doescape(_PPPLINKConfig *pss)
+{
+	word timedout;
+
+	if (pss->txpkt)
+		return 0; //not done
+
+   timedout = _CHK_SHORT_TIMEOUT(pss->modem.escape_timeout);
+
+	switch(pss->modem.escape_state)
+	{
+		case MODEM_ESCAPE_IDLE:
+      #ifdef PPPLINK_VERBOSE
+      	printf("SERLINK: starting modem escape sequence\n");
+      #endif
+			pss->modem.escape_timeout = _SET_SHORT_TIMEOUT(PSS_ESCAPE_TIME);
+			pss->modem.escape_state = MODEM_ESCAPE_DELAY1;
+			break;
+
+		case MODEM_ESCAPE_DELAY1:
+			if(timedout && !ppplink_sendraw(pss, "+", 1)) {
+	         pss->modem.escape_timeout = _SET_SHORT_TIMEOUT(PSS_ESCAPE_TIME_PLUS);
+	         pss->modem.escape_state = MODEM_ESCAPE_PLUS12;
+			}
+			break;
+
+		case MODEM_ESCAPE_PLUS12:
+			if(timedout && !ppplink_sendraw(pss, "+", 1)) {
+	         pss->modem.escape_timeout = _SET_SHORT_TIMEOUT(PSS_ESCAPE_TIME_PLUS);
+	         pss->modem.escape_state = MODEM_ESCAPE_PLUS23;
+			}
+			break;
+
+		case MODEM_ESCAPE_PLUS23:
+			if(timedout && !ppplink_sendraw(pss, "+", 1)) {
+	         pss->modem.escape_timeout = _SET_SHORT_TIMEOUT(PSS_ESCAPE_TIME);
+	         pss->modem.escape_state = MODEM_ESCAPE_DELAY2;
+			}
+			break;
+
+		case MODEM_ESCAPE_DELAY2:
+			if(timedout) {
+				pss->modem.escape_state = MODEM_ESCAPE_IDLE;
+				return 1; //all done
+			}
+			break;
+	}
+	return 0; //not done
+}
+#endif
+
+_ppplink_debug
+int ppplink_ifctl(_PPPLINKConfig* pss, int up, int change)
+{
+	auto PPPState *ppp;
+	auto word result, rx_bytes, bitno, errors, i;
+   auto int chat_state;
+	auto char *pkt;
+	auto char ppp_change;
+   auto word iface;
+
+   iface = pss->iface;
+
+#ifdef PPPLINK_VERBOSE
+	if (change)
+		printf("SERLINK: bringing %s serial PPP interface %d\n", up ? "up" : "down", iface);
+#endif
+
+	ppp = pss->ppp;
+
+	if (up && !pss->abort_flag) {
+		if (change) {
+			if (ppplink_open(pss))
+				return IFCTL_FAIL;
+
+#ifdef PPPLINK_VERBOSE
+			printf("SERLINK: Opened PPP serial on iface %d at %ld baud\n",
+					  iface, pss->baud);
+#endif
+
+#ifndef PPP_NO_MODEM
+			if(pss->usemodem) {
+				ppplink_rxmode(pss, PPPLINK_RAW); //set to Raw mode
+				pss->modem.connected = 0;
+				if(pss->modem.escape) {
+					pss->modem.escaping_flag = 1;
+					pss->modem.escape_state = MODEM_ESCAPE_IDLE;
+				}
+				else
+					pss->modem.escaping_flag = 0;
+				chat_init(&pss->modem.sendexpect, pss->modem.sendexpect_string,
+            	ppp->pap.remote_username, ppp->pap.remote_password, NULL);
+            pss->modem.chatting = PPPLINK_CHAT_LOGIN;
+			}
+#endif
+		} //end of if change
+#ifndef PPP_NO_MODEM
+		if(pss->usemodem) {
+			ppp_change = 0;
+			if(!pss->modem.connected) {
+				if (pss->modem.escaping_flag && ppplink_doescape(pss))
+						pss->modem.escaping_flag = 0; //done with modem escape
+            // Otherwise, we expect the ppplink_inband() ioctl to handle driving the
+            // chat state machine.
+            ppplink_inband(pss, NULL);		// NULL means no new data
+				if (pss->abort_flag || !pss->modem.connected)
+					return IFCTL_PEND;
+				else
+					ppp_change = 1; //first time ifctl_ppp will be called
+			} //end of if ! connected
+         else if (pss->modem.connected == 1) {
+         	pss->modem.connected = 2;
+            ppp_change = 1;
+         }
+		} // end of usemodem
+		else
+#endif
+			ppp_change = change;
+
+		result = ifctl_ppp(ppp, iface, up, ppp_change);
+
+	}	//end of if(up)
+	else {
+   	if(!pss->abort_flag && ppp->connected)
+      	// Note that when coming down, the return code is either 'OK' or 'PEND' - errors are suppressed.
+			result = ifctl_ppp(ppp, iface, up, change);
+      else
+      	result = IFCTL_OK; //triggers modem action
+#ifndef PPP_NO_MODEM
+      if (pss->usemodem) {
+      	if(change)
+		  		pss->modem.change = 1;
+			if(result == IFCTL_OK && pss->modem.change) {
+     	   	pss->modem.change = 0;
+			 	ppplink_rxmode(pss, PPPLINK_RAW); //go into raw mode
+
+				if(pss->modem.escape) {
+				 	pss->modem.escaping_flag = 1;
+					pss->modem.escape_state = MODEM_ESCAPE_IDLE;
+			 	}
+				else
+					pss->modem.escaping_flag = 0;
+				chat_init(&pss->modem.sendexpect, pss->modem.hangup_string,
+            	ppp->pap.remote_username, ppp->pap.remote_password, NULL);
+            pss->modem.chatting = PPPLINK_CHAT_HANGUP;
+			}
+
+  			if(result == IFCTL_OK) {
+	  			if(pss->modem.escaping_flag) {
+	  				if(ppplink_doescape(pss))
+						pss->modem.escaping_flag = 0; //done with modem escape
+           	 	else
+            		return IFCTL_PEND;
+		 		}
+            if (!pss->modem.chatting)
+               result = pss->abort_flag ? IFCTL_FAIL : IFCTL_OK;
+            else {
+            	ppplink_inband(pss, NULL);		// NULL means no new data
+            	result = IFCTL_PEND;
+            }
+	  		}	//if OK - from ifctl_ppp
+      } //if usemodem
+#endif
+
+	   if(result != IFCTL_PEND) {
+  	 		ppplink_close(pss);  	//one more thing to do
+      	pss->abort_flag = 0;
+#ifdef PPPLINK_VERBOSE
+			printf("SERLINK: Closed PPP serial on iface %d\n", iface);
+#endif
+  	 	}
+
+	} //if coming down
+
+	return result;
+}
+
+/*** BeginHeader ppplink_set_hdr */
+int ppplink_set_hdr(_PPPLINKConfig * pes, pppserial_ll_hdr * hdr, void __far * override);
+/*** EndHeader */
+_ppplink_debug
+int ppplink_set_hdr(_PPPLINKConfig * pes, pppserial_ll_hdr * hdr, void __far * override)
+{
+	// Header setup in sendpacket.  We only need to return length.
+	return sizeof(pppserial_ll_hdr);
+}
+
+
+
+/*** BeginHeader vspd_ifctl */
+int vspd_ifctl(_PPPLINKConfig* nic, int up, int change);
+/*** EndHeader */
+
+_ppplink_debug
+int vspd_ifctl(_PPPLINKConfig* pss, int up, int change)
+{
+	// 'change' is ignored since everything happens instantly.
+#ifdef PPPLINK_VERBOSE
+	printf("SERLINK: bringing %s VSPD interface %d\n", up ? "up" : "down", pss->iface);
+#endif
+
+	if (up) {
+		if (ppplink_open(pss))
+			return IFCTL_FAIL;
+
+#ifdef PPPLINK_VERBOSE
+		printf("SERLINK: Opened VSPD on iface %d at %ld baud\n",
+					  pss->iface, pss->baud);
+#endif
+	}
+	else {
+ 		ppplink_close(pss);
+#ifdef PPPLINK_VERBOSE
+		printf("SERLINK: Closed VSPD on iface %d\n", pss->iface);
+#endif
+
+	}
+
+	return IFCTL_OK;
+}
+
+/*** BeginHeader vspd_set_hdr */
+int vspd_set_hdr(_PPPLINKConfig * pes, void * hdr, void __far * override);
+/*** EndHeader */
+_ppplink_debug
+int vspd_set_hdr(_PPPLINKConfig * pes, void * hdr, void __far * override)
+{
+	return 0;
+}
+
+
+
+/*** BeginHeader ppplink_dma */
+int ppplink_dma(_PPPLINKConfig* nic, dma_chan_t rxchan, dma_chan_t txchan, word ioaddr);
+/*** EndHeader */
+
+_ppplink_debug
+int ppplink_dma(_PPPLINKConfig* nic, dma_chan_t rxchan, dma_chan_t txchan, word ioaddr)
+{
+	auto int txc, rxc, dma_vector_base_index;
+	auto word txm, rxm;
+	auto dma_addr_t p0, p1, p2, p3;
+	auto void *PPPDMAIsrRxX, *PPPDMAIsrTxX;
+	static char dummyByte;	// dummy byte for DMA polling access
+
+	if (!ioaddr)
+		ioaddr = nic->iobase;
+	rxc = DMAhandle2chan(rxchan);
+	txc = DMAhandle2chan(txchan);
+	if (txc == DMA_CHANNEL_NONE || rxc == DMA_CHANNEL_NONE)
+		return -EINVAL;
+	txm = 1u<<txc;
+	rxm = 1u<<rxc;
+	if (nic->rxdmamask && (nic->rxdmamask != rxm || nic->txdmamask != txm))
+		return -EPERM;	// Conflict
+	if (nic->rxdmamask)
+		return 0;	// Already in effect
+	// Set interrupt handler vectors for DMA
+	switch (nic->iobase)
+	{
+	case SADR:
+		PPPDMAIsrRxX = PPPDMAIsrRxA;
+		PPPDMAIsrTxX = PPPDMAIsrTxA;
+		break;
+	case SBDR:
+		PPPDMAIsrRxX = PPPDMAIsrRxB;
+		PPPDMAIsrTxX = PPPDMAIsrTxB;
+		break;
+	case SCDR:
+		PPPDMAIsrRxX = PPPDMAIsrRxC;
+		PPPDMAIsrTxX = PPPDMAIsrTxC;
+		break;
+	case SDDR:
+		PPPDMAIsrRxX = PPPDMAIsrRxD;
+		PPPDMAIsrTxX = PPPDMAIsrTxD;
+		break;
+	case SEDR:
+		PPPDMAIsrRxX = PPPDMAIsrRxE;
+		PPPDMAIsrTxX = PPPDMAIsrTxE;
+		break;
+	case SFDR:
+		PPPDMAIsrRxX = PPPDMAIsrRxF;
+		PPPDMAIsrTxX = PPPDMAIsrTxF;
+		break;
+	default:
+		return -ENXIO;
+	}
+#if CPU_ID_MASK(_CPU_ID_) >= R6000
+	// Rabbit 6000+:
+	//  - DMA channels 0-7 are located in a block starting at offset 0x80 (index
+	//    0x08) in the external interrupt vectors table.
+	//  - DMA channels 8-15 are located in a block starting at offset 0x180
+	//    (index 0x18, or 0x10+channel) in the external interrupt vectors table.
+	dma_vector_base_index = (8 > rxc) ? 0x08 : 0x10;
+	SetVectExtern(dma_vector_base_index+rxc, PPPDMAIsrRxX);
+	dma_vector_base_index = (8 > txc) ? 0x08 : 0x10;
+	SetVectExtern(dma_vector_base_index+txc, PPPDMAIsrTxX);
+#else
+	// Rabbit 4000, 5000:
+	//  - DMA channels 0-7 are located in a block starting at offset 0x80 (index
+	//    0x08) in the external interrupt vectors table.
+	dma_vector_base_index = 0x08;
+	SetVectExtern(dma_vector_base_index+rxc, PPPDMAIsrRxX);
+	SetVectExtern(dma_vector_base_index+txc, PPPDMAIsrTxX);
+#endif
+
+	// Initialize DMA buffer descriptors - receive
+	p0 = paddr(&dummyByte);
+	p1 = paddr(&nic->rxbd1);
+	p2 = paddr(&nic->rxbd2);
+	p3 = paddr(&nic->rxbd3);
+	DMAsetBufDesc(0x0F, 1,   p0,     p0,               0, p1, 12);	// Dummy first transfer only (harmless)
+	DMAsetBufDesc(0x13, 128, ioaddr, nic->rxbufp,      0, p2, 12);	// Array to next
+	DMAsetBufDesc(0x53, 128, ioaddr, nic->rxbufp+128, p2, p3, 16);	// Link to previous (endless loop)
+
+	// Disable interrupt for default serial port
+	WrPortI(nic->iobase+4, NULL, 0);
+	// Set the in/out pointers to zero
+	*(word *)&nic->txin = 0;
+	*(word *)&nic->rxin = 0;
+	// Set ISR parameters
+	nic->rxdmamask = rxm;
+	nic->txdmamask = txm;
+	nic->rxdmachan = rxc;
+	nic->txdmachan = txc;
+	// We don't fire off any tx dma.  This is done dynamically when transmit requested.
+	// Fire off the Rx dma, though.
+	DMAloadBufDesc(rxc, &p1);
+#if CPU_ID_MASK(_CPU_ID_) >= R6000
+	WrPortI16(DMALLR, rxm);
+#else
+	WrPortI(DMALR, NULL, rxm);
+#endif
+
+	// Initialize DMA buffer descriptors - transmit
+	p1 = paddr(&nic->txbd1);
+	p2 = paddr(&nic->txbd2);
+	p3 = paddr(&nic->txbd3);
+	DMAsetBufDesc(0x0C, 1, paddr("\x7E"), ioaddr, 0, p1, 12);	// Frame delimiter (no interrupt), array to next
+	// Control flags of next will be either
+	//  0x9C - don't use 3rd descriptor
+	//  0x0C - continue to 3rd descriptor
+	// Source and length of following are set up dynamically.
+	DMAsetBufDesc(0x9C, 0, nic->txbufp, ioaddr, 0, p2, 12);	// Array to next
+	DMAsetBufDesc(0x9C, 0, 0, ioaddr, 0, p3, 12);
+
+	return 0;
+}
+
+/*** BeginHeader ppplink_serial */
+int ppplink_serial(_PPPLINKConfig* nic);
+/*** EndHeader */
+
+_ppplink_debug
+int ppplink_serial(_PPPLINKConfig* nic)
+{
+	if (!nic->rxdmamask)
+   	return 0;	// Already in effect
+
+}
+
+/*** BeginHeader  ********************************************/
+#endif /* __PPPLINK_LIB */
+/*** EndHeader ***********************************************/

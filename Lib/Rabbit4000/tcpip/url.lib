@@ -1,0 +1,919 @@
+/*
+	url.lib
+	Copyright (c) 2008 Digi International Inc., All Rights Reserved
+
+	This software contains proprietary and confidential information of Digi
+	International Inc.  By accepting transfer of this copy, Recipient agrees
+	to retain this software in confidence, to prevent disclosure to others,
+	and to make no use of this software other than that for which it was
+	delivered.  This is a published copyrighted work of Digi International
+	Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+	prohibited.
+
+	Restricted Rights Legend
+
+	Use, duplication, or disclosure by the Government is subject to
+	restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+	Technical Data and Computer Software clause at DFARS 252.227-7031 or
+	subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+	Restricted Rights at 48 CFR 52.227-19, as applicable.
+
+	Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+*/
+/* START LIBRARY DESCRIPTION ************************************************
+
+	Library for parsing URLs (Uniform Resource Locators).
+
+	Sample URL formats (optional portions in []):
+      [ftp://][user[:pass]@]hostname[:port]/filename
+		[http://][user[:pass]@]hostname[:port]/filename[?querystring][#fragment]
+
+	Other than url_encodestr, this API is not finalized and should only be
+	called from Digi libraries.
+
+	Macros:
+
+	URL_VERBOSE - If defined, library will print status messages to STDOUT.
+
+	URL_DEBUG - If defined, functions will be debuggable (i.e., you can set
+				breakpoints and single-step into them).
+
+END DESCRIPTION **********************************************************/
+
+/*
+	ChangeLog:
+
+	2009-10-08  SJH  Changed to all far strings
+	2009-10-30  SJH  Added unparse, relative URI functions
+
+
+
+
+ Collected ABNF for URI; Appendix A of RFC 3986
+
+ URI           = scheme ":" hier-part [ "?" query ] [ "#" fragment ]
+
+ hier-part     = "//" authority path-abempty
+               / path-absolute
+               / path-rootless
+               / path-empty
+
+ URI-reference = URI / relative-ref
+
+ absolute-URI  = scheme ":" hier-part [ "?" query ]
+
+ relative-ref  = relative-part [ "?" query ] [ "#" fragment ]
+
+ relative-part = "//" authority path-abempty
+               / path-absolute
+               / path-noscheme
+               / path-empty
+
+ scheme        = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
+
+ authority     = [ userinfo "@" ] host [ ":" port ]
+ userinfo      = *( unreserved / pct-encoded / sub-delims / ":" )
+ host          = IP-literal / IPv4address / reg-name
+ port          = *DIGIT
+
+ IP-literal    = "[" ( IPv6address / IPvFuture  ) "]"
+
+ IPvFuture     = "v" 1*HEXDIG "." 1*( unreserved / sub-delims / ":" )
+
+ IPv6address   =                            6( h16 ":" ) ls32
+               /                       "::" 5( h16 ":" ) ls32
+               / [               h16 ] "::" 4( h16 ":" ) ls32
+               / [ *1( h16 ":" ) h16 ] "::" 3( h16 ":" ) ls32
+               / [ *2( h16 ":" ) h16 ] "::" 2( h16 ":" ) ls32
+               / [ *3( h16 ":" ) h16 ] "::"    h16 ":"   ls32
+               / [ *4( h16 ":" ) h16 ] "::"              ls32
+               / [ *5( h16 ":" ) h16 ] "::"              h16
+               / [ *6( h16 ":" ) h16 ] "::"
+
+ h16           = 1*4HEXDIG
+ ls32          = ( h16 ":" h16 ) / IPv4address
+
+ IPv4address   = dec-octet "." dec-octet "." dec-octet "." dec-octet
+
+ dec-octet     = DIGIT                 ; 0-9
+               / %x31-39 DIGIT         ; 10-99
+               / "1" 2DIGIT            ; 100-199
+               / "2" %x30-34 DIGIT     ; 200-249
+               / "25" %x30-35          ; 250-255
+
+ reg-name      = *( unreserved / pct-encoded / sub-delims )
+
+ path          = path-abempty    ; begins with "/" or is empty
+               / path-absolute   ; begins with "/" but not "//"
+               / path-noscheme   ; begins with a non-colon segment
+               / path-rootless   ; begins with a segment
+               / path-empty      ; zero characters
+
+ path-abempty  = *( "/" segment )
+ path-absolute = "/" [ segment-nz *( "/" segment ) ]
+ path-noscheme = segment-nz-nc *( "/" segment )
+ path-rootless = segment-nz *( "/" segment )
+ path-empty    = 0<pchar>
+
+ segment       = *pchar
+ segment-nz    = 1*pchar
+ segment-nz-nc = 1*( unreserved / pct-encoded / sub-delims / "@" )
+               ; non-zero-length segment without any colon ":"
+
+ pchar         = unreserved / pct-encoded / sub-delims / ":" / "@"
+
+ query         = *( pchar / "/" / "?" )
+
+ fragment      = *( pchar / "/" / "?" )
+
+ pct-encoded   = "%" HEXDIG HEXDIG
+
+ unreserved    = ALPHA / DIGIT / "-" / "." / "_" / "~"
+ reserved      = gen-delims / sub-delims
+ gen-delims    = ":" / "/" / "?" / "#" / "[" / "]" / "@"
+ sub-delims    = "!" / "$" / "&" / "'" / "(" / ")"
+               / "*" / "+" / "," / ";" / "="
+
+*/
+
+/*** BeginHeader */
+#ifndef URL_LIB_Incl
+#define URL_LIB_Incl
+
+#ifdef URL_DEBUG
+	#define _url_debug __debug
+#else
+	#define _url_debug __nodebug
+#endif
+
+#ifndef URL_MAX_BUFFER_SIZE
+	#define URL_MAX_BUFFER_SIZE 256
+#endif
+
+/* START _FUNCTION DESCRIPTION ********************************************
+url_parsed_t																		<url.lib>
+
+STRUCTURE:
+	typedef struct url_parsed {
+	   char  buffer[URL_MAX_BUFFER_SIZE];
+	   word  port;          // decoded port or 0 for default
+	   word	flags;			// flags as follows
+			URL_FLAG_RELATIVE_SCHEME //was relative to scheme i.e. starts with //
+			URL_FLAG_RELATIVE_HOST //was relative to host i.e. starts with /
+			URL_FLAG_AMBIGUOUS   //no scheme explicitly provided, and does not
+										// start with '/'.
+		// elements used for both http and ftp URLs
+	   char far *scheme;			// usually http or ftp
+	   char far *hostname;
+	   const char far *path;   // full pathname to object: always starts
+	   								// with a '/'.
+
+		// elements for http urls
+	   const char far *userinfo;// username:password
+	   char far *query;        // what comes after the first ?
+	   char far *fragment;     // what comes after the #
+
+		// elements for ftp urls
+	   const char far *username;
+	   char far *password;
+	   char far *filename;     // last element of the path (doesn't contain '/')
+	} url_parsed_t;
+
+DESCRIPTION: 	Use url_parse() to parse a URL into a url_parsed_t structure.
+					The buffer element holds pieces of the URL.  The various pointers
+					(char far *) always point into the buffer field.  Also,
+					_url_parse() provides some additional parameters for building up
+					absolute URLs from relative ones.
+
+	Relative vs. absolute URLs:
+
+		The flags field contains some bit flags which allow the application to
+		determine whether the URL was absolute or relative.
+
+		If a scheme was provided (scheme field points to a non-zero length
+		string), then the URL is always absolute.
+
+		Else if the URL_FLAG_RELATIVE_SCHEME flag is set, then the URL started
+		with '//' hence it is "relative" to some scheme dependent on the
+		current protocol.  E.g. //www.example.com is a relative URL (probably
+		to http://, but that really depends on the context).
+
+		Else if the URL_FLAG_RELATIVE_HOST flag is set, then the URL started
+		with a single '/' hence it is "relative" to some host (technically,
+		an 'authority' since it can also specify user info and a port number)
+		dependent on the current protocol.
+
+		If the URL_FLAG_AMBIGUOUS flag is set, then the first element of
+		the URL was neither a scheme nor '/'.  In this case, the interpretation
+		is determined by the flag passed to _url_parse().  url_parse() assumes
+		that an ambiguous URL starts with an 'authority' (like a hostname).
+
+END DESCRIPTION **********************************************************/
+/*
+	DEVNOTE:
+
+	Create methods to split path into path/filename and userinfo into
+	username/password.  Base on the following code from ftp_client.lib
+	(and replace the ftp_client code with calls to the new methods):
+
+	      if (!*parsed.username)
+	      {
+	         parsed.username = "ftp";
+	      }
+	      else if (*parsed.password)
+			{
+				// split userinfo into username and password
+				parsed.password[-1] = '\0';
+			}
+
+			if (*parsed.filename)
+			{
+				// split path into path and filename
+				parsed.filename[-1] = '\0';
+			}
+
+	Methods should ensure that the modified characters are within the .buffer
+	element.  (.buffer < .filename < &.buffer[URL_MAX_BUFFER_SIZE]).
+
+	We might want one other method to split .query and .fragment off as well.
+*/
+typedef struct url_parsed {
+	char	buffer[URL_MAX_BUFFER_SIZE];
+	word	port;				// decoded port or 0 for default
+	word	flags;			// flags as follows
+#define URL_FLAG_RELATIVE_SCHEME	0x0001	// was a relative URL to scheme
+														// i.e. started with '//'
+#define URL_FLAG_RELATIVE_HOST	0x0002	// was a relative URL to host
+														// i.e. started with '/' (but not //)
+#define URL_FLAG_AMBIGUOUS			0x0004	// No scheme or did not start with '/'
+	char	__far *scheme;
+	const char	__far *userinfo;
+	const char	__far *username;
+	char	__far *password;
+	char	__far *hostname;
+	const char	__far *path;			// full pathname to object
+	char	__far *filename;		// last element of the path
+	char	__far *query;			// what comes after the first ?
+	char	__far *fragment;		// what comes after the #
+} url_parsed_t;
+
+// number of char* elements in url_parsed_t, starting with scheme
+#define _URL_ELEMENT_COUNT 9
+
+/*** EndHeader */
+
+/*** BeginHeader url_copy */
+url_parsed_t __far *url_copy (url_parsed_t __far *dst, url_parsed_t __far *src);
+/*** EndHeader */
+// future public API for copying url_parsed_t structures
+_url_debug
+url_parsed_t __far *url_copy (url_parsed_t __far *dst, url_parsed_t __far *src)
+{
+	// Since the char* elements inside the url_parsed_t structure usually point
+	// into the url_parsed_t's buffer, copying one url_parsed_t to another is a
+	// little tricky -- you don't want the destination's pointers pointing into
+	// the source's buffer.  They should point into the destination's buffer.
+
+	// This function correctly copies one url_parsed_t into another.
+
+	auto int i;
+	auto char __far * __far *srcp;
+	auto char __far * __far *dstp;
+
+	_f_memcpy (dst->buffer, src->buffer, sizeof(src->buffer));
+	dst->port = src->port;
+	// copy the pointers (scheme, username, password, ..., fragment)
+	srcp = &src->scheme;
+	dstp = &dst->scheme;
+	for (i = 0; i < _URL_ELEMENT_COUNT; i++)
+	{
+		if (srcp[i] < src->buffer
+			|| (srcp[i] - src->buffer >= URL_MAX_BUFFER_SIZE) )
+		{
+			// srcp points outside of src->buffer
+			dstp[i] = srcp[i];
+		}
+		else
+		{
+			dstp[i] = &dst->buffer[srcp[i] - src->buffer];
+		}
+	}
+	return dst;
+}
+
+/*** BeginHeader url_dump */
+void url_dump( url_parsed_t __far *parsed);
+/*** EndHeader */
+// currently-private API, dump url structure to stdout (for debug)
+_url_debug
+char * _url_offs(url_parsed_t __far * pp, const char __far * ptr)
+{
+	static char v[4];
+	char __far * b = pp->buffer;
+	if (ptr < b || ptr >= b+sizeof(pp->buffer))
+		return "---";
+	sprintf(v, "%3lu", ptr - b);
+	return v;
+}
+
+_url_debug
+void url_dump( url_parsed_t __far *p)
+{
+	if (!p)
+		return;
+	if (p->flags & URL_FLAG_AMBIGUOUS)
+		printf("<ambiguous as to host or path>\n");
+	if (p->flags & URL_FLAG_RELATIVE_SCHEME)
+		printf("<relative to scheme>\n");
+	if (p->flags & URL_FLAG_RELATIVE_HOST)
+		printf("<relative to host>\n");
+   printf("scheme    : %s : %ls\n", _url_offs(p, p->scheme), p->scheme);
+   printf("userinfo  : %s : %ls\n", _url_offs(p, p->userinfo), p->userinfo);
+   printf("username  : %s : %ls\n", _url_offs(p, p->username), p->username);
+   printf("password  : %s : %ls\n", _url_offs(p, p->password), p->password);
+   printf("hostname  : %s : %ls\n", _url_offs(p, p->hostname), p->hostname);
+   printf("port      :     : %u\n", p->port);
+   printf("path      : %s : %ls\n", _url_offs(p, p->path), p->path);
+   printf("filename  : %s : %ls\n", _url_offs(p, p->filename), p->filename);
+   printf("query     : %s : %ls\n", _url_offs(p, p->query), p->query);
+   printf("fragment  : %s : %ls\n", _url_offs(p, p->fragment), p->fragment);
+//	printf( "buffer:\n");
+//	mem_dump( parsed->buffer, sizeof(parsed->buffer));
+}
+
+/*** BeginHeader url_clear */
+void url_clear( url_parsed_t __far *parsed);
+/*** EndHeader */
+// currently-private API, clear the url_parsed_t structure
+_url_debug
+void url_clear( url_parsed_t __far *parsed)
+{
+	//auto int i;
+	//auto char far * far *p;
+
+	_f_memset( parsed, 0, sizeof(*parsed));
+/* SJH - changed so that parser sets pointers to empty strings if element not
+         found.
+
+	// Instead of setting all of the pointers to NULL, have them point to an
+	// empty string (at the start of the buffer) instead.
+	// Buffer starts with "/" string, because an empty path is pointed here.
+	p = &parsed->scheme;
+	parsed->buffer[0] = '/';
+	parsed->buffer[1] = 0;
+	for (i = 0; i < _URL_ELEMENT_COUNT; i++)
+	{
+		p[i] = parsed->buffer + 1;		// point to the null (above)
+	}
+*/
+}
+
+/*** BeginHeader url_parse, _url_parse */
+int _url_parse( url_parsed_t __far *parsed, const char __far *url,
+					word flags, url_parsed_t __far * base);
+int url_parse( url_parsed_t __far *parsed, const char __far *url);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+url_parse																			<url.lib>
+
+SYNTAX:			int url_parse( url_parsed_t far *parsed, const char far *url)
+
+DESCRIPTION: 	Parses a URL into its component parts, for passing into other
+					functions.  See function help for url_parsed_t for information
+					on the fields of that structure.
+
+					Note that this function will accept invalid URLs.  It shouldn't
+					return an error for valid URLs, but it can return success for
+					invalid URLs.
+
+					A URL with no scheme (i.e. no ://), which does not start
+					with a '/', is assumed to be a host.  See _url_parse()
+					for other processing options.
+
+PARAMETER 1:	Structure to store the parsed URL in.  The returned structure
+               will maintain its own copy of the URL sub-strings.  All pointer
+               fields are guaranteed to be non-NULL if the return code is
+               zero.  Missing components in the URL have their corresponding
+               pointer field set to point to a zero length string.
+
+PARAMETER 2:   URL to parse.  No pointers to this parameter are stored, hence
+					it may safely be temporary storage (e.g. an auto variable).
+
+RETURN VALUE:  Integer code as follows:
+						 0: Success
+					   -EINVAL: Error parsing URL
+					   -E2BIG: URL is too big to parse.  Increase URL_MAX_BUFFER_SIZE
+					   		to handle larger URLs.
+
+END DESCRIPTION **********************************************************/
+
+/* START _FUNCTION DESCRIPTION ********************************************
+_url_parse																			<url.lib>
+
+SYNTAX: int _url_parse( url_parsed_t far *parsed, const char far *url,
+					word flags, url_parsed_t far * base);
+
+DESCRIPTION: 	Parses a URL into its component parts, for passing into other
+					functions.  See function help for url_parsed_t for information
+					on the fields of that structure.
+
+					Note that this function will accept invalid URLs.  It shouldn't
+					return an error for valid URLs, but it can return success for
+					invalid URLs.
+
+PARAMETER 1:	Structure to store the parsed URL in.  The returned structure
+               will maintain its own copy of the URL sub-strings.  All pointer
+               fields are guaranteed to be non-NULL if the return code is
+               zero.  Missing components in the URL have their corresponding
+               pointer field set to point to a zero length string.
+
+PARAMETER 2:   URL to parse.  No pointers to this parameter are stored, hence
+					it may safely be temporary storage (e.g. an auto variable).
+
+PARAMETER 3:   Processing options.  Currently, this may be either
+                 0: resolve ambiguous URL as a hostname
+					  URL_FLAG_RELATIVE_HOST: resolve ambiguous URL as a path.
+					For example:
+					  www.foo.com:8080
+					is (in spite of appearances) ambiguous, since it does not
+					start with '/' or a scheme (such as 'http://').
+					If this parameter is 0, then this URL would resolve to the
+					host name and port, as expected.  Otherwise, it would resolve
+					to a path (relative to some other host) since it is syntactically
+					valid as such.  Parameter 4 provides missing parts of the URL
+					if required.
+
+PARAMETER 4:	For relative URLs, i.e. those which start with a '/' or are
+					ambiguous, this parameter may provide initial parts of the
+					URL, such as a default scheme and/or host name.  If NULL, then
+					no defaults are provided.
+
+					This is useful for constructing absolute URLs based on a given
+					(pre-parsed) URL, plus a relative part (in parameter 2).  It is
+					only used if the given URL is in fact relative.
+
+					If URL starts with a scheme (an alphanumeric string followed
+					by '://') then it is absolute and this parameter is not used.
+
+					Else if the URL starts with '//', or is ambiguous but parameter
+					3 is zero, then the scheme field of this parameter provides a
+					default scheme.
+
+					Else if the URL starts with a single '/', or is ambiguous and
+					parameter 3 is URL_FLAG_RELATIVE_HOST, then this parameter
+					provides default scheme, userinfo, username, password, hostname,
+					and port.
+
+RETURN VALUE:  Integer code as follows:
+						 0: Success
+					   -EINVAL: Error parsing URL
+					   -E2BIG: URL is too big to parse.  Increase URL_MAX_BUFFER_SIZE
+					   		to handle larger URLs.
+
+END DESCRIPTION **********************************************************/
+
+_url_debug
+int url_parse( url_parsed_t __far *parsed, const char __far *url)
+{
+	return _url_parse(parsed, url, 0, NULL);
+}
+
+_url_debug
+int _url_parse( url_parsed_t __far *parsed, const char __far *url,
+					word flags, url_parsed_t __far * base)
+{
+	auto enum {
+	   URL_PARSING_START,
+	   URL_PARSING_PATH,
+	   URL_PARSING_QUERY,
+	   URL_PARSING_FRAGMENT
+	} state;
+	auto word i;
+	auto int have_scheme;
+	auto int copy_to_host;
+	auto char __far * __far *p;
+	auto char __far *element;				// start of hostname, userinfo or scheme
+	auto char __far *curpos;				// output position in buffer
+	auto char __far *colon;					// position of colon in buffer
+	auto char __far *bufend;				// end of buffer
+	auto const char __far *urlpos;	// parse position in URL
+	auto int c;							// current character
+	auto int error;
+
+	auto unsigned long port;		// strtol conversion of port listed in URL
+	auto char __far *endport;				// pointer to end or port parse
+
+	// this function is not checking for overflow
+
+	if (! parsed)
+	{
+		return -EINVAL;
+	}
+
+	#ifdef URL_VERBOSE
+		printf( "\nParsing %ls\n", url);
+	#endif
+
+	have_scheme = 0;
+
+	url_clear( parsed);
+	state = URL_PARSING_START;
+	bufend = parsed->buffer + sizeof(parsed->buffer) - 2;	// Allow for extra null term
+	urlpos = url;
+	colon = NULL;
+	error = 0;
+
+   // Look ahead to see if scheme provided
+   element = _f_strstr(url, "://");
+   if (element) {
+      // Temporarily cast away const
+      for (curpos = (char __far *)url; curpos < element; ++curpos) {
+         c = *curpos;
+         if (!(isalnum(c) || c=='.' || c=='-' || c == '+'))
+            break;
+      }
+      if (curpos != element)
+         error = -EINVAL;  // Invalid scheme
+      else
+         have_scheme = 1;
+   }
+
+	element = curpos = parsed->buffer + 1;	// Leave a null at start of buffer
+
+	// Special case: if starts with "//" then is authority section without
+	// a scheme.  No scheme means relative.
+	if (!memcmp(url, "//", 2)) {
+		parsed->flags |= URL_FLAG_RELATIVE_SCHEME;
+		urlpos += 2;
+	_copy_scheme:
+		if (base) {
+			_f_strcpy(curpos, base->scheme);
+			parsed->scheme = curpos;
+			curpos += strlen(curpos) + 1;
+			element = curpos;
+		}
+	}
+	else if (*url == '/' || *url != '/' && !have_scheme) {
+		copy_to_host = 1;
+		if (*url == '/')
+			parsed->flags |= URL_FLAG_RELATIVE_HOST;
+		else {
+	      parsed->flags |= URL_FLAG_AMBIGUOUS;
+	      if (!(flags & URL_FLAG_RELATIVE_HOST)) {
+	      	copy_to_host = 0;
+	      	// Get scheme only if available
+	      	goto _copy_scheme;
+	      }
+	   }
+		if (copy_to_host) {
+			if (base) {
+	         // Duplicate everything from scheme, userinfo, hostname, port
+	         i = (word)(base->path - base->buffer);
+	         _f_memcpy(parsed->buffer, base->buffer, i);
+	         curpos = parsed->buffer + i;
+	         parsed->scheme = parsed->buffer + (base->scheme - base->buffer);
+	         parsed->userinfo = parsed->buffer + (base->userinfo - base->buffer);
+	         parsed->username = parsed->buffer + (base->username - base->buffer);
+	         parsed->password = parsed->buffer + (base->password - base->buffer);
+	         parsed->hostname = parsed->buffer + (base->hostname - base->buffer);
+	         parsed->port = base->port;
+			}
+         *curpos = '/';     // insert a new slash for path/file
+         parsed->path = curpos;
+         parsed->filename = ++curpos;
+         state = URL_PARSING_PATH;
+         if (*url == '/')
+         	++urlpos;
+		}
+	}
+
+
+	while ( !error && (c = *curpos = *urlpos++) )
+	{
+/* DEVNOTE: To support more urls, this code should be updated to handle
+   pct-encoded strings (like %20).  When requesting files from web servers,
+   it won't be necessary to decode those strings, but using an FTP url
+   would require decoding the username and password, and possibly even the
+   pathname information.
+
+   This could be accomplished by copying the url byte-by-byte and converting
+   pct-encoded characters along the way.
+*/
+		/*
+		if (c == '%')
+		{
+			// decode pct-encoded character
+			c = hexstrtobyte( urlpos)
+			if (c == -1)
+			{
+            #ifdef URL_VERBOSE
+               printf( "%s: invalid pct-encoded character %%%.*ls\n",
+               	"url_parse", 2, urlpos);
+            #endif
+            error = -EINVAL;
+			}
+			else
+			{
+				// update buffer with decoded character, advance past encoded char
+				// in original url
+				*curpos = c;
+				urlpos += 2;
+			}
+		}
+		else
+		*/
+		switch (state)
+		{
+	      case URL_PARSING_START:
+	      	if (c == ':')
+	      	{
+					if (!parsed->scheme && urlpos[0] == '/' && urlpos[1] == '/')
+					{
+						// this is first occurrence of "://"
+						if (parsed->flags & (URL_FLAG_RELATIVE_SCHEME | URL_FLAG_RELATIVE_HOST)) {
+							// Cannot have e.g. '//http://'
+							error = -EINVAL;
+							break;
+						}
+	               *curpos = '\0';   // replace colon to null-terminate scheme
+						parsed->scheme = element;
+						urlpos += 2;		// skip over the "//"
+						element = curpos + 1;
+						parsed->flags &= ~URL_FLAG_AMBIGUOUS;
+					}
+					else
+					{
+						// this colon is either inside userinfo (user:pass) or
+						// it separates the hostname from the port
+						if (!colon)
+						{
+							// keep track of first colon in userinfo, or colon
+							// separating hostname from port
+							colon = curpos;
+						}
+					}
+	      	}
+	      	else if (c == '@')
+	      	{
+	      		if (parsed->userinfo)
+	      		{
+						#ifdef URL_VERBOSE
+							printf( "multiple userinfo found in URL\n");
+						#endif
+						error = -EINVAL;
+	      		}
+	      		else
+	      		{
+	      			*curpos = '\0';		// replace '@' to null-terminate userinfo
+	               parsed->username = parsed->userinfo = element;
+	               if (colon)
+	               {
+							parsed->password = colon + 1;
+							colon = NULL;
+	               }
+	               element = curpos + 1;
+	            }
+	      	}
+	      	else if (c == '/')
+	      	{
+               *curpos = '\0';   // replace '/' to null-terminate hostname/port
+	      		*++curpos = '/';		// insert a new slash for path/file
+               if (!parsed->hostname)
+                  parsed->hostname = element;
+					parsed->path = curpos;
+					parsed->filename = curpos + 1;
+					state = URL_PARSING_PATH;
+	      	}
+	      	break;
+
+	      case URL_PARSING_PATH:
+	      	if (c == '/')
+	      	{
+					parsed->filename = curpos + 1;
+	      	}
+	      	if (c == '?')
+	      	{
+					state = URL_PARSING_QUERY;
+					parsed->query = curpos + 1;
+	      	}
+	      	// fall through to URL_PARSING_QUERY, which checks for fragment
+
+	      case URL_PARSING_QUERY:
+	      	if (c == '#')
+	      	{
+					state = URL_PARSING_FRAGMENT;
+					parsed->fragment = curpos + 1;
+	      	}
+	      	break;
+
+	      case URL_PARSING_FRAGMENT:
+	      	// nothing to do but wait until the end of the string
+	      	break;
+
+		}
+		if (++curpos >= bufend)
+		{
+			error = -E2BIG;
+		}
+	}
+
+   if (!error && colon)
+   {
+      // make sure port is 1-65535, and that strtol ended
+      // on the null-terminator (no extra characters) -- the hostname+port
+      // combination was previously null terminated.
+      port = _f_strtol( colon+1, &endport, 10);
+      if (!port || port & 0xFFFF0000 || *endport)
+      {
+         // Was not valid port, consider to be part of host
+      }
+      else {
+         parsed->port = (word) port;
+	      // hostname element included a port number.  Null-terminate the
+	      // hostname and advance the pointer to the port.
+	      *colon = '\0';     // replace ':' to null-terminate hostname
+		}
+   }
+
+	if (error)
+	{
+		#ifdef URL_VERBOSE
+			printf( "error %d parsing [%ls]\n", error, url);
+		#endif
+		url_clear( parsed);
+	}
+	else if (state == URL_PARSING_START)
+	{
+		// assume that we just got a bare hostname
+		parsed->hostname = element;
+		*++curpos = '/';
+		parsed->path = curpos;
+	}
+
+	*++curpos = 0;
+	p = &parsed->scheme;
+	if (!parsed->scheme)
+		parsed->scheme = parsed->buffer; // point to null at start of buffer
+	for (i = 1; i < _URL_ELEMENT_COUNT; i++)
+		if (!p[i])
+			// Null pointers get set to end of previous pointer's string.
+			// Makes non-descending pointer order.
+			p[i] = p[i-1] + strlen(p[i-1]);
+
+
+	#ifdef URL_VERBOSE
+	url_dump( parsed);
+	#endif
+
+	return error;
+}
+
+/*** BeginHeader url_unparse */
+char __far * url_unparse( url_parsed_t __far *parsed);
+/*** EndHeader */
+_url_debug
+char __far * url_unparse( url_parsed_t __far *parsed)
+{
+	// We assume that 'path' points to path,filename,query and fragment.
+	// i.e. everything to the right of the hostname.
+	// Userinfo points to username and password.
+	// Other stuff we reassemble.
+	// NOTE: returns storage allocated by _sys_malloc()! Caller must
+	// free it using _sys_free().
+	word len;
+	char port[7];
+	char __far * u;
+	char __far * p;
+
+	if (parsed->port)
+		sprintf(port, ":%d", parsed->port);
+	else
+		port[0] = 0;
+	len = 1 + strlen(port);	// add 1 for final null term
+	if (parsed->scheme[0])
+		len += strlen(parsed->scheme) + 3;	// 3 for ://
+	else if (parsed->flags & URL_FLAG_RELATIVE_SCHEME)
+		len += 2;	// 2 for initial //
+	if (parsed->userinfo[0])
+		len += strlen(parsed->userinfo) + 1;	// 1 for @
+	len += strlen(parsed->hostname);
+	len += strlen(parsed->path);
+	u = _sys_malloc(len);
+	p = u;
+	if (parsed->scheme[0])
+		p += sprintf(p, "%ls://", parsed->scheme);
+	else if (parsed->flags & URL_FLAG_RELATIVE_SCHEME)
+		*p++ = '/', *p++ = '/';
+	if (parsed->userinfo[0])
+		p += sprintf(p, "%ls@", parsed->userinfo);
+	sprintf(p, "%ls%s%ls", parsed->hostname, port, parsed->path);
+
+	return u;
+}
+
+/*** BeginHeader url_encodestr */
+int url_encodestr (char __far *buffer, int bufsize, const char __far *nonencode,
+	const char __far *encode);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+url_encodestr                                                     <URL.LIB>
+
+SYNTAX: int url_encodestr (char far *buffer, int bufsize,
+					const char far *nonencode, const char far *encode);
+
+DESCRIPTION: 	Copy 'nonencode' to 'buffer', followed by 'encode' in
+               url-encoded format (convert space to +, non-alphanumeric to
+               %xx (where xx is ASCII value in hex)).  Returns the number
+               of characters written to 'buffer'.
+
+PARAMETER 1: 	buffer to write the string into
+
+PARAMETER 2:	size of buffer
+
+PARAMETER 3: 	string to copy before encoded string (can be NULL or "")
+
+PARAMETER 4: 	string to encode
+
+RETURN VALUE:	The number of characters written.  If the output is
+truncated due to the len parameter, then this function returns the number
+of characters that would have been written had there been enough space.
+
+Example of how to build x-www-form-urlencoded data to submit to cgi scripts:
+
+	Format of fields to post is multiple name/value pairs, separated by '&'.
+	Each name/value pair is separated by '='.  Names should only contain
+	alphanumeric characters.  Numbers can be printed directly into value part
+	of name/value pair, but strings need to be encoded by this function.
+
+	char post[256];
+	char *p;
+
+	p = post;
+	// first name/value pair does not start with '&'
+	p += snprintf( p, (int) (post + sizeof(post) - p), "real=%5.3f", 3.1415);
+	// additional name/value pairs start with '&' to separate from last pair
+	p += snprintf( p, (int) (post + sizeof(post) - p), "&int=%d", 12345);
+	p += url_encodestr( p, (int) (post + sizeof(post) - p),
+														"&string=", "Some string :&$@?");
+
+	printf ("%s\n", post);
+	httpc_post_url (&hsock, "http://www.domain.com/cgi-bin/post.cgi",
+			post, (int)(p - post), NULL);
+
+END DESCRIPTION **********************************************************/
+_url_debug
+int url_encodestr (char __far *buffer, int bufsize, const char __far *nonencode,
+	const char __far *encode)
+{
+	auto char __far *p;
+	auto char outlen;		// bytes that would have been copied if there was room
+
+	#define _url_addchar(c) if (++outlen < bufsize) { *p++ = c; }
+
+	outlen = 0;
+	p = buffer;
+	if (nonencode)
+	{
+		for (; *nonencode; nonencode++)
+		{
+			_url_addchar( *nonencode);
+		}
+	}
+	if (encode)
+	{
+		for (; *encode; encode++)
+		{
+	      if (isalnum (*encode) || strchr( "-._~", *encode))
+	      {
+	      	// Per RFC 3986, these characters are unreserved and do not need
+	      	// to be encoded.
+	      	_url_addchar( *encode);
+	      }
+	      else
+	      {
+	      	_url_addchar( '%');
+
+	         // Extra spaces in strings below are to work around a bug in DC 10.
+	         // Without the space, the array bounds checking throws an error
+	         // when the index is 15.  See V27144.
+            _url_addchar( "0123456789abcdef "[(*encode) >> 4]);
+            _url_addchar( "0123456789abcdef "[(*encode) & 0x000F]);
+	      }
+		}
+	}
+
+	// only write the null-terminator if there was a valid buffer size
+	if (bufsize > 0)
+	{
+		*p = 0;
+	}
+
+	return outlen;
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+
+

@@ -1,0 +1,1344 @@
+/*** BeginHeader  ********************************************/
+#ifndef __REGISTRY_LIB
+#define __REGISTRY_LIB
+
+#ifdef REGISTRY_DEBUG
+	#define _registry_debug	__debug
+#else
+	#define _registry_debug	__nodebug
+#endif
+
+// Requires zserver for basic resource access
+#ifndef __ZSERVER_LIB
+	#use "zserver.lib"
+#endif
+
+// Temp buffer size.  Unwise to set below about 600.
+// This defines the limit on any single line length in the registry file.
+// The sum of key length, value length, plus 2 extra for the '=' separator
+// and the trailing newline, must not exceed this value.
+#ifndef _REGBUF_SIZE
+	#define _REGBUF_SIZE 	1025
+#endif
+
+
+typedef struct {
+	char __far *	key;		// Entry key.  Must not contain '=' or newlines, and
+								// must not start with '['.  Must be null-terminated.
+	void __far *  value;	// Entry value.  Type determined by options.  If the
+								// REGOPTION_STRING option is set, this must
+								// not contain newlines and must be null terminated.
+	int  options;			// Entry options and flags:  If value is greater
+								// than zero, then value is an arbitrary binary
+								// value with the specified length.  It will be
+								// stored in the registry with twice that many
+								// ascii hex digits.  If value is <= -10, then it is
+								// an ascii string with maximum length of (-options-8).
+								// Otherwise, this field is a simple enumeration
+								// indicating the data type as follows:
+#define REGOPTION_EOL			0		// End of list
+#define REGOPTION_SHORT			(-1)	// Signed short (2 byte) - stored as decimal
+#define REGOPTION_LONG			(-2)	// Signed long (4 byte) - stored as decimal
+#define REGOPTION_BOOL			(-3)	// int (2 byte) - stored as 1 (if non-zero)
+												// or 0.
+#define REGOPTION_FLOAT			(-4)	// IEEE float (4 byte).  Only available
+												// if STDIO_DISABLE_FLOATS *not* defined.
+												// stored in %f format
+#define REGOPTION_RESV5			(-5)
+#define REGOPTION_RESV6			(-6)
+#define REGOPTION_DELETE		(-7)	// Delete this entry if found
+#define REGOPTION_NOP			(-8)	// No operation: convenience for
+												// constructing RegistryEntry lists.
+#define REGOPTION_RESV9			(-9)
+
+#define REGOPTION_LEN_BASE		(-8)	// Value should be *last* option, +1.
+
+// For variable length data...
+#define REGOPTION_BIN(len)		(len)	// Binary of given fixed length - stored
+												// expanded into ascii hexadecimal.  len
+												// must be 1.._REGBUF_SIZE/2-M
+												// where M is the size of the key plus 2.
+												// As a rule of thumb, be careful when
+												// len is more than about 256.
+#define REGOPTION_STRING(len)	(REGOPTION_LEN_BASE-(len))
+												// Null-terminated string up to len
+												// chars counting the null terminator
+												// - stored as-is.  len must be at least 2.
+												// len must not be more than _REGBUF_SIZE-M
+												// where M is the size of the key plus 2.
+												// As a rule of thumb, be careful when
+												// len is more than about 512.
+	word	work;				// This is a work field for the registry read/write
+								// library functions.  May be left uninitialized by
+								// the caller unless otherwise noted in the
+								// function description.
+} RegistryEntry;
+
+
+typedef struct {
+	// This is necessary in order to maintain consistent "view" of registry
+	// update process.  Must be first field in order to make it convenient to
+	// cast between RegistryContext and ServerContext.
+	ServerContext		sctx;
+
+	int		old_spec;	// resource handle for old registry, or -1
+	int		new_spec; 	// resource handle for new registry, or -1
+
+	char		name[SSPEC_MAXNAME+3];	// Remember name of "old" resource
+
+} RegistryContext;
+
+/*** EndHeader ***********************************************/
+
+
+/*** BeginHeader _registry_repl_entry */
+int _registry_repl_entry(RegistryEntry __far * ent, int * key_delete,
+								char __far * value);
+/*** EndHeader */
+_registry_debug
+int _registry_repl_entry(RegistryEntry __far * ent, int * key_delete,
+								char __far * value)
+{
+	auto int len;
+	auto word i;
+
+	len = 0;
+	*key_delete = 0;
+
+   switch (ent->options) {
+   case REGOPTION_DELETE:
+      *key_delete = 1;
+      break;
+   case REGOPTION_SHORT:
+   	len = sprintf(value, "%d", *(int __far *)ent->value);
+      //len = strlen(value);
+      break;
+   case REGOPTION_BOOL:
+   	len = sprintf(value, "%d", *(int __far *)ent->value != 0);
+      //len = strlen(value);
+      break;
+   case REGOPTION_LONG:
+   	len = sprintf(value, "%ld", *(long __far *)ent->value);
+      //len = strlen(value);
+      break;
+#ifndef STDIO_DISABLE_FLOATS
+   case REGOPTION_FLOAT:
+   	len = sprintf(value, "%f", *(float __far *)ent->value);
+      //len = strlen(value);
+      break;
+#endif
+   default:
+   	if (ent->options < REGOPTION_LEN_BASE-1) {
+   		// REGOPTION_STRING
+   		len = strlen((char __far *)ent->value);
+   		if (len > -ent->options + REGOPTION_LEN_BASE)
+   			len = -ent->options + REGOPTION_LEN_BASE;
+      	_f_memcpy(value, (char __far *)ent->value, len);
+      	value[len] = 0;
+   	}
+   	else if (ent->options <= 0)
+   		break;	// reserved
+      else {
+	      // binary value, convert to hex.
+         //DEVIDEA: should check here for sufficient space, but currently depend
+         // on application using reasonable lengths.
+         for (i = 0; i < (word)ent->options; ++i) {
+            sprintf(value + len, "%02X", *(((char __far *)ent->value) + i));
+            len += 2;
+         }
+      }
+      break;
+   }
+   return len;
+}
+
+
+/*** BeginHeader _registry_read_entry */
+int _registry_read_entry(RegistryEntry __far * ent, char __far * value, int len);
+/*** EndHeader */
+_registry_debug
+int _registry_read_entry(RegistryEntry __far * ent, char __far * value, int len)
+{
+	auto word j;
+
+   switch (ent->options) {
+   case REGOPTION_SHORT:
+   	_f_sscanf(value, "%d", ent->value);
+   	break;
+   case REGOPTION_BOOL:
+   	_f_sscanf(value, "%d", ent->value);
+   	*(int __far *)ent->value = *(int __far *)ent->value != 0;
+   	break;
+   case REGOPTION_LONG:
+   	_f_sscanf(value, "%ld", ent->value);
+   	break;
+#ifndef STDIO_DISABLE_FLOATS
+   case REGOPTION_FLOAT:
+   	_f_sscanf(value, "%f", ent->value);
+   	break;
+#endif
+   default:
+   	if (ent->options < REGOPTION_LEN_BASE - 1) {
+   		// REGOPTION_STRING
+   		j = -ent->options + (REGOPTION_LEN_BASE - 1);
+   			// max dest length, not incl null term
+			if (len > j)
+				len = j;
+      	_f_memcpy((char __far *)ent->value, value, len);
+      	((char __far *)ent->value)[len] = 0;	// null term the dest str
+   	}
+   	else if (ent->options <= 0)
+   		break;
+   	else {
+      	// binary value, convert to hex.
+      	// Null padded on end if less source material.
+      	hexstr2bin(value, (char __far *)ent->value, (word)ent->options);
+      }
+      break;
+   }
+   return len;
+}
+
+/*** BeginHeader _f_sspec_write */
+int _f_sspec_write(int sspec, char __far * buf, int len);
+/*** EndHeader */
+_registry_debug
+int _f_sspec_write(int sspec, char __far * buf, int len)
+{
+	auto char rbuf[256];
+	auto int rc, k;
+
+	while ((rc = len)) {
+		if (rc > sizeof(rbuf))
+			rc = sizeof(rbuf);
+		_f_memcpy(rbuf, buf, rc);
+		buf += rc;
+		len -= rc;
+		rc = sspec_write(sspec, rbuf, k = rc);
+		if (rc < 0)
+			break;
+		if (rc < k)
+			// no can do, assume caller can't handle partial write
+			return -EPERM;
+	}
+	return rc;
+}
+
+
+/*** BeginHeader registry_write */
+
+/* START FUNCTION DESCRIPTION ********************************************
+registry_write                            <REGISTRY.LIB>
+
+SYNTAX: int registry_write(RegistryContext * r,
+                    char far * section, RegistryEntry far * entries);
+
+DESCRIPTION: 	Modify the old registry r->old_spec using the specified
+               registry entries, writing the result to r->new_spec.  Only
+               entries in the named 'section' may be altered.  This function
+               also allows entries and sections to be deleted.
+
+               The new and old files must be different, since this function
+               depends on reading from the old file, performing the requested
+               modifications, and writing the new file -- this is all done
+               line-by-line.  Generally, you will need two resource files
+               which will alternate.  Only when the modifications are
+               successfully complete will the "old" file be deleted.  This
+               makes the update process more resistant to corruption caused
+               by e.g. the user turning off the power in the middle of the
+               update.  The helper function registry_prep_write() automates this
+               process.  registry_update() is a function which encapsulates
+               the basic registry update process.
+
+               NOTE: since this function requires some temporary malloc
+               memory, you should ensure that there is at least _REGBUF_SIZE
+               bytes of available system-space malloc memory.  The
+               _REGBUF_SIZE macro defaults to 1025 bytes, but you may
+               override this definition before #use registry.lib.
+
+               Registry resources are similar to Windows ".ini" file
+               format.  They are ASCII formatted (and thus human readable)
+               and consist of one or more "sections", each of which has
+               zero or more key=value lines.  For example
+
+                 [net settings]
+                 ip=10.10.6.100
+                 ssid=Rabbit
+                 [app settings]
+                 some integer=23
+                 a string=hello world
+
+               Each section is headed by a string enclosed in square
+               brackets.  Within each section is a list of key strings
+               followed by '=' followed by the value of that entry.  The
+               key string is arbitrary except that it cannot start with '['
+               or contain any '=', null or newline characters.  The value
+               string is arbitrary except that newline and null characters are
+               not allowed. Section names are arbitrary except they cannot
+               contain ']', null or newline characters.  Spaces are
+               always significant.  In particular, don't put spaces on either
+               side of the '=' separator.
+
+               If there are duplicate keys in the entries table, then it is
+               undefined which of the entries actually gets stored.  Don't
+               do it.
+
+               Normally, you do not need to be concerned with the above
+               format rules, since the library functions enforce them.
+
+               If you need to store null (binary zero) or newline (binary
+               0x0A or, in C syntax, "\n") then your application will need
+               to use some sort of convention for "escaping" such characters,
+               or you can use the REGOPTION_BIN() option which will store
+               the string expanded into ascii hexadecimal, which is completely
+               safe.
+
+					Individual key/value entries may be deleted by specifying the
+					REGOPTION_DELETE flag with the appropriate entries.
+
+PARAMETER1:		RegistryContext structure, with at least the old_spec and
+					new_spec fields initialized.  For example, use
+						registry_prep_write()
+					to set up this structure correctly.
+
+					r->old_spec:
+					Open resource handle of a readable resource containing
+               the old registry settings.  This is read from the current
+               seek position, thus in most cases you will want to call this
+               function with a freshly opened resource handle.
+               This may also be -1, which indicates there is *no* old
+               registry to update, and a new registry will be written to
+               new_spec.
+
+               r->new_spec:
+         		Open resource handle of a writable resource, to which
+               the old registry (modified with the given settings) will
+               be written.  Normally, this should initially be an
+               empty resource file.  The new settings will be written
+               starting at the current seek position in this resource.
+
+               Note that the resource handles remain open when this function
+               returns.
+PARAMETER2:    Section name.  If NULL or empty string, then the first
+               (anonymous) section of the registry is implied.
+PARAMETER3: 	List of replacement registry entries.  Each element in this
+               array is as follows:
+
+	            typedef struct {
+	               char far *  key;
+	               	// Entry key.  Must not contain '=' or newlines, and
+	                  // must not start with '['.  Must be null-terminated.
+	               void far *  value;
+	               	// Entry value.  Type determined by options.  If the
+	                  // REGOPTION_STRING option is set, this must
+	                  // not contain newlines and must be null terminated.
+	               int  options;
+	               	// Entry options and flags:  If value is greater
+	                  // than zero, then value is an arbitrary binary
+	                  // value with the specified length.  It will be
+	                  // stored in the registry with twice that many
+	                  // ascii hex digits.  If value is <= -10, then it is
+	                  // an ascii string with maximum length of (-options-8).
+	                  // Otherwise, this field is a simple enumeration
+	                  // indicating the data type as follows:
+	            #define REGOPTION_EOL         0     // End of list
+	            #define REGOPTION_SHORT       (-1)  // Signed short (2 byte) -
+	            												//  stored as decimal
+	            #define REGOPTION_LONG        (-2)  // Signed long (4 byte) -
+	            												//  stored as decimal
+	            #define REGOPTION_BOOL        (-3)  // int (2 byte) - stored as
+	            												// 1 (if non-zero) or 0.
+	            #define REGOPTION_FLOAT       (-4)  // IEEE float (4 byte).
+	            												// Only available
+	                                                // if STDIO_DISABLE_FLOATS
+	                                                // *not* defined.
+	                                                // stored in %f format
+	            #define REGOPTION_RESV5       (-5)
+	            #define REGOPTION_RESV6       (-6)
+	            #define REGOPTION_DELETE      (-7)  // Delete this entry if found
+	            #define REGOPTION_NOP         (-8)  // No operation: convenience
+	            												// for constructing
+	                                                // RegistryEntry lists.
+	            #define REGOPTION_RESV9       (-9)
+	            // For variable length data...
+	            #define REGOPTION_BIN(len)    (len)
+	            	// Binary of given fixed length - stored expanded into ascii
+	            	// hexadecimal.  len must be 1.._REGBUF_SIZE/2-M where M is
+	            	// the size of the key plus 2.  As a rule of thumb, be
+	            	// careful when len is more than about 256.
+	            #define REGOPTION_STRING(len) (-8-(len))
+	            	// Null-terminated string up to len chars counting the null
+	            	// terminator - stored as-is.  len must be at least 2.
+	               // len must not be more than _REGBUF_SIZE-M where M is the
+	               // size of the key plus 2.  As a rule of thumb, be careful
+	               // when len is more than about 512.
+
+	               word  work;
+	               	// This is a work field for the registry read/write
+	                  // library functions.  May be left uninitialized by
+	                  // the caller unless otherwise noted in the
+	                  // function description.
+	            } RegistryEntry;
+
+               The list MUST be terminated with an entry with the
+					REGOPTION_EOL option.
+               Caution: if this pointer is NULL, then the entire section
+               is deleted.
+RETURN VALUE:  <0  failure to write or read the resource
+               0	 success.
+
+SEE ALSO:		sspec_open, registry_read, registry_update, registry_get,
+					registry_prep_write, registry_finish_write
+
+END DESCRIPTION **********************************************************/
+
+
+int registry_write(RegistryContext * r,
+                    char __far * section, RegistryEntry __far * entries);
+/*** EndHeader */
+
+
+
+
+_registry_debug
+int registry_write(RegistryContext * r,
+                    char __far * section, RegistryEntry __far * entries)
+{
+/* Algorithm is to read line-by-line from old_spec until encountering matching
+   section (if any).  Each line is copied to new_spec.  If a matching section
+   is found, then for each key/value line within, the given entries table is
+   scanned to see if there is a matching key entry.  If so, then the new
+   entry is written, otherwise the old entry is copied.  This proceeds until
+   a new section is encountered, in which case the remaining unwritten
+   entries (if any) are written, then rest of the old file is
+   copied.  If there was no matching section found in the old file, a new
+   section is created in the new file and all table entries dumped to it.
+*/
+	auto word nent;		// Number of entries provided.
+	auto word i;
+	auto int sect_delete;
+	auto int key_delete;
+	auto int sect_search;
+	auto char __far * buf;
+	auto char __far * key;
+	auto char __far * value;
+	auto int keylen;
+	auto int rc, linelen;
+	auto int sect_strlen;
+	auto int replaced;
+	auto int old_spec;
+	auto int new_spec;
+
+	old_spec = r->old_spec;
+	new_spec = r->new_spec;
+
+#ifdef REGISTRY_VERBOSE
+	printf("registry_write(old=%d new=%d sect=%ls)\n",
+					old_spec, new_spec, section);
+#endif
+
+	sect_delete = 0;
+	sect_search = section != NULL && section[0];
+	sect_strlen = sect_search ? strlen(section) : 0;
+
+	buf = _sys_malloc(_REGBUF_SIZE);
+	if (!buf)
+		return -ENOMEM;
+
+	if (!entries) {
+		nent = 0;
+		sect_delete = 1;
+	}
+	else {
+		// Count entries, and clear work.
+		for (nent = 0; entries[nent].options != REGOPTION_EOL; ++nent)
+			entries[nent].work = 0;
+	}
+
+	if (old_spec >= 0)
+		for (;;) {
+	      // Read next line
+	      linelen = sspec_readchr(old_spec, buf, _REGBUF_SIZE, '\n');
+	      if (linelen < 0) {
+	         rc = linelen;
+	         goto _exit;
+	      }
+	      if (linelen == 0 && sspec_read(old_spec, NULL, 0) == 0)
+	         // EOF
+	         break;
+	      if (sect_search) {
+	         if (buf[0] == '['
+	             && linelen >= sect_strlen+3
+	             && !memcmp(section, buf+1, sect_strlen)
+	             && buf[sect_strlen+1] == ']') {
+	            sect_search = 0;  // search over
+	            if (!sect_delete) {
+	               rc = _f_sspec_write(new_spec, buf, linelen);
+	               if (rc < 0) goto _exit;
+	            }
+	         }
+	         else {
+	            rc = _f_sspec_write(new_spec, buf, linelen);
+	            if (rc < 0) goto _exit;
+	         }
+	      }
+	      else {
+	         // not sect_search, must be doing key/values
+	         if (buf[0] == '[') {
+	            // Got to new section.
+	            // Process remaining entries (if any) to insert them
+	            if (!sect_delete) {
+	               for (i = 0; i < nent; ++i)
+	                  if (!entries[i].work) {
+	                     // Note that section header is trashed by the following,
+	                     // but this is fixed below because we seek back to the
+	                     // start and re-read.
+	                     _f_strcpy(buf, entries[i].key);
+	                     rc = strlen(buf);
+	                     buf[rc++] = '=';
+	                     rc += _registry_repl_entry(entries+i,
+	                     									&key_delete, buf+rc);
+	                     if (!key_delete) {
+	                        buf[rc++] = '\n';
+	#ifdef REGISTRY_VERBOSE
+	                        printf("inserting %.*ls", rc, buf);
+	#endif
+	                        rc = _f_sspec_write(new_spec, buf, rc);
+	                        if (rc < 0) goto _exit;
+	                     }
+	                  }
+	            }
+	            // Need to re-read line which was overwritten above
+	            rc = sspec_seek(old_spec, -linelen, SEEK_CUR);
+	            if (rc < 0) goto _exit;
+	            sect_search = 1;
+	            continue;
+	         }
+	         key_delete = replaced = 0;
+	         if (!sect_delete) {
+	            key = buf;
+	            value = _f_memchr(key, '=', linelen);
+	            if (value) {
+	               keylen = (int)(value - key);
+	               *value = 0; // null term it
+	               ++value; // skip the '=' (now null)
+	               // Scan replacement array and replace if found
+	               for (i = 0; i < nent; ++i)
+	                  if (!strcmp(entries[i].key, key) && !entries[i].work) {
+	                     // found it
+	                     entries[i].work = 1; // indicate processed
+	                     rc = _registry_repl_entry(entries+i,
+	                     									&key_delete, value);
+	                     linelen = keylen + 1 + rc;
+	                     buf[linelen++] = '\n';
+	                     replaced = 1;
+	                     break;
+	                  }
+		            buf[keylen] = '=';   // put the '=' back in
+	            }
+	         }
+	         if (!key_delete && !sect_delete) {
+	#ifdef REGISTRY_VERBOSE
+	            printf("%s %.*ls", replaced ? "replaced" : "unchanged",
+	            						linelen, buf);
+	#endif
+	            rc = _f_sspec_write(new_spec, buf, linelen);
+	            if (rc < 0) goto _exit;
+	         }
+	      }
+	   }	// if (...) for(;;)
+
+	if (sect_search && !sect_delete) {
+		// Never found section we were looking for.  Insert all at end
+		sprintf(buf, "[%ls]\n", section);
+		linelen = strlen(buf);
+#ifdef REGISTRY_VERBOSE
+      printf("new section %.*ls", linelen, buf);
+#endif
+      rc = _f_sspec_write(new_spec, buf, linelen);
+      if (rc < 0) goto _exit;
+      sect_search = 0;
+   }
+
+   if (!sect_search) {
+   	// Finally, write out any unwritten entries if not in search mode
+      for (i = 0; i < nent; ++i) if (!entries[i].work) {
+         _f_strcpy(buf, entries[i].key);
+         rc = strlen(buf);
+         buf[rc++] = '=';
+         rc += _registry_repl_entry(entries+i, &key_delete, buf+rc);
+         if (!key_delete) {
+            buf[rc++] = '\n';
+#ifdef REGISTRY_VERBOSE
+            printf("inserting %.*ls", rc, buf);
+#endif
+            rc = _f_sspec_write(new_spec, buf, rc);
+            if (rc < 0) goto _exit;
+         }
+      }
+	}
+	rc = 0;
+
+_exit:
+	_sys_free(buf);
+	return rc;
+}
+
+/*** BeginHeader registry_read */
+
+/* START FUNCTION DESCRIPTION ********************************************
+registry_read                            <REGISTRY.LIB>
+
+SYNTAX:	int registry_read(RegistryContext * r,
+                    char far * section, RegistryEntry far * entries);
+
+DESCRIPTION: 	Read the registry r->old_spec using the specified
+               registry entries.  Only entries in the named 'section' are
+               read, and the results are placed at the locations pointed to
+               by the RegistryEntry array elements.
+
+               NOTE: since this function requires some temporary malloc
+               memory, you should ensure that there is at least _REGBUF_SIZE
+               bytes of available system-space malloc memory.  The
+               _REGBUF_SIZE macro defaults to 1025 bytes, but you may
+               override this definition before #use registry.lib.
+
+PARAMETER1:		RegistryContext structure, with at least the old_spec field
+					initialized.  For example, use
+						registry_prep_read()
+					to set up this structure correctly.
+
+					r->old_spec:
+					Open resource handle of a readable resource containing
+               the registry settings.  This is read from the current
+               seek position, thus in most cases you will want to call this
+               function with a freshly opened resource handle.
+PARAMETER2:    Section name.  If NULL or empty string, then the first
+               (anonymous) section of the registry is implied.
+PARAMETER3: 	List of registry entries to read.  See the description for
+					registry_write() for details.  The 'value' field will be set
+					to point to the location where the read value is stored.
+					If the key does not exist in the specified section, then the
+					contents at this location will be untouched.  Thus, you can
+					set 'default' values at each location before calling
+					registry_read().
+
+               As for registry_write(), the list MUST be terminated with an
+               entry with the REGOPTION_EOL option.
+RETURN VALUE:  <0  failure to write or read the resource
+               0	 success.
+
+SEE ALSO:		sspec_open, registry_write, registry_update, registry_get,
+					registry_prep_read, registry_finish_read
+
+END DESCRIPTION **********************************************************/
+
+int registry_read(RegistryContext * r,
+                    char __far * section, RegistryEntry __far * entries);
+/*** EndHeader */
+
+_registry_debug
+int registry_read(RegistryContext * r,
+                    char __far * section, RegistryEntry __far * entries)
+{
+	auto word nent;		// Number of entries provided.
+	auto word i;
+	auto int sect_search;
+	auto char __far * buf;
+	auto char __far * key;
+	auto char __far * value;
+	auto int keylen;
+	auto int rc, linelen;
+	auto int sect_strlen;
+	auto int spec;
+
+	spec = r->old_spec;
+
+#ifdef REGISTRY_VERBOSE
+	printf("registry_read(spec=%d sect=%ls)\n", spec, section);
+#endif
+
+	sect_search = section != NULL && section[0];
+	sect_strlen = sect_search ? strlen(section) : 0;
+
+	buf = _sys_malloc(_REGBUF_SIZE);
+	if (!buf)
+		return -ENOMEM;
+
+   // Count entries, and clear work.
+   for (nent = 0; entries[nent].options != REGOPTION_EOL; ++nent)
+      entries[nent].work = 0;
+
+	for (;;) {
+		// Read next line
+		linelen = sspec_readchr(spec, buf, _REGBUF_SIZE, '\n');
+		if (linelen < 0) {
+			rc = linelen;
+			goto _exit;
+		}
+		if (linelen == 0 && sspec_read(spec, NULL, 0) == 0)
+			// EOF
+			break;
+		if (sect_search) {
+			if (buf[0] == '['
+			    && linelen >= sect_strlen+3
+			    && !memcmp(section, buf+1, sect_strlen)
+			    && buf[sect_strlen+1] == ']') {
+				sect_search = 0;	// search over
+			}
+		}
+		else {
+			// not sect_search, must be doing key/values
+			if (buf[0] == '[') {
+				// Got to new sect.  Break, since we don't exhaustively search
+				// once we have found at least one matching section.
+				break;
+			}
+         key = buf;
+         value = _f_memchr(key, '=', linelen);
+         if (value) {
+            keylen = (int)(value - key);
+            *value = 0; // null term it
+            ++value; // skip the '=' (now null)
+            // Are we looking for this key?
+            for (i = 0; i < nent; ++i)
+               if (!strcmp(entries[i].key, key) && !entries[i].work) {
+                  // found it (first time)
+                  entries[i].work = 1; // indicate processed
+                  // sub 2 to account for '=' and trailing '\n'
+                  rc = _registry_read_entry(entries+i, value,
+                  									linelen - 2 - keylen);
+                  break;
+               }
+         }
+		}
+	}
+
+	rc = 0;
+
+_exit:
+	_sys_free(buf);
+	return rc;
+}
+
+/*** BeginHeader registry_enumerate */
+
+/* START FUNCTION DESCRIPTION ********************************************
+registry_enumerate                            <REGISTRY.LIB>
+
+SYNTAX:	int registry_enumerate(RegistryContext * r, int (*f)(),
+											int keyvalues, void far * ptr);
+
+DESCRIPTION: 	Enumerate registry r->old_spec, calling the specified function
+               f for each section header and, optionally, key=value pair.
+
+               Note that the registry_get() function also performs enumeration;
+               in fact it is a wrapper for this function.
+
+PARAMETER1:		RegistryContext structure, with at least the old_spec field
+					initialized.  For example, use
+						registry_prep_read()
+					to set up this structure correctly.
+
+					r->old_spec:
+					Open resource handle of a readable resource containing
+               the registry settings.  This is read from the current
+               seek position, thus in most cases you will want to call this
+               function with a freshly opened resource handle.
+PARAMETER2:    A callback function to be invoked.  The prototype for this
+               function must be as follows:
+						int f(void far * ptr,
+						      int new_sect,
+						      char * sect,
+						      char far * key,
+						      char far * value) { ... }
+					where the parameters are
+					  ptr - this is passed through from the 4th parameter to
+					        the registry_enumerate function (see below).
+					  new_sect - boolean indicating whether this call is to
+					        introduce a new section.  If true, then 'sect' is the
+					        new section name, and 'key' and 'value' are not
+					        relevant.
+					  sect - name of section if new_sect flag is true
+					  key - key (field) ascii string if new_sect is false
+					  value - value as an ascii string if new_sect is false.
+
+PARAMETER3:		Boolean indicating whether the callback function is to be
+					invoked for key=value pairs (if true).  In either case, the
+					callback is inkoked whenever a new section is found, and the
+					new_sect callback parameter will be set true.
+PARAMETER4:    An arbitrary pointer which will be passed through to the callback
+               on each invocation.
+RETURN VALUE:  <0  failure to write or read the resource
+               0	 success.
+
+SEE ALSO:		sspec_open, registry_read, registry_update, registry_get,
+               registry_prep_read, registry_finish_read
+
+END DESCRIPTION **********************************************************/
+
+int registry_enumerate(RegistryContext * r, int (*f)(), int keyvalues,
+								void __far * ptr);
+/*** EndHeader */
+
+_registry_debug
+int registry_enumerate(RegistryContext * r, int (*f)(), int keyvalues,
+								void __far * ptr)
+{
+	auto char sect[128];
+	auto char __far * buf;
+	auto char __far * key;
+	auto char __far * value;
+	auto char __far * nt;
+	auto int keylen;
+	auto int rc, linelen;
+	auto int sect_strlen;
+	auto int spec;
+
+	spec = r->old_spec;
+
+	buf = _sys_malloc(_REGBUF_SIZE);
+	if (!buf)
+		return -ENOMEM;
+
+	for (;;) {
+		// Read next line
+		linelen = sspec_readchr(spec, buf, _REGBUF_SIZE, '\n');
+		if (linelen < 0) {
+			rc = linelen;
+			goto _exit;
+		}
+		if (linelen == 0 && sspec_read(spec, NULL, 0) == 0)
+			// EOF
+			break;
+      if (buf[0] == '[') {
+      	key = _f_strchr(buf, ']');
+      	if (key) {
+      		*key = 0;
+      		_f_strcpy(sect, buf+1);
+      		rc = f((void __far *)ptr, (int)1, (char *)sect,
+      							(char __far *)NULL, (char __far *)NULL);
+      		if (rc)
+      			goto _exit;
+      	}
+      }
+      else {
+      	if (keyvalues) {
+      		key = buf;
+      		value = _f_strchr(key, '=');
+      		if (value) {
+      			*value = 0;
+      			++value;
+      			nt = _f_strchr(value, '\n');
+      			if (nt)
+      				*nt = 0;
+      		}
+      		rc = f((void __far *)ptr, (int)0, (char *)sect,
+      							(char __far *)key, (char __far *)value);
+      	}
+      }
+
+	}
+	rc = 0;
+
+_exit:
+	_sys_free(buf);
+	return rc;
+}
+
+
+/*** BeginHeader registry_prep_read */
+
+/* START FUNCTION DESCRIPTION ********************************************
+registry_prep_read                            <REGISTRY.LIB>
+
+SYNTAX:	int registry_prep_read(RegistryContext * r,
+                                char * basename,
+                                ServerContext * context);
+
+DESCRIPTION:	Prepare for reading a registry.  This function helps organize
+               registry resources in order to create a robust registry.
+
+               Most applications will use the sequence of functions
+
+                 registry_prep_read()
+                 registry_read() and/or registry_enumerate()
+                 registry_finish_read()
+
+               or simply
+
+                 registry_get()
+
+               Registry updates require reading from an old registry, editing
+               it, then writing the modified result to a new registry
+               resource.  This requires two resources to be open.  Normally,
+               the "old" registry will be deleted once the update is
+               successful.  If there is a power outage or reset during this
+               process, it is possible for two registry files to exist when
+               the system is restarted.  This causes problems, since one of the
+               registries may be corrupt.  This API imposes a naming convention
+					on the old/new resources so that a non-corrupt registry can
+					always be found.
+
+					The algorithm used appends an extension to the basename resource
+					name.  The extension is ".1", ".2" or ".3".  The "current"
+					registry resource will cycle through these extensions.
+					It is assumed that exactly 0, 1 or 2 of these resources
+					will exist at any time.  This means that at least one of the
+					possible resource names will not exist.  (If all three exist,
+					then the behavior is undefined, since the resources must have
+					been created outside the registry system.  The application is
+					responsible for ensuring this does not happen, otherwise the
+					ability to find a non-corrupt registry will be compromised).
+
+					If none of the resources exist, then this indicates a brand
+					new registry.  If exactly one exists, then this is the old
+					(and presumed non-corrupt) registry.  If two exist, it is assumed
+					that one of the resources is OK and the other corrupt.  Since
+					there are only 3 possible extensions, and they increment in
+					wrap-around fashion, the "lowest" numbered extension is assumed
+					to be the non-corrupt one, with "lowest" being in the sense
+					of modulo 3.  This is summarized in the following table:
+
+					Existing Extensions    Assumed non-corrupt
+					-------------------    --------------------------------------
+					-                      None, this is a new registry
+					1                      1
+					2                      2
+					3                      3
+					1,2                    1 (2 will be deleted)
+					2,3                    2 (3 will be deleted)
+					1,3                    3 (1 will be deleted)
+					1,2,3                  Should not happen - will arbitrarily
+					                         pick 1 and delete 2,3.
+
+					In the case that more than one registry extension was found,
+					the presumed corrupt resource is automatically deleted to
+					"clean up" the registry.
+
+PARAMETER1:    RegistryContext struct.  This is used to pass information
+               in a consistent manner between the major registry API
+               functions.  It may be passed uninitialized to this function.
+               This function fills in the r->old_spec field to
+         		indicate the open resource which will be used by
+               registry_read().  The value may also be set to -1 if there
+               was an error or no existing resource could be located.
+PARAMETER2: 	Base name (including path) of the registry.  This should NOT
+               include any extension (e.g. ".foo") since the extension is
+               manipulated by this function.  In practice, this will need to
+               be a resource name on non-volatile storage, which supports
+               names with extensions.  In practice, this limits the appropriate
+               filesystem to FAT filesystem only.  For example
+                  registry_prep_read("/A/myreg", &spec);
+               will select from a set of registry files called
+                  /A/myreg.1, /A/myreg.2, /A/myreg.3
+               of which, normally, only one will exist at any time.
+PARAMETER3:		ServerContext struct.  E.g. from http_getContext().
+RETURN VALUE:  <0  general failure, code will be negative of one of the
+                   codes in ERRNO.H.
+                0	 there is currently no resource of the given
+                   name.  This is not necessarily an error, since it will be
+                   returned if the registry has not yet been created.
+               1,2,3  An existing presumed non-corrupt resource has been
+                   opened.  The numeric return code indicates which of the
+                   extensions was located.
+
+SEE ALSO:		registry_read, registry_finish_read, registry_prep_write,
+               registry_write, registry_finish_write, registry_enumerate,
+               registry_update, registry_get
+
+END DESCRIPTION **********************************************************/
+
+int registry_prep_read(RegistryContext * r,
+							char * basename, ServerContext * context);
+/*** EndHeader */
+
+_registry_debug
+int registry_prep_read(RegistryContext * r,
+							char * basename, ServerContext * context)
+{
+	int len;
+	int spec1, spec2, spec3;
+
+	memcpy(&r->sctx, context, sizeof(r->sctx));
+	r->old_spec = -1;
+	len = strlen(basename);
+	if (len > sizeof(r->name)-3)
+		return -E2BIG;
+	strcpy(r->name, basename);
+	strcpy(r->name + len, ".1");
+	spec1 = sspec_open(r->name, context, O_READ, 0);
+	strcpy(r->name + len, ".2");
+	spec2 = sspec_open(r->name, context, O_READ, 0);
+	strcpy(r->name + len, ".3");
+	spec3 = sspec_open(r->name, context, O_READ, 0);
+	if (spec1 >= 0) {
+		if (spec3 >= 0) {
+			if (spec2 >= 0) {
+				// This should not happen unless app accidentally creates all 3
+				// resources.  Arbitrarily delete 2,3 and use 1.
+				sspec_close(spec2);
+				sspec_close(spec3);
+				sspec_delete(r->name, context);	// delete 3
+				strcpy(r->name + len, ".2");
+				sspec_delete(r->name, context);	// delete 2
+				strcpy(r->name + len, ".1");
+				r->old_spec = spec1;
+				return 1;
+			}
+			// 3 good, 1 bad
+			sspec_close(spec1);
+			strcpy(r->name + len, ".1");
+			sspec_delete(r->name, context);	// delete 1
+			strcpy(r->name + len, ".3");
+			r->old_spec = spec3;
+			return 3;
+		}
+		else if (spec2 >= 0) {
+			// 1 good, 2 bad
+			sspec_close(spec2);
+			strcpy(r->name + len, ".2");
+			sspec_delete(r->name, context);	// delete 1
+		}
+		strcpy(r->name + len, ".1");
+		r->old_spec = spec1;
+		return 1;
+	}
+	else if (spec2 >= 0) {
+		if (spec3 >= 0) {
+			// 2 good, 3 bad
+			sspec_close(spec3);
+			sspec_delete(r->name, context);	// delete 3
+		}
+		strcpy(r->name + len, ".2");
+		r->old_spec = spec2;
+		return 2;
+	}
+	else if (spec3 >= 0) {
+		r->old_spec = spec3;
+		return 3;
+	}
+	return 0;	// none existed
+}
+
+
+/*** BeginHeader registry_finish_read */
+
+/* START FUNCTION DESCRIPTION ********************************************
+registry_finish_read                            <REGISTRY.LIB>
+
+SYNTAX:	int registry_finish_read(RegistryContext * r);
+
+DESCRIPTION:	Finish reading a registry, and clean up resources.
+
+               Most applications will use the sequence of functions
+
+                 registry_prep_read()
+                 registry_read() and/or registry_enumerate()
+                 registry_finish_read()
+
+
+PARAMETER1:    RegistryContext struct, as set by registry_prep_read().
+RETURN VALUE:  <0  general failure, code will be negative of one of the
+                   codes in ERRNO.H.
+               0	 OK.
+
+SEE ALSO:		registry_read, registry_prep_read, registry_prep_write,
+               registry_write, registry_finish_write, registry_enumerate,
+               registry_update, registry_get
+
+END DESCRIPTION **********************************************************/
+
+int registry_finish_read(RegistryContext * r);
+/*** EndHeader */
+
+_registry_debug
+int registry_finish_read(RegistryContext * r)
+{
+	if (r->old_spec >= 0) {
+		sspec_close(r->old_spec);
+		r->old_spec = -1;
+	}
+	return 0;
+}
+
+/*** BeginHeader registry_prep_write */
+
+/* START FUNCTION DESCRIPTION ********************************************
+registry_prep_write                            <REGISTRY.LIB>
+
+SYNTAX:	int registry_prep_write(RegistryContext * r,
+                                 char * basename,
+                                 ServerContext * context);
+
+DESCRIPTION:	Prepare for updating a registry.  This function helps organize
+               registry resources in order to create a robust registry.
+
+               Most applications will use the sequence of functions
+
+                 registry_prep_write()
+                 registry_write()
+                 registry_finish_write()
+
+               or, more simply, just
+
+                 registry_update()
+
+					See the function description for registry_prep_read() for
+					details concerning the organization of registry files.
+
+					Like registry_prep_read, this function opens an existing
+					presumed non-corrupt registry for reading, and also a new
+					empty registry (the "next" registry) for writing the updated
+					results, as required by registry_write().
+
+PARAMETER1:    RegistryContext struct.  This is used to pass information
+               in a consistent manner between the major registry API
+               functions.  It may be passed uninitialized to this function.
+PARAMETER2: 	Base name (including path) of the registry.  This should NOT
+               include any extension (e.g. ".foo") since the extension is
+               manipulated by this function.  In practice, this will need to
+               be a resource name on non-volatile storage, which supports
+               names with extensions.  In practice, this limits the appropriate
+               filesystem to FAT filesystem only.  For example
+                  registry_prep_write("/A/myreg", &oldspec, &newspec);
+               will select from a set of registry files called
+                  /A/myreg.1, /A/myreg.2, /A/myreg.3
+               of which, normally, only two will exist at any time; one will
+               be opened for reading, and the other will be empty and ready
+               for writing.
+PARAMETER3:		ServerContext struct.  E.g. from http_getContext().
+RETURN VALUE:  <0  general failure, code will be negative of one of the
+                   codes in ERRNO.H.
+               0	 there is currently no resource of the given
+                   name.  *oldp will be set to -1 in this case.  This is
+                   not necessarily an error, since it will be returned if the
+                   registry has not yet been created.  You can pass *oldp
+                   to registry_write() in this case, and it will correctly
+                   create the new registry without attempting to read the
+                   (non-existent) "old" registry.
+               1,2,3  An existing presumed non-corrupt resource has been
+                   opened, and the open resource handle returned in *oldp.
+                   The numeric return code indicates which of the extensions
+                   was located.  Note that the "new" registry file will be
+                   this number plus 1 (except that 4 becomes 1).
+
+SEE ALSO:		registry_read, registry_finish_read, registry_prep_read,
+               registry_write, registry_finish_write, registry_enumerate,
+               registry_update, registry_get
+
+END DESCRIPTION **********************************************************/
+int registry_prep_write(RegistryContext * r, char * basename,
+								ServerContext * context);
+/*** EndHeader */
+
+_registry_debug
+int registry_prep_write(RegistryContext * r, char * basename,
+	 							ServerContext * context)
+{
+	char name[SSPEC_MAXNAME + 3];
+	int len;
+	int specn;
+	int rc;
+
+	r->new_spec = -1;
+	rc = registry_prep_read(r, basename, context);
+	if (rc < 0)
+		return rc;
+	strcpy(name, basename);
+	len = strlen(basename);
+	strcpy(name + len, rc == 1 ? ".2" : rc == 2 ? ".3" : ".1");
+	specn = sspec_open(name, context, O_WRITE|O_CREAT|O_TRUNC, 0);
+	if (specn < 0) {
+		if (r->old_spec >= 0) {
+			sspec_close(r->old_spec);	// close read handle if any
+			r->old_spec = -1;
+		}
+		return specn;	// error code
+	}
+	r->new_spec = specn;
+	return rc;
+}
+
+/*** BeginHeader registry_finish_write */
+
+/* START FUNCTION DESCRIPTION ********************************************
+registry_finish_write                            <REGISTRY.LIB>
+
+SYNTAX:	int registry_finish_write(RegistryContext * r);
+
+DESCRIPTION:	Finish updating a registry, and clean up resources.
+
+               Most applications will use the sequence of functions
+
+                 registry_prep_write()
+                 registry_write()
+                 registry_finish_write()
+
+
+PARAMETER1:    RegistryContext struct, as set by registry_prep_read().
+RETURN VALUE:  <0  general failure, code will be negative of one of the
+                   codes in ERRNO.H.
+               0	 OK.
+
+SEE ALSO:		registry_read, registry_prep_read, registry_prep_write,
+               registry_write, registry_finish_read, registry_enumerate,
+               registry_update, registry_get
+
+END DESCRIPTION **********************************************************/
+
+int registry_finish_write(RegistryContext * r);
+/*** EndHeader */
+
+_registry_debug
+int registry_finish_write(RegistryContext * r)
+{
+	registry_finish_read(r);
+
+	// Close new handle
+	if (r->new_spec >= 0) {
+  		sspec_close(r->new_spec);
+  		// Delete old, since now successfully replaced.  This must exist,
+  		// otherwise we would not have got to this point.
+		sspec_delete(r->name, &r->sctx);
+	}
+	return 0;
+}
+
+
+/*** BeginHeader registry_update */
+
+/* START FUNCTION DESCRIPTION ********************************************
+registry_update                            <REGISTRY.LIB>
+
+SYNTAX:	int registry_update(char * basename, char far * section,
+										RegistryEntry * re, ServerContext * sctx);
+
+DESCRIPTION:	Convenience function for updating a registry with a
+               minimum of fuss.  Basically combines the function calls
+                 registry_prep_write()
+                 registry_write()
+                 registry_finish_write()
+
+
+PARAMETER1:    Base name of registry file, as a Zserver resource name.
+               This file must not have an extension, since the extensions
+               ".1", ".2" and so on are appended to the name.
+PARAMETER2:		Section name to update (may be NULL to update the anonymous
+               section at the start of the registry file).
+PARAMETER3:		Array of update commands.  See registry_write() function
+					description for details.  If this pointer is NULL, the
+					entire section is deleted.
+PARAMETER4:    Server context.
+RETURN VALUE:  <0  general failure, code will be negative of one of the
+                   codes in ERRNO.H.
+               0	 OK.
+
+SEE ALSO:		registry_prep_write, registry_write, registry_finish_write,
+					registry_get
+
+END DESCRIPTION **********************************************************/
+
+int registry_update(char * basename, char __far * section, RegistryEntry * re,
+                             ServerContext * sctx);
+/*** EndHeader */
+
+_registry_debug
+int registry_update(char * basename, char __far * section, RegistryEntry * re,
+                             ServerContext * sctx)
+{
+	RegistryContext r;
+	int rc;
+
+	rc = registry_prep_write(&r, basename, sctx);
+	if (rc >= 0) {
+		rc = registry_write(&r, section, re);
+		registry_finish_write(&r);
+	}
+	return rc;
+}
+
+
+
+/*** BeginHeader registry_get */
+
+/* START FUNCTION DESCRIPTION ********************************************
+registry_get                            <REGISTRY.LIB>
+
+SYNTAX:	int registry_get(char * basename, char far * section,
+										RegistryEntry * re, ServerContext * sctx,
+										int (*f)(), int keyvalues, void far * ptr);
+
+DESCRIPTION:	Convenience function for reading and/or enumerating
+               registry contents.  This basically combines calls to the
+               following functions:
+						registry_prep_read()
+						registry_read() and/or registry_enumerate()
+						registry_finish_read()
+
+					If the field array (re) is not NULL, then registry_read()
+					will be called.
+
+					If the callback function (f) is not NULL, then
+					registry_enumerate() will be called.
+
+					If both re and f are not NULL, then read will be invoked before
+					enumerate.
+
+PARAMETER1:    Base name of registry file, as a Zserver resource name.
+               This file must not have an extension, since the extensions
+               ".1", ".2" and so on are appended to the name.
+PARAMETER2:		Section name to read (may be NULL to read the anonymous
+               section at the start of the registry file).
+PARAMETER3:		Array of fields to read.  See registry_read() function
+					description for details.
+PARAMETER4:    Server context.
+PARAMETER5:    Callback function.  See registry_enumerate() function
+					description for details.
+PARAMETER6:		Boolean indicating whether callback receives key=value pairs
+					as well as section headers.  If false, it only receives
+					section headers.
+PARAMETER7:		Arbitrary application data which will be dutifully passed
+					through to the callback without alteration.
+RETURN VALUE:  <0  general failure, code will be negative of one of the
+                   codes in ERRNO.H.
+               0	 OK.
+
+SEE ALSO:		registry_prep_read, registry_read, registry_finish_read,
+					registry_enumerate, registry_update
+
+END DESCRIPTION **********************************************************/
+
+int registry_get(char * basename, char __far * section, RegistryEntry * re,
+                             ServerContext * sctx,
+                             int (*f)(), int keyvalues, void __far * ptr);
+/*** EndHeader */
+
+_registry_debug
+int registry_get(char * basename, char __far * section, RegistryEntry * re,
+                             ServerContext * sctx,
+                             int (*f)(), int keyvalues, void __far * ptr)
+{
+	RegistryContext r;
+	int rc;
+
+	rc = registry_prep_read(&r, basename, sctx);
+	if (rc >= 0) {
+		if (re)
+			rc = registry_read(&r, section, re);
+		if (f) {
+			// Seek back to start, since reading registry leaves it at end
+			sspec_seek(r.old_spec, 0, SEEK_SET);
+			registry_enumerate(&r, f, keyvalues, ptr);
+		}
+		registry_finish_read(&r);
+	}
+	return rc;
+}
+
+
+
+/*** BeginHeader  ********************************************/
+#endif	// __REGISTRY_LIB
+/*** EndHeader ***********************************************/
+

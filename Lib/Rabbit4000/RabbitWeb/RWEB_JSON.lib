@@ -1,0 +1,1314 @@
+/*
+ *	rweb_json.lib -- RabbitWeb JSON functionality
+ *
+ * Copyright (c) 2008 Digi International Inc., All Rights Reserved
+ *
+ * This software contains proprietary and confidential information of Digi
+ * International Inc.  By accepting transfer of this copy, Recipient agrees
+ * to retain this software in confidence, to prevent disclosure to others,
+ * and to make no use of this software other than that for which it was
+ * delivered.  This is a published copyrighted work of Digi International
+ * Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+ * prohibited.
+ *
+ * Restricted Rights Legend
+ *
+ * Use, duplication, or disclosure by the Government is subject to
+ * restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+ * Technical Data and Computer Software clause at DFARS 252.227-7031 or
+ * subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+ * Restricted Rights at 48 CFR 52.227-19, as applicable.
+ *
+ * Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+ *
+ *    This library includes the library support for the RabbitWeb HTTP
+ *    enhancements.
+ */
+
+
+/*****************************************************************************
+******************************************************************************
+
+Serialization/De-serialization: JavaScript Object Notation - JSON
+
+
+These functions convert between #web variables and a string serialized format.
+The string format is JSON (see www.json.org).
+
+Technically, the JSON string should be in UTF-8 format, however we don't
+support it on the Rabbit so strings must be strictly ASCII (no high bit set!).
+Deserialization (parsing) does not check if there are any high bits set
+in the string, so the caller should do this first if the JSON string may have
+any such characters.
+
+We optionally allow the following extension for JSON: for objects,
+the "key" field need not have quotes, even though the standard says it must be
+a "string".  If used when generating, the key strings must not contain a colon,
+and must start with an alpha char.  When parsing, if such a
+key is encountered, then everything up to the next colon (which must exist)
+is counted as the key, except that any *trailing* whitespace is deleted.
+E.g.
+  {   k{ }" x  : 123 }
+is exactly equivalent to canonical form
+  { "k{ }\" x" : 123 }
+
+<NOTIMPLEMENTED>
+When serializing, we also optionally allow the following extension: arrays may
+omit values other than the first.  An omitted value implies a duplication of the
+previous value e.g.
+  [ -1,,,,2,{k:"x"},,0, ]
+is identical to
+  [ -1,-1,-1,-1,2,{"k":"x"},{"k":"x"},0,0 ]
+This is useful for storing sparse arrays. [Although note that #web does not
+support the non-homogeneous arrays implied by the above example!]
+</NOTIMPLEMENTED>
+
+
+
+Parsing: web_parse_json()
+
+We always accept the unquoted key form when parsing.
+
+C++ style comments may be included wherever whitespace is allowed.  If '//'
+is encountered, it and all data up to and including the next '\n' are discarded.
+
+Integer and float values may use
+0x or .x (hex) format.  0x for int, or .x for float means no interpretation
+i.e. the 8-, 16-
+or 32-bit pattern is immediately converted to binary and used as-is.  This
+is most efficient for internal use only (e.g. storing configurations in
+non-volatile storage).  When generating JSON, we only emit hex for floats,
+since ints are usually stored more compactly in signed decimal.
+
+Parsing builds up a single transaction, which may then be executed
+using web_transaction_execute().  The transaction must eventually be
+freed using web_transaction_free().
+
+<NOTIMPLEMENTED>
+If a "null" value is parsed, it is interpreted as "no
+change" to the #web variable that would otherwise be affected by that
+value, thus that key/value pair is not added to the transaction list.
+"true" and "false" are deemed to be integers 0 and 1 respectively.  All other
+cases pass the string value directly to the transaction list.
+</NOTIMPLEMENTED>
+
+Note that the string containing the JSON may be modified by the parser.
+In particular, the parser writes nulls to the string in order to null-terminate
+the key and value strings.  This prevents excess string copying and length
+computations.  It also converts JSON escape sequences to "raw" chars.  Since
+this is guaranteed to shrink the string, it is done in-place.
+
+
+
+******************************************************************************
+*****************************************************************************/
+
+/*** BeginHeader */
+#ifndef _RWEB_JSON_INCL
+#define _RWEB_JSON_INCL
+
+#ifndef _RWEB_GENERIC_INCL
+#use "rweb_generic.lib"
+#endif
+
+// Following macro causes web_init (in rweb_generic) to call routine in this
+// library to populate metadata.
+#define HAVE_RWEB_JSON
+
+
+/*** EndHeader */
+
+/*** BeginHeader web_parse_json */
+
+
+long web_parse_json(char __far * json, long json_len,
+			WebTrans_t __far * wtp, WebIteratorFilter_t __far * wif);
+
+
+long _web_pj_object(char __far * _p, WebParseX_t __far * wpj);
+long _web_pj_array(char __far * _p, WebParseX_t __far * wpj);
+
+/*** EndHeader */
+
+
+_web_debug
+char __far * _web_pj_unescape(char __far * p, char __far * __far * s, char __far * nxtchar)
+{
+	char delim;
+	char __far * q;
+	int x, n;
+
+	if (*p == '"') {
+		delim = '"';
+		++p;
+	}
+	else
+		// As extension: unquoted string (assumed to be an object key) is
+		// teminated by next colon (sans trailing whitespace).
+		delim = ':';
+	*s = q = p;
+	while (*p && *p != delim) {
+		if (*p == '\\') {
+			++p;
+			switch (*p) {
+			case '\\': case '"': *q++ = *p++; break;
+			case 'b': *q++ = '\b'; ++p; break;
+			case 'f': *q++ = '\f'; ++p; break;
+			case 'n': *q++ = '\n'; ++p; break;
+			case 'r': *q++ = '\r'; ++p; break;
+			case 't': *q++ = '\t'; ++p; break;
+			case 'u':
+				x = hexstr2bin(p+1, (char __far *)&n, 2);
+				if (x)
+					return NULL;
+				*q++ = (char)(n>>8);
+				p += 5;
+				break;
+			default:
+				return NULL;
+			}
+		}
+		else
+			*q++ = *p++;
+	}
+	if (delim == ':' )
+		while (q > *s && isspace(q[-1])) --q;
+	if (delim == '"') {
+		if (*p)
+			++p;
+		else
+			// Started with quote, but not terminated
+			return NULL;
+	}
+	while (isspace(*p)) ++p;
+	*nxtchar = *p;	// Remember next char (since, if a colon, it may be
+						// obliterated by next
+	*q = 0;		// Null term string result
+	if (*nxtchar)
+		return p+1;	// return next pos (after returned char)
+	else
+		return p;
+}
+
+_web_debug
+char __far * _web_pj_getvalue(WebParseX_t __far * wpj,
+				char __far * p, char __far * __far * s, char __far * nxtchar)
+{
+	int neg, len;
+	long intval;
+	long floatval;
+	int isfloat, x, exp;
+	long rc;
+
+	p = _web_gobble_whitespace(p, -1);
+	*s = p;
+	if (*p == '"') {
+		// String
+      p = _web_pj_unescape(p, s, nxtchar);
+      if (!p)
+         return NULL;
+      if (*nxtchar)
+      	--p;
+      if (wpj->wif->parser_callback)
+         wpj->wif->parser_callback(wpj, WPJ_STRING, *s, 0);
+      if (wpj->wtp && wpj->cursor->level == wpj->level)
+      	web_transaction_add(wpj->wtp, wpj->cursor, *s, WTA_NOGROUP, 0);
+	}
+	else if (*p == '-' || isdigit(*p) || *p == '.') {
+		// Number
+		neg = *p == '-';
+		isfloat = 0;
+		if (neg) {
+			++p;
+			if (!isdigit(*p))
+				return NULL;
+		}
+		intval = 0;
+		if ((*p == '0' || *p == '.') && p[1] == 'x') {
+			// Hex value (up to 8 digits)
+			isfloat = *p == '.';
+			x = numhexstr2bin(p+2, (char __far *)&intval, 4);
+			p += 2+x;
+			if (isfloat) {
+				wpj->floatval = *(float *)&intval;
+				if (neg)
+					wpj->floatval = -wpj->floatval;
+			}
+			else if (neg)
+				intval = -intval;
+		}
+		else {
+	      while (isdigit(*p)) ++p;
+	      exp = 0;
+	      if (*p == '.' || (exp = *p == 'e' || *p == 'E')) {
+	      	isfloat = 1;
+	      	++p;
+	      	if (exp && (*p == '-' || *p == '+'))
+	      		++p;
+				while (isdigit(*p)) ++p;
+				if (!exp && (*p == 'e' || *p == 'E')) {
+					++p;
+					if (*p == '-' || *p == '+')
+						++p;
+					while (isdigit(*p)) ++p;
+				}
+			}
+			if (isfloat) {
+				wpj->floatval = _f_strtod(*s, NULL);
+				if (neg)
+					wpj->floatval = -wpj->floatval;
+			}
+			else {
+				intval = _f_strtoul(*s, NULL, 10);
+				if (neg)
+					intval = -intval;
+			}
+	   }
+      if (wpj->wif->parser_callback)
+      	if (isfloat)
+         	wpj->wif->parser_callback(wpj, WPJ_FLOAT, NULL, 0);
+      	else
+         	wpj->wif->parser_callback(wpj, WPJ_INT, NULL, intval);
+      if (wpj->wtp && wpj->cursor->level == wpj->level)
+      	if (isfloat)
+      		web_transaction_add(wpj->wtp, wpj->cursor, &wpj->floatval,
+      			WTA_NOGROUP|WTA_BINARY, 0);
+      	else
+      		web_transaction_add(wpj->wtp, wpj->cursor, &intval,
+      			WTA_NOGROUP|WTA_BINARY, 0);
+	}
+	else if (*p == '[') {
+		// Array
+		++wpj->level;
+		rc = _web_pj_array(p+1, wpj);
+		if (rc < 0)
+			return NULL;
+		p += rc;
+		if (*p != ']')
+			return NULL;
+		++p;
+		--wpj->level;
+	}
+	else if (*p == '{') {
+		// Object
+		++wpj->level;
+		rc = _web_pj_object(p+1, wpj);
+		if (rc < 0)
+			return NULL;
+		p += rc;
+		if (*p != '}')
+			return NULL;
+		++p;
+		--wpj->level;
+	}
+	else if (isalpha(*p)) {
+		while (isalnum(*p)) ++p;
+		len = (int)(p - *s);
+		if (len == 4 && !memcmp(*s, "null", 4)) {
+	      if (wpj->wif->parser_callback)
+	         wpj->wif->parser_callback(wpj, WPJ_NULL, NULL, 0);
+	   }
+		else if (len == 4 && !memcmp(*s, "true", 4)) {
+	      if (wpj->wif->parser_callback)
+	         wpj->wif->parser_callback(wpj, WPJ_TRUE, NULL, 0);
+	   }
+		else if (len == 5 && !memcmp(*s, "false", 5)) {
+	      if (wpj->wif->parser_callback)
+	         wpj->wif->parser_callback(wpj, WPJ_FALSE, NULL, 0);
+	   }
+		else
+			return NULL;
+	}
+	else
+		return NULL;
+
+	p = _web_gobble_whitespace(p, -1);
+	*nxtchar = *p;
+	if (*p)
+		return p+1;	// return next pos (after returned char)
+	else
+		return p;
+}
+
+_web_debug
+long _web_pj_object(char __far * _p, WebParseX_t __far * wpj)
+{
+	// Parse a JSON object.  p points just after the open brace.
+	// p is null terminated.  Returns length parsed, not counting
+	// the closing brace; or -EINVAL if syntax error.
+
+	// In JSON, objects are a list of key:value pairs separated by
+	// commas.  The list is enclosed by braces (although this routine
+	// does not consume them; the caller is supposed to recognize the
+	// open brace, and check the close brace).
+	char __far * p = _p;
+	char __far * s;
+	char nxtchar;
+	int idx = 0;
+	int rc;
+	int dok;
+
+   if (wpj->level < _WEB_MAX_X_NEST) {
+      wpj->idx[wpj->level] = 0;
+      wpj->arry[wpj->level] = 0;	// Not an array
+   }
+	if (wpj->wif->parser_callback)
+		wpj->wif->parser_callback(wpj, WPJ_START_OBJECT, NULL, 0);
+	do {
+	   p = _web_gobble_whitespace(p, -1);
+	   nxtchar = *p;
+	   if (!nxtchar || nxtchar == '}') {
+	   	// Empty braces (if idx==0) or trailing comma (if idx != 0)
+	   	if (nxtchar)
+	   		++p;
+	   	break;
+	   }
+	   if (!nxtchar || nxtchar == ':'
+	   		// The following not syntactically necessary given our "slack" key rules,
+	   		// however we require keys to at least start with quote, or alpha,
+	   		// to avoid bad syntax from being accidentally parsed OK.
+	   		|| !strchr("\"_!@#$%^&*.?|~-+", nxtchar) && !isalpha(nxtchar))
+	   	return -EINVAL;
+      p = _web_pj_unescape(p, &s, &nxtchar);
+      if (!p)
+         return -EINVAL;
+      if (nxtchar != ':')
+         return -EINVAL;
+      if (wpj->level < _WEB_MAX_X_NEST)
+         wpj->key[wpj->level] = s;
+      if (wpj->wif->parser_callback)
+         wpj->wif->parser_callback(wpj, WPJ_KEY, s, idx);
+      dok = 0;
+      if (wpj->wtp && wpj->cursor->level+1 == wpj->level) {
+      	if (!web_cursor_down(wpj->cursor, s, idx))
+      		dok = 1;
+      }
+      // Parse values here
+      p = _web_pj_getvalue(wpj, p, &s, &nxtchar);
+      if (dok)
+      	web_cursor_up(wpj->cursor);
+      if (!p)
+      	return -EINVAL;
+      if (!nxtchar || nxtchar == '}')
+      	break;
+      if (nxtchar != ',')
+         return -EINVAL;
+      ++idx;
+	} while (1);
+
+	if (wpj->wif->parser_callback)
+		wpj->wif->parser_callback(wpj, WPJ_END_OBJECT, NULL, 0);
+	return p - _p;
+}
+
+
+
+_web_debug
+long _web_pj_array(char __far * _p, WebParseX_t __far * wpj)
+{
+	// Parse a JSON array.  p points just after the open bracket.
+	// p is null terminated.  Returns length parsed, not counting
+	// the closing brace; or -EINVAL if syntax error.
+
+	// In JSON, arrays are a list of values separated by
+	// commas.  The list is enclosed by brackets (although this routine
+	// does not consume them; the caller is supposed to recognize the
+	// open bracket, and check the close brace).
+	char __far * p = _p;
+	char __far * s;
+	char nxtchar;
+	int idx = 0;
+	int dok;
+
+   if (wpj->level < _WEB_MAX_X_NEST) {
+      wpj->key[wpj->level] = NULL;
+      wpj->arry[wpj->level] = 1;	// Know it's an array, but don't know dimension
+   }
+	if (wpj->wif->parser_callback)
+		wpj->wif->parser_callback(wpj, WPJ_START_ARRAY, NULL, 0);
+	do {
+	   p = _web_gobble_whitespace(p, -1);
+	   nxtchar = *p;
+	   if (!nxtchar || nxtchar == ',')
+	   	return -EINVAL;
+	   if (nxtchar == ']') {
+	   	// Empty brackets
+	   	++p;
+	   	break;
+	   }
+	   if (wpj->level < _WEB_MAX_X_NEST)
+      	wpj->idx[wpj->level] = idx;
+      if (wpj->wif->parser_callback)
+         wpj->wif->parser_callback(wpj, WPJ_IDX, NULL, idx);
+      dok = 0;
+      if (wpj->wtp && wpj->cursor->level+1 == wpj->level) {
+      	if (!web_cursor_down(wpj->cursor, NULL, idx))
+      		dok = 1;
+      }
+      // Parse values here
+      p = _web_pj_getvalue(wpj, p, &s, &nxtchar);
+      if (dok)
+      	web_cursor_up(wpj->cursor);
+      if (!p)
+      	return -EINVAL;
+      if (!nxtchar || nxtchar == ']')
+      	break;
+      if (nxtchar != ',')
+         return -EINVAL;
+      ++idx;
+	} while (1);
+
+	if (wpj->wif->parser_callback)
+		wpj->wif->parser_callback(wpj, WPJ_END_ARRAY, NULL, 0);
+	return p - _p;
+}
+
+
+// We return the actual length of the json string, including any leading
+// space.  Negative return if error.  May return less than json_len if
+// there was trailing stuff after the final close brace (which we ignore).
+_web_debug
+long web_parse_json(char __far * json, long json_len,
+			WebTrans_t __far * wtp, WebIteratorFilter_t __far * wif)
+{
+	WebParseX_t wpj;
+	WebCursor_t wc;
+	long rc;
+	char __far * p;		// Current parse position in json
+	char __far * q;		// End position
+	char __far * r;		// End position
+	char final;			// saved last char position.  We temporarily null-term.
+
+	memset(&wpj, 0, sizeof(wpj));
+	wpj.wif = wif;
+	wpj.cursor = &wc;
+	web_cursor_start(&wc);
+
+	// Transaction to be built.  May be NULL if only calling for execution
+	// of parser event callback (wif->parser_callback).
+	wpj.wtp = wtp;
+	if (wtp) {
+	   rc = web_transaction_start(wtp);
+	   if (rc)
+	      return rc;
+	}
+
+	// Do this carefully, to avoid running off the end of the buffer.
+	// If we find the correct enclosing '{' and '}', then replace the
+	// closing brace with a null.  This allows us to avoid having to check
+	// the length all the time.
+	p = _web_gobble_whitespace(json, json_len);
+	if (p-json < json_len-1 && *p == '{') {
+		q = json + (json_len-1);
+		final = *q;	// Remember this
+		*q = 0;		/* Force null terminate.  This was either the correct
+						   closing brace, or something in the trailer, or
+						   a syntax error if the object was not properly formed.
+						   In any case, when we put back 'final', we check that
+						   the result was indeed valid.
+						*/
+		// Parse the outer object.  Returned length does not include the final
+		// '}' if there is one.
+		rc = _web_pj_object(p+1, &wpj);
+		// Put back original char
+		*q = final;
+		if (rc >= 0) {
+			// Was OK.  Do final check
+			r = p + rc + 1;		// Position of last parsed char
+			if (r == q) {
+				// Was equal to last char in given buffer.  Must have been
+				// closing brace.
+				if (final != '}')
+					rc = -EINVAL;
+				else
+					rc = json_len;
+			}
+			else
+				rc = r - json;
+		}
+	}
+	else
+		rc = -EINVAL;	// Didn't start with open brace
+	if (rc < 0 && wtp)
+		web_transaction_free(wtp);
+	return rc;
+}
+
+
+/*
+Serializing: web_gen_json()
+
+Selection variables are serialized using their integer values, unless a flag
+is set to use the string translations.  The resulting JSON string will be
+in the form of a JSON "object", with one key for each root level #web
+variable.  The outer object may also be empty!
+
+Values are always assumed to be strings (requiring quotes in JSON), however
+integer and float types will have quotes omitted if they don't have a bin2str
+conversion function.
+
+An option to make the string "human readable" may be used, in which case
+space, \n and \t chars are inserted in order to beautify the JSON string.
+
+Optionally, a flag can specify that chars, ints and floats are written with 0x
+notation, bypassing any other string conversion.
+
+The result of serialization is a malloc'd string.  The caller must eventually
+free this string using web_free_json().
+*/
+/*** BeginHeader web_gen_json, web_free_json */
+long web_gen_json(WebIteratorFilter_t __far * filt, char __far * __far * jsonp,
+						word options);
+#define WGJ_PRETTY		0x0001	// Insert formatting spaces
+// Following options MUST NOT be used for JSON strings to be sent over
+// network, since the generated JSON is not strictly conforming (although our
+// parser is always OK with it).
+#define WGJ_HEX			0x0002	// Write floats in .x notation.
+#define WGJ_SQUASH_KEY	0x0004	// Omit quotes around key strings
+#define WGJ_SQUASH_ARR	0x0008	// Omit array values which are duplicates
+											// of previous in same array
+#define WGJ_NUMERIC		0x0010	// Generate "select" variables as numbers
+											// not strings of the enumeration.
+#define WGJ_SHADOW		0x0020	// Use shadow (else uses current)
+void web_free_json(char __far * __far * jsonp);
+/*** EndHeader */
+
+typedef struct {
+	word options;
+	int indent;
+	char __far * __far * ptr;	// Position in string to write to.
+									// At least _WEB_INITIAL_ALLOC/2 bytes available.
+} _web_json_gen_callback_data_t;
+
+_web_debug
+void _web_json_gen_callback(WebIterator_t __far * wi, int event,
+										const char __far * name, int dim)
+{
+	_web_json_gen_callback_data_t __far * data =
+		(_web_json_gen_callback_data_t __far *)wi->wif->data;
+	char __far * j = *data->ptr;
+	char __far * bkt;
+
+	if (data->options & WGJ_PRETTY &&
+		   !isspace(j[-1]) &&
+			(event == WIFE_MEMBER || event == WIFE_EXIT_STRUCT)) {
+		*j++ = '\n';
+		_f_memset(j, ' ', data->indent);
+		j += data->indent;
+	}
+
+	switch (event) {
+	case WIFE_ENTER_STRUCT:
+		*j++ = '{';
+		data->indent += 2;
+		break;
+	case WIFE_EXIT_STRUCT:
+		*j++ = '}';
+		data->indent -= 2;
+		break;
+	case WIFE_ENTER_ARRAY:
+		*j++ = '[';
+		data->indent += 2;
+		break;
+	case WIFE_EXIT_ARRAY:
+		*j++ = ']';
+		data->indent -= 2;
+		break;
+	case WIFE_TWEEN_ARRAY:
+	case WIFE_TWEEN_STRUCT:
+		if (data->options & WGJ_PRETTY)
+			while (isspace(j[-1])) --j;
+		*j++ = ',';
+		break;
+	case WIFE_MEMBER:
+		// Remove any [@] stuff..
+		bkt = _f_strchr(name, '[');
+		if (bkt)
+	      if (data->options & WGJ_SQUASH_KEY)
+	         sprintf(j, "%.*ls:", (int)(bkt - name), name);
+	      else
+	         sprintf(j, "\"%.*ls\":", (int)(bkt - name), name);
+		else
+	      if (data->options & WGJ_SQUASH_KEY)
+	         sprintf(j, "%ls:", name);
+	      else
+	         sprintf(j, "\"%ls\":", name);
+		j += strlen(j);
+		if (data->options & WGJ_PRETTY) {
+			*j++ = ' ';
+		}
+		break;
+	}
+	if (data->options & WGJ_PRETTY &&
+			event != WIFE_TWEEN_ARRAY &&
+			event != WIFE_MEMBER) {
+		*j++ = '\n';
+		_f_memset(j, ' ', data->indent);
+		j += data->indent;
+	}
+	*data->ptr = j;
+}
+
+
+_web_debug
+long web_gen_json(WebIteratorFilter_t __far * filt, char __far * __far * jsonp,
+						word options)
+{
+	_web_json_gen_callback_data_t data;
+	WebIterator_t  wi_inst;
+	WebIterator_t __far * wi;
+	long alloc, len, remlen;
+	char __far * j;
+	int t, rc;
+	char __far * spec;
+
+	filt->callback = _web_json_gen_callback;
+	filt->data = &data;
+	data.options = options;
+	data.indent = 0;
+	data.ptr = &j;
+
+	if (options & WGJ_HEX)
+		spec = options & WGJ_SHADOW ? "Njs" : "Nj";
+	else
+		spec = options & WGJ_SHADOW ? "NJs" : "NJ";
+	if (!(options & WGJ_NUMERIC))
+		++spec;	// Omit the initial 'N' in the spec.
+
+	j = *jsonp = (char __far *)_web_malloc(alloc = _WEB_INITIAL_ALLOC);
+	if (!j)
+		return -ENOMEM;
+	*j++ = '{';
+
+	for (wi = web_iter_start(&wi_inst, filt);
+	     web_iter_get(wi);
+	     web_iter_next(wi)) {
+		// Keep at least _WEB_INITIAL_ALLOC/2 bytes available, to avoid myriad
+		// ugly checks for overflow throughout the code.
+		len = j - *jsonp;
+		t = _WEB_INITIAL_ALLOC/2;
+	_realloc:
+		if (len + t > alloc) {
+			// Need to realloc
+			j = (char __far *)_web_realloc(*jsonp, alloc * 2);
+			if (!j) {
+				web_free_json(jsonp);
+				return -ENOMEM;
+			}
+			*jsonp = j;
+			j += len;
+			alloc *= 2;
+			len = j - *jsonp;
+		}
+		// Allow a little extra space for surrounding syntax
+		remlen = alloc - len - _WEB_INITIAL_ALLOC/4;
+		if (remlen > 32767)
+			rc = 32767;
+		else
+			rc = (int)remlen;
+		t = _web_format(wi, j, rc, spec);
+		if (t < 0)
+			return t;
+		if (t) {
+			t += _WEB_INITIAL_ALLOC/2;
+			goto _realloc;
+		}
+		j += strlen(j);
+	}
+	*j++ = '}';
+	*j = 0;
+	return j - *jsonp;
+}
+
+
+void web_free_json(char __far * __far * jsonp)
+{
+	_web_free(*jsonp);
+	*jsonp = NULL;
+}
+
+
+
+
+
+/*** BeginHeader web_register_metadata, web_parse_metadata */
+int web_register_metadata(long ximport_sym);
+int web_parse_metadata(void);
+
+#define WMPD_MAX_MSGS	40		// Max error messages in # list
+
+typedef struct {
+	enum {
+		WPMD_NAV,	// Navigating object hierarchy
+		WPMD_BRKT,	// Brackets (inside [] pair )
+		WPMD_META,	// Getting metadata (inside [{ }] pairs)
+		// Subsequent values for further nested structure inside [{ }]
+		WPMD_EGRP,	// Error group definition '#:[message,...]'
+	} state;
+	int skip;
+	int resume_level;
+	int dot;
+	WebCursor_t wc;
+	int meta_err;
+	const char __far * mkey;
+	const char __far * t;		// type
+	const char __far * d;		// desc
+	const char __far * fd;		// factory default (for query descriptors)
+	const char __far * key;	// keyed array
+	const char __far * r;		// rename
+	int shadow;			// shadow required
+	int fds;				// factory default shadow required
+	int attr;			// is attribute (else element)
+	int perm;			// Permissions (for RCI).
+							// 1 = r, 2 = w, 3 = r+w, 4 = none, 0 (default) = inherit.
+	const char __far * c;		// condition test parameter
+	const char __far * cond;	// condition callback
+	const char __far * cust;	// custom callback
+	unsigned n_emsg;
+	const char __far * emsg[WMPD_MAX_MSGS];
+	WebMetadata_t meta;
+} WPMData_t;
+
+/*** EndHeader */
+static __far int _web_num_meta = 0;
+static __far long _web_meta_ximports[10];
+
+_web_debug
+int web_register_metadata(long ximport_sym)
+{
+	if (_web_num_meta < 10) {
+		_web_meta_ximports[_web_num_meta++] = ximport_sym;
+		return 0;
+	}
+	return -ENOSPC;
+}
+
+_web_debug
+int _web_install_metadata(WPMData_t __far * wpmd, WebCursor_t __far * wc)
+{
+	WebCursor_t wci;
+	WebErrorList_t __far * wel = NULL;
+	WebStructMemInfo_t __far * wsmi;
+	WebMetadata_t __far * meta;
+	char __far * p;
+	char __far * __far * pp;
+	int i, len, gnlen, rc;
+	long min, max;
+#ifdef RWEB_INIT_VERBOSE
+	char buf[128];
+
+   if (wpmd->t) printf("\tt=%ls\n", wpmd->t);
+   if (wpmd->d) printf("\td=%ls\n", wpmd->d);
+   if ((wpmd->meta.flags & WM_HAVE_MIN_F) == WM_HAVE_MIN_F)
+      printf("\tmin=%f\n", wpmd->meta.min.f);
+   else if ((wpmd->meta.flags & WM_HAVE_MIN_F) == WM_HAVE_MIN_L)
+      printf("\tmin=%ld\n", wpmd->meta.min.l);
+   if ((wpmd->meta.flags & WM_HAVE_MAX_F) == WM_HAVE_MAX_F)
+      printf("\tmax=%f\n", wpmd->meta.max.f);
+   else if ((wpmd->meta.flags & WM_HAVE_MAX_F) == WM_HAVE_MAX_L)
+      printf("\tmax=%ld\n", wpmd->meta.max.l);
+   /*
+   if (wpmd->n_emsg) {
+      printf("\t%d error messages:\n", wpmd->n_emsg);
+      for (i = 0; i < wpmd->n_emsg; ++i)
+         printf("\t\t%ls\n", wpmd->emsg[i]);
+   }
+   */
+   if (wc->level < 0)
+      strcpy(buf, "<top>");
+   else
+      web_fqname(wc, buf, sizeof(buf));
+   printf("  ---> variable %s\n", buf);
+#endif
+
+	// Create error message list
+	if (wpmd->n_emsg) {
+
+		for (i = 0, len = 0; i < wpmd->n_emsg; ++i)
+			len += strlen(wpmd->emsg[i]) + 1;
+		len += sizeof(WebErrorList_t) +
+		       wpmd->n_emsg * sizeof(char __far *) +
+		       (gnlen = 2 * (wc->level+1) + 5);
+		wel = _web_malloc(len);
+		if (!wel)
+			return -ENOMEM;
+		wel->group_name = p = (char __far *)(wel+1);
+		_f_strcpy(p, "egrp");
+		p += strlen(p);
+		for (i = 0; i <= wc->level; ++i) {
+			sprintf(p, "%02X", wc->idx[i]);
+			p += 2;
+		}
+		*p = 0;
+		pp = (char __far * __far *)(p+1);
+		wel->id = 1 + 100*(wc->level+1);
+		wel->n_msgs = wpmd->n_emsg;
+		wel->msgs = pp;
+		p = (char __far *)(pp + wpmd->n_emsg);
+		for (i = 0; i < wpmd->n_emsg; ++i) {
+			_f_strcpy(p, wpmd->emsg[i]);
+			*pp++ = p;
+			p += strlen(p) + 1;
+		}
+#ifdef RWEB_INIT_VERBOSE
+      printf("\t%d error messages in group %ls:\n",
+      	wel->n_msgs, wel->group_name);
+      for (i = 0; i < wel->n_msgs; ++i)
+         printf("\t\t%d: %ls\n", wel->id + i, wel->msgs[i]);
+#endif
+	}
+
+	if (wc->level < 0) {
+		// Set top-level error list and description.  These are the
+		// only metadata relevant to the top level.
+		_web_base_errors = wel;
+		if (wpmd->d) {
+			_web_base_descr = _web_malloc(strlen(wpmd->d)+1);
+			_f_strcpy(_web_base_descr, wpmd->d);
+		}
+	}
+	else {
+	   wsmi = wc->wsmi[wc->level];
+
+	   // Compute reasonable defaults for type (t)
+	   if (!wpmd->t) {
+	      if (wsmi->meta && wsmi->meta->select.ptr16)
+	         wpmd->t = "enum";
+	      else switch (wsmi->type.simple) {
+	      case TSTRING:
+	         wpmd->t = "string";
+	         if (!(wpmd->meta.flags & WM_HAVE_MAX_F)) {
+	            wpmd->meta.flags |= WM_HAVE_MAX_L;
+	            wpmd->meta.max.l = web_size(wc)-1;
+	         }
+	         break;
+	      case T_CHAR:
+	         max = 255;
+	         goto _unsigned;
+	      case TUNSIGNED:
+	         max = 65535;
+	         goto _unsigned;
+	      case TULONG:
+	         max = 0;
+	      _unsigned:
+	         wpmd->t = "uint32";
+	         if (max && !(wpmd->meta.flags & WM_HAVE_MAX_F)) {
+	            wpmd->meta.flags |= WM_HAVE_MAX_L;
+	            wpmd->meta.max.l = max;
+	         }
+	         break;
+	      case TINT:
+	         min = -32768;
+	         max = 32767;
+	         goto _signed;
+	      case TLONG:
+	         min = max = 0;
+	      _signed:
+	         wpmd->t = "int32";
+	         if (min && !(wpmd->meta.flags & WM_HAVE_MIN_F)) {
+	            wpmd->meta.flags |= WM_HAVE_MIN_L;
+	            wpmd->meta.min.l = min;
+	         }
+	         if (max && !(wpmd->meta.flags & WM_HAVE_MAX_F)) {
+	            wpmd->meta.flags |= WM_HAVE_MAX_L;
+	            wpmd->meta.max.l = max;
+	         }
+	         break;
+	      case TFLOAT:
+	         wpmd->t = "float";
+	         break;
+	      }
+
+	   }
+
+	   // Now populate the permanent metadata struct
+	   len = wpmd->d ? strlen(wpmd->d) + 1 : 0;
+	   if (!wsmi->meta) {
+	      wsmi->meta = meta = _web_calloc(sizeof(*wsmi->meta) + len);
+	      if (!meta)
+	         return -ENOMEM;
+	      if (len) {
+	         meta->desc = (char __far *)(meta + 1);
+	         _f_strcpy(meta->desc, wpmd->d);
+	      }
+	   }
+	   else {
+	      meta = wsmi->meta;
+	      if (len) {
+	         meta->desc = _web_malloc(len);
+	         if (!meta->desc)
+	            return -ENOMEM;
+	         _f_strcpy(meta->desc, wpmd->d);
+	      }
+	   }
+	   meta->flags = wpmd->meta.flags;
+	   meta->min.l = wpmd->meta.min.l;
+	   meta->max.l = wpmd->meta.max.l;
+	   meta->errs = wel;
+		if (wpmd->perm) {
+			meta->groups |= RCI_GROUP;
+			if (wpmd->perm & 1)
+				meta->rperm |= RCI_GROUP;
+			else
+				meta->rperm &= ~RCI_GROUP;
+			if (wpmd->perm & 2)
+				meta->wperm |= RCI_GROUP;
+			else
+				meta->wperm &= ~RCI_GROUP;
+		}
+		if (wpmd->c)
+			meta->c[0] = *wpmd->c;
+		if (wpmd->cond)
+			meta->cond = _web_find_conditional(wpmd->cond);
+		if (wpmd->cust) {
+			meta->cond = _web_find_conditional(wpmd->cust);
+         meta->flags |= WM_CUSTOM;
+      }
+
+		if (wpmd->t)
+	   	meta->extrep = _web_find_extrep(wpmd->t);
+	   if (wpmd->fd && meta->extrep) {
+	   	meta->factory_dflt = _web_malloc(web_size(wc));
+	   	if (!meta->factory_dflt)
+	   		return -ENOMEM;
+			if (meta->extrep->str2bin(wc, (char __far *)wpmd->fd,
+						strlen(wpmd->fd), meta->factory_dflt)) {
+#ifdef RWEB_INIT_VERBOSE
+	         printf("Default value %ls not valid\n", wpmd->fd);
+#endif
+				_web_free(meta->factory_dflt);
+				meta->factory_dflt = NULL;
+			}
+	   }
+	   if (wpmd->shadow) {
+	   	meta->shadow = _web_malloc(web_size(wc));
+	   	if (!meta->shadow)
+	   		return -ENOMEM;
+	   	// Default to current data.  User application should initialize
+	   	// the shadow as desired.
+	   	_f_memcpy(meta->shadow, web_loc(wc), web_size(wc));
+	   }
+	   if (wpmd->fds) {
+	   	meta->fd = _web_calloc(web_size(wc));
+	   	if (!meta->fd)
+	   		return -ENOMEM;
+	   	// Default to zeros.  User application should initialize
+	   	// the FD as desired.
+	   }
+      if (wpmd->attr) {
+      	meta->flags |= WM_ATTRIBUTE;
+      }
+	   if (wpmd->key) {
+	   	// Locate the named field by going down via index 0
+	   	// until the named field is found at that level.
+	   	if (!web_key_value(wc, &wci, wpmd->key)) {
+#ifdef RWEB_INIT_VERBOSE
+         	printf("Key field %ls not located\n", wpmd->key);
+#endif
+	   	}
+	   	else if (web_leaf(&wci))
+		   	meta->key = wci.wsmi[wci.level];
+#ifdef RWEB_INIT_VERBOSE
+			else
+		      printf("Key field %ls not a leaf\n", wpmd->key);
+#endif
+	   }
+	   if (wpmd->r) {
+	   	// Rename the variable.
+			wsmi->name = _web_malloc(strlen(wpmd->r) + 1);
+			_f_strcpy(wsmi->name, wpmd->r);
+	   }
+	}
+
+	return 0;
+}
+
+
+_web_debug
+int _web_meta_callback(WebParseX_t __far * wpj, int event,
+										const char __far * key, long idx)
+{
+	WPMData_t __far * wpmd = (WPMData_t __far *)wpj->wif->data;
+	int rc, bool;
+
+	if (wpmd->skip && wpj->level > wpmd->resume_level)
+		return 0;
+	wpmd->skip = 0;
+
+	switch (event) {
+	case WPJ_START_OBJECT :
+		if (wpmd->state == WPMD_NAV) {
+	      rc = web_cursor_down(&wpmd->wc, NULL, 0);
+	      if (rc < 0) {
+#ifdef RWEB_INIT_VERBOSE
+	         printf("No object at level %d\n", wpj->level);
+#endif
+	         wpmd->skip = 1;
+	         wpmd->resume_level = wpj->level-1;
+	      }
+		}
+		else if (wpmd->state == WPMD_BRKT) {
+			wpmd->state = WPMD_META;
+			_f_memset(&wpmd->meta, 0, sizeof(wpmd->meta));
+			wpmd->meta_err = 0;
+			wpmd->t = NULL;
+			wpmd->d = NULL;
+			wpmd->r = NULL;
+			wpmd->fd = NULL;
+			wpmd->n_emsg = 0;
+			wpmd->key = NULL;
+			wpmd->shadow = 0;
+			wpmd->fds = 0;
+			wpmd->attr = 0;
+			wpmd->perm = 0;
+			wpmd->c = NULL;
+			wpmd->cond = NULL;
+			wpmd->cust = NULL;
+		}
+		else
+			++wpmd->state;
+		break;
+	case WPJ_END_OBJECT :
+		if (wpmd->state == WPMD_NAV)
+			rc = web_cursor_up(&wpmd->wc);
+		else
+			// End of metadata object, but wait for close bracket to commit
+			--wpmd->state;
+		break;
+	case WPJ_START_ARRAY :
+		if (wpmd->state == WPMD_BRKT) {
+#ifdef RWEB_INIT_VERBOSE
+	      printf("[[ at level %d\n", wpj->level);
+#endif
+			wpmd->skip = 1;
+			wpmd->resume_level = wpj->level-2;
+		}
+		else
+			++wpmd->state;
+		break;
+	case WPJ_END_ARRAY :
+		if (wpmd->state == WPMD_BRKT) {
+			// Close bracket of metadata object.
+#ifdef RWEB_INIT_VERBOSE
+			printf("Got metadata %s\n", wpmd->meta_err ? "in error" : "");
+#endif
+			if (!wpmd->meta_err) {
+				if (wpmd->dot)
+					// "dot" key means refer to parent level
+					web_cursor_up(&wpmd->wc);
+				if (web_dimension(&wpmd->wc)) {
+					// This is an implementation restriction, since there
+					// is no WebStructMemInfo_t for array levels.  Probably
+					// user intends to use the parent structure.
+#ifdef RWEB_INIT_VERBOSE
+					printf("Cannot assign metadata to array level!\n");
+#endif
+					wpmd->meta_err = 2;
+				}
+				else
+					_web_install_metadata(wpmd, &wpmd->wc);
+				if (wpmd->dot)
+					// Put back to child level
+					web_cursor_down(&wpmd->wc, NULL, 0);
+			}
+		}
+		--wpmd->state;
+		break;
+	case WPJ_STRING :
+		//printf("\"%ls\"", key);
+		if (wpmd->state == WPMD_META) {
+			if (!strcmp(wpmd->mkey, "t"))
+				wpmd->t = key;
+			else if (!strcmp(wpmd->mkey, "d"))
+				wpmd->d = key;
+			else if (!strcmp(wpmd->mkey, "c"))
+				wpmd->c = key;
+			else if (!strcmp(wpmd->mkey, "cond"))
+				wpmd->cond = key;
+			else if (!strcmp(wpmd->mkey, "cust"))
+				wpmd->cust = key;
+			else if (!strcmp(wpmd->mkey, "key"))
+				wpmd->key = key;
+			else if (!strcmp(wpmd->mkey, "$"))
+				wpmd->fd = key;
+			else if (!strcmp(wpmd->mkey, "r"))
+				wpmd->r = key;
+			else if (!strcmp(wpmd->mkey, "p")) {
+				if (!strcmp(key, "ro"))
+					wpmd->perm = 1;
+				else if (!strcmp(key, "wo"))
+					wpmd->perm = 2;
+				else if (!strcmp(key, "none"))
+					wpmd->perm = 4;
+				else
+					wpmd->perm = 3;
+			}
+			else {
+				wpmd->meta_err = 1;
+#ifdef RWEB_INIT_VERBOSE
+				printf("Unknown string metadata %ls : \"%ls\"\n", wpmd->mkey, key);
+#endif
+			}
+		}
+		else if (wpmd->state == WPMD_EGRP) {
+			if (!strcmp(wpmd->mkey, "#")) {
+				if (wpmd->n_emsg < WMPD_MAX_MSGS)
+					wpmd->emsg[wpmd->n_emsg++] = key;
+			}
+		}
+		break;
+	case WPJ_INT :
+		//printf("%ld", idx);
+		if (wpmd->state == WPMD_META) {
+			if (!strcmp(wpmd->mkey, "min")) {
+				wpmd->meta.min.l = idx;
+				wpmd->meta.flags &= ~WM_HAVE_MIN_F;
+				wpmd->meta.flags |= WM_HAVE_MIN_L;
+			}
+			else if (!strcmp(wpmd->mkey, "max")) {
+				wpmd->meta.max.l = idx;
+				wpmd->meta.flags &= ~WM_HAVE_MAX_F;
+				wpmd->meta.flags |= WM_HAVE_MAX_L;
+			}
+			else if (!strcmp(wpmd->mkey, "shadow")) {
+				wpmd->shadow = (int)idx;
+			}
+			else if (!strcmp(wpmd->mkey, "fd")) {
+				wpmd->fds = (int)idx;
+			}
+			else if (!strcmp(wpmd->mkey, "attr")) {
+				wpmd->attr = (int)idx;
+			}
+			else {
+				wpmd->meta_err = 1;
+#ifdef RWEB_INIT_VERBOSE
+				printf("Unknown long metadata %ls : %ld\n", wpmd->mkey, idx);
+#endif
+			}
+		}
+		break;
+	case WPJ_FLOAT :
+		//printf("%g", wpj->floatval);
+		if (wpmd->state == WPMD_META) {
+			if (!strcmp(wpmd->mkey, "min")) {
+				wpmd->meta.min.f = wpj->floatval;
+				wpmd->meta.flags |= WM_HAVE_MIN_F;
+			}
+			else if (!strcmp(wpmd->mkey, "max")) {
+				wpmd->meta.max.f = wpj->floatval;
+				wpmd->meta.flags |= WM_HAVE_MAX_F;
+			}
+			else {
+				wpmd->meta_err = 1;
+#ifdef RWEB_INIT_VERBOSE
+				printf("Unknown float metadata %ls : %f\n", wpmd->mkey, wpj->floatval);
+#endif
+			}
+		}
+		break;
+	case WPJ_TRUE :
+		bool = 1;
+		goto _dobool;
+	case WPJ_FALSE :
+		bool = 0;
+	_dobool:
+		break;
+	case WPJ_NULL :
+		break;
+	case WPJ_EMPTY :
+		break;
+	case WPJ_KEY :
+		//printf("%s\"%ls\":", idx ? "," : "", key);
+		if (wpmd->state == WPMD_NAV) {
+			if (key[0] == '.') {
+				// '.' key is reference to current level (not a specific field).
+				wpmd->dot = 1;
+				break;
+			}
+			wpmd->dot = 0;
+			if (key[0] == '@')
+				// Array dimension placeholder.  Use element 0 because it always exists.
+				// This will access the first member if it is not in fact an array level.
+		      rc = web_cursor_find(&wpmd->wc, NULL, 0);
+			else
+		      rc = web_cursor_find(&wpmd->wc, key, 0);
+	      if (rc < 0) {
+#ifdef RWEB_INIT_VERBOSE
+	         printf("Key %ls not found at level %d\n", key, wpj->level);
+#endif
+	         wpmd->skip = 1;
+	         wpmd->resume_level = wpj->level;
+	      }
+	      else {
+#ifdef RWEB_INIT_VERBOSE
+	         printf("Found key %ls at level %d\n", key, wpj->level);
+#endif
+	      }
+		}
+		else if (wpmd->state == WPMD_META)
+			wpmd->mkey = key;
+		break;
+	case WPJ_IDX :
+		//printf("%s", idx ? "," : "");
+		break;
+	}
+	return 0;
+}
+
+
+_web_debug
+int web_parse_metadata_ximport(long ximport_sym)
+{
+	char __far * p = (char __far *)ximport_sym;
+	long len = *(long __far *)p;
+	char __far * json;
+	long rc = 0;
+	WebIteratorFilter_t wif;
+	WPMData_t wpmd;
+
+	p += sizeof(long);
+
+	if (len > 32767)
+		return -E2BIG;
+
+	// Require temporary malloc area for parsing, because JSON parser modifies
+	// the string in-place.
+	json = _web_malloc(len);
+	if (!json)
+		return -ENOMEM;
+	_f_memcpy(json, p, (int)len);
+
+	_f_memset(&wif, 0, sizeof(wif));
+	_f_memset(&wpmd, 0, sizeof(wpmd));
+	wif.parser_callback = _web_meta_callback;
+	wif.data = &wpmd;
+	web_cursor_start(&wpmd.wc);
+	rc = web_parse_json(json, len, NULL, &wif);
+
+_exit:
+	_web_free(json);
+	return (int)rc;
+}
+
+_web_debug
+int web_parse_metadata(void)
+{
+	int i, rc;
+
+	for (i = 0; i < _web_num_meta; ++i) {
+		rc = web_parse_metadata_ximport(_web_meta_ximports[i]);
+		if (rc < 0)
+			return rc;
+	}
+	return 0;
+}
+
+
+
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+
+
+

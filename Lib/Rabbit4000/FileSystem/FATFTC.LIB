@@ -1,0 +1,2901 @@
+/*** BeginHeader */
+#ifndef __FATFTC_LIB
+#define __FATFTC_LIB
+
+/*** EndHeader */
+
+/* START LIBRARY DESCRIPTION *********************************************
+ FATFTC.LIB
+
+ FAT filesystem fault tolerant cache (write-back) and rollback-journal
+ library.
+
+ This layer requires sector based devices, if a device is not natively
+ a sector based device, the Flash Translation Layer must be used on
+ that device.  This library interfaces to the appropriate lower layer
+ (Flash Translation or Device Driver).
+
+ This is not a user-level API library.  It is used internally by the
+ DOS FAT library.
+
+ NOTE: changing macro definitions may invalidate any existing cache -
+       recommend purging the cache before doing any such changes.
+
+COPYRIGHT - Digi International, Inc. (C) 2003-2009
+
+Change history:
+   Who    When          What
+   ----   -----------   ------------------------
+   WTS    2009 Apr 22   Created initial version from fatwtc.lib
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader _ftc */
+
+#use "part_defs.lib"
+
+// You can define FATFTC_DEBUG_INIT which makes the _fatftc_init() call
+// debuggable, but you have to make an explicit call to it in your main()
+// program, since it will not be on the global init function chain.
+//#define FATFTC_DEBUG
+//#define FATFTC_DEBUG_INIT
+#ifdef FATFTC_DEBUG
+	#define _fatftc_debug __debug
+#else
+	#define _fatftc_debug __nodebug
+#endif
+
+// These are constants, and should not be changed without carefully reviewing
+// the implementation code!
+#define FAT_LBASIZE		512u	  // "sector" size, which is the minimum unit of
+                                //   storage managed by this lib.
+#define FAT_LBASHIFT		9u		  // log base 2 of the above
+
+#ifndef FAT_PAGEBUFFERS
+  #define FAT_PAGEBUFFERS  1    // Sector buffers needed for page write devices
+#else
+  #if FAT_PAGEBUFFERS < 0
+     #fatal "FAT_PAGEBUFFERS must be set to a positive integer value."
+  #endif
+#endif
+
+#ifdef FAT_MAXBUFS
+	#if FAT_MAXBUFS < 8
+   	#undef FAT_MAXBUFS   // Must have at least 8 buffers
+      #define FAT_MAXBUFS 8
+   #endif
+   #if FAT_MAXBUFS > 128
+   	#undef FAT_MAXBUFS   // Cannot have more than 128 buffers
+      #define FAT_MAXBUFS 128
+   #endif
+#else
+	// Not using a FAT-enabled BIOS.  Use _xalloc to get BB-RAM areas.
+   // Note that this is NOT recommended except for testing, since
+   // the areas might change between compiles.
+   #define FAT_MAXBUFS		24
+
+   #ifndef FAT_DEVSANDPARTS
+	   #define FAT_DEVSANDPARTS    2
+   #endif
+   #ifndef FAT_MAXDEVS
+   	#define FAT_MAXDEVS     FAT_DEVSANDPARTS
+   #endif
+   #ifndef FAT_MAXPARTITIONS
+   	#define FAT_MAXPARTITIONS  FAT_DEVSANDPARTS
+   #endif
+   #ifndef FAT_MAXMARKERS
+   	#define FAT_MAXMARKERS  16
+   #endif
+   #ifndef FAT_MAXRJ
+	   #define FAT_MAXRJ			1024
+   #endif
+   #ifndef FAT_MAXCHK
+	   #define FAT_MAXCHK  		21
+   #endif
+   #ifndef FAT_MAXSPARE
+      #define FAT_MAXSPARE		16
+   #endif
+   #define FAT_USE_XALLOC				// Tell _fatftc_init to use _xalloc().
+
+   // Total number of BB ram bytes required for caching and the various journals.
+   // Rounded to next FAT_LBASIZE byte boundary
+	#define FAT_TOTAL ((((long)(FAT_MAXBUFS+FAT_PAGEBUFFERS))*\
+                (FAT_LBASIZE+FAT_MAXSPARE)+FAT_MAXPARTITIONS*FAT_MAXRJ+\
+                (sizeof(RJHeader)+sizeof(RJEntry)+FAT_MAXCHK+2)*FAT_MAXMARKERS+\
+ 					  sizeof(FTCHeader)+FAT_LBASIZE-1)&(0xFFFFFFFF-(FAT_LBASIZE-1))
+#endif
+
+// Flags for fatftc_write() and/or fatftc_read().
+#define FTC_NO_PREIMAGE		0x0001	// Rollback data is "don't care"
+                                    //  - write() only.
+#define FTC_MEMSET			0x0002	// "data" is memset (byte) value
+                                    //  - write() only.
+#define FTC_MAKE_LRU			0x0004	// Force the relevant sector to be the LRU
+												// sector. This is useful when sequentially
+                                    // writing, when it is known that the sector
+                                    // will not be accessed again anytime soon.
+                                    // This flag applies to both read and write.
+#define FTC_WAIT				0x0008	// If set, the function will wait until the
+												// requested I/O operation(s) are complete.
+                                    // This makes the function "blocking".
+#define FTC_PURGE				0x0010	// Purge and unregister flag.  Used by
+                                    // fatftc_flush() etc.
+#define FTC_MARKER         0x0020   // Marker operation flag
+#define FTC_CONTINUE			0x8000	// Internal flag: passed to fatftc_read() to
+                                    // indicate continuation of previous read
+												// that was suspended due to device busy.
+#define FTC_NOWRITE        0x0020   // Don't write to device
+                                    //   (used in fatftc_flushdev())
+#define FTC_ONMOD          0x0040   // Compares marker bytes to be written with
+                                    // file and only writes if different. USE
+                                    // ONLY for directory size/date markers!!
+
+typedef struct    // BB-RAM cache entry info array (sub-structure to FTCHeader)
+{
+	word		status;			// This must be the FIRST FIELD.
+#define FTC_UNUSED			0			// Anything other than 0 is "in-use" (but
+                                    //   the FTC_USED bit must be set)
+
+#define FTC_USED				0x0100	// Entry in use.  Set for any valid entry.
+#define FTC_LOCKED			0x0400	// Cannot flush from cache until unlocked
+#define FTC_BUSY				0x0800	// This sector is being read or written and
+                                    //   cannot be flushed.  Device busy.
+#define FTC_DIRTY				0x8000	// Cache entry is not same as data on disk
+/* When a dirty sector is written out, the BUSY flag is set until the device
+   returns non-busy status.  Then, the busy and dirty flags are both reset.
+   Note that the DIRTY flag indicates whether a cache entry is busy because
+   of a write or a read.  If DIRTY is set, then it must be a write. */
+
+// NOTE: if the FTC_FIRST bit is not set, then following fields are ignored.
+// The correct fields are derived from the tied entry w/ the FTC_FIRST bit set.
+
+	word		dev;				// Device number - must be SECOND FIELD at OFFSET 2
+   word		lbn;				// Logical block number on device
+   unsigned long secnum;	// Sector number on device (0 = first sector).
+                           // This is logical sector of FAT_LBASIZE
+} FTCEntry;
+
+
+typedef struct   // BB-RAM rollback journal entry (variable length w/ pre-image)
+{
+	word		signature;		// Must contain A55A for entry to be considered valid.
+                           //   Must be FIRST FIELD.
+#define RJ_VALID		0xA55A
+	word		type;				// Entry type
+#define RJT_PREIMAGE		0		// Normal cache sector pre-image (may be any
+                              //   number of these)
+#define RJT_CHECKPOINT	1		// Checkpoint data preimage (only one can exist
+                              //   per journal)
+#define RJT_MARKER		2		// Marker data preimage (only one can exist per
+                              //   journal, and it must be the only thing in
+                              //   the journal.
+   unsigned long secnum;	// Sector number on device (LBA, in terms of logical
+                           //   sectors which are FAT_LBASIZE bytes in size)
+   word		offs;				// Offset of pre-image on sector (0..4095)
+   word		len;				// Length of pre-image (1..4096, although usually
+                           //   fairly small)
+   word		prevoffs;		// Offset (from RJHeader start) of previous RJ entry.
+                           //   0 if this is the first one.
+   								//   This field is used to assist with backwards
+                           //   processing during rollback.
+   // Pre-image data follows directly, thus this is variable length struct whose
+   // total length is given by sizeof(RJEntry) + RJEntry.len.
+} RJEntry;
+
+typedef union {
+   long l;
+   RJEntry __far * ptr;
+} RJEntryUnion;
+
+
+typedef struct      // BB-RAM device info array (sub-structure to FTCHeader)
+{
+	word		flags;
+#define FTCDI_FREE		0 			// Free entry
+#define FTCDI_USED		0x0001	// Used entry
+#define FTCDI_REMOVABLE	0x0002	// Removable media
+
+	word		resv;				// Reserved, set zero
+   char		devsig[16];		// Device/volume identification signature
+} FTCDevInfo;
+
+
+// This is the non-volatile header structure for FTC/RJ.  A single instance of
+// this lives in BB RAM, at a location determined by the BIOS.
+typedef struct
+{
+	unsigned long signature;		  // Must be FIRST FIELD.
+#define FTC_VALID		0xAA677655	  // Detector for uninitialized RAM
+	long	resv;							  // Reserved, set zero
+	FTCDevInfo dinfo[FAT_MAXDEVS];  // Device Info table
+   FTCEntry   ftc[FAT_MAXBUFS + FAT_PAGEBUFFERS];  // Info for each cache entry
+} FTCHeader;
+
+
+typedef struct   // BB-RAM start of each rollback journal (partition or marker)
+{
+	word		signature;		// Must set to RJ_VALID (0xA55A)
+   word		dev;				// Device number of device holding this partition
+                           //   (RJs are assigned by partition)
+   word		resv;				// Reserved, set zero
+   char		data[FAT_MAXCHK];	// Checkpoint or marker data
+
+   // First RJEntry follows immediately.  The total area available (starting
+   // with RJHeader.signature) is FAT_MAXRJ.
+   // FAT_MAXRJ must be <= 4097.  Typically, it should be about 1k.
+} RJHeader;
+
+typedef union {
+   long l;
+   RJHeader __far * ptr;
+} RJHeaderUnion;
+
+// Note that the "*_seg" (segmented addressing) fields are not implemented.
+
+typedef struct _FTCRoot {
+	// Younger and older entries in order of most recent access.  This the the
+   // doubly-linked LRU list. The "younger" pointer of the youngest entry points
+   // to the "no_younger" field in _ftc, and the "older" pointer of the
+   // oldest (i.e. LRU) entry points to the "oldest" field in _ftc.
+   // Both pointers must be not NULL, or both NULL if this entry is not used.
+   // NOTE: these fields must be the first 2 fields, and in the order given.
+   struct _FTCRoot * younger;
+   struct _FTCRoot * older;
+
+   // Following fields are constant once initialized.
+   word		index;		    // Index of this entry.  Used when the entry is
+   							    // determined by following the LRU chain.
+  	FTCEntry __far *	bbentry;  // Far pointer to FTCEntry data in BB-RAM area
+  	long		buf_lin;		    // Far address of BB-RAM cache buffers (FAT_LBASIZE)
+   long     buf2_lin;	    // Far address of spare data buffer (16 bytes)
+} FTCRoot;
+
+typedef struct {
+  	RJHeaderUnion header; 	// Far addr/ptr of RJHeader (@ start of this journal)
+   word		flags;
+#define RJ_CHKENT		0x0001	// If set, there is a checkpoint preimage entry
+#define RJ_MRKENT		0x0002	// If set, there is a marker preimage entry
+										// Only one of the above two can be set, since the
+                              // "current" data is shared.  MRKENT is set only
+                              // in the special short journals called,
+                              // u guessed it, marker journals.
+   word		remain;		// Remaining space in this RJ, in bytes.
+   word		trans;		// Non-zero if currently in transaction
+   word		lastoffs;	// Offset (from RJHeader start) to last entry in RJ.
+                        //   0 if no entries yet.
+   word		hlpid;		// Partition ID as known by higher layer.
+} RJRoot;
+
+typedef struct {
+	word		flags;
+#define FTCDR_REGISTERED  0x0001  // Set if device registered.
+#define FTCDR_REASSIGN    0x0002  // fat_init() discovered reassignable device
+#define FTCDR_PAGEWRITE   0x0010  // Force 'writesize' page writes to device
+  	FTCDevInfo __far * di;           // Pointer to FTCDevInfo entry in BB-RAM area
+   word     ftl_dev;    // Device index within the FTL (-1 if direct device)
+   mbr_dev  * fdev;		// Physical Device info
+   word		writesize;  // Writable unit size (in FAT_LBASIZE byte sectors)
+   long     cache;      // Address of device specific cache buffer (0L if N/A)
+   word		busy;			// Non-zero if device currently busy
+                        // If 'busy': 0x0100 = reading OR
+                        //            0x00## = sectors remaining to write
+#define FTCDR_READ   0x0100
+   word     entries[FAT_PAGEBUFFERS + 1];  // Cache entries to read or write
+   long		* bbuf;		// Busy buffer of sector being read (always entries[0])
+   word     bcount;     // Busy count of sectors remaining to write
+   word     bprt;       // Busy partition identifier
+	word		bflags;		// Busy flags for current busy operation
+} DevRoot;
+
+// This is the main run-time structure for the FTC and RJ layers.  A single
+// instance of this struct is allocated in static root RAM, and is initialized
+// by _fatftc_init().
+typedef struct
+{
+	FTCHeader __far * header;  // Ptr to FTCHeader in BB RAM (constant, from BIOS)
+   long   cache;    // Far address of cache buffer (multiple of 2KB, from BIOS)
+
+   // The following 4 fields are for the start and end of the LRU doubly linked
+   // list.  They must be in the order given, since each pair to look like the
+   // first 2 fields of FTCRoot.  Note that it is possible for a cache entry to
+   // be used, and yet not be in the LRU list.  This happens if there are cache
+   // entries from a previous boot, but the device is not yet registered.
+   FTCRoot * no_younger; // This field always NULL
+   FTCRoot * youngest;	 // Point to MRU entry (or oldest if empty list)
+   FTCRoot * oldest;	    // Point to LRU entry (or no_younger if empty)
+   FTCRoot * no_older;	 // This field always NULL (and is needed, don't remove)
+
+	// Run-time cache of important values (saves continuous long arithmetic and
+   // addr. format conversion at runtime - not battery backed)
+   FTCRoot entry[FAT_MAXBUFS + FAT_PAGEBUFFERS];
+	DevRoot dv[FAT_MAXDEVS];
+   RJRoot  rj[FAT_MAXPARTITIONS+FAT_MAXMARKERS];
+
+#ifdef FATFTC_NBTEST
+	word    nb;
+#endif
+} FTCRun;
+
+extern FTCRun _ftc;
+
+/*** EndHeader */
+
+FTCRun _ftc;			// Unique runtime instance.
+
+/*** BeginHeader _fatftc_addentry */
+void _fatftc_addentry(word index, word lru);
+/*** EndHeader */
+_fatftc_debug void _fatftc_addentry(word index, word flags)
+{
+	// Adds cache entry "index" to LRU list (as MRU entry if flags does not
+   // have FTC_MAKE_LRU set, LRU if bit is set).  If entry is already in the
+   // chain (i.e. has two non-null pointers), it is removed then re-added.
+   auto FTCRoot * wr;
+
+   wr = &_ftc.entry[index];
+   if (wr->younger && wr->older) {
+   	_fatftc_remove(index);
+   }
+   if (flags & FTC_MAKE_LRU) {
+	   wr->younger = _ftc.oldest;
+	   wr->older = (FTCRoot *)&_ftc.oldest;
+	   _ftc.oldest->older = wr;
+	   _ftc.oldest = wr;
+   }
+   else {
+	   wr->older = _ftc.youngest;
+	   wr->younger = (FTCRoot *)&_ftc.no_younger;
+	   _ftc.youngest->younger = wr;
+	   _ftc.youngest = wr;
+   }
+}
+
+/*** BeginHeader _fatftc_remove */
+void _fatftc_remove(word index);
+/*** EndHeader */
+_fatftc_debug void _fatftc_remove(word index)
+{
+	// Remove cache entry "index" from the LRU list. The entry does not actually
+   // have to be the LRU itself. The entry MUST be in the list to start with!
+   auto FTCRoot * wr;
+
+   wr = &_ftc.entry[index];
+   wr->older->younger = wr->younger;
+   wr->younger->older = wr->older;
+   wr->younger = wr->older = NULL;
+}
+
+/*** BeginHeader _fatftc_init */
+// Note that this can be called explicitly to simulate a reboot;
+// it is called automatically before main().
+void _fatftc_init(void);
+extern int _fatftc_donealloc;
+/*** EndHeader */
+
+int _fatftc_donealloc;
+__far FTCHeader * _fatftc_header;
+
+
+#ifdef FATFTC_DEBUG_INIT
+	__debug
+#else
+	__nodebug
+#endif
+void _fatftc_init(void)
+{
+	auto word i, j, stat, tie;
+   auto long e, jrnls;
+   auto DevRoot * dr;
+   auto __far FTCEntry * bbentry;
+
+   memset(&_ftc, 0, sizeof(_ftc));
+#ifdef FAT_USE_XALLOC
+   if (!_fatftc_donealloc) {
+   	_fatftc_donealloc = 1;
+	   e = FAT_TOTAL;
+	   _ftc.header = _fatftc_header = (FTCHeader __far *)(_xalloc(&e,1,XALLOC_BB));
+   }
+   else
+   	_ftc.header = _fatftc_header;
+#else
+	_ftc.header = (FTCHeader __far *)(_TOS_FATDATA - FAT_TOTAL + 1);
+#endif
+   _ftc.cache = (long)_ftc.header + sizeof(FTCHeader);
+   jrnls = _ftc.cache + ((long)(FAT_LBASIZE + FAT_MAXSPARE)) *
+                                (FAT_MAXBUFS + FAT_PAGEBUFFERS);
+   // Setup BB addresses and index for main cache buffers
+   for (i = 0; i < FAT_MAXBUFS; ++i) {
+   	_ftc.entry[i].bbentry = &(_ftc.header->ftc[i]);
+      _ftc.entry[i].buf_lin = _ftc.cache + (i * (long)(FAT_LBASIZE));
+      _ftc.entry[i].buf2_lin = _ftc.cache + ((long)(FAT_LBASIZE) * FAT_MAXBUFS)
+                                  + (i * FAT_MAXSPARE);
+      _ftc.entry[i].index = i;
+   }
+   // Setup BB addresses and index for device specific cache buffers
+   for (e = _ftc.entry[FAT_MAXBUFS - 1].buf2_lin + sizeof(FTCEntry);
+                i < (FAT_MAXBUFS + FAT_PAGEBUFFERS); ++i) {
+   	_ftc.entry[i].bbentry = &(_ftc.header->ftc[i]);
+      _ftc.entry[i].buf_lin = e + ((long)(i - FAT_MAXBUFS) * FAT_LBASIZE);
+      _ftc.entry[i].buf2_lin = e + ((long)(FAT_LBASIZE) * FAT_PAGEBUFFERS) +
+                                    ((i - FAT_MAXBUFS) * FAT_MAXSPARE);
+      _ftc.entry[i].index = i;
+   }
+   for (i = 0, e = jrnls; i < FAT_MAXPARTITIONS; ++i) {
+   	_ftc.rj[i].header.l = e;
+      e += FAT_MAXRJ;
+   }
+   for (; i < FAT_MAXPARTITIONS + FAT_MAXMARKERS; ++i) {
+   	_ftc.rj[i].header.l = e;
+      e += sizeof(RJHeader) + sizeof(RJEntry) + FAT_MAXCHK + 2;
+   }
+   for (i = 0; i < FAT_MAXDEVS; ++i) {
+   	_ftc.dv[i].di = &(_ftc.header->dinfo[i]);
+   }
+   // Make an empty LRU list.  We do not yet add entries to the LRU, since
+   // a device must be registered before any of its cache entries are
+   // allowed to be on the LRU.
+   _ftc.youngest = (FTCRoot *)&_ftc.oldest;
+   _ftc.oldest = (FTCRoot *)&_ftc.no_younger;
+
+   // Now check if header signature is valid.  If not, perform "factory init".
+   if (_ftc.header->signature != FTC_VALID) {
+   	_f_memset(_ftc.header, 0, sizeof(FTCHeader)); // Zero out the header
+      _f_memset((char __far *)jrnls, 0, e - jrnls); // Zero the journals & markers
+      _ftc.header->signature = FTC_VALID;
+   }
+   else {
+   	// Signature is valid.  Set reassignable bit for all removable
+      //   media devices with no outstanding RJ
+      for (i = 0; i < FAT_MAXDEVS; ++i) {
+      	if ((_ftc.dv[i].di->flags & FTCDI_REMOVABLE) &&
+               !fatrj_hasjournal(i, -1, 1)) {
+         	_ftc.dv[i].flags |= FTCDR_REASSIGN;
+         }
+      }
+		// Reset the reassignable bit if there is a dirty cache entry for a
+      // removable media.  Purge clean entries for removable media
+		for (i = 0; i < FAT_MAXBUFS; ++i) {
+			bbentry = _ftc.entry[i].bbentry;
+         stat = bbentry->status;
+         dr = &_ftc.dv[bbentry->dev];
+         if (stat & FTC_BUSY) {
+         	// Turn off busy flag, if any.
+            if (!(stat & FTC_DIRTY)) {
+            	// Not dirty, was reading in, so contents are not valid.
+					bbentry->status = 0;
+               continue;
+            }
+         	bbentry->status &= ~FTC_BUSY;
+         }
+         if (dr->di->flags & FTCDI_REMOVABLE) {
+            if (stat & FTC_DIRTY) {       // Cannot reassign if dirty entry(s)
+               dr->flags &= ~FTCDR_REASSIGN;
+            }
+            else {     // Purge and unregister clean entry for removable media
+               bbentry->status = 0;
+            }
+         }
+      }
+
+      // Purge journals with no entries
+      for (i = 0; i < FAT_MAXPARTITIONS; ++i) {
+      	fatrj_hasjournal(-1, i, 1);
+      }
+   }
+}
+
+
+/*** BeginHeader fatftc_deviter */
+int fatftc_deviter(int (*callback)() );
+#define FTC_NO_ACTION	0
+
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+fatftc_deviter                 <FATFTC.LIB>
+
+SYNTAX: int fatftc_deviter(int (*callback)())
+
+DESCRIPTION: 	The fatftc_deviter() function iterates through all devices in
+the bb ram table. Each entry causes a callback function to be invoked, and
+possibly one of a number of possible actions to be applied to that entry.
+
+The purpose of this function is primarily to be able to process devices which
+are not registerable on the current boot.  One possible cause of this situation
+is if the system is powered down, then a removable medium changed in a device.
+When the system is powered up, the old volume/device signature still exists and
+takes up a device table entry.  This entry cannot otherwise be reclaimed until
+the original volume is mounted then the device flushed (and unregistered).
+
+
+PARAMETER1:    The prototype for the callback function is
+     int callback(FTCDevInfo * dinfo, word registered)
+The "dinfo" parameter points to a root copy of the FTCDevInfo struct which is
+normally stored in bb ram.  The fields include the 16-char device "signature"
+which uniquely identifies the device and volume serial.
+
+The "registered" parameter & FTCDR_REGISTERED then the device is currently
+registered.  In general, if the device is registered then the callback need not
+do any processing since all is OK.  Otherwise, it indicates an entry which is
+pending re-registration on this boot.  The callback should decide what to do
+(either purge the entry and lose any cached data, or wait until later to
+register that device again). Note: the value of this parm is actually the flags
+field of the DevRoot entry.  Another possible bit value is FTCDR_REASSIGN which
+indicates that the device entry is eligible for reassignment (i.e. it is a
+removable medium and there are no dirty cache entries).  If this bit is set,
+then there is nothing to do.
+
+The return code from the callback indicates the action which should be taken.
+It should be one of
+   FTC_NO_ACTION - do nothing (the usual return code when "registered" is
+                   non-zero)
+   FTC_PURGE     - purge the entry and make it available for other device
+                   registrations.
+
+RETURN VALUE:  Currently always 0.
+
+END DESCRIPTION **********************************************************/
+_fatftc_debug int fatftc_deviter(int (*callback)() )
+{
+	auto FTCDevInfo di;
+	auto word dev;
+   auto int rc;
+
+   for (dev = 0; dev < FAT_MAXDEVS; ++dev) {
+   	_f_memcpy((char __far *)&di, _ftc.dv[dev].di, sizeof(di));
+      if (!di.flags) {
+      	continue;	// Ignore free entries
+      }
+      rc = callback(&di, _ftc.dv[dev].flags);
+      if (rc == FTC_PURGE) {
+      	// Requested purge.  If not already registered, register this
+         // device with 'norecovery'.
+         if (!(_ftc.dv[dev].flags & FTCDR_REGISTERED)) {
+         	fatftc_regdev(NULL,di.devsig,1,NULL);
+         }
+         // Now "flush" (which won't write anything) and unregister
+         fatftc_flushdev(dev, 1);
+      }
+   }
+   return 0;
+}
+
+/*** BeginHeader fatftc_regdev */
+int fatftc_regdev(mbr_dev * fdev, char sig[16], int norecovery,
+                          int (*checkpoint)() );
+int _fatftc_clearcache(void);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+fatftc_regdev                 <FATFTC.LIB>
+
+SYNTAX: int fatftc_regdev(mbr_dev * fdev, char sig[16], int norecovery,
+                              int (*checkpoint)())
+
+DESCRIPTION:  Register a FAT-capable device. This is called by the device
+              enumeration function in the FAT library. The purpose of this
+              function is to set up the necessary FTC control structure.
+
+       NOTE:  This function may block for some time if it is necessary to
+              apply rollback journal(s) to the device being registered.
+
+PARAMETER1: fdev is a pointer to the existing static mbr_dev structure.
+
+PARAMETER2:  sig is the unique signature for the device. This is so that the
+instance of the FTC control structure (for that device) can be located in the
+non-volatile ram. FTC remembers the cached data from before the last power-down,
+and this is especially critical in the case that a rollback needs to be
+performed. For fixed devices, the signature may be an arbitrary fixed string
+e.g. “SFLASH1” for the first serial flash. For removable devices, it would be
+best if the FAT directly reads the boot block on the device (bypassing FTC) to
+determine the volume label, and uses that label as the signature. In any case,
+the signature must be padded to exactly 16 bytes since the FTC always does a
+16-char memcmp() to find the matching device.
+
+PARAMETER3:  norecovery is a boolean. If TRUE, then any existing cache,
+rollback, and device table entries are discarded. This flag should only be set
+if the first attempt to register this device returned an error, and the end-user
+has been prompted that there was an error, but the user said go ahead
+anyway. This situation is more likely to occur with removable media, when the
+medium was changed without properly flushing the cache. Calling with this
+setting is likely to result in lost data or corruption of the old medium, but
+sometimes that cannot be helped.
+
+PARAMETER4:  Pointer to checkpoint callback function.  See the description under
+fatrj_setchk().  This function is invoked with the checkpoint data for this
+device; it may in fact be invoked several times if there was more
+than one registered partition.  The callback function needs to decide whether
+the checkpoint data is relevant and, if so, save it somewhere.  After
+calling the callback, this function resets all checkpoint data to zeros.
+
+RETURN VALUE: Non-negative: a small integer which uniquely identifies the
+                            device instance.  This number is required by some
+                            of the other FTC functions.
+              Negative Error codes:
+                 -EDQUOT - Running out of space in the FTC device table
+                 -EEXIST - Device already registered on this boot
+                 -EINVAL - Invalid parameter
+                 -ENOSPC - Cache is full of dirty entries from other device
+                 -EMISMATCH - Device known before, but removable status has
+                              changed when there are cache entries.  This code
+                              will not be returned if norecovery flag is set.
+                 -ETYPE  - Bad device type, needs more page buffers defined
+                 -<various> I/O error during rollback process.
+
+END DESCRIPTION **********************************************************/
+_fatftc_debug int fatftc_regdev(mbr_dev * fdev, char sig[16],
+                                 int norecovery, int (*checkpoint)() )
+{
+	auto int dev;		// Returned FTC device number (or -ve for error)
+   auto int rc;
+   auto int dev_free;
+   auto int dev_reassign;
+   auto int reused;
+   auto word stat, i, c, fresh, writesize;
+   auto char * chkdata;
+   auto FTCDevInfo __far * di;
+   auto FTCEntry __far * bbentry;
+   auto RJHeader __far * rh;
+   auto FTCRoot * entry;
+   auto DevRoot * dr;
+
+#ifdef FATFTC_VERBOSE
+	printf("fatftc_regdev: sig='%-16.16s' - %s\n", sig, norecovery ?
+                                                  "no recov" : "recover");
+#endif
+
+   writesize = (!fdev ? 1 : (_fatConfig[fdev->dev_num].type[1] == 'F' ?
+                          (fdev->byte_page + 256) >> 9 : 1));
+   if (writesize > (FAT_PAGEBUFFERS + 1)) {
+      return -ETYPE;     // Bad device type for given FAT Page Buffers
+   }
+
+   // Look for existing entry w/ matching signature (remember first free one)
+   dev_free = -1;
+   dev_reassign = -1;
+   reused = 0;
+   for (dev = 0; dev < FAT_MAXDEVS; ++dev) {
+      di = _ftc.dv[dev].di;
+      if (!di->flags) {
+         if (dev_free < 0) {
+         	dev_free = dev;	// First free entry
+         }
+      }
+		else {
+         if (!memcmp(di->devsig, (char __far *)sig, 16L)) {
+#ifdef FATFTC_VERBOSE
+				printf("fatftc_regdev: re-used\n");
+#endif
+   	   	reused = 1;
+            if (!fdev) {
+               writesize = _ftc.dv[dev].writesize;
+            }
+      		break;		// Found in-use
+	      }
+   	   if (dev_reassign < 0 && _ftc.dv[dev].flags & FTCDR_REASSIGN) {
+      		dev_reassign = dev;	// First reassignable entry
+         }
+      }
+   }
+	if (reused) {
+   	// Found in-use
+      if (!norecovery) {
+	      if (((fdev->driver->type[fdev->dev_num] & MBRTYPE_REMOVE) != 0) ^
+                ((di->flags & FTCDI_REMOVABLE) != 0)) {
+	         return -EMISMATCH;   // Mismatch of removable status
+         }
+      }
+   }
+   else {
+      if (dev_reassign >= 0) {
+	      dev = dev_reassign;
+	      _ftc.dv[dev].flags &= ~FTCDR_REGISTERED;
+	   }
+	   else {
+	      dev = dev_free;
+	   }
+   }
+
+   if (dev < 0) {
+   	return -EDQUOT;		// Quota exceeded (no free or reassignable entries)
+   }
+
+	dr = &_ftc.dv[dev];
+   if (dr->flags & FTCDR_REGISTERED) {
+   	return -EEXIST;		// Already registered
+   }
+   dr->writesize = i = writesize;
+   for (stat = 0; i; i >>= 1) {
+      if (i & 1) stat++;
+   }
+   if (stat != 1) {
+   	return -EINVAL;		// Writesize must be a power of 2
+   }
+   dr->flags |= (writesize > 1) ? FTCDR_REGISTERED | FTCDR_PAGEWRITE :
+                                          FTCDR_REGISTERED;
+   dr->flags &= ~FTCDR_REASSIGN;		// Cannot reasign now that registered.
+   dr->fdev = fdev;
+   di = dr->di;
+
+   if (!reused) {
+      if (!fdev) {
+         return -EINVAL;   // New device must pass in fdev pointer
+      }
+	   _f_memcpy(di->devsig, (char __far *)sig, 16);
+	   // Set this last...
+      di->flags = ((fdev->driver->type[fdev->dev_num] & MBRTYPE_REMOVE) ?
+                      FTCDI_REMOVABLE|FTCDI_USED : FTCDI_USED);
+   }
+   else {
+   	// Device was registered before bootup.  See if there was an outstanding
+      // rollback journal. If norecovery is false, apply the outstanding
+      // journal(s). Otherwise, trash the journal. But first, add any
+      // outstanding cache entries to the LRU.
+       // Set fresh start flag based on if LRU/MRU list is empty
+      fresh = (_ftc.youngest == (FTCRoot *)&_ftc.oldest ? 1 : 0);
+      for (i = c = 0; i < FAT_MAXBUFS; ++i) {
+      	entry = &_ftc.entry[i];
+         bbentry = entry->bbentry;
+         stat = bbentry->status;
+         if (stat & FTC_USED) {
+            if (bbentry->dev == dev) {
+#ifdef FATFTC_VERBOSE
+		 		   printf("fatftc_regdev: restoring old cache entry %u\n", i);
+#endif
+     			   _fatftc_addentry(i, 0);   // Make the MRU entry
+               if (norecovery) {
+            	   bbentry->status = stat & ~FTC_DIRTY; // Don't actually write
+            	   _fatftc_devwrite(i, FTC_PURGE);      // Unconditional purge
+               }
+            }
+            else {  // Check out cache entry from other devices if fresh start
+               if (fresh) {
+                  if (stat & FTC_DIRTY && !norecovery) {
+                     c++;                  // Add to dirty & non-reg. count
+                  }
+                  else {                   // Purge clean entries and
+                     bbentry->status = 0;  //  dirty entries if norecovery
+                  }
+               }
+            }
+         }
+      }
+      if (fresh && c == FAT_MAXBUFS) {
+         return -ENOSPC;       // Cache is full of non-purgeable dirty entries
+      }
+
+      for (i = 0; i < FAT_MAXPARTITIONS+FAT_MAXMARKERS; ++i) {
+      	rh = _ftc.rj[i].header.ptr;
+         if (rh->signature == RJ_VALID && rh->dev == dev) {
+#ifdef FATFTC_VERBOSE
+		 		printf("fatftc_regdev: found journal %u\n", i);
+#endif
+         	if (!norecovery && (rc = fatrj_rollback(i, FTC_WAIT)) < 0) {
+               dr->flags &= ~FTCDR_REGISTERED;
+               // Bad error, recovery failed (register again, with norecovery)
+               return rc;
+            }
+           	rh->signature = 0;	// Purge rollback journal
+         	if (!norecovery && checkpoint && (i < FAT_MAXPARTITIONS)) {
+            	checkpoint(dev, i, fdev, rh->data);
+            }
+         }
+      }
+   }
+
+   return dev;
+}
+
+int _fatftc_clearcache(void)
+{
+   int i;      // DEBUG function to clear all cache entries from BB-RAM
+
+   for(i=0; i < FAT_MAXBUFS; _ftc.entry[i++].bbentry->status = 0) {
+      _ftc.entry[i].younger = NULL;
+   }
+   _ftc.youngest = (FTCRoot *)&_ftc.oldest;
+   _ftc.oldest = (FTCRoot *)&_ftc.no_younger;
+
+   return 0;
+}
+
+/*** BeginHeader fat_tick, _fat_tick */
+int fat_tick();
+#ifndef FAT_USE_UCOS_MUTEX
+#define _fat_tick  fat_tick
+#else
+int _fat_tick(void);
+#endif
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+fat_tick                      <FATFTC.LIB>
+
+SYNTAX:
+   int fat_tick(void);
+
+DESCRIPTION:
+   Drive device I/O completion and periodic flushing. It is not generally
+   necessary for the application to call this function when operating in
+   blocking mode, however if it is called regularly (when the application
+   has nothing else to do) then filesystem performance may be improved.
+   When FAT is run in non-blocking mode, it is recommended that this
+   function be called regularly to drive write and maintenance actions to
+   completion.
+
+   uC/OS-II USERS:
+      The FAT API is not reentrant from multiple tasks. If you wish to use
+      the FAT from multiple uC/OS-II tasks,
+         #define FAT_USE_UCOS_MUTEX
+      to make all FAT API functions pend and post a mutex semaphore that
+      will prevent every other FAT API function from proceeding until it
+      obtains the mutex. Mutex timeouts or errors will cause a run-time
+      error,
+         ERR_FAT_MUTEX_ERROR.
+
+RETURN VALUE:
+   0 if no device is busy.
+   -EBUSY if any device is busy.
+END DESCRIPTION *********************************************************/
+
+#ifdef FAT_USE_UCOS_MUTEX
+_fatftc_debug
+int fat_tick(void)
+{
+    auto int rc;
+
+    _fat_ucos_mutex_pend();  // Wait for semaphore
+    rc =  _fat_tick();
+    _fat_ucos_mutex_post();  // Signal for semaphore
+    return rc;
+}
+
+_fatftc_debug int _fat_tick()
+#else
+_fatftc_debug int fat_tick()
+#endif
+{
+	auto word i;
+   auto DevRoot * dr;
+   auto int rc, rc2;
+   auto FTCEntry bbentry;
+
+	// Iterate through all devices.  If any are found with the busy flag set,
+   // then see if that device has completed its current operation.  If so, then
+   // find out which operation has completed and make the appropriate cache flag
+   // changes and/or start off the next part of a multi-sector operation.
+   for (i = 0, rc2 = 0; i < FAT_MAXDEVS; ++i) {
+   	dr = &_ftc.dv[i];
+      if (dr->fdev) {
+#ifdef __FATFTL_LIB
+			rc = dr->fdev->driver->xxx_InformStatus(dr->fdev, FTLS_BACKGROUND);
+#else
+			rc = dr->fdev->driver->xxx_InformStatus(dr->fdev, 0);
+#endif
+         if (rc) {
+            rc2 = rc;
+         	continue;	// Device still busy
+         }
+	      if (dr->busy) {
+	         if (dr->busy < FTCDR_READ) {
+	            _fatftc_devwrite(dr->entries[0], dr->bflags | FTC_CONTINUE);
+	         }
+	         else {
+	            fatftc_read(dr->bprt, dr->entries[0],
+	                          dr->bbuf, dr->bflags | FTC_CONTINUE);
+	         }
+	      }
+ 		}
+   }
+
+	return rc2;
+}
+
+
+/*** BeginHeader _fatftc_devwrite */
+int _fatftc_devwrite(word ent, word flags);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+_fatftc_devwrite                 <FATFTC.LIB>
+
+SYNTAX: int _fatftc_devwrite(word ent,	word flags)
+
+DESCRIPTION:  Write dirty entry "ent" (and possibly entries on same LBN)
+              to the device.  If all writes are successful, it also
+              resets the dirty flag(s).
+
+PARAMETER1: ent is index of entry to be written to the device.  May write
+                additional entries on the same LBN if writesize > 1.
+
+PARAMETER2: flags, If FTC_PURGE is set in flags, mark the cache entries as
+                   free (including removal from the LRU list).
+
+RETURN VALUE: 0 if OK, else negative error code:
+-EINVAL: if FTC_CONTINUE set in flags and device is not busy with a write
+-EDEVNOTREG: device for this cache entry has not been registered.
+-EBUSY: if device is busy
+
+END DESCRIPTION **********************************************************/
+_fatftc_debug int _fatftc_devwrite(word ent,	word flags)
+{
+	//
+   auto unsigned long secnum;
+   auto word i, e, dev, lbn, len, mask, stat;
+   auto long buf, buf2;
+   auto DevRoot * dr;
+   auto int rc;
+   auto FTCEntry __far * bbentry;
+
+   bbentry = _ftc.entry[ent].bbentry;
+	dev = bbentry->dev;
+   dr = &_ftc.dv[dev];
+
+   // Internal consistency checks
+   if (!(dr->flags & FTCDR_REGISTERED)) {
+   	if (flags & FTC_PURGE) {
+      	// Purge flag: Device not registered, remove entry from LRU list
+	   	_fatftc_remove(ent);		// Remove from LRU list
+      }
+   	return -EDEVNOTREG;
+   }
+
+   // See if device is busy at the driver level
+   if (dr->fdev->driver->xxx_InformStatus(dr->fdev, 0) == -EBUSY ||
+           dr->busy == FTCDR_READ) {
+      return -EBUSY;
+   }
+
+   if (dr->busy) {  // Check if write operation already in progress
+      // See if busy with write to a different beginning sector
+      if (ent != dr->entries[0] || !(flags & FTC_CONTINUE)) {
+         return -EBUSY;
+      }
+      len = dr->bcount;           // Get count of sectors left to write
+      if (len < dr->writesize) {  // Clear busy flag if sector just written
+         _ftc.entry[dr->entries[len]].bbentry->status &= ~FTC_BUSY;
+      }
+   }
+   else {
+      if (flags & FTC_CONTINUE) {
+         return -EINVAL;  // FTC_CONTINUE only set if callback of prior busy
+      }
+      if (!(bbentry->status & FTC_DIRTY)) {  // Only write if entry is dirty
+	      if (flags & FTC_PURGE) {   // Not dirty, see if purge flag set
+	         _fatftc_remove(ent);    // Remove from LRU list
+            bbentry->status = 0;    // And remove entry from the cache
+	      }
+	      return 0;
+      }
+	   len = 1;	                  // Assume just this cache entry to write
+      dr->entries[0] = ent;      // Always set start of array to base entry
+#if FAT_PAGEBUFFERS > 0
+      if (dr->writesize > 1) {   // See if write size is more than 1 sector
+	      lbn = bbentry->lbn;     // Get LBN of the base cache entry
+         // Scan for additional cache entries from the same LBN on device
+	      for (i = (ent == (FAT_MAXBUFS - 1) ? 0 : ent + 1); i != ent;
+	            i = (i == (FAT_MAXBUFS - 1) ? 0 : i + 1)) {
+	          bbentry = _ftc.entry[i].bbentry;
+	          if (bbentry->dev == dev && bbentry->lbn == lbn &&
+	               (bbentry->status & FTC_DIRTY)) {
+                dr->entries[len++] = i;  // Found entry w/ same LBN, add to list
+	             if (len == dr->writesize) {
+                   break;              // Filled writesize, stop looking
+                }
+	          }
+	      }
+      }
+      // Check for page write device and use device buffers if needed.
+      if ((dr->flags & FTCDR_PAGEWRITE) && len < dr->writesize) {
+         if (_ftc.entry[FAT_MAXBUFS].bbentry->status) {
+            return -EBUSY;     // Shared page write buffers are in use
+         }
+         mask = dr->writesize - 1;  // Setup writesize mask
+         // Set secnum to first sector in write page
+         secnum = (_ftc.entry[ent].bbentry->secnum & ~((long)mask));
+         for (e = FAT_MAXBUFS; len < dr->writesize; secnum++) {
+            for (i = 0; i < len; ) {   // Find sector(s) not already in cache
+               if (_ftc.entry[dr->entries[i]].bbentry->secnum == secnum) {
+                  secnum++;            // Sector already in list, try next one
+                  i = 0;               // Reset to start of entry list
+               }
+               else {
+                  i++;                 // No match, try next entry in list
+               }
+            }
+            dr->entries[len++] = e;            // Add another entry to write
+	         buf = _ftc.entry[e].buf_lin;       // Main buffer address of entry
+	         buf2 = _ftc.entry[e].buf2_lin;     // Spare buffer address of entry
+	         bbentry = _ftc.entry[e++].bbentry; // BB-RAM pointer for entry info
+            bbentry->secnum = secnum;
+            bbentry->lbn = lbn;
+            bbentry->status = FTC_USED | FTC_BUSY;
+	         do {                               // Read sector into device cache
+	            rc = dr->fdev->driver->xxx_ReadSector(secnum,buf,buf2,dr->fdev);
+	            if (rc == -EIO) {
+	               return rc;  // Bail out if I/O error
+	            }
+	         } while (rc == -EBUSY);
+         }
+      }
+#endif
+	   dr->busy = len;    // Set busy state to number of entries to be written
+   }
+
+	while (len) {
+      i = dr->entries[--len];            // Get cache entry to write to device
+	   buf = _ftc.entry[i].buf_lin;       // Get main buffer pointer for entry
+	   buf2 = _ftc.entry[i].buf2_lin;     // Get spare buffer pointer for entry
+	   bbentry = _ftc.entry[i].bbentry;   // Get BB-RAM pointer for entry info
+	   secnum = bbentry->secnum;          // Get device sector number for entry
+	   bbentry->status |= FTC_BUSY;       // Set busy bit on cache entry
+      // Write cache entry out to the device
+      rc = dr->fdev->driver->xxx_WriteSector(secnum, buf, buf2, dr->fdev,
+                                              len ? FTC_CONTINUE : 0);
+      if (rc == -EBUSY || rc == -EDRVBUSY) {
+	      if (rc == -EDRVBUSY) {
+	         len++;   // Increment entries to write, device has not queued it yet
+	      }
+         // Device has queued the write operation.  Record details so we can
+         // continue later and/or poll the device for completion.
+         dr->bcount = len;
+         dr->bflags = flags;
+         return -EBUSY;
+      }
+      if (rc < 0) {
+         stat = ~FTC_BUSY;                     // Drop busy on error
+         if (rc == -EROFS) stat &= ~FTC_DIRTY; // Drop dirty bit if read-only
+         do {
+            bbentry = _ftc.entry[dr->entries[len++]].bbentry;
+            bbentry->status &= stat;           // Set status on cache entries
+         } while (len < dr->busy);
+         dr->busy = 0;                         // Drop busy in devroot as well
+         return rc;
+      }
+      bbentry->status &= ~FTC_BUSY;      // Cache entry written, clear busy
+   }
+   // All written now.  Reset dirty flag(s) or purge from cache
+   for (i = dr->busy; i--; ) {
+      e = dr->entries[i];
+      bbentry = _ftc.entry[e].bbentry;
+#if FAT_PAGEBUFFERS > 0
+	   if ((flags & FTC_PURGE) || (e >= FAT_MAXBUFS)) {
+         if (e < FAT_MAXBUFS) {      // See if part of main cache
+   	      _fatftc_remove(e);       // Remove from LRU list
+         }
+#else
+	   if (flags & FTC_PURGE) {
+  	      _fatftc_remove(e);       // Remove from LRU list
+#endif
+         bbentry->status = FTC_UNUSED;     // Mark cache entry as unused.
+	   }
+  	   else {
+         bbentry->status &= ~FTC_DIRTY;    // Mark cache entry as clean
+	   }
+   }
+   dr->busy = 0;
+	return 0;
+}
+
+/*** BeginHeader _fatftc_dumpstate, _fatftc_dump_devs */
+int _fatftc_dumpstate(word dev, unsigned long secnum,
+                       int rcode, char * where);
+void _fatftc_dump_devs(word thisdev);
+/*** EndHeader */
+
+void _fatftc_dump_cache(long where)
+{
+	auto word i, j;
+   auto long b, b2, p, d;
+   auto word stat;
+   auto char * c;
+   auto FTCRoot * wr;
+   auto FTCEntry __far * bbentry;
+
+   c = (char *)&d;
+   printf("=== cache ===\n");
+   for (i = 0; i < FAT_MAXBUFS; ++i) {
+   	printf("c%u ", i);
+      bbentry = _ftc.entry[i].bbentry;
+      b = _ftc.entry[i].buf_lin;
+      b2 = b + FAT_LBASIZE;
+      stat = bbentry->status;
+      printf("\t%c%c%c",
+      	stat & FTC_USED ? 'U' : ' ',
+         stat & FTC_DIRTY ? 'D' : ' ',
+         stat & FTC_LOCKED ? 'L' : ' '
+         );
+#ifdef FATFTC_FULL_CHAIN_INFO
+      printf("\tdev%d\tsec%ld\twr-size%u  y=0x%04x  o=0x%04x",
+         	bbentry->dev,
+            bbentry->secnum,
+            _ftc.dv[bbentry->dev].writesize,
+            _ftc.entry[i].younger, _ftc.entry[i].older);
+#else
+      printf("\tdev%d\tsec%ld\twr-size%u",
+         	bbentry->dev,
+            bbentry->secnum,
+            _ftc.dv[bbentry->dev].writesize);
+#endif
+      if (where >= b && where < b2) {
+      	printf("\t<-- +%lu", where - b);
+      }
+      printf("\n");
+   }
+	printf("=== MRU->LRU ===\n");
+	for (wr = _ftc.youngest; wr->older; wr = wr->older) {
+   	printf("->%d", wr->index);
+   }
+#ifdef FATFTC_FULL_CHAIN_INFO
+	printf("\n=== LRU->MRU ===\n");
+	for (wr = _ftc.oldest; wr->younger; wr = wr->younger) {
+   	printf("->%d", wr->index);
+   }
+#endif
+   printf("\n");
+}
+
+void _fatftc_dump_devs(word thisdev)
+{
+	auto FTCDevInfo __far * di;
+   auto DevRoot * dr;
+   auto word i;
+
+   printf("=== devs ===\n");
+   printf("#  fls mbrd wrtsz bf sig\n");
+   printf("-  --- ---- ----- -- ----------------\n");
+   for (i = 0; i < FAT_MAXDEVS; ++i) {
+      dr = &_ftc.dv[i];
+      di = dr->di;
+      printf("%u%c %c%c%c %04X %5u %c%c %-16.16ls\n",
+      	i,
+         i == thisdev ? '*' : ' ',
+         dr->flags & FTCDR_REGISTERED ? 'R' : '!',
+         dr->flags & FTCDR_REASSIGN ? 'A' : ' ',
+         dr->busy ? 'B' : ' ',
+         dr->fdev,
+         dr->writesize * FAT_LBASIZE,
+         di->flags & FTCDI_USED ? 'U' : '!',
+         di->flags & FTCDI_REMOVABLE ? 'E' : ' ',
+         di->devsig);
+   }
+}
+
+_fatftc_debug int _fatftc_dumpstate(word dev, unsigned long secnum,
+                                     int rcode, char * where)
+{
+
+	printf("FTC: dumpstate: rc=%d in %s\n", rcode, where);
+   printf("  on behalf of dev=%u secnum=%lu\n", dev, secnum);
+
+   _fatftc_dump_cache(0);
+
+   _fatftc_dump_devs(dev);
+	return 0;
+}
+
+/*** BeginHeader _fatftc_getfree */
+int _fatftc_getfree(word dev, unsigned long secnum);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+_fatftc_getfree                 <FATFTC.LIB>
+
+SYNTAX: int _fatftc_getfree(word dev, unsigned long secnum)
+
+DESCRIPTION: Gets a free cache entry and assigns it to the given sector.
+             If necessary, it will flush the LRU sector to the device.
+             Cache entry is initialized with dev and secnum.  Blocks on
+             clearing of dirty entry from cache.
+
+PARAMETER1: dev is the device registered using fatftc_regdev().
+
+PARAMETER2: secnum is the LBA sector number to assign to the entry
+
+RETURN VALUE: If positive, it is the index of the cache entry
+	           -EUNFLUSHABLE: no cache entries to flush
+              -EBUSY: all eligable devices are busy
+
+END DESCRIPTION **********************************************************/
+_fatftc_debug int _fatftc_getfree(word dev, unsigned long secnum)
+{
+   auto int rc;
+   auto word i;
+   auto FTCRoot * entry;
+   auto FTCEntry __far * bbentry;
+#ifdef __FATFTL_LIB
+   auto mbr_dev * mdev;
+#endif
+
+   entry = NULL;
+
+   // Find a cache entry to use - order of preferrence is free/clean/dirty
+   for (i = 0; i < FAT_MAXBUFS && _ftc.entry[i].bbentry->status; i++);
+
+   if (i == FAT_MAXBUFS) {  // See if existing cache entry must be flushed
+      // No, find LRU clean entry. If no clean entries, find LRU dirty entry.
+      entry = _ftc.oldest;
+      while (entry->bbentry->status & (FTC_LOCKED | FTC_BUSY | FTC_DIRTY)) {
+         entry = entry->younger;
+         if (entry->younger == NULL) { // All cache entries dirty?
+            entry = _ftc.oldest;       // Yes, scan for dirty entry to flush
+            rc = -1;
+            while ((i = (entry->bbentry->status & (FTC_LOCKED | FTC_BUSY))) ||
+                      _ftc.dv[entry->bbentry->dev].busy) {
+               entry = entry->younger;   // Get next younger entry pointer
+               rc &= i;                  // Update ALL LOCKED flag
+               if (entry->younger == NULL) {
+                  return (rc ? -EUNFLUSHABLE : -EBUSY); // No flushable entry
+               }
+            }
+            break;
+         }
+      }
+      i = entry->index;   // Entry to flush from cache and re-use was found
+      while (entry->bbentry->status & FTC_DIRTY) {
+         // This resets the dirty bit, and marks entry unused
+         rc = _fatftc_devwrite(i, FTC_PURGE);
+         if (rc == -EBUSY) {
+            _fat_tick();
+            continue;    // Block on busy condition
+         }
+         if (rc < 0) {
+            return rc;   // May be I/O error
+         }
+      }
+   }
+
+	// i contains entry index of free entry
+	bbentry = _ftc.entry[i].bbentry;
+   bbentry->dev = dev;
+	bbentry->secnum = secnum;
+   bbentry->lbn = _ftc.dv[dev].fdev->sec_block ?
+                       (word)(secnum / _ftc.dv[dev].fdev->sec_block) : 0;
+   bbentry->status = FTC_USED;
+   return (int)i;
+}
+
+/*** BeginHeader _fatftc_find */
+int _fatftc_find(int prt, unsigned long secnum, word * devp, word * statp);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+_fatftc_find                 <FATFTC.LIB>
+
+SYNTAX: int _fatftc_find(int prt, unsigned long secnum, word * devp,
+                          word * statp)
+
+DESCRIPTION: Finds sector secnum of the given device and partition.
+             Returns index of the cache entry, or -ENODATA if not found.
+             Returns -EBUSY if the sector is found, but is not yet valid
+             because the device has not finished reading the data.
+             NOTE: if the device is initially busy, fat_tick() is called
+             to poll for completion.
+
+PARAMETER1: prt is the partition registered using fatrj_regpartition().
+
+PARAMETER2: secnum is the LBA sector number to assign to the entry
+
+PARAMETER3: *devp is set to the device number.  If NULL, then prt
+             contains the device number (not partition).
+
+PARAMETER4: *statp is set to point to the cache entry status word
+
+RETURN VALUE: If positive, it is the index of the cache entry
+              -EINVAL: invalid sector number for prt host device
+	           -ENODATA: no matching cache entry found.
+              -EBADPART: prt is an unmounted or invalid partition
+              -EBUSY: sector found, but not yet valid.
+
+END DESCRIPTION **********************************************************/
+_fatftc_debug int _fatftc_find(int prt, unsigned long secnum, word * devp,
+                                word * statp)
+{
+   auto word dev;
+   auto word i, stat;
+   auto FTCEntry __far * bbentry;
+
+
+   if (!devp) {
+   	dev = prt;
+   }
+   else {
+   	*devp = dev = _ftc.rj[prt].header.ptr->dev;
+   }
+   if (dev >= FAT_MAXDEVS) {
+      return -EBADPART;
+   }
+
+   // Check for valid sector number
+   if (secnum >= _ftc.dv[dev].fdev->seccount) {
+      return -EINVAL;
+   }
+
+   // Poll if requested device is busy
+   if (_ftc.dv[dev].busy) {
+   	_fat_tick();
+   }
+
+	for (i = FAT_MAXBUFS; i--; ) {        // Look through all cache entries
+      bbentry = _ftc.entry[i].bbentry;
+      if (secnum == bbentry->secnum && bbentry->dev == dev) {
+         *statp = stat = bbentry->status;   // Possible cache hit
+         if (stat & FTC_USED) {             // See if current cache entry
+            // Entry found, return index if ready or -EBUSY if not ready
+            return ((stat & (FTC_BUSY|FTC_DIRTY)) == FTC_BUSY ? -EBUSY : i);
+         }
+      }
+   }
+   return -ENODATA;
+}
+
+/*** BeginHeader fatftc_read */
+int fatftc_read(int prt, unsigned long secnum, long * where, word flags);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+fatftc_read                 <FATFTC.LIB>
+
+SYNTAX: int fatftc_read(int prt, unsigned long secnum, long * where,
+                          word flags)
+
+DESCRIPTION: Reads a logical sector into the cache, if not already
+             available.  Sets 'where' to address of cache buffer.
+
+             This function may return before the requested operation
+             has completed, unless the FTC_WAIT flag is passed.  If
+             -EBUSY is returned, this function should be called again
+             (with the same parameters) some time later, and after
+             calling fat_tick() to drive I/O completion.
+
+PARAMETER1: prt is the partition number from fatrj_regpartition().
+
+PARAMETER2: secnum is the LBA address of the logical sector to read,
+            relative to the start of the device (not the partition).
+            If FTC_CONTINUE is set in flags, secnum should be set to
+            the index of the cache entry instead of the LBA.
+
+PARAMETER4: where is a pointer to a longword, which will be set to the
+            physical address of the start of the cache entry, which will
+            contain the requested data. The FAT library can read the data
+            contents, but must not modify them (unless it explicitly calls
+            fatftc_makedirty()). The pointer is only guaranteed to be valid
+            up to the next call to fatftc_read, fatftc_write or any flush
+            function (including fat_tick) or the marker functions.
+            Note: if using uC/OS, the FAT library must use a global lock to
+            prevent any other task from calling FTC or RJ functions while it
+            is making use of the returned pointer. This is because the other
+            task might cause the cache entry to be flushed and re-used,
+            thus invalidating the current task’s reference.
+
+PARAMETER5: flags should normally be set zero, valid bits include:
+             FTC_MAKE_LRU -- if this bit is set, then the entry which is
+                 read is marked as the LRU cache entry, which means that
+                 the same cache entry will be the next one to be flushed.
+                 This is useful when the caller knows that the sector will
+                 not be accessed again any time soon.
+             FTC_WAIT -- if this bit is set, then the function will not
+                 return until the requested operation has completed.  If
+                 not set, then -EBUSY may be returned if the requested
+                 data is not immediately available.
+
+RETURN VALUE: 512 on success
+              Both read and write I/Os may occur for this call. Write
+              I/Os occur if the LRU cache entry has to be flushed.
+  Possible error codes are:
+     -EINVAL: sector number is invalid or device not initialized or
+               FTC_CONTINUE flag set when device is not busy with a read.
+     -EBADPART: bad or unmounted partition number
+     -EUNFLUSHABLE: too many unflushable entries in the cache to allow
+                    reading the requested sector.
+     -EBUSY: Device is busy, try again later (this is not really an error)
+             This code won't happen if the FTC_WAIT flag is set.
+     <other>: I/O error in the underlying device driver.
+
+END DESCRIPTION **********************************************************/
+_fatftc_debug int fatftc_read(int prt, unsigned long secnum, long * where,
+                               word flags)
+{
+	auto word dev, stat;
+	auto int ent, rc;
+   auto DevRoot * dr;
+   auto long buf, buf2;
+   auto FTCEntry __far * bbentry;
+
+#ifdef FATFTC_NBTEST
+   if (!(flags & FTC_WAIT)) {
+		if (++_ftc.nb == (FATFTC_NBTEST + 1)) {
+         _ftc.nb = 0;
+      }
+      else {
+         return -EBUSY;
+      }
+   }
+#endif
+
+   // Unless this is a marker read, validate the partition registration
+   if (!(flags & FTC_MARKER) && ((prt >= FAT_MAXPARTITIONS) ||
+        (_ftc.rj[prt].header.ptr->signature != RJ_VALID))) {
+   	return -EBADPART;
+   }
+
+   if (flags & FTC_CONTINUE) {
+      ent = (int)secnum;
+      secnum = _ftc.entry[ent].bbentry->secnum;
+      dev = _ftc.entry[ent].bbentry->dev;
+      dr = _ftc.dv + dev;
+      if (dr->busy != FTCDR_READ) {
+         return -EINVAL; // FTC_CONTINUE is only valid if prior read gave -EBUSY
+      }
+   }
+   else {
+	   do {
+	      ent = _fatftc_find(prt, secnum, &dev, &stat);
+	      if (ent == -EBUSY && !(flags & FTC_WAIT)) {
+	         return -EBUSY;    // Already trying to read; not completed.
+	      }
+	      _fat_tick();
+	   } while (ent == -EBUSY);
+	   if (ent < 0) {            // Error or cache miss?
+         if (ent != -ENODATA) { // Continue if cache miss
+            return ent;         // Otherwise return error
+         }
+      }
+      else {    // Cache hit, don't need to read sector
+	      // Add to LRU list as the MRU, unless FTC_MAKE_LRU bit is set in flags.
+	      _fatftc_addentry(ent, flags);
+	      *where = _ftc.entry[ent].buf_lin;
+	      // Contiguous byte count
+	      return 512;
+	   }
+	   dr = _ftc.dv + dev;
+   }
+
+   // verify that the device is setup
+   if(dev >= FAT_MAXDEVS || dr->fdev==NULL || secnum >= dr->fdev->seccount) {
+   	return -EINVAL;
+   }
+
+   if (!(flags & FTC_MARKER)) {
+	   if (dr->busy == FTCDR_READ && (flags & FTC_CONTINUE)) {
+	      dr->busy = 0;
+	   }
+	   else {
+	      while (dr->busy) {
+	         if (flags & FTC_WAIT) {
+	            _fat_tick();    // Wait for completion if wait flag is set
+            }
+	         else {
+	            return -EBUSY;  // Device busy with other operation (read/write)
+            }
+	      }
+	   }
+   }
+   if (!(flags & FTC_CONTINUE)) {
+	   // Cache miss.  Read in the specified sector.
+	   do {
+	      ent = _fatftc_getfree(dev, secnum);
+	      if (ent == -EBUSY && (flags & FTC_WAIT)) {
+	         _fat_tick();
+	         continue;
+	      }
+	      if (ent < 0) {
+	   #ifdef FATFTC_VERBOSE
+	         _fatftc_dumpstate(dev, secnum, ent, "fatftc_read [getfree]");
+	   #endif
+	         // May be error code from flush operation, or no available entries.
+	         return ent;
+	      }
+	   } while (ent == -EBUSY);
+   }
+
+   // Read in the data, then set the cache entry flags and mark as used
+   bbentry = _ftc.entry[ent].bbentry;
+   *where = buf = _ftc.entry[ent].buf_lin;
+   buf2 = _ftc.entry[ent].buf2_lin;
+  	assert(dr->fdev != NULL && dr->fdev->driver != NULL &&
+               dr->fdev->driver->xxx_ReadSector);
+   do {
+	   rc = dr->fdev->driver->xxx_ReadSector(secnum, buf, buf2, dr->fdev);
+	   if (rc && rc != -EBUSY) {
+	      // Error, toss back to free entry.
+	      bbentry->status = FTC_UNUSED;
+         *where = 0L;
+	      return rc;  // Bail out if I/O error
+	   }
+	   if (rc == -EBUSY && !(flags & FTC_WAIT)) {
+	      // Read cannot complete immediately.  Mark as busy sector.
+	      dr->busy = FTCDR_READ;      // Busy from read of sector.
+	      dr->entries[0] = ent;       // Save cache entry being read
+         dr->bprt = prt;
+         dr->bbuf = where;
+	      dr->bflags = flags;
+         bbentry->status |= FTC_BUSY;
+	      return -EBUSY;
+	   }
+      _fat_tick();     // Call tick to allow busy operation to finish
+   } while (rc == -EBUSY);
+   // Now mark the entry as not busy and add to the LRU list.  Most of
+   // the flags have already been set by getfree.
+   bbentry->status &= (~FTC_BUSY);
+   // Add to LRU list (as MRU, unless FTC_MAKE_LRU bit is set in flags)
+   _fatftc_addentry(ent, flags);
+
+   // Return byte read count
+   return 512;
+}
+
+/*** BeginHeader fatftc_cachestatus */
+int fatftc_cachestatus(word dev, long secnum);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+fatftc_cachestatus                 <FATFTC.LIB>
+
+SYNTAX: int fatftc_cachestatus(word dev, long secnum)
+
+DESCRIPTION: This function returns an indication of whether the given
+             sector is currently in cache or not.
+
+PARAMETER1: dev is the device registered using fatftc_regdev().
+PARAMETER2: secnum is the LBA sector number on that device.
+
+RETURN VALUE: The return value is
+	-ENODATA: not in cache
+   -EBUSY: in process of being read;
+   0: in cache and clean;
+   1: in cache and clean and in process of being read.
+   2: in cache and dirty;
+   3: in cache and dirty and in process of being written.
+
+END DESCRIPTION **********************************************************/
+_fatftc_debug int fatftc_cachestatus(word dev, long secnum)
+{
+	auto word stat;
+   auto int ent;
+
+   ent = _fatftc_find(dev, secnum, NULL, &stat);
+   if (ent < 0) {
+   	return ent;	// Not in cache
+   }
+   return (stat & FTC_DIRTY ? 2 : 0) + (stat & FTC_BUSY ? 1 : 0);
+}
+
+/*** BeginHeader fatftc_write */
+int fatftc_write(int prt, unsigned long secnum, word offset, word len,
+                  long data, word flags);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+fatftc_write                 <FATFTC.LIB>
+
+SYNTAX: int fatftc_write(int prt, unsigned long secnum, word offset,
+                          word len, long data, word flags)
+
+DESCRIPTION: This updates all or part of a sector, with possible rollback
+             journalling.  If a transaction is in progress, then the RJ is
+             updated with a pre-image of just the data to be overwritten
+             (unless the FTC_NO_PREIMAGE flag is set). The cached entry is
+             then overwritten and marked as “dirty”. Read or writes to the
+             device may occur if the sector was not currently in cache.
+
+   This function may return before the requested operation has completed,
+   unless the FTC_WAIT flag is passed.  If -EBUSY is returned, this
+   function should be called again (with the same parameters) some time
+   later, and after calling fat_tick() to drive I/O completion.
+
+PARAMETER1: prt is the RJ partition ID number. The Roll-Back Journal layer
+            uses partition ID numbers. The RJ partition ID number is
+            obtained when calling fatrj_regpartition().
+
+PARAMETER2: secnum is the LBA logical 512 byte sector number. This is not
+            relative to the partition start, but to the start of the device.
+
+PARAMETER3: offset is the starting offset of the section of data to update,
+            which must be between 0 and 511 inclusive.
+
+PARAMETER4: len is the length of data to update at the above offset. It must
+            be >= 1, and the sum of offset+len must be <= 512.
+      NOTE: the overwritten data must all fit within one physical sector of
+            the device i.e. overlap is not supported.
+
+PARAMETER5: data is an xmem (far) address of the first byte of data to
+            overwrite at the given offset. This data must be len bytes long.
+
+PARAMETER6: Options flags are as follows:
+  FTC_NO_PREIMAGE. If this bit is set then, during a transaction, pre-image
+    data will not be saved in the rollback journal. Example usage would be
+    when the FAT layer is initializing newly allocated clusters and prior
+    data was not meaningful.
+  FTC_MEMSET means that the data parameter is cast down to a byte value,
+    and that byte value is used to fill the requested update area. This is
+    equivalent to a memset operation, and would be used by the FAT layer
+    when initializing the clusters allocated to a new subdirectory.
+  FTC_MAKE_LRU has the same meaning as it does for fatftc_read(), and is
+    likewise intended for sequential operations.
+  FTC_WAIT means the function will block and not return -EBUSY.
+  FTC_ONMOD compares MARKER data to file contents and write only if different.
+    The FTC_MARKER flag must also be set as this is ONLY FOR MARKER entries.
+
+RETURN VALUE: On success, it returns the len parameter which was passed.
+              The following negative error codes may also be returned:
+   <any code from fatftc_read()>
+   -E2BIG: offset and/or len parameter is too big, or overlaps the end of
+           what could be read.
+   -EJOVERFLOW: if currently in a transaction, there was not enough room in
+       the rollback journal to accommodate the new pre-image.  The cache entry
+       has not been updated.  The caller may need to roll back the transaction
+       then try it again in smaller chunks, or commit but mark non-completion
+       using a checkpoint (however it may not be possible to create a
+       checkpoint if the journal is very close to being full).
+   -EBUSY: Device is busy, try again later (this is not really an error)
+           - this code will be returned only if FTC_WAIT flag is NOT set.
+
+END DESCRIPTION **********************************************************/
+_fatftc_debug int fatftc_write(int prt, unsigned long secnum, word offset,
+                                word len, long data, word flags)
+{
+	auto int rc, ent;
+   auto word seccount, dev, stat;
+   auto long buf;
+
+   // Compute required number of sectors to read (offset+len should be < 512)
+   seccount = ((offset + len - 1) >> 9u) + 1;
+   if (seccount > 1) {
+   	return -E2BIG;		// Too big to read
+   }
+
+   // See if pre-image of sector is needed
+   if (len < 512 || prt >= FAT_MAX_PARTITIONS ||
+          (!(flags & FTC_NO_PREIMAGE) && _ftc.rj[prt].trans)) {
+	   rc = fatftc_read(prt, secnum, &buf, flags);
+	   if (rc < 512) {
+	      return rc < 0 ? rc : -E2BIG;    // Error or incomplete read
+	   }
+   }
+   else {   // Overwriting entire sector, no need to pre-read sector
+	   do {  // See if sector already exists in the cache
+	      ent = _fatftc_find(prt, secnum, &dev, &stat);
+	      if (ent == -EBUSY && !(flags & FTC_WAIT)) {
+	         return -EBUSY;    // Already trying to read; not completed.
+	      }
+	      _fat_tick();
+	   } while (ent == -EBUSY);
+      if (ent < 0 && ent != -ENODATA) {
+         return ent;      // Error from _fatftc_find call
+      }
+	   while (ent < 0) {
+         ent = _fatftc_getfree(dev, secnum);
+         if (ent == -EBUSY && (flags & FTC_WAIT)) {
+            _fat_tick();
+            continue;
+         }
+         if (ent < 0) {          // Error condition detected
+      #ifdef FATFTC_VERBOSE
+            _fatftc_dumpstate(dev, secnum, ent, "fatftc_write [getfree]");
+      #endif
+            // May be error code from flush operation, or no available entries.
+            return ent;
+         }
+      }
+      // Add to LRU list as the MRU, unless FTC_MAKE_LRU bit is set in flags.
+      _fatftc_addentry(ent, flags);
+      buf = _ftc.entry[ent].buf_lin;  // Use buffer for the cache entry
+   }
+
+   // If ONMOD flag set, compare marker to file and exit if the same
+   if (((flags & (FTC_ONMOD | FTC_MARKER)) == (FTC_ONMOD | FTC_MARKER)) &&
+        (len <= FAT_MAXCHK)) {
+      // Compare with data in cache
+      if (memcmp((char __far *)data, (char __far *)buf+offset, len) == 0) {
+         return len;
+      }
+   }
+
+   if (!(flags & FTC_NO_PREIMAGE) && _ftc.rj[prt].trans) {
+   	rc = _fatrj_store_preimage(prt, secnum, buf, offset, len, RJT_PREIMAGE);
+      if (rc < 0) {
+      	return rc;
+      }
+   }
+
+   if (flags & FTC_MEMSET) {
+   	_f_memset((char __far *)(buf + offset), (int)data, (long)len);
+   }
+   else {
+   	_f_memcpy((char __far *)(buf + offset), (char __far *)(data), (long)len);
+   }
+
+   fatftc_makedirty(buf);
+   return len;
+}
+
+/*** BeginHeader fatftc_makedirty */
+int fatftc_makedirty(long where);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+fatftc_makedirty                 <FATFTC.LIB>
+
+SYNTAX: int fatftc_makedirty(long where)
+
+DESCRIPTION: Mark a cached sector (returned by fatftc_read()) as dirty,
+             because the caller overwrote all or part of it without using
+             fatftc_write(). Note that this does not support transaction-type
+             recovery, and markers (see below) may be invalidated. Use where
+             efficiency is of prime importance such as when writing data to
+             ordinary file clusters.
+
+PARAMETER1: Address of the sector which was overwritten (i.e. the 'where'
+            value returned from fatftc_read()).  The given address may point
+            anywhere inside the returned sector cache buffer.
+
+RETURN VALUE: 0 if OK, else negative error code:
+            -EFAULT: given address was not valid
+            -EBROKENTIE: internal error in this layer, indicating corruption
+                         of the cache entries.
+
+END DESCRIPTION **********************************************************/
+_fatftc_debug int fatftc_makedirty(long where)
+{
+	auto word ent, stat;
+   auto FTCEntry __far * bbentry;
+
+   ent = (word)((where - _ftc.cache) >> 9);
+   if (ent >= FAT_MAXBUFS) {
+   	return -EFAULT;			// Not a valid buffer address
+   }
+   // Now convert to first entry of tied group
+	bbentry = _ftc.entry[ent].bbentry;
+   stat = bbentry->status;
+   if (!(stat & FTC_USED) || (stat & FTC_BUSY)) {
+   	return -EFAULT;
+   }
+   bbentry->status = stat | FTC_DIRTY;
+   return 0;
+}
+
+/*** BeginHeader fatftc_flushdev */
+int fatftc_flushdev(word dev, word flags);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+fatftc_flushdev                 <FATFTC.LIB>
+
+SYNTAX: int fatftc_flushdev(word dev, word flags)
+
+DESCRIPTION: Flush all dirty cache entries and markers for a specified
+device.  This would be used prior to removal of a removable volume. If
+the FTC_PURGE flags bit is set then, after flushing to the device (even
+if unsuccessful), the device entry is unregistered. This is useful for
+removable volumes, since it is likely that a new medium will be mounted,
+with a generally different volume serial (and hence device signature).
+After such unregistration, the device needs to be re-registered using
+fatftc_regdev().
+
+This function will return before completion with a -EBUSY code if any
+I/O operation could not be completed without waiting.  In this case,
+this function should be called again later with the same parameters.
+You can avoid this by setting the FTC_WAIT flags bit.
+
+PARAMETER1: Device as returned by fatftc_regdev(). If dismounting a
+  removable device, use fat_removableDev, which is set by fat_AutoMount
+  when mounting the removable device. Use fat_solderedDev for soldered on
+  media.
+PARAMETER2: If FTC_PURGE bit is set, then in addition to being flushed,
+  the device is also unregistered, making its table entry free for
+  another device (or volser of the same device).
+  If FTC_WAIT bit is set, then block in this function until all
+  oustanding device operations are complete.
+  Other bits must be zero.
+
+RETURN VALUE: Returns 0 if success, otherwise a negative error code:
+<any return code from fatrj_unregmarker if FTC_PURGE bit set in flags>
+<any write I/O error code for a flushed sector>
+Since several I/Os may need to occur, there may be several different
+errors encountered.  Only the error code from the first error is
+returned.
+-EINVAL if dev is out of valid device number range
+-EBUSY  If any operation requires access to a busy device, then -EBUSY
+is returned and this function should be called again later.  This return
+code will not occur if the FTC_WAIT bit is set in the flags parameter.
+
+END DESCRIPTION **********************************************************/
+_fatftc_debug int fatftc_flushdev(word dev, word flags)
+{
+	auto int i;
+   auto int rc, rc2;
+   auto FTCEntry __far *bbentry;
+   auto RJHeader __far *rh;
+
+   if (dev >= FAT_MAXDEVS) {
+      return -EINVAL;
+   }
+   // Make sure device is not busy with operation right now
+   while (_ftc.dv[dev].busy) {
+      _fat_tick();
+      if (!(flags & FTC_WAIT))
+         return -EBUSY;
+   }
+   // First write out any markers
+   rc = 0;
+   for (i = FAT_MAXPARTITIONS; i < FAT_MAXPARTITIONS+FAT_MAXMARKERS; ++i) {
+      rh = _ftc.rj[i].header.ptr;
+      if (rh->signature == RJ_VALID && rh->dev == dev) {
+         rc2 = fatrj_unregmarker(i, flags);
+         if (rc2 == -EDRVBUSY) {
+            rc2 = -EBUSY;
+         }
+         if (rc2 == -EBUSY) {
+           	if (flags & FTC_WAIT) {
+              	for ( ; rc2 == -EBUSY; rc2 = fatrj_unregmarker(i, flags));
+            }
+            else {
+           		return -EBUSY;
+            }
+         }
+         if (!rc && rc2 < 0) {
+            rc = rc2;
+         }
+      }
+   }
+
+   // Write out dirty cache entries to the device
+   for (i = 0; i < FAT_MAXBUFS; ++i) {
+      bbentry = _ftc.entry[i].bbentry;
+      if ((bbentry->status & FTC_USED) && (bbentry->dev == dev)) {
+         if (flags & FTC_NOWRITE) {
+            bbentry->status = FTC_UNUSED;   // Drop entry if no writes flag set
+            _fatftc_remove(i);
+            continue;
+         }
+         while (_ftc.dv[dev].busy) {
+            _fat_tick();
+            if (!(flags & FTC_WAIT))
+               return -EBUSY;
+         }
+#ifdef FATFTC_VERBOSE
+         printf("fatftc_flushdev: writing cache %u\n", i);
+#endif
+         // Pass flags: Only purge if unregistering as well.
+         rc2 = _fatftc_devwrite(i, flags);
+         if (rc2 == -EDRVBUSY) {
+            rc2 = -EBUSY;
+         }
+         if (rc2 == -EBUSY) {
+            if (flags & FTC_WAIT) {
+               for ( ; _ftc.dv[dev].busy; _fat_tick());
+               rc2 = 0;
+            }
+            else {
+               return -EBUSY;
+            }
+         }
+         if (!rc && rc2 < 0) {
+            rc = rc2;
+         }
+      }
+   }
+	if (flags & (FTC_PURGE | FTC_NOWRITE)) {
+   	// Loop through all partitions on this device.  Unregister them first.
+      // This explicitly ends any transactions.
+      for (i = 0; i < FAT_MAXPARTITIONS; ++i) {
+			rh = _ftc.rj[i].header.ptr;
+         if (rh->signature == RJ_VALID && rh->dev == dev) {
+         	fatrj_tranend(i, 0); // Normal transaction end
+            if (flags & FTC_PURGE) {
+	         	rh->signature = 0;	// Unregister partititon
+            }
+         }
+      }
+
+      if (flags & FTC_PURGE) {
+	      // Unregister the device itself if purge flag is set
+	      _ftc.dv[dev].flags = 0;
+	      _ftc.dv[dev].di->flags = FTCDI_FREE;
+      }
+   }
+   return rc;
+}
+
+/*** BeginHeader fatftc_flushall */
+int fatftc_flushall(word flags);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+fatftc_flushall                 <FATFTC.LIB>
+
+SYNTAX: int fatftc_flushall(word flags)
+
+DESCRIPTION: Flush all dirty cache entries. This would be done prior to
+shutting down the FAT filesystem to ensure no reliance on the battery
+backed cache during the off time. All devices are unregistered if FTC_PURGE
+flag is set, which is recommended if the BIOS is going to be recompiled.
+With the FTC_PURGE flag, this function also unregisters any devices left
+over from a previous boot which were not registered during this boot. This
+ensures that there are no unflushable cache entries.
+
+Essentially, this function iterates through all devices calling
+fatftc_flushdev().
+
+This function will return before completion with a -EBUSY code if any I/O
+operation could not be completed without waiting.  In this case, this
+function should be called again later with the same parameters.  You can
+avoid this by setting the FTC_WAIT flags bit.
+
+PARAMETER1: If the FTC_PURGE bit is set, then in addition to being flushed,
+  all devices are also unregistered.
+  If FTC_WAIT is set, then this function will not return until all I/O
+  operations are complete.
+  Other bits must be set to zero.
+
+RETURN VALUE: Same as for fatftc_unregdev(), with the first error code
+returned.
+
+END DESCRIPTION **********************************************************/
+_fatftc_debug int fatftc_flushall(word flags)
+{
+	auto int rc, rc2;
+   auto word i;
+//
+
+   rc = 0;
+	for (i = 0; i < FAT_MAXDEVS; ++i) {
+   	if (_ftc.dv[i].flags & FTCDR_REGISTERED) {
+      	rc2 = fatftc_flushdev(i, flags);
+         if (!rc && rc2 < 0) {
+         	rc = rc2;
+         }
+			if (flags & FTC_PURGE) {
+	         _ftc.dv[i].flags = 0;
+	         _ftc.dv[i].di->flags = FTCDI_FREE;
+	      }
+      }
+   }
+	if (flags & FTC_PURGE) {
+      // If unregistering all devices, also get rid of stale entries from a
+      // previous boot of a device which never got registered this time.
+      for (i = 0; i < FAT_MAXPARTITIONS+FAT_MAXMARKERS; ++i) {
+      	_ftc.rj[i].header.ptr->signature = 0;    // Clear journal signatures
+         _ftc.rj[i].trans = 0;                    // Clear transaction flags
+      }
+      for (i = 0; i < FAT_MAXBUFS; ++i) {
+      	_ftc.entry[i].bbentry->status = 0;   // Free all cache entries
+      }
+   }
+	return rc;
+}
+
+/*** BeginHeader fatftc_dirty */
+int fatftc_dirty(int dev);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+fatftc_dirty                 <FATFTC.LIB>
+
+SYNTAX: int fatftc_dirty(int dev)
+
+DESCRIPTION: Returns the number of dirty cache entries on the specified
+             device.  If dev is -1, then all devices are totalled.
+
+PARAMETER1: Device number from fatftc_regdev(), OR -1 for 'all'.
+
+RETURN VALUE: Number of dirty cache entries on requested device(s)
+
+END DESCRIPTION **********************************************************/
+_fatftc_debug int fatftc_dirty(int dev)
+{
+	auto word rc;
+   auto word i;
+   auto FTCEntry __far * entry;
+
+   for (i = rc = 0; i < FAT_MAXBUFS; ) {
+   	entry = _ftc.entry[i++].bbentry;
+      if (((entry->status & (FTC_USED | FTC_DIRTY)) == (FTC_USED | FTC_DIRTY))
+            && (dev < 0 || entry->dev == dev)) {
+      	++rc;
+      }
+   }
+   return rc;
+}
+
+
+/*** BeginHeader _fatrj_store_preimage */
+int _fatrj_store_preimage(int prt, unsigned long secnum, long buf,
+                           word offset, word len, word type);
+                           // RJT_PREIMAGE, RJT_CHECKPOINT, RJT_MARKER
+/*** EndHeader */
+_fatftc_debug int _fatrj_store_preimage(int prt, unsigned long secnum,
+                                  long buf, word offset, word len, word type)
+{
+	auto word jlen;
+   auto RJRoot * rr;
+   auto RJEntryUnion entry;
+   auto word lastoffs;
+
+   rr = &_ftc.rj[prt];
+   entry.l = rr->header.l;
+   if (rr->header.ptr->signature != RJ_VALID) {
+   	return -EBADPART;
+   }
+   jlen = len + sizeof(RJEntry);
+   if (rr->remain < jlen) {
+   	return -EJOVERFLOW;
+   }
+   // Point to where new RJEntry will be placed
+   entry.l += (lastoffs = (word)FAT_MAXRJ - 2 - rr->remain);
+   rr->remain -= jlen;				// Update end pointer
+   _f_memcpy((char __far *)(entry.l + sizeof(RJEntry)),
+                 (char __far *)(buf + offset), len);	     //Save preimage data
+   *((int __far *)(entry.l + sizeof(RJEntry) + len)) = 0; // Invalidate next entry
+     // (This is why RJ area can only be used up to 2 bytes short of total area).
+   entry.ptr->type = type;
+   entry.ptr->secnum = secnum;
+   entry.ptr->offs = offset;
+   entry.ptr->len = len;
+   entry.ptr->prevoffs = rr->lastoffs;
+	rr->lastoffs = lastoffs;
+   if (type != RJT_MARKER) {  // Don't mark valid for markers.
+   	entry.ptr->signature = RJ_VALID;	// Last thing: mark the entry as valid
+   }
+	return 0;
+}
+
+/*** BeginHeader fatrj_transtart */
+int fatrj_transtart(int prt);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+fatrj_transtart                 <FATFTC.LIB>
+
+SYNTAX: int fatrj_transtart(int prt)
+
+DESCRIPTION: Indicate that a transaction is starting for the specified partition
+number. All calls to fatftc_write(), using this partition number, will write
+rollback journal entries until fatrj_tranend() is called. The amount of data
+which is updated during a transaction should be limited to the minimum required.
+If the log space is insufficient, then the call to fatftc_write() will fail.
+
+I/O and other errors which is encountered while a transaction is open will NOT
+casue the transaction to be closed.  It is the caller's responsibility to
+decide whether to retry an operation, or rollback.
+
+Transactions must not be nested for a given partition, however each partition
+may have an open transaction.
+
+PARAMETER1: Partition number as returned by fatrj_regpartition().
+
+RETURN VALUE: The return code is 0 for success, -ETRANSOPEN if a
+transaction is already open for this partition, or -EBADPART if the partition
+number is invalid. If errors occur, the previous transaction (if any) is still
+valid, but there is obviously a bug in the calling code.
+
+END DESCRIPTION **********************************************************/
+_fatftc_debug int fatrj_transtart(int prt)
+{
+	auto long e;
+   auto RJRoot * rr;
+
+   rr = &_ftc.rj[prt];
+   if (rr->header.ptr->signature != RJ_VALID) {
+   	return -EBADPART;
+   }
+   if (rr->trans) {
+   	return -ETRANSOPEN;
+   }
+   rr->trans = 1;
+   rr->remain = FAT_MAXRJ - sizeof(RJHeader) - 2;
+   rr->lastoffs = 0;
+   return 0;
+}
+
+/*** BeginHeader fatrj_tranend */
+int fatrj_tranend(int prt, word flags);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+fatrj_tranend                 <FATFTC.LIB>
+
+SYNTAX: int fatrj_tranend(int prt, word flags)
+
+DESCRIPTION: Indicate the successful end of a transaction.  It is OK to call
+this even when there is no open transaction for the specified partition,
+however the return code will be negative (which is really an indication that
+there is a bug in the calling layer because it did not check the return code
+from some previous operation which failed).
+
+If the partition number is invalid, it is ignored and a negative value is
+returned.  This function resets the journal to empty.
+
+PARAMETER1: Partition number as returned by fatrj_regpartition().
+
+PARAMETER2: Reserved for internal use.  Must be set to zero.
+
+RETURN VALUE: 0 if OK, -EBADPART if invalid partition.  Anything else
+indicates a caller error (passing a bad partition which could not be
+detected easily by this function).
+
+END DESCRIPTION **********************************************************/
+_fatftc_debug
+int fatrj_tranend(int prt, word flags)
+{
+	auto RJEntry __far * rjent;
+   auto RJRoot * rr;
+   auto int rc;
+
+#ifdef FATFTC_VERBOSE
+	printf("fatrj_tranend: handle=%u\n", prt);
+#endif
+
+   rr = &_ftc.rj[prt];
+   if (rr->header.ptr->signature != RJ_VALID) {
+   	return -EBADPART;
+   }
+   rjent = (RJEntry __far *)(rr->header.l + sizeof(RJHeader));
+	rr->trans = 0;
+   if (prt >= FAT_MAXPARTITIONS) {
+   	// This is a marker journal.  At end of "transaction", need to write
+      // the marker value back to cache.  Sets the ONMOD flag to check for
+      // changes in marker value and only writes if file was written to.
+      rc = fatftc_write(prt, rjent->secnum, rjent->offs, rjent->len,
+                  (long)rr->header.ptr->data, FTC_MARKER | FTC_ONMOD | flags);
+#ifdef FATFTC_VERBOSE
+		printf("fatrj_tranend: marker write (sec=%lu offs=%u len=%u)  -> %d\n",
+                  rjent->secnum, rjent->offs, rjent->len, rc
+      		);
+#endif
+      if (rc < 0) {
+         return rc;
+      }
+   }
+   rr->flags &= ~(RJ_CHKENT | RJ_MRKENT);
+   rjent->signature = 0;	// Mark first RJ entry as invalid
+   return 0;
+}
+
+/*** BeginHeader fatrj_rollback */
+int fatrj_rollback(int prt, word flags);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+fatrj_rollback                 <FATFTC.LIB>
+
+SYNTAX: int fatrj_rollback(int prt, word flags)
+
+DESCRIPTION: Force a rollback of the specified partition, and reset the
+journal.  This should not need to be called explicitly unless FAT realizes
+some other error has necessitated it (e.g. running out of space in the
+journal before the transaction was completed).
+
+This function is non-blocking (unless the FTC_WAIT flag is passed).  If it
+returns -EBUSY, then you must call the function again some time later to
+continue the rollback.  It is highly inadvisable to perform any other
+updates to the partition until the rollback returns something other than
+-EBUSY.
+
+PARAMETER1: Partition number as returned by fatrj_regpartition().
+
+PARAMETER2: Flag word.  All bits are reserved and should be set to zero
+except for FTC_WAIT.  If FTC_WAIT is set, then the rollback operation
+will not return until it is complete.
+
+RETURN VALUE: The return code is 0 for success, or a negative error code.
+Possible error codes are:
+-EBADPART: invalid partition number
+-EBUSY: device busy; need to call again later
+<write I/O error>: could not back out to a pre-image.  This is a serious
+error, since it indicates that a device medium may be corrupted.  Usually,
+this would occur if a removable medium was unavailable for the rollback.
+You can retry the rollback which failed, if the cause of the error has been
+removed (e.g. medium re-mounted), and you have not started this partition's
+transaction again, or written any more data.
+
+END DESCRIPTION **********************************************************/
+_fatftc_debug int fatrj_rollback(int prt, word flags)
+{
+	auto long trail;
+   auto RJEntryUnion entry;
+   auto RJHeaderUnion header;
+   auto RJRoot * rr;
+   auto int rc;
+
+#ifdef FATFTC_VERBOSE
+	printf("fatrj_rollback: handle=%u\n", prt);
+#endif
+
+   rr = &_ftc.rj[prt];
+   header.ptr = rr->header.ptr;
+   if (header.ptr->signature != RJ_VALID) {
+   	return -EBADPART;
+   }
+
+   rr->trans = 0;	// Make sure fatftc_write doesn't try to journal the rollback!
+   rr->remain = FAT_MAXRJ - sizeof(RJHeader) - 2;
+   rr->lastoffs = 0;
+   rr->flags = 0;
+
+   // Scan to find last RJ entry, then work backwards using the prevoffs field.
+   for (entry.l = header.l + sizeof(RJHeader), trail = 0L;
+         entry.ptr->signature == RJ_VALID;
+          trail = entry.l, entry.l += entry.ptr->len + sizeof(RJEntry));
+   entry.l = trail;	// Back off to last valid one (if any)
+   rc = 0;
+   while (entry.l > header.l) {
+   	// Rollback the last entry
+      rc = 0;
+      switch (entry.ptr->type) {
+        case RJT_MARKER:
+        case RJT_CHECKPOINT:
+#ifdef FATFTC_VERBOSE
+	  	 	 printf("fatrj_rollback: marker or checkpoint (e=%lu)\n", entry.l);
+#endif
+      	 _f_memcpy(header.ptr->data, (char __far *)(entry.l + sizeof(RJEntry)),
+                      FAT_MAXCHK);
+      	 break;
+
+        default:
+#ifdef FATFTC_VERBOSE
+		 	 printf("fatrj_rollback: journal (e=%lu: sec=%lu offs=%u len=%u)\n",
+                  entry.l, entry.ptr->secnum, entry.ptr->offs, entry.ptr->len);
+#endif
+	       rc = fatftc_write(prt, entry.ptr->secnum, entry.ptr->offs,
+                             entry.ptr->len, entry.l + sizeof(RJEntry),
+                                 FTC_MARKER | flags);
+          break;
+      }
+      if (rc < 0) {
+         break;
+      }
+      rc = 0;
+      entry.ptr->signature = 0;                 // Done w/entry, mark invalid.
+      entry.l = header.l + entry.ptr->prevoffs; // Get offset of previous entry
+   }
+   if (rc != -EBUSY) {
+      // Clear journal (keep registered)
+	   *((int __far *)(header.l + sizeof(RJHeader))) = 0;
+	   if (prt >= FAT_MAXPARTITIONS) {
+	   // Found a marker entry. "Rollback" by writing marker data back to cache.
+#ifdef FATFTC_VERBOSE
+	      printf("fatrj_rollback: calling tranend for marker...\n");
+#endif
+	      rc = fatrj_tranend(prt, flags);   // Pass through FTC_WAIT, if any.
+	      if (rc != -EBUSY) {
+	         header.ptr->signature = 0;     // Auto unregister marker
+         }
+      }
+   }
+   return rc;
+}
+
+
+/*** BeginHeader fatrj_hasjournal */
+int fatrj_hasjournal(int dev,	int prt, int purge);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+fatrj_hasjournal                 <FATFTC.LIB>
+
+SYNTAX: int fatrj_hasjournal(int dev, int prt, int purge)
+
+DESCRIPTION:  Test for existence of journal (pre-image) data for a device
+or partition (or several of either).  This is basically an internal function.
+
+PARAMETER1: Device number from fatftc_regdev(), or -1 for 'don't care'
+PARAMETER2: Partition number as returned by fatrj_regpartition(),
+             or -1 for 'any'
+PARAMETER3: If TRUE, then a journal with NO ENTRIES is purged (returned to
+            free partition journal status).  This flag should only be set
+            during init processing, since it effectively unregisters a
+            partition.  The journal is only purged if, in addition to
+            having no entries, the checkpoint data is all zeros.
+
+RETURN VALUE: Non zero if the rollback journal was not empty.
+
+END DESCRIPTION **********************************************************/
+_fatftc_debug int fatrj_hasjournal(int dev, int prt, int purge)
+{
+	// Return TRUE if there is currently a journal for device and/or partition
+   // (or any journal at all)
+	auto word r, lo, hi;
+   auto RJHeaderUnion header;
+   auto int rc;
+
+   rc = 0;
+   if (prt < 0) {
+   	lo = 0;
+      hi = FAT_MAXPARTITIONS;
+   }
+   else {
+   	lo = prt;
+      hi = prt + 1;
+   }
+   for (r = lo; r < hi; ++r) {
+      header.l = _ftc.rj[r].header.l;
+   	if (header.ptr->signature == RJ_VALID) {
+			if ((dev < 0) || (header.ptr->dev == dev)) {
+#ifdef FATFTC_DEBUG_INIT
+				printf("fatrj_hasjournal: entry %u is valid, matches dev %d\n",
+                      r, dev);
+#endif
+         	if ((header.ptr + 1)->signature == RJ_VALID ||
+                fatrj_getchk(r, NULL)) {
+#ifdef FATFTC_DEBUG_INIT
+					printf("  ...and is active\n");
+#endif
+            	rc = 1;
+            }
+            else if (purge) {
+#ifdef FATFTC_DEBUG_INIT
+					printf("  ...purging\n");
+#endif
+            	header.ptr->signature = 0;	// Completely nullify journal header.
+            }
+         }
+      }
+   }
+   return rc;
+}
+
+/*** BeginHeader fatrj_status */
+int fatrj_status(int prt, word * free);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+fatrj_status                 <FATFTC.LIB>
+
+SYNTAX: int fatrj_status(int prt, word * free)
+
+DESCRIPTION:  Test whether a journal is in use, and how many bytes may
+				be pre-imaged in a single operation.
+
+PARAMETER1: Partition number as returned by fatrj_regpartition()
+PARAMETER2: If not NULL, this will be filled in with the number of bytes
+            which could be pre-imaged on the next fatftc_write() call
+            if a transaction was open.
+
+RETURN VALUE: 0: a transaction is not open.  Caution: this is also returned
+                 if the partition number is invalid.
+              non-zero: a transaction is open.
+
+END DESCRIPTION **********************************************************/
+_fatftc_debug int fatrj_status( int prt, word * free)
+{
+	auto RJRoot * rjr;
+
+   if (prt < 0 || prt >= FAT_MAXPARTITIONS) {
+   	return 0;
+   }
+   rjr = &_ftc.rj[prt];
+  	if (rjr->header.ptr->signature != RJ_VALID) {
+   	return 0;
+   }
+	if (free) {
+   	*free = rjr->remain - sizeof(RJEntry);
+   }
+   return rjr->trans;
+}
+
+/*** BeginHeader fatrj_regpartition */
+int fatrj_regpartition(word dev, word hlpid);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+fatrj_regpartition                 <FATFTC.LIB>
+
+SYNTAX: int fatrj_regpartition(word dev, word hlpid)
+
+DESCRIPTION: This function registers a mounted partition, and tells the
+             RJ layer which device the partition is on.  The term
+             "partition" is actually a bit of a misnomer, however it
+             reflects the typical area of applicability of a rollback journal.
+
+  Note that there is no “unregpartition” call. Unregistering of partitions is
+  done by the fatftc_flush* calls with the “unregister” flag set. This implies
+  that a single partition on a multiple partition device cannot be individually
+  unregistered.
+
+PARAMETER1: dev is the device number (returned by a previous fatftc_regdev).
+
+PARAMETER2: hlpid is a "partition number" as known to the higher layer
+           (caller).  This number (usually 0-3 for FAT partitions) is stored
+           with the FTC partition (journal) entry so that if the same number
+           is passed on a subsequent call, the same ftc partition number will
+           be returned. The actual number is not significant to the FTC layer.
+
+RETURN VALUE: The return value is -EDQUOT if there are no free RJ resources,
+              or is a non-negative partition number which is to be used when
+               calling fatftc_write(), fatrj_transtart() and other functions.
+
+END DESCRIPTION **********************************************************/
+_fatftc_debug int fatrj_regpartition(word dev, word hlpid)
+{
+	// Register a partition for given device.  Looks in current non-volatile
+   // RJ table for a free or previosly used partition journal.
+   auto int i, x;
+   auto RJHeaderUnion header;
+   auto RJRoot * rr;
+   auto DevRoot * dr;
+
+   hlpid = hlpid & 3 | dev << 2;
+   // Find re-registration with same device/hlpid or an unused journal
+   for (i = 0, x = -1; i < FAT_MAXPARTITIONS; ++i) {
+   	rr = &_ftc.rj[i];
+		header.l = rr->header.l;
+      if (header.ptr->signature == RJ_VALID) { // Is partition journal in use?
+         if (hlpid == rr->hlpid) {     // Yes, does ID match with partition?
+	         dr = &_ftc.dv[header.ptr->dev];
+	         if (dr->fdev && dr->fdev->driver) {
+	            if ((!dr->fdev->fs_part[hlpid & 3]) ||
+	                ((fat_part *)(dr->fdev->fs_part[hlpid&3]))->dev == dr->fdev)
+               {
+	               return i;    // Pointer chain validated, OK to re-use
+	            }
+	         }
+	      }
+      }
+      else {
+         if (x < 0) {
+            x = i;     // Save index of unused partition journal
+         }
+      }
+   }
+
+   if (x < 0) {         // Not re-registering, is a partition journal free?
+	   return -EDQUOT;	// No, then return exceeded partition quota error
+   }
+
+   rr = &_ftc.rj[x];        // Use the available journal for this partition
+   header.l = rr->header.l;
+   // Initialize the partition rollback journal and mark as valid.
+   rr->remain = FAT_MAXRJ - sizeof(RJHeader) - 2;
+   rr->trans = rr->lastoffs = rr->flags = 0;
+   rr->hlpid = hlpid;       // Link this journal to the partition ID.
+   header.ptr->dev = dev;
+   // Clear 'resv' & 'data' fields and signature of first RJEntry
+   _f_memset((word __far *)(&header.ptr->resv), 0, 4L + FAT_MAXCHK);
+   header.ptr->signature = RJ_VALID;  // Must be last set, make journal valid.
+   return x;
+}
+
+/*** BeginHeader fatrj_regmarker */
+int fatrj_regmarker(word dev, unsigned long secnum, word offset, word len,
+                     word flags);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+fatrj_regmarker                 <FATFTC.LIB>
+
+SYNTAX: int  fatrj_regmarker(word dev, unsigned long secnum, word offset,
+                             word len, word flags)
+
+DESCRIPTION: This is used to register a “marker”. A marker is a designated area
+of filesystem storage which is to be treated like a mini cache. The intended use
+is for the EOF marker in directory entries.  The EOF is only 4 bytes, so it
+seems wasteful to have to use a whole cache entry (512 bytes) just to ensure
+that the EOF marker is kept up to date.
+
+It is intended that this function is used when a file is opened. The marker is
+set to point to the location of the EOF marker in the directory entry. While the
+file is open, updates to the EOF marker (i.e. appending to the file) go to the
+bb ram cache of the marker. When the file is closed, the fatrj_unregmarker()
+call will write the updated value to the normal cache entry for the directory
+location. If necessary, the whole 32-byte directory entry could be marked rather
+than just the EOF. This would be useful for keeping accurate “last modify” time
+information in addition to the EOF.  It is expected that the FAT library would
+keep the returned handle in the file structure, for easy reference.
+
+If the system crashed without closing the file, the rollback/recovery code will
+automatically save any outstanding markers back to the device, after applying
+the transaction rollback (if any). It is assumed that markers and sectors
+covered by rollback do not overlap.  Markers must not overlap with other
+markers.  Note that rollback journals per-se and markers are treated completely
+independently by the system.  Marker "writebacks" are never considered to be
+part of an outstanding transaction.  If it is desired, for example, to make an
+EOF update part of a transaction, then a marker cannot be used for the EOF
+location.
+
+There should not be a large number of markers current at any time, so the
+calling layer should always unregister markers when finished.
+
+PARAMETER1: dev is the device on which the marker resides.
+PARAMETER2: secnum is the sector number (i.e. 512-byte logical sector LBA)
+  relative to the start of the device.
+PARAMETER3: offset is the byte offset within that sector of the start of the
+  marker.
+PARAMETER4: len is the length of the marker (e.g. 4 bytes for the EOF field
+  in the directory entry).
+PARAMETER5: If the FTC_WAIT bit is set, this function will not return until
+  all necessary I/O operations have completed.  Otherwise, the -EBUSY code
+  may be returned.
+  All other bits must be zero.
+
+RETURN VALUE: The return value is negative if there was an error (invalid device
+or no space for more markers), or a non-negative “marker handle” if OK. This
+handle is passed to the other marker functions.  Error codes are:
+-E2BIG: marker bigger than FAT_MAXCHK bytes long.
+-EINVAL: offset and/or len parameters out of range
+-EDQUOT: too many markers currently outstanding
+-EBUSY: device was busy; could not read in initial marker value.  Call again
+  later.  This is not really an error.  To avoid it, you can first manually
+  read in the relevant sector so that it is in cache (using fatftc_read()).
+  Alternatively, you can set the FTC_WAIT bit in the flags parameter.
+<any return code from fatftc_read()>: this is from the initial read of the
+  current marker value.
+
+END DESCRIPTION **********************************************************/
+_fatftc_debug int fatrj_regmarker(word dev, unsigned long secnum, word offset,
+                                   word len, word flags)
+{
+   auto word i;
+   auto long where;
+   auto RJHeaderUnion header;
+   auto RJRoot * rr;
+   auto int rc;
+
+#ifdef FATFTC_VERBOSE
+   printf("regmarker: Try: secnum=%lu offset=%u len=%u\n", secnum, offset, len);
+#endif
+
+   // Register a marker for given device.  Looks in current non-volatile
+   // RJ table for a free marker journal entry.
+	if (len > FAT_MAXCHK) {
+   	return -E2BIG;
+   }
+   if (offset + len > 512 || !len) {
+   	return -EINVAL;
+   }
+
+   // Start looking after all of the partition journals
+   for (i = FAT_MAXPARTITIONS; i < FAT_MAXPARTITIONS+FAT_MAXMARKERS; ++i) {
+   	rr = &_ftc.rj[i];
+		header.l = rr->header.l;
+      if (header.ptr->signature != RJ_VALID) {
+      	// There is not really this much space (in fact there is only space
+         // for one preimage) but we set it like this so that store_preimage
+         // works correctly.
+	      rr->remain = FAT_MAXRJ - sizeof(RJHeader) - 2;
+	      rr->trans = 0;
+	      rr->lastoffs = 0;
+         rr->flags = RJ_MRKENT;
+      	header.ptr->dev = dev;
+         header.ptr->resv = 0;	             // 'resv' field zero
+         (header.ptr + 1)->signature = 0;	    // No entries yet
+      	// Get initial marker data from cache
+         rc = fatftc_read(i, secnum, &where, flags | FTC_MARKER);
+         if (rc < 0) {
+	      #ifdef FATFTC_VERBOSE
+	         printf("regmarker: %s %d\n", rc==-EBUSY ? "busy" : "error", rc);
+	      #endif
+         	return rc;
+         }
+         _f_memcpy(header.ptr->data, (char __far *)(where + offset), len);
+         header.ptr->signature = RJ_VALID;  	 // Must be last setting
+			_fatrj_store_preimage(i, secnum, (long)header.ptr->data,
+                                 offset, len, RJT_MARKER);
+      #ifdef FATFTC_VERBOSE
+      	printf("regmarker: OK, %d\n", i);
+      #endif
+         return i;
+      }
+   }
+   return -EDQUOT;	// Exceeded marker quota
+}
+
+/*** BeginHeader fatrj_unregmarker */
+int fatrj_unregmarker(int handle, word flags);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+fatrj_unregmarker                 <FATFTC.LIB>
+
+SYNTAX: int fatrj_unregmarker(int handle, word flags)
+
+DESCRIPTION: Unregister the marker, and write it to cache and the filesystem.
+This call would be used during file close processing if, e.g., the EOF field in
+the directory entry was selected as a marker -- there would be no need
+for an explicit directory entry update. Any function which unregisters a device
+automatically unregisters all markers on that device. It is OK to call this
+during a transaction, however the write is NOT considered part of the current
+transaction.  (Technically, markers are associated with devices, not
+partitions, which is why they cannot be associated with a particular rollback
+journal).
+
+PARAMETER1: handle is the return value from fatrj_regmarker().
+PARAMETER2: If the FTC_WAIT bit is set, this function will not return until
+  all necessary I/O operations have completed.  Otherwise, the -EBUSY code
+  may be returned.
+  If the FTC_NOWRITE bit is set, then marker will be dropped with no write
+  back to the device.
+
+RETURN VALUE: 0 if OK
+-EBADPART: invalid handle (not partition)
+-EBUSY: device busy; call again later.  This is not really an error.  You
+  can avoid this return code by setting the FTC_WAIT flags parameter bit.
+<any return code from fatftc_write()>: this occurs if there was an error
+  writing out the updated marker value.
+
+END DESCRIPTION **********************************************************/
+_fatftc_debug
+int fatrj_unregmarker(int handle, word flags)
+{
+	auto int rc;
+
+#ifdef FATFTC_VERBOSE
+   printf("unregmarker: Try: %d\n", handle);
+#endif
+	if (handle < FAT_MAXPARTITIONS) {
+   	return -EBADPART;
+   }
+   if (!(flags & FTC_NOWRITE)) {
+	   rc = fatrj_tranend(handle, flags);
+	   if (rc < 0) {
+	   #ifdef FATFTC_VERBOSE
+	      printf("unregmarker: (tranend) %s %d\n", rc==-EBUSY ? "busy" : "error",
+	                rc);
+	   #endif
+	      // If fatrj_tranend has already been called, it will return with a
+	      // bad part error code. Calling fat_DeviceUnmount with files
+	      // open is one way to end up here a second time.
+	      if (rc == -EBADPART) {
+	         rc = 0;
+	      }
+	      return rc;
+	   }
+   }
+   _ftc.rj[handle].header.ptr->signature = 0;	// Clear the marker
+#ifdef FATFTC_VERBOSE
+   printf("unregmarker: OK\n");
+#endif
+	return 0;
+}
+
+/*** BeginHeader fatrj_setmarker */
+int fatrj_setmarker(int handle, void * data);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+fatrj_setmarker                 <FATFTC.LIB>
+
+SYNTAX: int fatrj_setmarker(int handle, void * data)
+
+DESCRIPTION: Update the marker value.
+
+NOTE: Updated markers are not reflected in the main cache or device until they
+are unregistered. This means that FTC sector reads and writes will not reflect
+(or update) the current marker value.
+
+Marker updates are atomic in that a power interruption will not scramble the
+marker value. This requires that two copies of the marker are actually kept in
+bb ram, with validity indicator to indicate which copy is valid.  The mechanism
+used is internally similar to the rollback journal.
+
+PARAMETER1: handle is the return value from fatrj_regmarker().
+PARAMETER2: data is a pointer to the replacement data, with a length equal to
+the original registered length. E.g. for updating the file EOF, this would be a
+pointer to a longword.
+
+RETURN VALUE: Return value is 0 if OK, or negative if error:
+-EBADPART: invalid handle.
+
+END DESCRIPTION **********************************************************/
+_fatftc_debug int fatrj_setmarker(int handle, void * data)
+{
+	auto RJHeaderUnion header;
+   auto RJEntryUnion entry;
+   auto RJRoot * rr;
+   auto word len;
+
+	if (handle < FAT_MAXPARTITIONS) {
+   	return -EBADPART;
+   }
+   rr = &_ftc.rj[handle];
+   header.l = rr->header.l;
+   if (header.ptr->signature != RJ_VALID) {
+   	return -EBADPART;
+   }
+   entry.l = header.l + sizeof(RJHeader); // Set to first entry following header
+   entry.ptr->signature = RJ_VALID;	      // Set in case need to rollback
+   len = entry.ptr->len;
+   _f_memcpy(header.ptr->data, (char __far *)data, len);
+   entry.ptr->signature = 0;	            // OK, got valid new data
+   // Then also copy to preimage
+	_f_memcpy((char __far *)(entry.l + sizeof(RJEntry)), (char __far *)data, len);
+   return 0;
+}
+
+/*** BeginHeader fatrj_getmarker */
+int fatrj_getmarker(int handle, void * data);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+fatrj_getmarker                 <FATFTC.LIB>
+
+SYNTAX: int fatrj_getmarker(int handle, void * data)
+
+DESCRIPTION: Get the current marker value.
+
+PARAMETER1: handle is the return value from fatrj_regmarker().
+PARAMETER2: data must point to an area at least as large as the registered
+marker length.
+
+RETURN VALUE: Return value is 0 if OK, or negative if error:
+-EBADPART: invalid handle.
+
+END DESCRIPTION **********************************************************/
+_fatftc_debug int fatrj_getmarker(int handle, void * data)
+{
+	auto RJHeaderUnion header;
+   auto RJRoot * rr;
+   auto word len;
+
+	if (handle < FAT_MAXPARTITIONS) {
+   	return -EBADPART;
+   }
+   rr = &_ftc.rj[handle];
+   header.l = rr->header.l;
+   if (header.ptr->signature != RJ_VALID) {
+   	return -EBADPART;
+   }
+   len = *((word __far *)(header.l + (sizeof(RJHeader) + offsetof(RJEntry,len))));
+   _f_memcpy((char __far *)data, header.ptr->data, len);
+   return 0;
+}
+
+
+
+/*** BeginHeader fatrj_setchk */
+int fatrj_setchk(int prt, void * data);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+fatrj_setchk                 <FATFTC.LIB>
+
+SYNTAX: int fatrj_setchk(int prt, void * data)
+
+DESCRIPTION: 	The setchk() and getchk() functions allow additional checkpoint
+data to be stored during a sequence of transactions.  The checkpoint data is a
+fixed size block of exactly FAT_MAXCHK bytes (defaults to 21).   The intention
+of this facility is to allow for filesystem operations to be extended
+arbitrarily, in an atomic manner, without the limitations of the rollback
+journal itself (about 1k of changed data).  For example, if a file preallocation
+requires more than about 1000 bytes to be updated atomically, then the
+preallocation is extended using checkpoint data for each "chunk" of
+preallocation. The data must contain some indication of how to rollback or
+rollforward the entire sequence of operations, however the details of this are
+left up to the FAT layer.  The RJ layer does not attach any significance to the
+checkpoint data.
+
+Basically, the data is stored in BB RAM as part of the transaction journal area.
+There are two copies of the data, called "old" and "new".  The checkpoint data
+can only be changed using the setchk() function when a transaction has been
+started.
+
+It is intended that the checkpoint data is updated some time during the
+transaction, in order to indicate the expected state after the transaction
+successfully completes (i.e. tranend() is called).  If the transaction is rolled
+back, the checkpoint data is likewise rolled back to the state it was in before
+the transaction was started.
+
+This is what happens to the data stored in the rollback journal entry:
+
+   Start of transaction:
+     Create a preimage of the old data in the journal (this entry is specially
+     marked as a checkpoint entry, and only one such entry will exist).
+
+   During transaction:
+     storage and retrieval operate on the "new" data set.
+
+   End of transaction (commit):
+     Abandon the old copy (preimage) in the journal, leaving the new entry.
+
+   Outside transaction:
+     Value is readable, but no updates are allowed.
+
+   Rollback when device registered:
+     If there was an outstanding transaction, then the transaction is rolled
+     back (as usual) and the old checkpoint data is presented back to the
+     FAT layer via a callback function.  The FAT layer MUST use or save the
+     checkpoint data soon after that point, since it is reset to nulls when the
+     partition(s) are mounted (via fatrj_regpartition()).   The callback
+     function is passed as a parameter to fatftc_regdev().  Its prototype is:
+
+       int checkpoint(word dev, int prt, mbr_dev * fdev, void * chkdata)
+
+     dev is the device number (as returned from fatftc_regdev()).
+     prt is the partition number, as registered on the last boot - partition
+       numbers on this boot are not known yet, thus this value may not be
+       useful.
+     fdev is the device and controller parameters as passed to fatftc_regdev().
+     chkdata points to the old checkpoint data i.e. the rolled-back version.
+       it is FAT_MAXCHK butes long.
+
+     Note that this callback is invoked for each non-empty (outstanding) journal
+     on the device being registered.  It is not invoked if the norecovery
+     parameter is set, or the checkpoint function pointer is NULL.
+
+     The return value from the callback is not currently used, but it should
+     be set to zero for upwards compatibility.
+
+It is only valid to call fatrj_setchk() when a transaction is currently
+open for the given partition.
+
+PARAMETER1: partition number as returned by fatrj_regpartition()
+PARAMETER2: data points to an area of storage assumed to be FAT_MAXCHK bytes
+            long.  If NULL, it sets the checkpoint data to all nulls (which,
+            by convention only, means there is no action which needs to be
+            taken).
+
+RETURN VALUE: Return code is 0 if OK, else negative error code:
+-EBADPART: invalid partition
+-ETRANSNOTOPEN: transaction is not currently open for this partition
+-ECMCONFLICT: basically internal error (mixing checkpoints and markers).
+-EJOVERFLOW: journal unable to add the checkpoint entry (it is advisable to
+set the checkpoint data before calling fatftc_write()).
+
+END DESCRIPTION **********************************************************/
+
+_fatftc_debug int fatrj_setchk(int prt, void * data)
+{
+	auto RJHeaderUnion header;
+   auto RJRoot * rr;
+   auto int rc;
+
+   rr = &_ftc.rj[prt];
+   header.l = rr->header.l;
+   if (header.ptr->signature != RJ_VALID) {
+   	return -EBADPART;
+   }
+   if (!rr->trans) {
+   	return -ETRANSNOTOPEN;    // Must have transaction to update
+   }
+   if (rr->flags & RJ_MRKENT) {
+   	return -ECMCONFLICT;
+   }
+   if (!(rr->flags & RJ_CHKENT)) {
+   	// There is currently no checkpoint preimage stored.  Create one
+      // now.  (Delaying it to now instead of always doing it at transtart
+      // saves the overhead of creating the entry for the majority of
+      // transactions which do not require checkpoint data).
+   	rc = _fatrj_store_preimage(prt, 0, (long)header.ptr->data, 0,
+                                   FAT_MAXCHK, RJT_CHECKPOINT);
+      if (rc < 0) {
+      	return rc;
+      }
+      rr->flags |= RJ_CHKENT;
+   }
+   if (data) {
+      _f_memcpy(header.ptr->data, (char __far *)data, FAT_MAXCHK);
+   }
+   else {
+      _f_memset(header.ptr->data, 0, FAT_MAXCHK);
+   }
+	return 0;
+}
+
+
+/*** BeginHeader fatrj_getchk */
+int fatrj_getchk(int prt, void * data);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+fatrj_getchk                 <FATFTC.LIB>
+
+SYNTAX: int fatrj_getchk(int prt, void * data)
+
+DESCRIPTION: Get current checkpoint data for specified prt (rollback journal
+as returned from fatrj_regpartition()).
+
+PARAMETER1: partition number as returned by fatrj_regpartition()
+PARAMETER2: data, If NULL it merely tests the current value for all zeros.
+            If data is not NULL, the current checkpoint data is copied to
+            that location (assumed to be FAT_MAXCHK bytes long).
+
+RETURN VALUE: Return code is 1 if the checkpoint data is not all zeros;
+              0 if the checkpoint data is all zeros;
+             -EBADPART error code if invalid partition.
+
+END DESCRIPTION **********************************************************/
+_fatftc_debug int fatrj_getchk(int prt, void * data)
+{
+	auto char dd[FAT_MAXCHK];
+	auto RJHeaderUnion header;
+   auto RJRoot * rr;
+   auto word i;
+
+   if (!data) {
+   	data = dd;
+   }
+   rr = &_ftc.rj[prt];
+   header.l = rr->header.l;
+   if (header.ptr->signature != RJ_VALID) {
+   	return -EBADPART;
+   }
+  	_f_memcpy((char __far *)data, header.ptr->data, FAT_MAXCHK);
+   for (i = 0; i < FAT_MAXCHK; ++i) {
+      if (((char *)data)[i]) {
+         break;
+      }
+   }
+	return i < FAT_MAXCHK;     // Return 1 if non-null checkpoint data
+}
+
+
+/*** BeginHeader */
+#endif  // __FATFTC_LIB
+/*** EndHeader */
+

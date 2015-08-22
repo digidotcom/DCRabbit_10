@@ -1,0 +1,382 @@
+/*
+ *    fat_config.lib
+ *    COPYRIGHT - Digi International, Inc. (c) 2003 - 2008
+ *
+ *    This library looks at the board type, and works out suitable
+ *    FAT initialization settings.
+ *
+ */
+
+/*** BeginHeader _fatConfig, _fatDevConfig, _fat_driver_table,
+					_fat_device_table, _fat_part_table, fat_part_mounted,
+               num_fat_drivers, num_fat_devices */
+#ifndef FAT_CONFIG_H
+#define FAT_CONFIG_H
+
+// Define table entry which describes a FAT device driver
+typedef struct
+{
+	char * type;	// Currently, either "NF", "SF" or "SD"
+	int  (*InitDriver)( /*mbr_drvr *driver, void *device_list */ );
+	int  (*DriverCallback)( /*mbr_drvr *driver, void *device_list */ );
+} _fat_driver_descr;
+
+// Define table entry which describes a FAT device instance.
+typedef struct
+{
+	// The following pointer is used to match up with the corresponding driver
+   // table entry at init time.  It is not used to actually call the function.
+	int  (*InitDriver)( /*mbr_drvr *driver, void *device_list */ );
+	int  (*DeviceCallback)( /*mbr_drvr *driver, void *device_list */ );
+	word	deviceID;	// which device (eg:  soldered vs. socketed nand flash)
+	word	timeOut;		// not implemented yet:  time in seconds until cache flush
+   word	flags;
+// The MOUNT_PART_* and MOUNT_DEV_* flags indicate the applicable partitions
+// and devices to mount (or format, if requested).
+// NOTE:  The partition numbers apply to _all_ specified devices.  It is not
+// possible to mount, say, partition 1 of device 1 and partition 3 of device 2
+// in a single call to fat_AutoMount.  If you want to do this, then make
+// several calls to fat_AutoMount specifying a single device at a time.
+#define FDDF_MOUNT_PART_0			0x0001
+#define FDDF_MOUNT_PART_1			0x0002
+#define FDDF_MOUNT_PART_2			0x0004
+#define FDDF_MOUNT_PART_3			0x0008
+#define FDDF_MOUNT_PART_ALL		0x000F
+#define FDDF_MOUNT_DEV_0			0x0010
+#define FDDF_MOUNT_DEV_1			0x0020
+#define FDDF_MOUNT_DEV_2			0x0040
+#define FDDF_MOUNT_DEV_3			0x0080
+#define FDDF_MOUNT_DEV_ALL			0x00F0
+#define FDDF_NO_RECOVERY			0x0100	// Use norecovery if fails first time
+// Following formatting flags are typically used only on calls to fat_AutoMount.
+// If the device needs to be formatted, a single FAT partition is automatically
+//  created on that device.
+#define FDDF_COND_DEV_FORMAT		0x0200	// Format device if unformatted
+#define FDDF_COND_PART_FORMAT		0x0400	// Format partition if unformatted
+#define FDDF_UNCOND_DEV_FORMAT	0x2000	// Format device unconditionally
+#define FDDF_UNCOND_PART_FORMAT	0x4000	// Format partition unconditionally
+											//   Note:  Use these last two flags only in
+											//   calls to fat_AutoMount.  They should
+											//   never be set in a default configuration
+                                 //   unless the device is to be completely
+                                 //   blanked each time the program starts!
+// Following use default flag is used only on calls to fat_AutoMount.
+#define FDDF_USE_DEFAULT			0x8000 // Use default config flags (all
+		  											 // other values are run time override).
+	char * sig;		// Hard-coded signature (or NULL for removable devices)
+} _fat_device_descr;
+
+#ifndef _DRIVER_CALLBACK
+	#define _DRIVER_CALLBACK	NULL
+#endif
+#ifndef _DEVICE_CALLBACK
+	#define _DEVICE_CALLBACK	NULL
+#endif
+
+/******************************************************************************
+
+    This section examines the board type, and selects FAT driver parameters.
+
+    Note that there is no NEED to base selection on _BOARD_TYPE_.  Some
+    drivers may not be associated with any board type in particular; these
+    would require the user to explicitly include support by e.g. defining a
+    USE_XXX macro.
+
+    For custom drivers and devices, you can define the macros
+      _DRIVER_CUSTOM "my_driver.lib"
+      _DRIVER_CUSTOM_INIT { my_InitDriver, },
+      _DEVICE_CUSTOM_0  ...
+      _DEVICE_CUSTOM_1  ...etc.
+
+    NOTE:
+    Hot swap-ability is implemented for NAND devices only, and it require that
+    that the _fat_device_descr struct's *sig element be given a NULL string
+    value for those devices. Makes sure serial flash devices have a non-NULL
+    *sig element.
+
+    Include the following line in your custom driver definition if it uses a
+    NAND device for proper compilation:
+       #define FAT_NAND_DEVICE_USED
+
+
+******************************************************************************/
+
+// For backwards compatability with DC9.01
+#ifndef POWERCOREFLEX_SERIES
+ #define POWERCOREFLEX_SERIES 0
+#endif
+#ifndef _DF_TYPE_SER
+ #define _DF_TYPE_SER    0
+#endif
+
+#ifndef _DC_BRD_OPT0_
+ #define _DC_BRD_OPT0_ 0
+ #define NANDFLASH_ONBOARD 0
+#else
+ #ifndef BRDOPT0_NANDFLASHMASK
+  #define BRDOPT0_NANDFLASHMASK 0x00000010L
+ #endif
+ #if (_DC_BRD_OPT0_ & BRDOPT0_NANDFLASHMASK) != 0
+  #define NANDFLASH_ONBOARD 1
+ #else
+  #define NANDFLASH_ONBOARD 0
+ #endif
+#endif
+
+#if (NANDFLASH_ONBOARD)    // RCM40x0 w/ NAND
+ #ifdef FAT_NF_DIRECT      // Legacy read only NAND FAT option
+   #ifndef FAT16_READONLY
+     #define FAT16_READONLY  // Force read only mode if bypassing FTL on NAND
+   #endif
+	#define _DRIVER_0		"NFLASH_FAT.LIB"
+   #define _DRIVER_0_INIT  { "NF", nf_InitDriver, _DRIVER_CALLBACK, },
+   #define _DEVICE_0 { nf_InitDriver, _DEVICE_CALLBACK, 0, 0, \
+   								FDDF_MOUNT_PART_ALL|FDDF_MOUNT_DEV_0, "NFLASH-0", },
+	#define FAT_MAXCU 5
+ #else                     // NAND Flash access through FTL layer
+	#define _DRIVER_0		"FATFTL.LIB"
+   #define _FTL_DRIVER  "NFLASH_FAT.LIB"
+   #define _DRIVER_0_INIT  { "NT", ftl_InitDriver, _DRIVER_CALLBACK, },
+   #define _FTL_DRIVER_INIT  { "NF", nf_InitDriver, _DRIVER_CALLBACK, }
+   #define _DEVICE_0 { ftl_InitDriver, _DEVICE_CALLBACK, 0, 0, \
+   								FDDF_MOUNT_PART_ALL|FDDF_MOUNT_DEV_0, "NFLASH-0", },
+ #endif
+ #define FAT_NAND_DEVICE_USED
+
+#elif RCM4200_SERIES || RCM4400W_SERIES || RCM5400W_SERIES || BL4S100_SERIES \
+      || RCM5600W_SERIES || RCM6600W_SERIES || RCM6700_SERIES
+ #ifndef FAT_SF_FTL        // Serial flash default - bypass FTL layer
+  #ifndef FAT_SF_DISABLE   // Optional disable of FAT access to serial flash
+	#define _DRIVER_0		"SFLASH_FAT.LIB"
+   #define _DRIVER_0_INIT  { "SF", sf_InitDriver, _DRIVER_CALLBACK, },
+   #define _DEVICE_0 { sf_InitDriver, _DEVICE_CALLBACK, 0, 0, \
+   								FDDF_MOUNT_PART_ALL|FDDF_MOUNT_DEV_0, "SFLASH-1", },
+  #endif
+ #else                     // Optional FTL access of serial flash device
+	#define _DRIVER_0		"FATFTL.LIB"
+   #define _FTL_DRIVER  "SFLASH_FAT.LIB"
+   #define _DRIVER_0_INIT  { "ST", ftl_InitDriver, _DRIVER_CALLBACK, },
+   #define _FTL_DRIVER_INIT  { "SF", sf_InitDriver, _DRIVER_CALLBACK, }
+   #define _DEVICE_0 { ftl_InitDriver, _DEVICE_CALLBACK, 0, 0, \
+   								FDDF_MOUNT_PART_ALL|FDDF_MOUNT_DEV_0, "SFLASH-1", },
+ #endif
+
+#elif (POWERCOREFLEX_SERIES) && (_DF_TYPE_SER)
+	// Some PowerCoreFLEX boards have on-board serial flash
+   //  PowerCoreFLEX modules with serial flash will show this in ID block
+	#define _DRIVER_0		"SFLASH_FAT.LIB"
+   #define _DRIVER_0_INIT  { "SF", sf_InitDriver, _DRIVER_CALLBACK, },
+   #define _DEVICE_0 { sf_InitDriver, _DEVICE_CALLBACK, 0, 0, \
+   								FDDF_MOUNT_PART_ALL|FDDF_MOUNT_DEV_0, "SFLASH-1", },
+
+#elif RCM4300_SERIES
+	#define PC_COMPATIBLE
+   #define _DRIVER_0    "SD_FAT.LIB"
+   #define _DRIVER_0_INIT  { "SD", sd_InitDriver, _DRIVER_CALLBACK, },
+   #define _DEVICE_0 { sd_InitDriver, _DEVICE_CALLBACK, 0, 0, \
+                              FDDF_MOUNT_PART_ALL|FDDF_MOUNT_DEV_0, NULL, },
+   #define FAT_REMOVABLE
+   #define FAT_ALLOW_HOTSWAP
+   #define FAT_SD_DEVICE  FDDF_MOUNT_DEV_0
+   #define FAT_SD_PART    fat_part_mounted[0]
+
+#elif (R6000TEST_SERIES)   //DEVIDEA - interim board macro - BPM
+   // USB Mass storage device
+	#define PC_COMPATIBLE
+   #define _DRIVER_0    "USB_FAT.LIB"
+   #define _DRIVER_0_INIT  { "USB", usbms_InitDriver, _DRIVER_CALLBACK, },
+   #define _DEVICE_0 { usbms_InitDriver, _DEVICE_CALLBACK, 0, 0, \
+                              FDDF_MOUNT_PART_ALL|FDDF_MOUNT_DEV_0, NULL, },
+   #define FAT_REMOVABLE
+   #define FAT_ALLOW_HOTSWAP
+   #define FAT_USB_DEVICE  FDDF_MOUNT_DEV_0
+   #define FAT_USB_PART    fat_part_mounted[0]
+
+   /**************************************************************************
+    Final default.  Issue warning that we don't know which driver(s) to use
+   ***************************************************************************/
+#else
+	#ifndef _DRIVER_CUSTOM
+   	#error "Board type does not support FAT filesystem."
+   	#fatal "You need to define _DRIVER_CUSTOM etc."
+   #endif
+#endif
+
+/*****************************************************************************
+
+  End of board-specific settings.
+
+******************************************************************************/
+
+#ifndef FAT_MAXCU
+	#define FAT_MAXCU 3
+#endif
+
+#ifndef _DEVICE_0
+  #define _DEVICE_0
+  #define _DEVICE_1
+  #define _DEVICE_2
+  #define _DEVICE_3
+ #ifdef _DEVICE_CUSTOM_0
+  #ifndef _DEVICE_CUSTOM_1
+   #define SSPEC_MAX_FATDEVS 1
+  #else
+   #define SSPEC_MAX_FATDEVS 2
+  #endif
+ #endif
+#else
+ #ifndef _DEVICE_1
+   #define _DEVICE_1
+   #define _DEVICE_2
+   #define _DEVICE_3
+  #ifndef _DEVICE_CUSTOM_0
+   #define SSPEC_MAX_FATDEVS 1
+  #else
+   #define SSPEC_MAX_FATDEVS 2
+  #endif
+ #else
+  #ifndef _DEVICE_2
+   #define _DEVICE_2
+   #define _DEVICE_3
+   #ifndef _DEVICE_CUSTOM_0
+    #define SSPEC_MAX_FATDEVS 2
+   #else
+    #define SSPEC_MAX_FATDEVS 3
+   #endif
+  #else
+   #ifndef _DEVICE_3
+    #define _DEVICE_3
+    #ifndef _DEVICE_CUSTOM_0
+     #define SSPEC_MAX_FATDEVS 3
+    #else
+     #define SSPEC_MAX_FATDEVS 4
+    #endif
+   #endif
+  #endif
+ #endif
+#endif
+#ifndef _DEVICE_CUSTOM_0
+   #define _DEVICE_CUSTOM_0
+#else
+   #ifndef SSPEC_MAX_FATDEVS
+     #define SSPEC_MAX_FATDEVS 5
+   #endif
+#endif
+#ifndef _DEVICE_CUSTOM_1
+   #define _DEVICE_CUSTOM_1
+#endif
+
+// Bring in the driver library(s)
+#ifdef _DRIVER_0
+   #use _DRIVER_0
+#else
+	#define _DRIVER_0_INIT
+#endif
+#ifdef _DRIVER_1
+   #use _DRIVER_1
+#else
+	#define _DRIVER_1_INIT
+#endif
+#ifdef _DRIVER_CUSTOM
+   #use _DRIVER_CUSTOM
+#else
+	#define _DRIVER_CUSTOM_INIT
+#endif
+
+extern const _fat_driver_descr _fatConfig[];
+extern const _fat_device_descr _fatDevConfig[];
+
+extern mbr_drvr _fat_driver_table[];
+extern mbr_dev _fat_device_table[];
+extern fat_part _fat_part_table[];
+extern fat_part *fat_part_mounted[];
+extern const word num_fat_drivers;
+extern const word num_fat_devices;
+void _fat_config_init();
+
+/*** EndHeader */
+
+// Define run-time tables
+const _fat_driver_descr _fatConfig[] =
+{
+	_DRIVER_0_INIT
+	_DRIVER_1_INIT
+	_DRIVER_CUSTOM_INIT
+   { NULL, }	// Mark end of table
+};
+
+const _fat_device_descr _fatDevConfig[] =
+{
+	_DEVICE_0
+	_DEVICE_1
+	_DEVICE_2
+	_DEVICE_3
+	_DEVICE_CUSTOM_0
+	_DEVICE_CUSTOM_1
+   { NULL, }	// Mark end of table
+};
+mbr_drvr _fat_driver_table[sizeof(_fatConfig)/sizeof(_fatConfig[0]) - 1];
+mbr_dev _fat_device_table[sizeof(_fatDevConfig)/sizeof(_fatDevConfig[0]) - 1];
+fat_part _fat_part_table[(sizeof(_fatDevConfig)/sizeof(_fatDevConfig[0]) - 1)
+																	 * FAT_MAX_PARTITIONS];
+
+fat_part *fat_part_mounted[(sizeof(_fatDevConfig)/sizeof(_fatDevConfig[0]) - 1)
+																	 * FAT_MAX_PARTITIONS];
+
+const word num_fat_drivers = sizeof(_fatConfig)/sizeof(_fatConfig[0]) - 1;
+const word num_fat_devices = sizeof(_fatDevConfig)/sizeof(_fatDevConfig[0]) -1;
+
+// Dummy function to invoke global init of _fat_driver_table and
+//  fat_part_mounted.  There is no need to call this function.
+__nodebug
+void _fat_config_init()
+{
+#GLOBAL_INIT {  // initialize all
+   memset(_fat_driver_table, 0, sizeof(_fat_driver_table));
+   memset(fat_part_mounted, 0, sizeof(fat_part_mounted));
+   _fatftc_donealloc = 0;
+#ifndef FATFTC_DEBUG_INIT
+   _fatftc_init();
+#endif
+  }
+   memset(_fat_driver_table, 0, sizeof(_fat_driver_table));
+   memset(fat_part_mounted, 0, sizeof(fat_part_mounted));
+
+   _fatftc_init();
+}
+
+/*** BeginHeader fat_print_config */
+// This function is only for debugging.  Do not call in production program.
+void fat_print_config(void);
+/*** EndHeader */
+__nodebug void fat_print_config(void)
+{
+	auto word i, j;
+	const _fat_driver_descr * drvdesc;
+	const _fat_device_descr * devdesc;
+
+	printf("FAT configuration\n");
+	printf("-----------------\n");
+
+   printf("Drivers (total %u)...\n", num_fat_drivers);
+   for (i = 0; i < num_fat_drivers; ++i) {
+   	drvdesc = _fatConfig + i;
+   	printf("Type: %s  initFunc %04X  callback %04X\n",
+      	drvdesc->type, drvdesc->InitDriver, drvdesc->DriverCallback);
+      for (j = 0; j < num_fat_devices; ++j) {
+   		devdesc = _fatDevConfig + j;
+         if (devdesc->InitDriver != drvdesc->InitDriver)
+         	continue;
+      	printf("   --> Device %u:  ID %04X timeout %04X  flags %04X  " \
+      		"callback %04X\n\tsig %s\n", j, devdesc->deviceID, devdesc->timeOut,
+            devdesc->flags, devdesc->DeviceCallback,
+            devdesc->sig ? devdesc->sig : "<removable, read volser>" );
+      }
+   }
+   printf("\n");
+}
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+

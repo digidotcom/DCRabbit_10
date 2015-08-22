@@ -1,0 +1,1134 @@
+/****************************************************************************
+sha1.lib
+ *-----------------------------------------------------------------------------
+ * Copyright (c) 2008 Digi International Inc., All Rights Reserved
+ *
+ * This software contains proprietary and confidential information of Digi
+ * International Inc.  By accepting transfer of this copy, Recipient agrees
+ * to retain this software in confidence, to prevent disclosure to others,
+ * and to make no use of this software other than that for which it was
+ * delivered.  This is a published copyrighted work of Digi International
+ * Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+ * prohibited.
+ *
+ * Restricted Rights Legend
+ *
+ * Use, duplication, or disclosure by the Government is subject to
+ * restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+ * Technical Data and Computer Software clause at DFARS 252.227-7031 or
+ * subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+ * Restricted Rights at 48 CFR 52.227-19, as applicable.
+ *
+ * Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+ *-----------------------------------------------------------------------------
+
+Implementation of the SHA-1 message digest algorithm
+Recipe taken from 'Applied Cryptography, 2nd Edition; Bruce Schneier'
+
+2005/04/01 - SJH - created this version optimized for Rabbit 4000
+
+  In general, JKHL is used as an accumulator (c.f. BCDE in the R3k version)
+  The hash work values (a,b,c,d,e) are stored in pw', pw, px, py and pz
+  respectively, instead of at the bottom of the stack in the R3k version.
+
+2007/12/26 - SJH - changed to use PZ' instead of PW', since this will fit
+  better with proposed R6k instruction for cycling registers.  Also, added
+  hmac functions and far pointer support.
+
+2008/11/14 - SJH - finalized for Rabbit 6000 instruction set.  Added
+  complete loop unrolling if SHA_FAST defined (only works with Rabbit 6000).
+
+***************************************************************************/
+
+
+/*** BeginHeader sha_round1, sha_round2, sha_round3, sha_round4, sha_xor */
+
+#ifndef __SHA_LIB__
+#define __SHA_LIB__
+
+#ifndef _RAB6K
+	#define _RAB6K 0
+#endif
+
+// Define SHA_FAST to unroll loops.  This gives about 13% speed-up, but at the
+// cost of almost 4k extra code size.
+#ifndef SHA_FAST
+	#define _SHA_FAST 0
+#else
+	#if _RAB6K
+		#define _SHA_FAST 1
+	#else
+		// Cannot have fully unrolled loops unless Rabbit 6000
+		#define _SHA_FAST 0
+	#endif
+#endif
+
+#ifdef SHA_DEBUG
+	#define _sha_debug __debug
+#else
+	#define _sha_debug __nodebug
+#endif
+
+// SHA output is 20 bytes
+#define SHA_HASH_SIZE    20
+
+// Initialization constants (part of the SHA-1 spec)
+#define SHA_INIT_A 0x67452301
+#define SHA_INIT_B 0xefcdab89
+#define SHA_INIT_C 0x98badcfe
+#define SHA_INIT_D 0x10325476
+#define SHA_INIT_E 0xc3d2e1f0
+#define SHA_K_1 0x5a827999
+#define SHA_K_2 0x6ed9eba1
+#define SHA_K_3 0x8f1bbcdc
+#define SHA_K_4 0xca62c1d6
+
+// The SHA-1 state structure. This contains everything an individual SHA-1
+// hash needs to save state
+typedef struct
+{
+   // hash must be 1st field
+	unsigned long hash[5];
+
+	// message block must be 2nd field
+	unsigned long message_block[16]; //each 4-byte is in little-endian format
+
+   // Index into message block (stores current posistion in block, since
+   // we only process whole blocks)
+	int message_index;
+
+   // The total length of all input data added
+	unsigned long input_length;
+} sha_state;
+
+#if !_SHA_FAST
+// These are not C-callable functions! (Assembly only)
+__root void sha_round1(void);
+__root void sha_round2(void);
+__root void sha_round3(void);
+__root void sha_round4(void);
+__root void sha_xor(void);
+#endif
+
+// SHA_ST: store JKHL at (reg+x).  reg is IX, IY or SP.
+#define SHA_ST(reg, x) ld (reg+x),jkhl
+
+// SHA_LD: load JKHL from (reg+x).  reg is IX, IY or SP.
+#define SHA_LD(reg, x) ld jkhl,(reg+x)
+
+// SHA_ADD: add (reg+x) to BCDE.  reg is IX, IY or SP.
+#if _RAB6K
+	#define SHA_ADD(reg, x)  add   jkhl,(reg+x)
+#else
+	#define SHA_ADD(reg, x) \
+	   ld    bcde,(reg+x) $ \
+	   add   jkhl,bcde
+#endif
+
+// These stack offsets assume a 3 byte xmem return address is on the stack.
+// These offsets are used to create a stack workspace for the SHA-1 operations.
+// Since SHA1 cycles through a,b,c,d,e, instead of moving the data around, we
+// let it grow down in the stack.  We use the stack for temporary storage.
+// SP keeps decrementing by 4 bytes for each round step. There are 80 steps,
+// so at the very end we increment the SP back up by 320.
+// Initially a stack frame is set up thus (from high to low memory):
+//
+//       X0
+//       X1
+//       ...
+//       X15
+//       <lret addr>
+//        <- SP
+//
+// thus 'X15' (last data block) is at (sp+3).  X0-15 is the initial message
+// block which we are processing.  This is stored in reverse order i.e. X0 at
+// the highest offset.
+// The 'work' registers A-E are stored in pz', pw, px, py, pz.  These are logically
+// at the bottom of the above stack, with A at the bottom.  During each round,
+// 'E' is replaced, and a new 'A' is computed, and the stack pointer decremented
+// so that everything is effectively shifted.  Since A-E are actually in registers,
+// these have to be explicitly rotated rather than relying on offset trickery.
+#if _SHA_FAST
+	#define SHA_RET_ADDR_SIZE	0
+#else
+	#define SHA_RET_ADDR_SIZE	2
+#endif
+#define SHA_OFFS_X0  60+SHA_RET_ADDR_SIZE
+#define SHA_OFFS_X2  52+SHA_RET_ADDR_SIZE
+#define SHA_OFFS_X8  28+SHA_RET_ADDR_SIZE
+#define SHA_OFFS_X13 8+SHA_RET_ADDR_SIZE
+
+// Move with endianness swapping
+#if _RAB6K
+	#define SHA_RMOVE(x) \
+	   ld    bcde,(ix+20+(x*4)) $ \
+	   swap  bcde $ \
+	   ld    (sp+60-(x*4)),bcde
+#else
+	#define SHA_RMOVE(x) \
+	   ld    bcde,(ix+20+(x*4)) $ \
+	   rlc   8,bcde $ \
+	   ld    a,b $ \
+	   ld    b,d $ \
+	   ld    d,a $ \
+	   ld    (sp+60-(x*4)),bcde
+#endif
+
+// SHA_F etc.:
+// Result returned in JKHL.
+// There are 3 distinct functions for the different SHA-1 operations:
+//   F : ((c^d)&b)^d)
+//   H : b^c^d
+//   G : b&c | (b|c)&d
+// It is assumed that the parameters b, c and d are in pw, px, py respectively.
+
+
+// Result returned in JKHL.
+//   G : b&c | (b|c)&d
+#if _RAB6K
+	#define SHA_G \
+		db	0X49, 0XD2		// use SHAF2
+#else
+	#define SHA_G \
+	   ld    jkhl,pw $ \
+	   ld    bcde,px $ \
+	   or    jkhl,bcde $ \
+	   ld    bcde,py $ \
+	   and   jkhl,bcde $ \
+	   ld    px',jkhl $ \
+	   ld    jkhl,pw $ \
+	   ld    bcde,px $ \
+	   and   jkhl,bcde $ \
+	   exp $ \
+	   ld    bcde,px $ \
+	   exp $ \
+	   or    jkhl,bcde
+#endif
+
+//   F : ((c^d)&b)^d)
+#if _RAB6K
+	#define SHA_F \
+	   db 0x49, 0xC2		// SHAF1
+#else
+	#define SHA_F \
+	   ld    jkhl,px $ \
+	   ld    bcde,py $ \
+	   xor   jkhl,bcde $ \
+	   ld    bcde,pw $ \
+	   and   jkhl,bcde $ \
+	   ld    bcde,py $ \
+	   xor   jkhl,bcde
+#endif
+
+//   H : b^c^d
+#if _RAB6K
+	#define SHA_H \
+	   db 0x49, 0xE2		// SHAF3
+#else
+	#define SHA_H \
+	   ld    jkhl,pw $ \
+	   ld    bcde,px $ \
+	   xor   jkhl,bcde $ \
+	   ld    bcde,py $ \
+	   xor   jkhl,bcde
+#endif
+
+// Cycle work registers		jkhl -> pz' -> pw -> px -> py -> pz
+// jkhl dead after this, so can be trashed.
+#if _RAB6K
+	// Use RR4REG, except need to manually swap jkhl and z' first.
+	// Hence, better to use RR8REG and feed current JKHL in at the PY' position
+	// so it ends up in PZ'.  Then JKHL is loaded with Z' so it gets fed into
+	// PW.
+	#define SHA_CYCLE \
+		exp $ ld	py,jkhl $ ld jkhl,pz $ exp $ RR8REG
+#else
+	#define SHA_CYCLE \
+	   ld    pz,py $ \
+	   ld    py,px $ \
+	   ld    px,pw $ \
+	   exp $ \
+	   ld    pw',pz $ \
+	   ld    pz,jkhl $ \
+	   exp
+#endif
+
+#if _SHA_FAST
+	// fully in-line
+	#define SHA_COMMON	\
+		add	jkhl,pz $ \
+		add jkhl,(sp+SHA_OFFS_X0) $ \
+		add jkhl,(iy) $ \
+		alts ld bcde,pz $ \
+		rlc	4,bcde $ rlc	1,bcde $ add	jkhl,bcde
+
+	#define SHA_XOR  	ld		jkhl,(sp+SHA_OFFS_X0) $ \
+	   xor	jkhl,(sp+SHA_OFFS_X2) $ \
+	   xor	jkhl,(sp+SHA_OFFS_X8) $ \
+	   xor	jkhl,(sp+SHA_OFFS_X13) $ \
+	   rlc	1,jkhl
+
+	#define SHA_ROTC 	ld		bcde,px $ rrc	2,bcde $ ld		px,bcde
+
+	#define SHA_ROUND1  SHA_F $ SHA_COMMON $ SHA_CYCLE $ SHA_XOR $ SHA_ROTC $ push jkhl
+	#define SHA_ROUND2  SHA_H $ SHA_COMMON $ SHA_CYCLE $ SHA_XOR $ SHA_ROTC $ push jkhl
+	#define SHA_ROUND3  SHA_G $ SHA_COMMON $ SHA_CYCLE $ SHA_XOR $ SHA_ROTC $ push jkhl
+	#define SHA_ROUND4  SHA_ROUND2
+	#define SHA_ROUND4L SHA_H $ SHA_COMMON $ SHA_CYCLE $ SHA_ROTC $ add sp,-4
+
+#else
+	#define SHA_ROUND1  call sha_round1
+	#define SHA_ROUND2  call sha_round2
+	#define SHA_ROUND3  call sha_round3
+	#define SHA_ROUND4  call sha_round4
+	#define SHA_ROUND4L call sha_round4l
+#endif
+
+/*** EndHeader */
+
+// Assembly-only routines.  Not required if fully in-line code
+#if !_SHA_FAST
+
+//#asm xmem
+#asm __root
+// SHA-1 rounds functions. SHA-1 has four rounds each block of data goes
+// through, with round 2 and round 4 being identical.
+// Each round starts by performing a specific operation, those operations
+// being defined as follows:
+//   F : ((c^d)&b)^d)
+//   H : b^c^d
+//   G : b&c | (b|c)&d
+// Once the operation has been performed, common code finishes the operation
+
+sha_round2::
+sha_round4::
+	SHA_H
+	jr	.common
+sha_round3::
+	SHA_G
+	jr	.common
+sha_round1::
+	SHA_F
+.common:
+   ; Add in the E value
+#if _RAB6K
+	add	jkhl,pz
+	; Plus current X0
+	add jkhl,(sp+SHA_OFFS_X0)
+	; add in the Yn constant
+	add jkhl,(iy)
+	; get A
+	alts ld bcde,pz
+#else
+   ld		bcde,pz
+   add	jkhl,bcde
+	; Plus current X0
+   SHA_ADD(sp, SHA_OFFS_X0)
+   SHA_ADD(iy, 0)		; add in the Yn constant
+	exp
+   ld		bcde,pz		; get A
+   exp
+#endif
+   rlc	4,bcde
+   rlc	1,bcde		; rotate left 5 bits
+   add	jkhl,bcde	; add in to previous result
+
+   SHA_CYCLE
+	; fall thru to SHA_XOR...
+sha_xor::
+	; This routine assumes work registers have already been cycled, only the new X15 value
+   ; needs to be filled in.  This is returned in jkhl.
+   ; sets X15 (new) = (X13^X8^X2^X0)(old) <<< 1.
+   ; Also does rotation of C by 30 (= -2).
+#if _RAB6K
+	ld		jkhl,(sp+SHA_OFFS_X0)
+   xor	jkhl,(sp+SHA_OFFS_X2)
+   xor	jkhl,(sp+SHA_OFFS_X8)
+   xor	jkhl,(sp+SHA_OFFS_X13)
+#else
+	ld		jkhl,(sp+SHA_OFFS_X0)
+	ld		bcde,(sp+SHA_OFFS_X2)
+   xor	jkhl,bcde
+	ld		bcde,(sp+SHA_OFFS_X8)
+   xor	jkhl,bcde
+	ld		bcde,(sp+SHA_OFFS_X13)
+   xor	jkhl,bcde
+#endif
+   rlc	1,jkhl
+
+	ld		bcde,px
+   rrc	2,bcde
+   ld		px,bcde
+	ret
+
+
+sha_round4l::
+	SHA_H
+   ; Add in the E value
+#if _RAB6K
+	add	jkhl,pz
+	; Plus current X0
+	add jkhl,(sp+SHA_OFFS_X0)
+	; add in the Yn constant
+	add jkhl,(iy)
+	; get A
+	alts ld bcde,pz
+#else
+   ld		bcde,pz
+   add	jkhl,bcde
+	; Plus current X0
+   SHA_ADD(sp, SHA_OFFS_X0)
+   SHA_ADD(iy, 0)		; add in the Yn constant
+	exp
+   ld		bcde,pz		; get A
+   exp
+#endif
+   rlc	4,bcde
+   rlc	1,bcde		; rotate left 5 bits
+   add	jkhl,bcde	; add in to previous result
+
+   SHA_CYCLE
+
+	ld		bcde,px
+   rrc	2,bcde
+   ld		px,bcde
+	ret
+
+#endasm
+
+#endif // !_SHA_FAST
+
+/*** BeginHeader sha_init */
+void sha_init(sha_state __far*state);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+sha_init										   <SHA.LIB>
+
+SYNTAX: void sha_init(sha_state *state);
+
+DESCRIPTION: Initialize a SHA-1 hash. The parameter is a SHA-1 hash
+             state structure to be initialized.
+
+PARAMETER 1: Pointer to SHA-1 state structure
+
+RETURN VALUE: None
+
+END DESCRIPTION **********************************************************/
+
+// SHA-1 hash init array consisting of the SHA-1 initialization constants
+static const unsigned long sha_hash_init[5] =
+{
+ SHA_INIT_A,
+ SHA_INIT_B,
+ SHA_INIT_C,
+ SHA_INIT_D,
+ SHA_INIT_E
+};
+
+_sha_debug
+void sha_init(sha_state __far*state)
+{
+	//printf("SHA1: init %lX\n", state);
+	// Start off the hash, reset the index and length
+	_f_memcpy(state->hash, sha_hash_init, sizeof(state->hash));
+	state->message_index = 0;
+	state->input_length = 0;
+}
+
+/*** BeginHeader sha_add */
+void sha_add(sha_state __far*state, const char __far *in_bytes, size_t count);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+sha_add 										   <SHA.LIB>
+
+SYNTAX: void sha_add(sha_state *state, char far*in_bytes, size_t count);
+
+DESCRIPTION: Add an arbitrary amount of text to a SHA-1 hash. The
+             current hash is passed in through the state parameter,
+             and the text and its length in the other two parameters.
+
+PARAMETER 1: Pointer to SHA-1 state structure
+PARAMETER 2: Pointer to root data buffer containing input data
+PARAMETER 3: The length (in bytes) of the input data
+
+RETURN VALUE: None
+
+END DESCRIPTION **********************************************************/
+
+_sha_debug
+void sha_add(sha_state __far*state, const char __far *in_bytes, size_t count)
+{
+	word btm;
+	char __far*message_bytes;
+
+	//printf("SHA1: add  %lX len %u\n", state, count);
+	//xmem_dump((long)in_bytes, count);
+
+   // Update the total length with the size of the new data
+	state->input_length += count;
+
+   // Get a pointer to the internal hash block
+	message_bytes = (char __far*)state->message_block;
+
+   // While there are still bytes left to read
+	while (count)
+	{
+   	// The hash block is 64 bytes, and we wrap as needed
+      btm = 64 - state->message_index;
+      if (count < btm)
+      {
+      	btm = count;
+      }
+
+      // Copy the input data into the hash block
+      _f_memcpy(message_bytes + state->message_index, in_bytes, btm);
+
+      // Update the message index with the number of bytes added
+		state->message_index += btm;
+
+      // Update our count and input buffer
+      count -= btm;
+      in_bytes += btm;
+
+      // See if we have read an entire block yet
+		if (state->message_index == 64)
+		{
+      	//Run the hash on the current block and reset the block index
+			sha_transform(state);
+			state->message_index = 0;
+		}
+	}
+}
+
+/*** BeginHeader sha_finish */
+void sha_finish(sha_state __far*state, char __far*digest);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+sha_finish 										<SHA.LIB>
+
+SYNTAX: void sha_finish(sha_state *state, char far*digest);
+
+DESCRIPTION: Finish a SHA-1 hash and return the result. The output
+             parameter must be a root data buffer of at least 20 bytes
+             (the size of a SHA-1 hash output).
+
+PARAMETER 1: Pointer to SHA-1 state structure
+PARAMETER 2: Pointer to buffer for output data.  Must be exactly 20 bytes.
+
+RETURN VALUE: None
+
+END DESCRIPTION **********************************************************/
+
+// NULL padding for the finish operation
+static const char sha_pad[68] = { 0, };
+
+_sha_debug
+void sha_finish(sha_state __far*state, char __far*digest)
+{
+	unsigned long temp_length;
+
+	//printf("SHA1: fin  %lX\n", state);
+
+	// Get the total input length in bits
+	temp_length = state->input_length * 8;
+
+	// Add padding and do final transform
+	sha_add(state, "\x80", 1); //a 1 bit followed by 0 bits
+
+   // 4 extra nulls for most sig. 32 bits of 64 bit length field...
+	sha_add(state, sha_pad, ((120 - state->message_index) & 63) + 4);
+
+   // Switch to network byte order
+	sha_swap_32(&temp_length);
+
+   // Finally, add the length
+	sha_add(state, (char __far*)&temp_length, 4);
+
+#ifdef SHA_DEBUG
+	if(state->message_index)
+	{
+		printf("ERROR: message_index = %d on finish\n", state->message_index);
+	}
+   printf("a=%08lx\n", state->hash[0]);
+   printf("b=%08lx\n", state->hash[1]);
+   printf("c=%08lx\n", state->hash[2]);
+   printf("d=%08lx\n", state->hash[3]);
+   printf("e=%08lx\n", state->hash[4]);
+#endif
+
+	//swap and copy all five hash registers
+   sha_copy_and_swap(digest, (char __far*)state->hash, 5);
+}
+
+/*** BeginHeader sha_sofar */
+void sha_sofar(sha_state __far*state, char __far*digest);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+sha_sofar 										<SHA.LIB>
+
+SYNTAX: void sha_sofar(sha_state *state, char far*digest);
+
+DESCRIPTION:   Similar to sha_finish, except that the digest "so far" is
+               obtained without altering the state.  This is used in
+               some protocols such as TLS.  It allows several digests
+               to be obtained from the same data stream at various points,
+               which is more efficient than running several digests of
+               the same data stream in parallel.
+
+PARAMETER 1: Pointer to SHA-1 state structure
+PARAMETER 2: Pointer to buffer for output data.  Must be exactly 20 bytes.
+
+RETURN VALUE: None
+
+END DESCRIPTION **********************************************************/
+
+_sha_debug
+void sha_sofar(sha_state __far*state, char __far*digest)
+{
+	sha_state temp;
+	_f_memcpy(&temp, state, sizeof(temp));
+	sha_finish(&temp, digest);
+}
+
+/**********************
+Internal helper functions
+***********************/
+
+/*** BeginHeader sha_transform */
+void sha_transform(sha_state __far*state);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+sha_finish 										<SHA.LIB>
+
+SYNTAX: void sha_transform(sha_state *state);
+
+DESCRIPTION: The primary SHA-1 hash function. This function works on the
+             64-byte SHA-1 message block, performing the SHA-1 operations
+             upon the data in the current state's message buffer and
+             storing the result for further use.
+
+PARAMETER 1: Pointer to SHA-1 state structure
+
+RETURN VALUE: None
+
+END DESCRIPTION **********************************************************/
+
+
+static const unsigned long sha_karray[4] =
+{
+ SHA_K_1,
+ SHA_K_2,
+ SHA_K_3,
+ SHA_K_4
+};
+
+_sha_debug
+void sha_transform(sha_state __far*_state)
+{
+	auto sha_state __state;
+	auto sha_state * state;
+#ifdef SHA_VERBOSE
+	int i;
+	char *message_bytes;
+
+	printf("before transform:\n");
+	message_bytes = (char *)state->message_block;
+	for(i = 0;i < 64;i++) {
+		printf(" %02x", message_bytes[i]);
+      if (i == 31)
+      	printf("\n");
+   }
+	printf("\n");
+   printf("a=%08lx\n", state->hash[0]);
+   printf("b=%08lx\n", state->hash[1]);
+   printf("c=%08lx\n", state->hash[2]);
+   printf("d=%08lx\n", state->hash[3]);
+   printf("e=%08lx\n", state->hash[4]);
+#endif
+	// For now, we need a root copy of state
+	state = &__state;
+	_f_memcpy(state, _state, sizeof(*state));
+	#if _RAB6K
+	setEXPCanonical();
+	#endif
+
+/*
+   Dirty trick time:  since SHA1 cycles through the working set, instead of moving
+   the data around, we let it grow down in the stack.  We use the stack for
+   temporary storage.  SP keeps decrementing by 4 bytes for each round step.
+   There are 80 steps, so at the very end we increment the SP back up by 320.
+   Initially a stack frame is set up thus (from high to low memory):
+
+       X0
+       X1
+       ...
+       X15
+         <- SP
+
+   thus 'X15' (last data block) is at (sp+0).  X0-15 is the initial message
+   block which we are processing.  This is stored in reverse order i.e. X0 at
+   the highest offset.
+
+   Logically, the above stack frame is augmented with
+
+       E
+       D
+       C
+       B
+       A
+
+   however to save execution time, these are cached in pz', pw, px, py, pz
+   aor A-E respectively.
+
+   Each round step does some calculations involving A..E and one of the X
+   values (initially X0). This results in a temporary value i.e.
+     t = (A<<<5) + func(B,C,D) + E + X0 + Yn.
+   't' is pushed onto the stack, and becomes 'A' for the next round step.
+   The old E is not needed any more, so it is replaced with a new X value
+   (X16 for the first round step) i.e.
+     X16 = (X13 ^ X8 ^ X2 ^ X0) <<< 1
+   The next round step is done with the adjusted SP.  This continues for all
+   80 round steps. (The computation of the new Xn value in the last 16 steps is
+   not necessary, since the results will never be used).
+
+   Finally, the most recent values of A..E are added in to the original hash
+   state and the stack is popped by 320 bytes.
+*/
+
+#asm
+	push	ix
+	ld		ix,(sp+@sp+state+2)	; IX points to state struct.  First 20 bytes
+                              ; are current hash, next 64 bytes are
+                              ; new data block.
+	ld		hl,-64
+   add	hl,sp
+   ld		sp,hl		; allocate 64 bytes for message block
+	; Set up work registers A-E
+   ldl	pz,ix
+   ld		pz',(pz+0)
+   ld		pw,(pz+4)
+   ld		px,(pz+8)
+   ld		py,(pz+12)
+   ld		pz,(pz+16)
+   ; Now move message block.  We need to reverse its overall
+   ; order so that X0 is at highest stack address.  Not only that,
+   ; but the endianness is also swapped.
+	SHA_RMOVE(0)
+	SHA_RMOVE(1)
+	SHA_RMOVE(2)
+	SHA_RMOVE(3)
+	SHA_RMOVE(4)
+	SHA_RMOVE(5)
+	SHA_RMOVE(6)
+	SHA_RMOVE(7)
+	SHA_RMOVE(8)
+	SHA_RMOVE(9)
+	SHA_RMOVE(10)
+	SHA_RMOVE(11)
+	SHA_RMOVE(12)
+	SHA_RMOVE(13)
+	SHA_RMOVE(14)
+	SHA_RMOVE(15)
+
+#if _SHA_FAST
+   ld		iy,sha_karray	; Point to 'Yn' additive constants
+//#define SHA_K_1 0x5a827999
+//#define SHA_K_2 0x6ed9eba1
+//#define SHA_K_3 0x8f1bbcdc
+//#define SHA_K_4 0xca62c1d6
+
+   SHA_ROUND1
+   SHA_ROUND1
+   SHA_ROUND1
+   SHA_ROUND1
+   SHA_ROUND1
+   SHA_ROUND1
+   SHA_ROUND1
+   SHA_ROUND1
+   SHA_ROUND1
+   SHA_ROUND1
+   SHA_ROUND1
+   SHA_ROUND1
+   SHA_ROUND1
+   SHA_ROUND1
+   SHA_ROUND1
+   SHA_ROUND1
+   SHA_ROUND1
+   SHA_ROUND1
+   SHA_ROUND1
+   SHA_ROUND1
+	ld		de,4
+	add	iy,de
+
+   SHA_ROUND2
+   SHA_ROUND2
+   SHA_ROUND2
+   SHA_ROUND2
+   SHA_ROUND2
+   SHA_ROUND2
+   SHA_ROUND2
+   SHA_ROUND2
+   SHA_ROUND2
+   SHA_ROUND2
+   SHA_ROUND2
+   SHA_ROUND2
+   SHA_ROUND2
+   SHA_ROUND2
+   SHA_ROUND2
+   SHA_ROUND2
+   SHA_ROUND2
+   SHA_ROUND2
+   SHA_ROUND2
+   SHA_ROUND2
+	ld		de,4
+   add	iy,de
+
+   SHA_ROUND3
+   SHA_ROUND3
+   SHA_ROUND3
+   SHA_ROUND3
+   SHA_ROUND3
+   SHA_ROUND3
+   SHA_ROUND3
+   SHA_ROUND3
+   SHA_ROUND3
+   SHA_ROUND3
+   SHA_ROUND3
+   SHA_ROUND3
+   SHA_ROUND3
+   SHA_ROUND3
+   SHA_ROUND3
+   SHA_ROUND3
+   SHA_ROUND3
+   SHA_ROUND3
+   SHA_ROUND3
+   SHA_ROUND3
+	ld		de,4
+   add	iy,de
+
+   SHA_ROUND4
+   SHA_ROUND4
+   SHA_ROUND4
+   SHA_ROUND4
+   SHA_ROUND4L
+   SHA_ROUND4L
+   SHA_ROUND4L
+   SHA_ROUND4L
+   SHA_ROUND4L
+   SHA_ROUND4L
+   SHA_ROUND4L
+   SHA_ROUND4L
+   SHA_ROUND4L
+   SHA_ROUND4L
+   SHA_ROUND4L
+   SHA_ROUND4L
+   SHA_ROUND4L
+   SHA_ROUND4L
+   SHA_ROUND4L
+   SHA_ROUND4L
+#else
+   ld		iy,sha_karray	; Point to 'Yn' additive constants
+   ld		de,4				; Const increment for the Yn pointer
+   ld		b,20				; loop count
+.loop1:
+	exx
+   SHA_ROUND1			; JKHL = new A value
+   push	jkhl			; Save new X15 on stack, to effectively cycle data block
+   exx
+   djnz	.loop1
+   add	iy,de
+
+   ld		b,20				; loop count
+.loop2:
+	exx
+   SHA_ROUND2
+   push	jkhl
+   exx
+   djnz	.loop2
+   add	iy,de
+
+   ld		b,20				; loop count
+.loop3:
+	exx
+   SHA_ROUND3
+   push	jkhl
+   exx
+   djnz	.loop3
+   add	iy,de
+
+; First part of 4th round: keep doing XORs for expanded input data
+   ld		b,4				; loop count
+.loop4:
+	exx
+   SHA_ROUND4
+   push	jkhl
+   exx
+   djnz	.loop4
+
+; 2nd part of 4th round: no need to to the XORs.  Rotate 'C' only.
+   ld		b,16				; loop count
+.loop5:
+	exx
+   SHA_ROUND4L
+	;ld		bcde,px		; Rotate C
+   ;rrc	2,bcde
+   ;ld		px,bcde
+   add	sp,-4			; dummy push (value never used)
+   exx
+   djnz	.loop5
+#endif
+
+#if _RAB6K
+	alts ld jkhl,pz
+#else
+   exp
+	ld		jkhl,pz		; A
+   exp
+#endif
+   SHA_ADD(ix, 0)
+   SHA_ST(ix, 0)
+
+	ld		jkhl,pw		; B
+   SHA_ADD(ix, 4)
+   SHA_ST(ix, 4)
+
+	ld		jkhl,px		; C
+   SHA_ADD(ix, 8)
+   SHA_ST(ix, 8)
+
+	ld		jkhl,py		; D
+   SHA_ADD(ix, 12)
+   SHA_ST(ix, 12)
+
+	ld		jkhl,pz		; E
+   SHA_ADD(ix, 16)
+   SHA_ST(ix, 16)
+
+
+	ld		hl,384
+   add	hl,sp
+   ld		sp,hl				; discard extra 320 + 64 bytes we pushed
+
+   pop	ix
+#endasm
+#ifdef SHA_VERBOSE
+	printf("after transform:\n");
+   printf("a=%08lx\n", state->hash[0]);
+   printf("b=%08lx\n", state->hash[1]);
+   printf("c=%08lx\n", state->hash[2]);
+   printf("d=%08lx\n", state->hash[3]);
+   printf("e=%08lx\n", state->hash[4]);
+#endif
+	_f_memcpy(_state, state, sizeof(*_state));
+}
+
+/*** BeginHeader sha_swap_32 */
+__xmem void sha_swap_32(unsigned long *operand);
+/*** EndHeader */
+
+// Do a swap within a 32-bit area in memory
+// This effectively reverses the order of bytes
+// in a 32-bit area
+// Assumes the parameter is stored in HL
+
+#asm __xmem
+sha_swap_32::
+	 ld	 b, (hl)		; Load BC:DE with the 32-bit value
+	 inc	 hl
+	 ld	 c, (hl)
+	 inc	 hl
+	 ld	 d, (hl)
+	 inc	 hl
+	 ld	 e, (hl)
+	 ld	 (hl), b    ; BC:DE now goes back into (HL) in reverse
+	 dec	 hl
+	 ld	 (hl), c
+	 dec	 hl
+	 ld	 (hl), d
+	 dec	 hl
+	 ld	 (hl), e					;total 52 cycles
+	 lret
+#endasm
+
+
+/*** BeginHeader sha_copy_and_swap */
+__xmem void sha_copy_and_swap(char __far* dest, char __far* src, word lwcount);
+/*** EndHeader */
+
+//   Copy 'lwcount' 32-bit words from src to dest, byte swapping them into
+//   reverse endianness.
+
+_sha_debug __xmem void sha_copy_and_swap(char __far* dest, char __far* src, word lwcount)
+{
+	#asm
+   ld		px,(sp+@sp+dest)		; dest in PX
+	ld		hl,(sp+@sp+lwcount)
+   ld		bc,hl
+   ld		py,(sp+@sp+src)	; source in PY
+.loop:
+	ld		hl,(py+2)
+   ld		a,h
+   ld		h,L
+   ld		L,a
+   ld		(px),hl
+	ld		hl,(py)
+   ld		a,h
+   ld		h,L
+   ld		L,a
+   ld		(px+2),hl
+   ld		px,px+4
+   ld		py,py+4
+   dwjnz	.loop
+	#endasm
+}
+
+/*** BeginHeader sha1_vector */
+void sha1_vector(size_t num_elem, const char __far * __far * addr,
+	  				  const size_t __far *len, char __far *mac);
+/*** EndHeader */
+_sha_debug
+void sha1_vector(size_t num_elem, const char __far * __far * addr,
+                 const size_t __far *len, char __far *mac)
+{
+	auto word i;
+	auto sha_state pms;
+
+	sha_init(&pms);
+	for (i = 0; i < num_elem; ++i)
+		sha_add(&pms, addr[i], len[i]);
+	sha_finish(&pms, mac);
+}
+
+/*** BeginHeader hmac_sha1_vector, hmac_sha1 */
+void hmac_sha1_vector(unsigned char __far *key, unsigned int key_len,
+		      size_t num_elem, unsigned char __far *addr[],
+		      const unsigned int __far *len, unsigned char __far *mac);
+void hmac_sha1(unsigned char __far *key, unsigned int key_len,
+	       unsigned char __far *data, unsigned int data_len,
+	       unsigned char __far *mac);
+/*** EndHeader */
+
+/* HMAC code is based on RFC 2104 */
+_sha_debug
+void hmac_sha1_vector(unsigned char __far *key, unsigned int key_len,
+		      size_t num_elem, unsigned char __far *addr[],
+		      const unsigned int __far *len, unsigned char __far *mac)
+{
+	auto sha_state context;
+	auto unsigned char k_ipad[65]; /* inner padding - key XORd with ipad */
+	auto unsigned char k_opad[65]; /* outer padding - key XORd with opad */
+	auto unsigned char tk[20];
+	auto int i;
+
+        /* if key is longer than 64 bytes reset it to key = SHA1(key) */
+   if (key_len > 64) {
+		sha_init(&context);
+		sha_add(&context, key, key_len);
+		sha_finish(&context, tk);
+
+		key = tk;
+		key_len = 20;
+   }
+
+	/* the HMAC_SHA1 transform looks like:
+	 *
+	 * SHA1(K XOR opad, SHA1(K XOR ipad, text))
+	 *
+	 * where K is an n byte key
+	 * ipad is the byte 0x36 repeated 64 times
+	 * opad is the byte 0x5c repeated 64 times
+	 * and text is the data being protected */
+
+	/* start out by storing key in pads */
+	memset(k_ipad, 0, sizeof(k_ipad));
+	memset(k_opad, 0, sizeof(k_opad));
+	_f_memcpy(k_ipad, key, key_len);
+	_f_memcpy(k_opad, key, key_len);
+
+	/* XOR key with ipad and opad values */
+	for (i = 0; i < 64; i++) {
+		k_ipad[i] ^= 0x36;
+		k_opad[i] ^= 0x5c;
+	}
+
+	/* perform inner SHA1 */
+	sha_init(&context);                   /* init context for 1st pass */
+	sha_add(&context, k_ipad, 64);     /* start with inner pad */
+	/* then text of datagram; all fragments */
+	for (i = 0; i < num_elem; i++) {
+		sha_add(&context, addr[i], len[i]);
+	}
+	sha_finish(&context, mac);             /* finish up 1st pass */
+
+	/* perform outer SHA1 */
+	sha_init(&context);                   /* init context for 2nd pass */
+	sha_add(&context, k_opad, 64);     /* start with outer pad */
+	sha_add(&context, mac, 20);        /* then results of 1st hash */
+	sha_finish(&context, mac);             /* finish up 2nd pass */
+}
+
+
+_sha_debug
+void hmac_sha1(unsigned char __far *key, unsigned int key_len,
+	       unsigned char __far *data, unsigned int data_len,
+	       unsigned char __far *mac)
+{
+	hmac_sha1_vector(key, key_len, 1, &data, &data_len, mac);
+}
+
+
+/*** BeginHeader sha1_prf */
+void sha1_prf(unsigned char __far *key, unsigned int key_len,
+	      char __far *label, unsigned char __far *data, unsigned int data_len,
+	      unsigned char __far *buf, size_t buf_len);
+/*** EndHeader */
+_sha_debug
+void sha1_prf(unsigned char __far *key, unsigned int key_len,
+	      char __far *label, unsigned char __far *data, unsigned int data_len,
+	      unsigned char __far *buf, size_t buf_len)
+{
+	auto char counter;
+	auto size_t pos, plen;
+	auto uint8 hash[20];
+
+	auto unsigned char __far *addr[4];
+	auto unsigned int len[4];
+
+	addr[0] = label;
+	addr[1] = "";		// zero
+	addr[2] = data;
+	addr[3] = &counter;
+
+	len[0] = strlen(label);
+	len[1] = 1;
+	len[2] = data_len;
+	len[3] = 1;
+
+	counter = 0;
+	pos = 0;
+	while (pos < buf_len) {
+		plen = buf_len - pos;
+		if (plen >= 20) {
+			hmac_sha1_vector(key, key_len, 4, addr, len,
+					 &buf[pos]);
+			pos += 20;
+		} else {
+			hmac_sha1_vector(key, key_len, 4, addr, len,
+					 hash);
+			_f_memcpy(&buf[pos], hash, plen);
+			break;
+		}
+		++counter;
+	}
+}
+
+
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */

@@ -1,0 +1,2732 @@
+/*
+ *	rweb_http.lib -- RabbitWeb HTTP enhancements support
+ *
+ * Copyright (c) 2010 Digi International Inc., All Rights Reserved
+ *
+ * This software contains proprietary and confidential information of Digi
+ * International Inc.  By accepting transfer of this copy, Recipient agrees
+ * to retain this software in confidence, to prevent disclosure to others,
+ * and to make no use of this software other than that for which it was
+ * delivered.  This is a published copyrighted work of Digi International
+ * Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+ * prohibited.
+ *
+ * Restricted Rights Legend
+ *
+ * Use, duplication, or disclosure by the Government is subject to
+ * restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+ * Technical Data and Computer Software clause at DFARS 252.227-7031 or
+ * subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+ * Restricted Rights at 48 CFR 52.227-19, as applicable.
+ *
+ * Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+ *
+ *    This library includes the library support for the RabbitWeb HTTP
+ *    enhancements, including the ZHTML server-side-include language.
+ *    See also RWEB_GENERIC.LIB for the bulk of RabitWeb
+ *    support code which is not specific to HTTP.
+ */
+
+/*** BeginHeader */
+
+#if CC_VER < 0xA40
+	#fatal "This library must be used with Dynamic C version 10.60 or later."
+#endif
+
+// RabbitWeb bundled with Dynamic C.
+#use "RWEB_GENERIC.LIB"
+#use "RWEB_JSON.LIB"
+
+// For backward compat...
+#define WEB_ERROR web_error
+
+
+
+// These numbers keep track of the type of block that is encountered by the
+// ZHTML parser.  They are used in the ZHTMLBlockContext structure.
+enum {
+	_ZHTML_BLOCK_IF,
+   _ZHTML_BLOCK_FOR
+};
+
+// These numbers represent the various types of comparisons that are allowed in
+// if and for statements in the ZHTML parser.  They are used in the
+// ZHTMLBlockContext structure.
+enum {
+	_ZHTML_COMP_LT,	// <
+	_ZHTML_COMP_GT,	// >
+	_ZHTML_COMP_LE,	// <=
+	_ZHTML_COMP_GE,	// >=
+	_ZHTML_COMP_EQ,	// ==
+	_ZHTML_COMP_NE		// !=
+};
+
+// These numbers represent the different step operators used in for loops
+// (++, --, +=, and -=).  These are used in the calculation of the step member
+// of the ZHTMLBlockContext structure.
+enum {
+	_ZHTML_STEPOP_INC,	// ++
+   _ZHTML_STEPOP_DEC,	// --
+   _ZHTML_STEPOP_PE,		// +=
+   _ZHTML_STEPOP_ME		// -=
+};
+
+// This structure records information on an if or for block in the ZHTML
+// parser.
+typedef struct {
+	char blocktype;	// Keeps track of whether the given block is an if block or
+							// a for block
+   long loopbegin;	// Offset into the HTML page of the beginning of the loop
+   char var;			// The index of the loop variable $A-$Z that is used for
+   						// this for loop
+   int step;			// The number that should be added to the loop variable
+   						// every time we loop
+   int end;				// The number to which the loop variable should be compared
+   						// when the loop condition is being tested
+   char comparison;	// The type of comparison that should be done for the loop
+   						// check
+	WebCursor_t with;	// "Base" variable for this level
+} ZHTMLBlockContext;
+
+
+// This structure keeps information during the parsing process of a ZHTML file.
+typedef struct {
+	HttpState_fp state;// A pointer to the HttpState associated with this parser
+							// instance
+	int command;		// The command that was recognized by the parser for the
+							// current statement
+   char __far *p;		// A pointer to the current position in the parsing of the
+   						// ZHTML statement
+   char __far *tagend;		// A pointer to the end of the ZHTML tag
+   char __far *varbegin;	// During parsing, this is used to point to the beginning
+   						// of a variable
+   // Following fields generally contain information pertinent to the
+   // variable currently being examined e.g. in an echo or print statement.
+	WebCursor_t wc;		// Cursor pointing to current (committed) value
+	int __far * error_id;	// Points to error ID, or 0 if OK, or NULL if not an
+								// updated variable in current transaction.
+	int __far * bin_len;	// Points to length of binary value
+	void __far * newbin;	// Points to new binary value (or old, if not in transaction).
+	char __far * err_msg;	// Points to error message (or NULL)
+	char __far * orig_str;	// Pointer to original POST data string (may be in error)
+								// or NULL if not in transaction.
+	int orig_len;			// strlen() of the above
+	int _bin_len;		// bin_len points here if not an updated variable.
+
+   char __far *buffer;	// A pointer to the output buffer
+   char error;			// A boolean value that indicates whether we are processing
+   						// in error mode or not
+   int nesting;		// Keeps track of the current nesting level of blocks
+   int skipping;		// If 0, then it indicates that we aren’t skipping ZHTML
+   						// statements (due to a failed conditional).  If non-zero,
+   						// then it indicates that we are skipping, and the value is
+   						// the nesting level at which we started skipping.
+   char truth;			// A boolean value that is used to keep track of whether a
+   						// conditional expression evaluated to TRUE or FALSE
+   int tempvars[26];	// An array of temporary loop variable values that are used in for loops
+	// Keeps track of the if and for blocks that are nested around the current
+	// parser position
+   ZHTMLBlockContext context[RWEB_ZHTML_MAXBLOCKS];
+} ZHTMLParser;
+
+
+
+// This determines the size of the buffer that holds the POST request for
+// RWEB.  This buffer is located in xmem and is dynamically allocated as
+// needed using _sys_realloc().  The max amount can thus be quite generous.
+// This limit is to help prevent rogue users from overallocating memory.
+#ifndef RWEB_POST_MAXBUFFER
+	#define RWEB_POST_MAXBUFFER	2048
+#endif
+
+// This determines the maximum length of a variable.  This really only pertains
+// to string variables.
+#ifndef RWEB_ZHTML_MAXVARLEN
+	#define RWEB_ZHTML_MAXVARLEN	256
+#endif
+
+// This determines the maximum number of variables that an RWEB POST request
+// can supply in a single request.  That is, only this many variables can be
+// updated at once.
+#ifndef RWEB_POST_MAXVARS
+	#define RWEB_POST_MAXVARS	64
+#endif
+
+
+// defines for future XML support
+#define RWEB_CHECKED    " checked"
+#define RWEB_SELECTED   " selected"
+#define RWEB_CLOSETAG   ">"
+/*** EndHeader */
+
+
+
+/*** BeginHeader zhtml_checkvars, _http_trans */
+int zhtml_checkvars(HttpState_fp state);
+
+extern WebTrans_t _http_trans;
+/*** EndHeader */
+
+WebTrans_t _http_trans = NULL;
+
+// Check the variables received in the POST buffer.  It iterates through all of
+// the variables received in the POST buffer to check (and record) if the value
+// changed.  It then iterates through the list of changed variables and checks
+// each of the guards.  Variables that have failing guards are marked as being
+// in error.
+//
+// state  -- The current state of the HTTP server.
+// Return -- 0 if no errors found, 1 if errors were found, 2 if there was an
+//           authentication problem (the user has no write access to one or more
+//           of the POSTed variables).
+
+_http_nodebug
+int zhtml_checkvars(HttpState_fp state)
+{
+	int rc;
+	char __far * pb;		// Post buffer pointer
+	char __far * epb;	// End-of-Post buffer pointer
+	char __far * p;
+	char __far * name;	// Name in post buffer
+	char __far * val;	// Value in post buffer
+	int bkt;
+	int userid;
+	word usergroup;
+	int error_count;
+
+	// Free from any previous invocation.
+	web_transaction_free(&_http_trans);
+
+	// Create new transaction
+	rc = web_transaction_start(&_http_trans);
+	if (rc)
+		return rc;	// May be -ENOMEM!
+
+	web_transaction_set_auth(&_http_trans, state->auth_used);
+	web_transaction_set_group(&_http_trans, state->usergroup);
+#ifdef RABBITWEB_VERBOSE
+	printf("ZC: new transaction: auth=0x%04X group=0x%04X\n",
+						state->auth_used, state->usergroup);
+#endif
+	pb = _http_post;
+	epb = pb + _http_post_len;
+
+	while (pb < epb) {
+		// First, un-munge the variable name by converting even '+' to '['
+		// and odd '+' to ']'.
+		p = name = pb;
+		bkt = '[';
+		while (p < epb && *p != '=') {
+			if (*p == '+') {
+				*p = bkt;
+				bkt ^= '[' ^ ']';
+			}
+			++p;
+		}
+		// Then decode the value
+		val = NULL;
+		if (p < epb) {
+			*p = 0;
+			val = ++p;
+		}
+		if (val) {
+			// Find '&' separator
+			while (p < epb && *p != '&') ++p;
+			if (p < epb)
+				*p++ = 0;
+			// Decode value
+			http_urldecode(val, val, (int)(p - val));
+		}
+		pb = p;
+
+
+		// Now we have variable name and value.  Add to transaction list.
+		rc = web_transaction_add_by_name(&_http_trans, name, val, 0, 0);
+#ifdef RABBITWEB_VERBOSE
+		printf("ZC: update rc=%d for %ls='%ls'\n", rc, name, val);
+#endif
+		if (rc == -EACCES) {
+#ifdef RABBITWEB_VERBOSE
+			printf("ZC: --- access forbidden, abandoning\n");
+#endif
+			return 2;
+		}
+	}
+
+	// Initial trial application of guards (regardless of any errors
+	// encountered above)...
+	web_transaction_execute(&_http_trans,
+				WTE_NO_UPD_FUNC | WTE_NO_CURRENT | WTE_IGNORE_ADD_ERRORS);
+
+#ifdef RABBITWEB_VERBOSE
+	printf("ZC: trial application error count = %d\n",
+				web_transaction_error_count(&_http_trans));
+#endif
+
+	return web_transaction_error_count(&_http_trans) != 0;
+}
+
+
+
+
+/*** BeginHeader zhtml_applychanges */
+int zhtml_applychanges(HttpState_fp state);
+/*** EndHeader */
+
+_http_nodebug
+int zhtml_applychanges(HttpState_fp state)
+{
+	// Already checked the guards when creating transaction...
+	int rc = web_transaction_execute(&_http_trans, WTE_NO_GUARD_FUNC);
+#ifdef RABBITWEB_VERBOSE
+	printf("ZA: =====> transaction execute rc=%d\n", rc);
+#endif
+	web_transaction_free(&_http_trans);
+	return rc;
+}
+
+
+/*** BeginHeader zhtml_memstr */
+void __far *zhtml_memstr(void __far *src, char __far *str, int n);
+/*** EndHeader */
+
+// Finds a given string (exact match) within a buffer of length len.
+//
+// src    -- The buffer in which to look for the string
+// str    -- The string to search for
+// n      -- The length of the src buffer
+// Return -- a location pointer for the found string, or NULL if not found
+
+_http_nodebug
+void __far *zhtml_memstr(void __far *src, char __far *str, int n)
+{
+	auto int found;
+   auto char __far *loc;
+   auto int len;
+
+   found = 0;
+   len = strlen(str);
+   while (!found) {
+   	// Look for the first character
+   	loc = _f_memchr(src, str[0], n);
+      // Did we get it?  If so, do we have enough room to check the rest of the
+      // string?
+      if (!loc || (loc + len > (char __far *)src + n)) {
+      	return NULL;
+      }
+      // Check for the rest of the string
+      if (memcmp(loc+1, str+1, len-1) == 0) {
+      	found = 1;
+      }
+      else {
+      	// Wasn't found...advance the pointers
+         n -= (int)((loc + 1) - (char __far *)src);
+			// Check if we possibly have enough room for a match
+         if (n < len) {
+         	return NULL;
+         }
+         src = loc + 1;
+      }
+
+   }
+   return loc;
+}
+
+/*** BeginHeader zhtml_check_variable_access */
+int zhtml_check_variable_access(HttpState_fp state, WebCursor_t __far * wc,
+                                int write);
+/*** EndHeader */
+
+// This function checks the access to the given variable.  It checks whether
+// read or write access is being requested against the access restrictions for
+// the variable.
+//
+// state  -- The HttpState structure, which contains the current method of
+//           authentication.
+// wc     -- Cursor pointing to the variable for which we are checking access
+// write  -- !0 if write mode is being queried, 0 for read mode
+// Return -- 0 for success (has access), -1 for no access
+
+_http_nodebug
+int zhtml_check_variable_access(HttpState_fp state, WebCursor_t __far * wc,
+                                int write)
+{
+#ifdef RABBITWEB_VERBOSE
+	char buf[128];
+	web_fqname(wc, buf, sizeof(buf));
+#endif
+	if (!web_auth_ok(wc, state->auth_used)) {
+#ifdef RABBITWEB_VERBOSE
+		printf("ZCVA: %s not auth_ok for auth 0x%04X\n", buf, state->auth_used);
+#endif
+		return -1;
+	}
+	if (write && !web_writable(wc, state->usergroup)) {
+#ifdef RABBITWEB_VERBOSE
+		printf("ZCVA: %s not writable by group 0x%04X\n", buf, state->usergroup);
+#endif
+		return -1;
+	}
+	if (!write && !web_readable(wc, state->usergroup)) {
+#ifdef RABBITWEB_VERBOSE
+		printf("ZCVA: %s not readable by group 0x%04X\n", buf, state->usergroup);
+#endif
+		return -1;
+	}
+#ifdef RABBITWEB_VERBOSE
+	printf("ZCVA: %s access OK by group 0x%04X auth 0x%04X\n", buf,
+					state->usergroup, state->auth_used);
+#endif
+	return 0;
+}
+
+/*** BeginHeader zhtml_error */
+void zhtml_error(ZHTMLParser *parser, char __far *string);
+/*** EndHeader */
+
+// A convenience function for writing an error to the output buffer.
+//
+// parser -- The current state of the ZHTML parser.
+// string -- The error string to write to the output buffer.
+
+_http_nodebug
+void zhtml_error(ZHTMLParser *parser, char __far *string)
+{
+	auto int len;
+
+	len = snprintf(parser->buffer, HTTP_MAXBUFFER, "ZHTML ERROR: %ls\n", string);
+	if (len >= HTTP_MAXBUFFER) {
+		parser->buffer[HTTP_MAXBUFFER-1] = '\0';
+	}
+}
+
+/*** BeginHeader zhtml_parse_statement */
+int zhtml_parse_statement(ZHTMLParser *parser);
+
+enum {
+	ZHTML_CMD_NONE,
+   ZHTML_CMD_ECHO,
+   ZHTML_CMD_PRINTF,
+   ZHTML_CMD_IF,
+   ZHTML_CMD_FOR,
+   ZHTML_CMD_CLOSEBLOCK,
+   ZHTML_CMD_VARNAME,
+   ZHTML_CMD_PRINT_OPT,
+   ZHTML_CMD_PRINT_SELECT,
+   ZHTML_CMD_FIELD_CHECKBOX,
+   ZHTML_CMD_FIELD_RADIO,
+   ZHTML_CMD_WITH,
+   ZHTML_CMD_JSON,
+};
+/*** EndHeader */
+
+// Parses a complete ZHTML statement, enclose by <?z ... ?> tags.  The main
+// portion of this function is a large switch statement which does the parsing
+// for all the different commands.  This function returns the number of bytes
+// written to the output buffer.
+//
+// parser -- The current state of the ZHTML parser.
+// Return -- The number of bytes written to the output buffer.
+
+_http_nodebug
+int zhtml_parse_statement(ZHTMLParser *parser)
+{
+	auto char buf[192];
+   auto long number;
+   auto int index;
+   auto ZHTMLBlockContext *block;
+   auto int loopvar;
+   auto int end;
+   auto int stepop;
+   auto int retval;
+   auto char __far *oldp;
+
+	parser->buffer[0] = '\0';
+	parser->command = ZHTML_CMD_NONE;
+   // Skip whitespace
+   zhtml_parse_whitespace(parser);
+   // Read the command
+   zhtml_parse_command(parser);
+   // Go ahead and skip any whitespace after the command
+   zhtml_parse_whitespace(parser);
+   switch (parser->command) {
+	// Handles the case of a missing or invalid command
+   case ZHTML_CMD_NONE:
+   	zhtml_error(parser, "Missing or invalid command");
+      break;
+   // Handles an "echo", "with" or "print" statement
+   case ZHTML_CMD_ECHO:
+   case ZHTML_CMD_WITH:
+   case ZHTML_CMD_JSON:
+#ifdef RABBITWEB_VERBOSE
+		printf("ZPS: %s\n", parser->command == ZHTML_CMD_JSON ? "json" :
+									parser->command == ZHTML_CMD_WITH ? "with" : "echo");
+#endif
+      // The "echo" command simply takes a variable as the argument.
+      // "with" has the same syntax, except it does not output the
+      // variable.
+		if (zhtml_parse_openparen(parser) < 0) {
+      	zhtml_error(parser, "Expecting '('");
+			break;
+      }
+      zhtml_parse_whitespace(parser);
+		if (parser->command >= ZHTML_CMD_WITH)
+			retval = -1;
+		else {
+			retval = zhtml_parse_echo_error(parser);
+			if (retval == -1)
+				retval = zhtml_parse_echo_sizeof(parser);
+		}
+		if (retval == -1) {
+			// Not an error() expression
+			if (parser->command >= ZHTML_CMD_WITH)
+				loopvar = -1;
+			else
+	      	loopvar = zhtml_parse_loopvariable(parser);
+	      if (loopvar >= 0)
+	         // It is a loop variable
+	         sprintf(parser->buffer, "%d", parser->tempvars[loopvar]);
+	      else if (zhtml_parse_variable(parser, &(parser->wc)) == 0) {
+	         // Check access to the variable
+	         if (parser->command == ZHTML_CMD_WITH) {
+	         	_f_memcpy(&parser->context[parser->nesting].with,
+	         					&parser->wc, sizeof(WebCursor_t));
+				}
+	         else {
+	            if (zhtml_check_variable_access(parser->state,
+	                                            &(parser->wc), 0) < 0)
+	               // Error--don't have access to the variable
+	               zhtml_error(parser, "No read access to variable");
+	            else {
+	               if (parser->command == ZHTML_CMD_JSON)
+	               	zhtml_output_json(parser);
+	               else
+	               	zhtml_output_variable(parser, parser->buffer, NULL);
+	            }
+	         }
+	      }
+	      else
+	      	zhtml_error(parser, "Unknown variable");
+      }
+
+      // Parse out whitespace and then the end of the statement
+      zhtml_parse_whitespace(parser);
+      if (zhtml_parse_closeparen(parser) < 0)
+      	zhtml_error(parser, "Expecting ')'");
+      zhtml_parse_end(parser);
+   	break;
+	// Handles a "printf" statement
+   case ZHTML_CMD_PRINTF:
+#ifdef RABBITWEB_VERBOSE
+		printf("ZPS: printf\n");
+#endif
+		if (zhtml_parse_openparen(parser) < 0) {
+      	zhtml_error(parser, "Expecting '('");
+			break;
+      }
+      zhtml_parse_whitespace(parser);
+   	if (zhtml_parse_printfspec(parser, buf+4, sizeof(buf)-4) < 0) {
+      	zhtml_error(parser, "Invalid printf format specifier");
+         break;
+      }
+      zhtml_parse_whitespace(parser);
+      if (zhtml_parse_comma(parser) < 0) {
+      	zhtml_error(parser, "Expecting ','");
+         break;
+      }
+      zhtml_parse_whitespace(parser);
+	   loopvar = zhtml_parse_loopvariable(parser);
+	   if (loopvar < 0) {
+	      // No loop variable...maybe a regular variable?
+	      if (zhtml_parse_variable(parser, &(parser->wc)) < 0) {
+	         zhtml_error(parser, "Unknown variable");
+	         break;
+	      }
+	      // Check access to the variable
+	      if (zhtml_check_variable_access(parser->state,
+	                                      &(parser->wc), 0) < 0) {
+	         // Error--don't have access to the variable
+	         zhtml_error(parser, "No read access to variable");
+	         break;
+	      }
+	      // Output the variable
+	      zhtml_output_variable(parser, parser->buffer, buf+4);
+	   }
+	   else {
+         // It is a loop variable
+         sprintf(parser->buffer, buf+4, parser->tempvars[loopvar]);
+	   }
+      zhtml_parse_whitespace(parser);
+      if (zhtml_parse_closeparen(parser) < 0) {
+      	zhtml_error(parser, "Expecting ')'");
+			break;
+      }
+      zhtml_parse_end(parser);
+   	break;
+	// Handles an "if" statement
+   case ZHTML_CMD_IF:
+		if (parser->nesting >= RWEB_ZHTML_MAXBLOCKS) {
+			zhtml_error(parser, "if/for nesting level too deep!");
+			break;
+		}
+   	// Set the type of block, since this "if" statement will be defining a
+   	// new block
+   	parser->context[parser->nesting].blocktype = _ZHTML_BLOCK_IF;
+		if (zhtml_parse_openparen(parser) < 0) {
+      	zhtml_error(parser, "Expecting '('");
+			break;
+      }
+      zhtml_parse_whitespace(parser);
+      if (zhtml_parse_conditional(parser) < 0) {
+      	// zhtml_parse_conditional() generates its own errors
+         break;
+      }
+      zhtml_parse_whitespace(parser);
+		if (zhtml_parse_closeparen(parser) < 0) {
+         zhtml_error(parser, "Expecting ')'");
+			break;
+      }
+      zhtml_parse_whitespace(parser);
+      if (zhtml_parse_openbrace(parser) < 0) {
+      	zhtml_error(parser, "Expecting '{'");
+         break;
+      }
+      zhtml_parse_end(parser);
+
+		// Increment the nesting level (due to new block)
+      parser->nesting++;
+      _f_memcpy(&parser->context[parser->nesting].with,
+					 &parser->context[parser->nesting-1].with,
+					 sizeof(WebCursor_t));
+      // Check the result of the expression
+      if (!parser->truth && !parser->skipping) {
+      	// Need to start skipping data--indicate the nesting level at which we
+      	// started skipping
+			parser->skipping = parser->nesting;
+      }
+   	break;
+   // Handles a "for" statment
+   case ZHTML_CMD_FOR:
+		if (parser->nesting >= RWEB_ZHTML_MAXBLOCKS) {
+			zhtml_error(parser, "if/for nesting level too deep!");
+			break;
+		}
+   	block = &(parser->context[parser->nesting]);
+      // Set the type of block
+   	block->blocktype = _ZHTML_BLOCK_FOR;
+		if (zhtml_parse_openparen(parser) < 0) {
+         zhtml_error(parser, "Expecting '('");
+			break;
+      }
+      zhtml_parse_whitespace(parser);
+      // Determine which of $A-$Z is the loop variable
+      block->var = zhtml_parse_loopvariable(parser);
+      if (block->var < 0) {
+         zhtml_error(parser, "Expecting loop variable $A-$Z");
+         break;
+      }
+      zhtml_parse_whitespace(parser);
+		if (zhtml_parse_equals(parser) < 0) {
+         zhtml_error(parser, "Expecting '='");
+         break;
+      }
+      zhtml_parse_whitespace(parser);
+      // Get the starting value of the loop variable
+      if (zhtml_parse_number(parser, &number, 0) < 0) {
+      	// zhtml_parse_number generates its own errors
+         break;
+      }
+      // Save off the starting value of the temporary loop variable
+      parser->tempvars[block->var] = (int)number;
+      zhtml_parse_whitespace(parser);
+      if (zhtml_parse_semicolon(parser) < 0) {
+      	zhtml_error(parser, "Expecting ';'");
+         break;
+      }
+      zhtml_parse_whitespace(parser);
+      // Get the loop variable, and make sure it matches the first loop variable
+      loopvar = zhtml_parse_loopvariable(parser);
+      if (loopvar < 0) {
+         zhtml_error(parser, "Expecting loop variable $A-$Z");
+         break;
+      }
+      if (loopvar != block->var) {
+      	zhtml_error(parser, "Inconsistent loop variables");
+         break;
+      }
+      zhtml_parse_whitespace(parser);
+      // Get the conditional operator
+      block->comparison = zhtml_parse_comparison(parser);
+      if (block->comparison < 0) {
+      	zhtml_error(parser, "Expecting a conditional operator");
+         break;
+      }
+      zhtml_parse_whitespace(parser);
+		// Get the ending number (the number that the temporary variable will be
+		// compared against on each loop through)
+      if (zhtml_parse_number(parser, &number, 0) < 0) {
+      	// zhtml_parse_number generates its own errors
+         break;
+      }
+      block->end = (int)number;
+      zhtml_parse_whitespace(parser);
+      if (zhtml_parse_semicolon(parser) < 0) {
+      	zhtml_error(parser, "Expecting ';'");
+         break;
+      }
+      zhtml_parse_whitespace(parser);
+      // Get the loop variable, and make sure it matches the first loop variable
+      loopvar = zhtml_parse_loopvariable(parser);
+      if (loopvar < 0) {
+         zhtml_error(parser, "Expecting loop variable $A-$Z");
+         break;
+      }
+      if (loopvar != block->var) {
+      	zhtml_error(parser, "Inconsistent loop variables");
+         break;
+      }
+      zhtml_parse_whitespace(parser);
+      // Get the step operator of the for statement
+      stepop = zhtml_parse_stepop(parser);
+      if (stepop < 0) {
+      	zhtml_error(parser, "Expecting '++', '--', '+=', or '-='");
+         break;
+      }
+      if ((stepop == _ZHTML_STEPOP_PE) ||
+          (stepop == _ZHTML_STEPOP_ME)) {
+			// Need to get an integer as well, since the operator was += or -=
+	      zhtml_parse_whitespace(parser);
+	      if (zhtml_parse_number(parser, &number, 0) < 0) {
+	      	// zhtml_parse_number generates its own errors
+	         break;
+	      }
+         block->step = (int)number;
+      }
+      else {
+      	// An increment or decrement operation
+      	block->step = 1;
+      }
+      // Negate the step value if this is a '--' or '-=' operation
+      if ((stepop == _ZHTML_STEPOP_DEC) ||
+          (stepop == _ZHTML_STEPOP_ME)) {
+   		block->step = -block->step;
+      }
+      zhtml_parse_whitespace(parser);
+		if (zhtml_parse_closeparen(parser) < 0) {
+         zhtml_error(parser, "Expecting ')'");
+			break;
+      }
+      zhtml_parse_whitespace(parser);
+      if (zhtml_parse_openbrace(parser) < 0) {
+      	zhtml_error(parser, "Expecting '{'");
+         break;
+      }
+      zhtml_parse_end(parser);
+      // Save off the beginning offset of the for loop
+      parser->context[parser->nesting].loopbegin =
+         parser->state->endOffs;
+      // Increment the block nesting level
+      parser->nesting++;
+      _f_memcpy(&parser->context[parser->nesting].with,
+					 &parser->context[parser->nesting-1].with,
+					 sizeof(WebCursor_t));
+      // Check if we even meet the test condition this first time through
+		if (!zhtml_check_condition((long)parser->tempvars[block->var],
+		                           block->comparison,
+                                 (long)block->end)) {
+			if (!parser->skipping) {
+				parser->skipping = parser->nesting;
+         }
+      }
+   	break;
+	// Handles the '}' close block mechanism
+	case ZHTML_CMD_CLOSEBLOCK:
+		// Check if there is really a block to close
+		if (!parser->nesting) {
+      	zhtml_error(parser, "No matching '{'");
+         break;
+      }
+   	block = &(parser->context[parser->nesting - 1]);
+      // Check if this is a for loop we're "closing"
+      if ((block->blocktype == _ZHTML_BLOCK_FOR) && !parser->skipping) {
+      	parser->tempvars[block->var] += block->step;
+			if (!zhtml_check_condition((long)parser->tempvars[block->var],
+			                           block->comparison,
+                                    (long)block->end)) {
+         	// The for loop has ended
+            parser->nesting--;
+	         zhtml_parse_end(parser);
+         }
+         else {
+         	// We need to rewind the HTML file back to the beginning of the for
+            // loop block
+            if (http_seek(parser->state, block->loopbegin) < 0) {
+            	// Not a seekable resource
+               zhtml_error(parser,
+                  "For loops cannot be used with a non-seekable resource");
+					parser->nesting--;
+               zhtml_parse_end(parser);
+               break;
+            }
+				parser->state->ssiEnd = NULL;
+         }
+      }
+      // It's an if statement that we're closing, or we're currently skipping
+      // content
+      else {
+      	// Reduce our nesting level
+      	parser->nesting--;
+      	// See if we've gotten back down to the last failure level
+      	if (parser->nesting < parser->skipping) {
+      		parser->skipping = 0;
+      	}
+	      zhtml_parse_end(parser);
+      }
+      break;
+	// Handles the "varname" statement (does munging of variable names so that
+	// they can be transmitted in an HTTP POST)
+   case ZHTML_CMD_VARNAME:
+		if (zhtml_parse_openparen(parser) < 0) {
+      	zhtml_error(parser, "Expecting '('");
+			break;
+      }
+      zhtml_parse_whitespace(parser);
+      // Does the munging of the variable name
+      if (zhtml_copy_varname(parser, parser->buffer, HTTP_HALFBUF, 1) < 0) {
+      	zhtml_error(parser, "Expecting variable");
+      	break;
+      }
+		if (zhtml_parse_closeparen(parser) < 0) {
+         zhtml_error(parser, "Expecting ')'");
+			break;
+      }
+      zhtml_parse_end(parser);
+   	break;
+   // Handles a "checkbox" statement
+   case ZHTML_CMD_FIELD_CHECKBOX:
+      // The "checkbox" command simply takes a variable as the argument
+		if (zhtml_parse_openparen(parser) < 0) {
+      	zhtml_error(parser, "Expecting '('");
+			break;
+      }
+      zhtml_parse_whitespace(parser);
+
+		oldp = parser->p;
+      if (zhtml_parse_variable(parser, &(parser->wc)) == 0) {
+         // Check access to the variable
+         if (zhtml_check_variable_access(parser->state,
+                                         &(parser->wc), 0) < 0) {
+            // Error--don't have access to the variable
+            zhtml_error(parser, "No read access to variable");
+            break;
+         }
+      } else {
+         zhtml_error(parser, "Unknown variable");
+         break;
+      }
+
+      if (zhtml_get_numericvariable(parser, &(parser->wc), &number) < 0) {
+         zhtml_error(parser, "Expecting a variable of integral type");
+         break;
+      }
+
+      // Get the value and print it out
+	   parser->p = oldp;
+      zhtml_output_checkbox(parser, parser->buffer, (int) number);
+
+      // Parse out whitespace and then the end of the statement
+      zhtml_parse_whitespace(parser);
+      if (zhtml_parse_closeparen(parser) < 0) {
+      	zhtml_error(parser, "Expecting ')'");
+			break;
+      }
+      zhtml_parse_end(parser);
+   	break;
+   // Handles a "radio" statement
+   case ZHTML_CMD_FIELD_RADIO:
+      // The "radio button" command takes a variable and value as its arguments
+		if (zhtml_parse_openparen(parser) < 0) {
+      	zhtml_error(parser, "Expecting '('");
+			break;
+      }
+      zhtml_parse_whitespace(parser);
+
+		oldp = parser->p;
+      if (zhtml_parse_variable(parser, &(parser->wc)) == 0) {
+         // Check access to the variable
+         if (zhtml_check_variable_access(parser->state,
+                                         &(parser->wc), 0) < 0) {
+            // Error--don't have access to the variable
+            zhtml_error(parser, "No read access to variable");
+            break;
+         }
+      } else {
+         zhtml_error(parser, "Unknown variable");
+         break;
+      }
+
+      if (zhtml_get_numericvariable(parser, &(parser->wc), &number) < 0) {
+         zhtml_error(parser, "Expecting a variable of integral type");
+         break;
+      }
+
+      // Get the value and print it out
+	   parser->p = oldp;
+      zhtml_output_radio(parser, parser->buffer, (int) number);
+
+      // Parse out whitespace and then the end of the statement
+      zhtml_parse_whitespace(parser);
+      if (zhtml_parse_closeparen(parser) < 0) {
+      	zhtml_error(parser, "Expecting ')'");
+			break;
+      }
+      zhtml_parse_end(parser);
+   	break;
+   // Handles the "print_opt" command
+   case ZHTML_CMD_PRINT_OPT:
+		if (zhtml_parse_openparen(parser) < 0) {
+      	zhtml_error(parser, "Expecting '('");
+			break;
+      }
+      zhtml_parse_whitespace(parser);
+		// Parse the variable--information on it will be in parser->wc
+      if (zhtml_parse_variable(parser, &(parser->wc)) < 0) {
+         zhtml_error(parser, "Unknown variable");
+         break;
+      }
+      // Check access to the variable
+      if (zhtml_check_variable_access(parser->state,
+                                      &(parser->wc), 0) < 0) {
+         // Error--don't have access to the variable
+         zhtml_error(parser, "No read access to variable");
+         break;
+      }
+      zhtml_parse_whitespace(parser);
+      // Check if there is a ',' (which indicates the optional second
+      // parameter)
+      if (zhtml_parse_comma(parser) == 0) {
+      	// There is an optional second parameter.  It specifies which
+      	// selection value to print (rather than the default current value).
+      	zhtml_parse_whitespace(parser);
+      	if (zhtml_parse_number(parser, &number, 0) < 0) {
+      		// zhtml_parse_number() generates its own errors
+      		break;
+      	}
+	      if ((number < 0) || (number > INT_MAX)) {
+	         zhtml_error(parser, "Selection index out of range");
+	         break;
+	      }
+	      index = (int)number;
+      	zhtml_parse_whitespace(parser);
+      }
+      else {
+      	// No optional second parameter, so it prints the current value of the
+      	// selection variable.
+			if (zhtml_get_numericvariable(parser, &(parser->wc), &number) < 0) {
+				zhtml_error(parser, "Expecting a variable of integral type");
+				break;
+			}
+			index = _web_index_from_value(&(parser->wc), number);
+			if (index < 0) {
+				zhtml_error(parser, "Select variable has invalid value");
+				break;
+			}
+      }
+		// We now have the selection variable's numeric value--we must look up
+		// the corresponding string value
+		zhtml_output_selectionstring(parser, &(parser->wc), index);
+		if (zhtml_parse_closeparen(parser) < 0) {
+         zhtml_error(parser, "Expecting ')'");
+			break;
+      }
+      zhtml_parse_end(parser);
+   	break;
+	// Handles the "print_select" statement
+   case ZHTML_CMD_PRINT_SELECT:
+		if (zhtml_parse_openparen(parser) < 0) {
+      	zhtml_error(parser, "Expecting '('");
+			break;
+      }
+      zhtml_parse_whitespace(parser);
+		// Parse the variable--information on it will be in parser->wc
+      if (zhtml_parse_variable(parser, &(parser->wc)) < 0) {
+         zhtml_error(parser, "Unknown variable");
+         break;
+      }
+      // Check access to the variable
+      if (zhtml_check_variable_access(parser->state,
+                                      &(parser->wc), 0) < 0) {
+         // Error--don't have access to the variable
+         zhtml_error(parser, "No read access to variable");
+         break;
+      }
+      if (zhtml_output_print_select(parser) < 0) {
+      	// zhtml_output_print_select() generates its own errors
+      	break;
+      }
+      zhtml_parse_whitespace(parser);
+		if (zhtml_parse_closeparen(parser) < 0) {
+         zhtml_error(parser, "Expecting ')'");
+			break;
+      }
+      zhtml_parse_end(parser);
+   	break;
+   }
+	// Returns the length of the data in the output buffer
+	return strlen(parser->buffer);
+}
+
+/*** BeginHeader zhtml_parse_echo_error */
+int zhtml_parse_echo_error(ZHTMLParser *parser);
+/*** EndHeader */
+
+// Outputs the corresponding WEB_ERROR() message for a given variable whose
+// value is in error.  Note that this is for the error() function within an
+// echo() or print() statement--if it is within an if statement, then another
+// function parses it (zhtml_parse_error()).
+//
+// parser -- The current state of the ZHTML parser.
+// Return -- 0 on success, -1 if it is not an error() function, -2 on error.
+
+_http_nodebug
+int zhtml_parse_echo_error(ZHTMLParser *parser)
+{
+	// HTTP POST variable buffer
+	char _http_post_var[RWEB_ZHTML_MAXVARLEN];
+	auto char __far *oldp;
+	auto int i;
+	auto int offset;
+	auto long addr;
+	auto long endaddr;
+	int len;
+	char __far * msg;
+
+	// Save the old parser pointer
+	oldp = parser->p;
+   if (!memcmp(parser->p, "error", 5) &&
+       zhtml_isspace_or_paren(*(parser->p+5))) {
+   	parser->p += 5;
+   }
+   else {
+   	// Not an error--return -1 indicates simple that this is not an error(),
+   	// whereas returning -2 indicates a legitimate parsing problem
+   	return -1;
+   }
+   if (zhtml_parse_openparen(parser) < 0) {
+   	zhtml_error(parser, "Expecting '('");
+		return -2;
+   }
+   zhtml_parse_whitespace(parser);
+   // Read off the variable name
+   if (zhtml_copy_varname(parser, _http_post_var,
+                          RWEB_ZHTML_MAXVARLEN, 0) < 0) {
+   	zhtml_error(parser, "Invalid variable name");
+   	return -2;
+   }
+
+	if (_http_trans) {
+		msg = web_transaction_message_by_name(
+						&_http_trans, _http_post_var, NULL, NULL, 0);
+		if (msg) {
+			len = strlen(msg);
+         if (len >= HTTP_HALFBUF)
+            len = HTTP_HALFBUF - 1;
+			_f_memcpy(parser->buffer, msg, len);
+			parser->buffer[len] = 0;
+		}
+	}
+
+   zhtml_parse_whitespace(parser);
+   if (zhtml_parse_closeparen(parser) < 0) {
+   	zhtml_error(parser, "Expecting ')'");
+		return -2;
+   }
+   return 0;
+}
+
+
+
+/*** BeginHeader zhtml_parse_echo_sizeof */
+int zhtml_parse_echo_sizeof(ZHTMLParser *parser);
+/*** EndHeader */
+
+// Outputs decimal value which is the minimum field width required for
+// the ascii representation of a specified variable (worst case).
+// This is useful when generating HTML input tags e.g.
+//  <INPUT TYPE="text" NAME="foo" SIZE=<?z echo(sizeof($foo)) ?>
+//        VALUE="<?z echo($foo) ?>">
+//
+// parser -- The current state of the ZHTML parser.
+// Return -- 0 on success, -1 if it is not a sizeof() function, -2 on error.
+
+_http_nodebug
+int zhtml_parse_echo_sizeof(ZHTMLParser *parser)
+{
+	// HTTP POST variable buffer
+	char _http_post_var[RWEB_ZHTML_MAXVARLEN];
+	auto char __far *oldp;
+	auto int i;
+	char __far * t;
+
+	// Save the old parser pointer
+	oldp = parser->p;
+   if (!memcmp(parser->p, "sizeof", 6) &&
+       zhtml_isspace_or_paren(*(parser->p+6))) {
+   	parser->p += 6;
+   }
+   else {
+   	// Not a sizeof--return -1 indicates simple that this is not an error,
+   	// whereas returning -2 indicates a legitimate parsing problem
+   	return -1;
+   }
+   if (zhtml_parse_openparen(parser) < 0) {
+   	zhtml_error(parser, "Expecting '('");
+		return -2;
+   }
+   zhtml_parse_whitespace(parser);
+   if (zhtml_parse_variable(parser, &(parser->wc)) < 0)
+   	return -2;
+   zhtml_parse_whitespace(parser);
+   if (zhtml_parse_closeparen(parser) < 0) {
+   	zhtml_error(parser, "Expecting ')'");
+		return -2;
+   }
+
+	// Process the variable.  These should really depend on formatting
+	// function, but we assume a simple default here.
+	switch (web_type(&parser->wc)) {
+   case _DK_T_CHAR:
+      t = "3";
+      break;
+   case _DK_TSIGNEDCHAR:
+      t = "4";
+      break;
+   case _DK_TINT:
+      t = "6";
+      break;
+   case _DK_TUNSIGNED:
+      t = "5";
+      break;
+   case _DK_TLONG:
+      t = "11";
+      break;
+   case _DK_TULONG:
+      t = "10";
+      break;
+   case _DK_TFLOAT:
+   	// Cannot really determine, use a reasonable value
+      t = "12";
+      break;
+   default:
+   	t = NULL;
+	}
+
+	if (t)
+		_f_strcpy(parser->buffer, t);
+	else if (web_leaf(&parser->wc))
+		// Must be string, take away 1 for the null terminator
+		sprintf(parser->buffer, "%u", i_max(web_size(&parser->wc)-1, 1));
+	else
+		// Use 0 for aggregates
+		_f_strcpy(parser->buffer, "0");
+
+#ifdef RABBITWEB_VERBOSE
+	web_fqname(&parser->wc, _http_post_var, sizeof(_http_post_var));
+	printf("ZPES: echo sizeof(%s) = %ls\n", _http_post_var, parser->buffer);
+#endif
+   return 0;
+}
+
+/*** BeginHeader zhtml_output_print_select */
+int zhtml_output_print_select(ZHTMLParser *parser);
+/*** EndHeader */
+
+// Outputs the "<OPTION>foo <OPTION> bar <OPTION SELECTED> baz ..." type list
+// for a given selection variable.  This is a convenience function for
+// creating an HTML pulldown menu from a selection variable.
+//
+// parser -- The current state of the ZHTML parser
+// Return -- 0 on success, -1 on error
+
+_http_nodebug
+int zhtml_output_print_select(ZHTMLParser *parser)
+{
+	auto long number;
+	auto int index;
+	auto int i;
+	auto char __far *name;
+   auto char __far *p;
+
+   // Figure out the index that is currently selected
+   if (zhtml_get_numericvariable(parser, &(parser->wc), &number) < 0) {
+      zhtml_error(parser, "Expecting a variable of integral type");
+      return -1;
+   }
+#ifdef RABBITWEB_VERBOSE
+	printf("ZOPS: currently selected value %ld\n", number);
+#endif
+   index = _web_index_from_value(&(parser->wc), number);
+   if (index < 0) {
+      zhtml_error(parser, "Select variable has invalid value");
+      return -1;
+   }
+#ifdef RABBITWEB_VERBOSE
+	printf("ZOPS: currently selected index %d\n", index);
+#endif
+
+
+	// Print out the selection list
+	i = 0;
+   p = parser->buffer;
+   *p = '\0';
+   while (name = _web_selection_from_index(&(parser->wc), i)) {
+#ifdef RABBITWEB_VERBOSE
+		printf("ZOPS: selection %ls\n", name);
+#endif
+   	p += sprintf (p, "<option%s>%ls\r\n",
+   		(i == index) ? RWEB_SELECTED : "", name);
+   	++i;
+   }
+	return 0;
+}
+
+
+
+
+/*** BeginHeader zhtml_output_selectionstring */
+int zhtml_output_selectionstring(ZHTMLParser *parser, WebCursor_t __far *wc,
+                                 int index);
+/*** EndHeader */
+
+// Outputs the selection value corresponding to the given index for the given
+// selection variable.  Note that this output the string value, not the numeric
+// value.
+//
+// parser  -- The current state of the ZHTML parser.
+// wc -- The information on the selection variable.
+// index   -- The index of the value which we are outputting.
+// Return  -- 0 on success, -1 on error.
+
+_http_nodebug
+int zhtml_output_selectionstring(ZHTMLParser *parser, WebCursor_t __far *wc,
+                                 int index)
+{
+	unsigned long val;
+	int rc;
+
+	rc = _web_value_from_index(wc, index, &val);
+	if (rc < 0)
+		return rc;
+	web_format(wc, parser->buffer, HTTP_MAXBUFFER, "XA", &val);
+
+	return 0;
+}
+
+/*** BeginHeader zhtml_copy_varname */
+int zhtml_copy_varname(ZHTMLParser *parser, char __far *dest, int len, int encode);
+/*** EndHeader */
+
+// Parse a varname() statement.  The varname() statement takes the given
+// variable name, and performs loop variable substitutions.  Also, if the
+// encode parameter is set, it will encode the variable name so that it can be
+// transmitted in an HTTP POST.
+//
+// parser -- The current state of the ZHTML parser.
+// dest   -- The destination buffer for writing out the variable name.
+// len    -- The maximum length of the destination buffer.
+// encode -- Indicates if the variable name should be encoded for subsequent
+//           transmission in an HTTP POST request.
+// Return -- 0 on success, -1 on error.
+
+_http_nodebug
+int zhtml_copy_varname(ZHTMLParser *parser, char __far *dest, int len, int encode)
+{
+	auto int i;
+   auto char c;
+   auto int num;
+   auto int retval;
+   int rc;
+   int vlen;
+
+
+	_http_assert(dest != NULL);
+
+	i = 0;
+   if (*parser->p != '$') {
+      return -1;
+   }
+   ++parser->p;
+
+	vlen = zhtml_get_varname_len(parser);
+
+   if (vlen >= RWEB_ZHTML_MAXVARLEN) {
+#ifdef RABBITWEB_VERBOSE
+		printf("ZCV: Var name too long\n");
+#endif
+   	return -1;
+   }
+   vlen = zhtml_memcpy_substitute(parser, dest, len,
+   										parser->varbegin, vlen);
+   if (vlen < 0) {
+#ifdef RABBITWEB_VERBOSE
+		printf("ZCV: Var name failed substitution\n");
+#endif
+   	return -1;
+   }
+	if (vlen < len-1) {
+	   dest[vlen] = '\0';
+	}
+	else {
+#ifdef RABBITWEB_VERBOSE
+		printf("ZCV: Var name too long after substitution\n");
+#endif
+		return -1;
+	}
+
+	// Now look up the variable and perform relative-to-absolute name
+	// conversion.
+#ifdef RABBITWEB_VERBOSE
+	printf("ZCV: Looking up var name %ls\n", dest);
+#endif
+	// Always do relative look-ups w.r.t. the current "with" cursor.
+	_f_memcpy(&parser->wc, &parser->context[parser->nesting].with, sizeof(parser->wc));
+	rc = web_getvarinfo(dest, &parser->wc, NULL, 2);
+	if (rc < 0 && rc != -EISDIR) {
+#ifdef RABBITWEB_VERBOSE
+		printf("ZCV: Var not found, rc=%d\n", rc);
+#endif
+		return rc;
+	}
+	// Get the full name
+	web_fqname(&parser->wc, dest, len);
+
+	// Do the '[' and ']' munging if requested.  These are turned into
+	// spaces, which come back as '+' in the post data.
+	if (encode)
+		for (; *dest; ++dest) {
+      	if (*dest == '[' || *dest == ']')
+	      	*dest = ' ';
+      }
+
+
+   return 0;
+}
+
+/*** BeginHeader zhtml_output_json */
+void zhtml_output_json(ZHTMLParser *parser);
+/*** EndHeader */
+
+_http_nodebug
+void zhtml_output_json(ZHTMLParser *parser)
+{
+	char varname[RWEB_ZHTML_MAXVARLEN];
+	WebIteratorFilter_t wif;
+	char __far * rootlist[2];
+	long len;
+
+	web_fqname(&parser->wc, varname, sizeof(varname));
+	memset(&wif, 0, sizeof(wif));
+	rootlist[0] = varname;
+	rootlist[1] = NULL;
+	wif.varlist = rootlist;
+
+	if (parser->state->extbuf) {
+		_web_free(parser->state->extbuf);
+		parser->state->extbuf = NULL;
+		parser->state->extlen = 0;
+	}
+
+	len = web_gen_json(&wif, &parser->state->extbuf, WGJ_SQUASH_KEY);
+	if (len > 0)
+		if (len < 65536) {
+	      parser->state->extlen = (unsigned)len;
+	      parser->state->extp = parser->state->extbuf;
+		}
+		else
+			web_free_json(&parser->state->extbuf);
+}
+
+/*** BeginHeader zhtml_output_variable */
+void zhtml_output_variable(ZHTMLParser *parser, char __far *dest, char *spec);
+/*** EndHeader */
+
+// Output the value of the given variable (info contained in the parser state).
+// The value is output to the destination buffer using the given printf()-style
+// format specifier (or a default specifier if that is NULL).
+//
+// parser -- The current state of the ZHTML parser.
+// dest   -- The destination for the value.
+// spec   -- A format specifier for printing the variable, or NULL if a default
+//           appropriate to the variable type should be used.
+//           NOTE: 4 bytes prior to buf must be writable, since need to
+//           prepend the 'XA%/' (XML attribute) escaping spec.
+
+_http_nodebug
+void zhtml_output_variable(ZHTMLParser *parser, char __far *dest, char *spec)
+{
+	//FIXME: this function disregards the amount of space in dest.
+	auto int len;
+
+#ifdef RABBITWEB_VERBOSE
+	printf("ZOV: enter\n");
+#endif
+	if (spec && *spec) {
+		spec -= 4;
+		_f_memcpy(spec, "XA%/", 4);
+	}
+	else
+		spec = "XA";
+
+	_http_assert(dest != NULL);
+
+	// If variable in current transaction, use its original string value
+	if (parser->orig_str) {
+		_f_strcpy(dest, parser->orig_str);
+#ifdef RABBITWEB_VERBOSE
+		printf("...have orig_str %ls\n", dest);
+#endif
+	}
+	else {
+	   len = web_format(&parser->wc, dest, HTTP_MAXBUFFER, spec, parser->newbin);
+	   if (len > 0)
+	      // Couldn't fit, give up and put empty string (else garbage would be left)
+	      *dest = 0;
+#ifdef RABBITWEB_VERBOSE
+		printf("...have committed %ls\n", dest);
+#endif
+	}
+}
+
+/*** BeginHeader zhtml_output_checkbox */
+void zhtml_output_checkbox(ZHTMLParser *parser, char __far *dest, int checked);
+/*** EndHeader */
+
+// Output HTML for a checkbox form element.  Since unchecked checkboxes are
+// not submitted as part of an HTML form, we must include a hidden field with
+// a value of 0 to detect an unchecked checkbox.
+//
+// Usage in zhtml file:
+// 	<input <?z field_checkbox($somevar) ?> >
+// Expands to:
+// 	<input type="hidden" name="somevar" value="0">
+// 	<input type="checkbox" name="somevar" value="1" checked >
+//
+// parser  -- The current state of the ZHTML parser.
+// dest    -- The destination for the checkbox.
+// checked -- Set to 1 if the checkbox is checked
+
+_http_nodebug
+void zhtml_output_checkbox(ZHTMLParser *parser, char __far *dest, int checked)
+{
+	auto int len;
+	char __far *oldp;
+	char __far *p;
+
+	_http_assert(dest != NULL);
+
+	// p points into the output buffer and moves through it as we insert text
+	p = dest;
+
+	// output the hidden field
+	p += sprintf (p, "type=\"hidden\" name=\"");
+
+	// copy the varname from the parser to our output buffer, and rewind
+	// the parser so we can do it again for the checkbox field
+	oldp = parser->p;
+	zhtml_copy_varname (parser, p, RWEB_ZHTML_MAXVARLEN, 1);
+	parser->p = oldp;
+
+	// find end of string (after the varname copied by zhtml_copy_varname)
+	while (*p) p++;
+
+	// print the hidden field's closing quote for name property and add
+	// value="0" property
+	p += sprintf (p, "\" value=\"0\"" RWEB_CLOSETAG);
+
+	// output the start of the checkbox field
+	p += sprintf (p, "<input type=\"checkbox\" name=\"");
+	zhtml_copy_varname (parser, p, RWEB_ZHTML_MAXVARLEN, 1);
+	// find end of string (after the varname copied by zhtml_copy_varname)
+	while (*p) p++;
+
+	// print the checkbox field's closign quote for the name property and add
+	// value="1" property and optional checked property
+	p += sprintf (p, "\" value=\"1\"%s", checked ? RWEB_CHECKED : "");
+}
+
+/*** BeginHeader zhtml_output_radio */
+void zhtml_output_radio(ZHTMLParser *parser, char __far *dest, int checked_value);
+/*** EndHeader */
+
+// Output HTML for a radio button form element.
+//
+// Usage in zhtml file:
+// 	<input <?z field_radio($somevar, 5) ?> >
+// Expands to:
+// 	<input type="radio" name="somevar" value="5" checked >
+//
+// parser        -- The current state of the ZHTML parser.
+// dest          -- The destination for the radio button.
+// checked_value -- The variable's current value, used in decision to include
+//                  "checked" property in input button's tag
+
+_http_nodebug
+void zhtml_output_radio(ZHTMLParser *parser, char __far *dest, int checked_value)
+{
+	auto int len;
+   auto long value;
+	char __far *p;
+
+	_http_assert(dest != NULL);
+
+	// p points into the output buffer and moves through it as we insert text
+	p = dest;
+
+	// set the type and name properties of the radio button
+	p += sprintf (p, "type=\"radio\" name=\"");
+	zhtml_copy_varname (parser, p, RWEB_ZHTML_MAXVARLEN, 1);
+	// find end of string (after the varname copied by zhtml_copy_varname)
+	while (*p) p++;
+	*p++ = '"';			// add closing quote of name property
+
+   zhtml_parse_whitespace(parser);
+   if (zhtml_parse_comma(parser) < 0) {
+      zhtml_error(parser, "Expecting ','");
+      return;
+   }
+   zhtml_parse_whitespace(parser);
+
+   // get the value property for the radio button
+   if (zhtml_parse_number(parser, &value, 0) < 0) {
+      // zhtml_parse_number generates its own errors
+      return;
+   }
+
+	// add the value and optional checked properties to the radio button
+	p += sprintf (p, " value=\"%d\"%s", (int) value,
+   	(checked_value == (int) value) ? RWEB_CHECKED : "");
+}
+
+/*** BeginHeader zhtml_get_numericvariable */
+int zhtml_get_numericvariable(ZHTMLParser *parser, WebCursor_t __far *wc, long *dest);
+/*** EndHeader */
+
+// Given the variable information in wc, this function extracts the
+// numeric value.  If the variable is not of numeric type (not including a
+// float), it returns with a failure.  This function is used in many places
+// where a numeric value is needed by the parser (for instance, for loop
+// ranges).  The value is placed into the dest buffer.
+//
+// wc -- Information on the variable for which we are getting the value.
+// dest    -- The destination buffer for the value.
+// Return  -- 0 on success, -1 on error.
+
+_http_nodebug
+int zhtml_get_numericvariable(ZHTMLParser *parser, WebCursor_t __far *wc, long *dest)
+{
+	auto int type;
+   auto long temp;
+   auto void __far *ptr;
+
+	_http_assert(dest != NULL);
+
+   // Check that the type of the variable is numeric
+   type = web_type(wc);
+   if ((type != _DK_T_CHAR) && (type != _DK_TINT) && (type != _DK_TUNSIGNED) &&
+       (type != _DK_TSIGNEDCHAR) && (type != _DK_TLONG) && (type != _DK_TULONG))
+   {
+		return -1;
+   }
+
+	// Get new or old value as appropriate
+	ptr = parser->newbin;
+
+	// Copy out the value to the destination
+   switch (type) {
+   case _DK_T_CHAR:
+      *dest = (long)(*((char __far *)ptr));
+      break;
+   case _DK_TSIGNEDCHAR:
+      *dest = (long)(*((signed char __far *)ptr));
+      break;
+   case _DK_TINT:
+      *dest = (long)(*((int __far *)ptr));
+      break;
+   case _DK_TUNSIGNED:
+      *dest = (long)(*((unsigned int __far *)ptr));
+      break;
+   case _DK_TLONG:
+      *dest = *((long __far *)ptr);
+      break;
+   case _DK_TULONG:
+      *dest = (long)(*((unsigned long __far *)ptr));
+      break;
+   }
+   return 0;
+}
+
+/*** BeginHeader zhtml_parse_whitespace */
+int zhtml_parse_whitespace(ZHTMLParser *parser);
+/*** EndHeader */
+
+// Parse out any sort of whitespace until the next non-whitespace character.
+//
+// parser -- The current state of the ZHTML parser.
+// Return -- Always returns 0, since whitespace is always optional.
+
+_http_nodebug
+int zhtml_parse_whitespace(ZHTMLParser *parser)
+{
+	while (isspace(*(parser->p))) parser->p++;
+   return 0;
+}
+
+
+/*** BeginHeader zhtml_parse_inversion */
+int zhtml_parse_inversion(ZHTMLParser *parser);
+/*** EndHeader */
+
+// If bang seen, return 1 and skip whitespace, else do nothing and return 0.
+//
+// parser -- The current state of the ZHTML parser.
+
+_http_nodebug
+int zhtml_parse_inversion(ZHTMLParser *parser)
+{
+	if (*(parser->p) == '!') {
+      parser->p++;
+	   zhtml_parse_whitespace(parser);
+	   return 1;
+   }
+	return 0;
+}
+
+/*** BeginHeader zhtml_parse_auth */
+int zhtml_parse_auth(ZHTMLParser *parser);
+/*** EndHeader */
+
+// Parse an auth() expression.  The auth() expression takes two parameters.
+// The first is a variable, and the second is "ro" or "rw" to determine if the
+// user has read or read/write access, respectively.
+//
+// parser -- The current state of the ZHTML parser.
+// Return -- 0 for success, -1 if it is not an auth() expression, -2 on error.
+
+_http_nodebug
+int zhtml_parse_auth(ZHTMLParser *parser)
+{
+   auto int not;
+   auto char __far *oldp;
+   auto int write;
+   auto HttpState_fp state;
+   auto int have_access;
+
+	write = 0;
+	state = parser->state;
+
+	// Save off the old pointer
+	oldp = parser->p;
+	not = zhtml_parse_inversion(parser);
+
+   if (!memcmp(parser->p, "auth", 4) &&
+       zhtml_isspace_or_paren(*(parser->p+4))) {
+   	parser->p += 4;
+   }
+   else {
+		// Go back from the '!', if necessary
+		parser->p = oldp;
+   	return -1;
+   }
+   if (zhtml_parse_openparen(parser) < 0) {
+   	zhtml_error(parser, "Expecting '('");
+		return -2;
+   }
+   zhtml_parse_whitespace(parser);
+   if (zhtml_parse_variable(parser, &(parser->wc)) < 0) {
+      // Error--didn't find variable
+      zhtml_error(parser, "Unknown variable");
+		return -2;
+   }
+   zhtml_parse_whitespace(parser);
+	if (zhtml_parse_comma(parser) < 0) {
+		zhtml_error(parser, "Expecting ','");
+		return -2;
+	}
+   zhtml_parse_whitespace(parser);
+   if (!memcmp(parser->p, "\"rw\"", 4)) {
+   	// Checking write access
+		write = 1;
+	}
+	else if (memcmp(parser->p, "\"ro\"", 4)) {
+		zhtml_error(parser, "Expecting \"ro\" or \"rw\"");
+		return -2;
+	}
+	parser->p += 4;
+   zhtml_parse_whitespace(parser);
+   if (zhtml_parse_closeparen(parser) < 0) {
+   	zhtml_error(parser, "Expecting ')'");
+		return -2;
+   }
+
+	// Now check the access
+   have_access = zhtml_check_variable_access(state, &(parser->wc), write) == 0;
+	// Figure out the truth value of the expression
+	parser->truth = have_access ^ not;
+
+   return 0;
+}
+
+/*** BeginHeader zhtml_parse_error */
+int zhtml_parse_error(ZHTMLParser *parser);
+/*** EndHeader */
+
+// Parse an error() expression.  The error() expression with no parameters
+// simply indicates whether there is an error in the received variables (from a
+// POST).  With a variable as a parameter, it indicates whether that specific
+// variable is in error.  Note that for an error() expression encountered
+// within an echo() or print() statement, a different function is used to
+// parse it, since the semantics are different.
+//
+// parser -- The current state of the ZHTML parser.
+// Return -- 0 for success, -1 if it is not an error() expression, -2 on error.
+
+_http_nodebug
+int zhtml_parse_error(ZHTMLParser *parser)
+{
+	auto int i;
+   auto int not;
+   auto int in_error;
+   auto char __far *oldp;
+
+	// Save off the old pointer
+	oldp = parser->p;
+	not = zhtml_parse_inversion(parser);
+
+   if (!memcmp(parser->p, "error", 5) &&
+       zhtml_isspace_or_paren(*(parser->p+5))) {
+   	parser->p += 5;
+   }
+   else {
+		// Go back from the '!', if necessary
+		parser->p = oldp;
+   	return -1;
+   }
+   if (zhtml_parse_openparen(parser) < 0) {
+   	zhtml_error(parser, "Expecting '('");
+		return -2;
+   }
+   zhtml_parse_whitespace(parser);
+   // Are we simply testing for error mode?
+   if (*(parser->p) == ')') {
+   	parser->p++;
+		// Figure out the truth value of the expression
+      if ((parser->error && !not) || (!parser->error && not)) {
+      	parser->truth = 1;
+      }
+      else {
+      	parser->truth = 0;
+      }
+		return 0;
+   }
+   if (zhtml_parse_variable(parser, &(parser->wc)) < 0) {
+      // Error--didn't find variable
+      zhtml_error(parser, "Unknown variable");
+		return -2;
+   }
+   zhtml_parse_whitespace(parser);
+   if (zhtml_parse_closeparen(parser) < 0) {
+   	zhtml_error(parser, "Expecting ')'");
+		return -2;
+   }
+
+   // Check if this variable is in error
+   in_error = parser->error_id &&
+              *parser->error_id != 0 && *parser->error_id != -1;
+
+	// Figure out the truth value of the expression
+	parser->truth = in_error ^ not;
+
+   return 0;
+}
+
+/*** BeginHeader zhtml_parse_updating */
+int zhtml_parse_updating(ZHTMLParser *parser);
+/*** EndHeader */
+
+// Parse an updating() expression.  The updating() function takes no parameters
+// and simply determines if the ZHTML page is being displayed from a POST (that
+// is, with new values coming in) rather than from a GET.
+//
+// parser -- The current state of the ZHTML parser.
+// Return -- 0 on success, -1 if it is not an updating() expression, -2 on
+//           error.
+
+_http_nodebug
+int zhtml_parse_updating(ZHTMLParser *parser)
+{
+   auto int not;
+   auto char __far *oldp;
+
+	// Save off the old pointer
+	oldp = parser->p;
+	not = zhtml_parse_inversion(parser);
+
+   if (!memcmp(parser->p, "updating", 8) &&
+       zhtml_isspace_or_paren(*(parser->p+8))) {
+   	parser->p += 8;
+   }
+   else {
+		// Go back from the '!', if necessary
+   	parser->p = oldp;
+   	return -1;
+   }
+   if (zhtml_parse_openparen(parser) < 0) {
+   	zhtml_error(parser, "Expecting '('");
+		return -2;
+   }
+   zhtml_parse_whitespace(parser);
+   if (zhtml_parse_closeparen(parser) < 0) {
+      zhtml_error(parser, "Expecting ')'");
+		return -2;
+   }
+
+	// Check if the method is POST
+	parser->truth = (parser->state->method == HTTP_METHOD_POST) ^ not;
+
+	return 0;
+}
+
+/*** BeginHeader zhtml_parse_selected */
+int zhtml_parse_selected(ZHTMLParser *parser);
+/*** EndHeader */
+
+// Parse a selected() expression.  The selected() function takes two
+// parameters:  the first is a selection variable, and the second is an index
+// into the list of possible values the selection variable can take on.  If the
+// current value of the selection variable corresponds to the given index, then
+// the expression is TRUE.  This is often used to generate a list of values
+// for a selection variable, with the currently selected value "marked" somehow.
+//
+// parser -- The current state of the ZHTML parser.
+// Return -- 0 for success, -1 if it is not a selected() expression, -2 on
+//           error.
+
+_http_nodebug
+int zhtml_parse_selected(ZHTMLParser *parser)
+{
+   auto int not;
+   auto int index;
+   auto int selindex;
+   auto long number;
+
+	not = zhtml_parse_inversion(parser);
+
+   if (!memcmp(parser->p, "selected", 8) &&
+       zhtml_isspace_or_paren(*(parser->p+8))) {
+   	parser->p += 8;
+   }
+   else {
+   	return -1;
+   }
+   if (zhtml_parse_openparen(parser) < 0) {
+   	zhtml_error(parser, "Expecting '('");
+		return -2;
+   }
+   zhtml_parse_whitespace(parser);
+
+   // Parse the variable--information on it will be in parser->wc
+   if (zhtml_parse_variable(parser, &(parser->wc)) < 0) {
+      zhtml_error(parser, "Unknown variable");
+		return -2;
+   }
+   // Check access to the variable
+   if (zhtml_check_variable_access(parser->state, &(parser->wc), 0) < 0) {
+      // Error--don't have access to the variable
+      zhtml_error(parser, "No read access to variable");
+      return -2;
+   }
+   if (zhtml_get_numericvariable(parser, &(parser->wc), &number) < 0) {
+      zhtml_error(parser, "Expecting a variable of integral type");
+		return -2;
+   }
+   selindex = _web_index_from_value(&(parser->wc), number);
+   zhtml_parse_whitespace(parser);
+   if (zhtml_parse_comma(parser) < 0) {
+   	zhtml_error(parser, "Expecting ','");
+   	return -2;
+   }
+   zhtml_parse_whitespace(parser);
+   if (zhtml_parse_number(parser, &number, 0) < 0) {
+      // zhtml_parse_number() generates its own errors
+      return -2;
+   }
+   if ((number < 0) || (number > INT_MAX)) {
+      zhtml_error(parser, "Selection index out of range");
+      return -2;
+   }
+   index = (int)number;
+   if (zhtml_parse_closeparen(parser) < 0) {
+      zhtml_error(parser, "Expecting ')'");
+		return -2;
+   }
+   if (((selindex == index) && !not) ||
+       ((selindex != index) && not)) {
+   	parser->truth = 1;
+   }
+   else {
+   	parser->truth = 0;
+   }
+   return 0;
+}
+
+/*** BeginHeader zhtml_parse_conditional */
+int zhtml_parse_conditional(ZHTMLParser *parser);
+/*** EndHeader */
+
+// Parse a conditional expression.  This can be error(), updating(), selected(),
+// or a comparison (e.g., "$A == 2").  The truth result of this conditional
+// expression is placed in the parser->truth variable.
+//
+// parser -- The current state of the ZHTML parser.
+// Return -- 0 on success, -1 on error.
+
+_http_nodebug
+int zhtml_parse_conditional(ZHTMLParser *parser)
+{
+   auto char comparison;
+   auto long number1;
+   auto long number2;
+   auto char __far *oldp;
+   auto int retval;
+
+	oldp = parser->p;
+
+	// Is this auth()?
+	retval = zhtml_parse_auth(parser);
+	if (retval == 0) {
+		return 0;
+	}
+	else if (retval == -2) {
+		// zhtml_parse_auth() generated an error
+		return -1;
+	}
+	// Is this error()?
+	retval = zhtml_parse_error(parser);
+	if (retval == 0) {
+		return 0;
+	}
+	else if (retval == -2) {
+		// zhtml_parse_error() generated an error
+		return -1;
+	}
+	// Is this updating()?
+	parser->p = oldp;
+	retval = zhtml_parse_updating(parser);
+	if (retval == 0) {
+		return 0;
+	}
+	else if (retval == -2) {
+		// zhtml_parse_updating() generated an error
+		return -1;
+	}
+	// Is this selected()?
+	parser->p = oldp;
+	retval = zhtml_parse_selected(parser);
+	if (retval == 0) {
+		return 0;
+	}
+	else if (retval == -2) {
+		// zhtml_parse_selected generated an error
+		return -1;
+	}
+	// Get the first number
+	parser->p = oldp;
+	if (zhtml_parse_number(parser, &number1, 0) < 0) {
+		// zhtml_parse_number() generates its own errors
+		return -1;
+	}
+	zhtml_parse_whitespace(parser);
+	// Get the conditional operator
+	comparison = zhtml_parse_comparison(parser);
+	if (comparison < 0) {
+	   zhtml_error(parser, "Expecting a conditional operator");
+      return -1;
+	}
+	zhtml_parse_whitespace(parser);
+	// Get the number
+	if (zhtml_parse_number(parser, &number2, 0) < 0) {
+		// zhtml_parse_number() generates its own errors
+      return -1;
+	}
+   // Check the condition
+   parser->truth = zhtml_check_condition(number1, comparison, number2);
+   return 0;
+}
+
+/*** BeginHeader zhtml_parse_character */
+int zhtml_parse_character(ZHTMLParser *parser, int c);
+#define zhtml_parse_openparen(p)			zhtml_parse_character(p, '(')
+#define zhtml_parse_closeparen(p)		zhtml_parse_character(p, ')')
+#define zhtml_parse_openbrace(p)			zhtml_parse_character(p, '{')
+#define zhtml_parse_comma(p)				zhtml_parse_character(p, ',')
+#define zhtml_parse_equals(p)				zhtml_parse_character(p, '=')
+#define zhtml_parse_semicolon(p)			zhtml_parse_character(p, ';')
+/*** EndHeader */
+
+// Parse a single character.
+//
+// parser -- The current state of the ZHTML parser.
+// Return -- 0 on success, -1 on failure.
+
+_http_nodebug
+int zhtml_parse_character(ZHTMLParser *parser, int c)
+{
+	if (*(parser->p) != c) return -1;
+   parser->p++;
+   return 0;
+}
+
+/*** BeginHeader zhtml_parse_end */
+int zhtml_parse_end(ZHTMLParser *parser);
+/*** EndHeader */
+
+// Parse the end of a <?z ... ?> tag.  In particular, it looks for the the
+// ending '?' character.
+_http_nodebug
+int zhtml_parse_end(ZHTMLParser *parser)
+{
+	// Always valid to preceed with whitespace
+	zhtml_parse_whitespace(parser);
+   return zhtml_parse_character(parser, '?');
+}
+
+
+/*** BeginHeader zhtml_isspace_or_paren */
+int zhtml_isspace_or_paren(char c);
+/*** EndHeader */
+
+// Determines if the given character is a space or open parenthesis.  This is
+// often used to determine the end of a "function" name (which can be followed
+// by whitespace or a '(' ).
+//
+// c -- The character being queried.
+// Return -- 0 if not a space or '(', !0 if it is.
+
+_http_nodebug
+int zhtml_isspace_or_paren(char c)
+{
+	return isspace(c) || (c == '(');
+}
+
+/*** BeginHeader zhtml_parse_command */
+int zhtml_parse_command(ZHTMLParser *parser);
+/*** EndHeader */
+
+// Parse out a command name (including '}', or the loop close, as a command
+// name).  Information on the parsed command is placed in the parser data
+// structure.
+//
+// parser -- The current state of the ZHTML parser.
+// Return -- 0 on success, -1 on error.
+
+typedef struct {
+	char	*command;
+	int	map;
+} zhtmlCommandMap;
+
+const zhtmlCommandMap	zhtml_commands[] = {
+	{ "echo", ZHTML_CMD_ECHO },
+	{ "print", ZHTML_CMD_ECHO },
+	{ "printf", ZHTML_CMD_PRINTF },
+	{ "if", ZHTML_CMD_IF },
+	{ "for", ZHTML_CMD_FOR },
+	{ "varname", ZHTML_CMD_VARNAME },
+	{ "print_opt", ZHTML_CMD_PRINT_OPT },
+	{ "print_select", ZHTML_CMD_PRINT_SELECT },
+	{ "field_checkbox", ZHTML_CMD_FIELD_CHECKBOX },
+   { "field_radio", ZHTML_CMD_FIELD_RADIO },
+   { "with", ZHTML_CMD_WITH },
+   { "json", ZHTML_CMD_JSON }
+};
+
+_http_nodebug
+int zhtml_parse_command(ZHTMLParser *parser)
+{
+	int i, cmdlen;
+
+	for (i = 0; i < sizeof(zhtml_commands) / sizeof(zhtml_commands[0]); i++) {
+		cmdlen = strlen (zhtml_commands[i].command);
+	   if (!memcmp(parser->p, zhtml_commands[i].command, cmdlen) &&
+	       zhtml_isspace_or_paren(*(parser->p+cmdlen))) {
+	      parser->p += cmdlen;
+	      parser->command = zhtml_commands[i].map;
+	      return 0;
+	   }
+	}
+
+   // close brace?
+   if ((*(parser->p) == '}') && isspace(*(parser->p+1))) {
+   	parser->p += 1;
+      parser->command = ZHTML_CMD_CLOSEBLOCK;
+      return 0;
+   } else {
+   	parser->command = ZHTML_CMD_NONE;
+   	return -1;
+   }
+}
+
+/*** BeginHeader zhtml_parse_printfspec */
+int zhtml_parse_printfspec(ZHTMLParser *parser, char *buf, int buflen);
+/*** EndHeader */
+
+// Parses out a printf-style specifier for the printf() statement and places in
+// in the provided buf.
+//
+// parser -- The current state of the ZHTML parser.
+// buf    -- The destination for writing out the printf-style specifier (with
+//           the " characters stripped).
+// Return -- 0 on success, -1 on error
+
+_http_nodebug
+int zhtml_parse_printfspec(ZHTMLParser *parser, char *buf, int buflen)
+{
+	auto int i;
+
+	_http_assert(buf != NULL);
+
+	if (*(parser->p) != '\"') {
+   	return -1;
+   }
+   parser->p++;
+   i = 0;
+   while ((*(parser->p) != '\"') && (i < buflen)) {
+   	buf[i] = *(parser->p);
+   	i++;
+      parser->p++;
+   }
+   if (i == buflen) {
+   	return -1;
+   }
+   buf[i] = '\0';
+   parser->p++;
+   return 0;
+}
+
+/*** BeginHeader zhtml_memcpy_substitute */
+int zhtml_memcpy_substitute(ZHTMLParser *parser, char __far *dest, int destlen,
+                            char __far *src, int srclen);
+/*** EndHeader */
+
+// Takes the given src string and copies it to the dest string while performing
+// loop variable substitution (for array indices).
+//
+// parser  -- The current state of the ZHTML parser.  In particular, it has the
+//            current loop variable values.
+// dest    -- The destination buffer.
+// destlen -- The maximum length of the destination buffer.
+// src     -- The source buffer.
+// srclen  -- The maximum length of the source buffer.
+// Return  -- Number of bytes written to the dest buffer on success, -1 on error
+
+_http_nodebug
+int zhtml_memcpy_substitute(ZHTMLParser *parser, char __far *dest, int destlen,
+                            char __far *src, int srclen)
+{
+	auto char __far *orig_dest;
+   auto int retval;
+   auto int var;
+
+	_http_assert(dest != NULL);
+
+	orig_dest = dest;
+   while (srclen > 0) {
+		retval = zhtml_copytochar(dest, src, '$',
+		                          (destlen < srclen)?destlen:srclen);
+      dest += retval;
+      src += retval;
+      srclen -= retval;
+      destlen -= retval;
+      if (*src == '$') {
+      	// Need to substitue in $A-$Z value
+      	// Skip past '$'
+			src++;
+			srclen--;
+			if (srclen <= 0) {
+				return -1;
+			}
+			var = *src - 'A';
+			if ((var < 0) || (var > 25)) {
+				return -1;
+			}
+			retval = snprintf(dest, destlen, "%d", parser->tempvars[var]);
+			if (retval >= destlen) {
+				dest[destlen-1] = '\0';
+				dest += destlen-1;
+				// We've filled the buffer already
+				return (int)(dest - orig_dest);
+			}
+			// Skip past 'A'-'Z'
+			dest += retval;
+			destlen -= retval;
+			src++;
+			srclen--;
+      }
+   }
+   return (int)(dest - orig_dest);
+}
+
+/*** BeginHeader zhtml_get_varname_len */
+int zhtml_get_varname_len(ZHTMLParser *parser);
+/*** EndHeader */
+_http_nodebug
+int zhtml_get_varname_len(ZHTMLParser *parser)
+{
+	// Scan ahead to find end of a variable name, and return the length.
+	// parser->p should initially point just past the initial '$' or '@'.
+	// Returns with parser->p pointing after last valid char in variable
+	// (which may be unchanged from entry if there were no valid chars).
+	// Also, parser->varbegin will be set here to ppoint to the start of
+	// the variable name.
+	int c;
+
+	parser->varbegin = parser->p;
+
+	c = *parser->p;
+	if (!(isalpha(c) || c == '_' || c == '.' || c == '['))
+		return 0;
+
+	for (c = *++parser->p;
+			isalnum(c) || (strchr (".@[]_$", c) != NULL);
+			c = *++parser->p);
+	return (int)(parser->p - parser->varbegin);
+}
+
+/*** BeginHeader zhtml_parse_variablename */
+int zhtml_parse_variablename(ZHTMLParser *parser,
+			WebCursor_t __far * wc, int newval);
+/*** EndHeader */
+
+// Parses out a variable name, substitutes any loop variables into the array
+// indices, and does a lookup for the best match for the variable.  Information
+// on the variable is encapsulated in the parser structure.
+//
+// parser   -- The current state of the ZHTML parser
+// wc       -- OUTPUT.  Cursor set to matching variable.
+// newval   -- If a new value is available in the current transaction,
+//             use it, else always use the committed value.
+// Return   -- 0 on success, -1 on error.
+
+_http_nodebug
+int zhtml_parse_variablename(ZHTMLParser *parser,
+			WebCursor_t __far * wc, int newval)
+{
+	// HTTP POST variable buffer
+	char _http_post_var[RWEB_ZHTML_MAXVARLEN];
+	auto char c;
+	auto int len;
+   auto int retval;
+   int rc;
+   WebTransEntry_t cc;
+   WebTransEntry_t __far * we;
+	char __far * __far * error_msg;
+	char __far * __far * orig_str;
+	int __far * orig_len;
+
+	_http_assert(wc != NULL);
+
+	len = zhtml_get_varname_len(parser);
+
+   if (len >= RWEB_ZHTML_MAXVARLEN) {
+#ifdef RABBITWEB_VERBOSE
+		printf("Var name too long\n");
+#endif
+   	return -1;
+   }
+   len = zhtml_memcpy_substitute(parser, _http_post_var,
+                                 RWEB_ZHTML_MAXVARLEN, parser->varbegin,
+                                 len);
+   if (len < 0) {
+#ifdef RABBITWEB_VERBOSE
+		printf("Var name failed substitution\n");
+#endif
+   	return -1;
+   }
+	if (len < RWEB_ZHTML_MAXVARLEN-1) {
+	   _http_post_var[len] = '\0';
+	}
+	else {
+#ifdef RABBITWEB_VERBOSE
+		printf("Var name too long after substitution\n");
+#endif
+		return -1;
+	}
+
+#ifdef RABBITWEB_VERBOSE
+	printf("Looking up var name %s\n", _http_post_var);
+#endif
+	// Always do relative look-ups w.r.t. the current "with" cursor.
+	_f_memcpy(wc, &parser->context[parser->nesting].with, sizeof(*wc));
+	rc = web_getvarinfo(_http_post_var, wc, NULL, 2);
+	if (rc < 0 && rc != -EISDIR) {
+#ifdef RABBITWEB_VERBOSE
+		printf("Var not found, rc=%d\n", rc);
+#endif
+		return rc;
+	}
+
+	// Fill in relevant information for variables in current transaction
+	if (newval && _http_trans) {
+	   rc = web_cname(wc, cc.cname);
+	   we = _web_transaction_find_cname(_http_trans, cc.cname);
+	   if (we) {
+		   _web_grok_wte_all(we, &parser->error_id, &parser->bin_len, &parser->newbin,
+		   					&error_msg, &orig_str, &orig_len);
+			parser->orig_str = *orig_str;
+			parser->orig_len = *orig_len;
+		   if (*parser->error_id == -2) {
+		   	parser->err_msg = *error_msg;
+		   }
+		   else
+		   	parser->err_msg = NULL;
+#ifdef RABBITWEB_VERBOSE
+			printf("...new value %ls\n", parser->orig_str);
+			if (parser->err_msg)
+				printf("   err_msg %ls\n", parser->err_msg);
+#endif
+		   return 0;
+		}
+	}
+	// Not in transaction, set parms to committed value.
+	parser->error_id = NULL;
+	parser->bin_len = &parser->_bin_len;
+	parser->newbin = web_loc(wc);
+	parser->_bin_len = web_size(wc);
+	parser->err_msg = NULL;
+	parser->orig_str = NULL;
+	parser->orig_len = 0;
+#ifdef RABBITWEB_VERBOSE
+	printf("...old value\n");
+#endif
+	return 0;
+}
+
+
+/*** BeginHeader zhtml_parse_variable */
+int zhtml_parse_variable(ZHTMLParser *parser, WebCursor_t __far *wc);
+/*** EndHeader */
+
+// Parses out a normal, non-loop-variable.  This variable can be indicated by
+// a '$' or '@' character, depending on whether the user wants the newest or the
+// committed value of the variable.  Information on the parsed variable is
+// placed into the wc structure.
+//
+// parser  -- The current state of the ZHTML parser
+// wc -- OUTPUT.  Information on the parsed variable is passed out in this
+//            structure.
+// Return  -- 0 on success, -1 on error
+
+_http_nodebug
+int zhtml_parse_variable(ZHTMLParser *parser, WebCursor_t __far *wc)
+{
+   int newval;
+
+	_http_assert(wc != NULL);
+
+	// Check if the variable is leading with a '$' (newest version of the
+   // variable available) or a '@' (committed version of the variable)
+   // Note that if the new value is called for, but it was in error, then
+   // the old value is used.  This is because transaction processing
+   // overwrites the new value (binary) with the error message pointer,
+   // thus it is not available if a custom error was generated.
+	if (*(parser->p) == '$')
+      newval = parser->error != 0;
+   else if (*(parser->p) == '@')
+   	newval = 0;
+   else
+   	return -1;
+
+#ifdef RABBITWEB_VERBOSE
+	printf("ZPV: enter, newval=%d\n", newval);
+#endif
+   parser->p++;
+
+	return zhtml_parse_variablename(parser, wc, newval);
+}
+
+/*** BeginHeader zhtml_isvarchar */
+int zhtml_isvarchar(char c);
+/*** EndHeader */
+
+// Indicates whether the given character is a valid variable character.
+//
+// c      -- Character to check
+// Return -- 1 if it is a valid variable character, 0 if it is not
+
+_http_nodebug
+int zhtml_isvarchar(char c)
+{
+	// valid characters are letters, numbers, [, _, ] and .
+	return (isalnum(c) || (strchr ("[_].", c) != NULL));
+}
+
+/*** BeginHeader zhtml_parse_loopvariable */
+int zhtml_parse_loopvariable(ZHTMLParser *parser);
+/*** EndHeader */
+
+// Parse a loop variable ($A - $Z).  The index of the loop variable (0-25) is
+// returned.
+//
+// parser -- The current state of the ZHTML parser
+// Return -- index of the loop variable on success, -1 on error.
+
+_http_nodebug
+int zhtml_parse_loopvariable(ZHTMLParser *parser)
+{
+   auto int var;
+	char __far * oldp = parser->p;
+
+	// Must start with '$'
+	if (*(parser->p) != '$') {
+   	return -1;
+	}
+   parser->p++;
+   // Next value must be 'A'-'Z'
+   var = *(parser->p) - 'A';
+   if (zhtml_isvarchar(*(parser->p + 1))) {
+   	// The variable name doesn't end there
+      parser->p = oldp;
+   	return -1;
+   }
+   if ((var < 0) || (var > 25)) {
+      parser->p = oldp;
+   	return -1;
+   }
+   parser->p++;
+	return var;
+}
+
+/*** BeginHeader zhtml_parse_number */
+int zhtml_parse_number(ZHTMLParser *parser, long *number, int nocount);
+/*** EndHeader */
+
+// Parse out a numeric expression.  This can be a count() function, a loop
+// variable, a regular variable of integral type, or a numeric literal.  If the
+// nocount parameter is set, then the parser will not check for a count()
+// expression.  This is used to prevent recursion, since zhtml_parse_count()
+// can call zhtml_parse_number().
+//
+// parser -- The current state of the ZHTML parser
+// number -- OUTPUT.  The result of the numeric expression.
+// Return -- 0 on success, -1 on error.
+
+_http_nodebug
+int zhtml_parse_number(ZHTMLParser *parser, long *number, int nocount)
+{
+   auto char __far *p;
+   auto int retval;
+   auto int loopvar;
+   auto WebCursor_t wc;
+
+	_http_assert(number != NULL);
+
+	// Save off the original parser pointer
+	p = parser->p;
+
+	// Is this a count() function?
+	// nocount prevents us from parsing a count() function.  This is needed to
+	// prevent recursion, since count() can take a number (which could be a
+	// count) as a parameter).
+	if (!nocount) {
+	   retval = zhtml_parse_count(parser, number);
+	} else {
+		// count() not allowed
+		retval = -1;
+	}
+   if (retval == 0) {
+      // It was a count() function, and number has been filled in
+      return 0;
+   }
+   else if (retval < -1) {
+   	zhtml_error(parser, "Error in count() function");
+   	return -1;
+   }
+
+   // Not a count() function...Is this a loop variable?
+   parser->p = p;		// Restore the original parser pointer
+	loopvar = zhtml_parse_loopvariable(parser);
+	if (loopvar >= 0) {
+		*number = parser->tempvars[loopvar];
+		return 0;
+	}
+
+   // Not a loop variable...Is this a regular variable?
+   parser->p = p;		// Restore the original parser pointer
+	retval = zhtml_parse_variable(parser, &wc);
+	if (retval == 0) {
+	   if (zhtml_get_numericvariable(parser, &wc, number) < 0) {
+	      zhtml_error(parser, "Variable not of integral type");
+	      return -1;
+	   }
+		return 0;
+	}
+
+   // Must be an integer
+   parser->p = p;		// Restore the original parser pointer
+   *number = _f_strtol(parser->p, &p, 10);
+   if (!isspace(*p) && (*p != ';') && (*p != ')')) {
+   	zhtml_error(parser, "Expecting a number, variable, or count()");
+      return -1;
+   }
+   parser->p = p;
+
+	return 0;
+}
+
+/*** BeginHeader zhtml_parse_count */
+int zhtml_parse_count(ZHTMLParser *parser, long *number);
+/*** EndHeader */
+
+// Parse a count() exression.  This expression is used to give the size of a
+// specific dimension for an array (the second integral parameter gives the
+// index of the array for which we want a count--0 for a one-dimensional array)
+// or the number of options for a selection variable (in which case there is no
+// second parameter).  This is often used for the bounds in for loops.
+//
+// parser -- The current state of the ZHTML parser
+// number -- OUTPUT.  The result of the count() expression.
+// Return -- 0 on success, -1 if this was not a count expression, -2 on error
+
+_http_nodebug
+int zhtml_parse_count(ZHTMLParser *parser, long *number)
+{
+#ifdef RABBITWEB_VERBOSE
+	char buf[128];
+#endif
+	auto WebCursor_t info;
+
+#ifdef RABBITWEB_VERBOSE
+	printf("ZPC: enter\n");
+#endif
+	_http_assert(number != NULL);
+
+   if (memcmp(parser->p, "count", 5) ||
+       !zhtml_isspace_or_paren(*(parser->p+5))) {
+   	// Not a count
+   	return -1;
+   }
+   parser->p += 5;
+   zhtml_parse_whitespace(parser);
+   if (zhtml_parse_openparen(parser) < 0) {
+   	zhtml_error(parser, "Expecting '('");
+      return -2;
+   }
+   if (*parser->p != '$') {
+   	zhtml_error(parser, "Not a valid variable");
+   	return -2;
+   }
+   parser->p++;
+   if (zhtml_parse_variablename(parser, &info, 0) < 0) {
+   	zhtml_error(parser, "Not a valid variable");
+   	return -2;
+   }
+#ifdef RABBITWEB_VERBOSE
+	web_fqname(&info, buf, sizeof(buf));
+#endif
+   zhtml_parse_whitespace(parser);
+   if (zhtml_parse_comma(parser) < 0) {
+   	// No comma, so this must be a selection variable
+#ifdef RABBITWEB_VERBOSE
+		printf("ZPC: count(%s)\n", buf);
+#endif
+   	*number = _web_selection_count(&info);
+   	if (*number <= 0) {
+   		zhtml_error(parser, "Not a selection variable");
+   		return -2;
+   	}
+   }
+   else {
+   	// Parsed a comma, so there is a number following that gives the nth
+   	// dimension that we want the bound for
+   	zhtml_parse_whitespace(parser);
+   	if (zhtml_parse_number(parser, number, 1) < 0) {
+      	// zhtml_parse_number generates its own errors
+   		return -2;
+   	}
+#ifdef RABBITWEB_VERBOSE
+		printf("ZPC: count(%s,%ld)\n", buf, *number);
+#endif
+   	// RWeb extension: negative indices mean to go up in the hierarchy
+   	// Admittedly not that useful, but we need to check for -ve anyway.
+   	while (*number < 0) {
+   		if (web_cursor_up(&info) < 0) {
+	         zhtml_error(parser, "Index out of range for this array");
+	         return -2;
+			}
+			++*number;
+		}
+
+		// Go down 'number' levels using index 0 at each level.
+		while (*number > 0) {
+			if (web_cursor_down(&info, NULL, 0) < 0) {
+	         zhtml_error(parser, "Index out of range for this array");
+	         return -2;
+			}
+			--*number;
+		}
+
+   	*number = web_next_dimension(&info);
+   }
+#ifdef RABBITWEB_VERBOSE
+	printf("ZPC:   = %ld\n", *number);
+#endif
+   zhtml_parse_whitespace(parser);
+   if (zhtml_parse_closeparen(parser) < 0) {
+   	zhtml_error(parser, "Expecting ')'");
+      return -2;
+   }
+	return 0;
+}
+
+/*** BeginHeader zhtml_parse_comparison */
+int zhtml_parse_comparison(ZHTMLParser *parser);
+/*** EndHeader */
+
+// Parse out a comparison operator (<=, <, >=, etc.).
+//
+// parser -- The current state of the ZHTML parser
+// Return -- The type of comparison operator parsed, or -1 on error
+
+_http_nodebug
+int zhtml_parse_comparison(ZHTMLParser *parser)
+{
+	if (strncmp(parser->p, "<=", 2) == 0) {
+   	parser->p += 2;
+   	return _ZHTML_COMP_LE;
+   }
+   else if (*(parser->p) == '<') {
+   	parser->p++;
+   	return _ZHTML_COMP_LT;
+   }
+   else if (strncmp(parser->p, ">=", 2) == 0) {
+   	parser->p += 2;
+   	return _ZHTML_COMP_GE;
+   }
+   else if (*(parser->p) == '>') {
+   	parser->p++;
+   	return _ZHTML_COMP_GT;
+   }
+   else if (strncmp(parser->p, "==", 2) == 0) {
+   	parser->p += 2;
+   	return _ZHTML_COMP_EQ;
+   }
+   else if (strncmp(parser->p, "!=", 2) == 0) {
+   	parser->p += 2;
+   	return _ZHTML_COMP_NE;
+   }
+   else {
+   	return -1;
+   }
+}
+
+/*** BeginHeader zhtml_parse_stepop */
+int zhtml_parse_stepop(ZHTMLParser *parser);
+/*** EndHeader */
+
+// Parse out a step operator (++, --, +=, or -=).
+//
+// parser -- The current state of the ZHTML parser
+// Return -- The type of step operator parsed, or -1 on error.
+
+_http_nodebug
+int zhtml_parse_stepop(ZHTMLParser *parser)
+{
+	if (strncmp(parser->p, "++", 2) == 0) {
+   	parser->p += 2;
+      return _ZHTML_STEPOP_INC;
+   }
+	else if (strncmp(parser->p, "--", 2) == 0) {
+   	parser->p += 2;
+      return _ZHTML_STEPOP_DEC;
+   }
+	else if (strncmp(parser->p, "+=", 2) == 0) {
+   	parser->p += 2;
+      return _ZHTML_STEPOP_PE;
+   }
+	else if (strncmp(parser->p, "-=", 2) == 0) {
+   	parser->p += 2;
+      return _ZHTML_STEPOP_ME;
+   }
+	return -1;
+}
+
+/*** BeginHeader zhtml_check_condition */
+int zhtml_check_condition(long number1, char comparison, long number2);
+/*** EndHeader */
+
+// Given two values and the type of comparison, check the given comparison.
+//
+// number1    -- Value of the first number
+// comparison -- The type of comparison to perform (<, >, <=, etc.)
+// number2    -- Value of the second number
+// Return     -- 0 for failed comparison, !0 for successful comparison
+
+_http_nodebug
+int zhtml_check_condition(long number1, char comparison, long number2)
+{
+   switch (comparison) {
+   case _ZHTML_COMP_LT:
+      return (number1 < number2);
+   case _ZHTML_COMP_GT:
+      return (number1 > number2);
+   case _ZHTML_COMP_LE:
+      return (number1 <= number2);
+   case _ZHTML_COMP_GE:
+      return (number1 >= number2);
+   case _ZHTML_COMP_EQ:
+      return (number1 == number2);
+   case _ZHTML_COMP_NE:
+      return (number1 != number2);
+   }
+}
+
+/*** BeginHeader zhtml_copytochar */
+int zhtml_copytochar(char __far *dest, char __far *src, char c, int len);
+/*** EndHeader */
+
+// Copy from the src buffer to the dest buffer until a given character (c) is
+// encountered (note that c is not copied to the destination).  The destination
+// buffer is also NOT null-terminated.
+//
+// dest   -- The destination buffer
+// src    -- The source buffer
+// c      -- The character to which we will copy
+// len    -- The maximum length of the destination buffer
+// Return -- The number of bytes copied to the dest buffer
+
+_http_nodebug
+int zhtml_copytochar(char __far *dest, char __far *src, char c, int len)
+{
+	auto int i;
+
+	_http_assert(dest != NULL);
+
+	i = 0;
+	while ((*src != c) && (*src != '\0')) {
+		if (i >= len) {
+			return i;
+		}
+		else {
+	      *dest = *src;
+	      dest++;
+	      src++;
+	      i++;
+      }
+   }
+   return i;
+}
+
+
+
+
+
+

@@ -1,0 +1,745 @@
+/*
+	linklocal.lib
+	Copyright (c) 2008 Digi International Inc., All Rights Reserved
+
+	This software contains proprietary and confidential information of Digi
+	International Inc.  By accepting transfer of this copy, Recipient agrees
+	to retain this software in confidence, to prevent disclosure to others,
+	and to make no use of this software other than that for which it was
+	delivered.  This is a published copyrighted work of Digi International
+	Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+	prohibited.
+
+	Restricted Rights Legend
+
+	Use, duplication, or disclosure by the Government is subject to
+	restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+	Technical Data and Computer Software clause at DFARS 252.227-7031 or
+	subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+	Restricted Rights at 48 CFR 52.227-19, as applicable.
+
+	Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+*/
+/* START LIBRARY DESCRIPTION ************************************************
+
+	This library contains code associated with using IPv4 Link-Local Addressess
+	(169.254.x.x).  Refer to RFC 3927 for a full explanation on the methodology
+	of address selection, defense and delivery.
+
+	Note that the namespace prefix LL_ was already in use for "link layer".  This
+	library uses ZC_LL_ as its prefix, for "zeroconf, link-local".  At some
+	point, we may implement multicast DNS and DNS Service Discovery, the other
+	two layers of Zeroconf (and they may also make use of the ZC_ prefix).
+
+	To have an interface auto-negotiate a link-local address, assign 169.254.0.0
+	to it in either your compile-time configuration or using ifconfig().  If
+	there is a preferred address (i.e., a valid link-local address that the
+	device should use if available), initialize the interface with that address
+	instead of 169.254.0.0.
+
+	Link-local is especially handy for use as a fallback for DHCP.  Multiple
+	devices on a network (including Windows and Mac computers) can still
+	communicate with each other even when a DHCP server is unavailable.
+
+	See http://zeroconf.org/ for more information on zero-config networking.
+
+	Macros:
+
+	NUM_LINKLOCAL_IF - Maximum number of network interfaces that will be
+				using link-local addresses (defaults to 2 for boards with both
+				Ethernet and WiFi, else 1).  If an interface
+				tries to use a link-local address after NUM_LINKLOCAL_IF interfaces
+				have already been initialized with link-local addresses, ifconfig()
+				will return an error.
+
+	ZC_LL_VERBOSE - If defined, library will print status messages to STDOUT.
+
+	ZC_LL_DEBUG - If defined, functions will be debuggable (i.e., you can set
+				breakpoints and single-step into them).
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader */
+#ifndef __LINKLOCAL_LIB
+#define __LINKLOCAL_LIB
+/*** EndHeader */
+
+/*** BeginHeader */
+#include <string.h>
+
+#ifdef ZC_LL_DEBUG
+	#define _zc_ll_debug __debug
+#else
+	#define _zc_ll_debug __nodebug
+#endif
+
+#ifdef ZC_LL_VERBOSE
+	#define zc_ll_err(me, error, func) \
+	   printf( "%s, line %u: error %d (%ls) calling %s\n", \
+	      me, __LINE__, error, strerror(error), func)
+#else
+	#define zc_ll_err(me, error, func)
+#endif
+
+#define ZC_LL_VALID_ADDR(ip) \
+	((ip) >= IPADDR(169,254,1,0) && (ip) <= IPADDR(169,254,254,255))
+
+/*** EndHeader */
+
+/*** BeginHeader */
+
+// Constants per Section 9 of RFC 3927, not intended to be user-configurable.
+// Although Section 1.3 does state that, "Link-layer technologies that support
+// ARP but operate at rates below 1Mbps or latencies above one second may need
+// to specify different values for the following parameters."
+#define ZC_LL_PROBE_WAIT				1000	// initial random delay, in ms
+#define ZC_LL_PROBE_NUM					3		// number of probe packets
+#define ZC_LL_PROBE_MIN					1000	// min delay (ms) until repeated probe
+#define ZC_LL_PROBE_MAX					2000	// max delay (ms) until repeated probe
+#define ZC_LL_ANNOUNCE_WAIT			2000	// ms before announcing
+#define ZC_LL_ANNOUNCE_NUM				2		// number of announcement packets
+#define ZC_LL_ANNOUNCE_INTERVAL		2000	// ms between announcement packets
+#define ZC_LL_MAX_CONFLICTS			10		// max conflicts before rate limiting
+#define ZC_LL_RATE_LIMIT_INTERVAL	60000	// ms between successive attempts
+#define ZC_LL_DEFEND_INTERVAL			10000	// min ms between defensive ARPs
+
+// Even though the values above should never be changed, code later in this
+// library assumes a limited range for some values.
+#if ZC_LL_PROBE_WAIT <= 0
+   #fatal "ZC_LL_PROBE_WAIT must be positive."
+#endif
+#if ZC_LL_PROBE_MIN <= 0
+   #fatal "ZC_LL_PROBE_MIN must be positive."
+#endif
+#if ZC_LL_PROBE_MAX <= 0
+   #fatal "ZC_LL_PROBE_MAX must be positive."
+#endif
+#if ZC_LL_PROBE_MAX <= ZC_LL_PROBE_MIN
+	#fatal "ZC_LL_PROBE_MAX must be greater than ZC_LL_PROBE_MIN."
+#endif
+#if ZC_LL_ANNOUNCE_WAIT <= 0
+   #fatal "ZC_LL_ANNOUNCE_WAIT must be positive."
+#endif
+
+/*** EndHeader */
+
+/*** BeginHeader _linklocal_rand16, _linklocal_rand16_init,
+																	_linklocal_rand16_rtcxor */
+word _linklocal_rand16( void);
+void _linklocal_rand16_init( word seed);
+void _linklocal_rand16_rtcxor( void);
+/*** EndHeader */
+// See function help for rand16 and rand16_init from rand.lib for information
+// on these functions.
+
+word _linklocal_rand;
+
+// Initialize the PRNG with a seed
+_zc_ll_debug
+void _linklocal_rand16_init( word seed)
+{
+	_linklocal_rand = seed;
+}
+
+// Advance the PRNG and return its current value
+_zc_ll_debug
+word _linklocal_rand16( void)
+{
+	_linklocal_rand = _linklocal_rand * 30809U + 11213U;
+	return _linklocal_rand;
+}
+
+// Add entropy to the current seed by XORing it with the lower 16-bits of RTC
+_zc_ll_debug
+void _linklocal_rand16_rtcxor()
+{
+	#asm
+ioi   ld    (RTC0R), a			; latch RTC for a read
+ioi   ld    hl, (RTC0R)			; read lower 16-bits
+      ld    de, (_linklocal_rand)
+      xor   hl, de
+      ld    (_linklocal_rand), hl
+	#endasm
+}
+
+/*** BeginHeader linklocal_random_range */
+word linklocal_random_range( word min_val, word max_val);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+linklocal_random_range                                      <linklocal.lib>
+
+SYNTAX:	word linklocal_random_range( word min_val, word max_val)
+
+DESCRIPTION:	Returns a random value between a minimum and maximum (max range
+					is 0 to 65535).
+
+PARAMETER 1:	Minimum value for range.
+
+PARAMETER 2:	Maximum value for range.
+
+RETURN VALUE:	A random number between <min_val> and <max_val> (inclusive).
+
+END DESCRIPTION **********************************************************/
+_zc_ll_debug
+word linklocal_random_range( word min_val, word max_val)
+{
+	word range, test;
+	word delay;
+	int bits;
+
+	if (max_val <= min_val)
+	{
+		return min_val;
+	}
+
+	range = (max_val - min_val);
+
+	// find number of bits necessary to get a range covering 0 to range
+	bits = 1;
+	test = 1;
+	while (range > test)
+	{
+		++bits;
+		test = (test << 1) | 0x0001;
+	}
+
+	// might take multiple calls to get a value in the correct range
+	do {
+		delay = _linklocal_rand16() & test;
+	} while (delay > range);
+
+	return (min_val + delay);
+}
+
+/*** BeginHeader linklocal_init, linklocal_arphandler */
+enum {
+	ZC_LL_STATE_DISABLED = 0,	// interface not using link-local
+	ZC_LL_STATE_PROBE_WAIT,		// initial random delay
+	ZC_LL_STATE_PROBE,			// probing for probe_ip
+	ZC_LL_STATE_ANNOUNCE,		// announce that we're using probe_ip
+	ZC_LL_STATE_DEFEND			// defend probe_ip
+};
+
+typedef struct _ZC_LL_INFO
+{
+	unsigned long	probe_ip;		// ip we're trying to acquire
+	int				state;			// current state
+	int				count;			// counter used by various states
+	unsigned long	timeout;			// In STATE_DEFEND, value of MS_TIMER from
+											// last conflicting ARP packet.  Otherwise,
+											// new value of MS_TIMER before moving to next
+											// state
+	word				conflicts;		// number of conflicts
+} ZC_LL_INFO;
+
+extern ZC_LL_INFO	_zc_ll_info[];
+
+int linklocal_init( word iface, unsigned long ip);
+int linklocal_arphandler( word iface, arp_Header *arp);
+/*** EndHeader */
+#ifndef NUM_LINKLOCAL_IF
+	#if WIFI_ONBOARD && ETHERNET_ONBOARD
+		#define NUM_LINKLOCAL_IF 2
+	#else
+		#define NUM_LINKLOCAL_IF 1
+	#endif
+#endif
+ZC_LL_INFO	_zc_ll_info[NUM_LINKLOCAL_IF];
+
+#ifndef USE_LINKLOCAL
+	#fatal "Must define USE_LINKLOCAL for link-local (169.254.x.x) addressing."
+#endif
+#ifdef ARP_MINIMAL
+	#fatal "Can't have link-local (169.254.x.x) when ARP_MINIMAL defined."
+#endif
+
+// return a random link-local IP address (169.254.1.0 to 169.254.254.255)
+_zc_ll_debug
+unsigned long linklocal_randomip()
+{
+	unsigned long ip;
+
+	// Some addresses will be outside of the valid range of just under 16 bits
+	// of addresses.  If we get an address out of range, create another one.
+	do {
+		ip = IPADDR(169,254,0,0) + _linklocal_rand16();
+	} while (! ZC_LL_VALID_ADDR(ip));
+
+	return ip;
+}
+
+/* START _FUNCTION DESCRIPTION ********************************************
+linklocal_arphandler	                  							<linklocal.lib>
+
+SYNTAX: int linklocal_arphandler( word iface, arp_Header *arp)
+
+DESCRIPTION:	Called from ARP library with copies of all ARP packets.
+
+PARAMETER 1:	Interface packet received on.
+
+PARAMETER 2:	ARP packet received.
+
+RETURN VALUE:	1 if the packet was handled by this handler, 0 if the ARP
+					library should continue processing the packet.
+
+SEE ALSO:		linklocal_init, linklocal_tick
+
+END DESCRIPTION **********************************************************/
+_zc_ll_debug
+int linklocal_arphandler( word iface, arp_Header *arp)
+{
+   #ifdef ZC_LL_VERBOSE
+		auto char ipbuf[16];
+		auto char ethbuf[18];
+		auto byte ethaddr[6];		// near buffer for inet_ethtoa
+	#endif
+	auto ZC_LL_INFO *ll;
+	auto unsigned long checkip;
+	auto unsigned long timeout;
+
+	ll = _if_tab[iface].linklocal;
+	if (!ll || ll->state == ZC_LL_STATE_DISABLED)
+	{
+		return 0;
+	}
+
+   // Add entropy to the random number generator.
+   _linklocal_rand16_rtcxor();
+
+	checkip = ntohl( ll->probe_ip);
+
+	if (ll->state == ZC_LL_STATE_DEFEND)
+	{
+		if (checkip != arp->srcIPAddr)
+		{
+			// when defending, we only care about matches on the source IP
+			return 0;
+		}
+      // defend our use of this address from someone else trying to use it
+      if (MS_TIMER - ll->timeout > ZC_LL_DEFEND_INTERVAL)
+      {
+         // More than DEFEND_INTERVAL ms since last ARP conflict; attempt to
+         // defend our use of this IP.
+
+	      #ifdef ZC_LL_VERBOSE
+	      	_f_memcpy( &ethaddr, &arp->srcEthAddr, sizeof(ethaddr));
+	         printf( "linklocal: defending %s from %s with gratuitous ARP.\n",
+	            inet_ntoa( ipbuf, ll->probe_ip),
+	            inet_ethtoa( ethbuf, ethaddr));
+	      #endif
+
+         ll->timeout = MS_TIMER;
+         _arp_send_gratuitous( iface);
+
+         return 1;		// ARP library can ignore this packet, we've handled it
+      }
+
+      // This is the second ARP in less than DEFEND_INTERVAL ms.
+      #ifdef ZC_LL_VERBOSE
+      	_f_memcpy( &ethaddr, &arp->srcEthAddr, sizeof(ethaddr));
+         printf( "linklocal: ARP conflict (%u sec)\n\tgiving up %s to %s.\n",
+            (word) ((MS_TIMER - ll->timeout) / 1000),
+            inet_ntoa( ipbuf, ll->probe_ip),
+            inet_ethtoa( ethbuf, ethaddr));
+      #endif
+
+      // abort any open sockets, since our IP address is changing
+      _abort_socks( NETERR_IPADDR_CONFLICT, iface);
+      _if_tab[iface].ipaddr = 0;
+		// convince ifctl_tick() that it needs to tick the interface back up
+		_if_actual ^= (1 << iface);
+
+      timeout = linklocal_random_range( 0, ZC_LL_PROBE_WAIT);
+		// fall through to common probing code
+	}
+	else if (checkip == arp->srcIPAddr || (checkip == arp->dstIPAddr
+									&& !arp->srcIPAddr && arp->opcode == ARP_REQUEST) )
+	{
+		// We're seeing an ARP request or response with our IP as the source
+		// address, or another device is probing the same IP (an ARP REQUEST
+		// from 0.0.0.0 with our probe address as the destination IP).
+		// Cancel the current probing and change to another IP.
+      if (++ll->conflicts >= ZC_LL_MAX_CONFLICTS)
+      {
+         timeout = ZC_LL_RATE_LIMIT_INTERVAL;
+      }
+      else
+      {
+         timeout = linklocal_random_range( 0, ZC_LL_PROBE_WAIT);
+      }
+		// fall through to common probing code
+	}
+	else
+	{
+	   #ifdef ZC_LL_VERBOSE
+	      #ifndef ARP_VERBOSE
+	         printf( "linklocal: ignore ARP from %08lX to %08lX "\
+	         	"(not our ip, %08lX)\n", ntohl( arp->srcIPAddr),
+	         	ntohl( arp->dstIPAddr), ll->probe_ip);
+	      #endif
+	   #endif
+	   return 0;		// Have ARP library handle this packet
+	}
+
+	// if function hasn't returned, it's because we need to restart the probing.
+   ll->probe_ip = linklocal_randomip();
+   ll->state = ZC_LL_STATE_PROBE_WAIT;
+   ll->timeout = _SET_TIMEOUT( timeout);
+   #ifdef ZC_LL_VERBOSE
+      printf( "linklocal: ARP conflict #%u, waiting %lums to probe %s.\n",
+         ll->conflicts, timeout, inet_ntoa( ipbuf, ll->probe_ip));
+   #endif
+
+   return 1;		// ARP library can ignore this packet
+}
+
+/* START _FUNCTION DESCRIPTION ********************************************
+linklocal_init	                  									<linklocal.lib>
+
+SYNTAX: int linklocal_init( word iface, unsigned long ip)
+
+DESCRIPTION:	Called from TCP/IP stack to initialize an interface for obtaining
+					a link-local IP address.
+
+PARAMETER 1:	Interface to run link-local on.
+
+PARAMETER 2:	Initial address to attempt to use.  If this interface previously
+					used link-local addressing, can be the last-used address.  Pass
+					0 to choose a random address to start with.
+
+RETURN VALUE:	IFCTL_FAIL: Too many interfaces configured for link-local, need
+									to increase NUM_LINKLOCAL_IF.
+					IFCTL_OK: Interface configured for link-local.
+
+SEE ALSO:		linklocal_tick, linklocal_arphandler, linklocal_enable,
+					linklocal_disable
+
+END DESCRIPTION **********************************************************/
+_zc_ll_debug
+int linklocal_init( word iface, unsigned long ip)
+{
+   #ifdef ZC_LL_VERBOSE
+		auto char ipbuf[16];
+	#endif
+	auto ZC_LL_INFO *ll;
+	auto word timeout;
+	static int iface_index;
+
+#GLOBAL_INIT { iface_index = 0; }
+
+	// Select an IP address for the interface, and try to obtain it.
+
+	ll = _if_tab[iface].linklocal;
+	if (!ll)
+	{
+		// Assign one of the _zc_ll_info[] entries to this interface, return
+		// an error if we're out of entries.
+		if (iface_index < NUM_LINKLOCAL_IF)
+		{
+			if (!iface_index)
+			{
+				// On first pass, seed the PRNG with last two bytes of MAC
+				_linklocal_rand16_init(
+					*(unsigned *)&(my_eth_addr[iface]->eaddr[4]));
+			}
+	      _if_tab[iface].linklocal = ll = &_zc_ll_info[iface_index++];
+	      memset( ll, 0, sizeof(*ll));
+		}
+		else
+		{
+	      #ifdef ZC_LL_VERBOSE
+	         printf( "linklocal: error, must increase NUM_LINKLOCAL_IF\n");
+	      #endif
+			return IFCTL_FAIL;
+		}
+	}
+
+	if (ZC_LL_VALID_ADDR( ip))
+	{
+		// Try to use the IP passed to linklocal_init first.
+		ll->probe_ip = ip;
+	}
+	else if (! ZC_LL_VALID_ADDR( ll->probe_ip))
+	{
+		// If we don't already have a valid address to probe, select a starting
+		// address based on the MAC address.  Take the last 4 bytes of the
+		// MAC as an unsigned long (with third byte as MSB and 6th byte as LSB),
+		// and modulo that with the range of IP addresses that are valid for
+		// link-local.
+		ll->probe_ip = IPADDR(169,254,1,0) +
+			intel( *(unsigned long *)&(my_eth_addr[iface]->eaddr[2]))
+			% (IPADDR(169,254,254,255) - IPADDR(169,254,1,0) + 1);
+	}
+
+	ll->state = ZC_LL_STATE_PROBE_WAIT;
+   // set timeout between 0 and PROBE_WAIT ms
+   timeout = linklocal_random_range( 0, ZC_LL_PROBE_WAIT);
+   #ifdef ZC_LL_VERBOSE
+      printf( "linklocal: init complete, first probe of %s in %ums\n",
+      	inet_ntoa( ipbuf, ll->probe_ip), timeout);
+   #endif
+
+   // IP address on interface should be set to 0 during probing
+   _if_tab[iface].ipaddr = 0;
+   // make sure netmask is set correctly for link-local
+   _if_tab[iface].mask = IPADDR(255,255,0,0);
+
+   ll->timeout = _SET_TIMEOUT( timeout);
+
+   return IFCTL_OK;
+}
+
+/*** BeginHeader linklocal_tick */
+int linklocal_tick( word iface);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+linklocal_tick	                  									<linklocal.lib>
+
+SYNTAX: int linklocal_tick( word iface)
+
+DESCRIPTION:	Called from TCP/IP stack to advance the state machine for
+					link-local address negotiation.
+
+PARAMETER 1:	Interface with link-local addressing enabled.
+
+RETURN VALUE:	IFCTL_FAIL: Interface isn't configured for link-local, or
+									link-local has been disabled.
+					IFCTL_PEND: Address negotiation in progress.
+					IFCTL_OK: Interface has negotiated and is using a link-local
+									address.
+
+SEE ALSO:		linklocal_init, linklocal_arphandler, linklocal_enable,
+					linklocal_disable
+
+END DESCRIPTION **********************************************************/
+_zc_ll_debug
+int linklocal_tick( word iface)
+{
+   #ifdef ZC_LL_VERBOSE
+		auto char ipbuf[16];
+	#endif
+	auto ZC_LL_INFO *ll;
+	auto word timeout;
+
+	ll = _if_tab[iface].linklocal;
+	if (!ll || ll->state == ZC_LL_STATE_DISABLED)
+	{
+		// Linklocal is not enabled for this interface, shouldn't be ticking it.
+		return IFCTL_FAIL;
+	}
+
+	if (ll->state == ZC_LL_STATE_DEFEND)
+	{
+		// We have an IP address, and don't need to advance the state machine.
+		return IFCTL_OK;
+	}
+
+	if (!_CHK_TIMEOUT( ll->timeout))
+	{
+		// waiting for something to happen before we can continue
+		return IFCTL_PEND;
+	}
+
+	switch (ll->state)
+	{
+		case ZC_LL_STATE_PROBE_WAIT: 		// initial random delay
+         ll->state = ZC_LL_STATE_PROBE;
+         ll->count = 0;
+			// fall through to ZC_LL_STATE_PROBE and send first probe
+
+		case ZC_LL_STATE_PROBE:				// probing for probe_ip
+			// send probe request
+			_arp_request( ll->probe_ip, 0, iface);
+
+         if (++ll->count < ZC_LL_PROBE_NUM)
+         {
+         	// set timeout between PROBE_MIN and PROBE_MAX ms
+         	timeout = linklocal_random_range( ZC_LL_PROBE_MIN, ZC_LL_PROBE_MAX);
+				#ifdef ZC_LL_VERBOSE
+					printf( "linklocal: sent probe %d, next in %ums\n",
+						ll->count, timeout);
+				#endif
+				ll->timeout = _SET_TIMEOUT( timeout);
+         }
+         else
+         {
+				#ifdef ZC_LL_VERBOSE
+					printf( "linklocal: sent last probe, announce in %ums\n",
+						ZC_LL_ANNOUNCE_WAIT);
+				#endif
+            ll->timeout = _SET_TIMEOUT( ZC_LL_ANNOUNCE_WAIT);
+            ll->state = ZC_LL_STATE_ANNOUNCE;
+            ll->count = 0;
+         }
+			break;
+
+		case ZC_LL_STATE_ANNOUNCE:			// announce that we're using probe_ip
+			if (! ll->count)
+			{
+				// first pass through STATE_ANNOUNCE, can claim address
+				#ifdef ZC_LL_VERBOSE
+					printf( "linklocal: claiming %s\n",
+						inet_ntoa( ipbuf, ll->probe_ip));
+				#endif
+
+				// change ip address of interface to probe_ip
+				if (_if_tab[iface].ipaddr != ll->probe_ip)
+				{
+					// abort any open sockets, since our IP address is changing
+					_abort_socks( NETERR_IPADDR_CHANGE, iface);
+					_if_tab[iface].ipaddr = ll->probe_ip;
+	            // make sure netmask is set correctly for link-local
+	            _if_tab[iface].mask = IPADDR(255,255,0,0);
+				}
+			}
+
+			// send announcement
+			_arp_request( ll->probe_ip, ll->probe_ip, iface);
+
+			if (++ll->count < ZC_LL_ANNOUNCE_NUM)
+			{
+				#ifdef ZC_LL_VERBOSE
+					printf( "linklocal: sent announcement %d, next in %ums\n",
+						ll->count, ZC_LL_ANNOUNCE_INTERVAL);
+				#endif
+            ll->timeout = _SET_TIMEOUT( ZC_LL_ANNOUNCE_INTERVAL);
+			}
+			else
+			{
+				#ifdef ZC_LL_VERBOSE
+					printf( "linklocal: sent last announcement, now using ip\n");
+				#endif
+				ll->state = ZC_LL_STATE_DEFEND;
+				// initialize timeout value to indicate that we haven't seen
+				// an ARP conflict in DEFEND_INTERVAL ms.
+				ll->timeout = MS_TIMER - ZC_LL_DEFEND_INTERVAL;
+				ll->count = 0;
+
+				// reset conflict counter
+				ll->conflicts = 0;
+
+				return IFCTL_OK;
+			}
+			break;
+
+	}
+
+	return IFCTL_PEND;
+}
+
+/*** BeginHeader linklocal_disable */
+int linklocal_disable( word iface);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+linklocal_disable	                  								<linklocal.lib>
+
+SYNTAX: int linklocal_disable( word iface)
+
+DESCRIPTION:	Called from TCP/IP stack to disable link-local processing for
+					a given interface.  Used when a DHCP server was able to obtain
+					an address, or ifconfig() is called with a valid address.
+
+PARAMETER 1:	Interface with link-local addressing enabled.
+
+RETURN VALUE:	IFCTL_FAIL: Interface isn't configured for link-local.
+					IFCTL_OK: Link-local turned off for given interface.
+
+SEE ALSO:		linklocal_init, linklocal_tick, linklocal_enable
+
+END DESCRIPTION **********************************************************/
+_zc_ll_debug
+int linklocal_disable( word iface)
+{
+	auto ZC_LL_INFO *ll;
+
+	ll = _if_tab[iface].linklocal;
+	if (!ll)
+	{
+		return IFCTL_FAIL;
+	}
+	ll->state = ZC_LL_STATE_DISABLED;
+	return IFCTL_OK;
+}
+
+/*** BeginHeader linklocal_enable */
+int linklocal_enable( word iface, unsigned long ip);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+linklocal_enable	                  								<linklocal.lib>
+
+SYNTAX: int linklocal_enable( word iface, unsigned long ip)
+
+DESCRIPTION:	Called from TCP/IP stack to enable link-local processing for
+					a given interface.  Used when falling back on link-local after
+					a DHCP server timeout.
+
+					Calls linklocal_init() if necessary.
+
+PARAMETER 1:	Interface to enable link-local addressing on.
+
+PARAMETER 2:	Initial address to attempt to use.  If this interface previously
+					used link-local addressing, can be the last-used address.  Pass
+					0 to choose a random address to start with.
+
+RETURN VALUE:	IFCTL_PEND: Interface is already configured for link-local.
+					IFCTL_OK: Link-local turned on for given interface.
+
+SEE ALSO:		linklocal_init, linklocal_tick, linklocal_disable
+
+END DESCRIPTION **********************************************************/
+_zc_ll_debug
+int linklocal_enable( word iface, unsigned long ip)
+{
+	auto ZC_LL_INFO *ll;
+
+	ll = _if_tab[iface].linklocal;
+	if (ll && ll->state != ZC_LL_STATE_DISABLED)
+	{
+		if (ll->state == ZC_LL_STATE_DEFEND && ! _if_tab[iface].ipaddr)
+		{
+			// DHCP client has reset our IP address
+			// repeat the announce phase immediately & reclaim our IP
+			ll->timeout = _SET_TIMEOUT( 0);
+			ll->state = ZC_LL_STATE_ANNOUNCE;
+			ll->count = 0;
+		}
+
+		// already enabled
+		return IFCTL_PEND;
+	}
+
+	return linklocal_init( iface, ip);
+}
+
+/*** BeginHeader linklocal_is_enabled */
+int linklocal_is_enabled( word iface);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+linklocal_is_enabled	                  							<linklocal.lib>
+
+SYNTAX: int linklocal_is_enabled( word iface)
+
+DESCRIPTION:	Called from TCP/IP stack to see if an interface is currently
+					configured to use link-local addressing.
+
+PARAMETER 1:	Interface to check link-local status.
+
+RETURN VALUE:	1: interface has link-local addressing enabled
+					0: link-local addressing is not enabled for interface
+
+SEE ALSO:		linklocal_init, linklocal_tick, linklocal_enable,
+					linklocal_disable
+
+END DESCRIPTION **********************************************************/
+_zc_ll_debug
+int linklocal_is_enabled( word iface)
+{
+	auto ZC_LL_INFO *ll;
+
+	ll = _if_tab[iface].linklocal;
+	return (ll && ll->state != ZC_LL_STATE_DISABLED);
+}
+
+/*** BeginHeader */
+#endif	// __LINKLOCAL_LIB
+/*** EndHeader */

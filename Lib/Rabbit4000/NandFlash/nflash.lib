@@ -1,0 +1,1986 @@
+/*******************************************************************************
+NFLASH.LIB
+   Copyright (c) Rabbit Semiconductor, Inc., June 2006.
+
+DESCRIPTION:
+   Library for interfacing to NAND flash memory devices via the external I/O
+   data bus.  Specifically written to work with industry standard (eg:  Samsung,
+   Toshiba) NAND flash devices with 528 byte (512 data bytes plus 16 "spare"
+   bytes) page program and 16896 byte (32 pages) block erase sizes.
+
+   NAND Flash Restriction:
+      According to Toshiba's data sheets for TC58DVM72A1FT00, TC58DVM82A1FT00,
+      TC58DVM92A1FT00 and TC58DVG02A1FT00 NAND flash devices (commonly used in
+      16 MB through 128 MB xD Picture Card devices, respectively), out of order
+      page programming within an erase block is prohibited.  Due to this
+      restriction, the NAND flash driver offers only 16896 byte (block erase
+      size) at a time read and write capability.
+
+   The NAND flash API functions are designed to be reasonably similar to the
+   newer serial flash API functions found in SFLASH.LIB, however, the
+   operational differences between serial flash and NAND flash devices
+   necessitate several corresponding API differences.
+
+   These API functions make use of an nf_device structure as a handle for a
+   specific NAND flash device.  This allows multiple NAND flash devices to be
+   used by an application.
+
+   The API functions are:
+      nf_initDevice
+      nf_readPage
+      nf_eraseBlock
+      nf_writePage
+      nf_getPageCount
+      nf_getPageSize
+      nf_isBusyRBHW
+      nf_isBusyStatus
+
+SUPPORT LIB'S:
+   ECC.LIB, PART_DEFS.LIB
+*******************************************************************************/
+
+/*** BeginHeader */
+
+#ifndef __NFLASH_LIB__
+#define __NFLASH_LIB__
+
+#ifndef __ECC_LIB
+ #use "ecc.lib"
+#endif
+#ifndef __PART_DEFS_LIB
+ #use "part_defs.lib"
+#endif
+
+#ifdef NFLASH_DEBUG
+#define _nflash_nodebug __debug
+#else
+#define _nflash_nodebug __nodebug
+#endif
+
+// must define a NAND  flash programming unit size, if not already defined by
+//  the application
+#ifndef NFLASH_USEERASEBLOCKSIZE
+	// if NFLASH_USEERASEBLOCKSIZE is not defined, its value defaults to 1
+	//  0 == use 512 byte main data page size; 1 == use 16 KB main data page size
+	#define NFLASH_USEERASEBLOCKSIZE 1
+#endif
+
+// the application may define NFLASH_CANERASEBADBLOCKS in order to be allowed to
+//  erase bad blocks and to read initial bad blocks that would otherwise be
+//  skipped over in order to make page zero start at the first good block
+//#define NFLASH_CANERASEBADBLOCKS
+
+// a marker value to attest to valid battery backed xmem buffers content, etc.
+#define _NFLASH_MARKERVALUE 0xA55A3CC3L
+
+// maximum number of devices supported simultaneously by this library
+#define _NFLASH_MAXDEVICES 2	// soldered on device plus socketed device
+
+// NAND flash commands
+#define _NFLASH_AUTOPROGRAM	0x10	// execute auto program page (write) command
+#define _NFLASH_DATAINPUT		0x80	// load program page data to internal buffer
+#define _NFLASH_IDREAD			0x90	// read manufacturer+device ID
+#define _NFLASH_READMODE1		0x00	// read starting in first 256 bytes of page
+#define _NFLASH_READMODE2		0x01	// read starting in second 256 bytes of page
+#define _NFLASH_READMODE3		0x50	// read starting, staying in 16 spare bytes
+#define _NFLASH_RESET			0xFF	// reset device (terminates other command)
+#define _NFLASH_STATUSREAD		0x70	// report status (Pass/Fail, Ready/Busy
+
+#define _NFSTATE_PAGEWR_SAVE   -1   // Save erase block's backfill information
+#define _NFSTATE_PAGEWR_INIT   -2   // Initiate erase block operation
+#define _NFSTATE_SECTOR_WRITE  -8   // Sector write operation (assumed erased)
+#define _NFSTATE_PAGE_MOVE     -16  // Page move operation
+#define _NFSTATE_PAGE_ERASE    -32  // Page erase operation
+
+#ifndef _LCALL_RETBYTES
+// Not already defined in another library with pure xmem asm functions that use
+//  stack parameters.
+#define _LCALL_RETBYTES 3		// number of bytes stacked for lcall return
+#endif
+
+#define NFLASH_SCANBAD 16   // Bad block scan option for nf_initDevice function
+
+// Status macros: bit 7 = write protect, bit 6 = busy, bit 0 = operation failed
+//   Any bit set to 1 indicates the above stated condition
+#define nf_getstatus(X, Y) Y = _nf_deviceStatus(X) ^ 0xC0;
+#define nf_waitforstatus(X, Y) \
+                        while(nf_isBusyRBHW(X)); Y = _nf_deviceStatus(X) ^ 0xC0;
+
+typedef struct nf_device_st {
+	unsigned baseaddress;		// base external I/O address
+	sys_iopin_t cspin;			// internal /CS output pin information
+	sys_iopin_t rbpin;			// internal READY/BUSY input pin information
+	int addressbytes;				// number of bytes used for page addressing
+	int mbrtype;					// mbr_drvr type, per MBRTYPE_xxxxx macro defs
+	long startblock;				// first "good" erase block's number
+	long pages;						// total number of pages on the flash device
+	int erasepages;				// number of program pages in an erase block
+	long mainsize;					// size of a page/block, excluding spare data
+	int sparesize;					// size of a program page's spare data
+	int pagebitshift;				// "don't care" bits in a program page address
+	int erasebitshift;			// "don't care" bits in an erase block address
+	char __far *mainbfbuf;			// page/block main data backfill buffer address
+	char __far *sparebfbuf; 		// page/block spare data backfill buffer address
+	char __far *sparebuffer;		// single program page spare data buffer address
+	long marker;					// possibly valid buffers content marker value
+	int crc;							// CRC of prior nf_device struct info
+	// Previous structure elements are write once read mostly and are "protected"
+	//  by a CRC, so they don't need to be explicitly protected.
+	// Following structure elements are general read/write and are not
+	//  "protected" by a CRC, so they must be explicitly protected.
+	__protected int write_state;        // current state of multi-page write
+	__protected long write_page;        // current page of multi-page write
+	__protected char __far *write_buffer; // current buffer ptr for multi-page write
+	__protected struct nf_device_st *next;	// next element in linked list
+} nf_device;
+
+/*** EndHeader */
+
+
+/*** BeginHeader _nf_print_data */
+void _nf_print_data(char *dataTitle, long dataPage, char __far *dataBuffer,
+                      long dataSize);
+/*** EndHeader */
+//DEBUGGING function invoked by defining NFLASH_VERBOSE
+void _nf_print_data(char *dataTitle, long dataPage, char __far *dataBuffer,
+                      long dataSize)
+{
+	auto char ascii_buffer[17];
+	auto char hex_buffer[58];
+	auto char *hptr;
+	auto int  i, end;
+   auto long j;
+
+	printf("%s data (page %lx):\n", dataTitle, dataPage);
+	for (j = 0L; j < dataSize; j += end) {
+		hptr = hex_buffer + sprintf(hex_buffer, "%08lx ", j);
+      end = ((dataSize - j) > 16) ? 16 : (int)(dataSize - j);
+		for (i = 0; i < end; i++, dataBuffer++) {
+			hptr += sprintf(hptr, "%02x ", *dataBuffer);
+			if (*dataBuffer > 31 && *dataBuffer < 127) {
+				ascii_buffer[i] = *dataBuffer;
+			} else {
+				ascii_buffer[i] = '.';
+			}
+      }
+		sprintf(hptr, "   ");
+		ascii_buffer[i] = 0;
+		printf("%s%s\n", hex_buffer, ascii_buffer);
+	}
+}
+
+
+/*** BeginHeader _nf_print_dev */
+void _nf_print_dev(nf_device *dev);
+/*** EndHeader */
+//DEBUGGING function invoked by defining NFLASH_VERBOSE
+void _nf_print_dev(nf_device *dev)
+{
+	printf("nf_device address: 0x%04x\n", dev );
+	printf("\tbaseaddress: 0x%04x\n", dev->baseaddress);
+	printf("\tcspin\n");
+	printf("\t\tport: 0x%04x\n", dev->cspin.port);
+	printf("\t\tshadow: 0x%04x\n", dev->cspin.shadow);
+	printf("\t\tmask: 0x%02x\n", dev->cspin.mask);
+	printf("\trbpin\n");
+	printf("\t\tport: 0x%04x\n", dev->rbpin.port);
+	printf("\t\tshadow: 0x%04x\n", dev->rbpin.shadow);
+	printf("\t\tmask: 0x%02x\n", dev->rbpin.mask);
+	printf("\taddressbytes: %d\n", dev->addressbytes);
+	printf("\tmbrtype: 0x%04x\n", dev->mbrtype);
+	printf("\tstartblock: 0x%08lx\n", dev->startblock);
+	printf("\tpages: %ld\n", dev->pages);
+	printf("\terasepages: %d\n", dev->erasepages);
+	printf("\tmainsize: %lu\n", dev->mainsize);
+	printf("\tsparesize: %u\n", dev->sparesize);
+	printf("\tpagebitshift: %d\n", dev->pagebitshift);
+	printf("\terasebitshift: %d\n", dev->erasebitshift);
+	printf("\tmainbfbuf: 0x%08lx\n", dev->mainbfbuf);
+	printf("\tsparebfbuf: 0x%08lx\n", dev->sparebfbuf);
+	printf("\tsparebuffer: 0x%08lx\n", dev->sparebuffer);
+	printf("\tmarker: 0x%08lx\n", dev->marker);
+	printf("\tcrc: 0x%04x\n", dev->crc);
+	printf("\twrite_state: %d\n", dev->write_state);
+	printf("\twrite_page: 0x%08lx\n", dev->write_page);
+	printf("\twrite_buffer: 0x%08lx\n", dev->write_buffer);
+	printf("\tnext: 0x%04x\n", dev->next );
+}
+
+
+/*** BeginHeader nf_devtable */
+typedef struct {
+	long id_code;			// NAND flash ID code (long allows for future expansion)
+	long pages;				// total number of program pages
+	long pagesize;			// size of each program page, including "spare" bytes
+	int addressbytes;		// address bytes needed for page read/program commands
+	int pagebitshift;		// "don't care" bits in a program page address
+	int erasebitshift;	// "don't care" bits in an erase block address
+} nf_devtable_entry;
+
+// if not already defined by the application, to allow for more or less empty
+//  entries for future expansion
+#ifndef NFLASH_DEVTABLE_SIZE
+#define NFLASH_DEVTABLE_SIZE 12
+#endif
+
+extern const nf_devtable_entry nf_devtable[NFLASH_DEVTABLE_SIZE];
+/*** EndHeader */
+/*
+** table for NAND flash device configuration
+*/
+const nf_devtable_entry nf_devtable[NFLASH_DEVTABLE_SIZE] = {
+	{0x7320L,  32768L, 528L, 3, 9, 14},	// Micron/Numonyx/ST NAND128W3A
+	{0x7520L,  65536L, 528L, 3, 9, 14},	// Micron/Numonyx/ST NAND256W3A
+	{0x7620L, 131072L, 528L, 4, 9, 14},	// Micron/Numonyx/ST NAND512W3A
+	{0x7920L, 262144L, 528L, 4, 9, 14},	// Micron/Numonyx/ST NAND01GW3A
+	{0x73ECL,  32768L, 528L, 3, 9, 14},	// Samsung K9F2808UOC
+	{0x75ECL,  65536L, 528L, 3, 9, 14},	// Samsung K9F5608UOC
+	{0x76ECL, 131072L, 528L, 4, 9, 14},	// Samsung K9F1208U0A/B/M
+	{0x79ECL, 262144L, 528L, 4, 9, 14},	// Samsung K9K1G08U0A/M
+	{0x7398L,  32768L, 528L, 3, 9, 14},	// Toshiba TC58DVM72A1FT00
+	{0x7598L,  65536L, 528L, 3, 9, 14},	// Toshiba TC58DVM82A1FT00, TC58256AFT(I)
+	{0x7698L, 131072L, 528L, 4, 9, 14},	// Toshiba TC58DVM92A1FT00
+	{0x7998L, 262144L, 528L, 4, 9, 14}	// Toshiba TC58DVG02A1FT00
+};
+
+
+/*** BeginHeader nf_initDevice */
+int nf_initDevice(nf_device *dev, int options);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+nf_initDevice                 <NFLASH.LIB>
+
+SYNTAX: int nf_initDevice(nf_device *dev, int options);
+
+DESCRIPTION:  Initializes a particular nand flash device.  This function
+              must be called before the particular nand flash device can
+              be used.  See nf_devtable[] in NFLASH.LIB for the user-
+              updatable list of supported nand flash devices.  Note that
+              xalloc is called to allocate buffer(s) memory for each nand
+              flash device; a run time error will occur if the available
+              xmem RAM is insufficient.
+
+              There are two modes of operation for nand flash devices: FAT
+              and direct.  If you are using the FAT file system in the
+              default configuration, i.e., the nand flash has one FAT
+              partition that takes up the entire device, you do not need
+              to call nf_initDevice.  You only need to call nf_InitDriver,
+              which is the default device driver for the FAT file system
+              on a nand flash device.
+
+              Configurations other than the default one require more work.
+              For example, having two partitions on the device, one a FAT
+              partition and the other a non-FAT partition, require you to
+              know how to fit more than one partition on a device.  A good
+              example of how to do this is in the remote application
+              upload utility.  The function dlm_initserialflash in
+              /LIB/RCM3300/downloadmanager.lib is where to look for code
+              details.  The upload utility is specifically for the
+              RCM3300; however, even without the RCM3300, the utility is
+              still useful in detailing what is necessary to manage
+              multiple partitions.
+
+              The second mode of operation for nand flash devices is
+              direct access.  An application that directly accesses the
+              nand flash (using calls such as nf_readPage and
+              nf_writePage) may define NFLASH_USEERASEBLOCKSIZE to be
+              either 0 (zero) or 1 (one) before NFLASH.LIB is #used, in
+              order to set the nand flash driver's main data program unit
+              size to either the devices' program page size of 512 bytes
+              or to its erase block size of 16 KB.
+
+              If not defined by the application, NFLASH_USEERASEBLOCKSIZE
+              is set to the value 1 in NFLASH.LIB; this mode should
+              maximize the nand flash devices' life.
+              NFLASH_USEERASEBLOCKSIZE value 1 sets the driver up to
+              program an erase block size at a time.  This mode may be
+              best for applications with only a few files open in write
+              mode with larger blocks of data being written, and may be
+              especially good at append operations.  The trade off is
+              reduced flash erasures at the expense of chunkier overhead
+              due to the necessity of performing all 32 pages' ECC
+              calculations for each programming unit written.
+
+              NFLASH_USEERASEBLOCKSIZE value 0 sets the driver up to
+              program a program page size at a time.  This mode may be
+              best for applications with more than a few files open in
+              write mode with smaller blocks of data being written, and
+              may be especially good at interleaved file writes and/or
+              random access write operations.  The trade off is increased
+              flash erasures with the benefit of spread out overhead due
+              to the necessity of performing only 1 page's ECC
+              calculations per programming unit written.
+
+PARAMETER1: dev is a pointer to the nf_device struct that will be filled
+            in.  The nf_device struct will then act as a handle for the
+            NAND flash device.
+
+PARAMETER2: options allows selection of the nand flash device to initialize
+            and selection of initial scanning of the device.
+            Currently the least significant bit (bit 0) is set to 0 for the
+            soldered-on device or 1 for the socketed (xD Card) device.
+            Bit 4 should be set if a bad block scan is desired.
+            This is defined as NFLASH_SCANBAD for convenience. A bad block
+            scan will error if more than 2 percent of the blocks are marked
+            bad.  All other bits must be zero.
+
+RETURN VALUE: 0 if success,
+              -1 if unknown index or bad internal I/O port information,
+              -2 if error communicating with flash chip, or
+              -3 if unknown flash chip type.
+              -4 if device has too many bad blocks (2 percent or higher)
+END DESCRIPTION *********************************************************/
+
+#ifdef _ENABLE_16BIT_FLASH_
+ #ifdef __ALLOW_16BIT_AUXIO_DEFECT
+	#warns "Defining __ALLOW_16BIT_AUXIO_DEFECT exposes an ioe bug in exchange"
+	#warns " for improved memory performance.  See the Rabbit 4000 Users Manual"
+	#warns " Appendix B (errata section) or TN255 for complete details."
+	#warns "You may comment out these warning messages if you are certain your"
+	#warns " application is not at risk and absolute top performance is required."
+ #endif
+#endif
+
+#if _BBRAMS_LOCATION != _BBRAMS_NONE
+	// use separate battery backed /CS2 SRAM, when one is available
+	#define _XALLOC_FOR_NFLASH XALLOC_BB
+#else
+	// otherwise, assume standard /CS1 SRAM is battery backed!
+//	#warns "Using main /CS1 SRAM, data loss may result if not battery backed."
+	#define _XALLOC_FOR_NFLASH XALLOC_ANY
+#endif
+
+#if RCM4000_SERIES
+   #if (NANDFLASH_ONBOARD) == 0 // NO NAND FLASH
+   #error "This board does not have soldered-on NAND flash"
+   #fatal " or the ID block has been written incorrectly."
+   #endif
+   // Soldered NAND flash port definitions
+   #define NS_X_HASXDFLASH			0
+   #define NF_S_CSPORT           PEDR
+   #define NF_S_CSPORTSHADOW     PEDRShadow
+   #define NF_S_CSPORTFR         PEFR
+   #define NF_S_CSPORTFRSHADOW	PEFRShadow
+   #define NF_S_CSPORTDDR        PEDDR
+   #define NF_S_CSPORTDDRSHADOW  PEDDRShadow
+   #define NF_S_CSMASK           0x08
+   #define NF_S_RBPORT           PEDR
+   #define NF_S_RBPORTSHADOW     PEDRShadow
+   #define NF_S_RBPORTDCR      	PEDCR
+   #define NF_S_RBPORTDCRSHADOW  PEDCRShadow
+	#define NF_S_RBPORTFR			PEFR
+	#define NF_S_RBPORTFRSHADOW	PEFRShadow
+   #define NF_S_RBMASK           0x02
+   #define NF_S_BASEADDR         0x5BDC
+   #define NF_S_IBXCR_SETTING		0x8b	// 3WS, /CS stb, wr OK, mem bus, early IOWR
+#endif
+#if RCM4500W_SERIES
+   // Soldered NAND flash port definitions
+   #define NS_X_HASXDFLASH			0
+   #define NF_S_CSPORT           NAPCR
+   #define NF_S_CSPORTSHADOW     NAPCRShadow
+   #define NF_S_CSPORTFR       	0					// N/A
+   #define NF_S_CSPORTFRSHADOW	0					// N/A
+   #define NF_S_CSPORTDDR        0					// N/A
+   #define NF_S_CSPORTDDRSHADOW  0					// N/A
+
+   #define NF_S_CSMASK           0x08
+   #define NF_S_RBPORT           PEDR
+   #define NF_S_RBPORTSHADOW     PEDRShadow
+   #define NF_S_RBPORTDCR      	PEDCR
+   #define NF_S_RBPORTDCRSHADOW  PEDCRShadow
+	#define NF_S_RBPORTFR			PEFR
+	#define NF_S_RBPORTFRSHADOW	PEFRShadow
+   #define NF_S_RBMASK           0x08
+   #define NF_S_BASEADDR         0x5BDC
+   #define NF_S_IBXCR_SETTING		0x8b	// 3WS, /CS stb, wr OK, mem bus, early IOWR
+#endif
+
+// default to definitions for RCM3365 for undefined values
+#ifndef NF_S_CSPORT
+   #define NF_S_CSPORT           PDDR
+#endif
+#ifndef NF_S_CSPORTSHADOW
+   #define NF_S_CSPORTSHADOW     PDDRShadow
+#endif
+#ifndef NF_S_CSPORTFR
+   #define NF_S_CSPORTFR         PDFR
+#endif
+#ifndef NF_S_CSPORTFRSHADOW
+   #define NF_S_CSPORTFRSHADOW	PDFRShadow
+#endif
+#ifndef NF_S_CSPORTDDR
+   #define NF_S_CSPORTDDR        PDDDR
+#endif
+#ifndef NF_S_CSPORTDDRSHADOW
+   #define NF_S_CSPORTDDRSHADOW  PDDDRShadow
+#endif
+#ifndef NF_S_CSMASK
+   #define NF_S_CSMASK           0x02
+#endif
+#ifndef NF_S_RBPORT
+   #define NF_S_RBPORT           PDDR
+#endif
+#ifndef NF_S_RBPORTSHADOW
+   #define NF_S_RBPORTSHADOW     PDDRShadow
+#endif
+#ifndef NF_S_RBMASK
+   #define NF_S_RBMASK           0x01
+#endif
+#ifndef NF_S_RBPORTDCR
+   #define NF_S_RBPORTDCR      	PDDCR
+#endif
+#ifndef NF_S_RBPORTDCRSHADOW
+   #define NF_S_RBPORTDCRSHADOW  PDDCRShadow
+#endif
+#ifndef NF_S_RBPORTFR
+	#define NF_S_RBPORTFR			PDFR
+#endif
+#ifndef NF_S_RBPORTFRSHADOW
+	#define NF_S_RBPORTFRSHADOW	PDFRShadow
+#endif
+#ifndef NF_S_BASEADDR
+	#define NF_S_BASEADDR         0x5BDC
+#endif
+   // Socketed (xD Picture Card) NAND flash port definitions
+#ifndef NS_X_HASXDFLASH
+   #define NS_X_HASXDFLASH			1
+#endif
+#ifndef NF_X_CSPORT
+   #define NF_X_CSPORT           GOCR
+#endif
+#ifndef NF_X_CSPORTSHADOW
+   #define NF_X_CSPORTSHADOW     GOCRShadow
+#endif
+#ifndef NF_X_CSMASK
+   #define NF_X_CSMASK           0x01
+#endif
+#ifndef NF_X_RBPORT
+   #define NF_X_RBPORT           PDDR
+#endif
+#ifndef NF_X_RBPORTSHADOW
+   #define NF_X_RBPORTSHADOW     PDDRShadow
+#endif
+#ifndef NF_X_RBMASK
+   #define NF_X_RBMASK           0x01
+#endif
+#ifndef NF_X_BASEADDR
+	#define NF_X_BASEADDR         0x5BDC
+#endif
+
+_nflash_nodebug
+int nf_initDevice(nf_device *dev, int options)
+{
+	auto int bitShiftDiff, i, scan, which, myCRC;
+	auto long nandID, page, pagemax, xramSize;
+   static char __far * _nf_xallocBuffer[_NFLASH_MAXDEVICES];
+
+	#GLOBAL_INIT { _f_memset(_nf_xallocBuffer, 0, sizeof(_nf_xallocBuffer)); }
+
+   scan = options & NFLASH_SCANBAD;
+   which = options - scan;
+	switch (which) {
+	case 0:
+		dev->next = NULL;
+		dev->cspin.port   = NF_S_CSPORT;
+		dev->cspin.shadow = &NF_S_CSPORTSHADOW;
+		dev->cspin.mask   = NF_S_CSMASK;
+		dev->rbpin.port   = NF_S_RBPORT;
+		dev->rbpin.shadow = &NF_S_RBPORTSHADOW;
+		dev->rbpin.mask   = NF_S_RBMASK;
+		dev->baseaddress  = NF_S_BASEADDR;
+		// see MBRTYPE_xxxxx macro definitions in part_defs.lib
+#ifdef __FATFTL_LIB
+		dev->mbrtype = MBRTYPE_FLASH;   // FTL layer hides bad block markers
+#else
+		dev->mbrtype = MBRTYPE_FLASH | MBRTYPE_MARKERS;
+#endif
+		break;
+#if NS_X_HASXDFLASH == 1
+	case 1:
+		dev->next = NULL;
+		dev->cspin.port = NF_X_CSPORT;
+		dev->cspin.shadow = &NF_X_CSPORTSHADOW;
+		dev->cspin.mask = NF_X_CSMASK;
+		dev->rbpin.port = NF_X_RBPORT;
+		dev->rbpin.shadow = &NF_X_RBPORTSHADOW;
+		dev->rbpin.mask = NF_X_RBMASK;
+		dev->baseaddress = NF_X_BASEADDR;
+		// see MBRTYPE_xxxxx macro definitions in part_defs.lib
+#ifdef __FATFTL_LIB          // FTL layer hides bad block markers
+		dev->mbrtype = MBRTYPE_FLASH | MBRTYPE_REMOVE;
+#else
+		dev->mbrtype = MBRTYPE_FLASH | MBRTYPE_MARKERS | MBRTYPE_REMOVE;
+#endif
+		break;
+#endif
+	default:
+		return -1;	// unknown index selection, return error!
+	}
+
+	switch (dev->cspin.port) {
+		// Both possible on-board NAND /CEs must be set up here to avoid possible
+		//  bus contention should both be installed but only one initialized and
+		//  the other somehow left in an active state from power up.
+	case NF_X_CSPORT:
+	case NF_S_CSPORT:
+		// set up /BUFEN output for socketed NAND /CE (enabled when low)
+		WrPortI(NF_X_CSPORT, &NF_X_CSPORTSHADOW, 0x03 | NF_X_CSPORTSHADOW);
+		// set up output for soldered NAND /CE (enabled when low)
+		WrPortI(NF_S_CSPORT, &NF_S_CSPORTSHADOW, dev->cspin.mask | NF_S_CSPORTSHADOW);
+      #if !(RCM4500W_SERIES)
+		WrPortI(NF_S_CSPORTFR, &NF_S_CSPORTFRSHADOW, ~(dev->cspin.mask) & NF_S_CSPORTFRSHADOW);
+		WrPortI(NF_S_CSPORTDDR, &NF_S_CSPORTDDRSHADOW, dev->cspin.mask | NF_S_CSPORTDDRSHADOW);
+      #endif
+      #ifdef NANDFLASH_CUSTOM
+      WrPortI(SPCR, &SPCRShadow, 0x8C);   // Enable external I/O bus
+      #endif
+		break;
+	default:
+		return -1;	// unknown NAND /CE control port, return error!
+	}
+
+	switch (dev->rbpin.port) {
+	case NF_S_RBPORT:
+		// port D input is OK for NAND's R/B (busy when low),
+		//  so set open drain output capability (to match NAND's R/B output),
+		WrPortI(NF_S_RBPORTDCR, &NF_S_RBPORTDCRSHADOW, dev->rbpin.mask | NF_S_RBPORTDCRSHADOW);
+		//  and also set normal I/O functionality
+		WrPortI(NF_S_RBPORTFR, &NF_S_RBPORTFRSHADOW, ~(dev->rbpin.mask) & NF_S_RBPORTFRSHADOW);
+/*
+// Don't set the DDR up yet, as it may interfere with the User's desired LED
+//  function.  Instead, we'll only enforce the I/O pin's input mode briefly,
+//  later on, when we need to check the NAND's Ready/Busy hardware status.
+		WrPortI(PDDDR, &PDDDRShadow, ~(dev->rbpin.mask) & PDDDRShadow);
+*/
+		break;
+	default:
+		return -1;	// unknown NAND R/B status port, return error!
+	}
+
+	// set up the external I/O control register
+	i = 0x07 & (dev->baseaddress >> 13);			// index to I/O register, shadow
+	WrPortI(IB0CR + i, &IB0CRShadow - i, NF_S_IBXCR_SETTING);
+
+	// set up port E output as external I/O /CS strobe
+	WrPortI(PEDR, &PEDRShadow, (1 << i) | PEDRShadow);
+	WrPortI(PEFR, &PEFRShadow, (1 << i) | PEFRShadow);
+	WrPortI(PEDDR, &PEDDRShadow, (1 << i) | PEDDRShadow);
+
+	// reset the NAND flash to get it into a known state
+	_nf_deviceReset(dev);
+
+	// now check the NAND flash's internal status byte
+#ifdef NFLASH_VERBOSE
+	printf("status = 0x%x\n", _nf_deviceStatus(dev));
+#endif
+	if (nf_isBusyStatus(dev)) {
+		return -2;	// device is busy? (should not be busy this long after reset!)
+	}
+
+	nandID = _nf_deviceID(dev);
+#ifdef NFLASH_VERBOSE
+	printf("nandID = 0x%08lx\n", nandID);
+#endif
+
+	for (i = 0; i < NFLASH_DEVTABLE_SIZE; ++i) {
+		if (nf_devtable[i].id_code == nandID) {
+			dev->addressbytes = nf_devtable[i].addressbytes;
+			dev->pagebitshift = nf_devtable[i].pagebitshift;
+			dev->erasebitshift = nf_devtable[i].erasebitshift;
+			dev->sparesize = (int) (nf_devtable[i].pagesize -
+			                        (1L << dev->pagebitshift));
+			bitShiftDiff = dev->erasebitshift - dev->pagebitshift;
+			// calculate the number of program pages in an erase block
+			dev->erasepages = 1 << bitShiftDiff;
+#ifdef __NFLASH_FAT_LIB
+// If FAT is used, its cache and journals are used to manage write recovery.
+
+			// set up for programming an erase block size at a time
+			dev->pages = nf_devtable[i].pages >> bitShiftDiff;
+			dev->mainsize = (nf_devtable[i].pagesize << bitShiftDiff) &
+			                ~((1L << dev->erasebitshift) - 1L);
+			// Erase block size write doesn't need main or spare data backfill
+			//  buffers, but does need a single program page spare data buffer.
+			dev->mainbfbuf = dev->sparebfbuf = 0L;
+			xramSize = (long) dev->sparesize;
+			if (_nf_xallocBuffer[which] == 0L) {
+				_nf_xallocBuffer[which] = (char __far *)_xalloc(&xramSize, 0, XALLOC_ANY);
+         }
+			dev->sparebuffer = _nf_xallocBuffer[which];
+
+#else
+// Otherwise, this driver attempts to recover an interrupted write.
+	#if NFLASH_USEERASEBLOCKSIZE
+			// set up for programming an erase block size at a time
+			dev->pages = nf_devtable[i].pages >> bitShiftDiff;
+			dev->mainsize = (nf_devtable[i].pagesize << bitShiftDiff) &
+			                ~((1L << dev->erasebitshift) - 1L);
+			// Erase block size write doesn't need a main data backfill buffer, but
+			//  does need backfill and single program page spare data buffers.
+			// All are stored in a single allocation from battery backed xmem RAM.
+			dev->mainbfbuf = 0L;
+			xramSize = ((long) dev->sparesize << bitShiftDiff) +
+			           (long) dev->sparesize;
+			if (_nf_xallocBuffer[which] == 0L) {
+				_nf_xallocBuffer[which] =
+                        (char __far *)_xalloc(&xramSize, 0, _XALLOC_FOR_NFLASH);
+			}
+			dev->sparebfbuf = _nf_xallocBuffer[which];
+	#else
+			// set up for programming a program page size at a time
+			dev->pages = nf_devtable[i].pages;
+			dev->mainsize = nf_devtable[i].pagesize &
+			                ~((1L << dev->pagebitshift) - 1L);
+			// Program page size write needs a main data backfill buffer, plus
+			//  backfill and single program page spare data buffers.
+			// All are stored in a single allocation from battery backed xmem RAM.
+			xramSize = (nf_devtable[i].pagesize << bitShiftDiff) +
+			           (long) dev->sparesize;
+			if (_nf_xallocBuffer[which] == 0L) {
+				_nf_xallocBuffer[which] =
+                         (char __far *)_xalloc(&xramSize, 0, _XALLOC_FOR_NFLASH);
+			}
+			dev->mainbfbuf = _nf_xallocBuffer[which];
+			dev->sparebfbuf = dev->mainbfbuf + (dev->mainsize << bitShiftDiff);
+	#endif
+			// physical address of the single program page spare data buffer
+			dev->sparebuffer = dev->sparebfbuf +
+			                   ((long) dev->sparesize << bitShiftDiff);
+#endif
+
+			// default to first block being "good"
+			dev->startblock = 0L;
+
+#ifndef NFLASH_CANERASEBADBLOCKS
+			// skip over bad blocks at start of NAND flash device
+#if NFLASH_USEERASEBLOCKSIZE
+			for (page = 0, pagemax = dev->pages; page < pagemax; page += 4L) {
+#else
+			for (page = 0, pagemax = dev->pages; page < pagemax; page += 0x80L) {
+#endif
+				if (_nf_deviceCheckBlock(dev, page * dev->mainsize)) {
+            	// Bad block found, see if good start page found yet
+            	if (dev->startblock == page) {
+               // Move start page and set next test page to be the next page
+#if NFLASH_USEERASEBLOCKSIZE
+						dev->startblock += 1L;
+                  page -= 3L;
+#else
+						dev->startblock += 0x20L;
+                  page -= 0x60L;
+#endif
+   			   }
+#if NFLASH_USEERASEBLOCKSIZE
+               dev->pages -= 1L;
+#else
+               dev->pages -= 0x20L;
+#endif
+	            if (dev->pages < (pagemax - (pagemax / 50))) {
+	               return -4;      // Too many bad blocks on the device
+	            }
+				}
+            else {
+               if (!scan) {
+                  break;
+               }
+            }
+			}
+#endif
+
+#ifdef __NFLASH_FAT_LIB
+// If FAT is used, its cache and journals are used to manage write recovery.
+			dev->write_state = 0;	// enforce initial write state 0
+			dev->marker = 0L;			// neither the marker nor the crc are
+			dev->crc = 0;				//  used with the FAT file system
+#else
+// Otherwise, this driver attempts to recover an interrupted write.
+
+			// -2 in the following "if" is a magic number for the NFLASH.LIB
+			//  nf_initDevice function; it is the minimum numbered (perform block
+			//  erase) state in the nf_writePage function's state machine.
+			if ((_NFLASH_MARKERVALUE == dev->marker) && (-2 <= dev->write_state) &&
+			    (dev->erasepages >= dev->write_state) &&
+			    (getcrc((char *) dev, (char) offsetof(nf_device, crc), 0) ==
+			     dev->crc))
+			{
+				// All dev information seems to be OK after (presumed) power cycle,
+				//  so must be battery backed; BB backfill data should then also be
+				//  good.
+				if (0 < dev->write_state) {
+					// However, can't be sure that the NAND flash's block erase and
+					//  program pages (re)write actually completed before power
+					//  cycle, so back up and do over from the block erase again.
+					dev->write_state = -2;
+				}
+			} else {
+				// At least some dev information is changed, so prepare dev for
+				//  possibility of power fail recovery next time.
+				dev->write_state = 0;	// enforce initial write state 0
+				dev->marker = _NFLASH_MARKERVALUE;
+				// save CRC for nf_device struct up to, but not including its CRC
+				dev->crc = getcrc((char *) dev, (char) offsetof(nf_device, crc), 0);
+			}
+#endif
+
+#ifdef NFLASH_VERBOSE
+			printf("NAND flash device handle initialization completed:\n");
+			_nf_print_dev(dev);
+#endif
+			return 0;
+		}	// end if nf_devtable[i].id_code == nandID
+		else if (0 == nf_devtable[i].id_code) {
+			break;	// end of valid device table entries
+		}
+	}	// end for
+	return -3;	// unknown device
+}
+
+
+/*** BeginHeader nf_readPage */
+int nf_readPage(nf_device *dev, char __far *buffer, long page);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+nf_readPage                   <NFLASH.LIB>
+
+SYNTAX: int nf_readPage(nf_device *dev, char far *buffer, long page);
+
+DESCRIPTION: Reads data from the specified NAND flash device and page to
+             the specified buffer in xmem.  Note that in the case of most
+             error results at least some of the NAND flash page's content
+             has been read into the specified buffer.  Although the buffer
+             content must be considered unreliable, it can sometimes be
+             useful for inspecting page content in "bad" blocks.
+
+PARAMETER1: dev is a pointer to an initialized nf_device structure.
+
+PARAMETER2: buffer is the physical address of the xmem buffer to read data
+            into.
+
+PARAMETER2: page specifies the zero based number of the NAND flash page
+            to be read, relative to the first "good" page's number.
+
+RETURN VALUE: 0 if success, or the first error result encountered:
+              -1 if NAND flash device is busy,
+              -2 if block check time out error,
+              -3 if page is in a bad block,
+              -4 if page read time out error, or
+              -5 if uncorrectable data or ECC error.
+END DESCRIPTION *********************************************************/
+// buffer length must be equal to page/block size!
+_nflash_nodebug
+int nf_readPage(nf_device *dev, char __far *buffer, long page)
+{
+	auto int i, j, result, status;
+	auto long newECC[2], oldECC[2];
+
+	// first, check to see if the NAND flash device is ready
+	if (nf_isBusyStatus(dev)) {
+		// busy, report error immediately
+		return -1;
+	}
+
+	// default to "success" result
+	result = 0;
+
+	// convert relative page number to the page's actual start address
+#if NFLASH_USEERASEBLOCKSIZE
+	page = (page + dev->startblock) << dev->erasebitshift;
+#else
+	page = (page << dev->pagebitshift) + (dev->startblock << dev->erasebitshift);
+#endif
+
+#ifndef __FATFTL_LIB
+	// check if this page is (or is in) a bad block
+	status = _nf_deviceCheckBlock(dev, page);
+	if (1 == status) {
+		// block check time out error
+		result = -2;
+	}
+	else if (2 == status) {
+		// bad block marker error
+		result = -3;
+	}
+#endif
+
+#if NFLASH_USEERASEBLOCKSIZE
+	j = dev->erasepages;	// iterate through all of the erase block's pages
+	while (j--) {
+#endif
+		// read main data into caller's buffer, spare data into device's buffer
+		status = _nf_deviceReadPage(dev, buffer, dev->sparebuffer, page);
+		if (!result && status) {
+			// page read time out error
+			result = -4;
+		}
+
+		for (i = 0; i < 2; ++i) {
+			// get previous ECC, stored in NAND flash page's "spare" data
+			_f_memcpy((char __far *)&oldECC[i], dev->sparebuffer + (13 -(5 * i)), 3);
+
+			// calculate new ECC based on the NAND flash page's main data just read
+			newECC[i] = calculateECC256(buffer + (256 * i));
+			oldECC[i] &= 0x00FFFFFFL;
+#ifdef NFLASH_VERBOSE
+			if (newECC[i] != oldECC[i]) {
+				printf("oldECC[%d] is %08lx, but newECC[%d] is %08lx.\n",
+				       i, oldECC[i], i, newECC[i]);
+				_nf_print_data("Driver's spare", page >> dev->pagebitshift,
+				              dev->sparebuffer, dev->sparesize);
+			}
+#endif
+
+			// check ECCs and correct data (or old ECC) if necessary
+			status = chkCorrectECC256(buffer + (256 * i), &oldECC[i], &newECC[i]);
+			if (!result && (3 == status)) {
+				// uncorrectable data or ECC error
+				result = -5;
+			}
+			if (2 == status) {
+				// put the corrected ECC back into the "spare" data buffer
+				_f_memcpy(dev->sparebuffer +(13-(5 * i)), (char __far *)&oldECC[i],3);
+#ifdef NFLASH_VERBOSE
+				_nf_print_data("Driver's spare", page, dev->sparebuffer,
+				              dev->sparesize);
+#endif
+			}
+		}
+#if NFLASH_USEERASEBLOCKSIZE
+		buffer += 1L << dev->pagebitshift;
+		page += 1L << dev->pagebitshift;
+	}	// end while
+#endif
+
+	return result;
+}
+
+
+/*** BeginHeader nf_eraseBlock */
+int nf_eraseBlock(nf_device *dev, long page);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+nf_eraseBlock                 <NFLASH.LIB>
+
+SYNTAX: int nf_eraseBlock(nf_device *dev, long page);
+
+DESCRIPTION: Erases the block which contains the specified page, on the
+             specified NAND flash device.  Check for completion of the
+             erase operation using either nf_isBusyRBHW or
+             nf_isBusyStatus.
+
+             Normally, this function will not allow a bad block to be
+             erased.  However, when NFLASH_CANERASEBADBLOCKS is defined by
+             the application, the bad block check is not performed, and
+             the application is allowed to erase any block, regardless of
+             whether it is marked good or bad.
+
+PARAMETER1: dev is a pointer to an initialized nf_device structure.
+
+PARAMETER2: page specifies the zero based number of a NAND flash page in
+            the block to be erased, relative to the first "good" page.
+
+RETURN VALUE: 0 if success, or the first error result encountered:
+              -1 if NAND flash device is busy,
+              -2 if block check time out error, or
+              -3 if page is in a bad block.
+END DESCRIPTION *********************************************************/
+_nflash_nodebug
+int nf_eraseBlock(nf_device *dev, long page)
+{
+	auto int i, status;
+
+	// first, check to see if the NAND flash device is ready
+	if (nf_isBusyStatus(dev)) {
+		// busy, report error immediately
+		return -1;
+	}
+
+	// convert relative page number to the page's actual start address
+#if NFLASH_USEERASEBLOCKSIZE
+	page = (page + dev->startblock) << dev->erasebitshift;
+#else
+	page = (page << dev->pagebitshift) + (dev->startblock << dev->erasebitshift);
+#endif
+
+// if the application has not defined NFLASH_CANERASEBADBLOCKS
+#ifndef NFLASH_CANERASEBADBLOCKS
+	// check if this page is (or is in) a bad block
+	status = _nf_deviceCheckBlock(dev, page);
+	if (1 == status) {
+		// block check time out error
+		return -2;
+	}
+	else if (2 == status) {
+		// bad block marker error
+		return -3;
+	}
+#endif
+
+	// now initiate the block erase (non-blocking void function call)
+	_nf_deviceEraseBlock(dev, page);
+
+	return 0;
+}
+
+/*** BeginHeader nf_writePage */
+int nf_writePage(nf_device *dev, char __far *buffer, long page);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+nf_writePage                  <NFLASH.LIB>
+
+SYNTAX: int nf_writePage(nf_device *dev, char far *buffer, long page);
+
+DESCRIPTION: Writes data to the specified NAND flash device and page from
+             the specified buffer in xmem.  Check for completion of the
+             write operation using nf_isBusyRBHW or nf_isBusyStatus.
+
+PARAMETER1: dev is a pointer to an initialized nf_device structure.
+
+PARAMETER2: buffer is a far pointer to the data to be written.
+
+PARAMETER2: page specifies the zero based number of the NAND flash page
+            to be written, relative to the first "good" page.
+
+RETURN VALUE: 0 if success, or the first error result encountered:
+              -1 if NAND flash device is busy,
+              -2 if block check time out error,
+              -3 if page is in a bad block,
+              -4 if xmem/root memory transfer error, or
+              -5 if erase block or program page operation error.
+END DESCRIPTION *********************************************************/
+// buffer length must be equal to page/block size!
+_nflash_nodebug
+int nf_writePage(nf_device *dev, char __far *buffer, long page)
+{
+	auto int i, result;
+	auto char __far *myMainAddr, *mySpareAddr;
+   auto long newECC, myWriteAddr, pageOffset;
+	auto unsigned long oldTimer;
+
+	// this "state machine" falls through each state into the next, to complete
+	//  the entire erase block's program pages write providing that no individual
+	//  state blocks for too long while waiting for the nand flash device
+	switch (dev->write_state) {
+   case _NFSTATE_SECTOR_WRITE:   // Sector write operation
+   case _NFSTATE_PAGE_MOVE:      // Page move operation
+      if (_nf_deviceStatus(dev) != 0x40) {
+         return -1;              // Can't start, device not ready
+      }
+      dev->write_state = 0;      // Operation done, clear state and drop through
+
+	case 0:	// not currently writing (prepare NAND flash write's state machine)
+		dev->write_buffer = buffer;
+
+	// convert relative page number to the page's actual start address
+#if NFLASH_USEERASEBLOCKSIZE
+		dev->write_page = (page + dev->startblock) << dev->erasebitshift;
+#else
+		dev->write_page = (page << dev->pagebitshift) +
+                          (dev->startblock << dev->erasebitshift);
+#endif
+
+		dev->write_state = _NFSTATE_PAGEWR_SAVE;
+		// no break here, fall through to next state!
+	case _NFSTATE_PAGEWR_SAVE:	// save erase block's backfill information
+		result = _nf_saveBackFill(dev, dev->write_page);
+		if (result) {
+			dev->write_state = 0;	// error, abandon this write operation
+			return result;	// one of -1, -2, or -3
+		}
+#if !NFLASH_USEERASEBLOCKSIZE
+		// calculate page's offset into the main and spare backfill data buffers
+		pageOffset = (dev->write_page & ((1L << dev->erasebitshift) - 1L));
+		myMainAddr = dev->mainbfbuf + pageOffset;
+		mySpareAddr = dev->sparebfbuf +
+		              ((pageOffset >> dev->pagebitshift) * (long) dev->sparesize);
+
+		// copy caller's buffer into the main backfill data buffer
+		_f_memcpy(myMainAddr, dev->write_buffer, dev->mainsize);
+
+		// update this page's ECCs
+		_nf_updateECCs(myMainAddr, mySpareAddr);
+#endif
+		dev->write_state = _NFSTATE_PAGEWR_INIT;
+		// no break here, fall through to next state!
+
+	// -2 in the following "case" is a magic number for the NFLASH.LIB
+	//  nf_initDevice function; it is the minimum numbered (perform block
+	//  erase) state in the nf_writePage function's state machine.
+	case _NFSTATE_PAGEWR_INIT:	 // initiate erase block operation
+		_nf_deviceEraseBlock(dev, dev->write_page);
+#if NFLASH_USEERASEBLOCKSIZE
+		// start erase block pages' ECC calculations while the erasure proceeds!
+		//  must calculate all program pages' ECCs when using caller's buffer
+		//  (start by advance-updating erase block's initial program page's ECCs)
+		_nf_updateECCs(dev->write_buffer, dev->sparebfbuf);
+#else
+		// switch to use the main backfill buffer, when it exists
+		dev->write_buffer = dev->mainbfbuf;
+#endif
+		// wait at most 11 milliseconds for completion of erase block operation
+		i = 11;
+		oldTimer = MS_TIMER;
+		while (i) {
+			result = _nf_deviceStatus(dev);
+			// check for not Busy status
+			if (0x40 & result) {
+				break;
+			}
+			// check for new millisecond
+			if (oldTimer != MS_TIMER) {
+				oldTimer = MS_TIMER;
+				--i;
+			}
+		}
+
+		// check for time out or Fail status of erase block operation
+		if (!i || (0x01 & result)) {
+			dev->write_state = 0;	// error, abandon this write operation
+			return -5;	// erase block operation failed!
+		}
+		// calculate the address of the erase block's initial program page
+		dev->write_page = dev->write_page & ~((1L << dev->erasebitshift) - 1L);
+		dev->write_state = 1;
+		// no break here, fall through to next state!
+	default:	// perform program page operations
+		// calculate state's page offset into main buffer, spare backfill buffer
+		pageOffset = (long) (dev->write_state - 1) << dev->pagebitshift;
+		myMainAddr = dev->write_buffer + pageOffset;
+		mySpareAddr = dev->sparebfbuf +
+		              ((pageOffset >> dev->pagebitshift) * (long) dev->sparesize);
+
+		// calculate page's NAND flash address
+		myWriteAddr = dev->write_page + pageOffset;
+
+		// (re)write all program pages back into the erase block (state 0 is
+		//  reserved for "not writing," so valid states are from 1 to the number
+		//  of program pages in an erase block)
+		while ((0 < dev->write_state) && (dev->erasepages >= dev->write_state)) {
+#ifdef NFLASH_VERBOSE
+/*
+			_nf_print_data("Driver's main", myWriteAddr, myMainAddr,
+			              1u << dev->pagebitshift);
+			_nf_print_data("Driver's spare", myWriteAddr, mySpareAddr,
+			              dev->sparesize);
+			printf("\n");
+*/
+#endif
+			_nf_deviceWritePage(dev, myMainAddr, mySpareAddr, myWriteAddr);
+
+			// start set up for next program page operation
+			//  (needed for possible advance-update of next page's ECCs)
+			myMainAddr += 1L << dev->pagebitshift;
+			mySpareAddr += (long) dev->sparesize;
+
+#if NFLASH_USEERASEBLOCKSIZE
+			if (dev->write_state < dev->erasepages) {
+				// continue erase block pages' ECC calcs while writing proceeds!
+				//  must calc all program pages' ECCs when using caller's buffer
+				//  (continue by advance-updating the next program page's ECCs)
+				_nf_updateECCs(myMainAddr, mySpareAddr);
+			}
+#endif
+
+			// wait at most 2 milliseconds for completion of program page operation
+			i = 2;
+			oldTimer = MS_TIMER;
+			while (i) {
+				result = _nf_deviceStatus(dev);
+				// check for not Busy status
+				if (0x40 & result) {
+					break;
+				}
+				// check for new millisecond
+				if (oldTimer != MS_TIMER) {
+					oldTimer = MS_TIMER;
+					--i;
+				}
+			}
+
+			// check for time out or Fail status of program page operation
+			if (!i || (0x01 & result)) {
+				dev->write_state = 0;	// error, abandon this write operation
+				return -6;	// program page operation failed!
+			}
+
+			// complete set up for next program page operation
+			myWriteAddr += 1L << dev->pagebitshift;
+			++(dev->write_state);
+		}	// end while 0<dev->write_state && dev->erasepages>=dev->write_state
+	}	// end switch
+
+	dev->write_state = 0;	// completed this write operation
+	return 0;
+}
+
+
+/*** BeginHeader nf_getPageCount */
+long nf_getPageCount(nf_device *dev);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+nf_getPageCount               <NFLASH.LIB>
+
+SYNTAX: long nf_getPageCount(nf_device *dev);
+
+DESCRIPTION: Returns the number of program pages on the particular NAND
+             flash device.
+
+PARAMETER1: dev is a pointer to an nf_device struct for an initialized
+            NAND flash device.
+
+RETURN VALUE: The number of program pages on the NAND flash device.
+END DESCRIPTION *********************************************************/
+_nflash_nodebug
+long nf_getPageCount(nf_device *dev)
+{
+	return dev->pages;
+}
+
+
+/*** BeginHeader nf_getPageSize */
+long nf_getPageSize(nf_device *dev);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+nf_getPageSize                <NFLASH.LIB>
+
+SYNTAX: long nf_getPageSize(nf_device *dev);
+
+DESCRIPTION: Returns the size in bytes (excluding "spare" bytes) of each
+             program page on the particular NAND flash device.
+
+PARAMETER1: dev is a pointer to an nf_device struct for an initialized
+            NAND flash device.
+
+RETURN VALUE: The number of data bytes in the NAND flash's program page,
+              excluding the "spare" bytes used for ECC storage, etc.
+END DESCRIPTION *********************************************************/
+_nflash_nodebug
+long nf_getPageSize(nf_device *dev)
+{
+	return dev->mainsize;
+}
+
+
+/*** BeginHeader nf_isBusyRBHW */
+__xmem int nf_isBusyRBHW(nf_device *dev);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+nf_isBusyRBHW                 <NFLASH.LIB>
+
+SYNTAX: int nf_isBusyRBHW(nf_device *dev);
+
+DESCRIPTION: Returns 1 if the specified NAND flash device is busy.  Uses
+             the hardware Ready/Busy check method, and can be used to
+             determine the device's busy status even at the start of a
+             read page command.  Note that this function briefly enforces
+             the Ready/Busy input port bit, reads the pin status, and then
+             restores the port bit to its previous input/output state.
+             There should be little or no visible disturbance of the LED
+             output which shares the NAND flash's Ready/Busy status line.
+
+PARAMETER1: dev is a pointer to an initialized nf_device structure for the
+            particular NAND flash chip.
+
+RETURN VALUE: 1 if busy,
+              0 if ready (not currently transferring a page to be read, or
+                          erasing or writing a page), or
+              -1 if error (unsupported Ready/Busy input port).
+END DESCRIPTION *********************************************************/
+_nflash_nodebug __xmem
+int nf_isBusyRBHW(nf_device *dev)
+{
+	auto int result;
+
+	switch (dev->rbpin.port) {
+	case PDDR:
+		// briefly enforce I/O bit input mode while checking the NAND flash's
+		//  Ready/Busy hardware status (no point in saving a copy of the shadow
+		//  because if we're interrupted PDDDR may be changed at return anyway!)
+		WrPortI(PDDDR, NULL, ~(dev->rbpin.mask) & PDDDRShadow);
+		// set result 1 iff Ready/Busy is low
+		result = (RdPortI(PDDR) & dev->rbpin.mask) != dev->rbpin.mask;
+		// restore the I/O bit's previous I/O mode
+		WrPortI(PDDDR, NULL, PDDDRShadow);
+		break;
+	case PEDR:
+		// briefly enforce I/O bit input mode while checking the NAND flash's
+		//  Ready/Busy hardware status (no point in saving a copy of the shadow
+		//  because if we're interrupted PEDDR may be changed at return anyway!)
+		WrPortI(PEDDR, NULL, ~(dev->rbpin.mask) & PEDDRShadow);
+		// set result 1 iff Ready/Busy is low
+		result = (RdPortI(PEDR) & dev->rbpin.mask) != dev->rbpin.mask;
+		// restore the I/O bit's previous I/O mode
+		WrPortI(PEDDR, NULL, PEDDRShadow);
+		break;
+	default:
+		result = -1;	// unknown NAND R/B status port, set error result!
+	}
+	return result;
+}
+
+
+/*** BeginHeader nf_isBusyStatus */
+__xmem int nf_isBusyStatus(nf_device *dev);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+nf_isBusyStatus               <NFLASH.LIB>
+
+SYNTAX: int nf_isBusyStatus(nf_device *dev);
+
+DESCRIPTION: Returns 1 if the specified NAND flash device is busy erasing
+             or writing to a page.  Uses the software status check method,
+             which can not (must not) be used to determine the device's
+             busy status at the start of a read page command.
+
+PARAMETER1: dev is a pointer to an initialized nf_device structure for the
+            particular NAND flash chip.
+
+RETURN VALUE: 1 if busy, or
+              0 if ready (not currently erasing or writing a page).
+END DESCRIPTION *********************************************************/
+_nflash_nodebug __xmem
+int nf_isBusyStatus(nf_device *dev)
+{
+	return !(0x40 & _nf_deviceStatus(dev));
+}
+
+
+/*** BeginHeader _nf_saveBackFill */
+__xmem int _nf_saveBackFill(nf_device *dev, long pageAddress);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+_nf_saveBackFill              <NFLASH.LIB>
+
+SYNTAX: int _nf_saveBackFill(nf_device *dev, long pageAddress);
+
+DESCRIPTION: Saves an erase block's backfill information into the device's
+             main (if it exists) and spare data backfill buffers.
+
+PARAMETER1: dev is a pointer to an initialized nf_device structure for the
+            particular NAND flash chip.
+
+PARAMETER2: pageAddress specifies address bits 31:00 of a NAND flash
+            program page in the erase block whose backfill information is
+            to be saved.  In practice, the largest supported device only
+            uses address bits 26:00; unused high address bits must be zero
+            filled.
+
+RETURN VALUE: 0 if success, or the first error result encountered:
+              -1 if NAND flash device is busy,
+              -2 if block check (page read) time out error, or
+              -3 if page is in a bad block.
+END DESCRIPTION *********************************************************/
+_nflash_nodebug __xmem
+int _nf_saveBackFill(nf_device *dev, long pageAddress)
+{
+	auto int i;
+	auto char __far *myMainAddr, *mySpareAddr;
+
+	// first, check to see if the NAND flash device is ready
+	if (nf_isBusyStatus(dev)) {
+		// busy, report error immediately
+		return -1;
+	}
+
+	// use device's main (nonzero, if it exists) and spare backfill buffers
+	myMainAddr = dev->mainbfbuf;
+	mySpareAddr = dev->sparebfbuf;
+
+	// convert pageAddress to the erase block's first program page start address
+	pageAddress &= ~((1L << dev->erasebitshift) - 1L);
+
+	i = dev->erasepages;	// iterate through all of the erase block's pages
+	while (i--) {
+		// read main data into device's main buffer (if one exists),
+		//  spare data into device's spare buffer
+		if (_nf_deviceReadPage(dev, myMainAddr, mySpareAddr, pageAddress)) {
+			// block check (page read) time out error
+			return -2;
+		}
+
+		// check factory standard block marker byte (page's 0 based byte 517)
+		// Note:  The convention is that 0xFF is good, 0x00 indicates bad from
+		//        the factory, and that 0xF0 indicates gone bad while in use.
+		if (0xFF != mySpareAddr[5]) {
+			// bad block marker error
+			return -3;
+		}
+
+		// update local main buffer pointer only if it exists (is nonzero)
+		myMainAddr += (myMainAddr) ? 1L << dev->pagebitshift : 0L;
+		mySpareAddr += dev->sparesize;
+		pageAddress += 1L << dev->pagebitshift;
+	}	// end while
+
+	return 0;
+}
+
+
+/*** BeginHeader _nf_updateECCs */
+__xmem void _nf_updateECCs(char __far *mainAddress, char __far *spareAddress);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+_nf_updateECCs                <NFLASH.LIB>
+
+SYNTAX: void _nf_updateECCs(char far *mainAddress, char far *spareAddress);
+
+DESCRIPTION: Calculates the ECCs for a program page's main data and stores
+             the new ECCs into the spare data area.
+
+PARAMETER1: mainAddress is the physical address of the program page's main
+            data buffer.
+
+PARAMETER2: spareAddress is the physical address of the program page's
+            spare data buffer.
+
+END DESCRIPTION *********************************************************/
+_nflash_nodebug __xmem
+void _nf_updateECCs(char __far *mainAddress, char __far *spareAddress)
+{
+	auto long newECC;
+
+	// calculate main data buffer's ECCs, save them in the spare data buffer
+	newECC = calculateECC256(mainAddress);
+	_f_memcpy(spareAddress + 13, (__far void *)&newECC, 3u);
+
+	newECC = calculateECC256(mainAddress + 256);
+	_f_memcpy(spareAddress + 8, (__far void *)&newECC, 3u);
+
+   // Calculate and save spare buffer's ECC
+   *((word __far *)(spareAddress + 11)) = calculateECC8(spareAddress);
+
+	return;
+}
+
+
+/*** BeginHeader _nf_deviceCheckBlock */
+__xmem int _nf_deviceCheckBlock(nf_device *dev, long pageAddress);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+_nf_deviceCheckBlock          <NFLASH.LIB>
+
+SYNTAX: int _nf_deviceCheckBlock(nf_device *dev, long pageAddress);
+
+DESCRIPTION: Returns the specified NAND flash page's good vs. bad block
+             marking.  Note that because bad pages must not be erased in
+             order to retain their marking, if any program page within an
+             erase block is marked bad, all of the pages in the block are
+             then considered to be bad.
+
+PARAMETER1: dev is a pointer to an initialized nf_device structure for the
+            particular NAND flash chip.
+
+PARAMETER2: pageAddress specifies address bits 31:00 of the NAND flash
+            page (block) to be checked.  In practice, the largest
+            supported device only uses address bits 26:00; unused high
+            address bits must be zero filled.
+
+RETURN VALUE: 0 if marked as a good block,
+              1 if I/O (time out) error, or
+              2 if marked as a bad block.
+END DESCRIPTION *********************************************************/
+_nflash_nodebug __xmem
+int _nf_deviceCheckBlock(nf_device *dev, long pageAddress)
+{
+	auto int i;
+	auto long checkAddress, mainDataSize;
+
+	mainDataSize = 1L << (long) dev->pagebitshift;
+	// calculate the address of the erase block's initial program page
+	checkAddress = pageAddress & ~((1L << (long) dev->erasebitshift) - 1L);
+	i = dev->erasepages;	// iterate through all of the erase block's pages
+	// to be considered a good block, all of the pages must be marked good
+	while (i--) {
+		// read only the spare data (page's 0 based bytes 512 through 527)
+		if (_nf_deviceReadPage(dev, NULL, dev->sparebuffer, checkAddress)) {
+			return 1;
+		}
+		// check factory standard block marker byte (page's 0 based byte 517)
+		// Note:  The convention is that 0xFF is good, 0x00 indicates bad from
+		//        the factory, and that 0xF0 indicates gone bad while in use.
+		if (0xFF != dev->sparebuffer[5]) {
+			// bad block marker error
+			return 2;
+		}
+		checkAddress += mainDataSize;
+	}
+	return 0;
+}
+
+
+/*** BeginHeader _nf_deviceEraseBlock */
+void _nf_deviceEraseBlock(nf_device *dev, long pageAddress);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+_nf_deviceEraseBlock          <NFLASH.LIB>
+
+SYNTAX: void _nf_deviceEraseBlock(nf_device *dev, long pageAddress);
+
+DESCRIPTION: Erases on the specified NAND flash device the specified
+             block, consisting of multiple (typically 32) program pages.
+             Note that this function ignores PageAddress bits 08:00.
+             Check for completion of the erase operation using either
+             nf_isBusyRBHW or nf_isBusyStatus.  Or, use _nf_deviceStatus
+             to check for Ready/Busy, Pass/Fail and Write Protect status.
+
+PARAMETER1: dev is a pointer to an initialized nf_device structure.
+
+PARAMETER2: pageAddress specifies address bits 31:00 of the NAND flash
+            page to be erased.  In practice, the largest supported device
+            only uses address bits 26:09 and bits 13:09 are ignored;
+            unused high address bits must be zero filled.
+
+RETURN VALUE: None.
+END DESCRIPTION *********************************************************/
+#asm __xmem _nflash_nodebug
+_nf_deviceEraseBlock::
+		push	ix						; must not alter IX (for costates, cofuncs, etc.)
+		ld		ix, (SP+_LCALL_RETBYTES+2+0)	; pointer to dev
+		ld		hl, (SP+_LCALL_RETBYTES+2+3)	; get middle bytes of pageAddress
+		ex		de, hl				; swap middle bytes of pageAddress into DE
+		ld		hl, (SP+_LCALL_RETBYTES+2+4)	; get MSBs of pageAddress
+		ld		c, h					; copy MSB of pageAddress into C (31:08 in CDE)
+		srl	c						; shift 0 into C MSbit, C LSbit (24) into Carry
+		rr		de						; rotate Carry into DE MSbit (now 32:09 in CDE)
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+shadow)
+		ld		a, (IX+nf_device_st+cspin+sys_iopin_st+mask)
+      #if (RCM4500W_SERIES)
+      or		(hl)
+      #else
+		cpl							; complement the mask to reset the NAND's /CE bit
+		and	(hl)					; AND together with NAND's /CE shadow content
+      #endif
+		ld		(hl), a				; update NAND's /CE shadow
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+port)
+ioi	ld		(hl), a				; activate this NAND's /CE
+		ld		hl, (IX+nf_device_st+baseaddress)
+		inc	hl						; add CLE offset to base I/O address in HL
+		ld		a, 0x60				; Auto Block Erase command's first byte
+ioe	ld		(hl), a				; issue command's first byte
+		inc	hl						; increment to ALE offset from base I/O address
+		ld		a, (IX+nf_device_st+addressbytes)	; page read/program addr bytes
+		dec	a						; Auto Block Erase cmd uses one less address byte
+ioe	ld		(hl), e				; send Auto Block Erase command's 1st address byte
+		dec	a						; one less address byte to send
+		jr		z, .doneAddr_nf_dEB	; if done (Zero flag set), skip DC bytes
+
+ioe	ld		(hl), d				; send Auto Block Erase command's 2nd address byte
+		dec	a						; one less address byte to send
+		jr		z, .doneAddr_nf_dEB	; if done (Zero flag set), skip C byte
+
+ioe	ld		(hl), c				; send Auto Block Erase command's 3rd address byte
+.doneAddr_nf_dEB:
+		dec	hl						; decrement to CLE offset from base I/O address
+		ld		a, 0xD0				; Auto Block Erase command's second byte
+ioe	ld		(hl), a				; issue command's second byte
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+shadow)
+		ld		a, (IX+nf_device_st+cspin+sys_iopin_st+mask)
+      #if (RCM4500W_SERIES)
+		cpl							; complement the mask to reset the NAND's /CE bit
+		and	(hl)					; AND together with NAND's /CE shadow content
+      #else
+		or		(hl)					; OR together with NAND's /CE shadow content
+      #endif
+		ld		(hl), a				; update NAND's /CE shadow
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+port)
+ioi	ld		(hl), a				; deactivate this NAND's /CE
+		pop	ix						; must not alter IX (for costates, cofuncs, etc.)
+		lret
+#endasm
+
+
+/*** BeginHeader _nf_deviceID */
+long _nf_deviceID(nf_device *dev);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+_nf_deviceID                  <NFLASH.LIB>
+
+SYNTAX: long _nf_deviceID(nf_device *dev);
+
+DESCRIPTION: Reports the Manufacturer and Device ID codes of the specified
+             NAND flash device.
+
+PARAMETER1: dev is a pointer to an initialized nf_device structure.
+
+RETURN VALUE: The Manufacturer ID code is in the LSB of the result, the
+              Device ID code is in the lower middle byte (bits 15:08) of
+              the result.  The MSBs of the result are currently returned
+              zero filled, but a long result is returned to facilitate
+              expansion should there be a proliferation of compatible NAND
+              flash manufacturers and/or devices in future.
+END DESCRIPTION *********************************************************/
+#asm __xmem _nflash_nodebug
+_nf_deviceID::
+		push	ix						; must not alter IX (for costates, cofuncs, etc.)
+		ld		ix, (SP+_LCALL_RETBYTES+2+0)	; pointer to dev
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+shadow)
+		ld		a, (IX+nf_device_st+cspin+sys_iopin_st+mask)
+      #if (RCM4500W_SERIES)
+      or		(hl)
+      #else
+		cpl							; complement the mask to reset the NAND's /CE bit
+		and	(hl)					; AND together with NAND's /CE shadow content
+      #endif
+		ld		(hl), a				; update NAND's /CE shadow
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+port)
+ioi	ld		(hl), a				; activate this NAND's /CE
+		ld		hl, (IX+nf_device_st+baseaddress)
+		inc	hl						; add CLE offset to base I/O address in HL
+		ld		a, _NFLASH_IDREAD	; ID Read command byte
+ioe	ld		(hl), a				; issue command
+		inc	hl						; increment to ALE offset from base I/O address
+		xor	a						; ID Read address byte (is zero)
+ioe	ld		(hl), a				; send ID Read command's address
+		dec	hl						; restore base I/O
+		dec	hl						;  address
+ioe	ld		e, (hl)				; manufacturer code into LSB of long (BCDE) result
+ioe	ld		d, (hl)				; device code into least middle byte
+		ld		bc, 0x0000			; for now, zero out MSBs of long (BCDE) result
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+shadow)
+		ld		a, (IX+nf_device_st+cspin+sys_iopin_st+mask)
+      #if (RCM4500W_SERIES)
+		cpl							; complement the mask to reset the NAND's /CE bit
+		and	(hl)					; AND together with NAND's /CE shadow content
+      #else
+		or		(hl)					; OR together with NAND's /CE shadow content
+      #endif
+		ld		(hl), a				; update NAND's /CE shadow
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+port)
+ioi	ld		(hl), a				; deactivate this NAND's /CE
+		pop	ix						; must not alter IX (for costates, cofuncs, etc.)
+		lret
+#endasm
+
+
+/*** BeginHeader _nf_deviceReadPage */
+int _nf_deviceReadPage(nf_device *dev, char __far *mainBuffer,
+                         char __far *spareBuffer, long pageAddress);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+_nf_deviceReadPage            <NFLASH.LIB>
+
+SYNTAX: int _nf_deviceReadPage(nf_device *dev, char far *mainBuffer,
+                                char far *spareBuffer, long pageAddress);
+
+DESCRIPTION: Reads from the specified NAND flash page its main and/or
+             spare data into the specified buffers at their respective
+             nonzero physical addresses.  Note that this function ignores
+             pageAddress bits 08:00.  Use _nf_deviceStatus to check for
+             Pass/Fail status after completion of the read operation.
+
+PARAMETER1: dev is a pointer to an initialized nf_device structure.
+
+PARAMETER2: mainBuffer, if nonzero, is the physical address of the page's
+            main data destination buffer.  If mainBuffer is zero, the
+            page's main data is ignored.
+
+PARAMETER3: spareBuffer, if nonzero, is the physical address of the page's
+            spare data destination buffer.  If spareBuffer is zero, the
+            page's spare data is ignored.
+
+PARAMETER4: pageAddress specifies address bits 31:00 of the NAND flash
+            page to be read.  In practice, the largest supported device
+            only uses address bits 26:00; unused high address bits must be
+            zero filled.
+
+RETURN VALUE: 0 if success, or
+              1 if time out error.
+END DESCRIPTION *********************************************************/
+#asm __xmem _nflash_nodebug
+_nf_deviceReadPage::
+		ld		a, _NFLASH_READMODE1	; default to Read Mode (1) command byte
+		ld		bcde, (SP+_LCALL_RETBYTES+0+2)	; get mainBuffer address
+      test bcde               ; nonzero mainBuffer physical address?
+		jr		nz, .doRM1_nf_dRP	; if yes (Zero flag reset), go do Read Mode (1)
+
+		ld		bcde, (SP+_LCALL_RETBYTES+0+6)	; get spareBuffer address
+		test	bcde				   ; nonzero spareBuffer physical address?
+		jr		nz, .doRM3_nf_dRP	; if yes (Zero flag reset), go do Read Mode (3)
+
+      clr   hl
+		lret							; nothing to do, return "success" (HL is zero)
+
+.doRM3_nf_dRP:
+		ld		a, _NFLASH_READMODE3	; switch to use Read Mode (3) command byte
+.doRM1_nf_dRP:
+      push  ix
+		ld		ix, (SP+_LCALL_RETBYTES+2+0)	; pointer to dev
+altd	ld		a, a					; copy Read Mode (1, 3) command byte for later
+		ld		a, (IX+nf_device_st+cspin+sys_iopin_st+mask)
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+shadow)
+      #if (RCM4500W_SERIES)
+      or		(hl)
+      #else
+		cpl							; complement the mask to reset the NAND's /CE bit
+		and	(hl)					; AND together with NAND's /CE shadow content
+      #endif
+		ld		(hl), a				; update NAND's /CE shadow
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+port)
+ioi	ld		(hl), a				; activate this NAND's /CE
+
+		ld		hl, (SP+_LCALL_RETBYTES+2+11)	; get middle bytes of pageAddress
+		ld		de, hl				; swap pageAddress middle bytes into DE
+		ld		hl, (SP+_LCALL_RETBYTES+2+12)	; get MSBs of pageAddress
+		ld		b, h					; copy MSB of pageAddress into B (31:08 in BDE)
+		srl	b						; shift 0 into B MSbit, B LSbit (24) into Carry
+		rr		de						; rotate Carry into DE MSbit (now 32:09 in BDE)
+		ld		c, d					; now move address 32:09 into
+		ld		d, e					;  BCD and finally,
+		ld		e, 0					;  make address 32:09|07:00 in BCDE
+		ld		a, (IX+nf_device_st+addressbytes)	; page read/program addr bytes
+		ld		hl, (IX+nf_device_st+baseaddress)
+		inc	hl						; add CLE offset to base I/O address in HL
+		ex		af, af'				; recover the Read Mode (1, 3) command byte
+ioe	ld		(hl), a				; issue Read Mode (1 or 3) command
+		inc	hl						; increment to ALE offset from base I/O address
+		ex		af, af'				; recover address bytes to send
+ioe	ld		(hl), e				; send Read Mode (1, 3) command's 1st address byte
+		dec	a						; one less address byte to send
+		jr		z, .doneAddr_nf_dRP	; if done (Zero flag set), skip DCB bytes
+
+ioe	ld		(hl), d				; send Read Mode (1, 3) command's 2nd address byte
+		dec	a						; one less address byte to send
+		jr		z, .doneAddr_nf_dRP	; if done (Zero flag set), skip CB bytes
+
+ioe	ld		(hl), c				; send Read Mode (1, 3) command's 3rd address byte
+		dec	a						; one less address byte to send
+		jr		z, .doneAddr_nf_dRP	; if done (Zero flag set), skip B byte
+
+ioe	ld		(hl), b				; send Read Mode (1, 3) command's 4th address byte
+.doneAddr_nf_dRP:
+		ld		b, 10					; busy wait time out loop count
+.busyLoop_nf_dRP:
+		push	bc						; save the time out count
+		push	ix						; stack up the dev parameter
+		lcall	nf_isBusyRBHW
+		add	sp, 2					; scrape HL residue off of the stack
+		pop	bc						; recover the remaining time out count
+		bool	hl						; HL now contains 1 iff device is busy
+		jr		z, .notBusy_nf_dRP	; if not busy (Zero flag set), go read the page
+
+		djnz	.busyLoop_nf_dRP	; if not timed out, loop back to check busy again
+
+      pop   ix
+      lret							; device busy too long, return HL's time out error
+
+.notBusy_nf_dRP:
+		ld		bcde, (SP+_LCALL_RETBYTES+2+2)	; get mainBuffer address
+      ld    hl, bc            ; copy high word of address to HL
+		or		hl, de				; Is mainBuffer physical address zero?
+		jr		z, .spareCheck_nf_dRP	; if zero, go get spare data
+
+      ld    pw, bcde          ; save mainBuffer address to far pointer PW
+      ld    hl, bc            ; save high byte for near address check
+		ld    bc, 1 				; 512 bytes main data loop count (bytes reversed)
+		jr		.copy1916_nf_dRP
+
+.spareCheck_nf_dRP:
+		ld		bcde, (SP+_LCALL_RETBYTES+2+6)	; get spareBuffer address
+      ld    hl, bc
+		or		hl, de				; zero spareBuffer physical address?
+		jp		z, .exit_nf_dRP	; if yes (Zero flag set), we're done, go exit
+      ld    pw, bcde
+      ld    hl, bc            ; save high byte for near address check
+		ld		bc, 0x1000			; 16 bytes spare data loop count (bytes reversed)
+.copy1916_nf_dRP:
+      inc   hl                ; check for near address in far pointer
+      bool  hl
+      jr    nz,.copy_nf_start ; jump if conversion not needed
+      convd pw                ; convert near representation to true far pointer
+.copy_nf_start:
+		ld		hl, (IX+nf_device_st+baseaddress)
+		ld		de, hl				; put base external I/O address into DE
+      clr	hl                ; and clear buffer offset count in HL
+.readLoop_nf_dRP:
+ioe	ld		a, (de)				; get data from the NAND flash
+      ld		(pw+hl), a        ; save byte into buffer
+		inc	hl						; increment the buffer offset
+		djnz	.readLoop_nf_dRP	; if low byte of count is non-zero, loop back
+
+      dec   c
+      jr    z, .readLoop_nf_dRP ; Jump if high byte of count is now zero
+
+      bit   1,h
+		jr		nz, .spareCheck_nf_dRP ; if main page just read, check spareBuffer
+
+.exit_nf_dRP:
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+shadow)
+		ld		a, (IX+nf_device_st+cspin+sys_iopin_st+mask)
+      #if (RCM4500W_SERIES)
+		cpl							; complement the mask to reset the NAND's /CE bit
+		and	(hl)					; AND together with NAND's /CE shadow content
+      #else
+		or		(hl)					; OR together with NAND's /CE shadow content
+      #endif
+		ld		(hl), a				; update NAND's /CE shadow
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+port)
+ioi	ld		(hl), a				; deactivate this NAND's /CE
+		clr	hl						; everything went A-OK!
+      pop   ix
+		lret							; return "success"
+#endasm
+
+
+/*** BeginHeader _nf_deviceReset */
+void _nf_deviceReset(nf_device *dev);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+_nf_deviceReset               <NFLASH.LIB>
+
+SYNTAX: void _nf_deviceReset(nf_device *dev);
+
+DESCRIPTION: Resets the specified NAND flash device to a known state.
+             Check for completion of the reset operation using either
+             nf_isBusyRBHW or nf_isBusyStatus.
+
+PARAMETER1: dev is a pointer to an initialized nf_device structure.
+
+RETURN VALUE: None.
+END DESCRIPTION *********************************************************/
+#asm __xmem _nflash_nodebug
+_nf_deviceReset::
+		push	ix						; must not alter IX (for costates, cofuncs, etc.)
+		ld		ix, (SP+_LCALL_RETBYTES+2+0)	; pointer to dev
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+shadow)
+		ld		a, (IX+nf_device_st+cspin+sys_iopin_st+mask)
+      #if (RCM4500W_SERIES)
+      or		(hl)
+      #else
+		cpl							; complement the mask to reset the NAND's /CE bit
+		and	(hl)					; AND together with NAND's /CE shadow content
+      #endif
+		ld		(hl), a				; update NAND's /CE shadow
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+port)
+ioi	ld		(hl), a				; activate this NAND's /CE
+		ld		hl, (IX+nf_device_st+baseaddress)
+		inc	hl						; add CLE offset to base I/O address in HL
+		ld		a, _NFLASH_RESET	; Reset command byte
+ioe	ld		(hl), a				; issue command
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+shadow)
+		ld		a, (IX+nf_device_st+cspin+sys_iopin_st+mask)
+      #if (RCM4500W_SERIES)
+		cpl							; complement the mask to reset the NAND's /CE bit
+		and	(hl)					; AND together with NAND's /CE shadow content
+      #else
+		or		(hl)					; OR together with NAND's /CE shadow content
+      #endif
+		ld		(hl), a				; update NAND's /CE shadow
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+port)
+ioi	ld		(hl), a				; deactivate this NAND's /CE
+		pop	ix						; must not alter IX (for costates, cofuncs, etc.)
+		lret
+#endasm
+
+
+/*** BeginHeader _nf_deviceStatus */
+int _nf_deviceStatus(nf_device *dev);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+_nf_deviceStatus              <NFLASH.LIB>
+
+SYNTAX: int _nf_deviceStatus(nf_device *dev);
+
+DESCRIPTION: Reports the internal status of the specified NAND flash
+             device.
+
+PARAMETER1: dev is a pointer to an initialized nf_device structure.
+
+RETURN VALUE: The NAND flash device's status in the LSB of the result:
+                bit 0 is Pass (0) or Fail (1), and only valid when Ready;
+                bits 1 through 5 are not used (forced to 0);
+                bit 6 is Busy (0) or Ready (1);
+                bit 7 is Write Protected (0) or Not Write Protected (1).
+END DESCRIPTION *********************************************************/
+#asm __xmem _nflash_nodebug
+_nf_deviceStatus::
+		push	ix						; must not alter IX (for costates, cofuncs, etc.)
+		ld		ix, (SP+_LCALL_RETBYTES+2+0)	; pointer to dev
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+shadow)
+		ld		a, (IX+nf_device_st+cspin+sys_iopin_st+mask)
+      #if (RCM4500W_SERIES)
+      or		(hl)
+      #else
+		cpl							; complement the mask to reset the NAND's /CE bit
+		and	(hl)					; AND together with NAND's /CE shadow content
+      #endif
+		ld		(hl), a				; update NAND's /CE shadow
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+port)
+ioi	ld		(hl), a				; activate this NAND's /CE
+		ld		hl, (IX+nf_device_st+baseaddress)
+		inc	hl						; add CLE offset to base I/O address in HL
+		ld		a, _NFLASH_STATUSREAD	; Status Read command byte
+ioe	ld		(hl), a				; issue command
+		dec	hl						; restore base I/O address
+ioe	ld		e, (hl)				; get status byte
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+shadow)
+		ld		a, (IX+nf_device_st+cspin+sys_iopin_st+mask)
+      #if (RCM4500W_SERIES)
+		cpl							; complement the mask to reset the NAND's /CE bit
+		and	(hl)					; AND together with NAND's /CE shadow content
+      #else
+		or		(hl)					; OR together with NAND's /CE shadow content
+      #endif
+		ld		(hl), a				; update NAND's /CE shadow
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+port)
+ioi	ld		(hl), a				; deactivate this NAND's /CE
+		bool	hl						; clear H (MSB of result)
+		ld		a, e					; copy status byte into A
+		and	0xC1					; ensure status bits 1:5 are all reset (clear)
+		ld		L, a					; put status byte into L (LSB of result)
+		pop	ix						; must not alter IX (for costates, cofuncs, etc.)
+		lret
+#endasm
+
+
+/*** BeginHeader _nf_deviceWritePage */
+void _nf_deviceWritePage(nf_device *dev, char __far *mainBuffer,
+                           char __far *spareBuffer, long pageAddress);
+/*** EndHeader */
+/* START _FUNCTION DESCRIPTION ********************************************
+_nf_deviceWritePage           <NFLASH.LIB>
+
+SYNTAX: void _nf_deviceWritePage(nf_device *dev, char far *mainBuffer,
+                                  char far *spareBuffer, long pageAddress)
+
+DESCRIPTION: Writes to the specified NAND flash page the main and spare
+             data from the specified buffers.  Note that this function
+             ignores pageAddress bits 08:00.  Use _nf_deviceStatus to
+             check for Pass/Fail status after completion of the write
+             operation.
+
+PARAMETER1: dev is a pointer to an initialized nf_device structure.
+
+PARAMETER2: pageAddress specifies address bits 31:00 of the NAND flash
+            page to be written.  In practice, the largest supported device
+            only uses address bits 26:00; unused high address bits must be
+            zero filled.
+
+PARAMETER3: mainBuffer is the physical address of the page's main data
+            source buffer, which should never be zero.
+
+PARAMETER4: spareBuffer is the physical address of the page's spare data
+            source buffer, which should never be zero.
+
+RETURN VALUE: None.
+END DESCRIPTION *********************************************************/
+#asm __xmem _nflash_nodebug
+_nf_deviceWritePage::
+		push	ix						; must not alter IX (for costates, cofuncs, etc.)
+		ld		ix, (SP+_LCALL_RETBYTES+2+0)	; pointer to dev
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+shadow)
+		ld		a, (IX+nf_device_st+cspin+sys_iopin_st+mask)
+      #if (RCM4500W_SERIES)
+      or		(hl)
+      #else
+		cpl							; complement the mask to reset the NAND's /CE bit
+		and	(hl)					; AND together with NAND's /CE shadow content
+      #endif
+		ld		(hl), a				; update NAND's /CE shadow
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+port)
+ioi	ld		(hl), a				; activate this NAND's /CE
+		ld		hl, (SP+_LCALL_RETBYTES+2+11)	; get middle bytes of pageAddress
+		ex		de, hl				; swap pageAddress middle bytes into DE
+		ld		hl, (SP+_LCALL_RETBYTES+2+12)	; get MSBs of pageAddress
+		ld		b, h					; copy MSB of pageAddress into B (31:08 in BDE)
+		srl	b						; shift 0 into B MSbit, B LSbit (24) into Carry
+		rr		de						; rotate Carry into DE MSbit (now 32:09 in BDE)
+		ld		c, d					; now move address 32:09 into
+		ld		d, e					;  BCD and finally,
+		ld		e, 0					;  make address 32:09|07:00 in BCDE
+		ld		hl, (IX+nf_device_st+baseaddress)
+		inc	hl						; add CLE offset to base I/O address in HL
+		xor	a						; Read Mode (1) command byte (is zero)
+ioe	ld		(hl), a				; issue command (to reset Auto Program's pointer!)
+		ld		a, _NFLASH_DATAINPUT	; Serial Data Input command byte
+ioe	ld		(hl), a				; issue command
+		inc	hl						; increment to ALE offset from base I/O address
+		ld		a, (IX+nf_device_st+addressbytes)	; page read/program addr bytes
+ioe	ld		(hl), e				; send Auto Program command's 1st address byte
+		dec	a						; one less address byte to send
+		jr		z, .doneAddr_nf_dWP	; if done (Zero flag set), skip DCB bytes
+
+ioe	ld		(hl), d				; send Auto Program command's 2nd address byte
+		dec	a						; one less address byte to send
+		jr		z, .doneAddr_nf_dWP	; if done (Zero flag set), skip CB bytes
+
+ioe	ld		(hl), c				; send Auto Program command's 3rd address byte
+		dec	a						; one less address byte to send
+		jr		z, .doneAddr_nf_dWP	; if done (Zero flag set), skip B byte
+
+ioe	ld		(hl), b				; send Auto Program command's 4th address byte
+.doneAddr_nf_dWP:
+		dec	hl						; decrement to CLE offset from base I/O address
+		dec	hl						; decrement to base external I/O address
+		ex		de, hl				; swap base external I/O address into DE for later
+		or		1						; reset Zero flag to mark not last transfer
+		push	af						; preserve Zero (is not last transfer) flag
+		ld		b, 0					; 512 bytes main data two-byte transfer loop count
+		ld		pw, (SP+_LCALL_RETBYTES+4+2)	; get mainBuffer address into pw
+		jr		.copy1916_nf_dWP
+
+.spareXfer_nf_dWP:
+		xor	a						; set Zero flag to mark last transfer to be done
+		push	af						; preserve Zero (last transfer for sure) flag
+		ld		b, 8				; 16 bytes spare data two-byte transfer loop count
+		ld		pw, (SP+_LCALL_RETBYTES+4+6)	; get spareBuffer address into pw
+.copy1916_nf_dWP:
+      ld    jkhl,pw           ; check far pointer for unconverted near address
+      ld    a,l               ; save low byte to ACC
+      clr   hl                ; needed if JK is 0xFFFF
+      inc   hl
+      add   hl,jk
+      jr    nz,.copy_nf_start ; jump if conversion not needed
+      convd pw                ; convert near representation to true far pointer
+.copy_nf_start:
+
+      ld    hl,de             ; get base external I/O data address in HL
+      rra                           ; move addr lsb to carry for even/odd test
+		jr		nc, .evenBegin_nf_dWP	; if no carry, go skip "odd" start
+		ex		af, af'				; save even/odd (set/reset) Zero flag for later
+      ld		a,(pw)            ; get single byte to get far pointer word aligned
+ioe	ld		(hl), a				; write only LSB of data pair to the NAND flash
+      ld    pw,pw+1
+      djnz  .writeLoop_nf_dWP ; jump into write loop with first cycle split
+                              ; b is never 1, so jump will always be taken
+.evenBegin_nf_dWP:
+		ex		af, af'				; save even/odd (reset/set) carry flag for later
+.writeLoop_nf_dWP:
+      ld		de,(pw)
+ioe	ld		(hl), e				; write LSB of data pair to the NAND flash
+ioe	ld		(hl), d				; write MSB of data pair to the NAND flash
+		ld 	pw,pw+2				; move pointer to next data pair buffer address
+		djnz	.writeLoop_nf_dWP	; if not done all data pair transfers, loop back
+.loopDone_nf_dWP:
+		ex		af, af'				; did destination buffer start on odd address?
+		jr		nc, .evenEnd_nf_dWP	; if no carry bit, go skip "odd" finish
+
+      ld		a,(pw)
+ioe	ld		(hl), a				; write only LSB of data pair to the NAND flash
+.evenEnd_nf_dWP:
+      ld    de,hl             ; save base address in case of loop back
+		pop	af						; recover Zero (last transfer) flag (set == last)
+		jp		nz, .spareXfer_nf_dWP	; if not last transfer (Zero flag reset),
+												;  go do spare data transfer
+		inc	hl						; add CLE offset to base I/O address in HL
+		ld		a, _NFLASH_AUTOPROGRAM	; Auto Program command byte
+ioe	ld		(hl), a				; issue command
+		ld		ix, (SP+_LCALL_RETBYTES+2+0)	; pointer to dev
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+shadow)
+		ld		a, (IX+nf_device_st+cspin+sys_iopin_st+mask)
+      #if (RCM4500W_SERIES)
+		cpl							; complement the mask to reset the NAND's /CE bit
+		and	(hl)					; AND together with NAND's /CE shadow content
+      #else
+		or		(hl)					; OR together with NAND's /CE shadow content
+      #endif
+		ld		(hl), a				; update NAND's /CE shadow
+		ld		hl, (IX+nf_device_st+cspin+sys_iopin_st+port)
+ioi	ld		(hl), a				; deactivate this NAND's /CE
+		pop	ix						; must not alter IX (for costates, cofuncs, etc.)
+		lret
+#endasm
+
+
+/*** BeginHeader */
+#endif	// __NFLASH_LIB__
+/*** EndHeader */

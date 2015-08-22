@@ -1,0 +1,627 @@
+/* START LIBRARY DESCRIPTION *********************************************
+RSA.LIB
+ *-----------------------------------------------------------------------------
+ * Copyright (c) 2008 Digi International Inc., All Rights Reserved
+ *
+ * This software contains proprietary and confidential information of Digi
+ * International Inc.  By accepting transfer of this copy, Recipient agrees
+ * to retain this software in confidence, to prevent disclosure to others,
+ * and to make no use of this software other than that for which it was
+ * delivered.  This is a published copyrighted work of Digi International
+ * Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+ * prohibited.
+ *
+ * Restricted Rights Legend
+ *
+ * Use, duplication, or disclosure by the Government is subject to
+ * restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+ * Technical Data and Computer Software clause at DFARS 252.227-7031 or
+ * subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+ * Restricted Rights at 48 CFR 52.227-19, as applicable.
+ *
+ * Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+ *-----------------------------------------------------------------------------
+
+DESCRIPTION: Implementation of the RSA public-key encryption
+             algorithm for SSL
+- Algorithm adapted from 'Applied Cryptography, 2nd Edition; Bruce Schneier',
+
+Change History:
+	2009 Sep 25  SJH  Removed local buffers in stack frame to prevent
+	                  stack overruns with large key sizes.
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader */
+#ifndef _RSA_H
+#define _RSA_H
+
+// Math support for RSA
+#ifndef MPARITH_H
+	#use "MPARITH.LIB"
+#endif
+
+#ifndef MPA_FQ
+	#define MPA_FQ
+#endif
+
+// This is the MAXIMUM supported RSA key size (bytes).  We support keys shorter
+// than this as well.  MP_SIZE, defined in MPARITH.LIB, is always a multiple
+// of 16, plus 2 for convenient zero padding.  Hence, we subtract 2 to get the
+// actual RSA modulus ('key') length which must be a multiple of 16 bytes,
+// or 128 bits.
+#define RSA_KEY_LENGTH (MP_SIZE-2)	// Defaults to 128 i.e. 1024 bits.
+
+// Hash function for Mask Generation Function (MGF1)
+#ifndef __SHA_LIB__
+	#use "SHA1.LIB"
+#endif
+
+// Debugging macros
+#ifdef RSA_DEBUG
+	#define _rsa_debug __debug
+#else
+	#define _rsa_debug __nodebug
+#endif
+
+// Primitive types
+typedef char RSA_byte_t;
+typedef unsigned int RSA_uint16_t;
+
+// Civilized types
+typedef struct RSA_public_key_t {
+	int private_key; /* whether private key part is set.
+	                    If so, private key fields follow
+	                    in the enclosing RSA_key struct. */
+	MP_Mod n; /* modulus (p * q) */
+	MP_Mod e; /* public exponent */
+} RSA_public_key;
+
+typedef struct RSA_key_t {
+	word flags;					// Flags as follows:
+#define RSA_KEY_PRIV_COP_YIELD	0x0001
+	// Co-process yield on private key RSA operations
+#define RSA_KEY_PUB_COP_YIELD		0x0002
+	// Co-process yield on public key RSA operations
+
+	RSA_public_key	public;	// However, set the 'private_key' field TRUE!
+
+	MP_Mod d; /* private exponent */
+
+#ifndef RSA_DISABLE_CRT
+	MP_Mod p; 		/* prime p (factor of n) */
+	MP_Mod q; 		/* prime q (factor of n) */
+	MP_Mod dmp1; 	/* d mod (p - 1); CRT exponent */
+	MP_Mod dmq1; 	/* d mod (q - 1); CRT exponent */
+	MP_Mod iqmp; 	/* 1 / q mod p; CRT coefficient */
+#endif
+} RSA_key;
+
+
+
+/*** EndHeader */
+
+/*** BeginHeader RSA_print_key */
+// Debug function only
+void RSA_print_key(struct RSA_key_t __far * k);
+/*** EndHeader */
+__nodebug void RSA_print_mp(char * hdr, MP_Mod __far * m)
+{
+	printf("  %s: length=%u\n", hdr, m->length);
+	mem_dump(m->mod, m->length);
+
+}
+__nodebug void RSA_print_key(struct RSA_key_t __far * k)
+{
+	printf("*** RSA key ***\n");
+	printf("public:\n");
+	RSA_print_mp("n", &k->public.n);
+	RSA_print_mp("e", &k->public.e);
+	if (k->public.private_key) {
+		RSA_print_mp("d", &k->d);
+#ifndef RSA_DISABLE_CRT
+		RSA_print_mp("p", &k->p);
+		RSA_print_mp("q", &k->q);
+#endif
+	}
+	printf("***\n");
+}
+
+/*** BeginHeader RSA_PKCS1v1_5_Encrypt */
+
+
+int RSA_PKCS1v1_5_Encrypt(struct RSA_key_t __far *, RSA_byte_t __far *,
+	                   unsigned int,
+                      RSA_byte_t __far *, int, int, void MPA_FQ *);
+/*** EndHeader */
+
+_rsa_debug
+int RSA_PKCS1v1_5_Encrypt(struct RSA_key_t __far * key,
+                  RSA_byte_t __far * data,
+                  unsigned int data_len, RSA_byte_t __far * output, int signature,
+                  int phase, void MPA_FQ * mms)
+{
+   auto RSA_byte_t MPA_FQ * PS;	// temp padding pointer
+   auto RSA_byte_t MPA_FQ * msg;	// message
+
+   auto unsigned int PS_len, i, j;
+   auto MP_Mod __far * N;
+   auto MP_Mod __far * expon;
+   auto int use_crt;
+
+	N = &key->public.n;
+#ifdef RSA_VERBOSE
+	if (!phase) {
+	   printf("RSA_PKCS1v1_5_Encrypt%s: %u bit key\n",
+	      signature ? " (signature)" : "", N->length-2<<3);
+	   RSA_print_key(key);
+	}
+#endif
+
+	use_crt = 0;
+	if (signature) {
+		if (!key->public.private_key) {
+#ifdef RSA_VERBOSE
+			printf("Failed, no private key\n");
+#endif
+			return -SSL_PRIV_KEY_ENCRYPTION_FAIL;
+		}
+		expon = &key->d;
+#ifndef RSA_DISABLE_CRT
+		use_crt = key->p.length-2 == (N->length-2)>>1;
+#endif
+	}
+	else
+		expon = &key->public.e;
+
+   switch (phase) {
+	case 0:
+	   // Length checking
+	   if(data_len > N->length-13) {
+#ifdef RSA_VERBOSE
+			printf("Failed, data length too long (%d > %d)\n", data_len, N->length-13);
+#endif
+	      return signature ?
+	      	-SSL_PRIV_KEY_ENCRYPTION_FAIL :
+	      	-SSL_PUB_KEY_ENCRYPTION_FAIL;
+	   }
+
+		// Use 'g' field for message, since that's what we need for the
+		// mp_modexpCRT_1() call.  We can then pass a NULL parm to prevent
+		// another copy to self!
+#ifndef RSA_DISABLE_CRT
+		if (use_crt)
+			msg = ((mp_modexpCRT_state MPA_FQ *)mms)->g;
+		else
+#endif
+		msg = ((mp_modexp_state MPA_FQ *)mms)->g;
+	   // calculate block length
+	   PS_len = N->length - data_len - 5;
+		// Build in little endian order to avoid call to bin2mp().
+		PS = msg + N->length - 4 - PS_len;
+
+
+	   if (signature)
+	      _f_memset(PS, 0xFF, PS_len);
+	   else {
+	      _ssl_big_rand(PS, PS_len);
+
+	      // Must not have zero bytes, since null is used as padding terminator.
+	      // Change all 0's to 0xFF's
+	      for (i = 0; i < PS_len; ++i)
+	         if (!PS[i])
+	            PS[i] = 0xFF;
+	   }
+	   PS[-1] = 0;	// Null terminate the padding
+
+	   // Build message to encrypt: set last 2 bytes (MSBs) to x0001 or x0002
+		PS = msg + (N->length - 4);
+		*(word MPA_FQ *)PS = signature ? 1u : 2u;
+
+		// Copy data, reversing endianness
+	   for (i = 0, j = data_len - 1; i < data_len; ++i, --j)
+	   	msg[i] = data[j];
+
+#ifndef RSA_DISABLE_CRT
+		if (use_crt)
+	   	mp_modexpCRT_1((mp_modexpCRT_state MPA_FQ *)mms, /*msg*/NULL,
+	   							&key->p, &key->q,
+	   							key->dmp1.mod, key->dmq1.mod,
+	   							key->iqmp.mod);
+		else
+#endif
+	   mp_modexp_1((mp_modexp_state MPA_FQ *)mms, /*msg*/NULL, expon->mod, N);
+	   return -EAGAIN;
+
+	case 1:
+	   // Encrypt the message
+#ifndef RSA_DISABLE_CRT
+		if (use_crt) {
+	      if (mp_modexpCRT_2((mp_modexpCRT_state MPA_FQ *)mms) < 0)
+	         return -EAGAIN;
+		}
+		else
+#endif
+		if (mp_modexp_2((mp_modexp_state MPA_FQ *)mms) < 0)
+			return -EAGAIN;
+#ifndef RSA_DISABLE_CRT
+		if (use_crt)
+			msg = ((mp_modexpCRT_state MPA_FQ *)mms)->ms.b;
+		else
+#endif
+		msg = ((mp_modexp_state MPA_FQ *)mms)->b;
+
+
+	   // Convert result back to big-endian format
+	   for (i = 0, j = N->length-3; i <= j; ++i, --j) {
+	   	output[i] = msg[j];
+	   	output[j] = msg[i];
+	   }
+#ifdef RSA_VERBOSE
+	   printf("RSA_PKCS1v1_5_Encrypt: done\n");
+#endif
+
+	}
+   return N->length-2;
+}
+
+/*** BeginHeader RSA_PKCS1v1_5_Decrypt */
+
+int RSA_PKCS1v1_5_Decrypt(struct RSA_key_t __far *, RSA_byte_t __far *,
+                          RSA_byte_t __far *, int, int, void MPA_FQ *);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+RSA_PKCS1v1_5_Decrypt                  <RSA.LIB>
+
+SYNTAX: int RSA_PKCS1v1_5_Decrypt(struct RSA_key_t far * key,
+                                  RSA_byte_t far * data,
+                                  RSA_byte_t far * output,
+                                  int sig_check,
+                                  int phase, void * mms);
+
+DESCRIPTION: Dcrypt an RSA-encrypted value, with PKCS#1 v1.5 padding.
+				 PKCS#1 v1.5 padding is as follows:
+
+             00 | 02 | PS | 00 | M
+
+             Where M is the message, and | denotes concatenation
+             PS is a sequence of non-zero random bytes of length
+             RSA_KEY_LENGTH - length(M) - 3.
+
+             If 'sig_check' parameter is true, then padding is same as
+             above except second byte is 01.  Equivalent to use of
+             public key (else private)
+
+PARAMETER 1: RSA key
+PARAMETER 2: Encrypted data
+PARAMETER 3: Output buffer (must be at least RSA_KEY_LEGTH bytes)
+PARAMETER 4: Boolean: true if this is a signature operation, else encryption.
+PARAMETER 5: For non-blocking operation: phase (0 to start, 1 to continue).
+PARAMETER 6: For non-blocking operation: state.  Must point to
+             mp_modexp_state (if RSA_DISABLE_CRT is defined) or
+             mp_modexpCRT_state (if RSA_DISABLE_CRT is not defined).
+
+RETURN VALUE: Returns -1 on error, length of extracted message on success
+
+END DESCRIPTION **********************************************************/
+
+_rsa_debug
+int RSA_PKCS1v1_5_Decrypt(struct RSA_key_t __far * key,
+                          RSA_byte_t __far * data,
+                          RSA_byte_t __far * output, int sig_check,
+                          int phase, void MPA_FQ * mms)
+{
+	auto int i, j, len;
+   auto RSA_byte_t MPA_FQ * msg;
+
+   auto MP_Mod __far * N;
+   auto MP_Mod __far * priv_key;
+   auto int use_crt;
+
+   N = &key->public.n;
+
+#ifdef RSA_VERBOSE
+	if (!phase) {
+	   printf("RSA_PKCS1v1_5_Decrypt%s: %u bit key\n",
+	      sig_check ? " (signature check)" : "", N->length-2<<3);
+	   RSA_print_key(key);
+	}
+#endif
+
+  	use_crt = 0;
+   if (sig_check) {
+   	priv_key = &key->public.e;
+   }
+   else {
+		if (!key->public.private_key) {
+#ifdef RSA_VERBOSE
+			printf("Failed, no private key\n");
+#endif
+			return -SSL_PRIV_KEY_DECRYPTION_FAIL;
+		}
+   	priv_key = &key->d;
+#ifndef RSA_DISABLE_CRT
+		use_crt = key->p.length-2 == (N->length-2)>>1;
+#endif
+   }
+
+
+
+   switch (phase) {
+	case 0:
+#ifndef RSA_DISABLE_CRT
+		if (use_crt)
+			msg = ((mp_modexpCRT_state MPA_FQ *)mms)->g;
+		else
+#endif
+		msg = ((mp_modexp_state MPA_FQ *)mms)->g;
+
+		// Reverse endianness
+	   for (i = 0, j = N->length-3; i <= j; ++i, --j) {
+	   	msg[i] = data[j];
+	   	msg[j] = data[i];
+	   }
+
+	   // Start to decrypt the message.  NULL parameter passed, because we set
+	   // up the appropriate member directly in the state struct (.g)
+#ifndef RSA_DISABLE_CRT
+		if (use_crt)
+	   	mp_modexpCRT_1((mp_modexpCRT_state MPA_FQ *)mms, /*msg*/NULL,
+	   							&key->p, &key->q,
+	   							key->dmp1.mod, key->dmq1.mod,
+	   							key->iqmp.mod);
+		else
+#endif
+	   mp_modexp_1((mp_modexp_state MPA_FQ *)mms, /*msg*/NULL, priv_key->mod, N);
+	   return -EAGAIN;
+	case 1:
+#ifndef RSA_DISABLE_CRT
+		if (use_crt) {
+	      if (mp_modexpCRT_2((mp_modexpCRT_state MPA_FQ *)mms) < 0)
+	         return -EAGAIN;
+		}
+		else
+#endif
+		if (mp_modexp_2((mp_modexp_state MPA_FQ *)mms) < 0)
+			return -EAGAIN;
+#ifndef RSA_DISABLE_CRT
+		if (use_crt)
+			msg = ((mp_modexpCRT_state MPA_FQ *)mms)->ms.b;
+		else
+#endif
+		msg = ((mp_modexp_state MPA_FQ *)mms)->b;
+
+	   // Check validity (endianness is still "reversed" w.r.t. spec.)
+	   if (msg[N->length-3] != 0x00 || msg[N->length-4] != (sig_check ? 0x01 : 0x02)) {
+#ifdef RSA_VERBOSE
+			printf("Failed validity check\n");
+#endif
+	      return sig_check ?
+	      				-SSL_PUB_KEY_DECRYPTION_FAIL :
+	      				-SSL_PRIV_KEY_DECRYPTION_FAIL;
+	   }
+
+	   // Skip over padding (backwards; we are going from MSB down)
+	   i = N->length - 5;
+	   len = N->length-4;
+	   while (msg[i] && len > 0) {
+	      --i;
+	      --len;
+	   }
+
+	   // Account for the 0 padding terminator
+	   --i;
+	   --len;
+
+	   // Extract the decrypted message, reversing it back to std. big-endian
+	   for (j = 0; j <= i; ++j, --i) {
+	   	output[j] = msg[i];
+	   	output[i] = msg[j];
+	   }
+
+#ifdef RSA_VERBOSE
+	   printf("RSA_PKCS1v1_5_Decrypt: done, len=%d\n", len);
+#endif
+	   // Return length of decrypted message
+	   return len;
+
+   }
+
+}
+
+/*** BeginHeader RSA_op */
+void RSA_op(MP_Mod __far *, MP_Mod __far *, RSA_byte_t __far *, RSA_byte_t __far *);
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+RSA_op                                 <RSA.LIB>
+
+SYNTAX: void RSA_op(MP_Mod far * N, RSA_byte_t far * expon,
+                    RSA_byte_t far * data, RSA_byte_t far * output);
+
+DESCRIPTION: Perform an RSA encryption/decryption operation.
+
+PARAMETER 1: The RSA public modulus
+PARAMETER 2: The RSA exponent (public exponent or private key)
+PARAMETER 3: Plaintext data (encryption) or ciphertext (decryption)
+PARAMETER 4: Output ciphertext (encryption) or plaintext (decryption)
+
+RETURN VALUE: None
+
+END DESCRIPTION **********************************************************/
+
+_rsa_debug
+void RSA_op(MP_Mod __far * N, MP_Mod __far * expon,
+            RSA_byte_t __far * data, RSA_byte_t __far * output)
+{
+	// Yes, this is a silly wrapper, but need it to be a function not a macro
+	// since it is called via function pointer from SSL_TPORT.LIB.
+	// Another reason for this wrapper is that in the future there will be a
+	// better algorithm for RSA than brute-force exponentiation.
+	_f_mp_modexp(output, data, expon->mod, N);
+}
+
+
+/*** BeginHeader */
+#define RSA_convert_ASCII(s, m) hex2mp(x, m)
+/*** EndHeader */
+
+/* START _FUNCTION DESCRIPTION ********************************************
+RSA_convert_ASCII                      <RSA.LIB>
+
+SYNTAX: RSA_convert_ASCII(char far * in_str, MP_Mod far* m);
+
+DESCRIPTION: Convert an ASCII-encoded string into a little-endian
+             raw format for use with RSA_op.
+
+             The input format is as follows:
+             The output value 0xAB 4E 67 8A 9D would be represented as
+             the string constant "AB4E678A9D".
+
+             If the input string is longer than required, then the
+             trailing digits will be ignored.  If less than required,
+             then the result will have leading zeros in the MSBs,
+             which will probably fail to work if this is an RSA
+             modulus.  The proper length for the input string
+             is exactly (m->length-2)*2 bytes of hexadecimal characters.
+             An RSA modulus also requires the most significant bit to be
+             '1' i.e. the first hex digit should be 8,9,A..F.
+
+             NOTE: this is implemented as a macro which simply calls
+             hex2mp() in MPARITH.LIB.
+
+PARAMETER 1: ASCII encoded string
+PARAMETER 2: Output for use with RSA_op.  The length field of this
+				 structure must be set *before* calling this function.
+
+RETURN VALUE: None
+
+END DESCRIPTION **********************************************************/
+
+
+
+
+
+
+/*** BeginHeader crypto_public_key_decrypt_pkcs1 */
+// From "x509_all.c":363
+int crypto_public_key_decrypt_pkcs1(struct RSA_key_t __far * key,
+					char __far * crypt, size_t crypt_len,
+					char __far * plain, size_t __far * plain_len);
+/*** EndHeader */
+_rsa_debug
+int crypto_public_key_decrypt_pkcs1(struct RSA_key_t __far * key,
+					char __far * crypt, size_t crypt_len,
+					char __far * plain, size_t __far * plain_len) {
+    auto int len; 	// From "x509_all.c":369
+    auto int phase;
+    // The following are a bit too big to fit on the stack, but they
+    // currently need to be root for pre-6000 CPUs, so we have to use
+    // root allocation for the 4000 and 5000.
+#if _RAB6K
+	#define getmain _sys_malloc
+	#define freemain _sys_free
+#else
+	#define getmain _root_malloc
+	#define freemain _root_free
+#endif
+#ifndef RSA_DISABLE_CRT
+   auto mp_modexpCRT_state MPA_FQ * mms;
+   mms = (mp_modexpCRT_state MPA_FQ *)getmain(sizeof(*mms));
+#else
+   auto mp_modexp_state MPA_FQ * mms;
+   mms = (mp_modexp_state MPA_FQ *)getmain(sizeof(*mms));
+#endif
+#undef getmain
+
+	 // This is a signature check
+    phase = 0;
+    do {
+    	len = RSA_PKCS1v1_5_Decrypt(key, crypt, plain, 1, phase, mms);
+    #ifdef _COPROCESS_H
+    	if (key->flags & RSA_KEY_PUB_COP_YIELD)
+    		cop_yield(NULL);
+    #endif
+    	phase = 1;
+    } while (len == -EAGAIN);
+    freemain(mms);
+#undef freemain
+    if (len<0) return len;
+
+    *plain_len = len;
+    return 0;
+
+}
+
+
+/*** BeginHeader crypto_public_key_encrypt_pkcs1_v15 */
+// From "x509_all.c":474
+int crypto_public_key_encrypt_pkcs1_v15(struct RSA_key_t __far * key,
+													char __far * in, size_t inlen,
+													char __far * out, size_t __far * outlen);
+/*** EndHeader */
+_rsa_debug
+int crypto_public_key_encrypt_pkcs1_v15(struct RSA_key_t __far * key,
+	 												char __far * in, size_t inlen,
+	 												char __far * out, size_t __far * outlen) {
+    auto int len; 	// From "x509_all.c":480
+	 auto int phase;
+	 auto mp_modexp_state mms;
+
+	 phase = 0;
+	 // Using public key = encrypting message
+	 do {
+    	len = RSA_PKCS1v1_5_Encrypt(key,
+    											in, inlen, out, 0, phase, &mms);
+    #ifdef _COPROCESS_H
+    	if (key->flags & RSA_KEY_PUB_COP_YIELD)
+    		cop_yield(NULL);
+    #endif
+    	phase = 1;
+    } while (len == -EAGAIN);
+    if (len<0) return len;
+
+    *outlen = len;
+    return 0;
+
+}
+
+
+/*** BeginHeader crypto_private_key_sign_pkcs1 */
+// From "x509_all.c":490
+int crypto_private_key_sign_pkcs1(struct RSA_key_t __far * key, char __far * in,
+									size_t inlen, char __far * out, size_t __far * outlen);
+/*** EndHeader */
+_rsa_debug
+int crypto_private_key_sign_pkcs1(struct RSA_key_t __far * key, char __far * in,
+									size_t inlen, char __far * out, size_t __far * outlen) {
+    auto int len; 	// From "x509_all.c":494
+	 auto int phase;
+	 auto mp_modexp_state mms;
+
+	 phase = 0;
+	 // Using private key = signing
+	 do {
+    	len = RSA_PKCS1v1_5_Encrypt(key,
+    										in, inlen, out, 1, phase, &mms);
+    #ifdef _COPROCESS_H
+    	if (key->flags & RSA_KEY_PRIV_COP_YIELD)
+    		cop_yield(NULL);
+    #endif
+    	phase = 1;
+    } while (len == -EAGAIN);
+    if (len<0) return len;
+
+    *outlen = len;
+    return 0;
+
+}
+
+
+
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
+

@@ -1,0 +1,451 @@
+/*
+	miniLoader.lib
+
+	Copyright (c) 2009 Digi International Inc., All Rights Reserved
+
+	This software contains proprietary and confidential information of Digi
+	International Inc.  By accepting transfer of this copy, Recipient agrees
+	to retain this software in confidence, to prevent disclosure to others,
+	and to make no use of this software other than that for which it was
+	delivered.  This is a published copyrighted work of Digi International
+	Inc.  Except as permitted by federal law, 17 USC 117, copying is strictly
+	prohibited.
+
+	Restricted Rights Legend
+
+	Use, duplication, or disclosure by the Government is subject to
+	restrictions set forth in sub-paragraph (c)(1)(ii) of The Rights in
+	Technical Data and Computer Software clause at DFARS 252.227-7031 or
+	subparagraphs (c)(1) and (2) of the Commercial Computer Software -
+	Restricted Rights at 48 CFR 52.227-19, as applicable.
+
+	Digi International Inc. 11001 Bren Road East, Minnetonka, MN 55343
+*/
+
+/* START LIBRARY DESCRIPTION *********************************************
+
+	This library supports the Remote Program Update library for the
+   RCM5750 memory model (the only product currently using that model).
+
+   The mini-loader is a small program that runs in RAM transferring
+   a program stored in serial flash to parallel flash. The mini-loader
+   works as follows:
+
+
+     0) The miniloader is compiled into the BIOS to ensure that its code is
+        compiled low in root memory and its data is compiled high.
+     1) The application verifies the firmware update stored in serial flash,
+        leaving the I/O registers properly configured to run the serial flash.
+     2) The application calls buMiniLoader in board_update.lib.
+     3) buMiniLoader sets _bu_ml_StartPage to _bu_firmfile.src.sflash.startpage,
+        which will have been loaded during the verification process. It also
+        sets _bu_ml_FW_length from  _bu_firmfile.info.length to get the
+        total FW size.
+     4) buMiniLoader calls _bu_sfMiniLoader.
+     5) _bu_sfMiniLoader turns off the WDT, interrupts, and Separate I&D.
+     6) _bu_sfMiniLoader copies the first 0x3000 byte of code in parallel
+        flash into the bottom of external RAM.
+     7) External RAM is mapped to Memory Bank 0 at which point the next
+        instruction is fetched from the external RAM copy of the program
+        location and execution continues from there.
+     8) Set Memory Bank 3 to the parallel flash with the LSB of the address
+        inverted.
+     9) Initialize the parallel flash driver to use Memory Bank 3
+        at 0x180000 (maps to the beginning of parallel flash).
+
+    10) IF (CODESIZE <= 512K)
+            Erase the first CODESIZE bytes of parallel flash
+            copy CODESIZE bytes from serial to parallel flash.
+        ELSE
+            Erase the first 512K bytes of parallel flash.
+            copy CODESIZE bytes from serial to parallel flash.
+
+    11) IF (CODESIZE > 512K)
+            Un-invert MB3 address LSB.
+            Re-initialize parallel flash driver flash
+            Erase the last CODESIZE-512K bytes of parallel flash
+            copy the last CODESIZE-512K  bytes from serial to parallel flash.
+
+    12) Enable WDT to 1/4 sec timeout, map Memory Bank 0 to parallel flash
+    13) Infinite loop to WD timeout and reset board.
+
+  ASSUMPTIONS:
+  	  The parallel flash drivers and all the code in this file are located
+     in root code below 0x3000. This assumption is already made about
+     the parallel flash drivers
+
+     MECR is set to use 512K banks sizes (MECR = 0x20).
+
+     The code is currently configured for an Atmel serial flash a page size
+     of 0x210 bytes. If a device that doesn't conform to this is used, some
+     changes will be necessary to the code (see code comments).
+
+END DESCRIPTION **********************************************************/
+
+/*** BeginHeader _bu_sfMiniLoader */
+
+__root void _bu_sfMiniLoader();
+
+#define SF_AR_OFFSET 1
+#define SF_SR_OFFSET 3
+#define SF_CR_OFFSET 4
+#define SF_ER_OFFSET 5
+#define SF_SPI_RXMASK        0x40
+#define SF_SPI_TXMASK        0x80
+#define BU_K_APPROX 0xF83E
+
+#if _BOARD_TYPE_ == RCM5750     // The only board currently supported
+	#define BU_SF_PAGEADDRSHIFT  0x02
+	#define BU_SF_PAGESIZE       0x210
+   #define BU_SPI_CSPORT        PDDR
+   #define BU_SPI_CSPIN         6
+   #define SF_SERPORT			  SBDR
+	#define SF_SPI_CONTROL_VALUE 0x1C
+   #define BU_SF_ENABLECS       ioi  res BU_SPI_CSPIN, (iy)
+   #define BU_SF_DISABLECS      ioi  set BU_SPI_CSPIN, (iy)
+   #define BU_ML_PF_PAGESIZE    0x200
+#else
+	#fatal "This library only works with the RCM5750/60."
+#endif
+
+#define NBUFFER  commBuffer // Use some no-longer-needed BIOS buffer space
+                            // for tansferring data.
+/*** EndHeader */
+
+char bu_serFlashComBuffer[4];
+
+#asm __root
+_bu_sfMiniLoader::
+		ipset 3              ; Turn off interupts until new FW runs
+      ld    a, 0x51        ; Disable watchdog
+ioi   ld    (WDTTR), a
+      ld    a, 0x54
+ioi   ld    (WDTTR), a
+
+#if __SEPARATE_INST_DATA__
+/****************************************
+ DEVIDEA - This works, but we should
+ really just unconditionally see where
+ the stack is mapped and move it if
+ it's in the way.
+**************************************/
+      ld    a, 0xF7        ;  Move stack out of the way of mini-loader copy
+ioi   ld    (STACKSEG), a
+#endif
+
+      ld    bc, 0x3000     ; Copy 1rst 12K to bottom of external RAM.
+      ld    py, 0x100000   ; Should include this function and the root,
+      ld    px, 0x000000   ; BIOS including the parallel flash drivers.
+      copy
+
+      ld    a, 0x45        ; Remap MB0 to internal RAM
+ioi   ld    (MB0CR), a
+      nop                  ; Now root code runs in internal RAM copy of prog.
+
+      ld    a, 0x80
+ioi   ld    (MMIDR), a     ; Turn off Separate I&D
+
+      //***** Get program length and see if  > 512K
+      ld    bcde, (_bu_ml_FW_length)
+      ld    jk, 0x0008
+      clr	hl
+      cp    jkhl, bcde
+      push  bcde             ; Save total size
+      push  af               ; Save carry flag
+
+      //***** Init. parallel flash driver to use bottom half of device
+      ld    a, 0x10          ; Invert LSB (A19)
+ioi   ld    (MB3CR), a
+c    _InitFlashDriver(0x180000ul, 0x180000ul);
+
+      //***** Get start offset in serial flash of new FW
+		ld    de, (_bu_ml_StartPage)
+      ld    bc, BU_SF_PAGESIZE
+      mulu
+      ex    bc, hl
+      ex    de, hl
+      ex    jkhl, bcde
+      ld    pw, jkhl         ; PW = absolute start offset into S flash
+      ld    bc, 0            ; So we subtract 0 from total size
+
+      pop   af               ;  See if we need to program both halves
+      jr    nc, .bu_LT_0x80000
+      push  pw               ; Preserve start offset
+
+      // Erase whole bottom half of parallel flash
+c    _EraseFlashRange(0x180000ul, 0x1FFFFFul);
+      pop   pw               ; Restore serial flash start addr. arg.
+
+      // Program whole bottom half
+      ld    py, 0x00180000   ; Parallel flash start address arg.
+      ld    pz, 0x00200000   ; Parallel flash end address arg.
+      call _bu_ProgamSflash2Pflash
+
+      //***** Now map top half of parallel flash MB 3
+      ld    a, 0x00
+ioi   ld    (MB3CR), a       ; Uninvert LSB
+c    _InitFlashDriver(0x180000ul, 0x180000ul);
+      ld    bc, 0x0008       ; Subtract 512K from total size
+
+.bu_LT_0x80000:
+      pop   jkhl             ; Get total length
+      ld    de,0
+      sub   jkhl, bcde       ; JKHL = prog. size-0 or size-512K
+      push  pw               ; Preserve start (or running) offset
+      ld    bcde, 0
+      ld    bc, 0x0018
+      add   jkhl, bcde       ; JKHL = prog. 0x180000 + remaining size
+      push  jkhl             ; Preserve for programming call
+      push  jkhl             ; Load parameter for erase func.
+      ld    bcde, 0
+      ld    bc, 0x0018
+      push  bcde
+      call  _EraseFlashRange
+      add   sp, 8
+
+      //***** Program remaining parallel flash
+      ld    py, 0x00180000   ; Set start parallel flash address
+      pop   pz               ; Get top address
+      pop   pw               ; Get starting address for program call
+      ld    a,0x10
+      call _bu_ProgamSflash2Pflash
+
+.buMiniLoaderExit:
+
+      //***** Force WD timeout reset
+		xor   a
+ioi   ld    (WDTTR),a        ; Enable WDT
+ioi   ld    (MB0CR), a       ; Map MB0 to parallel flash, 4 wait states
+      ld    a, 0x53          ; Set WDT to 1/4 sec timeout
+ioi   ld    (WDTCR),a
+.bu_resetLoop:               ; Infinite loop, waiting for watchdog timeout
+      jr    .bu_resetLoop
+
+// End of _bu_sfMiniLoader, start of support functions
+
+
+//**********************************************
+// Transfer from serial flash.
+// PZ = top parallel flash address
+// PY = start parallel flash address
+// PW = serial flash start absolute offset
+_bu_ProgamSflash2Pflash::
+.bu_4KPageLoop:
+      ld    ix, SF_SERPORT    ; Serial flash SPI port
+      ld    iy, BU_SPI_CSPORT ; Serial flash CS port
+;; The industry standard 0x03 continuous read command followed by three address
+;; bytes will not work for boards equipped with Atmel serial flash devices with
+;; revision levels earlier than "D" (i.e. revisions prior to AT45DB041D,
+;; AT45DB081D, AT45DB161D, AT45DB321D, AT45DB642D). The 0x03 command is also
+;; limited to 33 MHz operation, maximum. In contrast, the Atmel-specific
+;; "legacy" 0xE8 continuous read command is supported for all AT45DBxxxx serial
+;; flash device revisions to date, at up to 66 MHz operation, maximum.
+		ld		a, 0xE8				; Atmel-specific 0xE8 continuous read command
+      ld    (bu_serFlashComBuffer), a
+      ld    bcde,  pw         ; BCDE = serial flash start read address
+		call _bu_sfgetPageAddr  ; Load 3 address bytes to Comm. buffer+1
+		ld		bc, 8					; command + 3 address + 4 don't care bytes
+		BU_SF_ENABLECS          ; Enable serial flash chip select
+      ld    hl, bu_serFlashComBuffer
+      call  bu_ml_WriteSerFlash
+      ld    de, NBUFFER       ; Read buffer location
+      ld    bc, BU_ML_PF_PAGESIZE
+      call  bu_ml_ReadSerFlash
+		BU_SF_DISABLECS         ; Serial flash CS off
+
+      //***** Write to parallel flash
+      push  py                ; Save parallel flash address to write
+      push  pz                ; Save top address
+      push  pw                ; Save serial flash offset
+      push  BU_ML_PF_PAGESIZE ; Number of bytes to write arg.
+      push  0xFFFF            ; Convert buffer to physical address
+      push  NBUFFER           ; Source buffer logical address ptr. arg.
+      push  py                ; Parallel flash start address arg.
+      call  _ProgramFlashBlock
+      add   sp, 10
+      pop   pw
+      pop   pz
+      pop   py
+
+      //***** Bump up serial flash offset by same amount
+      ld    jkhl, pw
+      ld    de, BU_ML_PF_PAGESIZE
+      ld    bc, 0
+      add   jkhl, bcde
+      ld    pw, jkhl
+
+      //***** Bump up parallel flash address by page
+      ld    jkhl, py
+      add   jkhl, bcde
+      ld    py, jkhl
+
+      ld    bcde, pz
+      cp    jkhl, bcde
+      jr    nc, .bu_copyDone
+
+      jr    .bu_4KPageLoop
+
+.bu_copyDone:
+      // zero flag set = we're done
+      ret								; end of _bu_ProgamSflash2Pflash
+
+//**********************************************
+// Receive the program bytes
+// DE = logical address to read data into
+// BC = number of bytes to read
+// Assumes ix =  SF_SERPORT
+bu_ml_ReadSerFlash::
+; Wait for serial flash communication to be idle, discarding unexpected Rx bytes
+;  as necessary to achieve the idle state, before attempting to receive from the
+;  serial flash.
+; This loop is a potential lock up point, but if lockup occurs it means serial
+;  flash communication is somehow broken. In this case it's probably better to
+;  lock up instead of continuing in some broken manner.
+.bu_r_DropDataLp:
+ioi	ld		a, (ix)					; clear receive data buffer / FIFO
+ioi	ld		a, (ix+SF_SR_OFFSET)	; check status register, is more data waiting?
+		and	0xAC						; test Rx full/overrun, Tx full/sending bits
+		jr		nz, .bu_r_DropDataLp	; if TX busy or RX not empty go re-check . . .
+
+ReadLoop:
+      ld    a, SF_SPI_CONTROL_VALUE | SF_SPI_RXMASK
+ioi   ld    (ix + SF_CR_OFFSET), a ; load RX control value
+ReadWait:                  ; wait for the receive to complete
+ioi   bit   7, (ix + SF_SR_OFFSET)  ; test receiver bit
+      jr    z, ReadWait   ; jump if not done yet
+ioi   ld    a, (ix)       ; get the byte
+      ld    (de), a       ; store the byte
+      inc   de            ; point to next byte
+      dwjnz ReadLoop
+		ret									; end of bu_ml_ReadSerFlash
+
+//**********************************************
+// Send serial bytes
+// BC = number of bytes to write
+// PX = source ptr
+// Assumes ix =  SF_SERPORT
+bu_ml_WriteSerFlash::
+; Wait for serial flash communication to be idle, discarding unexpected Rx bytes
+;  as necessary to achieve the idle state, before attempting to transmit to the
+;  serial flash.
+; This loop is a potential lock up point, but if lockup occurs it means serial
+;  flash communication is somehow broken. In this case it's probably better to
+;  lock up instead of continuing in some broken manner.
+.bu_w_DropDataLp:
+ioi	ld		a, (ix)					; clear receive data buffer / FIFO
+ioi	ld		a, (ix+SF_SR_OFFSET)	; check status register, is more data waiting?
+		and	0xAC						; test Rx full/overrun, Tx full/sending bits
+		jr		nz, .bu_w_DropDataLp	; if TX busy or RX not empty go re-check . . .
+
+sbfStreamOutL:
+      ld    a, (hl)  ; get a byte
+ioi   ld    (ix), a  ;  send it
+      ld    a, SF_SPI_CONTROL_VALUE | SF_SPI_RXMASK | SF_SPI_TXMASK
+ioi   ld    (ix + SF_CR_OFFSET), a
+;; The Rabbit's SPI transmitter idle status bit is actually set 1/2 bit-time
+;; early. To compensate for this, we start a simultaneous receive plus transmit
+;; operation and wait for the receive operation to complete. We discard the
+;; received byte before proceeding.
+sbfSoTXwait:
+ioi   bit   7, (ix + SF_SR_OFFSET)  ; wait for receiver bit to be set
+      jr    z, sbfSoTXwait
+
+ioi   ld    a, (ix)						; get dummy read byte (clear receiver bit)
+      inc   hl
+      dwjnz  sbfStreamOutL
+
+		ret									; end of bu_ml_WriteSerFlash
+
+//**********************************************
+//  Converts BCDE physical address to three page/offset bytes
+//  in the Atmel serial flash format and loads them to
+//  bu_serFlashComBuffer+1
+//  See BOOTDEV_SFLASH.LIB _sbf_getPageAddr for a detailed
+//  description of the aglorithm.
+_bu_sfgetPageAddr::
+// For future reference if binary mode mode used
+//  a = binary mode  1 = binary mode, 0 = standard
+//      bit     0,a
+//      jr      nz, .busf_OffsetOK     ; Just return if bin. mode
+
+      //*** Standard mode ***
+.busf_StdMode:
+      ld       hl, BU_SF_PAGEADDRSHIFT
+      push     bcde                    ; Save Addr
+      rrc      8, bcde                 ; R always > 8, work with 3 bytes
+      ld       b, 0
+.busf_Loop1:
+      dec      L                       ; dec. & test 1rst since r=R-1
+      jr       z, .busf_SadrrDone
+      srl      1, bcde                 ; Shift the rest of the way
+      jr       .busf_Loop1
+.busf_SadrrDone:                       ; DE = Addr>>r = Pb,(BC=0)
+      ld       bc, BU_K_APPROX
+      mulu                             ; HL:BC = (Addr>>r)*0xF83E
+                                       ; HL = (Addr>>r)*0xF83E >> 16 = K*Pb
+      ld       de, hl                  ; DE  = K*Pb = Ps
+      ld       bc', hl                 ; BC' = Ps
+      ld       bc, BU_SF_PAGESIZE      ; BC = S
+      mulu                             ; HL:BC = S*Ps
+      ld       d, b
+      ld       e, c
+      ex       bc, hl                  ; BC:DE = S*Ps
+      pop      jkhl                    ; JKHL = Addr
+      sub      jkhl, bcde              ; HL = Offs, (JK = 0)
+      ex       de', hl                 ; DE' = Offs
+      exx                              ; BC = Ps, DE = Offs
+
+      //*** Adjust for offs too big  ***
+      ld       hl, BU_SF_PAGESIZE
+      dec      hl
+      cp       hl, de
+      jr       nc, .busf_OffsetOK     ; Jump iff offs <= (S-1)
+      inc      bc                     ; Increment Ps,
+      inc      hl
+      ex       de, hl                 ;     and
+      sub      hl, de                 ; Decrease offs by S
+      ex       de, hl
+.busf_OffsetOK:
+
+      ; In std. mode, we need a tweak See ATMEL data sheets for
+      ; bit pattern
+      ld      a, BU_SF_PAGEADDRSHIFT
+.busf_LAloop:
+      cp      0               ; Test 1rst because we might not shift
+      jr      z, .busf_LAready
+      rlc     bc              ; Rotate left 1
+      dec     a
+      jr      .busf_LAloop
+.busf_LAready:
+      ld      a, c            ; Merge bits of of third byte
+      or      d
+      ld      c, a
+.busf_LA_load:                ; Gets sent out big endian
+		ld      hl, bu_serFlashComBuffer+1
+      ld      a, b
+      ld      (hl), a
+      ld      a, c
+      inc     hl
+      ld      (hl), a
+      ld      a, e
+      inc     hl
+      ld      (hl), a
+      ret							; end of _bu_sfgetPageAddr
+
+_bu_EndMiniLoader::
+
+#endasm
+
+/*** BeginHeader buMiniLoader */
+int buMiniLoader (unsigned startpage, unsigned long length);
+/*** EndHeader */
+// Entry point for mini loader:
+// Set globals and call function embedded in BIOS.
+__nodebug
+int buMiniLoader (unsigned startpage, unsigned long length)
+{
+	_bu_ml_StartPage = startpage;
+	_bu_ml_FW_length = length;
+   _bu_sfMiniLoader();
+}
+
