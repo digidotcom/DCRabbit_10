@@ -1,0 +1,2187 @@
+/*
+   Copyright (c) 2015 Digi International Inc.
+
+   This Source Code Form is subject to the terms of the Mozilla Public
+   License, v. 2.0. If a copy of the MPL was not distributed with this
+   file, You can obtain one at http://mozilla.org/MPL/2.0/.
+*/
+/*** BeginHeader */
+#ifndef __WRITEIDBLOCK_LIB
+#define __WRITEIDBLOCK_LIB
+/*** EndHeader */
+
+/* START LIBRARY DESCRIPTION ***************************************************
+WRITEIDBLOCK.LIB
+
+DESCRIPTION:
+	System ID block writing common functions.
+
+API FUNCTIONS:
+	wib_addAutomaticValues(.)
+	wib_addMacro(.,.,.)
+	wib_buildAndWrite(.)
+	wib_checkReservedFlash(.)
+	wib_copyExistingIdBlock(.)
+	wib_getSysConstsSz(.)
+	wib_initWriteIdBlockLib(.,.)
+	wib_removeMacro(.,.)
+	wib_setMAC(.,.)
+	wib_setProductName(.,.)
+	wib_setSerialNumber(.,.)
+	wib_setSys4kBlocks(.,.)
+	wib_setSysConsts(.,.,.)
+	wib_setTimeStamp(.,.)
+	wib_setUser4kBlocks(.,.)
+	wib_setVendorId(.,.)
+	wib_termWriteIdBlockLib(.,.)
+	wib_writeValidMarker(.,.)
+
+DEBUG FUNCTIONS:
+	wib_askRetainMAC(.,.)
+	wib_dumpMacroTable(.)
+
+SUPPORT LIB'S:
+END DESCRIPTION ***************************************************************/
+
+
+// -----------------------------------------------------------------------------
+// |          ID+User blocks and associated items' typical placement           |
+// -----------------------------------------------------------------------------
+
+/*
+	top of (parallel or serial) primary flash
+	highest physical address (offset)
+	+---------------------------------------------+
+	| valid marker ID (member of system ID block) |
+	| version 5 system ID block                   |
+	| optional system constants (below ID block)  |
+	| optional system macro table                 |
+	| optional memory device specification table  |
+	~                                             ~ one or more sectors (pages)
+	| reserved persistent data storage area       |
+	+---------------------------------------------+ sector (page) boundary
+	| valid marker A                              |
+	~                                             ~ one or more sectors (pages)
+	| User block image A                          |
+	+---------------------------------------------+ sector (page) boundary
+	| valid marker B                              |
+	~                                             ~ one or more sectors (pages)
+	| User block image B                          |
+	+---------------------------------------------+ sector (page) boundary
+	|                                             |
+	~                                             ~
+	~ BIOS + application code and constants space ~
+	~                                             ~
+	|                                             |
+	+---------------------------------------------+
+	bottom of (parallel or serial) primary flash
+	lowest physical address (offset)
+*/
+
+
+// -----------------------------------------------------------------------------
+// |                      Macro definitions and typedefs                       |
+// -----------------------------------------------------------------------------
+
+/*** BeginHeader */
+#ifndef ENABLE_SYSTEM_ID_BLOCK_OVERWRITE
+	#error "CAUTION: This library's functionality is intended only for advanced"
+	#error "   Users. Overwriting a system ID block and its associated reserved"
+	#error "   memory area may permanently destroy factory and / or custom User"
+	#error "   information that is stored in the primary flash."
+	#fatal "Must #define ENABLE_SYSTEM_ID_BLOCK_OVERWRITE to #use this library!"
+#endif	// ENABLE_SYSTEM_ID_BLOCK_OVERWRITE
+
+#ifdef WIB_DEBUG
+	#define _wib_debug debug
+#else	// WIB_DEBUG
+	#define _wib_debug nodebug
+#endif	// WIB_DEBUG
+
+// default size of the optional system constants area
+#ifndef WIB_CONST_SZ_MAX
+ #ifdef _DC_CONST_SZ_
+	#define WIB_CONST_SZ_MAX _DC_CONST_SZ_
+ #else	// _DC_CONST_SZ_
+	#define WIB_CONST_SZ_MAX 0
+ #endif	// _DC_CONST_SZ_
+#endif	// WIB_CONST_SZ_MAX
+
+// default size of the flash write buffer
+#ifndef WIB_WR_BUF_SZ
+	#define WIB_WR_BUF_SZ 0x0800
+#endif	// WIB_WR_BUF_SZ
+
+/*
+	The default WIB_SYS4KBLKS macro value can be easily overridden at compile
+	time by adding a custom definition into DC's Project Options' Defines tab.
+	The default value can also be easily overridden at run time by calling the
+	wib_setSys4kBlocks() function.
+*/
+#ifndef WIB_SYS4KBLKS
+	#define WIB_SYS4KBLKS 4
+#endif	// WIB_SYS4KBLKS
+
+/*
+	The default WIB_USER4KBLKS macro value can be easily overridden at compile
+	time by adding a custom definition into DC's Project Options' Defines tab.
+	The default value can also be easily overridden at run time by calling the
+	wib_setUser4kBlocks() function.
+*/
+#ifndef WIB_USER4KBLKS
+	#define WIB_USER4KBLKS 2
+#endif	// WIB_USER4KBLKS
+
+/*
+	The default WIB_VENDOR_ID macro value can be easily overridden at compile
+	time by adding a custom definition into DC's Project Options' Defines tab.
+	The default value can also be easily overridden at run time by calling the
+	wib_setVendorId() function.
+*/
+#ifndef WIB_VENDOR_ID
+	#define WIB_VENDOR_ID 1
+#endif	// WIB_VENDOR_ID
+
+// error check the User and system 4K blocks macro definitions
+#if 0 > WIB_USER4KBLKS || 16 < WIB_USER4KBLKS
+	#fatal "WIB_USER4KBLKS must be in the range [0,16]."
+#endif	// 0 > WIB_USER4KBLKS
+
+#if 1 > WIB_SYS4KBLKS
+	#fatal "WIB_SYS4KBLKS must be greater than or equal to 1."
+#endif	// 1 > WIB_SYS4KBLKS
+
+/*
+	This compile time test is not sufficient to prevent all potential problems.
+	For example, it is possible that the MAX_USERBLOCK_SIZE macro value may be
+	reduced for subsequent compiles, or it is also possible that the board's
+	program (primary, parallel or serial) flash device may have a sector layout
+	that causes unaccounted gaps between the ID block plus persistent data area
+	and the User block or between User block images.
+*/
+#if MAX_USERBLOCK_SIZE < (WIB_SYS4KBLKS + WIB_USER4KBLKS * 2ul) * 4096ul
+	#error "The MAX_USERBLOCK_SIZE macro value is smaller than the combined size"
+	#error " of the ID block plus persistent data area plus User block images."
+	#error "Try increasing the MAX_USERBLOCK_SIZE macro's value to at least"
+	#error (WIB_SYS4KBLKS + WIB_USER4KBLKS * 2ul) * 4096ul
+	#fatal " before attempting another compilation."
+#endif	// MAX_USERBLOCK_SIZE < (WIB_SYS4KBLKS + WIB_USER4KBLKS * 2ul) * 4096ul
+
+// This typedef structure is the layout of the system macro table's header
+//  information.
+typedef struct {
+	uint16 sz;
+	uint8 version;
+} _wib_macroHeader;
+
+// This typedef structure must be instantiated by the User's application and
+//  provided as a parameter to all WriteIdBlock.lib API functions.
+typedef struct {
+	MacroTableEntry sysMac_tbl[MACRO_TABLE_SIZE];
+	size_t          sysMac_cnt;
+	MemDevSpec      memDev_tbl[MEMORY_DEVICE_TABLE_SIZE];
+	size_t          memDev_cnt;
+#if WIB_CONST_SZ_MAX
+	uint8           sysCnst_buf[WIB_CONST_SZ_MAX];
+	size_t          sysCnst_cnt;
+#endif	// WIB_CONST_SZ_MAX
+	SysIDBlockType  idBlock;
+#if !_SERIAL_BOOT_FLASH_
+	uint8           wr_buf[WIB_WR_BUF_SZ];
+#endif	// !_SERIAL_BOOT_FLASH_
+	int             save_acs0cr;
+	int             save_macr;
+	int             save_mb3cr;
+	int             didMap;
+} wib_sysIdBlockData;
+/*** EndHeader */
+
+
+// -----------------------------------------------------------------------------
+// |                                 Functions                                 |
+// -----------------------------------------------------------------------------
+
+/*** BeginHeader wib_addAutomaticValues */
+void wib_addAutomaticValues(wib_sysIdBlockData far *build);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wib_addAutomaticValues        <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   void wib_addAutomaticValues(wib_sysIdBlockData far *build);
+
+DESCRIPTION:
+   Adds generic (typical) constant information into the specified system
+   ID block build data structure.
+
+IMPORTANT NOTE FOR DEVELOPERS:
+   This function should contain only carefully considered compile time
+   conditional code or macros whose compile time value is dependent on,
+   for example, _BOARD_TYPE_. Inclusion of such code or macros may prevent
+   this function from being used in test fixture code where it may be
+   desirable to have the ability to change at run time a board's ID block
+   or persistent data content.
+
+PARAMETER1:
+   A pointer to the system ID block build data structure. If NULL, this
+   function will cause a run time exception and exit.
+
+RETURN VALUE:
+   None.
+
+SEE ALSO:
+   wib_addMacro, wib_buildAndWrite, wib_setSys4kBlocks, wib_setSysConsts,
+   wib_setTableVersion, wib_setTimeStamp, wib_setUser4kBlocks,
+   wib_setVendorId
+END DESCRIPTION *********************************************************/
+
+_wib_debug
+void wib_addAutomaticValues(wib_sysIdBlockData far *build)
+{
+#if WIB_CONST_SZ_MAX
+	auto uint32 sysCnstAddr;
+#endif	// WIB_CONST_SZ_MAX
+
+	if (!build) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+	// set the (as yet) only supported system ID block version
+	wib_setTableVersion(build, 5);
+
+	// set the default vendor ID
+	wib_setVendorId(build, WIB_VENDOR_ID);
+
+	// fill in the time stamp field
+#ifdef _FIRMWARE_TIMESTAMP_
+	wib_setTimeStamp(build, _FIRMWARE_TIMESTAMP_);
+#else
+	wib_setTimeStamp(build, dc_timestamp);
+#endif	// _FIRMWARE_TIMESTAMP_
+
+	build->idBlock.flashID = getFlashId();
+	build->idBlock.flashType = getFlashWriteMode();
+	build->idBlock.flashSize = getFlashSize();
+	build->idBlock.sectorSize = getSectorSize();
+	build->idBlock.numSectors = getNumSectors();
+
+	// specify the CPU type and revision
+	build->idBlock.cpuID = RdPortI(GCPU) << 8;
+	build->idBlock.cpuID |= RdPortI(GREV);
+	build->idBlock.cpuID &= 0x1F1F;
+
+	// 6114400 = 19200 baud * 16 pclks per baud * 2 pclks per main crystal clock
+	build->idBlock.crystalFreq = (unsigned long) getdivider19200() * 614400ul;
+
+	// set the default system ID block persistent data area size
+	wib_setSys4kBlocks(build, WIB_SYS4KBLKS);
+
+	// set the default User block size
+	wib_setUser4kBlocks(build, WIB_USER4KBLKS);
+
+	build->idBlock.idBlockSize = sizeof build->idBlock;
+
+	// mark the system ID block valid
+	_f_memcpy(build->idBlock.marker, _wib_validMarker,
+	          sizeof build->idBlock.marker);
+
+#if WIB_CONST_SZ_MAX
+	/*
+		System constants, if they exist, are expected to be extremely valuable
+		if for no other reason than they may be difficult or even impossible for
+		an end-User to appropriately replace without assistance from Rabbit. An
+		example is the RCM54xxW's WiFi calibration information, which calibration
+		requires an expensive test rack and detailed knowledge in order to both
+		maximize WiFi performance and meet FCC regulations.
+
+		For this reason, we make every reasonable effort to retain the system
+		constants even on a board which no longer has a valid system ID block.
+		In any case, it should be noted that the possibly bogus system constants
+		information that is gathered here can be easily replaced by a later call
+		to the wib_setSysConsts() function.
+	*/
+	// system constants' location is relative to the top of the program flash
+	//  (we can't count on having a valid ID block here!)
+	sysCnstAddr = _SectorToLong(getNumSectors()) - sizeof build->sysCnst_buf;
+	// if at all possible, retain the original system constants content
+	if (SysIDBlock.tableVersion && SysIDBlock.idBlockSize) {
+		// locate system constants according to our valid ID block information
+		 sysCnstAddr -= SysIDBlock.idBlockSize;
+	} else {
+		// locate system constants assuming same-version ID block information
+		 sysCnstAddr -= build->idBlock.idBlockSize;
+	}
+ #if _SERIAL_BOOT_FLASH_
+	// copy system constants from just below the serial boot flash's ID block
+	_sbfReadUsr(_wib_sbf_buf, sysCnstAddr, sizeof _wib_sbf_buf);
+	wib_setSysConsts(build, _wib_sbf_buf, sizeof build->sysCnst_buf);
+ #else	// _SERIAL_BOOT_FLASH_
+	// parallel flash
+	// copy system constants from just below the /CS0 flash's system ID block
+	wib_setSysConsts(build, (void far *) sysCnstAddr, sizeof build->sysCnst_buf);
+ #endif	// _SERIAL_BOOT_FLASH_
+#endif	// WIB_CONST_SZ_MAX
+}
+
+/*** BeginHeader wib_addMacro */
+int wib_addMacro(wib_sysIdBlockData far *build, const char far *mac,
+                 uint32 val);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wib_addMacro                  <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   int wib_addMacro(wib_sysIdBlockData far *build, const char far *mac,
+                    uint32 val);
+
+DESCRIPTION:
+   Adds a new system macro, if possible, into the system ID block build
+   data structure's system macro table.
+
+PARAMETER1:
+   A pointer to the system ID block build data structure. If NULL, this
+   function will cause a run time exception and exit.
+
+PARAMETER2:
+   A pointer to the new system macro's base name (i.e. excluding the
+   "_DC_" prefix and the "_" suffix). The maximum macro name length is
+   MACRO_NAME_SIZE - 1 (currently 8) characters.
+
+PARAMETER3:
+   The value of the new system macro.
+
+RETURN VALUE:
+   0 if the new system macro was added to the build macros table.
+   1 if the new system macro wasn't added (build macros table is full).
+
+SEE ALSO:
+   wib_removeMacro
+END DESCRIPTION *********************************************************/
+
+_wib_debug
+int wib_addMacro(wib_sysIdBlockData far *build, const char far *mac, uint32 val)
+{
+	auto int return_value;
+	auto int mac_index;
+	auto MacroTableEntry far *entry;
+
+	if (!build) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+	// Search the existing macros for <mac>.  If it already exists, update it
+	// otherwise just add a new one.
+	for (mac_index = 0; mac_index < build->sysMac_cnt; ++mac_index) {
+		if (!strncmp(mac, build->sysMac_tbl[mac_index].name, MACRO_NAME_SIZE))
+		{
+			break;
+		}
+	}
+	if (mac_index < build->sysMac_cnt) {
+		// macro is already in table, update it
+		build->sysMac_tbl[mac_index].value = val;
+		return_value = 0;
+	} else {
+		if (build->sysMac_cnt < MACRO_TABLE_SIZE) {
+			// there's enough room to add the macro at the end of the table
+			entry = &build->sysMac_tbl[build->sysMac_cnt++];
+			_f_strncpy(entry->name, mac, MACRO_NAME_SIZE);
+			entry->name[MACRO_NAME_SIZE - 1] = '\0';
+#ifdef WIB_VERBOSE
+			if (strlen(mac) >= MACRO_NAME_SIZE) {
+				printf("WARNING: Macro names longer than %d characters are not per",
+				       MACRO_NAME_SIZE - 1);
+				printf("mitted.\n         Truncating macro name '%ls' to '%ls'.\n",
+				       mac, entry->name);
+			}
+#endif	// WIB_VERBOSE
+			entry->value = val;
+			return_value = 0;
+		} else {
+			// macro table is full, return error
+			return_value = 1;
+		}
+	}
+
+	return return_value;
+}
+
+/*** BeginHeader wib_removeMacro */
+int wib_removeMacro(wib_sysIdBlockData far *build, const char far *mac);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wib_removeMacro               <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   int wib_removeMacro(wib_sysIdBlockData far *build,
+                       const char far *mac);
+
+DESCRIPTION:
+   If a match is found, removes a system macro from the system ID block
+   build data structure's system macro table. The maximum macro name
+   length checked is MACRO_NAME_SIZE (currently 9) characters.
+
+PARAMETER1:
+   A pointer to the system ID block build data structure. If NULL, this
+   function will cause a run time exception and exit.
+
+PARAMETER2:
+   A pointer to a system macro's base name (i.e. excluding the "_DC_"
+   prefix and the "_" suffix).
+
+RETURN VALUE:
+   0 if a matching system macro is removed (success).
+   1 if no matching system macro is found (failure).
+
+SEE ALSO:
+   wib_buildAndWrite, wib_addMacro
+END DESCRIPTION *********************************************************/
+
+_wib_debug
+int wib_removeMacro(wib_sysIdBlockData far *build, const char far *mac)
+{
+	auto int found;
+	auto int mac_index;
+
+	if (!build) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+	// default result is macro not found
+	found = 0;
+	// Search through the existing macros to find it. If it's there, backfill
+	// the structure (like an array update), otherwise do nothing.
+	for (mac_index = 0; mac_index < build->sysMac_cnt; ++mac_index) {
+		if (found) {
+			build->sysMac_tbl[mac_index - 1] = build->sysMac_tbl[mac_index];
+		}
+		if (!strncmp(mac, build->sysMac_tbl[mac_index].name, MACRO_NAME_SIZE))
+		{
+			found = 1;
+		}
+	}
+	if (found) {
+		--build->sysMac_cnt;
+	}
+
+	return !found;		// !1 == removed, !0 == not found
+}
+
+/*** BeginHeader wib_buildAndWrite */
+int wib_buildAndWrite(wib_sysIdBlockData far *build);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wib_buildAndWrite             <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   int wib_buildAndWrite(wib_sysIdBlockData far *build);
+
+DESCRIPTION:
+   Builds a system ID block and persistent content according to the
+   specified system ID block build data structure and writes the system ID
+   block and its persistent data to the top of the primary (program,
+   parallel or serial) flash device.
+
+   When build->idBlock.idBlock2.userBlockSiz2 > 0 then also ensures
+   (writes as necessary) User block valid markers.
+
+IMPORTANT NOTE:
+   Due to its reliance on the serial boot flash library's WriteFlash()
+   macro definition, when compiled to a board equipped with a serial boot
+   flash this function uses a global root memory flash write source
+   buffer.
+
+PARAMETER1:
+   A pointer to the system ID block build data structure. If NULL, this
+   function will cause a run time exception and exit.
+
+RETURN VALUE:
+   0 - Success.
+   ERR_ASSERTFAILURE - Unsupported system ID block version, feature, write
+      address or write length.
+   Other - A nonzero result code returned by a support function.
+
+SEE ALSO:
+   wib_addAutomaticValues, wib_addMacro, wib_copyExistingIdBlock,
+   wib_initWriteIdBlockLib, wib_termWriteIdBlockLib, wib_writeValidMarker
+END DESCRIPTION *********************************************************/
+
+#ifdef _ENABLE_16BIT_FLASH_
+ #if RAM_COMPILE
+	#error "True RAM compile mode write of a system ID block to a 16-bit flash"
+	#fatal "equipped board is not yet supported. Use flash compile mode instead."
+ #endif	// RAM_COMPILE
+#endif	// _ENABLE_16BIT_FLASH_
+
+_wib_debug
+int wib_buildAndWrite(wib_sysIdBlockData far *build)
+{
+	auto int crc, idblocksector, rc, ublockAsector, ublockBsector;
+	auto uint16 count, macnamesize;
+	auto uint32 blocklength, flashTop, idblockaddr;
+	auto uint32 markerAaddr, markerBaddr, physaddr, ublockAaddr, ublockBaddr;
+	auto MacroTableEntry far *entry;
+
+#if _SERIAL_BOOT_FLASH_
+	/*
+		Due to its reliance on the serial boot flash library's WriteFlash() macro
+		definition, when compiled to a board equipped with a serial boot flash
+		this function uses a global root memory flash write source buffer.
+	*/
+	auto uint8 *pbuf, *save_pbuf;
+#else	// _SERIAL_BOOT_FLASH_
+	// parallel flash
+	auto uint8 far *pbuf, *save_pbuf;
+#endif	// _SERIAL_BOOT_FLASH_
+
+	if (!build) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+#if _SERIAL_BOOT_FLASH_
+	pbuf = _wib_sbf_buf;
+#else	// _SERIAL_BOOT_FLASH_
+	// parallel flash
+	pbuf = build->wr_buf;
+ #ifdef _ENABLE_16BIT_FLASH_
+	/*
+		For 16-bit flash, the _ProgramFlashBlock() function requires an even
+		write start address and an even write size. We rely on the placement of
+		the system ID block at the very top of an even size program flash
+		device to allow us to be only concerned with an even write size at this
+		point. To achieve an even write size we speculatively place an extra byte
+		at the start of the write buffer only when 16-bit flash is detected;
+		later, we may choose to not write this extra byte.
+	*/
+	*pbuf++ = 0xFF;	// typically, 0xFF is flash content erased state
+ #endif	// _ENABLE_16BIT_FLASH_
+#endif	// _SERIAL_BOOT_FLASH_
+
+	if (5 != build->idBlock.tableVersion) {
+		// Supports only system ID block version 5 at this time.
+		return ERR_ASSERTFAILURE;
+	}
+
+	if (build->memDev_cnt) {
+		save_pbuf = pbuf;
+		pbuf += sizeof (uint16); // skip past size (recalculate below)
+		*pbuf++ = 0;            // set the version
+		count = 0;
+		while(count < build->memDev_cnt) {
+			_f_memcpy(pbuf, build->memDev_tbl + count, sizeof (MemDevSpec));
+			pbuf += sizeof (MemDevSpec);
+			++count;
+		}
+		*((uint16 far *) save_pbuf) = (uint16) (pbuf - save_pbuf);
+		build->idBlock.idBlock2.devSpecLoc = *((uint16 far *) save_pbuf);
+	}
+
+	if (build->sysMac_cnt) {
+		save_pbuf = pbuf;
+		pbuf += sizeof (uint16); // skip past size (recalculate below)
+		*pbuf++ = 0;      // set the version
+		count = 0;
+		entry = build->sysMac_tbl;
+		while(count < build->sysMac_cnt) {
+			macnamesize = strlen(entry->name) + 1; // add one for null char
+			_f_memcpy(pbuf, entry->name, macnamesize);
+			pbuf += macnamesize;
+			_f_memcpy(pbuf, &entry->value, sizeof entry->value);
+			pbuf += sizeof entry->value;
+			++count;
+			++entry;
+		}
+		*((uint16 far *) save_pbuf) = (uint16) (pbuf - save_pbuf);
+		build->idBlock.idBlock2.macrosLoc = *((uint16 far *) save_pbuf);
+		if (build->idBlock.idBlock2.devSpecLoc) {
+			build->idBlock.idBlock2.devSpecLoc +=build->idBlock.idBlock2.macrosLoc;
+		}
+	}
+
+#if WIB_CONST_SZ_MAX
+	// enforce the maximum system constants buffer size
+	if (sizeof build->sysCnst_buf < build->sysCnst_cnt) {
+		build->sysCnst_cnt = sizeof build->sysCnst_buf;
+	}
+	// always copy from the front of the system constants buffer
+	_f_memcpy(pbuf, build->sysCnst_buf, build->sysCnst_cnt);
+	pbuf += build->sysCnst_cnt;
+	if (build->idBlock.idBlock2.macrosLoc) {
+		build->idBlock.idBlock2.macrosLoc += build->sysCnst_cnt;
+	}
+	if (build->idBlock.idBlock2.devSpecLoc) {
+		build->idBlock.idBlock2.devSpecLoc += build->sysCnst_cnt;
+	}
+#endif	// WIB_CONST_SZ_MAX
+
+	// Do the original (outer) CRC calculation, which (for the purpose of
+	//  backwards compatibility) excludes the reserved member and the idBlock2
+	//  member that was added to the version 5 system ID block.
+	count = (uint16) &build->idBlock.idBlock2 -
+	        (uint16) &build->idBlock.tableVersion;
+	crc = _wib_getCRC16CCITT(&build->idBlock, count, 0x0000);
+	count = (uint16) &build->idBlock.tableVersion + sizeof build->idBlock -
+	        (uint16) &build->idBlock.idBlockSize;
+	crc = _wib_getCRC16CCITT(&build->idBlock.idBlockSize, count, crc);
+	build->idBlock.idBlockCRC = crc;
+	// Now, based upon the original (outer) CRC calculation result, do the new
+	//  (inner) CRC calculation specfically over the idBlock2 member.
+	crc = _wib_getCRC16CCITT(&build->idBlock.idBlock2, sizeof (SysIDBlockType2),
+	                         crc);
+	build->idBlock.idBlock2.idBlockCRC2 = crc;
+
+	// Write head of block
+	_f_memcpy(pbuf, &build->idBlock, sizeof build->idBlock);
+	pbuf += sizeof build->idBlock;
+
+	flashTop = _SectorToLong(getNumSectors());
+	idblocksector = _LongToSector(flashTop - build->idBlock.idBlockSize -
+	                              build->idBlock.idBlock2.persBlockLoc);
+	idblockaddr = _SectorToLong(idblocksector);
+	// sanity check the idblockaddr value
+	if (!idblockaddr) {
+		// we can't write a system ID block to physical address 0!
+		return ERR_ASSERTFAILURE;
+	}
+
+	// default to success result
+	rc = 0;
+	// default to zero markerXaddr values
+	//  (later, this may mean no User block image X valid marker writes)
+	markerAaddr = 0ul;
+	markerBaddr = 0ul;
+	if (build->idBlock.userBlockSize) {
+		// No support for old-style combined ID+User blocks at this time.
+		rc = ERR_ASSERTFAILURE;
+	}
+	else if (build->idBlock.idBlock2.userBlockSiz2) {
+		ublockAsector = _LongToSector(idblockaddr - sizeof build->idBlock.marker -
+		                              build->idBlock.idBlock2.userBlockSiz2);
+		ublockAaddr = _SectorToLong(ublockAsector);
+		markerAaddr = ublockAaddr + build->idBlock.idBlock2.userBlockSiz2;
+		ublockBsector = _LongToSector(ublockAaddr - sizeof build->idBlock.marker -
+		                              build->idBlock.idBlock2.userBlockSiz2);
+		ublockBaddr = _SectorToLong(ublockBsector);
+		markerBaddr = ublockBaddr + build->idBlock.idBlock2.userBlockSiz2;
+
+		// brief sanity check of the flash write addresses
+		if (!markerAaddr ||
+		    _LongToSector(idblockaddr) <=
+		    _LongToSector(markerAaddr + sizeof build->idBlock.marker - 1ul))
+		{
+			/*
+				The physical address of User block image A's valid marker must be
+				nonzero and strictly less than the lowest physical address of the
+				system ID block plus its persistent data area. In addition, the
+				marker mustn't share a flash sector (page) with the system ID block
+				or its persistent data area.
+			*/
+			rc = ERR_ASSERTFAILURE;
+		}
+		if (!rc &&
+		    (!markerBaddr ||
+		     _LongToSector(ublockAaddr) <=
+		     _LongToSector(markerBaddr + sizeof build->idBlock.marker - 1ul)))
+		{
+			/*
+				The physical address of User block image B's valid marker must be
+				nonzero and strictly less than the lowest physical address of User
+				block image A. In addition, User block image B's valid marker
+				mustn't share a flash sector (page) with User block image A.
+			*/
+			rc = ERR_ASSERTFAILURE;
+		}
+	}
+
+#if _SERIAL_BOOT_FLASH_
+	/*
+		Due to its reliance on the serial boot flash library's WriteFlash() macro
+		definition, when compiled to a board equipped with a serial boot flash
+		this function always uses root memory flash write source buffers.
+	*/
+	blocklength = pbuf - _wib_sbf_buf;
+#else	// _SERIAL_BOOT_FLASH_
+	// parallel flash
+	blocklength = pbuf - build->wr_buf;
+#endif	// _SERIAL_BOOT_FLASH_
+
+	physaddr = flashTop - blocklength;
+
+	if (!rc && markerAaddr) {
+		rc = wib_writeValidMarker(build, markerAaddr);
+	}
+
+	if (!rc && markerBaddr) {
+		rc = wib_writeValidMarker(build, markerBaddr);
+	}
+
+#if _SERIAL_BOOT_FLASH_
+	if (!rc) {
+		rc = WriteFlash(physaddr, _wib_sbf_buf, (uint16) blocklength);
+	}
+#else	// _SERIAL_BOOT_FLASH_
+	// parallel flash
+ #ifdef _ENABLE_16BIT_FLASH_
+	/*
+		For 16-bit flash, the _ProgramFlashBlock() function requires an even
+		write start address and an even write size. For the system ID block plus
+		its persistent data area, we rely only on the above sector requirements,
+		as the write size is adjusted (if necessary) at run time by ignoring the
+		single byte that is speculatively placed at the start of the write buffer
+		only when 16-bit flash is detected. The following sanity check ensures
+		that our assumption of guaranteed even sector size is correct.
+	*/
+	if (1ul & idblockaddr || 1ul & (physaddr + blocklength)) {
+  #ifdef WIB_VERBOSE
+		if (1ul & idblockaddr) {
+			printf("Error, ID block area sector start address is odd! (0x%08LX)\n",
+			       idblockaddr);
+		}
+		if (1ul & (physaddr + blocklength)) {
+			printf("Error, ID block area sector end address is odd! (0x%08LX)\n",
+			       physaddr + blocklength);
+		}
+  #endif
+		rc = ERR_ASSERTFAILURE;
+	}
+ #endif	// _ENABLE_16BIT_FLASH_
+
+	if (!rc) {
+		// re-use save_pbuf as a flash write source pointer
+		save_pbuf = build->wr_buf;
+ #ifdef _ENABLE_16BIT_FLASH_
+		/*
+			For 16-bit flash, the _ProgramFlashBlock() function requires an even
+			write start address and an even write size. We rely on the placement of
+			the system ID block at the very top of an even size program flash
+			device to allow us to be only concerned with an even write size at this
+			point. To achieve an even write size we may choose to not write the
+			extra byte that is speculatively placed at the start of the write
+			buffer only when 16-bit flash is detected.
+		*/
+		if (1ul & blocklength) {
+			// the speculative write length is odd, so skip writing the extra byte
+			++save_pbuf;
+			++physaddr;
+			--blocklength;
+		}
+ #endif	// _ENABLE_16BIT_FLASH_
+		/*
+			Ensure that the entire system ID block plus persistent data area is
+			erased prior to writing the new information. Note that the value
+			physaddr + blocklength - 1 is the last address in the primary flash.
+		*/
+		_EraseFlashRange(idblockaddr, physaddr + blocklength - 1ul);
+		rc = _ProgramFlashBlock(physaddr, save_pbuf, (uint16) blocklength);
+	}
+
+	if (!rc) {
+		rc = memcmp((void far *) physaddr, save_pbuf, (uint16) blocklength);
+	}
+#endif	// _SERIAL_BOOT_FLASH_
+
+#if DK_ENABLE_DEBUGKERNEL
+	if (0x08 & OPMODE) {
+		// in debug run mode, so alter the debug tag to force a BIOS recompile at
+		//  the next compile, which will then cause a system ID block reload
+		++dkcDebugTag;
+	}
+#endif	// DK_ENABLE_DEBUGKERNEL
+
+	return rc;
+}
+
+/*** BeginHeader wib_writeValidMarker */
+int wib_writeValidMarker(wib_sysIdBlockData far *build, uint32 markerAddr);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wib_writeValidMarker          <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   int wib_writeValidMarker(wib_sysIdBlockData far *build,
+                            uint32 markerAddr);
+
+DESCRIPTION:
+   Writes a User block valid marker to the (parallel or serial) primary
+   program flash device.
+
+IMPORTANT NOTE:
+   Due to its reliance on the serial boot flash library's WriteFlash()
+   macro definition, when compiled to a board equipped with a serial boot
+   flash this function must use a root memory flash write source buffer.
+
+PARAMETER1:
+   A pointer to the system ID block build data structure. If NULL, this
+   function will cause a run time exception and exit.
+
+RETURN VALUE:
+   0 - Success.
+   ERR_ASSERTFAILURE - Unsupported write address or write length.
+   Other - A nonzero result code returned by a support function.
+
+SEE ALSO:
+   wib_buildAndWrite
+END DESCRIPTION *********************************************************/
+
+#ifdef _ENABLE_16BIT_FLASH_
+ #if RAM_COMPILE
+	#error "True RAM compile mode write of a system ID block to a 16-bit flash"
+	#fatal "equipped board is not yet supported. Use flash compile mode instead."
+ #endif	// RAM_COMPILE
+#endif	// _ENABLE_16BIT_FLASH_
+
+_wib_debug
+int wib_writeValidMarker(wib_sysIdBlockData far *build, uint32 markerAddr)
+{
+	auto int result;
+
+	if (!build) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+#if _SERIAL_BOOT_FLASH_
+	/*
+		Due to its reliance on the serial boot flash library's WriteFlash() macro
+		definition, when compiled to a board equipped with a serial boot flash
+		this function must use a root memory flash write source buffer. Otherwise,
+		_wib_validMarker could be a const uint8 far array (like _wib_erasedMarker)
+		to save root constants space.
+	*/
+	if (markerAddr) {
+		// attempt to write a valid marker
+		result = WriteFlash(markerAddr, _wib_validMarker,
+		                    sizeof build->idBlock.marker);
+	} else {
+		// error, invalid marker address
+		result = ERR_ASSERTFAILURE;
+	}
+#else	// _SERIAL_BOOT_FLASH_
+	// parallel flash
+	if (markerAddr) {
+		// default to the success result value
+		result = 0;
+	} else {
+		// error, invalid marker address
+		result = ERR_ASSERTFAILURE;
+	}
+
+ #ifdef _ENABLE_16BIT_FLASH_
+	/*
+		For 16-bit flash, the _ProgramFlashBlock() function requires an even
+		write start address and an even write size. For User block validity
+		markers, we rely on the placement of an even size marker at the very
+		top of an even size sector where all sectors start at an even address
+		boundary to meet these requirements.
+	*/
+	if (!result && (1ul & markerAddr || 1u & sizeof build->idBlock.marker)) {
+  #ifdef WIB_VERBOSE
+		if (1ul & markerAddr) {
+			printf("Error, marker address (0x%08LX) is odd!\n", markerAddr);
+		}
+		if (1u & sizeof build->idBlock.marker) {
+			printf("Error, marker size (%u) is odd!\n",
+			       sizeof build->idBlock.marker);
+		}
+  #endif
+		result = ERR_ASSERTFAILURE;
+	}
+ #endif	// _ENABLE_16BIT_FLASH_
+
+	if (!result && memcmp(_wib_validMarker, (void far *) markerAddr,
+	                         sizeof build->idBlock.marker))
+	{
+		/*
+			There is not already a User block image valid marker in place, so now
+			check if the relevant flash bytes are already erased.
+		*/
+		if (memcmp(_wib_erasedMarker, (void far *) markerAddr,
+		              sizeof build->idBlock.marker))
+		{
+			/*
+				Since the User block image's validity marker is not set and is not
+				already in the erased state then its parallel flash sector(s) must
+				be erased now.
+			*/
+			_EraseFlashRange(markerAddr,
+			                 markerAddr + sizeof build->idBlock.marker - 1ul);
+		}
+		result = _ProgramFlashBlock(markerAddr, _wib_validMarker,
+		                            sizeof build->idBlock.marker);
+	}
+
+	if (!result) {
+		result = memcmp((void far *) markerAddr, _wib_validMarker,
+		                   sizeof build->idBlock.marker);
+	}
+#endif	// _SERIAL_BOOT_FLASH_
+
+	return result;
+}
+
+/*** BeginHeader wib_copyExistingIdBlock */
+int wib_copyExistingIdBlock(wib_sysIdBlockData far *build);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wib_copyExistingIdBlock       <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   int wib_copyExistingIdBlock(wib_sysIdBlockData far *build);
+
+DESCRIPTION:
+   Copies the current system ID block (excepting the CRCs, which are
+   immediately overwritten with zeros in order to correctly calculate
+   new CRCs later on), system constants if any), memory devices
+   specification table and system macros table content into the system ID
+   block build data structure.
+
+PARAMETER1:
+   A pointer to the system ID block build data structure. If NULL, this
+   function will cause a run time exception and exit.
+
+RETURN VALUE:
+   0 if all current system information is copied into the build structure.
+   -1 if invalid memory devices specification table.
+   -2 if overflowed memory devices specification build table.
+   -3 if error in retrieving system macros table exists.
+
+SEE ALSO:
+   wib_addMacro, wib_askRetainMAC, wib_buildAndWrite,
+   wib_initWriteIdBlockLib, wib_removeMacro, wib_setSysConsts
+END DESCRIPTION *********************************************************/
+
+_wib_debug
+int wib_copyExistingIdBlock(wib_sysIdBlockData far *build)
+{
+	auto MemDevSpec dev_spec;
+	auto int index;
+	auto int result;
+	auto int return_value;
+
+	if (!build) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+	return_value = 0;
+
+	wib_initWriteIdBlockLib(build, SysIDBlock.flashSize);
+
+	// Copy the id block except for the crc fields, which must be initialized to
+	//  zero in order for the wib_buildAndWrite() function to perform correctly.
+	build->idBlock = SysIDBlock;
+	build->idBlock.idBlockCRC = 0;
+	build->idBlock.idBlock2.idBlockCRC2 = 0;
+
+	// Copy the constants...
+#if WIB_CONST_SZ_MAX
+ #if _SERIAL_BOOT_FLASH_
+	_sbfReadUsr(_wib_sbf_buf, IDBlockAddr - sizeof build->sysCnst_buf,
+	            sizeof _wib_sbf_buf);
+	wib_setSysConsts(build, _wib_sbf_buf, sizeof build->sysCnst_buf);
+ #else	// _SERIAL_BOOT_FLASH_
+	// parallel flash
+	wib_setSysConsts(build,
+	                 (void far *) (IDBlockAddr - sizeof build->sysCnst_buf),
+	                 sizeof build->sysCnst_buf);
+ #endif	// _SERIAL_BOOT_FLASH_
+#endif	// WIB_CONST_SZ_MAX
+
+	if (build->idBlock.idBlock2.devSpecLoc) {
+		// Copy the memory device specification table.
+		for (index = 0, result = 0; result == 0; ++index) {
+			result = _GetDevSpecIndex(index, &dev_spec);
+			if (result == 0) {
+				result = _wib_addDevice(build, &dev_spec);
+			}
+		}
+		if (result != -1) {
+			if (1 == result) {
+#ifdef WIB_VERBOSE
+				printf("Overflowed memory device specification build table.\n");
+#endif	// WIB_VERBOSE
+				return_value = -2;
+			} else {
+#ifdef WIB_VERBOSE
+				printf("Invalid memory device specification table.\n");
+#endif	// WIB_VERBOSE
+				return_value = -1;
+			}
+		}
+	}
+
+	if (_wib_retrieveMacros(build)) {
+#ifdef WIB_VERBOSE
+		printf("Error retrieving system macro table.\n");
+#endif	// WIB_VERBOSE
+		return_value = -3;
+	}
+
+	return return_value;
+}
+
+/*** BeginHeader wib_initWriteIdBlockLib */
+void wib_initWriteIdBlockLib(wib_sysIdBlockData far *build, uint16 fSz);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wib_initWriteIdBlockLib       <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   void wib_initWriteIdBlockLib(wib_sysIdBlockData far *build,
+                                uint16 fSz);
+
+DESCRIPTION:
+   Initializes (by reseting all bytes to zero) the specified system ID
+   block build data structure. In RAM compile mode, optionally maps the
+   /CS0 parallel flash device into the MB3CR quadrant.
+
+PARAMETER1:
+   A pointer to the system ID block build data structure. If NULL, this
+   function will cause a run time exception and exit.
+
+PARAMETER2:
+   If nonzero, the actual size of the /CS0 parallel flash device to be
+   mapped into the MB3CR quadrant. Note that this parameter only has
+   effect in RAM compile mode on a board equipped with a /CS0 parallel
+   flash device.
+
+RETURN VALUE:
+   None.
+
+SEE ALSO:
+   wib_addAutomaticValues, wib_addMacro, wib_buildAndWrite,
+   wib_copyExistingIdBlock, wib_termWriteIdBlockLib
+END DESCRIPTION *********************************************************/
+
+_wib_debug
+void wib_initWriteIdBlockLib(wib_sysIdBlockData far *build, uint16 fSz)
+{
+	if (!build) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+	// zero (clear, reset) all data, especially the build->didMap flag
+	_f_memset(build, 0, sizeof (wib_sysIdBlockData));
+
+#if RAM_COMPILE && !_SERIAL_BOOT_FLASH_
+	if (fSz) {
+		/*
+			When compiling in RAM_COMPILE mode to a parallel program flash equipped
+			board, manually map the /CS0 flash with maximum wait states into the
+			top (MB3CR) quadrant, then initialize the flash driver to suit.
+		*/
+		build->save_mb3cr = RdPortI(MB3CR);
+		WrPortI(MB3CR, &MB3CRShadow, 0x00);
+		_InitFlashDriver((1ul << (MSB_BIT + 1)) - (1ul << (MSB_BIT - 1)),
+		                 (1ul << (MSB_BIT + 1)) - fSz * 0x1000ul);
+		// mark the /CS0 parallel flash mapping as done
+		build->didMap = 1;
+	}
+#elif FAST_RAM_COMPILE && !_SERIAL_BOOT_FLASH_
+	/*
+		This conditional code section works around a DC 10.4x flash driver
+		initialization bug when compiling in FAST_RAM_COMPILE mode to a /CS0
+		parallel program flash equipped board.
+	*/
+	_InitFlashDriver((1ul << (MSB_BIT + 1)) - (1ul << (MSB_BIT - 1)),
+	                 (1ul << (MSB_BIT + 1)) - _FLASH_SIZE_ * 0x1000ul);
+#endif	// RAM_COMPILE && !_SERIAL_BOOT_FLASH_
+}
+
+/*** BeginHeader wib_termWriteIdBlockLib */
+void wib_termWriteIdBlockLib(wib_sysIdBlockData far *build, int unMap);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wib_termWriteIdBlockLib       <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   void wib_termWriteIdBlockLib(wib_sysIdBlockData far *build, int unMap);
+
+DESCRIPTION:
+   In RAM compile mode, optionally unmaps the /CS0 parallel flash device
+   from the MB3CR quadrant by restoring the previously saved registers'
+   content.
+
+PARAMETER1:
+   A pointer to the system ID block build data structure. If NULL, this
+   function will cause a run time exception and exit.
+
+PARAMETER2:
+   A flag to indicate whether (nonzero) or not (zero) to unmap the /CS0
+   parallel flash device that has been previously mapped into the MB3CR
+   quadrant. Note that this parameter can only have effect in RAM compile
+   mode on a board equipped with a /CS0 parallel flash device.
+
+RETURN VALUE:
+   None.
+
+SEE ALSO:
+   wib_initWriteIdBlockLib
+END DESCRIPTION *********************************************************/
+
+_wib_debug
+void wib_termWriteIdBlockLib(wib_sysIdBlockData far *build, int unMap)
+{
+	if (!build) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+#if RAM_COMPILE && !_SERIAL_BOOT_FLASH_
+	if (unMap && build->didMap) {
+		/*
+			Compiling in RAM_COMPILE mode to a /CS0 parallel program flash equipped
+			board which was previoulsy manually mapped into the MB3CR quadrant, so
+			restore the original register(s) setting(s).
+		*/
+		WrPortI(MB3CR, &MB3CRShadow, build->save_mb3cr);
+		// mark the /CS0 parallel flash mapping as undone
+		build->didMap = 0;
+	}
+#endif	// RAM_COMPILE && !_SERIAL_BOOT_FLASH_
+}
+
+/*** BeginHeader wib_checkReservedFlash */
+int wib_checkReservedFlash(wib_sysIdBlockData far *build);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wib_checkReservedFlash        <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   int wib_checkReservedFlash(wib_sysIdBlockData far *build);
+
+DESCRIPTION:
+   A run time check of the current MAX_USERBLOCK_SIZE macro value vs. the
+   individual board's minimum reserved ID+User blocks area flash
+   requirement.
+
+IMPORTANT NOTE FOR DEVELOPERS:
+   This run time test is not sufficient to prevent all potential problems.
+   For example, it is possible that the MAX_USERBLOCK_SIZE macro value may
+   be subsequently reduced for compilation of the end User's application.
+
+PARAMETER1:
+   A pointer to the system ID block build data structure. If NULL, this
+   function will cause a run time exception and exit.
+
+RETURN VALUE:
+   0: Success, the current MAX_USERBLOCK_SIZE macro value meets the
+      minimum reserved ID+User blocks area flash requirement.
+   1: Failure, the current MAX_USERBLOCK_SIZE macro value must be
+      increased in order to meet the minimum reserved ID+User blocks area
+      flash requirement.
+
+SEE ALSO:
+   wib_getSysConstsSz, wib_setMAC, wib_setProductName,
+   wib_setSerialNumber, wib_setSys4kBlocks, wib_setSysConsts,
+   wib_setTableVersion, wib_setTimeStamp, wib_setUser4kBlocks,
+   wib_setVendorId
+END DESCRIPTION *********************************************************/
+
+_wib_debug
+int wib_checkReservedFlash(wib_sysIdBlockData far *build)
+{
+	auto int result, tempSect;
+	auto uint32 minReserve, tempAddr, topAddr, trueFlashSize;
+
+	if (!build) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+	// default to the successful result value
+	result = 0;
+
+	// top of flash physical address
+	topAddr = _SectorToLong(getNumSectors());
+
+	// calculate the true flash size, which is possibly not a power of two
+	//  (i.e. if serial boot flash)
+	trueFlashSize = topAddr - _SectorToLong(0u);
+
+	// system ID block's persistent data area start (lowest physical address)
+	tempSect = _LongToSector(topAddr - build->idBlock.idBlockSize -
+	                         build->idBlock.idBlock2.persBlockLoc);
+	tempAddr = _SectorToLong(tempSect);
+
+	if (build->idBlock.userBlockSize) {
+		// No support for old-style combined ID+User blocks at this time.
+		result = 1;
+	}
+	else if (build->idBlock.idBlock2.userBlockSiz2) {
+		// User block image A's start (lowest physical address)
+		tempSect = _LongToSector(tempAddr - sizeof build->idBlock.marker -
+		                         build->idBlock.idBlock2.userBlockSiz2);
+		tempAddr = _SectorToLong(tempSect);
+
+		// User block image B's start (lowest physical address)
+		tempSect = _LongToSector(tempAddr - sizeof build->idBlock.marker -
+		                         build->idBlock.idBlock2.userBlockSiz2);
+		tempAddr = _SectorToLong(tempSect);
+	}
+
+	// calculate the basic minimum required ID+User blocks reserved area size
+	minReserve = topAddr - tempAddr;
+
+/*
+	Determine the size of the ID+User blocks reserved memory area:
+	   When a program is stored in serial boot flash it must be copied to run in
+	   the primary RAM, so the size of a reserved memory area that is required to
+	   protect the ID+User blocks area may range from zero up to the value of
+	   the MAX_USERBLOCK_SIZE macro. Otherwise, the actual size of the entire
+	   ID+User blocks area, including gaps (if any) between blocks and / or
+	   images, must be protected.
+*/
+#if _SERIAL_BOOT_FLASH_
+	// The program must be copied from the serial boot flash to run in RAM.
+	if (trueFlashSize - minReserve >= (ORG_RAM_SIZE)) {
+		// The serial boot flash size is much larger than the primary RAM size, so
+		//  the ID+User blocks area is totally outside the maximum run-in-RAM
+		//  program area. There's no need for an ID+User blocks reserved memory
+		//  area.
+		minReserve = 0;
+	}
+	else if (trueFlashSize > (ORG_RAM_SIZE)) {
+		// The serial boot flash size is somewhat larger than the primary RAM
+		//  size, so the ID+User blocks area is partially outside the maximum
+		//  run-in-RAM program area. There's only need for a reduced ID+User
+		//  blocks reserved memory area.
+		minReserve -= trueFlashSize - (ORG_RAM_SIZE);
+	}
+	else if (trueFlashSize - minReserve >= (ORG_FLASH_SIZE)) {
+		// The serial boot flash size is less than or equal to the primary RAM
+		//  size but (including spare data) is much larger than its power-of-two
+		//  ORG_FLASH_SIZE size. The ID+User blocks area is totally outside the
+		//  ORG_FLASH_SIZE program area, so there's no need for an ID+User blocks
+		//  reserved memory area.
+		minReserve = 0;
+	}
+	else if (trueFlashSize > (ORG_FLASH_SIZE)) {
+		// The serial boot flash size is less than or equal to the primary RAM
+		//  size but (including spare data), is somewhat larger than its
+		//  power-of-two ORG_FLASH_SIZE size. The ID+User blocks area is partially
+		//  outside the ORG_FLASH_SIZE program area, so there's only need for a
+		//  reduced ID+User blocks reserved memory area.
+		minReserve -= trueFlashSize - (ORG_FLASH_SIZE);
+	}
+#endif	// _SERIAL_BOOT_FLASH_
+
+	if ((MAX_USERBLOCK_SIZE) < minReserve) {
+		result = 1;
+	}
+
+	return result;
+}
+
+/*** BeginHeader wib_getSysConstsSz */
+size_t wib_getSysConstsSz(wib_sysIdBlockData far *build);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wib_getSysConstsSz            <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   size_t wib_getSysConstsSz(wib_sysIdBlockData far *build);
+
+DESCRIPTION:
+   Reports the size (length, in bytes) of the constants data that has
+   previously been copied into the system ID block build data structure's
+   system constants buffer.
+
+PARAMETER1:
+   A pointer to the system ID block build data structure. If NULL, this
+   function will cause a run time exception and exit.
+
+RETURN VALUE:
+   The size (length, in bytes) of constants data that is currently stored
+   in the system ID block build data structure's system constants buffer.
+
+SEE ALSO:
+   wib_checkReservedFlash, wib_setMAC, wib_setProductName,
+   wib_setSerialNumber, wib_setSys4kBlocks, wib_setSysConsts,
+   wib_setTableVersion, wib_setTimeStamp, wib_setUser4kBlocks,
+   wib_setVendorId
+END DESCRIPTION *********************************************************/
+
+_wib_debug
+size_t wib_getSysConstsSz(wib_sysIdBlockData far *build)
+{
+	if (!build) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+#if WIB_CONST_SZ_MAX
+	return build->sysCnst_cnt;
+#else	// WIB_CONST_SZ_MAX
+	return 0;
+#endif	// WIB_CONST_SZ_MAX
+}
+
+/*** BeginHeader wib_setMAC */
+void wib_setMAC(wib_sysIdBlockData far *build, const char far *newMAC);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wib_setMAC                    <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   void wib_setMAC(wib_sysIdBlockData far *build,
+                   const char far *newMAC);
+
+DESCRIPTION:
+   Updates the system ID block build data structure's MAC address field.
+
+PARAMETER1:
+   A pointer to the system ID block build data structure. If NULL, this
+   function will cause a run time exception and exit.
+
+PARAMETER2:
+   A pointer to the new MAC address field content, which must be a char
+   array of exactly 6 bytes in size, and not a string. If NULL, this
+   function will cause a run time exception and exit.
+
+RETURN VALUE:
+   None.
+
+SEE ALSO:
+   wib_checkReservedFlash, wib_getSysConstsSz, wib_setProductName,
+   wib_setSerialNumber, wib_setSys4kBlocks, wib_setSysConsts,
+   wib_setTableVersion, wib_setTimeStamp, wib_setUser4kBlocks,
+   wib_setVendorId
+END DESCRIPTION *********************************************************/
+
+_wib_debug
+void wib_setMAC(wib_sysIdBlockData far *build, const char far *newMAC)
+{
+	if (!build || !newMAC) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+	_f_memcpy(build->idBlock.macAddr, newMAC, sizeof build->idBlock.macAddr);
+}
+
+/*** BeginHeader wib_setProductName */
+void wib_setProductName(wib_sysIdBlockData far *build, char far *newPN);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wib_setProductName            <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   void wib_setProductName(wib_sysIdBlockData far *build,
+                           char far *newPN);
+
+DESCRIPTION:
+   Updates the system ID block build data structure's product name field.
+   Note that the entire system ID block product name field in the build
+   data structure is replaced with new content, which is not necessarily
+   zero terminated.
+
+PARAMETER1:
+   A pointer to the system ID block build data structure. If NULL, this
+   function will cause a run time exception and exit.
+
+PARAMETER2:
+   A pointer to the new product name field content, which must be a char
+   array of exactly 30 bytes in size, but need not be a string. If NULL,
+   this function will cause a run time exception and exit.
+
+RETURN VALUE:
+   None.
+
+SEE ALSO:
+   wib_checkReservedFlash, wib_getSysConstsSz, wib_setMAC,
+   wib_setSerialNumber, wib_setSys4kBlocks, wib_setSysConsts,
+   wib_setTableVersion, wib_setTimeStamp, wib_setUser4kBlocks,
+   wib_setVendorId
+END DESCRIPTION *********************************************************/
+
+_wib_debug
+void wib_setProductName(wib_sysIdBlockData far *build, char far *newPN)
+{
+	if (!build || !newPN) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+	_f_memcpy(build->idBlock.productName, newPN,
+	          sizeof build->idBlock.productName);
+}
+
+/*** BeginHeader wib_setSerialNumber */
+void wib_setSerialNumber(wib_sysIdBlockData far *build, char far *newSN);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wib_setSerialNumber           <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   void wib_setSerialNumber(wib_sysIdBlockData far *build,
+                            char far *newSN);
+
+DESCRIPTION:
+   Updates the system ID block build data structure's serial number field.
+   Note that the entire system ID block serial number field in the build
+   data structure is replaced with new content, which is not necessarily
+   zero terminated.
+
+PARAMETER1:
+   A pointer to the system ID block build data structure. If NULL, this
+   function will cause a run time exception and exit.
+
+PARAMETER2:
+   A pointer to the new serial number field content, which must be a char
+   array of exactly 24 bytes in size, but need not be a string. If NULL,
+   this function will cause a run time exception and exit.
+
+RETURN VALUE:
+   None.
+
+SEE ALSO:
+   wib_checkReservedFlash, wib_getSysConstsSz, wib_setMAC,
+   wib_setProductName, wib_setSys4kBlocks, wib_setSysConsts,
+   wib_setTableVersion, wib_setTimeStamp, wib_setUser4kBlocks,
+   wib_setVendorId
+END DESCRIPTION *********************************************************/
+
+_wib_debug
+void wib_setSerialNumber(wib_sysIdBlockData far *build, char far *newSN)
+{
+	if (!build || !newSN) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+	_f_memcpy(build->idBlock.serialNumber, newSN,
+	          sizeof build->idBlock.serialNumber);
+}
+
+/*** BeginHeader wib_setSys4kBlocks */
+void wib_setSys4kBlocks(wib_sysIdBlockData far *build, uint16 sys4kBlocks);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wib_setSys4kBlocks            <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   void wib_setSys4kBlocks(wib_sysIdBlockData far *build,
+                           uint16 sys4kBlocks);
+
+DESCRIPTION:
+   Updates the build data structure's system ID block plus persistent data
+   area size.
+
+IMPORTANT NOTES FOR DEVELOPERS:
+   1) A total ID+User blocks reserved area allocation which exceeds the
+      value of the MAX_USERBLOCK_SIZE macro will cause a run time
+      exception and exit.
+   2) At present, this function requires that a version 5 system ID block
+      be built. If another version is set, this function will cause a run
+      time exception and exit.
+   3) At present, this function requires that the specified number of 4
+      KByte blocks be nonzero. If zero, this function will cause a run
+      time exception and exit.
+
+PARAMETER1:
+   A pointer to the system ID block build data structure. If NULL, this
+   function will cause a run time exception and exit.
+
+PARAMETER2:
+   The size, in 4 KByte blocks, of the desired system ID block plus
+   persistent data area. Note that no specific maximum block count is
+   enforced.
+
+RETURN VALUE:
+   None.
+
+SEE ALSO:
+   wib_checkReservedFlash, wib_getSysConstsSz, wib_setMAC,
+   wib_setProductName, wib_setSerialNumber, wib_setSysConsts,
+   wib_setTableVersion, wib_setTimeStamp, wib_setUser4kBlocks,
+   wib_setVendorId
+END DESCRIPTION *********************************************************/
+
+_wib_debug
+void wib_setSys4kBlocks(wib_sysIdBlockData far *build, uint16 sys4kBlocks)
+{
+	if (!build) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+	// at least for now:
+	//  enforce the version 5 unique ID block requirement!
+	//  enforce the nonzero sys4kBlocks requirement!
+	if (5u != build->idBlock.tableVersion || !sys4kBlocks) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+	build->idBlock.idBlock2.persBlockLoc = sys4kBlocks * 4096ul;
+	if (sys4kBlocks) {
+		build->idBlock.idBlock2.persBlockLoc -= sizeof build->idBlock;
+	}
+
+	// enforce the current MAX_USERBLOCK_SIZE macro value
+	if (wib_checkReservedFlash(build)) {
+		exception(-ERR_ASSERTFAILURE);
+		exit(-ERR_ASSERTFAILURE);
+	}
+}
+
+/*** BeginHeader wib_setSysConsts */
+#if WIB_CONST_SZ_MAX
+void wib_setSysConsts(wib_sysIdBlockData far *build, void far *constData,
+                      size_t constLen);
+#endif	// WIB_CONST_SZ_MAX
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wib_setSysConsts              <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   void wib_setSysConsts(wib_sysIdBlockData far *build,
+                         void far *constData, size_t constLen);
+
+DESCRIPTION:
+   Updates the system ID block build data structure's system constants.
+
+PARAMETER1:
+   A pointer to the system ID block build data structure. If NULL, this
+   function will cause a run time exception and exit.
+
+PARAMETER2:
+   A pointer to the new system constants, which must be less than or equal
+   to WIB_CONST_SZ_MAX bytes in size. If NULL, this function will cause a
+   run time exception and exit.
+
+PARAMETER3:
+   The length (size, in bytes) of the new system constants.
+
+RETURN VALUE:
+   None.
+
+SEE ALSO:
+   wib_checkReservedFlash, wib_getSysConstsSz, wib_setMAC,
+   wib_setProductName, wib_setSerialNumber, wib_setSys4kBlocks,
+   wib_setTableVersion, wib_setTimeStamp, wib_setUser4kBlocks,
+   wib_setVendorId
+END DESCRIPTION *********************************************************/
+
+#if WIB_CONST_SZ_MAX
+_wib_debug
+void wib_setSysConsts(wib_sysIdBlockData far *build, void far *constData,
+                      size_t constLen)
+{
+	if (!build || !constData) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+	build->sysCnst_cnt = constLen;
+	// enforce the maximum system constants buffer size
+	if (sizeof build->sysCnst_buf < build->sysCnst_cnt) {
+		build->sysCnst_cnt = sizeof build->sysCnst_buf;
+#ifdef WIB_VERBOSE
+		printf("wib_setSysConsts: Truncated constants data to fit the buffer.\n");
+#endif	// WIB_VERBOSE
+	}
+	// always copy from the front of the system constants buffer
+	_f_memcpy(build->sysCnst_buf, constData, build->sysCnst_cnt);
+}
+#endif	// WIB_CONST_SZ_MAX
+
+/*** BeginHeader wib_setTableVersion */
+void wib_setTableVersion(wib_sysIdBlockData far *build, uint16 version);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wib_setTableVersion           <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   void wib_setTableVersion(wib_sysIdBlockData far *build,
+                            uint16 version);
+
+DESCRIPTION:
+   Updates the build data structure's system ID block version.
+
+IMPORTANT NOTE FOR DEVELOPERS:
+   At present, this function requires that a version 5 system ID block be
+   built. If another version is set, this function will cause a run time
+   exception and exit.
+
+PARAMETER1:
+   A pointer to the system ID block build data structure. If NULL, this
+   function will cause a run time exception and exit.
+
+PARAMETER2:
+   The desired system ID block version. If zero, this function will cause
+   a run time exception and exit.
+
+RETURN VALUE:
+   None.
+
+SEE ALSO:
+   wib_checkReservedFlash, wib_getSysConstsSz, wib_setMAC,
+   wib_setProductName, wib_setSerialNumber, wib_setSys4kBlocks,
+   wib_setSysConsts, wib_setTimeStamp, wib_setUser4kBlocks,
+   wib_setVendorId
+END DESCRIPTION *********************************************************/
+
+_wib_debug
+void wib_setTableVersion(wib_sysIdBlockData far *build, uint16 version)
+{
+	if (!build || !version) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+	// at least for now, enforce the version 5 unique ID block!
+	if (5u != version) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+	build->idBlock.tableVersion = version;
+}
+
+/*** BeginHeader wib_setTimeStamp */
+void wib_setTimeStamp(wib_sysIdBlockData far *build, uint32 timeStamp);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wib_setTimeStamp              <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   void wib_setTimeStamp(wib_sysIdBlockData far *build, uint32 timeStamp);
+
+DESCRIPTION:
+   Updates the system ID block build data structure's time stamp.
+
+PARAMETER1:
+   A pointer to the system ID block build data structure. If NULL, this
+   function will cause a run time exception and exit.
+
+PARAMETER2:
+   The desired Dynamic C time stamp, i.e. the number of seconds elapsed
+   since 12:00:00 am, 01-Jan-1980.
+
+RETURN VALUE:
+   None.
+
+SEE ALSO:
+   wib_checkReservedFlash, wib_getSysConstsSz, wib_setMAC,
+   wib_setProductName, wib_setSerialNumber, wib_setSys4kBlocks,
+   wib_setSysConsts, wib_setTableVersion, wib_setUser4kBlocks,
+   wib_setVendorId
+END DESCRIPTION *********************************************************/
+
+_wib_debug
+void wib_setTimeStamp(wib_sysIdBlockData far *build, uint32 timeStamp)
+{
+	auto struct tm t;
+
+	if (!build) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+	// fill in the time stamp fields
+	mktm(&t, timeStamp);
+	build->idBlock.timestamp[0] = (t.tm_year + 1900) / 100;
+	build->idBlock.timestamp[1] = t.tm_year % 100;
+	build->idBlock.timestamp[2] = t.tm_mon;
+	build->idBlock.timestamp[3] = t.tm_mday;
+	build->idBlock.timestamp[4] = t.tm_hour;
+	build->idBlock.timestamp[5] = t.tm_min;
+	build->idBlock.timestamp[6] = t.tm_sec;
+}
+
+/*** BeginHeader wib_setUser4kBlocks */
+void wib_setUser4kBlocks(wib_sysIdBlockData far *build, uint16 user4kBlocks);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wib_setUser4kBlocks           <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   void wib_setUser4kBlocks(wib_sysIdBlockData far *build,
+                            uint16 user4kBlocks);
+
+DESCRIPTION:
+   Updates the build data structure's system ID block's User block size.
+
+IMPORTANT NOTES FOR DEVELOPERS:
+   1) A total ID+User blocks reserved area allocation which exceeds the
+      value of the MAX_USERBLOCK_SIZE macro will cause a run time
+      exception and exit.
+   2) At present, this function requires that a version 5 system ID block
+      be built. If another version is set, this function will cause a run
+      time exception and exit.
+
+PARAMETER1:
+   A pointer to the system ID block build data structure. If NULL, this
+   function will cause a run time exception and exit.
+
+PARAMETER2:
+   The size, in 4 KByte blocks, of the desired User block. If the desired
+   size of the User block exceeds sixteen 4 KByte blocks (i.e. 64 KBytes),
+   this function will cause a run time exception and exit.
+
+RETURN VALUE:
+   None.
+
+SEE ALSO:
+   wib_checkReservedFlash, wib_getSysConstsSz, wib_setMAC,
+   wib_setProductName, wib_setSerialNumber, wib_setSys4kBlocks,
+   wib_setSysConsts, wib_setTableVersion, wib_setTimeStamp,
+   wib_setVendorId
+END DESCRIPTION *********************************************************/
+
+_wib_debug
+void wib_setUser4kBlocks(wib_sysIdBlockData far *build, uint16 user4kBlocks)
+{
+	if (!build || 16 < user4kBlocks) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+	// at least for now, enforce the version 5 unique ID block!
+	if (5u != build->idBlock.tableVersion) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+	build->idBlock.idBlock2.userBlockSiz2 = user4kBlocks * 4096u;
+	if (user4kBlocks) {
+		// fit the valid marker within the specified User block size
+		build->idBlock.idBlock2.userBlockSiz2 -= sizeof build->idBlock.marker;
+	}
+
+	// enforce the current MAX_USERBLOCK_SIZE macro value
+	if (wib_checkReservedFlash(build)) {
+		exception(-ERR_ASSERTFAILURE);
+		exit(-ERR_ASSERTFAILURE);
+	}
+}
+
+/*** BeginHeader wib_setVendorId */
+void wib_setVendorId(wib_sysIdBlockData far *build, uint16 vendorId);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wib_setVendorId               <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   void wib_setVendorId(wib_sysIdBlockData far *build, uint16 vendorId);
+
+DESCRIPTION:
+   Updates the build data structure's system ID block's Vendor Id. Note
+   that Vendor Id zero is reserved.
+
+PARAMETER1:
+   A pointer to the system ID block build data structure. If NULL, this
+   function will cause a run time exception and exit.
+
+PARAMETER2:
+   The desired Vendor Id. If zero, this function will cause a run time
+   exception and exit.
+
+RETURN VALUE:
+   None.
+
+SEE ALSO:
+   wib_checkReservedFlash, wib_getSysConstsSz, wib_setMAC,
+   wib_setProductName, wib_setSerialNumber, wib_setSys4kBlocks,
+   wib_setSysConsts, wib_setTableVersion, wib_setTimeStamp,
+   wib_setUser4kBlocks
+END DESCRIPTION *********************************************************/
+
+_wib_debug
+void wib_setVendorId(wib_sysIdBlockData far *build, uint16 vendorId)
+{
+	if (!build || !vendorId) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+	build->idBlock.vendorID = vendorId;
+}
+
+/*******************************************************************************
+	Below this comment block are explicitly debuggable public API functions.
+*******************************************************************************/
+
+/*** BeginHeader wib_askRetainMAC */
+void wib_askRetainMAC(wib_sysIdBlockData far *build, const char far *newMAC);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wib_askRetainMAC              <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   void wib_askRetainMAC(wib_sysIdBlockData far *build,
+                         const char far *newMAC);
+
+DESCRIPTION:
+   Updates the system ID block build data structure's MAC address copy.
+   If a valid system ID block exists then the User is asked if the current
+   system ID block MAC address should be retained, otherwise the specified
+   new MAC address is copied. This function is specifically intended only
+   for debugging usage.
+
+PARAMETER1:
+   A pointer to the system ID block build data structure. If NULL, this
+   function will cause a run time exception and exit.
+
+PARAMETER2:
+   A pointer to the new MAC address. If NULL, this function will cause a
+   run time exception and exit.
+
+RETURN VALUE:
+   None.
+
+SEE ALSO:
+   wib_setMAC
+END DESCRIPTION *********************************************************/
+
+debug
+void wib_askRetainMAC(wib_sysIdBlockData far *build, const char far *newMAC)
+{
+	auto int ch;
+
+	if (!build || !newMAC) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+	// default to the new MAC address
+	wib_setMAC(build, newMAC);
+	if (SysIDBlock.tableVersion) {
+		// nonzero tableVersion implies that there is a valid system ID block
+		printf("\nRetain the %02X:%02X:%02X:%02X:%02X:%02X MAC address (Y/N)? ",
+		       SysIDBlock.macAddr[0], SysIDBlock.macAddr[1],
+		       SysIDBlock.macAddr[2], SysIDBlock.macAddr[3],
+		       SysIDBlock.macAddr[4], SysIDBlock.macAddr[5]);
+		ch = toupper(getchar());
+		if (ch != 'N') {
+			// force any other character to 'Y'
+			ch = 'Y';
+			// retain the old MAC address
+			wib_setMAC(build, SysIDBlock.macAddr);
+		}
+		printf("%c\n", ch);
+	}
+}
+
+/*** BeginHeader wib_dumpMacroTable */
+void wib_dumpMacroTable(wib_sysIdBlockData far *build);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ********************************************
+wib_dumpMacroTable            <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   void wib_dumpMacroTable(wib_sysIdBlockData far *build);
+
+DESCRIPTION:
+   Prints to STDIO the current content of the system ID block build data
+   structure's macro table. This function is specifically intended only
+   for debugging usage.
+
+PARAMETER1:
+   A pointer to the system ID block build data structure. If NULL, this
+   function will cause a run time exception and exit.
+
+RETURN VALUE:
+   None.
+
+SEE ALSO:
+   wib_addMacro, wib_removeMacro
+END DESCRIPTION *********************************************************/
+
+debug
+void wib_dumpMacroTable(wib_sysIdBlockData far *build)
+{
+	auto int mac_index;
+
+	if (!build) {
+		exception(-ERR_BADPARAMETER);
+		exit(-ERR_BADPARAMETER);
+	}
+
+	for (mac_index = 0; mac_index < build->sysMac_cnt; ++mac_index) {
+		printf("\t%10ls = 0x%08lx\n", build->sysMac_tbl[mac_index].name,
+		       build->sysMac_tbl[mac_index].value);
+	}
+}
+
+/*******************************************************************************
+	Below this comment block are private API functions and globals.
+*******************************************************************************/
+
+/*** BeginHeader _wib_addDevice */
+int _wib_addDevice(wib_sysIdBlockData far *build, MemDevSpec far *device);
+/*** EndHeader */
+
+/* START_FUNCTION DESCRIPTION ********************************************
+_wib_addDevice                <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   int _wib_addDevice(wib_sysIdBlockData far *build,
+                      MemDevSpec far *device);
+
+DESCRIPTION:
+   Adds a new memory device specification, if possible, into the system ID
+   block build data structure's memory devices specification table.
+
+PARAMETER1:
+   A pointer to the system ID block build data structure.
+
+PARAMETER2:
+   A pointer to the new memory device specification structure.
+
+RETURN VALUE:
+   0 if the new MemDevSpec was added to the build memory devices table.
+   1 if the new MemDevSpec wasn't added (build mem devices table is full).
+END DESCRIPTION *********************************************************/
+
+_wib_debug
+int _wib_addDevice(wib_sysIdBlockData far *build, MemDevSpec far *device)
+{
+	auto int return_value;
+
+	if (build->memDev_cnt < MEMORY_DEVICE_TABLE_SIZE) {
+		build->memDev_tbl[build->memDev_cnt++] = *device;
+		return_value = 0;
+	} else {
+		return_value = 1;
+	}
+	return return_value;
+}
+
+/*** BeginHeader _wib_getCRC16CCITT */
+uint16 _wib_getCRC16CCITT(void far *data, uint32 count, uint16 accCRC);
+/*** EndHeader */
+
+/* START_FUNCTION DESCRIPTION ********************************************
+_wib_getCRC16CCITT            <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   uint16 _wib_getCRC16CCITT(void far *data, uint32 count, uint16 accCRC);
+
+DESCRIPTION:
+   Calculates the CRC-16-CCITT value for the given data array, based on
+   the given initial or previously calculated CRC value. In particular,
+   note that it is possible to use the previous CRC result, fed into
+   accCRC, to chain CRC-16-CCITT calculations. Such chaining is useful
+   when covering multiple, discontinuous data arrays.
+
+PARAMETER1:
+   A pointer to the data array (memory area) for which a CRC-16-CCITT is
+   to be calculated.
+
+PARAMETER2:
+   The count of bytes in (i.e. the size of) the data array.
+
+PARAMETER3:
+   Either an initial CRC value or a previously accumulated CRC value. The
+   appropriate initial CRC value is dependent on the application. When
+   calculating the system ID block's primary CRC, zero is the appropriate
+   initial CRC value; thereafter, CRC chaining is used.
+
+RETURN VALUE:
+   Based on the supplied initial or accumulated CRC value, the calculated
+   CRC-16-CCITT value of the given data array.
+END DESCRIPTION *********************************************************/
+
+_wib_debug
+uint16 _wib_getCRC16CCITT(void far *data, uint32 count, uint16 accCRC)
+{
+	auto uint8 datum;
+	auto uint8 far *datumPtr;
+	auto uint16 bits, carry;
+
+	datumPtr = (uint8 far *) data;
+	while (count--) {
+		datum = *datumPtr++;
+		bits = CHAR_BIT;
+		while (bits--) {
+			carry = (accCRC ^ (int) datum << 8) & 0x8000;
+			accCRC <<= 1;
+			if (carry) {
+				accCRC ^= 0x1021;
+			}
+			datum <<= 1;
+		}
+	}
+	return accCRC;
+}
+
+/*** BeginHeader _wib_retrieveMacros */
+int _wib_retrieveMacros(wib_sysIdBlockData far *build);
+/*** EndHeader */
+
+/* START_FUNCTION DESCRIPTION ********************************************
+_wib_retrieveMacros           <WRITEIDBLOCK.LIB>
+
+SYNTAX:
+   int _wib_retrieveMacros(wib_sysIdBlockData far *build);
+
+DESCRIPTION:
+   Retrieves the current system macros stored in primary (program,
+   parallel or serial) flash and saves them into the system ID block build
+   data structure's system macro table.
+
+PARAMETER1:
+   A pointer to the system ID block build data structure.
+
+RETURN VALUE:
+   0 if all current system macros were added to the build macros table.
+   -1 if no system macros table exists.
+   -2 if no system ID block exists.
+   -3 if the system macros table is an unknown version.
+   -4 if a system macro name length is too long.
+   -5 if a system macro isn't added (build macros table is full).
+END DESCRIPTION *********************************************************/
+
+_wib_debug
+int _wib_retrieveMacros(wib_sysIdBlockData far *build)
+{
+	// The compiler changes a macro xx in the macro table to _DC_xx_ as used by
+	// library and sample code; these macros help clarify the logic of unwrapping
+	// the macro parameter.
+	//#define COMPILER_PFX 4
+	//#define COMPILER_SFX 1
+	//#define COMPILER_CHRS (COMPILER_PFX + COMPILER_SFX)
+
+	auto uint32 value;
+	auto uint16 length; // Multipurpose
+
+	// A small buffer to hold the maximum macro table entry. This is not of type
+	// MacroTableEntry because the macro table is packed so that strings only
+	// take exactly the space they require.
+	auto char raw_buffer[sizeof (MacroTableEntry)];
+
+	// Intended to point to the end of the string of the current macro table.
+	auto char far *null_char_ptr;
+
+	auto _wib_macroHeader header;				// A copy of the header.
+	auto _wib_macroHeader far *header_ptr;	// A pointer to the header.
+	auto char far *raw_ptr;					// A pointer to the current entry.
+	auto char far *raw_ptr_end;				// The end of the macro table.
+	// --- END OF DECLARATIONS ---
+
+	if (SysIDBlock.idBlock2.macrosLoc == 0) {
+		return -1;
+	}
+
+	if (IDBlockAddr == 0) {
+		return -2;
+	}
+
+#if _SERIAL_BOOT_FLASH_
+	header_ptr = (_wib_macroHeader far *)
+	             (IDBlockAddr - SysIDBlock.idBlock2.macrosLoc);
+	_sbfReadUsr(&header, (uint32) header_ptr, sizeof header);
+#elif RAM_COMPILE
+	header_ptr = (_wib_macroHeader far *) _sys_macro_table_copy;
+	header = *header_ptr;
+#else	// _SERIAL_BOOT_FLASH_
+	// parallel flash
+	header_ptr = (_wib_macroHeader far *)
+	             (IDBlockAddr - SysIDBlock.idBlock2.macrosLoc);
+	header = *header_ptr;
+#endif	// _SERIAL_BOOT_FLASH_
+
+	if (header.version != 0) {
+		return -3;	// Version 0 macro tables are latest.
+	}
+
+	// This block reads a full entry length worth of data into the raw buffer.
+	// It then searches the raw buffer for the null character that should
+	// terminate the string and errors if not found. This null character also
+	// marks the beginning of the macro value.
+	// On entry, 'length' does not have an appropriate value to increment the
+	// pointer, but is calculated within the loop; The 'length' variable is re-
+	// used to conserve stack space.
+	for (raw_ptr = (char far *) (header_ptr + 1),
+	     raw_ptr_end = raw_ptr + (header.sz - sizeof header);
+	     raw_ptr < raw_ptr_end; raw_ptr += length)
+	{
+		// Get the entry, then check for a match.
+#if _SERIAL_BOOT_FLASH_
+		_sbfReadUsr(raw_buffer, (uint32) raw_ptr, sizeof raw_buffer);
+#else	// _SERIAL_BOOT_FLASH_
+	// parallel flash
+		_f_memcpy(raw_buffer, raw_ptr, sizeof raw_buffer);
+#endif	// _SERIAL_BOOT_FLASH_
+		for (null_char_ptr = raw_buffer, length = 0;
+		     *null_char_ptr != '\x00' && length < MACRO_NAME_SIZE;
+		     ++null_char_ptr, ++length)
+		;
+		if (length == MACRO_NAME_SIZE) {
+			return -4;
+		}
+		length += 1 + sizeof (uint32);	// '1 +' for null character
+
+		value = *(uint32 far *) (null_char_ptr + 1);
+		if (wib_addMacro(build, raw_buffer, value)) {
+			return -5;
+		}
+	}
+	return 0;
+}
+
+/*** BeginHeader _wib_erasedMarker */
+extern const uint8 far _wib_erasedMarker[];
+/*** EndHeader */
+
+const uint8 far _wib_erasedMarker[] = {
+	'\xFF', '\xFF', '\xFF', '\xFF', '\xFF', '\xFF'
+};
+
+/*** BeginHeader _wib_validMarker */
+extern const uint8 _wib_validMarker[];
+/*** EndHeader */
+
+const uint8 _wib_validMarker[] = {
+	'\x55', '\xAA', '\x55', '\xAA', '\x55', '\xAA'
+};
+
+/*** BeginHeader _wib_sbf_buf */
+#if WIB_CONST_SZ_MAX > WIB_WR_BUF_SZ
+	#define _WIB_SBF_BUF_SZ_ WIB_CONST_SZ_MAX
+#else	// WIB_CONST_SZ_MAX > WIB_WR_BUF_SZ
+	#define _WIB_SBF_BUF_SZ_ WIB_WR_BUF_SZ
+#endif	// WIB_CONST_SZ_MAX > WIB_WR_BUF_SZ
+extern uint8 _wib_sbf_buf[_WIB_SBF_BUF_SZ_];
+/*** EndHeader */
+
+/*
+	Due to its reliance on the DC 10.4x serial boot flash library's _sbfReadUsr()
+	function and WriteFlash() macro, when compiled to a board equipped with a
+	serial boot flash this library uses a global root memory serial flash
+	read/write buffer.
+*/
+uint8 _wib_sbf_buf[_WIB_SBF_BUF_SZ_];
+
+/*** BeginHeader */
+#endif
+/*** EndHeader */
