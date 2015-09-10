@@ -87,6 +87,10 @@ Revision History:	Rev 1.0 Initial Release
                           bytes at start and end of flash from being
                           overwritten.  Support for writing serial boot flash
                           on BL4S1xx boards.
+	2014 Nov 04  SJH - Added support for 45DB641E.  The old method of
+                  determining device parameters by reading just the status
+                  register is not sufficient.  Need to read manufacturer
+                  and device ID as well.
 
 *************************************************************************/
 
@@ -901,9 +905,14 @@ RETURN VALUE:  0 for success,
                -4 if shared SPI port in use by other resource
 
 END DESCRIPTION **********************************************************/
+extern char _mfg_id[4];
+extern char _n_status;
 
 /*** EndHeader */
-
+#ifndef __BOOTDEV_SFLASH__
+char _mfg_id[4];
+char _n_status;
+#endif
 
 /*
 table for flash device configuration
@@ -911,22 +920,31 @@ table for flash device configuration
 
 typedef struct {
 	int id_code;
+   long mfgid;			// 4 bytes from mfg and dev id read.  If zero, then
+   						// ignore (for backwards compat).
    long pages;
    unsigned int pagesize;
    int addressbytes;
    int pagebitshift;
 } sf_devtable_entry;
 
+// NOTE: put devices with non-zero manufacturer info (2nd field) before the
+// zero (i.e. default) entry with the same status code (1st field).
+// The first byte read using the 9F opcode is in the LSB of the long
+// value, so (e.g.) the 0x1F for Atmel is the LSB.  Currently, only
+// 4 bytes are read.  If more than this is required in the future,
+// another field will need to be added.
 const sf_devtable_entry sf_devtable[] =
 {
-   {0x001C, 2048L, 264, 3, 9},	  // AT45DB041B
-   {0x0024, 4096L, 264, 3, 9},	  // AT45DB081B
-   {0x002C, 4096L, 528, 3, 10},	  // AT45DB161D - new RCM5450W 2MB serflash
-   {0x0034, 8192L, 528, 3, 10},	  // AT45DB321
-   {0x003C, 8192L, 1056, 3, 11},  // AT45DB642
-   {0x0010, 16384L, 1056, 4, 11}, // AT45DB1282
-   {0, 0L, 0, 0, 0},              // Place holder for manual addition
-   {0, 0L, 0, 0, 0}
+   {0x001C, 0L,			 2048L, 	264, 	3, 9},	  	// AT45DB041B
+   {0x0024, 0L,			 4096L, 	264, 	3, 9},	  	// AT45DB081B
+   {0x002C, 0L,			 4096L, 	528, 	3, 10},	  	// AT45DB161D - new RCM5450W 2MB serflash
+   {0x0034, 0L,			 8192L, 	528, 	3, 10},	  	// AT45DB321
+	{0x003C, 0x0100281FL, 32768L, 264,  3, 9},     	// AT45DB641E - new RCM4200
+   {0x003C, 0L,			 8192L, 	1056, 3, 11},  	// AT45DB642
+   {0x0010, 0L,			 16384L, 1056, 4, 11}, 		// AT45DB1282
+   {0,},              // Place holder for manual addition
+   {0,}
 };
 #define SFLASH_DEVTABLE_SIZE (sizeof(sf_devtable)/sizeof(sf_devtable[0]))
 
@@ -938,6 +956,7 @@ _sflash_nodebug sf_initDevice(sf_device *dev,
 	auto char status;
    auto int i;
    auto unsigned long t;
+   auto long mfg;
 
 #if RCM6600W_SERIES || RCM6700_SERIES
    if (SPIgetSemaphore(SPI_DF)) {
@@ -953,6 +972,26 @@ _sflash_nodebug sf_initDevice(sf_device *dev,
    dev->cspin.mask = 1 << cs_pin;
 
    dev->write_state = 0;
+
+#ifndef __BOOTDEV_SFLASH__
+	// If this board boots from serial flash, we already have device info set up
+   // (by the BIOS).  In this case, where we don't boot from serflash, we need
+   // to duplicate those actions, in order to support ATDB45xxxE rev serflash.
+   _n_status = 2;
+   _sf_deviceStatus(dev);
+   _sf_deviceStatus(dev);     // Dummy reads (discard result)
+
+   sf_enableCS(dev);
+   sfspi_xwrite(paddr("\x9F"),1);  //Send command 0x9F (get dev ID)
+   sfspi_xread(paddr(_mfg_id), 4);  //Read 4 bytes
+   sf_disableCS(dev);
+
+   // If AT45DB321C, then need extra dummy status byte read
+   if (_mfg_id[1] == 0x27 && _mfg_id[2] == 0x00)
+      _n_status = 3;
+
+
+#endif
 
    // read until status not busy (with timeout mechanism)
   	t = MS_TIMER;
@@ -976,9 +1015,14 @@ _sflash_nodebug sf_initDevice(sf_device *dev,
    //SJH - note that this method of determining the device density (using
    // middle 4 bits of status register) is obsolete and should be replaced
    // with the proper JEDEC "manufacterer and device ID read" command.
+   // ...We now do this when required.
+
+   mfg = *(long *)_mfg_id;	// Get Mfg ID as a long
+
    for(i = 0; i < SFLASH_DEVTABLE_SIZE;i++)
    {
-      if(sf_devtable[i].id_code == (status & 0x3C))
+      if(sf_devtable[i].id_code == (status & 0x3C) &&
+         (!sf_devtable[i].mfgid || sf_devtable[i].mfgid == mfg))
       {
          dev->pagesize = sf_devtable[i].pagesize;
 			dev->page_offset = 0;
@@ -1156,8 +1200,12 @@ _sflash_nodebug char sf_deviceStatus(const sf_device *dev)
 			flash at greater than 25 MHz. For safety, we always send the dummy byte
 			and expect the read status register result in the byte following the
 			dummy byte.
+         SJH - Aug 14, 2014: changed to dynamically determine whether to read
+         dummy byte, so works with all serial flash revs C..E.  Note that
+         _n_status is set to 2 or 3 in the bios.
 		*/
-   	sfspi_xwrite(paddr("\xD7"), 2);  //Send command 0xD7 and dummy 0x00
+   	sfspi_xwrite(paddr("\xD7"), _n_status-1);  //Send command 0xD7 and
+      														// possibly dummy 0x00
    	sfspi_xread(paddr(&status), 1);  //Read status byte
 		sf_disableCS(dev);
 
@@ -1182,7 +1230,7 @@ _sflash_nodebug char sf_deviceStatus(const sf_device *dev)
 		greater than 25 MHz. For safety, we always send the dummy byte and expect
 		the read status register result in the byte following the dummy byte.
 	*/
-   sfspi_xwrite(paddr("\xD7"), 2);  //Send command 0xD7 and dummy 0x00
+   sfspi_xwrite(paddr("\xD7"), _n_status-1);  //See SJH comment above
    sfspi_xread(paddr(&status), 1);  //Read status byte
 	sf_disableCS(dev);
 
@@ -1617,6 +1665,18 @@ _sflash_nodebug int sf_writePage(const sf_device *dev, int bank, long page)
    	sf_address (&command[1], addrbytes,
    		(page + dev->page_offset) << dev->pagebitshift);
    	command[addrbytes + 1] = '\x00'; //extra zero byte
+
+      #ifdef SFLASH_DEBUG_DETAIL
+      /*SJH - dump the actual command to make sure no corruption */
+      printf("$$wp %02X %02X %02X %02X\n",
+      	command[0], command[1], command[2], command[3]);
+      page = (long)command[1]<<16 | (long)command[2]<<8 | (long)command[3];
+      if (page & 0x3FF)
+      	printf("$$wp - bad LSBs\n");
+      page >>= 10;
+      if (page < SF_PROTECT_LOW>>9)
+      	printf("$$wp - bad lo addr\n");
+      #endif
 
    	sf_enableCS(dev);
 
