@@ -847,3 +847,16 @@
           printf("%s   %s\n", foo[0], foo[1]);
        }
 
+28. The compiler incorrectly throws an error ("Duplicate 'const' keywords not
+    allowed in this context.") if a function contains multiple, non-pointer
+    `const` parameters.
+
+    Work-around example: replace
+
+        void foo(const int bar, const int baz) {}
+
+    with
+
+        typedef const int const_int;
+        void foo(const_int bar, const_int baz) {}
+
