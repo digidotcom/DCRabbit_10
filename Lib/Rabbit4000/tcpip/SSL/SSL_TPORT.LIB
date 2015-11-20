@@ -19,8 +19,8 @@ DESCRIPTION:
   sockets, then #use SSL_SOCK.LIB instead.
 
   This library supports:
-    - Server-side (TLS or SSLv3.0, with SSLv2 handshake compatibility)
-    - Client-side (TLS only)
+    - Server-side
+    - Client-side
     - Far pointers throughout
     - Arbitrary number of sessions (limited by _sys_malloc() memory)
     - Session resumption for both client and server sides
@@ -1404,17 +1404,6 @@ int tls_sm(ssl_Socket __far * state,
 		do {
 	      // Assemble fragmented handshake messages
 	      if (state->hdr.rec_type == SSL_REC_handshake) {
-	      	if (state->cur_state == SSL_STATE_HS_LISTEN && state->sslv2_hs) {
-	      		// Unfortunately, different processing for SSLV2 client hello.
-	      		// SSLV2 doesn't have HS fragmentation, so just read everything
-	      		// in buffer.
-	            _tbuf_xread(&hh, hs_in, 0, 3);	// peek at message type and version
-	      		hs_len = hs_in->len;					// length is everything in buffer
-	            _tbuf_ref(hs_in, &g, 0, (word)hs_len);
-	            // t is set up to map everything for SSLV2
-	            _f_memcpy(&t, hs_in, sizeof(t));
-	      		goto _hs_proc;
-	      	}
 	         if (hs_in->len >= sizeof(hh)) {
 	            _tbuf_xread(&hh, hs_in, 0, sizeof(hh));
 	            hs_len = n24toul(hh.length) + sizeof(hh);
@@ -3064,7 +3053,6 @@ int tls_do_client_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
    // 3) send server hello done message
    auto SSL_byte_t sess_id[SSL_MAX_SESSION_ID];
    auto SSL_uint16_t ciphers[SSL_MAX_CIPHER_LIST];
-   auto SSLv2_ClientHello v2;
 	auto SSL_ClientHello cli_hello;
    auto int ret_val, temp;
    auto long cc;
@@ -3077,82 +3065,35 @@ int tls_do_client_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
    	  printf("--->Received Client Hello, begin Server Hello<---\n");
 #endif
 
-	// This is one case where we need to handle SSLv2 format as well as SSLv3/TLS.
-	if (state->cur_state == SSL_STATE_HS_LISTEN && state->sslv2_hs) {
-		_tbuf_delete(t, 1);	// discard message type (client_hello)
-	   _tbuf_extract(&cli_hello.client_version, t, sizeof(SSL_ProtocolVersion));
-		_tbuf_extract(&v2, t, 6);	// get length fields
-		v2.ciphersuite_length = ntohs(v2.ciphersuite_length)/3;	// *number* of suites
-		cli_hello.session_id_length = ntohs(v2.session_id_length);
-		v2.challenge_length = ntohs(v2.challenge_length);
-	   suites = 0;
-		for (i = 0; i < v2.ciphersuite_length; ++i) {
-			if (suites == SSL_MAX_CIPHER_LIST) {
+   // Parse the handshake message
+   _tbuf_extract(&cli_hello.client_version, t, sizeof(SSL_ProtocolVersion) + sizeof(SSL_Random));
+
+   // Extract length and session id and check for illegal length
+   _tbuf_extract(&cli_hello.session_id_length, t, 1);
+   if(cli_hello.session_id_length > SSL_MAX_SESSION_ID) {
 #if _SSL_PRINTF_DEBUG
-    			printf("*** No suitable cipher suite in SSLv2 client hello ***\n");
+ 		printf("*** Session ID too long in client hello ***\n");
 #endif
-	      	return tls_error(state, SSL_CIPHER_CHOICE_ERROR, out);
-	      }
-			cc = 0;
-			_tbuf_extract(((char *)&cc)+1, t, 3);
-			cc = ntohl(cc);
-			if (!(cc & 0xFF0000))
-				// OK, is a recognized v3 suite
-				ciphers[suites++] = htons((word)cc);
-		}
-		if (cli_hello.session_id_length > SSL_MAX_SESSION_ID ||
-		    v2.challenge_length > sizeof(SSL_Random)) {
+      return tls_error(state, SSL_HS_SESSION_ID_TOO_LONG, out);
+   }
+
+   // Get session ID
+   _tbuf_extract(sess_id, t, cli_hello.session_id_length);
+
+   // Extract length and ciphersuites
+   _tbuf_extract(&cli_hello.ciphersuite_length, t, 2);
+	cli_hello.ciphersuite_length = ntohs(cli_hello.ciphersuite_length);
+   if(cli_hello.ciphersuite_length > SSL_MAX_CIPHER_LIST*2) {
 #if _SSL_PRINTF_DEBUG
-    		printf("*** Session ID too long in SSLv2 client hello ***\n");
+		printf("*** Client hello ciphersuite list too long ***\n");
 #endif
-	      return tls_error(state, SSL_HS_SESSION_ID_TOO_LONG, out);
-	   }
-		cli_hello.ciphersuite_length = suites*2;	// Length in bytes (when reduced to 2-byte entries)
+      return tls_error(state, SSL_CIPHER_CHOICE_ERROR, out);
+   }
+   _tbuf_extract(ciphers, t, cli_hello.ciphersuite_length);
 
-	   // Get session ID
-	   _tbuf_extract(sess_id, t, cli_hello.session_id_length);
-
-	   // We need to convert the SSLv2 challenge data into our Random seed
-	   // Pad with 0's to the left (move the bytes to the furthest right they
-	   // can go, sizeof(SSL_Random) - challenge_len)
-	   // Clear the buffer and our random
-	   memset(&cli_hello.random, 0, sizeof(SSL_Random));
-	   _tbuf_extract(((char *)&cli_hello.random) + sizeof(SSL_Random) - v2.challenge_length,
-	   					t, v2.challenge_length);
-
-		cli_hello.compression_length = 0;
-	}
-	else {
-	   // Parse the handshake message
-	   _tbuf_extract(&cli_hello.client_version, t, sizeof(SSL_ProtocolVersion) + sizeof(SSL_Random));
-
-	   // Extract length and session id and check for illegal length
-	   _tbuf_extract(&cli_hello.session_id_length, t, 1);
-	   if(cli_hello.session_id_length > SSL_MAX_SESSION_ID) {
-#if _SSL_PRINTF_DEBUG
-    		printf("*** Session ID too long in client hello ***\n");
-#endif
-	      return tls_error(state, SSL_HS_SESSION_ID_TOO_LONG, out);
-	   }
-
-	   // Get session ID
-	   _tbuf_extract(sess_id, t, cli_hello.session_id_length);
-
-	   // Extract length and ciphersuites
-	   _tbuf_extract(&cli_hello.ciphersuite_length, t, 2);
-		cli_hello.ciphersuite_length = ntohs(cli_hello.ciphersuite_length);
-	   if(cli_hello.ciphersuite_length > SSL_MAX_CIPHER_LIST*2) {
-#if _SSL_PRINTF_DEBUG
-    		printf("*** Client hello ciphersuite list too long ***\n");
-#endif
-	      return tls_error(state, SSL_CIPHER_CHOICE_ERROR, out);
-	   }
-	   _tbuf_extract(ciphers, t, cli_hello.ciphersuite_length);
-
-	   // Extract length and compression methods (ignore actual methods)
-	   _tbuf_extract(&cli_hello.compression_length, t, sizeof(cli_hello.compression_length));
-	   _tbuf_delete(t, cli_hello.compression_length);
-	}
+   // Extract length and compression methods (ignore actual methods)
+   _tbuf_extract(&cli_hello.compression_length, t, sizeof(cli_hello.compression_length));
+   _tbuf_delete(t, cli_hello.compression_length);
 
    cli_hello.session_id = cli_hello.session_id_length > 0 ? sess_id : NULL;
    cli_hello.cipher_suites = cli_hello.ciphersuite_length > 0 ? ciphers : NULL;
@@ -3757,8 +3698,7 @@ int tls_decrypt(ssl_Socket __far * state, ssl_Header __far * hdr, _tbuf __far * 
  * which are not yet available.  Only when a complete record is available is any
  * state permanently updated (except in the case of errors).
  *
- * Note that data in the input tbuf may be altered (e.g. decrypted).  The
- * header may also be converted from an SSLV2 to a TLS header (same length).
+ * Note that data in the input tbuf may be altered (e.g. decrypted).
  *
  * If app_data is not NULL, then it is a buffer to which any application
  * data received will be appended.  If NULL, then the decrypted data will
@@ -3781,7 +3721,7 @@ int tls_decrypt(ssl_Socket __far * state, ssl_Header __far * hdr, _tbuf __far * 
  *   .  conn->hdr will be set to the TLS-equivalent record header
  *       (the length of decrypted data can be obtained directly from hdr.length
  *        since it is stored in host format, and has the footer subtracted out)
- *   .  some state chages may be made if e.g. sslv2 headers or change cipher
+ *   .  some state chages may be made if e.g. change cipher
  *        spec or alerts encountered.
  *   .  if any application data is received (in a valid state for it) then
  *        the data is decrypted and appended to app_data.
@@ -3814,11 +3754,10 @@ int tls_proc_record(ssl_Socket __far *state,
 				     )
 {
    auto TLS_Alert alert;		  	   // Used to extract an alert message
-   auto SSL_Record_Hdr header;		// Temporary header for converting v2 to v3/TLS record header
    auto ssl_Header h;
 	auto size_t rec_len, start, dstart, foot;
 	auto int bytes_decrypted;
-	auto int v2_wrap, rec_type;
+	auto int rec_type;
 #ifndef TLS_OLDBUF
 	auto word app_remain;
 #endif
@@ -3835,19 +3774,13 @@ int tls_proc_record(ssl_Socket __far *state,
 	// peek at header
 	_tbuf_xread(&h, data, 0, sizeof(h));
 
-	if (h.v3.version.major == SSL3_VER_MAJ && h.v3.version.minor == SSL3_VER_MIN ||
-	    h.v3.version.major == TLS1_VER_MAJ && h.v3.version.minor == TLS1_VER_MIN)
-		rec_len = ntohs(h.v3.length), v2_wrap = 0, rec_type = h.v3.rec_type;
-	else if (h.v2.length & 0x80 && 	// MSB must be '1' (0x80 not 0x8000 since network order)
-	         state->cur_state == SSL_STATE_HS_LISTEN &&	// must be server waiting for client hello
-	         (h.v2.version.major == SSL3_VER_MAJ && h.v2.version.minor == SSL3_VER_MIN ||
-		       h.v2.version.major == TLS1_VER_MAJ && h.v2.version.minor == TLS1_VER_MIN))
-		// Subtract 3, since V2 length includes the type and version fields which really
-		// belong in the following client hello message, which we have started to read.
-	   rec_len = (ntohs(h.v2.length) & 0x7FFF) - 3, v2_wrap = 1, rec_type = SSL_REC_handshake;
-	else {
+	if (h.v3.version.major == TLS1_VER_MAJ && h.v3.version.minor == TLS1_VER_MIN) {
+		rec_len = ntohs(h.v3.length);
+      rec_type = h.v3.rec_type;
+	}
+   else {
 #if _SSL_PRINTF_DEBUG
-    	printf("*** Got unknown header version ***\n");
+    	printf("*** Got unsupported header version ***\n");
 #endif
       return tls_error(state, SSL_READ_PROTOCOL_VER, out_data);
    }
@@ -3937,30 +3870,8 @@ int tls_proc_record(ssl_Socket __far *state,
 
 	// Now everything should fit in buffers.
 
-   if (v2_wrap) {
-   	state->hdr.rec_type = rec_type;
-   	state->hdr.version.major = h.v2.version.major;
-   	state->hdr.version.minor = h.v2.version.minor;
-   	// This tells caller that buffer contains a V2 client hello (state must
-   	// have been in SSL_STATE_HS_LISTEN from the above).
-   	state->sslv2_hs = 1;
-   	// Reduce to actual header size.  Above pretends 5-byte header, but actually
-   	// the SSLV2 header in this case is 2 bytes.
-   	dstart = 2;
-	   state->hdr.length = rec_len;
-	   rec_len += 3;
-   }
-   else {
-   	_f_memcpy(&state->hdr, &h.v3, sizeof(state->hdr));
-	   state->hdr.length = rec_len;	// assume unencrypted for now
-	}
-
-   if (state->hdr.version.minor == SSL3_VER_MIN) {
-#if _SSL_PRINTF_DEBUG
-    	printf("*** Not allowing SSLv3 ***\n");
-#endif
-		return tls_error(state, SSL_HS_CLI_PROTOCOL_ERROR, out_data);
-	}
+	_f_memcpy(&state->hdr, &h.v3, sizeof(state->hdr));
+   state->hdr.length = rec_len;	// assume unencrypted for now
 
 	// Delete header from buffer
    _tbuf_delete(data, dstart);
