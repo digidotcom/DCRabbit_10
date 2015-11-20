@@ -609,7 +609,6 @@ int tls_set_done(ssl_Socket __far * state)
 
 	state->tport && state->tport(state, TPORT_EVENT_DONE, 0);
 	state->is_client = 0;
-	state->is_ssl_v3 = 0;
 	state->is_psk = 0;
 }
 
@@ -1099,9 +1098,7 @@ int tls_digest_hs_message(ssl_Socket __far* state, ll_Gather * g)
 _ssl_tport_debug
 int tls_finished_mac(ssl_Socket __far* state, char __far * buf, int verify)
 {
-	// SSL3_VERIFY_DATA_SIZE is greater than TLS_VERIFY_DATA_SIZE and is
-   // therefore used as the dimension of these buffers
-	auto SSL_byte_t mac[SSL3_VERIFY_DATA_SIZE];
+	auto SSL_byte_t mac[TLS_VERIFY_DATA_SIZE];
    auto SSL_byte_t ret_val;
    auto SSL_Finish_Hash_t fh;
    auto _ssl_MAC_sender_t sender;
@@ -1112,20 +1109,11 @@ int tls_finished_mac(ssl_Socket __far* state, char __far * buf, int verify)
    sender = (!state->is_client ^ !verify) ? SSL_FMAC_CLIENT : SSL_FMAC_SERVER;
 	ret_val = 0;
 	// Generate the mac
-   if(state->is_ssl_v3) {
-		_ssl_v3_generate_finish_mac(state, &fh, sender, mac);
-		if (verify)
-      	ret_val = _f_memcmp(mac, buf, SSL3_VERIFY_DATA_SIZE);
-      else
-      	_f_memcpy(buf, mac, ret_val = SSL3_VERIFY_DATA_SIZE);
-   }
-	else {
-		_tls_1_generate_finish_mac(state, &fh, sender, mac);
-		if (verify)
-      	ret_val = _f_memcmp(mac, buf, TLS_VERIFY_DATA_SIZE);
-      else
-      	_f_memcpy(buf, mac, ret_val = TLS_VERIFY_DATA_SIZE);
-   }
+	_tls_1_generate_finish_mac(state, &fh, sender, mac);
+	if (verify)
+   	ret_val = _f_memcmp(mac, buf, TLS_VERIFY_DATA_SIZE);
+   else
+   	_f_memcpy(buf, mac, ret_val = TLS_VERIFY_DATA_SIZE);
 
 	return ret_val;
 }
@@ -1288,7 +1276,7 @@ int tls_sm(ssl_Socket __far * state,
            _tbuf __far * app_out)
 {
 	auto SSL_byte_t cert_verf_hashes[36];	// MD5 plus SHA hash
-	auto SSL_byte_t recvd_mac[SSL3_VERIFY_DATA_SIZE];
+	auto SSL_byte_t recvd_mac[TLS_VERIFY_DATA_SIZE];
 	auto SSL_Handshake_Hdr_t hh;
 	auto _tbuf t;			// HS message data only (not header), overlays hs_in.
 	auto ll_Gather g;		// complete HS message buffer (ref to hs_in data)
@@ -1316,7 +1304,6 @@ int tls_sm(ssl_Socket __far * state,
 			return tls_error(state, SSL_BAD_STATE_CLI_HELLO, NULL);
 		}
 		state->is_client = 1;
-		state->flags |= SSL_F_DISABLE_SSLV3;
 		rc = tls_send_client_hello(state, tport_out);
 		state->hs_timeout = _SET_SHORT_TIMEOUT(SSL_HANDSHAKE_TIMEOUT);
 		if (!rc)
@@ -1790,26 +1777,10 @@ int tls_do_server_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
    if(!(srv.server_version.major == TLS1_VER_MAJ &&
         srv.server_version.minor == TLS1_VER_MIN))
    {
-	   //	Check for SSLv3
-	   if(!(srv.server_version.major == SSL3_VER_MAJ &&
-   	     srv.server_version.minor == SSL3_VER_MIN)) {
 #if _SSL_PRINTF_DEBUG
-    		printf("*** Bad SSL version ***\n");
+    	printf("*** Bad TLS version ***\n");
 #endif
-      	return tls_error(state, SSL_HS_CLI_PROTOCOL_ERROR, out);
-      }
-      else {
-      	// We are now an SSLv3 client, so set the state to reflect
-         // this fact
-      	state->is_ssl_v3 = 1;
-      	// (This should always be set for client, since we currently only do TLS)
-      	if (state->flags & SSL_F_DISABLE_SSLV3) {
-#if _SSL_PRINTF_DEBUG
-    			printf("*** SSLv3 not allowed ***\n");
-#endif
-      		return tls_error(state, SSL_HS_CLI_PROTOCOL_ERROR, out);
-      	}
-      }
+      return tls_error(state, SSL_HS_CLI_PROTOCOL_ERROR, out);
    }
 
 	rc = 0;
@@ -1817,15 +1788,8 @@ int tls_do_server_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
 	if (state->flags & SSL_F_RESUMED) {
 		state->cur_state = SSL_STATE_WAIT_CCS_RESUME;
 
-      // Derive keys from state
-      if(state->is_ssl_v3) {
-         // Derive keys using SSLv3 algorithms
-         rc = _ssl_v3_derive_keys(state);
-      }
-      else {
-      	// Derive keys using TLSv1 algorithms
-      	rc = _tls_1_derive_keys(state);
-      }
+      // Derive keys from state using TLSv1 algorithms
+      rc = _tls_1_derive_keys(state);
 
       if(!rc) {
 	      // Now that we have keys, we can initialize our bulk cipher
@@ -1978,7 +1942,6 @@ int tls_send_certificate_verify(ssl_Socket __far* state, _tbuf __far * out, int 
 	auto char hashes[RSA_KEY_LENGTH];
 	auto _tbuf __far * t;
 	auto int rc;
-	auto size_t lenfield;
    auto RSA_key __far * key;
 #ifndef RSA_DISABLE_CRT
    auto mp_modexpCRT_state * mms;
@@ -2044,18 +2007,11 @@ int tls_send_certificate_verify(ssl_Socket __far* state, _tbuf __far * out, int 
 	   t = _tls_init_hs_msg(state, SSL_MAX_HANDSHAKE_SIZE, certificate_verify);
 	   if (!t)
 	      return tls_error(state, SSL_ALLOC_FAIL, out);
-	   if (state->is_ssl_v3)
-	      lenfield = 0;
-	   else
-	      lenfield = 2;
 
-		_f_memcpy(t->buf + (t->len + lenfield), hashes, rc);
+		_f_memcpy(t->buf + (t->len + 2), hashes, rc);
+      *(size_t __far *)(t->buf + t->len) = htons(rc);
 
-	   if (lenfield)
-	      // This silliness for TLS
-	      *(size_t __far *)(t->buf + t->len) = htons(rc);
-
-	   t->len += rc + lenfield;
+	   t->len += rc + 2;
 	   rc = _tls_finalize_hs_msg(state, t, out);
 	   break;
 	}
@@ -2119,8 +2075,7 @@ int tls_do_server_key_exchange(ssl_Socket __far * state, _tbuf * t, _tbuf __far 
    // 'key identity hint'.
    auto size_t hint_len;
 
-   if (!state->is_ssl_v3)
-      _tbuf_delete(t, 2);  // Remove redundant TLS length field
+   _tbuf_delete(t, 2);  // Remove redundant TLS length field
    state->psk_hint = &state->resource_index->psk_hint;
    // Quietly truncate hint to max size we can accept
    hint_len = u_min(t->len, sizeof(state->psk_hint->data));
@@ -2192,8 +2147,7 @@ int tls_do_client_key_exchange(ssl_Socket __far * state, _tbuf * t, _tbuf __far 
 	   #endif
 	      return tls_error(state, SSL_PRIV_KEY_DECRYPTION_FAIL, out);
       }
-      if (!state->is_ssl_v3)
-         _tbuf_delete(t, 2);  // Remove redundant TLS length field
+      _tbuf_delete(t, 2);  // Remove redundant TLS length field
       psk_id_len = u_min(t->len, sizeof(buf.psk.input));
       _tbuf_extract(buf.psk.input, t, psk_id_len);
 	   #if _SSL_PRINTF_DEBUG > 2
@@ -2228,8 +2182,7 @@ int tls_do_client_key_exchange(ssl_Socket __far * state, _tbuf * t, _tbuf __far 
 	   case 0:
 	      // first phase: fire off modular exp.
          // Get the encrypted message
-         if (!state->is_ssl_v3)
-            _tbuf_delete(t, 2);  // Remove redundant TLS length field
+         _tbuf_delete(t, 2);  // Remove redundant TLS length field
 
          rsa_key_len = state->cipher_state->key_exch->key_size >> 3;
          if (rsa_key_len != t->len || rsa_key_len > MP_SIZE-2 ||
@@ -2344,8 +2297,7 @@ int tls_do_certificate_verify(ssl_Socket __far * state, _tbuf * t, _tbuf __far *
 #if _SSL_PRINTF_DEBUG > 1
 	printf("--->Verifying client certificate...<---\n");
 #endif
-	if (!state->is_ssl_v3)
-		_tbuf_delete(t, 2);	// Delete TLS redundant length field
+	_tbuf_delete(t, 2);	// Delete TLS redundant length field
 
    if (state->peer_cert && TLS_SIGN_RSA == state->cipher_state->suite->signature_alg) {
       rsa_key_len = state->cipher_state->key_exch->key_size >> 3;
@@ -3035,58 +2987,29 @@ void _ssl_cipher_init(ssl_Socket __far* state, SSL_uint16_t suite_number) {
 
 ///////////////////////////////////////////////////////
 
-	if(state->is_ssl_v3) {
-   	// Use SSLv3 digest methods
-      // We use the HMAC constants for this, because the SSLv3 MAC is derived
-      // from an early version of HMAC, so we can reuse the values
-	   cipher->digest->init = _ssl_v3_mac_hash_init;
-	   cipher->digest->add = _ssl_v3_mac_hash_append;
-	   cipher->digest->finish = _ssl_v3_mac_hash_finish;
+   // Set up digest algorithm (TLS only uses HMAC)
+   cipher->digest->init = HMAC_hash_init;
+   cipher->digest->add = HMAC_hash_append;
+   cipher->digest->finish = HMAC_hash_finish;
 
-	   if(TLS_DIGEST_MD5 == suite->digest_alg) {
-	      // Use SSLv3 MAC hash for digests
-	      _ssl_v3_mac_init(&cipher->digest->state, HMAC_USE_MD5);
-	      cipher->digest->hash_size = HMAC_MD5_HASH_SIZE;
+   if(TLS_DIGEST_MD5 == suite->digest_alg) {
+      // TLS uses HMAC for digests
+      HMAC_init(&cipher->digest->state, HMAC_USE_MD5);
+      cipher->digest->hash_size = HMAC_MD5_HASH_SIZE;
 
-		   // Set these here for use later
-	      cipher->server_mac_sec_size = HMAC_MD5_HASH_SIZE;
-	      cipher->client_mac_sec_size = HMAC_MD5_HASH_SIZE;
-	   }
-
-	   if(TLS_DIGEST_SHA == suite->digest_alg) {
-	      // Use SSLv3 MAC hash for digests
-	      _ssl_v3_mac_init(&cipher->digest->state, HMAC_USE_SHA);
-	      cipher->digest->hash_size = HMAC_SHA_HASH_SIZE;
-		   // Set these here for use later
-	      cipher->server_mac_sec_size = HMAC_SHA_HASH_SIZE;
-	      cipher->client_mac_sec_size = HMAC_SHA_HASH_SIZE;
-	   }
+		// Set these here for use later
+      cipher->server_mac_sec_size = HMAC_MD5_HASH_SIZE;
+      cipher->client_mac_sec_size = HMAC_MD5_HASH_SIZE;
    }
-   else {
-	   // Set up digest algorithm (TLS only uses HMAC)
-	   cipher->digest->init = HMAC_hash_init;
-	   cipher->digest->add = HMAC_hash_append;
-	   cipher->digest->finish = HMAC_hash_finish;
 
-	   if(TLS_DIGEST_MD5 == suite->digest_alg) {
-	      // TLS uses HMAC for digests
-	      HMAC_init(&cipher->digest->state, HMAC_USE_MD5);
-	      cipher->digest->hash_size = HMAC_MD5_HASH_SIZE;
+   if(TLS_DIGEST_SHA == suite->digest_alg) {
+      // TLS uses HMAC for digests
+      HMAC_init(&cipher->digest->state, HMAC_USE_SHA);
+      cipher->digest->hash_size = HMAC_SHA_HASH_SIZE;
 
-			// Set these here for use later
-         cipher->server_mac_sec_size = HMAC_MD5_HASH_SIZE;
-	      cipher->client_mac_sec_size = HMAC_MD5_HASH_SIZE;
-	   }
-
-	   if(TLS_DIGEST_SHA == suite->digest_alg) {
-	      // TLS uses HMAC for digests
-	      HMAC_init(&cipher->digest->state, HMAC_USE_SHA);
-	      cipher->digest->hash_size = HMAC_SHA_HASH_SIZE;
-
-		   // Set these here for use later
-	      cipher->server_mac_sec_size = HMAC_SHA_HASH_SIZE;
-	      cipher->client_mac_sec_size = HMAC_SHA_HASH_SIZE;
-	   }
+	   // Set these here for use later
+      cipher->server_mac_sec_size = HMAC_SHA_HASH_SIZE;
+      cipher->client_mac_sec_size = HMAC_SHA_HASH_SIZE;
    }
 
 ///////////////////////////////////////////////////////
@@ -3246,25 +3169,10 @@ int tls_do_client_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
    if(!(cli_hello.client_version.major == TLS1_VER_MAJ &&
         cli_hello.client_version.minor == TLS1_VER_MIN))
    {
-	   //	Check for SSLv3
-	   if(!(cli_hello.client_version.major == SSL3_VER_MAJ &&
-   	     cli_hello.client_version.minor == SSL3_VER_MIN)) {
 #if _SSL_PRINTF_DEBUG
-    		printf("*** Bad version in client hello ***\n");
+    	printf("*** Bad version in client hello ***\n");
 #endif
-      	return tls_error(state, SSL_HS_CLI_PROTOCOL_ERROR, out);
-      }
-      else {
-      	// We are now an SSLv3 server, so set the state to reflect
-         // this fact
-      	state->is_ssl_v3 = 1;
-      	if (state->flags & SSL_F_DISABLE_SSLV3) {
-#if _SSL_PRINTF_DEBUG
-    			printf("*** SSLv3 not allowed in client hello ***\n");
-#endif
-      		return tls_error(state, SSL_HS_CLI_PROTOCOL_ERROR, out);
-      	}
-      }
+      return tls_error(state, SSL_HS_CLI_PROTOCOL_ERROR, out);
    }
 
 #if !SSL_NO_SESSION_RENEGOTIATION
@@ -3310,15 +3218,8 @@ int tls_do_client_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
    	// Note: No error return from TLS_cipher_init
 		_ssl_cipher_init(state, state->cipher_state->suite->suite_number);
 
-      // Derive keys from state
-      if(state->is_ssl_v3) {
-         // Derive keys using SSLv3 algorithms
-         ret_val = _ssl_v3_derive_keys(state);
-      }
-      else {
-      	// Derive keys using TLSv1 algorithms
-      	ret_val = _tls_1_derive_keys(state);
-      }
+      // Derive keys from state using TLSv1 algorithms
+      ret_val = _tls_1_derive_keys(state);
 
       if(!ret_val) {
 	      // Now that we have keys, we can initialize our bulk cipher
@@ -3657,10 +3558,8 @@ int tls_gen_mac(ssl_Socket __far* state, void __far* mac,
    // Add record type
    digest->add((void __far *)&digest->state, (void __far *)&h->rec_type, sizeof(h->rec_type));
 
-   // Add version if not SSLv3
-	if(!state->is_ssl_v3) {
-	   digest->add((void __far *)&digest->state, (void __far *)&h->version, sizeof(h->version));
-	}
+   // Add version
+   digest->add((void __far *)&digest->state, (void __far *)&h->version, sizeof(h->version));
 
    // Add length.  The length used in MAC calculations is the data length i.e. NOT including
    // the MAC length and any padding.
@@ -4057,13 +3956,10 @@ int tls_proc_record(ssl_Socket __far *state,
 	}
 
    if (state->hdr.version.minor == SSL3_VER_MIN) {
-		state->is_ssl_v3 = 1;
-		if (state->flags & SSL_F_DISABLE_SSLV3) {
 #if _SSL_PRINTF_DEBUG
-    		printf("*** Not allowing SSLv3 ***\n");
+    	printf("*** Not allowing SSLv3 ***\n");
 #endif
-			return tls_error(state, SSL_HS_CLI_PROTOCOL_ERROR, out_data);
-		}
+		return tls_error(state, SSL_HS_CLI_PROTOCOL_ERROR, out_data);
 	}
 
 	// Delete header from buffer
@@ -4382,14 +4278,8 @@ int tls_write_record(ssl_Socket __far * state, SSL_ContentType rec_type,
    encrypted = state->flags & SSL_F_ENCRYPT;
 
    state->wr_hdr.rec_type = rec_type;
-	if(state->is_ssl_v3) {
-		state->wr_hdr.version.major = SSL3_VER_MAJ;
-		state->wr_hdr.version.minor = SSL3_VER_MIN;
-   }
-   else {
-		state->wr_hdr.version.major = TLS1_VER_MAJ;
-		state->wr_hdr.version.minor = TLS1_VER_MIN;
-   }
+	state->wr_hdr.version.major = TLS1_VER_MAJ;
+	state->wr_hdr.version.minor = TLS1_VER_MIN;
    length = len;
    cipher->bulk_cipher->padding_len = padding_len = 0;
    if (encrypted) {
@@ -4642,14 +4532,8 @@ int tls_send_server_hello(ssl_Socket __far* state, _tbuf __far * out)
    	return tls_error(state, SSL_ALLOC_FAIL, out);
 
 	// Server version
-   if(state->is_ssl_v3) {
-		version.major = SSL3_VER_MAJ;
-	   version.minor = SSL3_VER_MIN;
-   }
-   else {
-		version.major = TLS1_VER_MAJ;
-	   version.minor = TLS1_VER_MIN;
-	}
+	version.major = TLS1_VER_MAJ;
+   version.minor = TLS1_VER_MIN;
 	_tbuf_append(t, &version, sizeof(version));
 
    // Server random
@@ -4831,24 +4715,13 @@ int _ssl_cli_key_exch(ssl_Socket __far* state, SSL_ClientKeyExchange __far* cli_
 #if _SSL_USE_RSA_
 	case TLS_KX_RSA:
 	   // Check Protcol Version
-	   if(state->is_ssl_v3) {
-	      if(!((cli_key_exch->by_kx_algo.exchange_keys.client_version.major == SSL3_VER_MAJ) &&
-	           (cli_key_exch->by_kx_algo.exchange_keys.client_version.minor == SSL3_VER_MIN))) {
+      if(!(cli_key_exch->by_kx_algo.exchange_keys.client_version.major == TLS1_VER_MAJ &&
+           cli_key_exch->by_kx_algo.exchange_keys.client_version.minor == TLS1_VER_MIN)) {
 	#if _SSL_PRINTF_DEBUG
-	         printf("*** Bad version in SSLv3 CKE ***\n");
+         printf("*** Bad version in TLS CKE ***\n");
 	#endif
-	         return tls_error(state, SSL_EXCH_KEYS_PROTOCOL_VER, out);
-	      }
-	   }
-	   else {
-	      if(!(cli_key_exch->by_kx_algo.exchange_keys.client_version.major == TLS1_VER_MAJ &&
-	           cli_key_exch->by_kx_algo.exchange_keys.client_version.minor == TLS1_VER_MIN)) {
-	#if _SSL_PRINTF_DEBUG
-	         printf("*** Bad version in TLS CKE ***\n");
-	#endif
-	         return tls_error(state, SSL_EXCH_KEYS_PROTOCOL_VER, out);
-	      }
-	   }
+         return tls_error(state, SSL_EXCH_KEYS_PROTOCOL_VER, out);
+      }
 
 	   // Fill our pre master secret data structure
 	   _f_memcpy(&pre_master_secret.data, &cli_key_exch->by_kx_algo.exchange_keys,
@@ -4870,29 +4743,20 @@ int _ssl_cli_key_exch(ssl_Socket __far* state, SSL_ClientKeyExchange __far* cli_
    // ***Derive the Master Secret***
    memset(out_temp, 0, SSL_KEY_BLOCK_SIZE);
    memset(output, 0, SSL_KEY_BLOCK_SIZE);
-   if(state->is_ssl_v3) {
-   	// Derive the Master Secret using SSLv3 hash expansion
-		_ssl_v3_hash_expand(&pre_master_secret,
-                          (SSL_byte_t __far*)&cipher->client_random,
-                          (SSL_byte_t __far*)&cipher->server_random,
-                          output, SSL_MASTER_SEC_SIZE);
-   }
-   else {
-	   // Build the label to be used in the key derivation
-	   // Seeded label = MASTER_SEC_LABEL + client random + server random
-	   memcpy(seeded_label, TLS_MASTER_SEC_LABEL, strlen(TLS_MASTER_SEC_LABEL));
-	   label_len = strlen(TLS_MASTER_SEC_LABEL);
-	   _f_memcpy(seeded_label + label_len, &cipher->client_random,
-	          sizeof(SSL_Random));
-	   label_len += sizeof(SSL_Random);
-	   _f_memcpy(seeded_label + label_len, &cipher->server_random,
-	          sizeof(SSL_Random));
-	   label_len += sizeof(SSL_Random);
+   // Build the label to be used in the key derivation
+   // Seeded label = MASTER_SEC_LABEL + client random + server random
+   memcpy(seeded_label, TLS_MASTER_SEC_LABEL, strlen(TLS_MASTER_SEC_LABEL));
+   label_len = strlen(TLS_MASTER_SEC_LABEL);
+   _f_memcpy(seeded_label + label_len, &cipher->client_random,
+          sizeof(SSL_Random));
+   label_len += sizeof(SSL_Random);
+   _f_memcpy(seeded_label + label_len, &cipher->server_random,
+          sizeof(SSL_Random));
+   label_len += sizeof(SSL_Random);
 
-      // Derive the Master Secret using the TLS PRF
-		_tls_1_PRF(&pre_master_secret, seeded_label, label_len, output,
-   	         out_temp, SSL_MASTER_SEC_SIZE);
-   }
+   // Derive the Master Secret using the TLS PRF
+	_tls_1_PRF(&pre_master_secret, seeded_label, label_len, output,
+  	         out_temp, SSL_MASTER_SEC_SIZE);
 
    // Save our secret for use in key block derivation
    memcpy(&master_secret.data, output, sizeof(master_secret.data));
@@ -4907,11 +4771,7 @@ int _ssl_cli_key_exch(ssl_Socket __far* state, SSL_ClientKeyExchange __far* cli_
    _f_memcpy(state->master_secret, &master_secret, sizeof(*state->master_secret));
 
 	// Derive our session keys from the master secret
-   // DEVIDEA: Consolidate key derivation
-   if(state->is_ssl_v3)
-	   _ssl_v3_derive_keys(state);
-   else
-	   _tls_1_derive_keys(state);
+	_tls_1_derive_keys(state);
 
    return 0;
 }
@@ -4935,10 +4795,7 @@ int tls_send_client_key_exchange(ssl_Socket __far* state, _tbuf __far * out)
 	size_t outlen, lenfield;
 	auto int rc;
 
-   if (state->is_ssl_v3)
-      lenfield = 0;
-   else
-      lenfield = 2;
+   lenfield = 2;
 
 	switch (state->cipher_state->suite->key_exchange_alg) {
    default:
@@ -5000,14 +4857,8 @@ int tls_send_client_key_exchange(ssl_Socket __far* state, _tbuf __far * out)
 
 	   // Since we only support RSA, this is the way to generate the pre-master secret
 	   _ssl_big_rand(secret+2, sizeof(secret)-2);
-	   if (state->is_ssl_v3) {
-	      secret[0] = SSL3_VER_MAJ;
-	      secret[1] = SSL3_VER_MIN;
-	   }
-	   else {
-	      secret[0] = TLS1_VER_MAJ;
-	      secret[1] = TLS1_VER_MIN;
-	   }
+	   secret[0] = TLS1_VER_MAJ;
+	   secret[1] = TLS1_VER_MIN;
 	    #ifdef _COPROCESS_H
 	   if (state->flags & SSL_F_COP_YIELD)
 	      state->peer_cert->rsa_key->flags |= RSA_KEY_PUB_COP_YIELD;

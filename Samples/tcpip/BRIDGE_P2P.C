@@ -342,7 +342,6 @@
 //#define WIFI_MAC_MGMT_VERBOSE 1
 //#define IP_VERBOSE
 //#define _SSL_PRINTF_DEBUG 4
-//#define SSL3_PRINTF_DEBUG
 //#define SSL_SOCK_VERBOSE
 //#define TCP_VERBOSE
 
