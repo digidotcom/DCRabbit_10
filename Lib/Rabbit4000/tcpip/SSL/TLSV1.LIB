@@ -107,7 +107,7 @@ int _tls_1_derive_keys(ssl_Socket __far* state) {
 	auto SSL_CipherState __far* cipher;			// Pointers to state internals
    auto SSL_BulkCipherConfig __far* bulk_cipher;
 	auto SSL_Secret __far* master_secret;
-   auto SSL_byte_t output[SSL_KEY_BLOCK_SIZE], out_temp[SSL_KEY_BLOCK_SIZE];
+   auto SSL_byte_t output[SSL_KEY_BLOCK_SIZE];
    auto SSL_byte_t seeded_label[SSL_SEEDED_LABEL_MAX];
    auto SSL_byte_t __far*keys;
    auto unsigned int label_len;
@@ -142,10 +142,9 @@ int _tls_1_derive_keys(ssl_Socket __far* state) {
    // number of bytes needed. This won't buy much, since we will
    // at most avoid an iteration or two in the PRF. Also, this only
    // happens once in the handshake.
-   memset(out_temp, 0, SSL_KEY_BLOCK_SIZE);
    memset(output, 0, SSL_KEY_BLOCK_SIZE);
-	_tls_1_PRF(master_secret, seeded_label, label_len, output,
-            out_temp, SSL_KEY_BLOCK_SIZE);
+	_SHA256_PRF(master_secret, seeded_label, label_len, output,
+            SSL_KEY_BLOCK_SIZE);
 
 #if _SSL_PRINTF_DEBUG > 2
    printf("\nKey material block:\n");
@@ -212,7 +211,6 @@ int _tls_1_generate_finish_mac(ssl_Socket __far* state, SSL_Finish_Hash_t __far*
 	// This buffer needs to be big enough to hold the MD5 and SHA-1
    // handshake hashes plus TLS_FINISHED_LAB_XXX concatenated
 	auto SSL_byte_t seeded_label[HMAC_MD5_HASH_SIZE + HMAC_SHA_HASH_SIZE + 16];
-   auto SSL_byte_t out_temp[TLS_VERIFY_DATA_SIZE];
    auto unsigned int seeded_label_len;
 
 	// Complete the hash, generate seeded label
@@ -233,8 +231,8 @@ int _tls_1_generate_finish_mac(ssl_Socket __far* state, SSL_Finish_Hash_t __far*
    seeded_label_len += HMAC_SHA_HASH_SIZE;
 
    // Do the final finished calculation
-	_tls_1_PRF(state->master_secret, seeded_label, seeded_label_len, mac,
-                     out_temp, TLS_VERIFY_DATA_SIZE);
+	_SHA256_PRF(state->master_secret, seeded_label, seeded_label_len, mac,
+                     TLS_VERIFY_DATA_SIZE);
 
 #if _SSL_PRINTF_DEBUG > 2
 	printf("Generated verify data:\n");
@@ -246,16 +244,15 @@ int _tls_1_generate_finish_mac(ssl_Socket __far* state, SSL_Finish_Hash_t __far*
 }
 ////////////////////////////////////////////////////////////////////////////////
 
-/*** BeginHeader _tls_1_PRF */
-void _tls_1_PRF(SSL_Secret __far*, SSL_byte_t __far*, int, SSL_byte_t __far*, SSL_byte_t __far*, int);
+/*** BeginHeader _SHA256_PRF */
+void _SHA256_PRF(SSL_Secret __far*, SSL_byte_t __far*, int, SSL_byte_t __far*, int);
 /*** EndHeader */
 
 /* START _FUNCTION DESCRIPTION ********************************************
-_tls_1_PRF                               <SSL.LIB>
+_SHA256_PRF                               <SSL.LIB>
 
-SYNTAX: void _tls_1_PRF(SSL_Secret far* secret, SSL_byte_t far* label,
-                      int label_len, SSL_byte_t far* output1,
-                      SSL_byte_t far* output2, int length);
+SYNTAX: void _SHA256_PRF(SSL_Secret far* secret, SSL_byte_t far* label,
+                      int label_len, SSL_byte_t far* output, int length);
 
 DESCRIPTION: TLS Pseudo-Random Function. Using a master secret,
              and an ASCII label, produce a pseudo-random number
@@ -264,56 +261,33 @@ DESCRIPTION: TLS Pseudo-Random Function. Using a master secret,
 PARAMETER 1: The secret
 PARAMETER 2: An ASCII label
 PARAMETER 3: Length of the label (NOT including NULL terminator)
-PARAMETER 4: Primary output, of size length
-PARAMETER 5: Temporary buffer, also of size length
-PARAMETER 6: The length of the desired output
+PARAMETER 4: Output buffer, of size length
+PARAMETER 5: The length of the desired output
 
 RETURN VALUE: None
 
 END DESCRIPTION **********************************************************/
 
 __TLS_V1_DEBUG__
-void _tls_1_PRF(SSL_Secret __far* secret, // The hash secret
+void _SHA256_PRF(SSL_Secret __far* secret, // The hash secret
    SSL_byte_t __far* label,   // label (used in hash)
    int label_len,       // Seed value for random number
-   SSL_byte_t __far* output1, // Output data 1 (of size length)
-	SSL_byte_t __far* output2, // Output data 2 (of size length, used as temporoary)
+   SSL_byte_t __far* output, // Output data (of size length)
    int length )         // length of output data
 {
-   auto SSL_uint16_t LS;		// Length of the split secret
-   auto SSL_byte_t __far *S1, *S2;	// Pointers to the split secret
-   auto HMAC_ctx_t md5;      // HMAC states for MD5 and SHA
-   auto HMAC_ctx_t sha;
+   auto HMAC_ctx_t hmac;
    auto int i;
 #if TLS_PRF_PROFILE
 	auto unsigned long t0, t1;
    t0 = MS_TIMER;
 #endif
 
-   // Split the secret
-   LS = secret->length / 2;
-   S1 = &secret->data[0];
-
-	// This is always at length/2 , even if length is odd (rounded down)
-   S2 = &secret->data[LS];
-
-   if(secret->length & 0x01 != 0) {
-    	// Length is odd, round up
-      LS += 1;
-   }
-
-   // Initialize HMAC hashes
-   HMAC_init(&md5, HMAC_USE_MD5);
-   HMAC_init(&sha, HMAC_USE_SHA);
+   // Initialize HMAC hash
+   HMAC_init(&hmac, HMAC_USE_SHA256);
 
    // Do the hashing
-   P_HASH(&md5, S1, LS, label, label_len, output1, length);
-   P_HASH(&sha, S2, LS, label, label_len, output2, length);
+   P_HASH(&hmac, &secret->data[0], secret->length, label, label_len, output, length);
 
-   // XOR the results
-	for(i = 0; i < length; i++) {
-		output1[i] ^= output2[i];
-   }
 #if TLS_PRF_PROFILE
    t1 = MS_TIMER;
    printf("TLS_PRF time: %dms\n", t1-t0);
