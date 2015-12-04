@@ -1501,7 +1501,7 @@ int tls_sm(ssl_Socket __far * state,
 	            #if _SSL_PRINTF_DEBUG
 	                printf("*** Got renegotiation in app data state ***\n");
 	            #endif
-   					tls_send_alert(state, TLS_ALRT_no_renegotiation, tport_out, 0);
+   					tls_send_alert(state, TLS_ALRT_no_renegotiation, tport_out, TLS_auto_level);
 
             	}
             	else {
@@ -1650,9 +1650,13 @@ _do_output:
 	    (nag_avail = _tbuf_remain(tport_out)) >= SSL_OUT_BUF_RESERVE) {
 		// OK to send application data.  nag_curr is size of record
 		// we would create at this point.
-		nag_curr = (nag_len = app_out->len) + sizeof(SSL_Record_Hdr) +
-		           state->cipher_state->digest->hash_size +
-					  state->cipher_state->bulk_cipher->block_size;
+      nag_curr = state->cipher_state->bulk_cipher->block_size;
+      // If we're using a block cipher, leave room for the explicit IV.
+      if (nag_curr) {
+         nag_curr += SSL_EXPLICIT_IV_SIZE;
+		}
+		nag_curr += (nag_len = app_out->len) + sizeof(SSL_Record_Hdr) +
+		           state->cipher_state->digest->hash_size;
 		if (nag_curr > nag_avail) {
 			nag_len -= (nag_curr - nag_avail);
 			nag_curr = nag_avail;
@@ -2994,6 +2998,8 @@ void _ssl_cipher_init(ssl_Socket __far* state, SSL_uint16_t suite_number) {
    }
 #endif
 
+   // Be sure to update SSL_MAX_CIPHER_KEY and SSL_MAX_CIPHER_BLOCK when
+   // adding bulk ciphers.
 ///////////////////////////////////////////////////////
 
    // Set up digest algorithm (TLS only uses HMAC)
@@ -3031,6 +3037,7 @@ void _ssl_cipher_init(ssl_Socket __far* state, SSL_uint16_t suite_number) {
       cipher->client_mac_sec_size = HMAC_SHA256_HASH_SIZE;
    }
 
+   // Be sure to update SSL_MAX_HASH_SIZE/HMAC_MAX_HASH_SIZE when adding hashes.
 ///////////////////////////////////////////////////////
 }
 
@@ -3141,7 +3148,8 @@ int tls_do_client_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
         cli_hello.client_version.minor == TLS1_VER_MIN))
    {
 #if _SSL_PRINTF_DEBUG
-    	printf("*** Bad version in client hello ***\n");
+      printf("*** Bad version in client hello 0x%02x 0x%02x***\n",
+         cli_hello.client_version.major, cli_hello.client_version.minor);
 #endif
       return tls_error(state, SSL_HS_CLI_PROTOCOL_ERROR, out);
    }
@@ -3453,13 +3461,14 @@ int tls_gen_mac(ssl_Socket __far* state, void __far* mac,
 /*** EndHeader */
 
 // Generate a MAC for a message (either incoming or outgoing) using the
-// appropriate digest. Works for both TLS and SSLv3
+// appropriate digest.
 // Note: The buffer mac (parameter 2) is assumed to be
 // big enough to contain final MAC.
 // Also increments the appropriate sequence number
+// Ignores the explicit IV at the start of received messages.
 // Appropriate record header (state->hdr or state->wr_hdr) must be set up with
 // *final* record length (in local host order), and parameter data_len is
-// length of actual data to hash.
+// length of actual data to hash (and does not include the explicit IV).
 
 _ssl_tport_debug
 int tls_gen_mac(ssl_Socket __far* state, void __far* mac,
@@ -3494,9 +3503,6 @@ int tls_gen_mac(ssl_Socket __far* state, void __far* mac,
   	length = h->length;
 
 #if _SSL_PRINTF_DEBUG > 3
-   printf("Generating %s MAC - record length: %u+%u(mac)+%u(pad)\n",
-      mac_mode == SSL_MAC_RECEIVE ? "receive" : "send",
-      data_len, digest->hash_size, cipher->bulk_cipher->padding_len);
    /*
    printf("MAC secret:\n");
    mem_dump((SSL_byte_t far*)secret, sec_size);
@@ -3508,9 +3514,7 @@ int tls_gen_mac(ssl_Socket __far* state, void __far* mac,
 
    // TLS record MAC = Digest(mac_secret, seq_num + type + version +
    //                         length + content)
-   // SSLv3 MAC = Digest(mac_secret + pad2 + Digest(mac_secret + pad1 +
-   //                    seq_num + length + content)
-   // The digest is HMAC for TLS, and the SSLv3 MAC for SSLv3
+   // The digest is HMAC
    // All this function does is add the seq_num through content into the hash
    // and finish the hash, the individual algorithms take care of the rest
    if(mac_mode == SSL_MAC_SEND) {
@@ -3538,8 +3542,17 @@ int tls_gen_mac(ssl_Socket __far* state, void __far* mac,
    digest->add((void __far *)&digest->state, (void __far *)&temp_len, 2);
 
    // *** Digest Content ***
-   // Finally, add the content (uses content length)
-   _tbuf_ref(data, &g, 0, data_len);
+   // Finally, add the content (skipping over received IV)
+   _tbuf_ref(data, &g, mac_mode == SSL_MAC_SEND ? 0 : SSL_EXPLICIT_IV_SIZE, data_len);
+   
+#if _SSL_PRINTF_DEBUG > 3
+   printf("Generating %s MAC - record length: %u+%u(mac)\n",
+      mac_mode == SSL_MAC_RECEIVE ? "receive" : "send", data_len, digest->hash_size);
+   mem_dump(g.data2, g.len2);
+   if (g.len3)
+      mem_dump(g.data3, g.len3);
+#endif
+
 	digest->add((void __far *)&digest->state, (void __far *)g.data2, g.len2);
 	if (g.len3)
 		digest->add((void __far *)&digest->state, (void __far *)g.data3, g.len3);
@@ -3631,6 +3644,8 @@ int tls_decrypt(ssl_Socket __far * state, ssl_Header __far * hdr, _tbuf __far * 
    if (state->flags & SSL_F_DECRYPT)
    {
 	   cipher = state->cipher_state;
+	   _ssl_assert(cipher->digest->hash_size <= SSL_MAX_HASH_SIZE);
+
 	   bulk_cipher = cipher->bulk_cipher;
 
    	_tbuf_ref(data, &g, 0, rec_len);
@@ -3677,7 +3692,8 @@ int tls_decrypt(ssl_Socket __far * state, ssl_Header __far * hdr, _tbuf __far * 
       bytes_decrypted = rec_len - (digest->hash_size + padding_len);
 
       // Generate the appropriate MAC for this record
-		tls_gen_mac(state, calcd_mac, data, SSL_MAC_RECEIVE, bytes_decrypted);
+		tls_gen_mac(state, calcd_mac, data, SSL_MAC_RECEIVE,
+      	bytes_decrypted - SSL_EXPLICIT_IV_SIZE);
 
 		// Retrieve the actual mac
 	   _tbuf_xread(recvd_mac, data, bytes_decrypted, digest->hash_size);
@@ -3804,13 +3820,14 @@ int tls_proc_record(ssl_Socket __far *state,
 	// peek at header
 	_tbuf_xread(&h, data, 0, sizeof(h));
 
-	if (h.v3.version.major == TLS1_VER_MAJ && h.v3.version.minor == TLS1_VER_MIN) {
+	if (h.v3.version.major == TLS1_VER_MAJ && h.v3.version.minor >= 1) { // TODO: check this == TLS1_VER_MIN) {
 		rec_len = ntohs(h.v3.length);
       rec_type = h.v3.rec_type;
 	}
    else {
 #if _SSL_PRINTF_DEBUG
-    	printf("*** Got unsupported header version ***\n");
+      printf("*** Got unsupported header version 0x%02x 0x%02x***\n",
+         h.v3.version.major, h.v3.version.minor);
 #endif
       return tls_error(state, SSL_READ_PROTOCOL_VER, out_data);
    }
@@ -3910,16 +3927,23 @@ int tls_proc_record(ssl_Socket __far *state,
    if ((bytes_decrypted = tls_decrypt(state, &h, data, rec_len, out_data)) < 0)
       return bytes_decrypted;
 
+	if (bytes_decrypted < rec_len) {
+		// strip the explicit IV from the start of the decrypted data
+      _ssl_assert(bytes_decrypted > SSL_EXPLICIT_IV_SIZE);
+		bytes_decrypted -= SSL_EXPLICIT_IV_SIZE;
+		rec_len -= SSL_EXPLICIT_IV_SIZE;
+		_tbuf_delete(data, SSL_EXPLICIT_IV_SIZE);
+      
+		// There was a non-zero footer (mac plus padding).
+		state->hdr.length = bytes_decrypted;
+	}
+   
 #if _SSL_PRINTF_DEBUG > 2
 	if  (bytes_decrypted < rec_len)
    	printf("[TLS RECORD] have %u length record, decrypted to %u\n", rec_len, bytes_decrypted);
 	else
    	printf("[TLS RECORD] have %u length record\n", rec_len);
 #endif
-
-	if (bytes_decrypted < rec_len)
-		// There was a non-zero footer (mac plus padding).
-		state->hdr.length = bytes_decrypted;
 
 	switch (rec_type) {
 	default:
@@ -4224,9 +4248,14 @@ int tls_write_record(ssl_Socket __far * state, SSL_ContentType rec_type,
    length = len;
    cipher->bulk_cipher->padding_len = padding_len = 0;
    if (encrypted) {
+      // Account for the explicit IV before the cleartext payload
+      length += SSL_EXPLICIT_IV_SIZE;
+      
    	length += digest->hash_size;
       // Add padding for block ciphers according to RFC 2246 section 6.2.3.2
       block_size = cipher->bulk_cipher->block_size;
+      _ssl_assert(block_size <= SSL_MAX_CIPHER_BLOCK);
+      
       if (block_size) {
          // Fill up the remainder of last block (if length of data is not a
          // multiple of the block size) with bytes equal to the size of the
@@ -4258,8 +4287,9 @@ int tls_write_record(ssl_Socket __far * state, SSL_ContentType rec_type,
 
 #if _SSL_PRINTF_DEBUG > 3
 		printf("------------------- S E N D ----------------------\n");
-   	printf("Sending 5(hdr)+%u+%u(mac)+%u(pad)\n",
-   		len, encrypted ? digest->hash_size : 0, encrypted ? padding_len : 0);
+   	printf("Sending 5(hdr)+%u(iv)+%u+%u(mac)+%u(pad)\n",
+   		encrypted && block_size ? SSL_EXPLICIT_IV_SIZE : 0, len,
+         encrypted ? digest->hash_size : 0, encrypted ? padding_len : 0);
 	#if _SSL_PRINTF_DEBUG > 4
   		printf("\nRecord header:\n");
    #endif
@@ -4290,6 +4320,9 @@ int tls_write_record(ssl_Socket __far * state, SSL_ContentType rec_type,
 	if (length + sizeof(ssl_Header) > _tbuf_remain(out)) {
 		// This will try to use 'out' to write an alert, however this is only done if
 		// not currently trying to write an alert, to avoid infinite recursion.
+      // TODO: need to pass state information through this calling chain and
+      // down to tls_gen_mac() to have it NOT increment the sequence number
+      // since we're not actually sending this record.
 #if _SSL_PRINTF_DEBUG
     	printf("*** Could not send alert ***\n");
 #endif
@@ -4306,7 +4339,10 @@ int tls_write_record(ssl_Socket __far * state, SSL_ContentType rec_type,
       printf("\nBlock cipher Padding value:%d\n", padding_len-1);
       printf("Record Length after padding:%ld=0x%lX\n", length, length);
 #endif
-
+      if (block_size) {
+         // encrypt explicit IV before cleartext payload
+         tls_encrypt(state, out, "fake explicit iv", SSL_EXPLICIT_IV_SIZE);
+      }
       tls_encrypt(state, out, (void __far *)g.data2, g.len2);
       if (g.len3)
       	tls_encrypt(state, out, (void __far *)g.data3, g.len3);
