@@ -3408,48 +3408,38 @@ char __far * tls_connection_server_handshake(void __far *tls_ctx,
 }
 
 /*** BeginHeader _ssl_increment_seq */
-int _ssl_increment_seq(ssl_Socket __far*, SSL_byte_t __far*);
+int _ssl_increment_seq(SSL_byte_t __far*);
 /*** EndHeader */
 
 // Increment a sequence number. Assumes sequence number is in
 // network-endian order (no conversion needed).
 // Returns 0 on success, non-zero on failure
 _ssl_tport_debug
-int _ssl_increment_seq(ssl_Socket __far* state, SSL_byte_t __far* seq_num) {
- 	auto int i, carry;
+int _ssl_increment_seq(SSL_byte_t __far* seq_num) {
+ 	auto int i;
 
-   _ssl_assert(state != NULL);
+   _ssl_assert(seq_num != NULL);
 
-   // Note: This is a bit of a dirty trick. The SSL sequence number
-   // is an 8-byte integer that starts at 0 at the beginning of a
-   // session, and counts up for each record received. The number is
-   // always used in network-endian order, so we can avoid endianness
-   // conversion by adding in reverse, hence the reversed loop index.
-   // The algorithm works by starting with the top byte, and incrementing
-   // it until the byte overflows (this is checked with the upcast to an
-   // integer from a byte to set the carry value). If the byte overflows,
-   // than the loop continues, and begins by incrementing the next byte
-   // down. If there is no carry for any given byte, then the byte increments
-   // and the function returns successfully. If we ever actually overflow
-   // the entire (!) 8-byte number, we return an error.
-
-   carry = 1;
-   for(i = SSL_SEQ_NUM_SIZE-1; i > 0; i--) {
-      carry = (int)seq_num[i] + 1; // Integer conversion to check for carry
-      if(carry > 0xFF) {
-			// We have a carry
-         seq_num[i] = 0;
-      }
-      else {
-      	seq_num[i] += 1;
+   /*
+      Since the sequence number is always used in network-endian order, we
+      can avoid endianness conversions by incrementing in reverse, hence the
+      reversed loop index.
+      
+   	The algorithm works by starting with the LSB, and incrementing
+   	it. If the byte overflows to 0x00, the loop continues, and increments
+   	the next (more significant) byte.
+      
+   	If the increment didn't overflow, the function returns successfully.
+   	If it overflows the entire 64-bit number, the function return an error.
+	*/
+   
+   for(i = SSL_SEQ_NUM_SIZE-1; i >= 0; --i) {
+      if (++seq_num[i])
          return 0;
-      }
    }
-   // Should never get here (means carry check passed every time, overflowing
-   // the sequence number)
+   // Should only get here on a rollover of 0xFFFFFFFFFFFFFFFF to 0.
    // In practice, this is a 64-bit number which starts at 0, thus it is totally
    // infeasible for it to overflow, even at a billion records per sec for 100 years.
-   SSL_error(state, SSL_SEQ_NUM_OVERFLOW);
    return 1;
 }
 
@@ -3528,7 +3518,9 @@ int tls_gen_mac(ssl_Socket __far* state, void __far* mac,
 	                SSL_SEQ_NUM_SIZE);
    }
 
-	_ssl_increment_seq(state, seqno);
+   if (_ssl_increment_seq(seqno)) {
+      SSL_error(state, SSL_SEQ_NUM_OVERFLOW);
+   }
 
    // Add record type
    digest->add((void __far *)&digest->state, (void __far *)&h->rec_type, sizeof(h->rec_type));
