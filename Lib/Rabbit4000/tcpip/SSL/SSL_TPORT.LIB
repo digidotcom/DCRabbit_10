@@ -1267,8 +1267,13 @@ int tls_sm(ssl_Socket __far * state,
            _tbuf __far * app_in,
            _tbuf __far * app_out)
 {
-	auto SSL_byte_t cert_verf_hashes[36];	// MD5 plus SHA hash
+	auto SSL_byte_t cert_verf_hashes[HMAC_MAX_HASH_SIZE];
 	auto SSL_byte_t recvd_mac[TLS_VERIFY_DATA_SIZE];
+	auto union {
+		sha_state sha1;
+		sha256_context sha256;
+	} hash_sofar;
+
 	auto SSL_Handshake_Hdr_t hh;
 	auto _tbuf t;			// HS message data only (not header), overlays hs_in.
 	auto ll_Gather g;		// complete HS message buffer (ref to hs_in data)
@@ -1440,15 +1445,27 @@ int tls_sm(ssl_Socket __far * state,
 					}
 					if (hh.msg_type != hello_request) {
 						if (hh.msg_type == certificate_verify) {
+                     _tbuf_xread(&state->cert_verify_sigalgo, hs_in, sizeof(hh), 2);
+                     if (state->cert_verify_sigalgo.signature != TLS_SIGN_RSA) {
+                        // unsupported signature type
+                        return tls_error(state, SSL_ILLEGAL_PARAMETER_ERROR, tport_out);
+                     }
+                     
 							// Take snapshot of hashes so far, since this is the data
 							// which was signed by the client.
-                     /* TODO: update Certificate Request code to handle new
-                     	message structure, recording the requested
-                        SignatureAndHashAlgorithm, and use that to create
-                        cert_verf_hashes.
-	                  md5_sofar(&state->fin_hash->md5_hash, cert_verf_hashes);
-	                  sha_sofar(&state->fin_hash->sha_hash, cert_verf_hashes+16);
-                     */
+                     switch (state->cert_verify_sigalgo.hash) {
+                     	case TLS_HASH_SHA1:
+                           hash_sofar.sha1 = state->fin_hash->sha1_hash;
+                           sha_finish(&hash_sofar.sha1, cert_verf_hashes);
+                        	break;
+                     	case TLS_HASH_SHA256:
+                           hash_sofar.sha256 = state->fin_hash->sha256_hash;
+                           sha256_finish(&hash_sofar.sha256, cert_verf_hashes);
+                        	break;
+                        default:
+                        	// unsupported hash type
+                           return tls_error(state, SSL_ILLEGAL_PARAMETER_ERROR, tport_out);
+                     }
 						}
 						tls_digest_hs_message(state, &g);
 					}
@@ -2363,24 +2380,48 @@ int tls_do_certificate_verify(ssl_Socket __far * state, _tbuf * t, _tbuf __far *
 	auto char verf_plain[MP_SIZE];
    auto size_t plain_len, rsa_key_len;
    auto int rc;
+   auto int hash_length;
 
 #if _SSL_PRINTF_DEBUG > 1
 	printf("--->Verifying client certificate...<---\n");
 #endif
-	_tbuf_delete(t, 2);	// Delete TLS redundant length field
+	_tbuf_delete(t, 4);	// Delete signature algorithm and length fields
 
-   if (state->peer_cert && TLS_SIGN_RSA == state->cipher_state->suite->signature_alg) {
-      rsa_key_len = state->cipher_state->key_exch->key_size >> 3;
+   if (state->peer_cert && state->peer_cert->rsa_key
+   	&& TLS_SIGN_RSA == state->cipher_state->suite->signature_alg
+   	&& TLS_SIGN_RSA == state->cert_verify_sigalgo.signature) {
+      rsa_key_len = state->peer_cert->rsa_key->public.n.length - 2;
       if (rsa_key_len != t->len || rsa_key_len > MP_SIZE-2) {
 #if _SSL_PRINTF_DEBUG
     		printf("*** Public key decryption failed basic sanity ***\n");
 #endif
       	return tls_error(state, SSL_PUB_KEY_DECRYPTION_FAIL, out);
       }
+      // current implementation only supports SHA-1 and SHA-256 hashes
+      hash_length = state->cert_verify_sigalgo.hash ==
+         TLS_HASH_SHA256 ? HMAC_SHA256_HASH_SIZE
+                         : HMAC_SHA_HASH_SIZE;
 		_tbuf_extract(verf, t, rsa_key_len);
-		if (crypto_public_key_decrypt_pkcs1(state->peer_cert->rsa_key, verf, rsa_key_len, verf_plain, &plain_len) ||
-		    plain_len != 36 ||
-		    _f_memcmp(cert_verf_hashes, verf_plain, 36)) {
+      
+      /* For TLS 1.2, the decryption step now results in an ASN.1-wrapped
+         copy of the hash we want to check.  Rather than parse the ASN.1
+         for the OCTET STRING containing the hash, we'll just compare the
+         last <hash_length> bytes of the result and ignore the wrapper.
+      */
+      rc = crypto_public_key_decrypt_pkcs1(state->peer_cert->rsa_key,
+      	verf, rsa_key_len, verf_plain, &plain_len);
+#if _SSL_PRINTF_DEBUG
+      printf("cert_verf: decrypt rc=%d\n", rc);
+      if (rc == 0) {
+   		printf("ASN.1-wrapped hash (%d bytes):\n", plain_len);
+			mem_dump(verf_plain, plain_len);
+      }
+   	printf("expected hash:\n");
+		mem_dump(cert_verf_hashes, hash_length);
+#endif
+		if (rc || plain_len < hash_length ||
+		    _f_memcmp(cert_verf_hashes,
+                    &verf_plain[plain_len - hash_length], hash_length)) {
 #if _SSL_PRINTF_DEBUG
     		printf("*** Public key decryption failed ***\n");
 #endif
@@ -4784,6 +4825,12 @@ int tls_send_server_hello_done(ssl_Socket __far* state, _tbuf __far * out)
 /*** BeginHeader tls_send_certificate_request */
 int tls_send_certificate_request(ssl_Socket __far* state, _tbuf __far * out);
 /*** EndHeader */
+// If adding entries, update hash states stored in fin_hash and code that
+// selects the hash to use before signing.
+const far TLS_SignatureAndHashAlgorithm _supported_sig_algs[] = {
+	{ TLS_HASH_SHA256, TLS_SIGN_RSA },
+	{ TLS_HASH_SHA1, TLS_SIGN_RSA }
+};
 _ssl_tport_debug
 int tls_send_certificate_request(ssl_Socket __far* state, _tbuf __far * out)
 {
@@ -4799,6 +4846,11 @@ int tls_send_certificate_request(ssl_Socket __far* state, _tbuf __far * out)
 	cert_type = 0x0101; // (rsa_sign (MSB) = 1, length (LSB) = 1)
 	_tbuf_append(t, &cert_type, sizeof(cert_type));
 
+   // add list of supported signature algorithms, prepended with its length
+   oal = htons(sizeof(_supported_sig_algs));
+	_tbuf_append(t, &oal, sizeof(oal));
+   _tbuf_append(t, &_supported_sig_algs, sizeof(_supported_sig_algs));
+   
 	// Add ASN.1 Distinguished Names of the certificate authorities we accept
 	// as a server, for the peer client.
 	// DEVIDEA: need to implement this if we wish our server to robustly
