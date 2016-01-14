@@ -2000,6 +2000,31 @@ _len_error:
 
 }
 
+/*** BeginHeader _tbuf_extract_ntoh16 */
+SSL_uint16_t _tbuf_extract_ntoh16(_tbuf __far *t);
+/*** EndHeader */
+// Extract 16-bit value from a tbuf and reverse its byte order.
+_ssl_tport_debug
+SSL_uint16_t _tbuf_extract_ntoh16(_tbuf __far *t)
+{
+	SSL_uint16_t u16;
+   
+   _tbuf_extract(&u16, t, 2);
+   return ntohs(u16);
+}
+
+/*** BeginHeader _tbuf_append_hton16 */
+void _tbuf_append_hton16(_tbuf __far *t, SSL_uint16_t value);
+/*** EndHeader */
+// Append 16-bit value in reverse-byte-order to a tbuf.
+_ssl_tport_debug
+void _tbuf_append_hton16(_tbuf __far *t, SSL_uint16_t value)
+{
+	SSL_uint16_t u16;
+   
+	u16 = htons(value);
+   _tbuf_append(t, &u16, 2);
+}
 
 /*** BeginHeader tls_do_certificate_request */
 int tls_do_certificate_request(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out);
@@ -2007,11 +2032,70 @@ int tls_do_certificate_request(ssl_Socket __far * state, _tbuf * t, _tbuf __far 
 _ssl_tport_debug
 int tls_do_certificate_request(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
 {
+	auto int cert_type_rsa = FALSE, have_hash_algo = FALSE;
+	auto SSL_byte_t b, cert_type;
+   auto SSL_uint16_t hash_length;
+   auto TLS_SignatureAndHashAlgorithm hash_algo;
+   
+#if _SSL_PRINTF_DEBUG
+	printf(">> parse certificate request\n");
+#endif
+      
 	// We only support RSA signing.
-	// DEVIDEA: save list of acceptable DNs for the client.  Currently, client would
-	// have no clue as to which (if any) CAs would be acceptable to this server.
-	state->flags |= SSL_F_SEND_CERT;
-	return 0;
+   
+	// At least 2 bytes for cert types (length, RSA signed) and 4 bytes for hash
+	// algorithms (2-byte length, at least one 2-byte algorithm).
+	if (t->len >= 6) {
+		_tbuf_extract(&b, t, 1);
+#if _SSL_PRINTF_DEBUG
+      printf("%u cert types\n", b);
+#endif
+      
+		// Verify that Certificate Types includes RSA
+		while (b && t->len > 4) {
+			_tbuf_extract(&cert_type, t, 1);
+			if (cert_type == 1) {
+				cert_type_rsa = TRUE;
+			}
+         --b;
+		}
+      
+      // look at supported hash algorithms
+      if (cert_type_rsa && b == 0 && t->len >= 4) {
+      	hash_length = _tbuf_extract_ntoh16(t);
+#if _SSL_PRINTF_DEBUG
+         printf("%u bytes of hashalgos\n", hash_length);
+#endif
+         while (hash_length >= 2 && t->len >= 2) {
+         	_tbuf_extract(&hash_algo, t, 2);
+            if (!have_hash_algo && hash_algo.signature == TLS_SIGN_RSA) {
+            	if (hash_algo.hash == TLS_HASH_SHA1
+               	|| hash_algo.hash == TLS_HASH_SHA256) {
+#if _SSL_PRINTF_DEBUG
+                  printf("using %s hash algorithm\n",
+                  	hash_algo.hash == TLS_HASH_SHA1 ? "SHA-1" : "SHA-256");
+#endif
+                  have_hash_algo = TRUE;
+                  state->cert_verify_sigalgo = hash_algo;
+               }
+            }
+            hash_length -= 2;
+         }
+      }
+      
+      if (have_hash_algo && hash_length == 0) {
+	      // DEVIDEA: save list of acceptable DNs for the client.  Currently, client would
+	      // have no clue as to which (if any) CAs would be acceptable to this server.
+         
+         state->flags |= SSL_F_SEND_CERT;
+         return 0;
+      }
+   }
+
+#if _SSL_PRINTF_DEBUG
+   printf(">> could not parse certificate request\n");
+#endif
+	return tls_error(state, SSL_ILLEGAL_PARAMETER_ERROR, out);
 }
 
 
@@ -2019,10 +2103,32 @@ int tls_do_certificate_request(ssl_Socket __far * state, _tbuf * t, _tbuf __far 
 /*** BeginHeader tls_send_certificate_verify */
 int tls_send_certificate_verify(ssl_Socket __far* state, _tbuf __far * out, int phase);
 /*** EndHeader */
+// In TLS 1.2, the encrypted hash is part of a DER-encoded message.  To
+// simplify building the payload, we have hard-coded headers for each hash
+// type (SHA-1 and SHA-256)
+
+// DER header for Certificate Verify payload with SHA-1 hash.
+// OID 1.3.14.3.2.26 followed by 20-byte OCTET STRING
+const far SSL_byte_t _cert_verify_header_sha1[] =
+	{ 0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2B, 0x0E,
+     0x03, 0x02, 0x1A, 0x05, 0x00, 0x04, 0x14 };
+
+// DER header for Certificate Verify payload with SHA-256 hash.
+// OID 2.16.840.1.101.3.4.2.1 followed by 32-byte OCTET STRING
+const far SSL_byte_t _cert_verify_header_sha256[] =
+	{ 0x30, 0x31, 0x30, 0x0D, 0x06, 0x09, 0x60, 0x86,
+     0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+     0x00, 0x04, 0x20 };
+   
 _ssl_tport_debug
 int tls_send_certificate_verify(ssl_Socket __far* state, _tbuf __far * out, int phase)
 {
-	auto char hashes[RSA_KEY_LENGTH];
+	auto char hashes[RSA_KEY_LENGTH];  // hash to encrypt, reused for encrypted signature
+   auto SSL_uint16_t hash_length = 0;
+	auto union {
+		sha_state sha1;
+		sha256_context sha256;
+	} hash_sofar;
 	auto _tbuf __far * t;
 	auto int rc;
    auto RSA_key __far * key;
@@ -2039,7 +2145,9 @@ int tls_send_certificate_verify(ssl_Socket __far* state, _tbuf __far * out, int 
 	switch (phase) {
 	case 0:
 		// first phase: fire off modular exp.
-	   if (!state->cert || TLS_SIGN_RSA != state->cipher_state->suite->signature_alg) {
+	   if (!state->cert
+      	|| TLS_SIGN_RSA != state->cipher_state->suite->signature_alg
+         || TLS_SIGN_RSA != state->cert_verify_sigalgo.signature) {
 	#if _SSL_PRINTF_DEBUG
 	      printf("*** Cert verify signature algo not supported (not RSA) ***\n");
 	#endif
@@ -2048,17 +2156,31 @@ int tls_send_certificate_verify(ssl_Socket __far* state, _tbuf __far * out, int 
 
 	   // Digitally sign (rsa encrypt with our private key) the result of
 	   // the handshake message hashes to this point.
-      /* TODO: update Certificate Request code to handle new
-         message structure, recording the requested
-         SignatureAndHashAlgorithm, and use that to create
-         cert_verf_hashes.
-	   md5_sofar(&state->fin_hash->md5_hash, hashes);
-	   sha_sofar(&state->fin_hash->sha_hash, hashes+16);
-		*/
-
+      // The code in tls_do_certificate_request() that set cert_verify_sigalgo
+      // ensured it was RSA with either SHA1 or SHA256.
+      switch (state->cert_verify_sigalgo.hash) {
+         case TLS_HASH_SHA1:
+         	hash_length = sizeof _cert_verify_header_sha1;
+            _f_memcpy(hashes, _cert_verify_header_sha1, hash_length);
+            hash_sofar.sha1 = state->fin_hash->sha1_hash;
+            sha_finish(&hash_sofar.sha1, &hashes[hash_length]);
+            hash_length += HMAC_SHA_HASH_SIZE;
+            break;
+         case TLS_HASH_SHA256:
+         	hash_length = sizeof _cert_verify_header_sha256;
+            _f_memcpy(hashes, _cert_verify_header_sha256, hash_length);
+            hash_sofar.sha256 = state->fin_hash->sha256_hash;
+            sha256_finish(&hash_sofar.sha256, &hashes[hash_length]);
+            hash_length += HMAC_SHA256_HASH_SIZE;
+            break;
+      }
+#if _SSL_PRINTF_DEBUG
+		printf(">> Generating Certificate Verify on %u bytes\n", hash_length);
+      mem_dump(hashes, hash_length);
+#endif
 	   rc = RSA_PKCS1v1_5_Encrypt(key,
 	                              hashes,
-	                              36,	// MD5 plus SHA1 size
+	                              hash_length,
 	                              NULL,
 	                              1,    // signature
 	                              0,    // first phase
@@ -2092,14 +2214,17 @@ int tls_send_certificate_verify(ssl_Socket __far* state, _tbuf __far * out, int 
 			break;
 		}
 
+#if _SSL_PRINTF_DEBUG
+		printf(">> Creating %u-byte Certificate Verify record\n", rc);
+      mem_dump(hashes, hash_length);
+#endif
 	   t = _tls_init_hs_msg(state, SSL_MAX_HANDSHAKE_SIZE, certificate_verify);
 	   if (!t)
 	      return tls_error(state, SSL_ALLOC_FAIL, out);
-
-		_f_memcpy(t->buf + (t->len + 2), hashes, rc);
-      *(size_t __far *)(t->buf + t->len) = htons(rc);
-
-	   t->len += rc + 2;
+         
+      _tbuf_append(t, &state->cert_verify_sigalgo, 2);  // signature algorithm
+      _tbuf_append_hton16(t, rc);                       // signature length
+      _tbuf_append(t, hashes, rc);                      // signature
 	   rc = _tls_finalize_hs_msg(state, t, out);
 	   break;
 	}
@@ -2403,8 +2528,8 @@ int tls_do_certificate_verify(ssl_Socket __far * state, _tbuf * t, _tbuf __far *
                          : HMAC_SHA_HASH_SIZE;
 		_tbuf_extract(verf, t, rsa_key_len);
       
-      /* For TLS 1.2, the decryption step now results in an ASN.1-wrapped
-         copy of the hash we want to check.  Rather than parse the ASN.1
+      /* For TLS 1.2, the decryption step now results in an DER-encoded
+         copy of the hash we want to check.  Rather than parse the DER fields
          for the OCTET STRING containing the hash, we'll just compare the
          last <hash_length> bytes of the result and ignore the wrapper.
       */
@@ -2413,7 +2538,7 @@ int tls_do_certificate_verify(ssl_Socket __far * state, _tbuf * t, _tbuf __far *
 #if _SSL_PRINTF_DEBUG
       printf("cert_verf: decrypt rc=%d\n", rc);
       if (rc == 0) {
-   		printf("ASN.1-wrapped hash (%d bytes):\n", plain_len);
+   		printf("DER-encoded hash (%d bytes):\n", plain_len);
 			mem_dump(verf_plain, plain_len);
       }
    	printf("expected hash:\n");
