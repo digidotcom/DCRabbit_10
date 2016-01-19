@@ -429,8 +429,6 @@ ssl_Socket __far * tls_connection_init_state(void __far *tls_ctx, ssl_Socket __f
 	state->flags = SSL_F_NO_RESUME;
 #endif
 
-	tls_set_default_ciphersuites(state);
-
 	return state;
 
 }
@@ -1811,7 +1809,7 @@ int tls_do_server_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
 	_f_memcpy(state->session_id, srv.session_id,srv.session_id_length);
 
    // Extract selected ciphersuite
-   _tbuf_extract(&srv.cipher_suite, t, 2);
+   srv.cipher_suite = _tbuf_extract_ntoh16(t);
 
    // Extract compression method (set 16-bit enum to 0, then load low byte)
    srv.compression_method = 0;
@@ -1831,10 +1829,7 @@ int tls_do_server_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
    srv.extensions_length = rc;
    
    // Initialize cipher state based on the selection
-	for (i = 0; i < state->n_accept_suites; ++i)
-		if (srv.cipher_suite == state->accept_suites[i])
-			break;
-	if (i >= state->n_accept_suites) {
+	if (_tls_get_suite(srv.cipher_suite) == NULL) {
 #if _SSL_PRINTF_DEBUG
     	printf("*** No suitable cipher suite ***\n");
 #endif
@@ -1845,7 +1840,7 @@ int tls_do_server_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
 	_f_memcpy(&state->cipher_state->server_random, &srv.random, sizeof(SSL_Random));
 
 	// Init cipher suite
-	_ssl_cipher_init(state, ntohs(srv.cipher_suite));
+	_ssl_cipher_init(state, srv.cipher_suite);
 
 	#if _SSL_PRINTF_DEBUG > 2
 	   printf("\n\nServer Random:\n");
@@ -2834,6 +2829,7 @@ const char*_ssl_get_suite_str(SSL_uint16_t suite)
 
 /*** BeginHeader _tls_get_suite */
 const __far SSL_SuiteConfig *_tls_get_suite(SSL_uint16_t suite_number);
+void _tls_append_supported_suites(ssl_Socket __far *state, _tbuf __far *t);
 /*** EndHeader */
 #define _SSL_SUITE(kx, cipher, hash, allow, forbid) \
 	{ TLS_ ## kx ## _WITH_ ## cipher ## _ ## hash, \
@@ -2893,6 +2889,37 @@ const __far SSL_SuiteConfig *_tls_get_suite(SSL_uint16_t suite_number)
    }
    
 	return NULL;
+}
+
+/*
+	Append list of supported cipher suites to client hello.
+*/
+_ssl_tport_debug
+void _tls_append_supported_suites(ssl_Socket __far *state, _tbuf __far *t)
+{
+	const __far SSL_SuiteConfig *suite = _tls_suites;
+   SSL_uint16_t ciphers[SSL_MAX_CIPHER_LIST];
+	int cipher_count = 0;
+   int byte_count;
+   int i;
+   
+   for (i = 0; i < sizeof _tls_suites / sizeof(SSL_SuiteConfig); ++suite, ++i) {
+      if ( (!suite->flags_allow || (suite->flags_allow & state->suite_flags))
+           && !(suite->flags_forbid & state->suite_flags)) {
+#if _SSL_PRINTF_DEBUG > 2
+			printf("Append %s (0x%04x) to cipher list\n", suite->fulltext_name,
+         	suite->suite_number);
+#endif
+      	ciphers[cipher_count++] = htons(suite->suite_number);
+         if (cipher_count == SSL_MAX_CIPHER_LIST) {
+         	break;
+         }
+      }
+   }
+   
+   byte_count = cipher_count * 2;
+   _tbuf_append_hton16(t, byte_count);
+	_tbuf_append(t, ciphers, byte_count);
 }
 
 /*** BeginHeader _ssl_choose_suite */
@@ -4639,9 +4666,7 @@ int tls_send_client_hello(ssl_Socket __far* state, _tbuf __far * out)
 	if (state->session_id_length)
 		_tbuf_append(t, state->session_id, state->session_id_length);
 
-	// Ciphersuite list
-   _tbuf_append_hton16(t, state->n_accept_suites * 2);
-	_tbuf_append(t, state->accept_suites, state->n_accept_suites * 2);
+   _tls_append_supported_suites(state, t);
 
 	// Compression: only null supported.
 	temp = 0x0001;		// length 1, null(0) compression
@@ -5243,122 +5268,6 @@ int tls_connection_set_master_key(void __far *tls_ctx, ssl_Socket __far *state,
 	state->flags |= SSL_F_TICKET_KEY;
 	return 0;
 }
-
-
-/*** BeginHeader tls_add_ciphersuite */
-int tls_add_ciphersuite(ssl_Socket __far * state, SSL_uint16_t suite);
-/*** EndHeader */
-_ssl_tport_debug
-int tls_add_ciphersuite(ssl_Socket __far * state, SSL_uint16_t suite)
-{
-	auto word i;
-
-	if (   suite != TLS_RSA_WITH_RC4_128_MD5
-	    && suite != TLS_RSA_WITH_RC4_128_SHA
-	    && suite != TLS_RSA_WITH_AES_128_CBC_SHA
-	    && suite != TLS_RSA_WITH_AES_128_CBC_SHA256
-	    && suite != TLS_RSA_WITH_AES_256_CBC_SHA
-	    && suite != TLS_RSA_WITH_AES_256_CBC_SHA256
-	    && suite != TLS_RSA_WITH_NULL_MD5
-	    && suite != TLS_RSA_WITH_NULL_SHA
-	    && suite != TLS_RSA_WITH_NULL_SHA256
-	    && suite != TLS_PSK_WITH_RC4_128_SHA
-	    && suite != TLS_PSK_WITH_AES_128_CBC_SHA
-	    && suite != TLS_PSK_WITH_AES_256_CBC_SHA
-	    && suite != TLS_PSK_WITH_NULL_SHA
-	   )
-		return -1;	// not supported
-
-	for (i = 0; i < state->n_accept_suites; ++i)
-		if (state->accept_suites[i] == suite)
-			return 0;	// already there
-	if (state->n_accept_suites == SSL_MAX_CIPHER_LIST)
-		return -1;	// cannot fit
-	// These stored in network order
-	state->accept_suites[i] = htons(suite);
-	++state->n_accept_suites;
-	return 0;
-}
-
-/*** BeginHeader tls_set_default_ciphersuites */
-int tls_set_default_ciphersuites(ssl_Socket __far * state);
-/*** EndHeader */
-_ssl_tport_debug
-int tls_set_default_ciphersuites(ssl_Socket __far * state)
-{
-	auto int ns;
-
-	ns = 0;
-#if _SSL_USE_RSA_
-	#if _SSL_USE_AES_
-	tls_add_ciphersuite(state, TLS_RSA_WITH_AES_128_CBC_SHA); ++ns;
-	tls_add_ciphersuite(state, TLS_RSA_WITH_AES_128_CBC_SHA256); ++ns;
-	#endif
-	#if _SSL_USE_AES256_
-	tls_add_ciphersuite(state, TLS_RSA_WITH_AES_256_CBC_SHA); ++ns;
-	tls_add_ciphersuite(state, TLS_RSA_WITH_AES_256_CBC_SHA256); ++ns;
-	#endif
-	#if _SSL_USE_RC4_
-	tls_add_ciphersuite(state, TLS_RSA_WITH_RC4_128_SHA); ++ns;
-	tls_add_ciphersuite(state, TLS_RSA_WITH_RC4_128_MD5); ++ns;
-	#endif
-#endif
-#if _SSL_USE_PSK_
-	#if _SSL_USE_AES_
-	tls_add_ciphersuite(state, TLS_PSK_WITH_AES_128_CBC_SHA); ++ns;
-	#endif
-	#if _SSL_USE_AES256_
-	tls_add_ciphersuite(state, TLS_PSK_WITH_AES_256_CBC_SHA); ++ns;
-	#endif
-	#if _SSL_USE_RC4_
-	tls_add_ciphersuite(state, TLS_PSK_WITH_RC4_128_SHA); ++ns;
-	#endif
-#endif
-	return ns > 0 ? 0 : -1;
-}
-
-/*** BeginHeader tls_connection_set_cipher_list */
-// Following enum values are for compatibility with wpa_supplicant.
-// Since our TLS does not yet support some of these ciphersuites, those
-// are set to 0xFF so that we will expurgate them from the acceptable list.
-enum {
-	TLS_CIPHER_NONE = 0,
-	TLS_CIPHER_RC4_SHA = TLS_RSA_WITH_RC4_128_SHA /* 0x0005 */,
-	TLS_CIPHER_AES128_SHA = TLS_RSA_WITH_AES_128_CBC_SHA /* 0x002f */,
-	TLS_CIPHER_AES128_SHA256 = TLS_RSA_WITH_AES_128_CBC_SHA256 /* 0x003c */,
-	TLS_CIPHER_RSA_DHE_AES128_SHA = 0xFF /* 0x0031 */,
-	TLS_CIPHER_ANON_DH_AES128_SHA = 0xFF /* 0x0034 */
-};
-
-
-/**
- * tls_connection_set_cipher_list - Configure acceptable cipher suites
- * @tls_ctx: TLS context data from tls_init()
- * @conn: Connection context data from tls_connection_init()
- * @ciphers: Zero (TLS_CIPHER_NONE) terminated list of allowed ciphers
- * (TLS_CIPHER_*).
- * Returns: 0 on success, -1 on failure
- *
- */
-int tls_connection_set_cipher_list(void __far *tls_ctx, ssl_Socket __far *state,
-				   char __far *ciphers);
-/*** EndHeader */
-_ssl_tport_debug
-int tls_connection_set_cipher_list(void __far *tls_ctx, ssl_Socket __far *state,
-				   char __far *ciphers)
-{
-	state->n_accept_suites = 0;
-	while (*ciphers) {
-		if (*ciphers != 0xFF)
-			if (tls_add_ciphersuite(state, *ciphers))
-				return -1;
-		++ciphers;
-	}
-	if (!state->n_accept_suites)
-		return -1;
-	return 0;
-}
-
 
 
 /*** BeginHeader tls_get_cipher */
