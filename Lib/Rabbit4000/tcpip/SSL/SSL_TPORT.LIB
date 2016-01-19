@@ -1829,7 +1829,7 @@ int tls_do_server_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
    srv.extensions_length = rc;
    
    // Initialize cipher state based on the selection
-	if (_tls_get_suite(srv.cipher_suite) == NULL) {
+	if (_tls_get_suite(srv.cipher_suite, state) == NULL) {
 #if _SSL_PRINTF_DEBUG
     	printf("*** No suitable cipher suite ***\n");
 #endif
@@ -2819,7 +2819,7 @@ const char*_ssl_get_suite_str(SSL_uint16_t suite)
    	return "TLS_NULL_WITH_NULL_NULL";
    }
    
-   config = _tls_get_suite(suite);
+   config = _tls_get_suite(suite, NULL);
    if (config) {
    	return config->fulltext_name;
    }
@@ -2828,7 +2828,8 @@ const char*_ssl_get_suite_str(SSL_uint16_t suite)
 }
 
 /*** BeginHeader _tls_get_suite */
-const __far SSL_SuiteConfig *_tls_get_suite(SSL_uint16_t suite_number);
+const __far SSL_SuiteConfig *_tls_get_suite(SSL_uint16_t suite_number,
+	ssl_Socket __far *state);
 void _tls_append_supported_suites(ssl_Socket __far *state, _tbuf __far *t);
 /*** EndHeader */
 #define _SSL_SUITE(kx, cipher, hash, allow, forbid) \
@@ -2877,13 +2878,19 @@ const __far SSL_SuiteConfig _tls_suites[] = {
    return NULL.
 */
 _ssl_tport_debug
-const __far SSL_SuiteConfig *_tls_get_suite(SSL_uint16_t suite_number)
+const __far SSL_SuiteConfig *_tls_get_suite(SSL_uint16_t suite_number,
+	ssl_Socket __far *state)
 {
 	const __far SSL_SuiteConfig *suite = _tls_suites;
    int i;
    
    for (i = 0; i < sizeof _tls_suites / sizeof(SSL_SuiteConfig); ++suite, ++i) {
    	if (suite->suite_number == suite_number) {
+      	if (state
+         	&& (suite->flags_allow != (suite->flags_allow & state->suite_flags)
+            	|| (suite->flags_forbid & state->suite_flags))) {
+            return NULL;
+         }
       	return suite;
       }
    }
@@ -2904,7 +2911,7 @@ void _tls_append_supported_suites(ssl_Socket __far *state, _tbuf __far *t)
    int i;
    
    for (i = 0; i < sizeof _tls_suites / sizeof(SSL_SuiteConfig); ++suite, ++i) {
-      if ( (!suite->flags_allow || (suite->flags_allow & state->suite_flags))
+      if (suite->flags_allow == (suite->flags_allow & state->suite_flags)
            && !(suite->flags_forbid & state->suite_flags)) {
 #if _SSL_PRINTF_DEBUG > 2
 			printf("Append %s (0x%04x) to cipher list\n", suite->fulltext_name,
@@ -2922,46 +2929,6 @@ void _tls_append_supported_suites(ssl_Socket __far *state, _tbuf __far *t)
 	_tbuf_append(t, ciphers, byte_count);
 }
 
-/*** BeginHeader _ssl_choose_suite */
-SSL_uint16_t _ssl_choose_suite(ssl_Socket __far* state, SSL_uint16_t __far *, SSL_uint16_t);
-/*** EndHeader */
-
-// Selection uses pre-defined constant priorities for each suite.
-// Priorities are in increasing order, with 0 being the lowest
-// priority (which is also the error condition)
-// The length parameter is the number of elements in suites
-// which is a pointer to an xmem buffer
-_ssl_tport_debug
-SSL_uint16_t _ssl_choose_suite(ssl_Socket __far* state, SSL_uint16_t __far * suites, SSL_uint16_t length) {
-   auto int i;
-   auto const __far SSL_SuiteConfig *config;
-   auto int priority;	// Priority level of the current suite
-   auto SSL_uint16_t cur_suite; // Currently selected suite
-
-   priority = 0;
-   cur_suite = TLS_NULL_WITH_NULL_NULL; // If we return this, error
-   for(i = 0; i < length; i++) {
-   	// the suite number is still in network short form, so convert
-      config = _tls_get_suite(ntohs(suites[i]));
-
-   	// See if we support the suite; it's a higher priority than the current
-      // suite; if suite_flags are required to make use of it; if suite_flags
-      // forbid our use of it.
-      if (config && config->priority > priority
-         && (!config->flags_allow          // and state allows it
-            || (config->flags_allow & state->suite_flags))
-         && !(config->flags_forbid & state->suite_flags)) {
-         
-         cur_suite = config->suite_number;
-         priority = config->priority;
-      }
-   }
-
-   // Finally, return the suite we selected
-   return cur_suite;
-}
-
-
 /*** BeginHeader _ssl_server_cipher_init */
 int _ssl_server_cipher_init(ssl_Socket __far*, SSL_ClientHello __far*, _tbuf __far *);
 /*** EndHeader */
@@ -2974,47 +2941,15 @@ _ssl_tport_debug
 int _ssl_server_cipher_init(ssl_Socket __far* state, SSL_ClientHello __far* cli_hello_ptr, _tbuf __far * out)
 {
 	auto SSL_CipherState __far* cipher;
-   auto const SSL_SuiteConfig __far* _suite;
-   auto SSL_uint16_t suite_number;
    auto SSL_byte_t rand_buf[SSL_MAX_SESSION_ID - HMAC_MD5_HASH_SIZE];
    auto SSL_byte_t seed_buf[HMAC_MD5_HASH_SIZE];
 	auto int i, ret_val;
 
    ret_val = 0;
 
-#if _SSL_PRINTF_DEBUG > 2
-	printf("Client supported suites:\n");
-
-	// Process the ciphersuite choices
-   for(i = 0; i < cli_hello_ptr->ciphersuite_length/2; i++) {
-      _suite = _tls_get_suite(ntohs(cli_hello_ptr->cipher_suites[i]));
-		if (_suite) {
-			printf("%s\n", _suite->fulltext_name);
-      }
-   }
-#endif
-
 	// Access to state members
    cipher = state->cipher_state;
-
-   // Set up the cipher suite, based on the suite selection
-   // from the client offer (ciphersuite_length is the number of BYTES
-   // in the ciphersuite array, so we need to divide by the size of
-   // the suite numbers)
-	suite_number = _ssl_choose_suite(state, cli_hello_ptr->cipher_suites,
-                                   cli_hello_ptr->ciphersuite_length /
-                                   sizeof(SSL_uint16_t));
-
-   // Check the suite choice
-	if(TLS_NULL_WITH_NULL_NULL == suite_number) {
-    	// Oops, did not find a compatible ciphersuite
-#if _SSL_PRINTF_DEBUG
-    	printf("*** No suitable cipher suite ***\n");
-#endif
-      tls_error(state, SSL_CIPHER_CHOICE_ERROR, out);
-      return 1; // Return immediately
-   }
-
+   
    // Setup the server random for generating key material
    // The time stamp needs to be a UNIX time stamp, so
    // calculate the value from the SEC_TIMER
@@ -3027,7 +2962,7 @@ int _ssl_server_cipher_init(ssl_Socket __far* state, SSL_ClientHello __far* cli_
 
    // Initialize the cipher, based upon our selection
    // Note: No error return from TLS_cipher_init
-	_ssl_cipher_init(state, suite_number);
+	_ssl_cipher_init(state, cli_hello_ptr->ciphersuite_number);
 
   	// Create a new session ID
    // DEVIDEA: In the future, we need to check for the existence of
@@ -3094,7 +3029,7 @@ void _ssl_cipher_init(ssl_Socket __far* state, SSL_uint16_t suite_number) {
    auto SSL_uint32_t time_stamp;
 
    cipher = state->cipher_state;
-   cipher->suite = suite = _tls_get_suite(suite_number);
+   cipher->suite = suite = _tls_get_suite(suite_number, NULL);
    
    // Clear sequence number
   	_f_memset(cipher->seq_number, 0, SSL_SEQ_NUM_SIZE);
@@ -3272,7 +3207,9 @@ int tls_do_client_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
    // 2) send certificate
    // 3) send server hello done message
    auto SSL_byte_t sess_id[SSL_MAX_SESSION_ID];
-   auto SSL_uint16_t ciphers[SSL_MAX_CIPHER_LIST];
+   auto const SSL_SuiteConfig __far *preferred_cipher;
+   auto const SSL_SuiteConfig __far *offered_cipher;
+   auto SSL_uint16_t suite_bytes;
 	auto SSL_ClientHello cli_hello;
    auto int ret_val, temp;
    auto long cc;
@@ -3304,16 +3241,32 @@ int tls_do_client_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
    _tbuf_extract(sess_id, t, cli_hello.session_id_length);
 
    // Extract length and ciphersuites
-	cli_hello.ciphersuite_length = _tbuf_extract_ntoh16(t);
-   if(cli_hello.ciphersuite_length > SSL_MAX_CIPHER_LIST*2) {
+   preferred_cipher = NULL;
+	suite_bytes = _tbuf_extract_ntoh16(t);
+   while (suite_bytes > 1) {
+   	offered_cipher = _tls_get_suite(_tbuf_extract_ntoh16(t), state);
+		if (offered_cipher) {
 #if _SSL_PRINTF_DEBUG
-		printf("*** Client hello ciphersuite list too long (%u bytes)***\n",
-      	cli_hello.ciphersuite_length);
+      	printf("Consider cipher %s (priority %d)\n",
+         	offered_cipher->fulltext_name, offered_cipher->priority);
+#endif
+	      if (!preferred_cipher
+	            || offered_cipher->priority > preferred_cipher->priority) {
+	         preferred_cipher = offered_cipher;
+	      }
+		}
+      suite_bytes -= 2;
+   }
+   // if we didn't select a cipher, or had an odd number of bytes in the list
+   if (preferred_cipher == NULL || suite_bytes) {
+#if _SSL_PRINTF_DEBUG
+		printf("*** No supported ciphers in client hello ciphersuite list ***\n");
 #endif
       return tls_error(state, SSL_CIPHER_CHOICE_ERROR, out);
    }
-   _tbuf_extract(ciphers, t, cli_hello.ciphersuite_length);
 
+   cli_hello.ciphersuite_number = preferred_cipher->suite_number;
+   
    // Extract length and compression methods (ignore actual methods)
    _tbuf_extract(&cli_hello.compression_length, t, 1);
    _tbuf_delete(t, cli_hello.compression_length);
@@ -3325,7 +3278,6 @@ int tls_do_client_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
    cli_hello.extensions_length = temp;
    
    cli_hello.session_id = cli_hello.session_id_length > 0 ? sess_id : NULL;
-   cli_hello.cipher_suites = cli_hello.ciphersuite_length > 0 ? ciphers : NULL;
    // Null compression must be specified, so assume it's there.  We currently don't
    // support any others.
    cli_hello.compression_methods = NULL;
