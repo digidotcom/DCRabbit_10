@@ -121,9 +121,6 @@
 // Defining this macro tells SSL to enable AES.
 // AES_CRYPT.LIB must be available and support SSL (v1.05 or greater)
 //#define SSL_USE_AES
-// This macro tells SSL to disable RC4
-// IMPORTANT: At least one cipher (RC4 or AES) must be enabled.
-//#define SSL_DONT_USE_RC4
 
 // Import the certificate and corresponding private key.
 // The Dynamic C Certificate Generation Utility will create these files

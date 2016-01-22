@@ -385,7 +385,6 @@
    // with AES.
 	#define SSL_USE_AES
 	#define SSL_USE_PSK
-	#define SSL_DONT_USE_RC4
 	#define SSL_DONT_USE_RSA
 	#use "ssl_sock.lib"
 #endif
