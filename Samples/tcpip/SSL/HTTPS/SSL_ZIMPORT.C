@@ -84,9 +84,6 @@
 // SSL Stuff
 // This macro tells the HTTP library to use SSL
 #define USE_HTTP_SSL
-// Defining this macro tells SSL to enable AES.
-// AES_CRYPT.LIB must be available and support SSL (v1.05 or greater)
-//#define SSL_USE_AES
 
 // Import the certificate and corresponding private key.
 // The Dynamic C Certificate Generation Utility will create these files
