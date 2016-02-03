@@ -50,15 +50,19 @@
            to check this if the sample seems to fail in spite of everything.
            You can override these macros in the Defines panel.
 
-        NOTE: you can also use a Hotmail account (a.k.a "Windows live").
-        In this case, #define POP_SERVER "pop3.live.com", and use your
-        Hotmail account settings in POP_USER and POP_PASS.  There is no
-        need to change any of your Hotmail account settings (as of the
-        date of writing, Sep 2009).
+        NOTE: you can also use a Hotmail/Outlook.com account once Microsoft
+        upgrades their servers from TLS 1.0 to TLS 1.2 (still not the case
+        in February 2016).
+        
+        In this case, #define POP_SERVER "pop-mail.outlook.com", and use your
+        Hotmail/Outlook.com credentials in POP_USER and POP_PASS.  You may
+        also need to enable POP access for your account in Options:
+           https://outlook.live.com/owa/#path=/options/popandimap
+        
         Unfortunately, Microsoft in their wisdom use 4096 bit RSA keys in
         some of their certificates, thus you need to #define MP_SIZE 514.
-        GMail only used 1024-bit keys, hence the default MP_SIZE (130)
-        is sufficient.
+        GMail uses 2048-bit keys, and requires a MP_SIZE of at least 258.
+        
         To date, Yahoo does not allow POP3/SMTP access with their free email
         accounts.
 *******************************************************************************/
@@ -71,11 +75,12 @@
 // certificates in use.
 #ximport "../sample_certs/EquifaxSecureCA.crt"  ca_pem1
 
-// This one for Hotmail (SMTP)
+// This one for Hotmail/Outlook.com (POP3 and SMTP)
 #ximport "../sample_certs/GTECyberTrustGlobalRoot.crt"  ca_pem2
-#define MP_SIZE 514			// Recommended to support 4096-bit RSA keys used by
-									// some Microsoft certs.  (Crazy, but the root CA
-									// uses only 2048 bit keys!)
+#define MP_SIZE 258			// necessary for GMail's RSA keys
+
+//#define MP_SIZE 514			// Recommended to support 4096-bit RSA keys used by
+									// some Microsoft certs.
 
 // Comment this out if the Real-Time Clock is set accurately.
 #define X509_NO_RTC_AVAILABLE
@@ -106,7 +111,7 @@
  */
 #ifndef POP_SERVER
 	#define POP_SERVER	"pop.gmail.com"	// GMail
-	//#define POP_SERVER	"pop3.live.com"		// Hotmail
+	//#define POP_SERVER	"pop-mail.outlook.com"		// Hotmail
 #endif
 #ifndef POP_PORT
 	#define POP_PORT	995	// Port 995 used for POP3 tunneled through TLS
