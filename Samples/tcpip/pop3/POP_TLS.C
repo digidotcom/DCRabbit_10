@@ -221,7 +221,7 @@ int pop_server_policy(ssl_Socket far * state, int trusted,
 	printf("Server claims to be CN='%ls'\n", cert->subject.cn);
 	printf("We are looking for  CN='%s'\n", pop3_getserver());
 
-	if (strcmp(cert->subject.cn, pop3_getserver())) {
+	if (x509_validate_hostname(cert, pop3_getserver())) {
 		printf("Mismatch!\n\n");
 		return 1;
 	}

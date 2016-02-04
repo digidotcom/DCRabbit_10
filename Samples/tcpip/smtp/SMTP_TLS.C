@@ -258,7 +258,7 @@ int smtp_server_policy(ssl_Socket far * state, int trusted,
 	printf("Server claims to be CN='%ls'\n", cert->subject.cn);
 	printf("We are looking for  CN='%s'\n", smtp_getserver());
 
-	if (strcmp(cert->subject.cn, smtp_getserver())) {
+	if (x509_validate_hostname(cert, smtp_getserver())) {
 		printf("Mismatch!\n\n");
 		return 1;
 	}

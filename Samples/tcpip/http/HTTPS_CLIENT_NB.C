@@ -136,7 +136,7 @@ int my_server_policy(ssl_Socket far * state, int trusted,
 	else
 		host = s->hostname;
 
-	if (strcmp(cert->subject.cn, host)) {
+	if (x509_validate_hostname(cert, host)) {
 		printf("Certificate hostname mismatch%s!\n",
 			httpc_globals.ip ? " (using proxy)" : "");
 		printf("Was expecting %ls, got %ls\n\n",
