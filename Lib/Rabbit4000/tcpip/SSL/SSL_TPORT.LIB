@@ -3719,6 +3719,50 @@ int tls_decrypt(ssl_Socket __far * state, ssl_Header __far * hdr, _tbuf __far * 
 					 size_t rec_len, _tbuf __far * out_data);
 /*** EndHeader */
 
+/*
+	Verify that padding used in CBC is correct.  Last byte indicates length
+   of padding, and all padding bytes should be set to that value.
+*/
+_ssl_tport_debug
+int _tls_check_padding(_tbuf __far * data, size_t rec_len)
+{
+	auto padding[16];
+   auto check[16];
+   auto SSL_byte_t padding_byte;
+   auto int padding_len;
+	auto int offset, count;
+   
+	_tbuf_xread(&padding_byte, data, rec_len-1, 1);
+   // Padding length is *(last byte), plus 1.
+   padding_len = (int) padding_byte + 1;
+   if (padding_len > 1) {
+	   if (padding_len >= rec_len) {
+	      return -1;
+	   }
+	   
+	   // Check padding in chunks of up to 16 bytes, as a balance between
+	   // stack usage and calls to _tbuf_xread().
+	   memset(padding, padding_byte, 16);
+	   for (offset = rec_len - padding_len; padding_byte != 0; offset += 16) {
+	      count = padding_byte;
+	      if (count > 16) {
+	         count = 16;
+	      }
+	      _tbuf_xread(check, data, offset, count);
+	      if (memcmp(padding, check, count)) {
+#if _SSL_PRINTF_DEBUG > 2
+				printf("Error checking %u bytes at offset 0x%x for padding 0x%02x\n",
+            	count, offset, padding_byte);
+            mem_dump(check, count);
+#endif
+	         return -1;
+	      }
+	      padding_byte -= count;
+	   }
+   }
+   return padding_len;	
+}
+
 _ssl_tport_debug
 int tls_decrypt(ssl_Socket __far * state, ssl_Header __far * hdr, _tbuf __far * data,
 					 size_t rec_len, _tbuf __far * out_data)
@@ -3729,7 +3773,7 @@ int tls_decrypt(ssl_Socket __far * state, ssl_Header __far * hdr, _tbuf __far * 
 	auto size_t bytes_decrypted;
 	auto SSL_CipherState __far * cipher;
 	auto SSL_BulkCipherConfig __far * bulk_cipher;
-   auto SSL_byte_t padding_len;
+   auto int padding_len;
    auto SSL_DigestConfig __far* digest;  	// Pointer to digest state
 
 	if (!rec_len)
@@ -3770,9 +3814,10 @@ int tls_decrypt(ssl_Socket __far * state, ssl_Header __far * hdr, _tbuf __far * 
 	         return tls_error(state, SSL_READ_BLOCK_CIPHER_ERROR, out_data);
 	      }
 
-	      // Padding length is *(last byte), plus 1.
-	      _tbuf_xread(&padding_len, data, rec_len-1, 1);
-	      ++padding_len;
+         padding_len = _tls_check_padding(data, rec_len);
+         if (padding_len < 0) {
+         	return tls_error(state, SSL_BAD_RECORD_MAC, out_data);
+         }
       }
       else {
          padding_len = 0;
