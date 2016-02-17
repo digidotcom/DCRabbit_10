@@ -359,7 +359,7 @@ size_t _stream_stdout_write( void __far *cookie, const void __far *buffer,
 #ifndef STDIO_DEBUG_SERIAL
 		jr		z, .exit					; skip the debug kernel code if in run mode
 #else
-	#ifndef STDIO_DEBUG_FORCED_SERIAL
+	#ifndef STDIO_DEBUG_FORCEDSERIAL
 		jr		nz, .dkDoMsg			; use the debug kernel for stdout
 	#endif
 		ld		hl, (sp+@sp+bytes)
