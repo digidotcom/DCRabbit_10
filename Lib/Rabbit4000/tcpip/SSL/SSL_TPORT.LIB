@@ -19,16 +19,16 @@ DESCRIPTION:
   sockets, then #use SSL_SOCK.LIB instead.
 
   This library supports:
-    - Server-side (TLS or SSLv3.0, with SSLv2 handshake compatibility)
-    - Client-side (TLS only)
+    - Server-side
+    - Client-side
     - Far pointers throughout
     - Arbitrary number of sessions (limited by _sys_malloc() memory)
     - Session resumption for both client and server sides
     - "non-blocking" RSA private key operations.
     - Use of X509 certificates
     - Verification of certificates against a list of trusted CAs
-    - MD5 or SHA-1 message authentication
-    - RC4 or AES bulk encryption
+    - SHA-1 or SHA-256 message authentication
+    - AES bulk encryption
     - RSA key exchange and authentication
 
   Based on...
@@ -260,10 +260,6 @@ int ssl_init(ssl_Socket __far* state) {
 	   seed_hash_secret((char*)0);
 
 		_ssl_globals.done_init = 1;
-
-		// Set the magic number which allows us to convert "far" socket pointers to
-		// root.  This is temporary until TCP/IP supports far pointers throughout.
-		//_ssl_globals.rootable = (long)ssl_ResourcePool - paddr(ssl_ResourcePool);
 	}
 
    // Clear out the state
@@ -399,7 +395,6 @@ ssl_Socket __far * tls_connection_init_state(void __far *tls_ctx, ssl_Socket __f
    // Allocate resources to state structure
 	state->resource_index = rp;
 	state->cipher_state = &rp->cipher;
-   state->cipher_state->suite = &rp->suite;
    state->cipher_state->key_exch = &rp->key_exch;
    state->cipher_state->bulk_cipher = &rp->bulk_cipher;
    state->cipher_state->digest = &rp->digest;
@@ -412,8 +407,8 @@ ssl_Socket __far * tls_connection_init_state(void __far *tls_ctx, ssl_Socket __f
    _f_memset(state->master_secret, 0, sizeof(SSL_Secret));
 
    // Finish hash initialization
-   md5_init(&state->fin_hash->md5_hash);
-   sha_init(&state->fin_hash->sha_hash);
+   sha_init(&state->fin_hash->sha1_hash);
+   sha256_init(&state->fin_hash->sha256_hash);
 
 #if _SSL_USE_RSA_
 	state->cert = &rp->cert;
@@ -429,8 +424,6 @@ ssl_Socket __far * tls_connection_init_state(void __far *tls_ctx, ssl_Socket __f
 #if SSL_NO_SESSION_RENEGOTIATION
 	state->flags = SSL_F_NO_RESUME;
 #endif
-
-	tls_set_default_ciphersuites(state);
 
 	return state;
 
@@ -609,7 +602,6 @@ int tls_set_done(ssl_Socket __far * state)
 
 	state->tport && state->tport(state, TPORT_EVENT_DONE, 0);
 	state->is_client = 0;
-	state->is_ssl_v3 = 0;
 	state->is_psk = 0;
 }
 
@@ -802,7 +794,7 @@ word tls_set_flags(ssl_Socket __far * state, word flags, word mask)
 }
 
 
-/*** BeginHeader tls_set_tport_flags, tls_get_tport_flags */
+/*** BeginHeader tls_set_tport_flags */
 // Similar to tls_set_flags(), except these flags are for use by transport layer
 // and not otherwise used by TLS/SSL libraries.
 word tls_set_tport_flags(ssl_Socket __far * state, word flags, word mask);
@@ -993,12 +985,12 @@ _ssl_tport_debug
 int tls_connection_get_keys(void __far *tls_ctx, ssl_Socket __far *conn,
 			    struct tls_keys __far *keys)
 {
-	keys->master_key = conn->master_secret.data;
-	keys->master_key_len = conn->master_secret.length;
-	keys->client_random = (char __far *)&conn->cipher.client_random;
-	keys->client_random_len = sizeof(conn->cipher.client_random);
-	keys->server_random = (char __far *)&conn->cipher.server_random;
-	keys->server_random_len = sizeof(conn->cipher.server_random);
+	keys->master_key = conn->master_secret->data;
+	keys->master_key_len = conn->master_secret->length;
+	keys->client_random = (char __far *)&conn->cipher_state->client_random;
+	keys->client_random_len = sizeof(conn->cipher_state->client_random);
+	keys->server_random = (char __far *)&conn->cipher_state->server_random;
+	keys->server_random_len = sizeof(conn->cipher_state->server_random);
 	keys->inner_secret_len = 0;	//DEVIDEA: implement this
 	return 0;
 }
@@ -1033,13 +1025,12 @@ int tls_connection_prf(void __far *tls_ctx, ssl_Socket __far *conn,
 		       char __far *label, int server_random_first,
 		       char __far *out, size_t out_len)
 {
-	auto char temp[256];
 	auto char seed[256+ 2 * sizeof(SSL_Random)];
 	auto word lablen;
 
 	lablen = _f_strlen(label);
 
-	if (!tls_connection_established(tls_ctx, conn) || out_len > sizeof(temp) || lablen > 256)
+	if (!tls_connection_established(tls_ctx, conn) || lablen > 256)
 		return -1;
 
 	_f_memcpy(seed, label, lablen);
@@ -1053,8 +1044,8 @@ int tls_connection_prf(void __far *tls_ctx, ssl_Socket __far *conn,
 			  sizeof(SSL_Random));
 	}
 
-	_tls_1_PRF(conn->master_secret, seed, lablen + 2*sizeof(SSL_Random), out,
-            temp, out_len);
+	_SHA256_PRF(conn->master_secret, seed, lablen + 2*sizeof(SSL_Random), out,
+            out_len);
 
 	return 0;
 }
@@ -1076,21 +1067,14 @@ int tls_digest_hs_message(ssl_Socket __far* state, ll_Gather * g)
 #endif
 
 	// Digest 1st part
-   md5_append(&state->fin_hash->md5_hash, 	(char __far *)g->data2, g->len2);
-	sha_add(&state->fin_hash->sha_hash, 		(char __far *)g->data2, g->len2);
+	sha_add(&state->fin_hash->sha1_hash, g->data2, g->len2);
+   sha256_add(&state->fin_hash->sha256_hash, g->data2, g->len2);
 
 	// ...and 2nd if any
 	if (g->len3) {
-	   md5_append(&state->fin_hash->md5_hash,  (char __far *)g->data3, g->len3);
-	   sha_add(&state->fin_hash->sha_hash,     (char __far *)g->data3, g->len3);
+	   sha_add(&state->fin_hash->sha1_hash, g->data3, g->len3);
+	   sha256_add(&state->fin_hash->sha256_hash, g->data3, g->len3);
    }
-
-#if _SSL_PRINTF_DEBUG > 3
-   printf("   md5[0]=%lu sha[0]=%lu\n",
-   	state->fin_hash->md5_hash.abcd[0],
-      state->fin_hash->sha_hash.hash[0]
-      );
-#endif
 
    // Success
    return 0;
@@ -1099,33 +1083,22 @@ int tls_digest_hs_message(ssl_Socket __far* state, ll_Gather * g)
 _ssl_tport_debug
 int tls_finished_mac(ssl_Socket __far* state, char __far * buf, int verify)
 {
-	// SSL3_VERIFY_DATA_SIZE is greater than TLS_VERIFY_DATA_SIZE and is
-   // therefore used as the dimension of these buffers
-	auto SSL_byte_t mac[SSL3_VERIFY_DATA_SIZE];
+	auto SSL_byte_t mac[TLS_VERIFY_DATA_SIZE];
    auto SSL_byte_t ret_val;
    auto SSL_Finish_Hash_t fh;
    auto _ssl_MAC_sender_t sender;
 
-	// Copy state, since we still need to keep hashing HS mesages in fin_hash.
+	// Copy state, since we still need to keep hashing HS messages in fin_hash.
    _f_memcpy(&fh, state->fin_hash, sizeof(fh));
 
    sender = (!state->is_client ^ !verify) ? SSL_FMAC_CLIENT : SSL_FMAC_SERVER;
 	ret_val = 0;
 	// Generate the mac
-   if(state->is_ssl_v3) {
-		_ssl_v3_generate_finish_mac(state, &fh, sender, mac);
-		if (verify)
-      	ret_val = _f_memcmp(mac, buf, SSL3_VERIFY_DATA_SIZE);
-      else
-      	_f_memcpy(buf, mac, ret_val = SSL3_VERIFY_DATA_SIZE);
-   }
-	else {
-		_tls_1_generate_finish_mac(state, &fh, sender, mac);
-		if (verify)
-      	ret_val = _f_memcmp(mac, buf, TLS_VERIFY_DATA_SIZE);
-      else
-      	_f_memcpy(buf, mac, ret_val = TLS_VERIFY_DATA_SIZE);
-   }
+	_tls_1_generate_finish_mac(state, &fh, sender, mac);
+	if (verify)
+   	ret_val = _f_memcmp(mac, buf, TLS_VERIFY_DATA_SIZE);
+   else
+   	_f_memcpy(buf, mac, ret_val = TLS_VERIFY_DATA_SIZE);
 
 	return ret_val;
 }
@@ -1233,7 +1206,7 @@ int tls_query_unsent(ssl_Socket __far * state)
  * established if the first call passes a NULL tport_in.  This signifies
  * that a client_hello message is to be formatted and returned.
  *
- * tport_out will be used to contain handshake and/or alert mesages which are
+ * tport_out will be used to contain handshake and/or alert messages which are
  * generated by this state machine.  During the actual handshake phase, this
  * buffer must be big enough to contain the required data, otherwise a
  * 'record write overflow' error will be generated and the connection will
@@ -1287,8 +1260,13 @@ int tls_sm(ssl_Socket __far * state,
            _tbuf __far * app_in,
            _tbuf __far * app_out)
 {
-	auto SSL_byte_t cert_verf_hashes[36];	// MD5 plus SHA hash
-	auto SSL_byte_t recvd_mac[SSL3_VERIFY_DATA_SIZE];
+	auto SSL_byte_t cert_verf_hashes[HMAC_MAX_HASH_SIZE];
+	auto SSL_byte_t recvd_mac[TLS_VERIFY_DATA_SIZE];
+	auto union {
+		sha_state sha1;
+		sha256_context sha256;
+	} hash_sofar;
+
 	auto SSL_Handshake_Hdr_t hh;
 	auto _tbuf t;			// HS message data only (not header), overlays hs_in.
 	auto ll_Gather g;		// complete HS message buffer (ref to hs_in data)
@@ -1316,7 +1294,6 @@ int tls_sm(ssl_Socket __far * state,
 			return tls_error(state, SSL_BAD_STATE_CLI_HELLO, NULL);
 		}
 		state->is_client = 1;
-		state->flags |= SSL_F_DISABLE_SSLV3;
 		rc = tls_send_client_hello(state, tport_out);
 		state->hs_timeout = _SET_SHORT_TIMEOUT(SSL_HANDSHAKE_TIMEOUT);
 		if (!rc)
@@ -1412,22 +1389,11 @@ int tls_sm(ssl_Socket __far * state,
 			 state->hdr.rec_type != SSL_REC_handshake)
 			continue;
 
-		// This loop processes all handshake mesages in one record (if HS record
+		// This loop processes all handshake messages in one record (if HS record
 		// content, otherwise it will only iterate once for app data).
 		do {
 	      // Assemble fragmented handshake messages
 	      if (state->hdr.rec_type == SSL_REC_handshake) {
-	      	if (state->cur_state == SSL_STATE_HS_LISTEN && state->sslv2_hs) {
-	      		// Unfortunately, different processing for SSLV2 client hello.
-	      		// SSLV2 doesn't have HS fragmentation, so just read everything
-	      		// in buffer.
-	            _tbuf_xread(&hh, hs_in, 0, 3);	// peek at message type and version
-	      		hs_len = hs_in->len;					// length is everything in buffer
-	            _tbuf_ref(hs_in, &g, 0, (word)hs_len);
-	            // t is set up to map everything for SSLV2
-	            _f_memcpy(&t, hs_in, sizeof(t));
-	      		goto _hs_proc;
-	      	}
 	         if (hs_in->len >= sizeof(hh)) {
 	            _tbuf_xread(&hh, hs_in, 0, sizeof(hh));
 	            hs_len = n24toul(hh.length) + sizeof(hh);
@@ -1472,10 +1438,27 @@ int tls_sm(ssl_Socket __far * state,
 					}
 					if (hh.msg_type != hello_request) {
 						if (hh.msg_type == certificate_verify) {
+                     _tbuf_xread(&state->cert_verify_sigalgo, hs_in, sizeof(hh), 2);
+                     if (state->cert_verify_sigalgo.signature != TLS_SIGN_RSA) {
+                        // unsupported signature type
+                        return tls_error(state, SSL_ILLEGAL_PARAMETER_ERROR, tport_out);
+                     }
+                     
 							// Take snapshot of hashes so far, since this is the data
 							// which was signed by the client.
-	                  md5_sofar(&state->fin_hash->md5_hash, cert_verf_hashes);
-	                  sha_sofar(&state->fin_hash->sha_hash, cert_verf_hashes+16);
+                     switch (state->cert_verify_sigalgo.hash) {
+                     	case TLS_HASH_SHA:
+                           hash_sofar.sha1 = state->fin_hash->sha1_hash;
+                           sha_finish(&hash_sofar.sha1, cert_verf_hashes);
+                        	break;
+                     	case TLS_HASH_SHA256:
+                           hash_sofar.sha256 = state->fin_hash->sha256_hash;
+                           sha256_finish(&hash_sofar.sha256, cert_verf_hashes);
+                        	break;
+                        default:
+                        	// unsupported hash type
+                           return tls_error(state, SSL_ILLEGAL_PARAMETER_ERROR, tport_out);
+                     }
 						}
 						tls_digest_hs_message(state, &g);
 					}
@@ -1531,7 +1514,7 @@ int tls_sm(ssl_Socket __far * state,
 	            #if _SSL_PRINTF_DEBUG
 	                printf("*** Got renegotiation in app data state ***\n");
 	            #endif
-   					tls_send_alert(state, TLS_ALRT_no_renegotiation, tport_out, 0);
+   					tls_send_alert(state, TLS_ALRT_no_renegotiation, tport_out, TLS_auto_level);
 
             	}
             	else {
@@ -1680,9 +1663,13 @@ _do_output:
 	    (nag_avail = _tbuf_remain(tport_out)) >= SSL_OUT_BUF_RESERVE) {
 		// OK to send application data.  nag_curr is size of record
 		// we would create at this point.
-		nag_curr = (nag_len = app_out->len) + sizeof(SSL_Record_Hdr) +
-		           state->cipher_state->digest->hash_size +
-					  state->cipher_state->bulk_cipher->block_size;
+      nag_curr = state->cipher_state->bulk_cipher->block_size;
+      // If we're using a block cipher, leave room for the explicit IV.
+      if (nag_curr) {
+         nag_curr += SSL_EXPLICIT_IV_SIZE;
+		}
+		nag_curr += (nag_len = app_out->len) + sizeof(SSL_Record_Hdr) +
+		           state->cipher_state->digest->hash_size;
 		if (nag_curr > nag_avail) {
 			nag_len -= (nag_curr - nag_avail);
 			nag_curr = nag_avail;
@@ -1718,6 +1705,66 @@ _unexpected:
 #endif
  	return tls_error(state, SSL_READ_UNEXPECTED_MSG, tport_out);
 
+}
+
+/*** BeginHeader _tls_parse_hello_extensions */
+int _tls_parse_hello_extensions(ssl_Socket __far * state, _tbuf * t);
+/*** EndHeader */
+_ssl_tport_debug
+int _tls_parse_hello_extensions(ssl_Socket __far * state, _tbuf * t)
+{
+   auto SSL_uint16_t total_length;        // total bytes of extensions
+   auto SSL_uint16_t remaining_length;    // remaining bytes of extensions
+   auto SSL_uint16_t ext_id;              // current parsed extension ID
+   auto SSL_uint16_t ext_length;          // length of current parsed extension
+   
+   // Extract optional TLS Extensions
+   // Check for extensions and verify format of the data.
+   if (t->len == 0)
+      // no extensions present
+      return 0;
+      
+   if (t->len == 1 || t->len > 5000)
+      // error, expect 2 bytes for length, and no more than 5000 bytes
+      // (arbitrary value) of extensions
+      return -1;
+      
+   remaining_length = total_length = _tbuf_extract_ntoh16(t);
+   
+   while (remaining_length) {
+      if (remaining_length < 4) {
+#if _SSL_PRINTF_DEBUG
+			printf("error parsing hello extensions (len=%u, %u bytes remain)\n",
+         	total_length, remaining_length);
+#endif
+         return -1;
+      }
+      remaining_length -= 4;
+      
+      ext_id = _tbuf_extract_ntoh16(t);
+      ext_length = _tbuf_extract_ntoh16(t);
+#if _SSL_PRINTF_DEBUG
+		printf("Parsed Hello Extension 0x%04x len=%u\n", ext_id, ext_length);
+#endif
+      if (ext_length > remaining_length) {
+#if _SSL_PRINTF_DEBUG
+			printf("extension length (%u) > remaining extension bytes (%u)\n",
+         	ext_length, remaining_length);
+#endif
+         return -1;
+      }
+      // Insert code to check for and process specific extensions here.  For
+      // now, just burn through them and make sure the message is of a valid
+      // format.  Make use of state->is_client to determine whether this is a
+      // Server Hello (is_client == TRUE) or Client Hello (is_client == FALSE).
+      if (ext_length > 0) {
+         // ignore extension data
+         _tbuf_delete(t, ext_length);
+         remaining_length -= ext_length;
+      }
+   }
+   
+   return total_length;
 }
 
 /*** BeginHeader tls_do_server_hello */
@@ -1758,13 +1805,27 @@ int tls_do_server_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
 	_f_memcpy(state->session_id, srv.session_id,srv.session_id_length);
 
    // Extract selected ciphersuite
-   _tbuf_extract(&srv.cipher_suite, t, 2);
+   srv.cipher_suite = _tbuf_extract_ntoh16(t);
 
+   // Extract compression method (set 16-bit enum to 0, then load low byte)
+   srv.compression_method = 0;
+   _tbuf_extract(&srv.compression_method, t, 1);
+   // Verify Null compression was specified.
+   if (srv.compression_method != SSL_CM_null) {
+#if _SSL_PRINTF_DEBUG
+		printf("unexpected compression method 0x%02x\n", srv.compression_method);
+#endif
+		return tls_error(state, SSL_ILLEGAL_PARAMETER_ERROR, out);
+   }
+   
+   // Extract optional TLS Extensions
+   rc = _tls_parse_hello_extensions(state, t);
+   if (rc < 0)
+      return tls_error(state, SSL_HELLO_EXT_DECODE_ERROR, out);
+   srv.extensions_length = rc;
+   
    // Initialize cipher state based on the selection
-	for (i = 0; i < state->n_accept_suites; ++i)
-		if (srv.cipher_suite == state->accept_suites[i])
-			break;
-	if (i >= state->n_accept_suites) {
+	if (_tls_get_suite(srv.cipher_suite, state) == NULL) {
 #if _SSL_PRINTF_DEBUG
     	printf("*** No suitable cipher suite ***\n");
 #endif
@@ -1775,41 +1836,21 @@ int tls_do_server_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
 	_f_memcpy(&state->cipher_state->server_random, &srv.random, sizeof(SSL_Random));
 
 	// Init cipher suite
-	_ssl_cipher_init(state, ntohs(srv.cipher_suite));
-
-   // Null compression must be specified, so assume it's there.  We currently don't
-   // support any others.
-   srv.compression_method = SSL_CM_null;
+	_ssl_cipher_init(state, srv.cipher_suite);
 
 	#if _SSL_PRINTF_DEBUG > 2
 	   printf("\n\nServer Random:\n");
 	   mem_dump((SSL_byte_t*)&srv.random, sizeof(SSL_Random));
 	#endif
 
-   // Check Protcol Version
+   // Check Protocol Version
    if(!(srv.server_version.major == TLS1_VER_MAJ &&
         srv.server_version.minor == TLS1_VER_MIN))
    {
-	   //	Check for SSLv3
-	   if(!(srv.server_version.major == SSL3_VER_MAJ &&
-   	     srv.server_version.minor == SSL3_VER_MIN)) {
 #if _SSL_PRINTF_DEBUG
-    		printf("*** Bad SSL version ***\n");
+    	printf("*** Bad TLS version ***\n");
 #endif
-      	return tls_error(state, SSL_HS_CLI_PROTOCOL_ERROR, out);
-      }
-      else {
-      	// We are now an SSLv3 client, so set the state to reflect
-         // this fact
-      	state->is_ssl_v3 = 1;
-      	// (This should always be set for client, since we currently only do TLS)
-      	if (state->flags & SSL_F_DISABLE_SSLV3) {
-#if _SSL_PRINTF_DEBUG
-    			printf("*** SSLv3 not allowed ***\n");
-#endif
-      		return tls_error(state, SSL_HS_CLI_PROTOCOL_ERROR, out);
-      	}
-      }
+      return tls_error(state, SSL_HS_CLI_PROTOCOL_ERROR, out);
    }
 
 	rc = 0;
@@ -1817,15 +1858,8 @@ int tls_do_server_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
 	if (state->flags & SSL_F_RESUMED) {
 		state->cur_state = SSL_STATE_WAIT_CCS_RESUME;
 
-      // Derive keys from state
-      if(state->is_ssl_v3) {
-         // Derive keys using SSLv3 algorithms
-         rc = _ssl_v3_derive_keys(state);
-      }
-      else {
-      	// Derive keys using TLSv1 algorithms
-      	rc = _tls_1_derive_keys(state);
-      }
+      // Derive keys from state using TLSv1 algorithms
+      rc = _tls_1_derive_keys(state);
 
       if(!rc) {
 	      // Now that we have keys, we can initialize our bulk cipher
@@ -1953,6 +1987,31 @@ _len_error:
 
 }
 
+/*** BeginHeader _tbuf_extract_ntoh16 */
+SSL_uint16_t _tbuf_extract_ntoh16(_tbuf __far *t);
+/*** EndHeader */
+// Extract 16-bit value from a tbuf and reverse its byte order.
+_ssl_tport_debug
+SSL_uint16_t _tbuf_extract_ntoh16(_tbuf __far *t)
+{
+	SSL_uint16_t u16;
+   
+   _tbuf_extract(&u16, t, 2);
+   return ntohs(u16);
+}
+
+/*** BeginHeader _tbuf_append_hton16 */
+void _tbuf_append_hton16(_tbuf __far *t, SSL_uint16_t value);
+/*** EndHeader */
+// Append 16-bit value in reverse-byte-order to a tbuf.
+_ssl_tport_debug
+void _tbuf_append_hton16(_tbuf __far *t, SSL_uint16_t value)
+{
+	SSL_uint16_t u16;
+   
+	u16 = htons(value);
+   _tbuf_append(t, &u16, 2);
+}
 
 /*** BeginHeader tls_do_certificate_request */
 int tls_do_certificate_request(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out);
@@ -1960,11 +2019,70 @@ int tls_do_certificate_request(ssl_Socket __far * state, _tbuf * t, _tbuf __far 
 _ssl_tport_debug
 int tls_do_certificate_request(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
 {
+	auto int cert_type_rsa = FALSE, have_hash_algo = FALSE;
+	auto SSL_byte_t b, cert_type;
+   auto SSL_uint16_t hash_length;
+   auto TLS_SignatureAndHashAlgorithm hash_algo;
+   
+#if _SSL_PRINTF_DEBUG
+	printf(">> parse certificate request\n");
+#endif
+      
 	// We only support RSA signing.
-	// DEVIDEA: save list of acceptable DNs for the client.  Currently, client would
-	// have no clue as to which (if any) CAs would be acceptable to this server.
-	state->flags |= SSL_F_SEND_CERT;
-	return 0;
+   
+	// At least 2 bytes for cert types (length, RSA signed) and 4 bytes for hash
+	// algorithms (2-byte length, at least one 2-byte algorithm).
+	if (t->len >= 6) {
+		_tbuf_extract(&b, t, 1);
+#if _SSL_PRINTF_DEBUG
+      printf("%u cert types\n", b);
+#endif
+      
+		// Verify that Certificate Types includes RSA
+		while (b && t->len > 4) {
+			_tbuf_extract(&cert_type, t, 1);
+			if (cert_type == 1) {
+				cert_type_rsa = TRUE;
+			}
+         --b;
+		}
+      
+      // look at supported hash algorithms
+      if (cert_type_rsa && b == 0 && t->len >= 4) {
+      	hash_length = _tbuf_extract_ntoh16(t);
+#if _SSL_PRINTF_DEBUG
+         printf("%u bytes of hashalgos\n", hash_length);
+#endif
+         while (hash_length >= 2 && t->len >= 2) {
+         	_tbuf_extract(&hash_algo, t, 2);
+            if (!have_hash_algo && hash_algo.signature == TLS_SIGN_RSA) {
+            	if (hash_algo.hash == TLS_HASH_SHA
+               	|| hash_algo.hash == TLS_HASH_SHA256) {
+#if _SSL_PRINTF_DEBUG
+                  printf("using %s hash algorithm\n",
+                  	hash_algo.hash == TLS_HASH_SHA ? "SHA-1" : "SHA-256");
+#endif
+                  have_hash_algo = TRUE;
+                  state->cert_verify_sigalgo = hash_algo;
+               }
+            }
+            hash_length -= 2;
+         }
+      }
+      
+      if (have_hash_algo && hash_length == 0) {
+	      // DEVIDEA: save list of acceptable DNs for the client.  Currently, client would
+	      // have no clue as to which (if any) CAs would be acceptable to this server.
+         
+         state->flags |= SSL_F_SEND_CERT;
+         return 0;
+      }
+   }
+
+#if _SSL_PRINTF_DEBUG
+   printf(">> could not parse certificate request\n");
+#endif
+	return tls_error(state, SSL_ILLEGAL_PARAMETER_ERROR, out);
 }
 
 
@@ -1972,13 +2090,34 @@ int tls_do_certificate_request(ssl_Socket __far * state, _tbuf * t, _tbuf __far 
 /*** BeginHeader tls_send_certificate_verify */
 int tls_send_certificate_verify(ssl_Socket __far* state, _tbuf __far * out, int phase);
 /*** EndHeader */
+// In TLS 1.2, the encrypted hash is part of a DER-encoded message.  To
+// simplify building the payload, we have hard-coded headers for each hash
+// type (SHA-1 and SHA-256)
+
+// DER header for Certificate Verify payload with SHA-1 hash.
+// OID 1.3.14.3.2.26 followed by 20-byte OCTET STRING
+const far SSL_byte_t _cert_verify_header_sha1[] =
+	{ 0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2B, 0x0E,
+     0x03, 0x02, 0x1A, 0x05, 0x00, 0x04, 0x14 };
+
+// DER header for Certificate Verify payload with SHA-256 hash.
+// OID 2.16.840.1.101.3.4.2.1 followed by 32-byte OCTET STRING
+const far SSL_byte_t _cert_verify_header_sha256[] =
+	{ 0x30, 0x31, 0x30, 0x0D, 0x06, 0x09, 0x60, 0x86,
+     0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+     0x00, 0x04, 0x20 };
+   
 _ssl_tport_debug
 int tls_send_certificate_verify(ssl_Socket __far* state, _tbuf __far * out, int phase)
 {
-	auto char hashes[RSA_KEY_LENGTH];
+	auto char hashes[RSA_KEY_LENGTH];  // hash to encrypt, reused for encrypted signature
+   auto SSL_uint16_t hash_length = 0;
+	auto union {
+		sha_state sha1;
+		sha256_context sha256;
+	} hash_sofar;
 	auto _tbuf __far * t;
 	auto int rc;
-	auto size_t lenfield;
    auto RSA_key __far * key;
 #ifndef RSA_DISABLE_CRT
    auto mp_modexpCRT_state * mms;
@@ -1993,7 +2132,9 @@ int tls_send_certificate_verify(ssl_Socket __far* state, _tbuf __far * out, int 
 	switch (phase) {
 	case 0:
 		// first phase: fire off modular exp.
-	   if (!state->cert || TLS_SIGN_RSA != state->cipher_state->suite->signature_alg) {
+	   if (!state->cert
+      	|| TLS_SIGN_RSA != state->cipher_state->suite->signature_alg
+         || TLS_SIGN_RSA != state->cert_verify_sigalgo.signature) {
 	#if _SSL_PRINTF_DEBUG
 	      printf("*** Cert verify signature algo not supported (not RSA) ***\n");
 	#endif
@@ -2002,12 +2143,31 @@ int tls_send_certificate_verify(ssl_Socket __far* state, _tbuf __far * out, int 
 
 	   // Digitally sign (rsa encrypt with our private key) the result of
 	   // the handshake message hashes to this point.
-	   md5_sofar(&state->fin_hash->md5_hash, hashes);
-	   sha_sofar(&state->fin_hash->sha_hash, hashes+16);
-
+      // The code in tls_do_certificate_request() that set cert_verify_sigalgo
+      // ensured it was RSA with either SHA1 or SHA256.
+      switch (state->cert_verify_sigalgo.hash) {
+         case TLS_HASH_SHA:
+         	hash_length = sizeof _cert_verify_header_sha1;
+            _f_memcpy(hashes, _cert_verify_header_sha1, hash_length);
+            hash_sofar.sha1 = state->fin_hash->sha1_hash;
+            sha_finish(&hash_sofar.sha1, &hashes[hash_length]);
+            hash_length += HMAC_SHA_HASH_SIZE;
+            break;
+         case TLS_HASH_SHA256:
+         	hash_length = sizeof _cert_verify_header_sha256;
+            _f_memcpy(hashes, _cert_verify_header_sha256, hash_length);
+            hash_sofar.sha256 = state->fin_hash->sha256_hash;
+            sha256_finish(&hash_sofar.sha256, &hashes[hash_length]);
+            hash_length += HMAC_SHA256_HASH_SIZE;
+            break;
+      }
+#if _SSL_PRINTF_DEBUG
+		printf(">> Generating Certificate Verify on %u bytes\n", hash_length);
+      mem_dump(hashes, hash_length);
+#endif
 	   rc = RSA_PKCS1v1_5_Encrypt(key,
 	                              hashes,
-	                              36,	// MD5 plus SHA1 size
+	                              hash_length,
 	                              NULL,
 	                              1,    // signature
 	                              0,    // first phase
@@ -2041,21 +2201,17 @@ int tls_send_certificate_verify(ssl_Socket __far* state, _tbuf __far * out, int 
 			break;
 		}
 
+#if _SSL_PRINTF_DEBUG
+		printf(">> Creating %u-byte Certificate Verify record\n", rc);
+      mem_dump(hashes, hash_length);
+#endif
 	   t = _tls_init_hs_msg(state, SSL_MAX_HANDSHAKE_SIZE, certificate_verify);
 	   if (!t)
 	      return tls_error(state, SSL_ALLOC_FAIL, out);
-	   if (state->is_ssl_v3)
-	      lenfield = 0;
-	   else
-	      lenfield = 2;
-
-		_f_memcpy(t->buf + (t->len + lenfield), hashes, rc);
-
-	   if (lenfield)
-	      // This silliness for TLS
-	      *(size_t __far *)(t->buf + t->len) = htons(rc);
-
-	   t->len += rc + lenfield;
+         
+      _tbuf_append(t, &state->cert_verify_sigalgo, 2);  // signature algorithm
+      _tbuf_append_hton16(t, rc);                       // signature length
+      _tbuf_append(t, hashes, rc);                      // signature
 	   rc = _tls_finalize_hs_msg(state, t, out);
 	   break;
 	}
@@ -2119,8 +2275,7 @@ int tls_do_server_key_exchange(ssl_Socket __far * state, _tbuf * t, _tbuf __far 
    // 'key identity hint'.
    auto size_t hint_len;
 
-   if (!state->is_ssl_v3)
-      _tbuf_delete(t, 2);  // Remove redundant TLS length field
+   _tbuf_delete(t, 2);  // Remove redundant TLS length field
    state->psk_hint = &state->resource_index->psk_hint;
    // Quietly truncate hint to max size we can accept
    hint_len = u_min(t->len, sizeof(state->psk_hint->data));
@@ -2136,7 +2291,6 @@ int tls_do_server_key_exchange(ssl_Socket __far * state, _tbuf * t, _tbuf __far 
 
 
 /*** BeginHeader tls_do_client_key_exchange */
-#define SSL_UNKNOWN_IDENTITY 961
 int tls_do_client_key_exchange(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out, int phase);
 /*** EndHeader */
 _ssl_tport_debug
@@ -2192,8 +2346,7 @@ int tls_do_client_key_exchange(ssl_Socket __far * state, _tbuf * t, _tbuf __far 
 	   #endif
 	      return tls_error(state, SSL_PRIV_KEY_DECRYPTION_FAIL, out);
       }
-      if (!state->is_ssl_v3)
-         _tbuf_delete(t, 2);  // Remove redundant TLS length field
+      _tbuf_delete(t, 2);  // Remove redundant TLS length field
       psk_id_len = u_min(t->len, sizeof(buf.psk.input));
       _tbuf_extract(buf.psk.input, t, psk_id_len);
 	   #if _SSL_PRINTF_DEBUG > 2
@@ -2228,8 +2381,7 @@ int tls_do_client_key_exchange(ssl_Socket __far * state, _tbuf * t, _tbuf __far 
 	   case 0:
 	      // first phase: fire off modular exp.
          // Get the encrypted message
-         if (!state->is_ssl_v3)
-            _tbuf_delete(t, 2);  // Remove redundant TLS length field
+         _tbuf_delete(t, 2);  // Remove redundant TLS length field
 
          rsa_key_len = state->cipher_state->key_exch->key_size >> 3;
          if (rsa_key_len != t->len || rsa_key_len > MP_SIZE-2 ||
@@ -2340,25 +2492,48 @@ int tls_do_certificate_verify(ssl_Socket __far * state, _tbuf * t, _tbuf __far *
 	auto char verf_plain[MP_SIZE];
    auto size_t plain_len, rsa_key_len;
    auto int rc;
+   auto int hash_length;
 
 #if _SSL_PRINTF_DEBUG > 1
 	printf("--->Verifying client certificate...<---\n");
 #endif
-	if (!state->is_ssl_v3)
-		_tbuf_delete(t, 2);	// Delete TLS redundant length field
+	_tbuf_delete(t, 4);	// Delete signature algorithm and length fields
 
-   if (state->peer_cert && TLS_SIGN_RSA == state->cipher_state->suite->signature_alg) {
-      rsa_key_len = state->cipher_state->key_exch->key_size >> 3;
+   if (state->peer_cert && state->peer_cert->rsa_key
+   	&& TLS_SIGN_RSA == state->cipher_state->suite->signature_alg
+   	&& TLS_SIGN_RSA == state->cert_verify_sigalgo.signature) {
+      rsa_key_len = state->peer_cert->rsa_key->public.n.length - 2;
       if (rsa_key_len != t->len || rsa_key_len > MP_SIZE-2) {
 #if _SSL_PRINTF_DEBUG
     		printf("*** Public key decryption failed basic sanity ***\n");
 #endif
       	return tls_error(state, SSL_PUB_KEY_DECRYPTION_FAIL, out);
       }
+      // current implementation only supports SHA-1 and SHA-256 hashes
+      hash_length = state->cert_verify_sigalgo.hash ==
+         TLS_HASH_SHA256 ? HMAC_SHA256_HASH_SIZE
+                         : HMAC_SHA_HASH_SIZE;
 		_tbuf_extract(verf, t, rsa_key_len);
-		if (crypto_public_key_decrypt_pkcs1(state->peer_cert->rsa_key, verf, rsa_key_len, verf_plain, &plain_len) ||
-		    plain_len != 36 ||
-		    _f_memcmp(cert_verf_hashes, verf_plain, 36)) {
+      
+      /* For TLS 1.2, the decryption step now results in an DER-encoded
+         copy of the hash we want to check.  Rather than parse the DER fields
+         for the OCTET STRING containing the hash, we'll just compare the
+         last <hash_length> bytes of the result and ignore the wrapper.
+      */
+      rc = crypto_public_key_decrypt_pkcs1(state->peer_cert->rsa_key,
+      	verf, rsa_key_len, verf_plain, &plain_len);
+#if _SSL_PRINTF_DEBUG
+      printf("cert_verf: decrypt rc=%d\n", rc);
+      if (rc == 0) {
+   		printf("DER-encoded hash (%d bytes):\n", plain_len);
+			mem_dump(verf_plain, plain_len);
+      }
+   	printf("expected hash:\n");
+		mem_dump(cert_verf_hashes, hash_length);
+#endif
+		if (rc || plain_len < hash_length ||
+		    _f_memcmp(cert_verf_hashes,
+                    &verf_plain[plain_len - hash_length], hash_length)) {
 #if _SSL_PRINTF_DEBUG
     		printf("*** Public key decryption failed ***\n");
 #endif
@@ -2393,7 +2568,7 @@ int tls_set_session(ssl_Socket __far * state, SSL_Session_Resume_t __far * sess)
    cipher = state->cipher_state;
 
    // Index now points into the cache, copy our data over to our state
-   cipher->suite->suite_number = sess->suite_number;
+   cipher->suite = sess->suite;
    _f_memcpy(state->master_secret, &sess->master_secret, sizeof(SSL_Secret));
    state->session_id_length = sess->session_id_length;
    _f_memcpy(state->session_id, sess->session_id, state->session_id_length);
@@ -2411,7 +2586,7 @@ int tls_get_session(ssl_Socket __far * state, SSL_Session_Resume_t __far * sess)
 
    cipher = state->cipher_state;
 
-   sess->suite_number = cipher->suite->suite_number;
+   sess->suite = cipher->suite;
    _f_memcpy(&sess->master_secret, state->master_secret, sizeof(SSL_Secret));
    sess->session_id_length = state->session_id_length;
    _f_memcpy(sess->session_id, &state->session_id, state->session_id_length);
@@ -2557,7 +2732,7 @@ void _ssl_big_rand(SSL_byte_t __far*, unsigned int);
 /*** EndHeader */
 
 /* START _FUNCTION DESCRIPTION ********************************************
-_ssl_big_rand                          <SSL.LIB>
+_ssl_big_rand                          <SSL_TPORT.LIB>
 
 SYNTAX: void _ssl_big_rand(SSL_byte_t* value, unsigned int length);
 
@@ -2588,14 +2763,12 @@ void _ssl_big_rand(SSL_byte_t __far* value, unsigned int length) {
 }
 
 /*** BeginHeader ssl_aes_cbc_init ***/
-#if _SSL_USE_AES_
 int ssl_aes_cbc_init(void __far * state, int direction, char __far * key,
 					  int key_length, char __far * iv);
-#endif
 /*** EndHeader ***/
 
 /* START _FUNCTION DESCRIPTION ********************************************
-ssl_aes_cbc_init                               <SSL.LIB>
+ssl_aes_cbc_init                               <SSL_TPORT.LIB>
 
 SYNTAX: int ssl_aes_cbc_init(AESstreamState* state, int direction, char* key,
 					  int key_length, char* iv);
@@ -2606,7 +2779,7 @@ DESCRIPTION: Initialize the AES-CBC stream cipher. This function is a wrapper
 PARAMETER 1: An AES stream state structure
 PARAMETER 2: Direction (ignored)
 PARAMETER 3: The key, stored as a an array of bytes
-PARAMETER 4: The length of the key (ignored, always 128 bits)
+PARAMETER 4: The length of the key in bytes (either 16 (AES128) or 32 (AES256))
 PARAMETER 5: Initialization vector
 
 RETURN VALUE: 0 on success, non-zero on failure
@@ -2617,153 +2790,126 @@ _ssl_tport_debug
 int ssl_aes_cbc_init(void __far * state, int direction, char __far * key,
 					  int key_length, char __far * iv)
 {
+#if _SSL_USE_AES256_
+	// generic stream initializer for 128, 192 or 256-bit key
+	_AESinitStream(state, key, key_length / 4, iv);
+#else
+	// dedicated AES128 version
 	AESinitStream4x4((AESstreamState __far *)state, key, iv);
+#endif
    return 0;
 }
 
 /*** BeginHeader _ssl_get_suite_str */
-char* _ssl_get_suite_str(SSL_uint16_t);
+const char *_ssl_get_suite_str(SSL_uint16_t);
 /*** EndHeader */
 
 _ssl_tport_debug
-char* _ssl_get_suite_str(SSL_uint16_t suite)
+const char*_ssl_get_suite_str(SSL_uint16_t suite)
 {
-	switch (suite) {
-	case TLS_NULL_WITH_NULL_NULL: return "TLS_NULL_WITH_NULL_NULL";
-#if _SSL_USE_PSK_
-	case TLS_PSK_WITH_RC4_128_SHA: return "TLS_PSK_WITH_RC4_128_SHA";
-   case TLS_PSK_WITH_AES_128_CBC_SHA: return "TLS_PSK_WITH_AES_128_CBC_SHA";
-   case TLS_PSK_WITH_NULL_SHA: return "TLS_PSK_WITH_NULL_SHA";
-#endif
-	case TLS_RSA_WITH_NULL_MD5: return "TLS_RSA_WITH_NULL_MD5";
-	case TLS_RSA_WITH_NULL_SHA: return "TLS_RSA_WITH_NULL_SHA";
-	case TLS_RSA_WITH_RC4_128_MD5: return "TLS_RSA_WITH_RC4_128_MD5";
-	case TLS_RSA_WITH_RC4_128_SHA: return "TLS_RSA_WITH_RC4_128_SHA";
-	/*
-	case TLS_RSA_WITH_3DES_EDE_CBC_SHA: return "TLS_RSA_WITH_3DES_EDE_CBC_SHA";
-	case TLS_DH_DSS_WITH_3DES_EDE_CBC_SHA: return "TLS_DH_DSS_WITH_3DES_EDE_CBC_SHA";
-	case TLS_DH_anon_WITH_3DES_EDE_CBC_SHA: return "TLS_DH_anon_WITH_3DES_EDE_CBC_SHA";
-	*/
-	case TLS_RSA_WITH_AES_128_CBC_SHA: return "TLS_RSA_WITH_AES_128_CBC_SHA";
-	/*
-	case TLS_DH_anon_WITH_AES_128_CBC_SHA: return "TLS_DH_anon_WITH_AES_128_CBC_SHA";
-	case TLS_RSA_WITH_DES_CBC_SHA: return "TLS_RSA_WITH_DES_CBC_SHA";
-	*/
-	default: return "Unknown ciphersuite";
-	}
+   auto const __far SSL_SuiteConfig *config;
+
+   if (suite == TLS_NULL_WITH_NULL_NULL) {
+   	return "TLS_NULL_WITH_NULL_NULL";
+   }
+   
+   config = _tls_get_suite(suite, NULL);
+   if (config) {
+   	return config->fulltext_name;
+   }
+   
+	return "Unknown ciphersuite";
 }
 
-
-/*** BeginHeader _ssl_choose_suite */
-SSL_uint16_t _ssl_choose_suite(ssl_Socket __far* state, SSL_uint16_t __far *, SSL_uint16_t);
+/*** BeginHeader _tls_get_suite */
+const __far SSL_SuiteConfig *_tls_get_suite(SSL_uint16_t suite_number,
+	ssl_Socket __far *state);
+void _tls_append_supported_suites(ssl_Socket __far *state, _tbuf __far *t);
 /*** EndHeader */
+#define _SSL_SUITE(kx, cipher, hash, allow, forbid) \
+	{ TLS_ ## kx ## _WITH_ ## cipher ## _ ## hash, \
+     "TLS_" #kx "_WITH_" #cipher "_" #hash, \
+     TLS_ ## kx ## _ ## cipher ## _ ## hash ## _PRI, \
+     allow, forbid, \
+     TLS_KX_ ## kx, TLS_SIGN_ ## kx, TLS_CIPHER_ ## cipher, TLS_HASH_ ## hash }
 
-// Selection uses pre-defined constant priorities for each suite.
-// Priorities are in increasing order, with 0 being the lowest
-// priority (which is also the error condition)
-// The length parameter is the number of elements in suites
-// which is a pointer to an xmem buffer
-_ssl_tport_debug
-SSL_uint16_t _ssl_choose_suite(ssl_Socket __far* state, SSL_uint16_t __far * suites, SSL_uint16_t length) {
-   auto int i;
-   auto int priority;	// Priority level of the current suite
-   auto SSL_uint16_t cur_suite, temp; // Currently selected suite
-
-   priority = 0;
-   cur_suite = TLS_NULL_WITH_NULL_NULL; // If we return this, error
-   for(i = 0; i < length; i++) {
-   	// the suite number is still in network short form, so convert
-      temp = ntohs(suites[i]);
-
-   	// See what we have
-		switch(temp) {
+const __far SSL_SuiteConfig _tls_suites[] = {
 #if _SSL_USE_RSA_
-      case TLS_RSA_WITH_NULL_MD5:
-	      if (!(state->suite_flags & SSL_S_ALLOW_NULL) ||
-	          (state->suite_flags & SSL_S_FORBID_MD5))
-	         break;
-	      if(TLS_RSA_NULL_MD5_PRI > priority) {
-	         priority =  TLS_RSA_NULL_MD5_PRI;
-	         cur_suite = TLS_RSA_WITH_NULL_MD5;
-	      }
-	      break;
-      case TLS_RSA_WITH_NULL_SHA:
-      	if (!(state->suite_flags & SSL_S_ALLOW_NULL))
-      		break;
-	      if(TLS_RSA_NULL_SHA_PRI > priority) {
-	         priority =  TLS_RSA_NULL_SHA_PRI;
-	         cur_suite = TLS_RSA_WITH_NULL_SHA;
-	      }
-	      break;
-	#if _SSL_USE_RC4_
-		case TLS_RSA_WITH_RC4_128_MD5:
-	      if (state->suite_flags & (SSL_S_FORBID_RC4 | SSL_S_FORBID_MD5))
-	         break;
-	      if(TLS_RSA_RC4_128_MD5_PRI > priority) {
-	         priority =  TLS_RSA_RC4_128_MD5_PRI;
-	         cur_suite = TLS_RSA_WITH_RC4_128_MD5;
-	      }
-	      break;
-		case TLS_RSA_WITH_RC4_128_SHA:
-	      if (state->suite_flags & SSL_S_FORBID_RC4)
-	         break;
-	      if(TLS_RSA_RC4_128_SHA_PRI > priority) {
-	         priority =  TLS_RSA_RC4_128_SHA_PRI;
-	         cur_suite = TLS_RSA_WITH_RC4_128_SHA;
-	      }
-	      break;
-	#endif
-	#if _SSL_USE_AES_
-		case TLS_RSA_WITH_AES_128_CBC_SHA:
-	      if(TLS_RSA_AES_128_CBC_SHA_PRI > priority) {
-	         priority =  TLS_RSA_AES_128_CBC_SHA_PRI;
-	         cur_suite = TLS_RSA_WITH_AES_128_CBC_SHA;
-	      }
-	      break;
-	#endif
-#endif
+	_SSL_SUITE(RSA, NULL, SHA, SSL_S_ALLOW_NULL, 0),
+	_SSL_SUITE(RSA, NULL, SHA256, SSL_S_ALLOW_NULL, 0),
+	_SSL_SUITE(RSA, AES_128_CBC, SHA, 0, 0),
+	_SSL_SUITE(RSA, AES_128_CBC, SHA256, 0, 0),
+#if _SSL_USE_AES256_
+	_SSL_SUITE(RSA, AES_256_CBC, SHA, 0, 0),
+	_SSL_SUITE(RSA, AES_256_CBC, SHA256, 0, 0),
+#endif // _SSL_USE_AES256_
+#endif // _SSL_USE_RSA_
+
 #if _SSL_USE_PSK_
-		case TLS_PSK_WITH_NULL_SHA:
-      	if (!(state->suite_flags & SSL_S_ALLOW_NULL) ||
-         	 !(state->suite_flags & SSL_S_ALLOW_PSK))
-      		break;
-	      if (TLS_PSK_NULL_SHA_PRI > priority) {
-	         priority =  TLS_PSK_NULL_SHA_PRI;
-	         cur_suite = TLS_PSK_WITH_NULL_SHA;
-	      }
-			break;
-	#if _SSL_USE_RC4_
-		case TLS_PSK_WITH_RC4_128_SHA:
-	      if (state->suite_flags & SSL_S_FORBID_RC4 ||
-         	 !(state->suite_flags & SSL_S_ALLOW_PSK))
-	         break;
-	      if (TLS_PSK_RC4_128_SHA_PRI > priority) {
-	         priority =  TLS_PSK_RC4_128_SHA_PRI;
-	         cur_suite = TLS_PSK_WITH_RC4_128_SHA;
-	      }
-      	break;
-   #endif
-	#if _SSL_USE_AES_
-		case TLS_PSK_WITH_AES_128_CBC_SHA:
-      	if (!(state->suite_flags & SSL_S_ALLOW_PSK))
-         	break;
-	      if (TLS_PSK_AES_128_CBC_SHA_PRI > priority) {
-	         priority =  TLS_PSK_AES_128_CBC_SHA_PRI;
-	         cur_suite = TLS_PSK_WITH_AES_128_CBC_SHA;
-	      }
-      	break;
-   #endif
-#endif
-      // Currently unsupported suites
-      default:
-	      break;  // Do nothing
+	_SSL_SUITE(PSK, NULL, SHA, SSL_S_ALLOW_NULL | SSL_S_ALLOW_PSK, 0),
+	_SSL_SUITE(PSK, AES_128_CBC, SHA, SSL_S_ALLOW_PSK, 0),
+#if _SSL_USE_AES256_
+	_SSL_SUITE(PSK, AES_256_CBC, SHA, SSL_S_ALLOW_PSK, 0),
+#endif // _SSL_USE_AES256_
+#endif // _SSL_USE_PSK_
+};
+#undef _SSL_SUITE
+
+/*
+	Return a pointer to a SSL_SuiteConfig structure if we support it, otherwise
+   return NULL.
+*/
+_ssl_tport_debug
+const __far SSL_SuiteConfig *_tls_get_suite(SSL_uint16_t suite_number,
+	ssl_Socket __far *state)
+{
+	const __far SSL_SuiteConfig *suite = _tls_suites;
+   int i;
+   
+   for (i = 0; i < sizeof _tls_suites / sizeof(SSL_SuiteConfig); ++suite, ++i) {
+   	if (suite->suite_number == suite_number) {
+      	if (state
+         	&& (suite->flags_allow != (suite->flags_allow & state->suite_flags)
+            	|| (suite->flags_forbid & state->suite_flags))) {
+            return NULL;
+         }
+      	return suite;
       }
    }
-
-   // Finally, return the suite we selected
-   return cur_suite;
+   
+	return NULL;
 }
 
+/*
+	Append list of supported cipher suites to client hello.
+*/
+_ssl_tport_debug
+void _tls_append_supported_suites(ssl_Socket __far *state, _tbuf __far *t)
+{
+	const __far SSL_SuiteConfig *suite = _tls_suites;
+   SSL_uint16_t ciphers[SSL_MAX_CIPHER_LIST];
+	int cipher_count = 0;
+   int byte_count;
+   int i;
+   
+   for (i = 0; i < sizeof _tls_suites / sizeof(SSL_SuiteConfig); ++suite, ++i) {
+      if (suite->flags_allow == (suite->flags_allow & state->suite_flags)
+           && !(suite->flags_forbid & state->suite_flags)) {
+#if _SSL_PRINTF_DEBUG > 2
+			printf("Append %s (0x%04x) to cipher list\n", suite->fulltext_name,
+         	suite->suite_number);
+#endif
+      	ciphers[cipher_count++] = htons(suite->suite_number);
+         if (cipher_count == SSL_MAX_CIPHER_LIST) {
+         	break;
+         }
+      }
+   }
+   
+   byte_count = cipher_count * 2;
+   _tbuf_append_hton16(t, byte_count);
+	_tbuf_append(t, ciphers, byte_count);
+}
 
 /*** BeginHeader _ssl_server_cipher_init */
 int _ssl_server_cipher_init(ssl_Socket __far*, SSL_ClientHello __far*, _tbuf __far *);
@@ -2777,49 +2923,15 @@ _ssl_tport_debug
 int _ssl_server_cipher_init(ssl_Socket __far* state, SSL_ClientHello __far* cli_hello_ptr, _tbuf __far * out)
 {
 	auto SSL_CipherState __far* cipher;
-   auto SSL_SuiteConfig __far* suite;
-   auto SSL_uint16_t suite_number;
    auto SSL_byte_t rand_buf[SSL_MAX_SESSION_ID - HMAC_MD5_HASH_SIZE];
    auto SSL_byte_t seed_buf[HMAC_MD5_HASH_SIZE];
 	auto int i, ret_val;
 
    ret_val = 0;
 
-#if _SSL_PRINTF_DEBUG > 2
-	printf("Client supported suites:\n");
-
-	// Process the ciphersuite choices
-   for(i = 0; i < cli_hello_ptr->ciphersuite_length/2; i++) {
-   	suite_number = ntohs(cli_hello_ptr->cipher_suites[i]);
-		// Only print if a known suite
-		if(strcmp(_ssl_get_suite_str(suite_number), "Unknown ciphersuite")) {
-			printf("%s\n", _ssl_get_suite_str(suite_number));
-      }
-   }
-#endif
-
 	// Access to state members
    cipher = state->cipher_state;
-   suite = cipher->suite;
-
-   // Set up the cipher suite, based on the suite selection
-   // from the client offer (ciphersuite_length is the number of BYTES
-   // in the ciphersuite array, so we need to divide by the size of
-   // the suite numbers)
-	suite_number = _ssl_choose_suite(state, cli_hello_ptr->cipher_suites,
-                                   cli_hello_ptr->ciphersuite_length /
-                                   sizeof(SSL_uint16_t));
-
-   // Check the suite choice
-	if(TLS_NULL_WITH_NULL_NULL == suite_number) {
-    	// Oops, did not find a compatible ciphersuite
-#if _SSL_PRINTF_DEBUG
-    	printf("*** No suitable cipher suite ***\n");
-#endif
-      tls_error(state, SSL_CIPHER_CHOICE_ERROR, out);
-      return 1; // Return immediately
-   }
-
+   
    // Setup the server random for generating key material
    // The time stamp needs to be a UNIX time stamp, so
    // calculate the value from the SEC_TIMER
@@ -2832,7 +2944,7 @@ int _ssl_server_cipher_init(ssl_Socket __far* state, SSL_ClientHello __far* cli_
 
    // Initialize the cipher, based upon our selection
    // Note: No error return from TLS_cipher_init
-	_ssl_cipher_init(state, suite_number);
+	_ssl_cipher_init(state, cli_hello_ptr->ciphersuite_number);
 
   	// Create a new session ID
    // DEVIDEA: In the future, we need to check for the existence of
@@ -2894,16 +3006,13 @@ int _NullCipherTransform(void __far * state, const char __far * message,
 _ssl_tport_debug
 void _ssl_cipher_init(ssl_Socket __far* state, SSL_uint16_t suite_number) {
 	auto SSL_CipherState __far* cipher;
-   auto SSL_SuiteConfig __far* suite;
+   auto const SSL_SuiteConfig __far* suite;
+   auto const SSL_SuiteConfig __far *supported_suite;
    auto SSL_uint32_t time_stamp;
 
    cipher = state->cipher_state;
-   suite = cipher->suite;
-
-   // Set up our number and text name
-	suite->suite_number = suite_number;
-	suite->fulltext_name = _ssl_get_suite_str(suite_number);
-
+   cipher->suite = suite = _tls_get_suite(suite_number, NULL);
+   
    // Clear sequence number
   	_f_memset(cipher->seq_number, 0, SSL_SEQ_NUM_SIZE);
   	_f_memset(cipher->rd_seq_number, 0, SSL_SEQ_NUM_SIZE);
@@ -2913,73 +3022,10 @@ void _ssl_cipher_init(ssl_Socket __far* state, SSL_uint16_t suite_number) {
     printf("\nUsing ciphersuite: %ls\n", (char __far *)suite->fulltext_name);
 #endif
 
-///////////////////////////////////////////////////////
-	if (0) {}	// syntax to allow following to start with 'else'
-
-#if _SSL_USE_RSA_
-
-   else if (TLS_RSA_WITH_NULL_MD5 == suite_number ||
-       TLS_RSA_WITH_NULL_SHA == suite_number) {
-	  	suite->key_exchange_alg = TLS_KX_RSA;
-	  	suite->signature_alg = TLS_SIGN_RSA;
-		suite->bulk_cipher_alg = TLS_CIPHER_NULL;
-   	suite->digest_alg =
-   		TLS_RSA_WITH_NULL_MD5 == suite_number ? TLS_DIGEST_MD5 :
-   															 TLS_DIGEST_SHA;
-   }
-
-	#if _SSL_USE_RC4_
-   // Set up ciphersuite
-   else if (TLS_RSA_WITH_RC4_128_MD5 == suite_number||
-		      TLS_RSA_WITH_RC4_128_SHA == suite_number) {
-	  	suite->key_exchange_alg = TLS_KX_RSA;
-	  	suite->signature_alg = TLS_SIGN_RSA;
-// DEVIDEA: Certificate authentication is not yet supported
-//		suite->authentication_alg = TLS_AUTH_RSA;
-		suite->bulk_cipher_alg = TLS_CIPHER_RC4_128;
-   	suite->digest_alg =
-   		TLS_RSA_WITH_RC4_128_MD5 == suite_number ? TLS_DIGEST_MD5 :
-   															 	 TLS_DIGEST_SHA;
-   }
-	#endif
-
-	#if _SSL_USE_AES_
-	else if (TLS_RSA_WITH_AES_128_CBC_SHA == suite_number) {
-	  	suite->key_exchange_alg = TLS_KX_RSA;
-	  	suite->signature_alg = TLS_SIGN_RSA;
-		suite->digest_alg = TLS_DIGEST_SHA;
-      suite->bulk_cipher_alg = TLS_CIPHER_AES_128_CBC;
-   }
-	#endif
-
-#endif
-
 #if _SSL_USE_PSK_
-	else if (TLS_PSK_WITH_NULL_SHA == suite_number) {
-	  	suite->key_exchange_alg = TLS_KX_PSK;
-	  	suite->signature_alg = TLS_SIGN_PSK;
-		suite->digest_alg = TLS_DIGEST_SHA;
-      suite->bulk_cipher_alg = TLS_CIPHER_NULL;
-      state->is_psk = 1;
+	if (suite->key_exchange_alg == TLS_KX_PSK) {
+   	state->is_psk = 1;
    }
-	#if _SSL_USE_RC4_
-	else if (TLS_PSK_WITH_RC4_128_SHA == suite_number) {
-	  	suite->key_exchange_alg = TLS_KX_PSK;
-	  	suite->signature_alg = TLS_SIGN_PSK;
-		suite->digest_alg = TLS_DIGEST_SHA;
-      suite->bulk_cipher_alg = TLS_CIPHER_RC4_128;
-      state->is_psk = 1;
-   }
-	#endif
-	#if _SSL_USE_AES_
-	else if (TLS_PSK_WITH_AES_128_CBC_SHA == suite_number) {
-	  	suite->key_exchange_alg = TLS_KX_PSK;
-	  	suite->signature_alg = TLS_SIGN_PSK;
-		suite->digest_alg = TLS_DIGEST_SHA;
-      suite->bulk_cipher_alg = TLS_CIPHER_AES_128_CBC;
-      state->is_psk = 1;
-   }
-	#endif
 #endif
 ///////////////////////////////////////////////////////
 
@@ -3013,82 +3059,60 @@ void _ssl_cipher_init(ssl_Socket __far* state, SSL_uint16_t suite_number) {
 		cipher->bulk_cipher->decrypt = _NullCipherTransform;
    }
 
-#if _SSL_USE_RC4_
-	else if (TLS_CIPHER_RC4_128 == suite->bulk_cipher_alg) {
-		cipher->bulk_cipher->key_size = 16; // Bytes = 128/8
-		cipher->bulk_cipher->block_size = 0;
-		cipher->bulk_cipher->init = RC4Init;
-		cipher->bulk_cipher->encrypt = RC4Transform;
-		cipher->bulk_cipher->decrypt = RC4Transform;
-   }
-#endif
-
-#if _SSL_USE_AES_
+   #if SSL_MAX_CIPHER_KEY < 16 || SSL_MAX_CIPHER_BLOCK < _AES_CBC_BLK_SZ_
+   	#fatal Settings for maximum cipher key or block size are too small.
+   #endif
    else if (TLS_CIPHER_AES_128_CBC == suite->bulk_cipher_alg) {
 		cipher->bulk_cipher->key_size = 16; // Bytes = 128/8
 		cipher->bulk_cipher->block_size = _AES_CBC_BLK_SZ_;
 		cipher->bulk_cipher->init = ssl_aes_cbc_init;
-		cipher->bulk_cipher->encrypt = AESencryptStream4x4_CBC;
-		cipher->bulk_cipher->decrypt = AESdecryptStream4x4_CBC;
+		cipher->bulk_cipher->encrypt = AESencryptStream4xK_CBC;
+		cipher->bulk_cipher->decrypt = AESdecryptStream4xK_CBC;
+   }
+
+#if _SSL_USE_AES256_
+   #if SSL_MAX_CIPHER_KEY < 32 || SSL_MAX_CIPHER_BLOCK < _AES_CBC_BLK_SZ_
+   	#fatal Settings for maximum cipher key or block size are too small.
+   #endif
+   else if (TLS_CIPHER_AES_256_CBC == suite->bulk_cipher_alg) {
+		cipher->bulk_cipher->key_size = 32; // Bytes = 256/8
+		cipher->bulk_cipher->block_size = _AES_CBC_BLK_SZ_;
+		cipher->bulk_cipher->init = ssl_aes_cbc_init;
+		cipher->bulk_cipher->encrypt = AESencryptStream4xK_CBC;
+		cipher->bulk_cipher->decrypt = AESdecryptStream4xK_CBC;
    }
 #endif
 
+   // Be sure to update SSL_MAX_CIPHER_KEY and SSL_MAX_CIPHER_BLOCK when
+   // adding bulk ciphers.
 ///////////////////////////////////////////////////////
 
-	if(state->is_ssl_v3) {
-   	// Use SSLv3 digest methods
-      // We use the HMAC constants for this, because the SSLv3 MAC is derived
-      // from an early version of HMAC, so we can reuse the values
-	   cipher->digest->init = _ssl_v3_mac_hash_init;
-	   cipher->digest->add = _ssl_v3_mac_hash_append;
-	   cipher->digest->finish = _ssl_v3_mac_hash_finish;
+   // Set up digest algorithm (TLS only uses HMAC)
+   cipher->digest->init = HMAC_hash_init;
+   cipher->digest->add = HMAC_hash_append;
+   cipher->digest->finish = HMAC_hash_finish;
 
-	   if(TLS_DIGEST_MD5 == suite->digest_alg) {
-	      // Use SSLv3 MAC hash for digests
-	      _ssl_v3_mac_init(&cipher->digest->state, HMAC_USE_MD5);
-	      cipher->digest->hash_size = HMAC_MD5_HASH_SIZE;
+   if(TLS_HASH_SHA == suite->digest_alg) {
+      // TLS uses HMAC for digests
+      HMAC_init(&cipher->digest->state, HMAC_USE_SHA);
+      cipher->digest->hash_size = HMAC_SHA_HASH_SIZE;
 
-		   // Set these here for use later
-	      cipher->server_mac_sec_size = HMAC_MD5_HASH_SIZE;
-	      cipher->client_mac_sec_size = HMAC_MD5_HASH_SIZE;
-	   }
-
-	   if(TLS_DIGEST_SHA == suite->digest_alg) {
-	      // Use SSLv3 MAC hash for digests
-	      _ssl_v3_mac_init(&cipher->digest->state, HMAC_USE_SHA);
-	      cipher->digest->hash_size = HMAC_SHA_HASH_SIZE;
-		   // Set these here for use later
-	      cipher->server_mac_sec_size = HMAC_SHA_HASH_SIZE;
-	      cipher->client_mac_sec_size = HMAC_SHA_HASH_SIZE;
-	   }
-   }
-   else {
-	   // Set up digest algorithm (TLS only uses HMAC)
-	   cipher->digest->init = HMAC_hash_init;
-	   cipher->digest->add = HMAC_hash_append;
-	   cipher->digest->finish = HMAC_hash_finish;
-
-	   if(TLS_DIGEST_MD5 == suite->digest_alg) {
-	      // TLS uses HMAC for digests
-	      HMAC_init(&cipher->digest->state, HMAC_USE_MD5);
-	      cipher->digest->hash_size = HMAC_MD5_HASH_SIZE;
-
-			// Set these here for use later
-         cipher->server_mac_sec_size = HMAC_MD5_HASH_SIZE;
-	      cipher->client_mac_sec_size = HMAC_MD5_HASH_SIZE;
-	   }
-
-	   if(TLS_DIGEST_SHA == suite->digest_alg) {
-	      // TLS uses HMAC for digests
-	      HMAC_init(&cipher->digest->state, HMAC_USE_SHA);
-	      cipher->digest->hash_size = HMAC_SHA_HASH_SIZE;
-
-		   // Set these here for use later
-	      cipher->server_mac_sec_size = HMAC_SHA_HASH_SIZE;
-	      cipher->client_mac_sec_size = HMAC_SHA_HASH_SIZE;
-	   }
+	   // Set these here for use later
+      cipher->server_mac_sec_size = HMAC_SHA_HASH_SIZE;
+      cipher->client_mac_sec_size = HMAC_SHA_HASH_SIZE;
    }
 
+   if(TLS_HASH_SHA256 == suite->digest_alg) {
+      // TLS uses HMAC for digests
+      HMAC_init(&cipher->digest->state, HMAC_USE_SHA256);
+      cipher->digest->hash_size = HMAC_SHA256_HASH_SIZE;
+
+	   // Set these here for use later
+      cipher->server_mac_sec_size = HMAC_SHA256_HASH_SIZE;
+      cipher->client_mac_sec_size = HMAC_SHA256_HASH_SIZE;
+   }
+
+   // Be sure to update SSL_MAX_HASH_SIZE/HMAC_MAX_HASH_SIZE when adding hashes.
 ///////////////////////////////////////////////////////
 }
 
@@ -3140,12 +3164,16 @@ int tls_do_client_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
    // 2) send certificate
    // 3) send server hello done message
    auto SSL_byte_t sess_id[SSL_MAX_SESSION_ID];
-   auto SSL_uint16_t ciphers[SSL_MAX_CIPHER_LIST];
-   auto SSLv2_ClientHello v2;
+   auto const SSL_SuiteConfig __far *preferred_cipher;
+   auto const SSL_SuiteConfig __far *offered_cipher;
+   auto SSL_uint16_t suite_bytes;
 	auto SSL_ClientHello cli_hello;
    auto int ret_val, temp;
    auto long cc;
    auto word i, suites;
+   auto SSL_uint16_t extensions_length;   // total bytes of extensions
+   auto SSL_uint16_t ext_id;              // current parsed extension ID
+   auto SSL_uint16_t ext_length;          // length of current parsed extension
 
    ret_val = 0; // Assume success
    state->flags &= ~SSL_F_RESUMED;
@@ -3154,85 +3182,59 @@ int tls_do_client_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
    	  printf("--->Received Client Hello, begin Server Hello<---\n");
 #endif
 
-	// This is one case where we need to handle SSLv2 format as well as SSLv3/TLS.
-	if (state->cur_state == SSL_STATE_HS_LISTEN && state->sslv2_hs) {
-		_tbuf_delete(t, 1);	// discard message type (client_hello)
-	   _tbuf_extract(&cli_hello.client_version, t, sizeof(SSL_ProtocolVersion));
-		_tbuf_extract(&v2, t, 6);	// get length fields
-		v2.ciphersuite_length = ntohs(v2.ciphersuite_length)/3;	// *number* of suites
-		cli_hello.session_id_length = ntohs(v2.session_id_length);
-		v2.challenge_length = ntohs(v2.challenge_length);
-	   suites = 0;
-		for (i = 0; i < v2.ciphersuite_length; ++i) {
-			if (suites == SSL_MAX_CIPHER_LIST) {
+   // Parse the handshake message
+   _tbuf_extract(&cli_hello.client_version, t, sizeof(SSL_ProtocolVersion) + sizeof(SSL_Random));
+
+   // Extract length and session id and check for illegal length
+   _tbuf_extract(&cli_hello.session_id_length, t, 1);
+   if(cli_hello.session_id_length > SSL_MAX_SESSION_ID) {
 #if _SSL_PRINTF_DEBUG
-    			printf("*** No suitable cipher suite in SSLv2 client hello ***\n");
+ 		printf("*** Session ID too long in client hello ***\n");
 #endif
-	      	return tls_error(state, SSL_CIPHER_CHOICE_ERROR, out);
+      return tls_error(state, SSL_HS_SESSION_ID_TOO_LONG, out);
+   }
+
+   // Get session ID
+   _tbuf_extract(sess_id, t, cli_hello.session_id_length);
+
+   // Extract length and ciphersuites
+   preferred_cipher = NULL;
+	suite_bytes = _tbuf_extract_ntoh16(t);
+   while (suite_bytes > 1) {
+   	offered_cipher = _tls_get_suite(_tbuf_extract_ntoh16(t), state);
+		if (offered_cipher) {
+#if _SSL_PRINTF_DEBUG
+      	printf("Consider cipher %s (priority %d)\n",
+         	offered_cipher->fulltext_name, offered_cipher->priority);
+#endif
+	      if (!preferred_cipher
+	            || offered_cipher->priority > preferred_cipher->priority) {
+	         preferred_cipher = offered_cipher;
 	      }
-			cc = 0;
-			_tbuf_extract(((char *)&cc)+1, t, 3);
-			cc = ntohl(cc);
-			if (!(cc & 0xFF0000))
-				// OK, is a recognized v3 suite
-				ciphers[suites++] = htons((word)cc);
 		}
-		if (cli_hello.session_id_length > SSL_MAX_SESSION_ID ||
-		    v2.challenge_length > sizeof(SSL_Random)) {
+      suite_bytes -= 2;
+   }
+   // if we didn't select a cipher, or had an odd number of bytes in the list
+   if (preferred_cipher == NULL || suite_bytes) {
 #if _SSL_PRINTF_DEBUG
-    		printf("*** Session ID too long in SSLv2 client hello ***\n");
+		printf("*** No supported ciphers in client hello ciphersuite list ***\n");
 #endif
-	      return tls_error(state, SSL_HS_SESSION_ID_TOO_LONG, out);
-	   }
-		cli_hello.ciphersuite_length = suites*2;	// Length in bytes (when reduced to 2-byte entries)
+      return tls_error(state, SSL_CIPHER_CHOICE_ERROR, out);
+   }
 
-	   // Get session ID
-	   _tbuf_extract(sess_id, t, cli_hello.session_id_length);
-
-	   // We need to convert the SSLv2 challenge data into our Random seed
-	   // Pad with 0's to the left (move the bytes to the furthest right they
-	   // can go, sizeof(SSL_Random) - challenge_len)
-	   // Clear the buffer and our random
-	   memset(&cli_hello.random, 0, sizeof(SSL_Random));
-	   _tbuf_extract(((char *)&cli_hello.random) + sizeof(SSL_Random) - v2.challenge_length,
-	   					t, v2.challenge_length);
-
-		cli_hello.compression_length = 0;
-	}
-	else {
-	   // Parse the handshake message
-	   _tbuf_extract(&cli_hello.client_version, t, sizeof(SSL_ProtocolVersion) + sizeof(SSL_Random));
-
-	   // Extract length and session id and check for illegal length
-	   _tbuf_extract(&cli_hello.session_id_length, t, 1);
-	   if(cli_hello.session_id_length > SSL_MAX_SESSION_ID) {
-#if _SSL_PRINTF_DEBUG
-    		printf("*** Session ID too long in client hello ***\n");
-#endif
-	      return tls_error(state, SSL_HS_SESSION_ID_TOO_LONG, out);
-	   }
-
-	   // Get session ID
-	   _tbuf_extract(sess_id, t, cli_hello.session_id_length);
-
-	   // Extract length and ciphersuites
-	   _tbuf_extract(&cli_hello.ciphersuite_length, t, 2);
-		cli_hello.ciphersuite_length = ntohs(cli_hello.ciphersuite_length);
-	   if(cli_hello.ciphersuite_length > SSL_MAX_CIPHER_LIST*2) {
-#if _SSL_PRINTF_DEBUG
-    		printf("*** Client hello ciphersuite list too long ***\n");
-#endif
-	      return tls_error(state, SSL_CIPHER_CHOICE_ERROR, out);
-	   }
-	   _tbuf_extract(ciphers, t, cli_hello.ciphersuite_length);
-
-	   // Extract length and compression methods (ignore actual methods)
-	   _tbuf_extract(&cli_hello.compression_length, t, sizeof(cli_hello.compression_length));
-	   _tbuf_delete(t, cli_hello.compression_length);
-	}
-
+   cli_hello.ciphersuite_number = preferred_cipher->suite_number;
+   
+   // Extract length and compression methods (ignore actual methods)
+   _tbuf_extract(&cli_hello.compression_length, t, 1);
+   _tbuf_delete(t, cli_hello.compression_length);
+   
+   // Check for extensions and verify format of the data.
+   temp = _tls_parse_hello_extensions(state, t);
+   if (temp < 0)
+      return tls_error(state, SSL_HELLO_EXT_DECODE_ERROR, out);
+   cli_hello.extensions_length = temp;
+   
    cli_hello.session_id = cli_hello.session_id_length > 0 ? sess_id : NULL;
-   cli_hello.cipher_suites = cli_hello.ciphersuite_length > 0 ? ciphers : NULL;
    // Null compression must be specified, so assume it's there.  We currently don't
    // support any others.
    cli_hello.compression_methods = NULL;
@@ -3242,29 +3244,16 @@ int tls_do_client_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
 	   mem_dump((SSL_byte_t*)&cli_hello.random, sizeof(SSL_Random));
 	#endif
 
-   // Check Protcol Version
+   // Check Protocol Version the client is requesting for this connection.
+   // We only support TLS 1.2, and cannot downgrade to 1.1 or 1.0.
    if(!(cli_hello.client_version.major == TLS1_VER_MAJ &&
         cli_hello.client_version.minor == TLS1_VER_MIN))
    {
-	   //	Check for SSLv3
-	   if(!(cli_hello.client_version.major == SSL3_VER_MAJ &&
-   	     cli_hello.client_version.minor == SSL3_VER_MIN)) {
 #if _SSL_PRINTF_DEBUG
-    		printf("*** Bad version in client hello ***\n");
+      printf("*** Bad version in client hello 0x%02x 0x%02x***\n",
+         cli_hello.client_version.major, cli_hello.client_version.minor);
 #endif
-      	return tls_error(state, SSL_HS_CLI_PROTOCOL_ERROR, out);
-      }
-      else {
-      	// We are now an SSLv3 server, so set the state to reflect
-         // this fact
-      	state->is_ssl_v3 = 1;
-      	if (state->flags & SSL_F_DISABLE_SSLV3) {
-#if _SSL_PRINTF_DEBUG
-    			printf("*** SSLv3 not allowed in client hello ***\n");
-#endif
-      		return tls_error(state, SSL_HS_CLI_PROTOCOL_ERROR, out);
-      	}
-      }
+      return tls_error(state, SSL_HS_CLI_PROTOCOL_ERROR, out);
    }
 
 #if !SSL_NO_SESSION_RENEGOTIATION
@@ -3310,15 +3299,8 @@ int tls_do_client_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
    	// Note: No error return from TLS_cipher_init
 		_ssl_cipher_init(state, state->cipher_state->suite->suite_number);
 
-      // Derive keys from state
-      if(state->is_ssl_v3) {
-         // Derive keys using SSLv3 algorithms
-         ret_val = _ssl_v3_derive_keys(state);
-      }
-      else {
-      	// Derive keys using TLSv1 algorithms
-      	ret_val = _tls_1_derive_keys(state);
-      }
+      // Derive keys from state using TLSv1 algorithms
+      ret_val = _tls_1_derive_keys(state);
 
       if(!ret_val) {
 	      // Now that we have keys, we can initialize our bulk cipher
@@ -3528,52 +3510,101 @@ char __far * tls_connection_server_handshake(void __far *tls_ctx,
 }
 
 /*** BeginHeader _ssl_increment_seq */
-int _ssl_increment_seq(ssl_Socket __far*, SSL_byte_t __far*);
+int _ssl_increment_seq(SSL_byte_t __far*);
 /*** EndHeader */
 
 // Increment a sequence number. Assumes sequence number is in
 // network-endian order (no conversion needed).
 // Returns 0 on success, non-zero on failure
 _ssl_tport_debug
-int _ssl_increment_seq(ssl_Socket __far* state, SSL_byte_t __far* seq_num) {
- 	auto int i, carry;
+int _ssl_increment_seq(SSL_byte_t __far* seq_num) {
+ 	auto int i;
 
-   _ssl_assert(state != NULL);
+   _ssl_assert(seq_num != NULL);
 
-   // Note: This is a bit of a dirty trick. The SSL sequence number
-   // is an 8-byte integer that starts at 0 at the beginning of a
-   // session, and counts up for each record received. The number is
-   // always used in network-endian order, so we can avoid endianness
-   // conversion by adding in reverse, hence the reversed loop index.
-   // The algorithm works by starting with the top byte, and incrementing
-   // it until the byte overflows (this is checked with the upcast to an
-   // integer from a byte to set the carry value). If the byte overflows,
-   // than the loop continues, and begins by incrementing the next byte
-   // down. If there is no carry for any given byte, then the byte increments
-   // and the function returns successfully. If we ever actually overflow
-   // the entire (!) 8-byte number, we return an error.
-
-   carry = 1;
-   for(i = SSL_SEQ_NUM_SIZE-1; i > 0; i--) {
-      carry = (int)seq_num[i] + 1; // Integer conversion to check for carry
-      if(carry > 0xFF) {
-			// We have a carry
-         seq_num[i] = 0;
-      }
-      else {
-      	seq_num[i] += 1;
+   /*
+      Since the sequence number is always used in network-endian order, we
+      can avoid endianness conversions by incrementing in reverse, hence the
+      reversed loop index.
+      
+   	The algorithm works by starting with the LSB, and incrementing
+   	it. If the byte overflows to 0x00, the loop continues, and increments
+   	the next (more significant) byte.
+      
+   	If the increment didn't overflow, the function returns successfully.
+   	If it overflows the entire 64-bit number, the function return an error.
+	*/
+   
+   for(i = SSL_SEQ_NUM_SIZE-1; i >= 0; --i) {
+      if (++seq_num[i])
          return 0;
-      }
    }
-   // Should never get here (means carry check passed every time, overflowing
-   // the sequence number)
+   // Should only get here on a rollover of 0xFFFFFFFFFFFFFFFF to 0.
    // In practice, this is a 64-bit number which starts at 0, thus it is totally
    // infeasible for it to overflow, even at a billion records per sec for 100 years.
-   SSL_error(state, SSL_SEQ_NUM_OVERFLOW);
    return 1;
 }
 
 
+/*** BeginHeader _t_ssl_increment_seq */
+int _t_ssl_increment_seq(int verbose);
+/*** EndHeader */
+/*
+	Test cases for _ssl_increment_seq().
+*/
+_ssl_tport_debug
+int _t_ssl_increment_seq(int verbose)
+{
+	static const far SSL_byte_t start[6][8] = {
+	   { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+	   { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF },
+	   { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF },
+	   { 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF },
+	   { 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF },
+	   { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF },
+	};
+	static const far SSL_byte_t result[6][8] = {
+	   { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 },
+	   { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00 },
+	   { 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00 },
+	   { 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+	   { 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+	   { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+	};
+	SSL_byte_t sequence[8];
+	int test, failures = 0;
+   
+   for (test = 0; test < 6; ++test)
+   {
+   	// set up array
+	   _f_memcpy(sequence, start[test], 8);
+      
+      // run function and check return value first
+	   if ((_ssl_increment_seq(sequence) == 1) != (test == 5))
+	   {
+      	++failures;
+			if (verbose)
+	      	printf("FAIL #%u: _ssl_increment_seq returned wrong value\n", test);
+	   }
+      
+      // then check results
+      if (_f_memcmp(sequence, result[test], 8))
+      {
+      	++failures;
+         if (verbose)
+         {
+	         printf("FAIL #%u: didn't match expected\n", test);
+	         mem_dump(sequence, 8);
+	         mem_dump(result[test], 8);
+         }
+      }
+   }
+   
+   if (verbose)
+   	printf("%s: %s\n", __FUNCTION__, failures ? "FAILED" : "PASSED");
+   
+   return failures;
+}
 
 /*** BeginHeader tls_gen_mac */
 int tls_gen_mac(ssl_Socket __far* state, void __far* mac,
@@ -3581,13 +3612,14 @@ int tls_gen_mac(ssl_Socket __far* state, void __far* mac,
 /*** EndHeader */
 
 // Generate a MAC for a message (either incoming or outgoing) using the
-// appropriate digest. Works for both TLS and SSLv3
+// appropriate digest.
 // Note: The buffer mac (parameter 2) is assumed to be
 // big enough to contain final MAC.
 // Also increments the appropriate sequence number
+// Ignores the explicit IV at the start of received messages.
 // Appropriate record header (state->hdr or state->wr_hdr) must be set up with
 // *final* record length (in local host order), and parameter data_len is
-// length of actual data to hash.
+// length of actual data to hash (and does not include the explicit IV).
 
 _ssl_tport_debug
 int tls_gen_mac(ssl_Socket __far* state, void __far* mac,
@@ -3622,9 +3654,6 @@ int tls_gen_mac(ssl_Socket __far* state, void __far* mac,
   	length = h->length;
 
 #if _SSL_PRINTF_DEBUG > 3
-   printf("Generating %s MAC - record length: %u+%u(mac)+%u(pad)\n",
-      mac_mode == SSL_MAC_RECEIVE ? "receive" : "send",
-      data_len, digest->hash_size, cipher->bulk_cipher->padding_len);
    /*
    printf("MAC secret:\n");
    mem_dump((SSL_byte_t far*)secret, sec_size);
@@ -3636,9 +3665,7 @@ int tls_gen_mac(ssl_Socket __far* state, void __far* mac,
 
    // TLS record MAC = Digest(mac_secret, seq_num + type + version +
    //                         length + content)
-   // SSLv3 MAC = Digest(mac_secret + pad2 + Digest(mac_secret + pad1 +
-   //                    seq_num + length + content)
-   // The digest is HMAC for TLS, and the SSLv3 MAC for SSLv3
+   // The digest is HMAC
    // All this function does is add the seq_num through content into the hash
    // and finish the hash, the individual algorithms take care of the rest
    if(mac_mode == SSL_MAC_SEND) {
@@ -3652,15 +3679,15 @@ int tls_gen_mac(ssl_Socket __far* state, void __far* mac,
 	                SSL_SEQ_NUM_SIZE);
    }
 
-	_ssl_increment_seq(state, seqno);
+   if (_ssl_increment_seq(seqno)) {
+      SSL_error(state, SSL_SEQ_NUM_OVERFLOW);
+   }
 
    // Add record type
    digest->add((void __far *)&digest->state, (void __far *)&h->rec_type, sizeof(h->rec_type));
 
-   // Add version if not SSLv3
-	if(!state->is_ssl_v3) {
-	   digest->add((void __far *)&digest->state, (void __far *)&h->version, sizeof(h->version));
-	}
+   // Add version
+   digest->add((void __far *)&digest->state, (void __far *)&h->version, sizeof(h->version));
 
    // Add length.  The length used in MAC calculations is the data length i.e. NOT including
    // the MAC length and any padding.
@@ -3668,8 +3695,17 @@ int tls_gen_mac(ssl_Socket __far* state, void __far* mac,
    digest->add((void __far *)&digest->state, (void __far *)&temp_len, 2);
 
    // *** Digest Content ***
-   // Finally, add the content (uses content length)
-   _tbuf_ref(data, &g, 0, data_len);
+   // Finally, add the content (skipping over received IV)
+   _tbuf_ref(data, &g, mac_mode == SSL_MAC_SEND ? 0 : SSL_EXPLICIT_IV_SIZE, data_len);
+   
+#if _SSL_PRINTF_DEBUG > 3
+   printf("Generating %s MAC - record length: %u+%u(mac)\n",
+      mac_mode == SSL_MAC_RECEIVE ? "receive" : "send", data_len, digest->hash_size);
+   mem_dump(g.data2, g.len2);
+   if (g.len3)
+      mem_dump(g.data3, g.len3);
+#endif
+
 	digest->add((void __far *)&digest->state, (void __far *)g.data2, g.len2);
 	if (g.len3)
 		digest->add((void __far *)&digest->state, (void __far *)g.data3, g.len3);
@@ -3742,6 +3778,56 @@ int tls_decrypt(ssl_Socket __far * state, ssl_Header __far * hdr, _tbuf __far * 
 					 size_t rec_len, _tbuf __far * out_data);
 /*** EndHeader */
 
+/*
+	Verify that padding used in CBC is correct.  Last byte indicates length
+   of padding, and all padding bytes should be set to that value.
+*/
+_ssl_tport_debug
+int _tls_check_padding(_tbuf __far * data, size_t rec_len)
+{
+	auto padding[16];
+   auto check[16];
+   auto SSL_byte_t padding_byte;
+   auto int padding_len;
+	auto int offset, count;
+   
+   if (rec_len < 2) {
+   	// need at least 1 byte of data and 1 byte of padding
+   	return -1;
+   }
+   
+	_tbuf_xread(&padding_byte, data, rec_len-1, 1);
+   // Padding length is *(last byte), plus 1.
+   padding_len = (int) padding_byte + 1;
+   if (padding_len > 1) {
+	   if (padding_len >= rec_len) {
+      	// record needs to to contain actual data, not just padding
+	      return -1;
+	   }
+	   
+	   // Check padding in chunks of up to 16 bytes, as a balance between
+	   // stack usage and calls to _tbuf_xread().
+	   memset(padding, padding_byte, 16);
+	   for (offset = rec_len - padding_len; padding_byte != 0; offset += 16) {
+	      count = padding_byte;
+	      if (count > 16) {
+	         count = 16;
+	      }
+	      _tbuf_xread(check, data, offset, count);
+	      if (memcmp(padding, check, count)) {
+#if _SSL_PRINTF_DEBUG > 2
+				printf("Error checking %u bytes at offset 0x%x for padding 0x%02x\n",
+            	count, offset, padding_byte);
+            mem_dump(check, count);
+#endif
+	         return -1;
+	      }
+	      padding_byte -= count;
+	   }
+   }
+   return padding_len;	
+}
+
 _ssl_tport_debug
 int tls_decrypt(ssl_Socket __far * state, ssl_Header __far * hdr, _tbuf __far * data,
 					 size_t rec_len, _tbuf __far * out_data)
@@ -3752,7 +3838,7 @@ int tls_decrypt(ssl_Socket __far * state, ssl_Header __far * hdr, _tbuf __far * 
 	auto size_t bytes_decrypted;
 	auto SSL_CipherState __far * cipher;
 	auto SSL_BulkCipherConfig __far * bulk_cipher;
-   auto SSL_byte_t padding_len;
+   auto int padding_len;
    auto SSL_DigestConfig __far* digest;  	// Pointer to digest state
 
 	if (!rec_len)
@@ -3761,6 +3847,8 @@ int tls_decrypt(ssl_Socket __far * state, ssl_Header __far * hdr, _tbuf __far * 
    if (state->flags & SSL_F_DECRYPT)
    {
 	   cipher = state->cipher_state;
+	   _ssl_assert(cipher->digest->hash_size <= SSL_MAX_HASH_SIZE);
+
 	   bulk_cipher = cipher->bulk_cipher;
 
    	_tbuf_ref(data, &g, 0, rec_len);
@@ -3791,23 +3879,23 @@ int tls_decrypt(ssl_Socket __far * state, ssl_Header __far * hdr, _tbuf __far * 
 	         return tls_error(state, SSL_READ_BLOCK_CIPHER_ERROR, out_data);
 	      }
 
-	      // Padding length is *(last byte), plus 1.
-	      _tbuf_xread(&padding_len, data, rec_len-1, 1);
-	      ++padding_len;
+         padding_len = _tls_check_padding(data, rec_len);
+         if (padding_len < 0) {
+         	return tls_error(state, SSL_BAD_RECORD_MAC, out_data);
+         }
       }
       else {
          padding_len = 0;
       }
-      cipher->bulk_cipher->padding_len = padding_len;
 
 	   digest = cipher->digest;
-
       // Subtract out mac length and padding length, to indicate length
       // up to the start of the mac.
       bytes_decrypted = rec_len - (digest->hash_size + padding_len);
 
       // Generate the appropriate MAC for this record
-		tls_gen_mac(state, calcd_mac, data, SSL_MAC_RECEIVE, bytes_decrypted);
+		tls_gen_mac(state, calcd_mac, data, SSL_MAC_RECEIVE,
+      	bytes_decrypted - SSL_EXPLICIT_IV_SIZE);
 
 		// Retrieve the actual mac
 	   _tbuf_xread(recvd_mac, data, bytes_decrypted, digest->hash_size);
@@ -3844,6 +3932,74 @@ int tls_decrypt(ssl_Socket __far * state, ssl_Header __far * hdr, _tbuf __far * 
 }
 
 
+/*** BeginHeader _t_tls_check_padding */
+int _t_tls_check_padding(int verbose);
+/*** EndHeader */
+/*
+	Test code for _tls_check_padding() function.
+*/
+
+int _tls_check_padding(_tbuf __far * data, size_t rec_len);
+
+_ssl_tport_debug
+int _t_tls_check_padding(int verbose)
+{
+	char buffer[300];
+   _tbuf tbuf;
+   uint8_t pad_byte;
+   uint8_t fill_byte;
+   int i, j, result, expect;
+   int failures = 0;
+   
+   // Reference tls_decrypt() to force compiler to compile _tls_check_padding().
+   tls_decrypt;
+   
+   // Set up _tbuf structure to reference a buffer on the stack.
+   tbuf.buf = buffer;
+   tbuf.maxlen = sizeof buffer;
+   tbuf.begin = tbuf.len = 0;
+   
+   for (i = 0; i < 256; ++i)
+   {
+   	pad_byte = (uint8_t) i;
+      fill_byte = pad_byte ^ 0xAA;
+      memset(buffer, fill_byte, sizeof buffer);
+      
+      // start with 5 fill bytes, then padding bytes
+      // FF FF FF FF FF PP PP PP PP ...
+      memset(&buffer[5], pad_byte, i + 1);
+      for (j = 0; j < 8; ++j)
+      {
+      	if (j < 7)
+         {
+	         tbuf.begin = j;
+	         tbuf.len = i + 6 - j;
+	         // expect failure if buffer length is smaller than padding bytes
+	         expect = (tbuf.len > i + 1) ? (i + 1) : -1;
+         }
+         else
+         {
+	         tbuf.begin = 0;
+	         tbuf.len = i + 5;
+	         // expect failure since padding is short by one byte
+	         expect = -1;
+         }
+         result = _tls_check_padding(&tbuf, tbuf.len);
+         if (result != expect)
+         {
+            ++failures;
+            if (verbose)
+               printf("FAIL: pad=0x%02X, j=%u, result=%d (expect %d)\n",
+                  pad_byte, j, result, expect);
+         }
+      }
+   }
+   
+   if (verbose)
+   	printf("%s: %s\n", __FUNCTION__, failures ? "FAILED" : "PASSED");
+
+   return failures;
+}
 
 /*** BeginHeader tls_proc_record */
 /**
@@ -3858,8 +4014,7 @@ int tls_decrypt(ssl_Socket __far * state, ssl_Header __far * hdr, _tbuf __far * 
  * which are not yet available.  Only when a complete record is available is any
  * state permanently updated (except in the case of errors).
  *
- * Note that data in the input tbuf may be altered (e.g. decrypted).  The
- * header may also be converted from an SSLV2 to a TLS header (same length).
+ * Note that data in the input tbuf may be altered (e.g. decrypted).
  *
  * If app_data is not NULL, then it is a buffer to which any application
  * data received will be appended.  If NULL, then the decrypted data will
@@ -3882,7 +4037,7 @@ int tls_decrypt(ssl_Socket __far * state, ssl_Header __far * hdr, _tbuf __far * 
  *   .  conn->hdr will be set to the TLS-equivalent record header
  *       (the length of decrypted data can be obtained directly from hdr.length
  *        since it is stored in host format, and has the footer subtracted out)
- *   .  some state chages may be made if e.g. sslv2 headers or change cipher
+ *   .  some state chages may be made if e.g. change cipher
  *        spec or alerts encountered.
  *   .  if any application data is received (in a valid state for it) then
  *        the data is decrypted and appended to app_data.
@@ -3915,11 +4070,10 @@ int tls_proc_record(ssl_Socket __far *state,
 				     )
 {
    auto TLS_Alert alert;		  	   // Used to extract an alert message
-   auto SSL_Record_Hdr header;		// Temporary header for converting v2 to v3/TLS record header
    auto ssl_Header h;
 	auto size_t rec_len, start, dstart, foot;
 	auto int bytes_decrypted;
-	auto int v2_wrap, rec_type;
+	auto int rec_type;
 #ifndef TLS_OLDBUF
 	auto word app_remain;
 #endif
@@ -3936,19 +4090,14 @@ int tls_proc_record(ssl_Socket __far *state,
 	// peek at header
 	_tbuf_xread(&h, data, 0, sizeof(h));
 
-	if (h.v3.version.major == SSL3_VER_MAJ && h.v3.version.minor == SSL3_VER_MIN ||
-	    h.v3.version.major == TLS1_VER_MAJ && h.v3.version.minor == TLS1_VER_MIN)
-		rec_len = ntohs(h.v3.length), v2_wrap = 0, rec_type = h.v3.rec_type;
-	else if (h.v2.length & 0x80 && 	// MSB must be '1' (0x80 not 0x8000 since network order)
-	         state->cur_state == SSL_STATE_HS_LISTEN &&	// must be server waiting for client hello
-	         (h.v2.version.major == SSL3_VER_MAJ && h.v2.version.minor == SSL3_VER_MIN ||
-		       h.v2.version.major == TLS1_VER_MAJ && h.v2.version.minor == TLS1_VER_MIN))
-		// Subtract 3, since V2 length includes the type and version fields which really
-		// belong in the following client hello message, which we have started to read.
-	   rec_len = (ntohs(h.v2.length) & 0x7FFF) - 3, v2_wrap = 1, rec_type = SSL_REC_handshake;
-	else {
+	if (h.v3.version.major == TLS1_VER_MAJ && h.v3.version.minor >= 1) {
+		rec_len = ntohs(h.v3.length);
+      rec_type = h.v3.rec_type;
+	}
+   else {
 #if _SSL_PRINTF_DEBUG
-    	printf("*** Got unknown header version ***\n");
+      printf("*** Got unsupported header version 0x%02x 0x%02x***\n",
+         h.v3.version.major, h.v3.version.minor);
 #endif
       return tls_error(state, SSL_READ_PROTOCOL_VER, out_data);
    }
@@ -4038,33 +4187,8 @@ int tls_proc_record(ssl_Socket __far *state,
 
 	// Now everything should fit in buffers.
 
-   if (v2_wrap) {
-   	state->hdr.rec_type = rec_type;
-   	state->hdr.version.major = h.v2.version.major;
-   	state->hdr.version.minor = h.v2.version.minor;
-   	// This tells caller that buffer contains a V2 client hello (state must
-   	// have been in SSL_STATE_HS_LISTEN from the above).
-   	state->sslv2_hs = 1;
-   	// Reduce to actual header size.  Above pretends 5-byte header, but actually
-   	// the SSLV2 header in this case is 2 bytes.
-   	dstart = 2;
-	   state->hdr.length = rec_len;
-	   rec_len += 3;
-   }
-   else {
-   	_f_memcpy(&state->hdr, &h.v3, sizeof(state->hdr));
-	   state->hdr.length = rec_len;	// assume unencrypted for now
-	}
-
-   if (state->hdr.version.minor == SSL3_VER_MIN) {
-		state->is_ssl_v3 = 1;
-		if (state->flags & SSL_F_DISABLE_SSLV3) {
-#if _SSL_PRINTF_DEBUG
-    		printf("*** Not allowing SSLv3 ***\n");
-#endif
-			return tls_error(state, SSL_HS_CLI_PROTOCOL_ERROR, out_data);
-		}
-	}
+	_f_memcpy(&state->hdr, &h.v3, sizeof(state->hdr));
+   state->hdr.length = rec_len;	// assume unencrypted for now
 
 	// Delete header from buffer
    _tbuf_delete(data, dstart);
@@ -4073,16 +4197,23 @@ int tls_proc_record(ssl_Socket __far *state,
    if ((bytes_decrypted = tls_decrypt(state, &h, data, rec_len, out_data)) < 0)
       return bytes_decrypted;
 
+	if (bytes_decrypted < rec_len) {
+		// strip the explicit IV from the start of the decrypted data
+      _ssl_assert(bytes_decrypted > SSL_EXPLICIT_IV_SIZE);
+		bytes_decrypted -= SSL_EXPLICIT_IV_SIZE;
+		rec_len -= SSL_EXPLICIT_IV_SIZE;
+		_tbuf_delete(data, SSL_EXPLICIT_IV_SIZE);
+      
+		// There was a non-zero footer (mac plus padding).
+		state->hdr.length = bytes_decrypted;
+	}
+   
 #if _SSL_PRINTF_DEBUG > 2
 	if  (bytes_decrypted < rec_len)
    	printf("[TLS RECORD] have %u length record, decrypted to %u\n", rec_len, bytes_decrypted);
 	else
    	printf("[TLS RECORD] have %u length record\n", rec_len);
 #endif
-
-	if (bytes_decrypted < rec_len)
-		// There was a non-zero footer (mac plus padding).
-		state->hdr.length = bytes_decrypted;
 
 	switch (rec_type) {
 	default:
@@ -4362,6 +4493,7 @@ int tls_write_record(ssl_Socket __far * state, SSL_ContentType rec_type,
 {
    auto SSL_byte_t mac[HMAC_MAX_HASH_SIZE];
    auto SSL_byte_t pad[SSL_MAX_CIPHER_BLOCK];
+   auto SSL_byte_t explicit_iv[SSL_EXPLICIT_IV_SIZE];
    auto long length;
    auto SSL_CipherState __far* cipher;
    auto SSL_DigestConfig __far* digest;
@@ -4382,20 +4514,19 @@ int tls_write_record(ssl_Socket __far * state, SSL_ContentType rec_type,
    encrypted = state->flags & SSL_F_ENCRYPT;
 
    state->wr_hdr.rec_type = rec_type;
-	if(state->is_ssl_v3) {
-		state->wr_hdr.version.major = SSL3_VER_MAJ;
-		state->wr_hdr.version.minor = SSL3_VER_MIN;
-   }
-   else {
-		state->wr_hdr.version.major = TLS1_VER_MAJ;
-		state->wr_hdr.version.minor = TLS1_VER_MIN;
-   }
+	state->wr_hdr.version.major = TLS1_VER_MAJ;
+	state->wr_hdr.version.minor = TLS1_VER_MIN;
    length = len;
-   cipher->bulk_cipher->padding_len = padding_len = 0;
+   padding_len = 0;
    if (encrypted) {
+      // Account for the explicit IV before the cleartext payload
+      length += SSL_EXPLICIT_IV_SIZE;
+      
    	length += digest->hash_size;
       // Add padding for block ciphers according to RFC 2246 section 6.2.3.2
       block_size = cipher->bulk_cipher->block_size;
+      _ssl_assert(block_size <= SSL_MAX_CIPHER_BLOCK);
+      
       if (block_size) {
          // Fill up the remainder of last block (if length of data is not a
          // multiple of the block size) with bytes equal to the size of the
@@ -4417,9 +4548,13 @@ int tls_write_record(ssl_Socket __far * state, SSL_ContentType rec_type,
 
 
    state->wr_hdr.length = (word)length;
-   if (encrypted)
+   if (encrypted) {
    	// This expects header length to be in host order
 		tls_gen_mac(state, mac, data, SSL_MAC_SEND, len);
+      if (block_size) {
+      	_ssl_big_rand(explicit_iv, sizeof explicit_iv);
+      }
+   }
 	// Correct endianness
    state->wr_hdr.length = htons((word)length);
 
@@ -4427,12 +4562,19 @@ int tls_write_record(ssl_Socket __far * state, SSL_ContentType rec_type,
 
 #if _SSL_PRINTF_DEBUG > 3
 		printf("------------------- S E N D ----------------------\n");
-   	printf("Sending 5(hdr)+%u+%u(mac)+%u(pad)\n",
-   		len, encrypted ? digest->hash_size : 0, encrypted ? padding_len : 0);
+   	printf("Sending 5(hdr)+%u(iv)+%u+%u(mac)+%u(pad)\n",
+   		encrypted && block_size ? SSL_EXPLICIT_IV_SIZE : 0, len,
+         encrypted ? digest->hash_size : 0, encrypted ? padding_len : 0);
 	#if _SSL_PRINTF_DEBUG > 4
   		printf("\nRecord header:\n");
    #endif
       mem_dump((SSL_byte_t __far*)&state->wr_hdr, sizeof(SSL_Record_Hdr));
+      if (encrypted && block_size) {
+	#if _SSL_PRINTF_DEBUG > 4
+			printf("\nExplicit IV:\n");
+   #endif
+			mem_dump(explicit_iv, sizeof explicit_iv);
+		}
 	#if _SSL_PRINTF_DEBUG > 4
   		printf("\nRecord data (plaintext):\n");
 	#endif
@@ -4475,7 +4617,10 @@ int tls_write_record(ssl_Socket __far * state, SSL_ContentType rec_type,
       printf("\nBlock cipher Padding value:%d\n", padding_len-1);
       printf("Record Length after padding:%ld=0x%lX\n", length, length);
 #endif
-
+      if (block_size) {
+         // encrypt explicit IV before cleartext payload
+         tls_encrypt(state, out, explicit_iv, SSL_EXPLICIT_IV_SIZE);
+      }
       tls_encrypt(state, out, (void __far *)g.data2, g.len2);
       if (g.len3)
       	tls_encrypt(state, out, (void __far *)g.data3, g.len3);
@@ -4565,12 +4710,10 @@ int tls_send_client_hello(ssl_Socket __far* state, _tbuf __far * out)
 {
 	auto _tbuf __far * t;
 	auto SSL_CipherState __far* cipher;	 // Pointers to state internals
-   auto SSL_SuiteConfig __far* suite;
    auto SSL_ProtocolVersion version;
    auto SSL_uint16_t temp;
 
    cipher = state->cipher_state;
-   suite = cipher->suite;
 
    // Build the client hello message
    t = _tls_init_hs_msg(state, SSL_MAX_HANDSHAKE_SIZE, client_hello);
@@ -4605,10 +4748,7 @@ int tls_send_client_hello(ssl_Socket __far* state, _tbuf __far * out)
 	if (state->session_id_length)
 		_tbuf_append(t, state->session_id, state->session_id_length);
 
-	// Ciphersuite list
-	temp = htons(state->n_accept_suites * 2);
-	_tbuf_append(t, &temp, 2);
-	_tbuf_append(t, state->accept_suites, state->n_accept_suites * 2);
+   _tls_append_supported_suites(state, t);
 
 	// Compression: only null supported.
 	temp = 0x0001;		// length 1, null(0) compression
@@ -4631,10 +4771,8 @@ int tls_send_server_hello(ssl_Socket __far* state, _tbuf __far * out)
    auto SSL_ProtocolVersion version;
    auto SSL_uint16_t suite_num;
 	auto SSL_CipherState __far* cipher;	 // Pointers to state internals
-   auto SSL_SuiteConfig __far* suite;
 
    cipher = state->cipher_state;
-   suite = cipher->suite;
 
    // Build the ServerHello message
    t = _tls_init_hs_msg(state, SSL_MAX_HANDSHAKE_SIZE, server_hello);
@@ -4642,14 +4780,8 @@ int tls_send_server_hello(ssl_Socket __far* state, _tbuf __far * out)
    	return tls_error(state, SSL_ALLOC_FAIL, out);
 
 	// Server version
-   if(state->is_ssl_v3) {
-		version.major = SSL3_VER_MAJ;
-	   version.minor = SSL3_VER_MIN;
-   }
-   else {
-		version.major = TLS1_VER_MAJ;
-	   version.minor = TLS1_VER_MIN;
-	}
+	version.major = TLS1_VER_MAJ;
+   version.minor = TLS1_VER_MIN;
 	_tbuf_append(t, &version, sizeof(version));
 
    // Server random
@@ -4661,13 +4793,11 @@ int tls_send_server_hello(ssl_Socket __far* state, _tbuf __far * out)
 	   _tbuf_append(t, state->session_id, state->session_id_length);
 
    // The suite number must be switched to a network short to be processed
-   // correctly (using htons)
-   suite_num = htons(suite->suite_number);
-   _tbuf_append(t, &suite_num, sizeof(SSL_uint16_t));
+   // correctly
+   _tbuf_append_hton16(t, cipher->suite->suite_number);
 
-   // We always use compression method 'null'
-   suite_num = SSL_CM_null;
-   _tbuf_append(t, &suite_num, 1);
+   // We always use compression method 'null' (0)
+   _tbuf_append(t, "", 1);
 
    return _tls_finalize_hs_msg(state, t, out);
 }
@@ -4759,6 +4889,12 @@ int tls_send_server_hello_done(ssl_Socket __far* state, _tbuf __far * out)
 /*** BeginHeader tls_send_certificate_request */
 int tls_send_certificate_request(ssl_Socket __far* state, _tbuf __far * out);
 /*** EndHeader */
+// If adding entries, update hash states stored in fin_hash and code that
+// selects the hash to use before signing.
+const far TLS_SignatureAndHashAlgorithm _supported_sig_algs[] = {
+	{ TLS_HASH_SHA256, TLS_SIGN_RSA },
+	{ TLS_HASH_SHA, TLS_SIGN_RSA }
+};
 _ssl_tport_debug
 int tls_send_certificate_request(ssl_Socket __far* state, _tbuf __far * out)
 {
@@ -4774,6 +4910,10 @@ int tls_send_certificate_request(ssl_Socket __far* state, _tbuf __far * out)
 	cert_type = 0x0101; // (rsa_sign (MSB) = 1, length (LSB) = 1)
 	_tbuf_append(t, &cert_type, sizeof(cert_type));
 
+   // add list of supported signature algorithms, prepended with its length
+   _tbuf_append_hton16(t, sizeof(_supported_sig_algs));
+   _tbuf_append(t, &_supported_sig_algs, sizeof(_supported_sig_algs));
+   
 	// Add ASN.1 Distinguished Names of the certificate authorities we accept
 	// as a server, for the peer client.
 	// DEVIDEA: need to implement this if we wish our server to robustly
@@ -4798,7 +4938,7 @@ _ssl_tport_debug
 int _ssl_cli_key_exch(ssl_Socket __far* state, SSL_ClientKeyExchange __far* cli_key_exch, _tbuf __far * out) {
 	auto SSL_Secret master_secret, pre_master_secret;
 	auto SSL_CipherState __far* cipher;			// Pointers to state internals
-   auto SSL_byte_t output[SSL_KEY_BLOCK_SIZE], out_temp[SSL_KEY_BLOCK_SIZE];
+   auto SSL_byte_t output[SSL_KEY_BLOCK_SIZE];
    auto SSL_byte_t seeded_label[SSL_SEEDED_LABEL_MAX];
    auto SSL_uint16_t psk_len;
    auto SSL_byte_t * p;
@@ -4830,25 +4970,14 @@ int _ssl_cli_key_exch(ssl_Socket __far* state, SSL_ClientKeyExchange __far* cli_
 
 #if _SSL_USE_RSA_
 	case TLS_KX_RSA:
-	   // Check Protcol Version
-	   if(state->is_ssl_v3) {
-	      if(!((cli_key_exch->by_kx_algo.exchange_keys.client_version.major == SSL3_VER_MAJ) &&
-	           (cli_key_exch->by_kx_algo.exchange_keys.client_version.minor == SSL3_VER_MIN))) {
+	   // Check Protocol Version
+      if(!(cli_key_exch->by_kx_algo.exchange_keys.client_version.major == TLS1_VER_MAJ &&
+           cli_key_exch->by_kx_algo.exchange_keys.client_version.minor == TLS1_VER_MIN)) {
 	#if _SSL_PRINTF_DEBUG
-	         printf("*** Bad version in SSLv3 CKE ***\n");
+         printf("*** Bad version in TLS CKE ***\n");
 	#endif
-	         return tls_error(state, SSL_EXCH_KEYS_PROTOCOL_VER, out);
-	      }
-	   }
-	   else {
-	      if(!(cli_key_exch->by_kx_algo.exchange_keys.client_version.major == TLS1_VER_MAJ &&
-	           cli_key_exch->by_kx_algo.exchange_keys.client_version.minor == TLS1_VER_MIN)) {
-	#if _SSL_PRINTF_DEBUG
-	         printf("*** Bad version in TLS CKE ***\n");
-	#endif
-	         return tls_error(state, SSL_EXCH_KEYS_PROTOCOL_VER, out);
-	      }
-	   }
+         return tls_error(state, SSL_EXCH_KEYS_PROTOCOL_VER, out);
+      }
 
 	   // Fill our pre master secret data structure
 	   _f_memcpy(&pre_master_secret.data, &cli_key_exch->by_kx_algo.exchange_keys,
@@ -4868,31 +4997,21 @@ int _ssl_cli_key_exch(ssl_Socket __far* state, SSL_ClientKeyExchange __far* cli_
 #endif
 
    // ***Derive the Master Secret***
-   memset(out_temp, 0, SSL_KEY_BLOCK_SIZE);
    memset(output, 0, SSL_KEY_BLOCK_SIZE);
-   if(state->is_ssl_v3) {
-   	// Derive the Master Secret using SSLv3 hash expansion
-		_ssl_v3_hash_expand(&pre_master_secret,
-                          (SSL_byte_t __far*)&cipher->client_random,
-                          (SSL_byte_t __far*)&cipher->server_random,
-                          output, SSL_MASTER_SEC_SIZE);
-   }
-   else {
-	   // Build the label to be used in the key derivation
-	   // Seeded label = MASTER_SEC_LABEL + client random + server random
-	   memcpy(seeded_label, TLS_MASTER_SEC_LABEL, strlen(TLS_MASTER_SEC_LABEL));
-	   label_len = strlen(TLS_MASTER_SEC_LABEL);
-	   _f_memcpy(seeded_label + label_len, &cipher->client_random,
-	          sizeof(SSL_Random));
-	   label_len += sizeof(SSL_Random);
-	   _f_memcpy(seeded_label + label_len, &cipher->server_random,
-	          sizeof(SSL_Random));
-	   label_len += sizeof(SSL_Random);
+   // Build the label to be used in the key derivation
+   // Seeded label = MASTER_SEC_LABEL + client random + server random
+   memcpy(seeded_label, TLS_MASTER_SEC_LABEL, strlen(TLS_MASTER_SEC_LABEL));
+   label_len = strlen(TLS_MASTER_SEC_LABEL);
+   _f_memcpy(seeded_label + label_len, &cipher->client_random,
+          sizeof(SSL_Random));
+   label_len += sizeof(SSL_Random);
+   _f_memcpy(seeded_label + label_len, &cipher->server_random,
+          sizeof(SSL_Random));
+   label_len += sizeof(SSL_Random);
 
-      // Derive the Master Secret using the TLS PRF
-		_tls_1_PRF(&pre_master_secret, seeded_label, label_len, output,
-   	         out_temp, SSL_MASTER_SEC_SIZE);
-   }
+   // Derive the Master Secret using the TLS PRF
+	_SHA256_PRF(&pre_master_secret, seeded_label, label_len, output,
+  	         SSL_MASTER_SEC_SIZE);
 
    // Save our secret for use in key block derivation
    memcpy(&master_secret.data, output, sizeof(master_secret.data));
@@ -4907,11 +5026,7 @@ int _ssl_cli_key_exch(ssl_Socket __far* state, SSL_ClientKeyExchange __far* cli_
    _f_memcpy(state->master_secret, &master_secret, sizeof(*state->master_secret));
 
 	// Derive our session keys from the master secret
-   // DEVIDEA: Consolidate key derivation
-   if(state->is_ssl_v3)
-	   _ssl_v3_derive_keys(state);
-   else
-	   _tls_1_derive_keys(state);
+	_tls_1_derive_keys(state);
 
    return 0;
 }
@@ -4932,13 +5047,8 @@ int tls_send_client_key_exchange(ssl_Socket __far* state, _tbuf __far * out)
 #endif
 	auto SSL_ClientKeyExchange cke;
 	auto _tbuf __far * t;
-	size_t outlen, lenfield;
+	size_t outlen;
 	auto int rc;
-
-   if (state->is_ssl_v3)
-      lenfield = 0;
-   else
-      lenfield = 2;
 
 	switch (state->cipher_state->suite->key_exchange_alg) {
    default:
@@ -4977,10 +5087,9 @@ int tls_send_client_key_exchange(ssl_Socket __far* state, _tbuf __far * out)
 	   t = _tls_init_hs_msg(state, SSL_MAX_HANDSHAKE_SIZE, client_key_exchange);
 	   if (!t)
 	      return tls_error(state, SSL_ALLOC_FAIL, out);
-	   if (lenfield)
-	      *(SSL_uint16_t __far *)(t->buf + t->len) = htons(id.length);
-      _f_memcpy(t->buf + t->len + lenfield, id.data, id.length);
-      t->len += lenfield + id.length;
+      *(SSL_uint16_t __far *)(t->buf + t->len) = htons(id.length);
+      _f_memcpy(t->buf + t->len + 2, id.data, id.length);
+      t->len += 2 + id.length;
 
    	break;
 #endif //_SSL_USE_PSK_
@@ -5000,23 +5109,16 @@ int tls_send_client_key_exchange(ssl_Socket __far* state, _tbuf __far * out)
 
 	   // Since we only support RSA, this is the way to generate the pre-master secret
 	   _ssl_big_rand(secret+2, sizeof(secret)-2);
-	   if (state->is_ssl_v3) {
-	      secret[0] = SSL3_VER_MAJ;
-	      secret[1] = SSL3_VER_MIN;
-	   }
-	   else {
-	      secret[0] = TLS1_VER_MAJ;
-	      secret[1] = TLS1_VER_MIN;
-	   }
+	   secret[0] = TLS1_VER_MAJ;
+	   secret[1] = TLS1_VER_MIN;
 	    #ifdef _COPROCESS_H
 	   if (state->flags & SSL_F_COP_YIELD)
 	      state->peer_cert->rsa_key->flags |= RSA_KEY_PUB_COP_YIELD;
 	    #endif
 	   rc = crypto_public_key_encrypt_pkcs1_v15(state->peer_cert->rsa_key,
-	         secret, sizeof(secret), t->buf + (t->len + lenfield), &outlen);
-	   if (lenfield)
-	      *(SSL_uint16_t __far *)(t->buf + t->len) = htons(outlen);
-	   t->len += outlen + lenfield;
+	         secret, sizeof(secret), t->buf + (t->len + 2), &outlen);
+      *(SSL_uint16_t __far *)(t->buf + t->len) = htons(outlen);
+	   t->len += outlen + 2;
 	   if (rc < 0) {
 	      _sys_free(t);
 	#if _SSL_PRINTF_DEBUG
@@ -5250,108 +5352,6 @@ int tls_connection_set_master_key(void __far *tls_ctx, ssl_Socket __far *state,
 }
 
 
-/*** BeginHeader tls_add_ciphersuite */
-int tls_add_ciphersuite(ssl_Socket __far * state, SSL_uint16_t suite);
-/*** EndHeader */
-_ssl_tport_debug
-int tls_add_ciphersuite(ssl_Socket __far * state, SSL_uint16_t suite)
-{
-	auto word i;
-
-	if (   suite != TLS_RSA_WITH_RC4_128_MD5
-	    && suite != TLS_RSA_WITH_RC4_128_SHA
-	    && suite != TLS_RSA_WITH_AES_128_CBC_SHA
-	    && suite != TLS_RSA_WITH_NULL_MD5
-	    && suite != TLS_RSA_WITH_NULL_SHA
-	    && suite != TLS_PSK_WITH_RC4_128_SHA
-	    && suite != TLS_PSK_WITH_AES_128_CBC_SHA
-	    && suite != TLS_PSK_WITH_NULL_SHA
-	   )
-		return -1;	// not supported
-
-	for (i = 0; i < state->n_accept_suites; ++i)
-		if (state->accept_suites[i] == suite)
-			return 0;	// already there
-	if (state->n_accept_suites == SSL_MAX_CIPHER_LIST)
-		return -1;	// cannot fit
-	// These stored in network order
-	state->accept_suites[i] = htons(suite);
-	++state->n_accept_suites;
-	return 0;
-}
-
-/*** BeginHeader tls_set_default_ciphersuites */
-int tls_set_default_ciphersuites(ssl_Socket __far * state);
-/*** EndHeader */
-_ssl_tport_debug
-int tls_set_default_ciphersuites(ssl_Socket __far * state)
-{
-	auto int ns;
-
-	ns = 0;
-#if _SSL_USE_RSA_
-	#if _SSL_USE_AES_
-	tls_add_ciphersuite(state, TLS_RSA_WITH_AES_128_CBC_SHA); ++ns;
-	#endif
-	#if _SSL_USE_RC4_
-	tls_add_ciphersuite(state, TLS_RSA_WITH_RC4_128_SHA); ++ns;
-	tls_add_ciphersuite(state, TLS_RSA_WITH_RC4_128_MD5); ++ns;
-	#endif
-#endif
-#if _SSL_USE_PSK_
-	#if _SSL_USE_AES_
-	tls_add_ciphersuite(state, TLS_PSK_WITH_AES_128_CBC_SHA); ++ns;
-	#endif
-	#if _SSL_USE_RC4_
-	tls_add_ciphersuite(state, TLS_PSK_WITH_RC4_128_SHA); ++ns;
-	#endif
-#endif
-	return ns > 0 ? 0 : -1;
-}
-
-/*** BeginHeader tls_connection_set_cipher_list */
-// Following enum values are for compatibility with wpa_supplicant.
-// Since our TLS does not yet support some of these ciphersuites, those
-// are set to 0xFF so that we will expurgate them from the acceptable list.
-enum {
-	TLS_CIPHER_NONE = 0,
-	TLS_CIPHER_RC4_SHA = TLS_RSA_WITH_RC4_128_SHA /* 0x0005 */,
-	TLS_CIPHER_AES128_SHA = TLS_RSA_WITH_AES_128_CBC_SHA /* 0x002f */,
-	TLS_CIPHER_RSA_DHE_AES128_SHA = 0xFF /* 0x0031 */,
-	TLS_CIPHER_ANON_DH_AES128_SHA = 0xFF /* 0x0034 */
-};
-
-
-/**
- * tls_connection_set_cipher_list - Configure acceptable cipher suites
- * @tls_ctx: TLS context data from tls_init()
- * @conn: Connection context data from tls_connection_init()
- * @ciphers: Zero (TLS_CIPHER_NONE) terminated list of allowed ciphers
- * (TLS_CIPHER_*).
- * Returns: 0 on success, -1 on failure
- *
- */
-int tls_connection_set_cipher_list(void __far *tls_ctx, ssl_Socket __far *state,
-				   char __far *ciphers);
-/*** EndHeader */
-_ssl_tport_debug
-int tls_connection_set_cipher_list(void __far *tls_ctx, ssl_Socket __far *state,
-				   char __far *ciphers)
-{
-	state->n_accept_suites = 0;
-	while (*ciphers) {
-		if (*ciphers != 0xFF)
-			if (tls_add_ciphersuite(state, *ciphers))
-				return -1;
-		++ciphers;
-	}
-	if (!state->n_accept_suites)
-		return -1;
-	return 0;
-}
-
-
-
 /*** BeginHeader tls_get_cipher */
 /**
  * tls_get_cipher - Get current cipher name
@@ -5404,49 +5404,53 @@ int tls_connection_enable_workaround(void __far *tls_ctx,
 /**
  * tls_connection_client_hello_ext - Set TLS extension for ClientHello
  * @tls_ctx: TLS context data from tls_init()
- * @conn: Connection context data from tls_connection_init()
- * @ext_type: Extension type
- * @data: Extension payload (%NULL to remove extension)
- * @data_len: Extension payload length
+ * @state: Connection context data from tls_connection_init()
+ * @extensions: array of extensions to include in client hello
+ * @extension_count: number of extensions in array
  * Returns: 0 on success, -1 on failure
  */
-/* TLS Extensions */
-#define TLS_EXT_PAC_OPAQUE 35
 
 int tls_connection_client_hello_ext(void __far *tls_ctx, ssl_Socket __far *state,
-				    int ext_type,  char __far *data,
-				    size_t data_len);
+					const TLS_Extension __far *extensions, int extension_count);
 /*** EndHeader */
 _ssl_tport_debug
 int tls_connection_client_hello_ext(void __far *tls_ctx, ssl_Socket __far *state,
-				    int ext_type,  char __far *data,
-				    size_t data_len)
+					const TLS_Extension __far *extensions, int extension_count)
 {
+	int i;
+   const TLS_Extension __far *ext;
+	SSL_uint16_t data_length = 0;
 	auto char __far * pos;
 
-	state->flags &= ~SSL_F_TICKET;
 	_sys_free(state->client_hello_ext);
 	state->client_hello_ext = NULL;
 	state->client_hello_ext_len = 0;
 
-	if (data == NULL || data_len == 0)
+	if (extensions == NULL || extension_count == 0)
 		return 0;
 
-	pos = conn->client_hello_ext = _sys_malloc(6 + data_len);
+   // Each extension has 2-byte type, 2-byte length, and optional data
+	for (i = 0; i < extension_count; ++i)
+   	data_length += 4 + extensions[i].extension_length;
+
+	// Allocate space for all extensions, plus 2-bytes to hold overall length
+	pos = state->client_hello_ext = _sys_malloc(2 + data_length);
 	if (pos == NULL)
 		return -1;
 
-	*(SSL_uint16_t *)pos = htons(4 + data_len);
+	*(SSL_uint16_t __far *)pos = htons(data_length);
 	pos += 2;
-	*(SSL_uint16_t *)pos = htons(ext_type);
-	pos += 2;
-	*(SSL_uint16_t *)pos = htons(data_len);
-	pos += 2;
-	_f_memcpy(pos, data, data_len);
-	state->client_hello_ext_len = 6 + data_len;
-
-	if (ext_type == TLS_EXT_PAC_OPAQUE)
-		state->flags |= SSL_F_TICKET;
+	for (ext = extensions, i = 0; i < extension_count; ++ext, ++i) {
+	   *(SSL_uint16_t __far *)pos = htons(ext->extension_type);
+	   pos += 2;
+	   *(SSL_uint16_t __far *)pos = htons(ext->extension_length);
+	   pos += 2;
+      if (ext->extension_length) {
+		   _f_memcpy(pos, ext->extension_data, ext->extension_length);
+         pos += ext->extension_length;
+      }
+   }
+	state->client_hello_ext_len = 2 + data_length;
 
 	return 0;
 }

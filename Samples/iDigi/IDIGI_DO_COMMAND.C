@@ -81,7 +81,7 @@
 	use of the Firefox "Poster" plug-in:
 
 	set URL field to
-		http://sd1-na.idigi.com/ws/sci
+		http://my.devicecloud.com/ws/sci
 	userid and password to iDigi account information.
 
 	Post following xml to server (content type application/xml):
@@ -209,7 +209,7 @@
 #define IDIGI_CONTACT "support@digi.com"
 #define IDIGI_LOCATION "Planet Earth"
 #define IDIGI_DESCRIPTION "Simple iDigi demo"
-#define IDIGI_SERVER "sd1-na.idigi.com"
+#define IDIGI_SERVER "my.devicecloud.com"
 
 // Store non-volatile configuration data in the userID block, via the
 // Simple UserID Block FileSystem.  You can use SUBFS to also store a limited

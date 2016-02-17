@@ -430,7 +430,10 @@ extern int errno;
 													 // to send client hello.  State must be
 													 // initial (SSL_STATE_LISTEN) or done
 													 // (SSL_STATE_DONE).
-
+#define SSL_UNKNOWN_IDENTITY        961 // Unknown PSK identity.
+#define SSL_HELLO_EXT_DECODE_ERROR  962 // Error decoding extensions in TLS hello.
+#define SSL_DECODE_ERROR            963 // Error decoding TLS message.
+#define SSL_ILLEGAL_PARAMETER_ERROR 964 // Illegal parameter in TLS message.
 
 // Run Time Analog Errors (Made near max. negative to keep outside ADC ranges)
 #define  ERR_ANA_INVAL               32000   // 8300 invalid parameter value

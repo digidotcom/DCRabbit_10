@@ -68,10 +68,6 @@
 // no (insecure) HTTP servers.
 #define HTTP_SSL_SOCKETS	1
 
-//#define SSL_USE_AES				// <-- comment out to only use RC4 stream cipher
-//#define SSL_DONT_USE_RC4
-
-
 // If defined, remove code which supports legacy .dcc format certificates
 //#define SSL_DISABLE_LEGACY_DCC
 
