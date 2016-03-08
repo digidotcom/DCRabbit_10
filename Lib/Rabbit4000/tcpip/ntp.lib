@@ -4,7 +4,7 @@ ntp.lib
 DESCRIPTION:
   Implementation of an SNTP protocol client according to RFC-1769 for
   Rabbit microprocessor. To use this library you must define the NTP
-  servers used as in the following example:
+  servers used, as in the following example:
 
     //Number of servers configured
     #define NSERVERS          4
@@ -24,11 +24,25 @@ DESCRIPTION:
     };
     #use "ntp.lib"
 
+    ...
+    rc = ntp_set_time (&adj);
+    if (rc > 0)
+      printf ("Time adjusted by %d seconds", adj);
+    
+  The library provides the following functions:
+  
+  ntp_set_time            Query all configured time servers
+  ntp_query_server        Query one time server
+  ntp_set_time_async      Cofunction version of ntp_set_time
+  ntp_query_server_async  Cofunction version of ntp_query_server
+  dow                     Compute day of the week for a date
+  ndow                    Compute n-th day of the week for a month and year
+  
 END DESCRIPTION **********************************************************/
 
 /*** BeginHeader */
 /*
-  If NTP_SET_TIMER is defined, the set_ntp_time function will change the
+  If NTP_SET_TIMER is defined, the ntp_set_time function will change the
   SEC_TIMER counter directly. This can affect other tasks that are using
   DelaySec or IntervalSec functions.
 
@@ -52,6 +66,73 @@ END DESCRIPTION **********************************************************/
 #define NTP_PACKET_SIZE   48
 #define NTP_TIMEOUT       4000
 #define NTP_PORT          123
+
+//Differences between local time and servers' time (Rabbit epoch).
+long tdiffs[NSERVERS];
+
+// Flag to indicate whether valid result obtained from corresponding server.
+int use_this[NSERVERS];
+
+// Number of valid results remaining.
+int nservers;
+
+//Array of configured time servers
+extern char* server_hosts[];
+
+/*
+  Check received timestamps and discard the worst preforming servers.
+
+  In most cases this is snake oil as NTP servers are fairly reliable, network is
+  fast pretty and our resolution (1 sec.) is too low to make any difference.
+  The code was in the original TIME.C sample form ZWorld and I decided to keep for now.
+*/
+void discard_outliers(void)
+{
+  int i, j, k;
+  int minservers;
+  float diff;
+  float wdiff;
+  float mdiff;
+
+  if (nservers >= 3)
+    minservers = nservers + 1 >> 1; // Half (rounded up) of the successful servers
+  else
+    minservers = nservers;
+
+  while (nservers > minservers)
+  {
+    // Throw away the worst outliers first, until minservers remain.  The
+    // "worst outlier" is the one whose sum-of-squares distance from the others
+    // is greatest.
+    mdiff = 0.0;
+    for (i = 0; i < NSERVERS; i++)
+      if (!use_this[i])
+        continue;
+      else
+      {
+        wdiff = 0.0;
+        for (j = 0; j < NSERVERS; j++)
+        if (!use_this[j] || i == j)
+          continue;
+        else
+        {
+          diff = (long)(tdiffs[j] - tdiffs[i]);
+          wdiff += diff * diff;
+        }
+        if (wdiff > mdiff)
+        {
+          mdiff = wdiff;
+          k = i;
+        }
+      }
+    if (sqrt(mdiff) / nservers < 60)
+      // Don't discard any more if within about 60 seconds of each other
+      break;
+    use_this[k] = 0;
+    DPRINTF(("Discarding server %d (%s)\n", k, server_hosts[k]));
+    nservers--;
+  }
+}
 
 /*** EndHeader */
 
@@ -80,8 +161,8 @@ char* format_timestamp (uint32 stamp)
   return b;
 }
 
-/*** BeginHeader set_ntp_time, ntp_query_server*/
-int set_ntp_time (long *padj);
+/*** BeginHeader ntp_set_time, ntp_query_server*/
+int ntp_set_time (long *padj);
 int ntp_query_server (char *server, uint32 *stamp, long *tdiff );
 /*** EndHeader */
 
@@ -186,77 +267,10 @@ int ntp_query_server (char *server, uint32 *stamp, long *tdiff )
   return delay;
 }
 
-//Differences between local time and servers' time (Rabbit epoch).
-long tdiffs[NSERVERS];
-
-// Flag to indicate whether valid result obtained from corresponding server.
-int use_this[NSERVERS];
-
-// Number of valid results remaining.
-int nservers;
-
-//Array of configured time servers
-extern char* server_hosts[];
-
-/*
-  Check received timestamps and discard the worst preforming servers.
-
-  In most cases this is snake oil as NTP servers are fairly reliable, network is
-  fast pretty and our resolution (1 sec.) is too low to make any difference.
-  The code was in the original TIME.C sample form ZWorld and I decided to keep for now.
-*/
-void discard_outliers(void)
-{
-  int i, j, k;
-  int minservers;
-  float diff;
-  float wdiff;
-  float mdiff;
-
-  if (nservers >= 3)
-    minservers = nservers + 1 >> 1; // Half (rounded up) of the successful servers
-  else
-    minservers = nservers;
-
-  while (nservers > minservers)
-  {
-    // Throw away the worst outliers first, until minservers remain.  The
-    // "worst outlier" is the one whose sum-of-squares distance from the others
-    // is greatest.
-    mdiff = 0.0;
-    for (i = 0; i < NSERVERS; i++)
-      if (!use_this[i])
-        continue;
-      else
-      {
-        wdiff = 0.0;
-        for (j = 0; j < NSERVERS; j++)
-        if (!use_this[j] || i == j)
-          continue;
-        else
-        {
-          diff = (long)(tdiffs[j] - tdiffs[i]);
-          wdiff += diff * diff;
-        }
-        if (wdiff > mdiff)
-        {
-          mdiff = wdiff;
-          k = i;
-        }
-      }
-    if (sqrt(mdiff) / nservers < 60)
-      // Don't discard any more if within about 60 seconds of each other
-      break;
-    use_this[k] = 0;
-    DPRINTF(("Discarding server %d (%s)\n", k, server_hosts[k]));
-    nservers--;
-  }
-}
-
 /* START FUNCTION DESCRIPTION ************************************************
-set_ntp_time                   <ntp.lib>
+ntp_set_time                   <ntp.lib>
 
-  Syntax:       int set_ntp_time (long *padj);
+  Syntax:       int ntp_set_time (long *padj);
 
   Description:  Pool all configured NTP servers, find average offset between our
                 clock and NTP time and adjust RTC clock to match NTP time.
@@ -268,7 +282,7 @@ set_ntp_time                   <ntp.lib>
   Return:       0 if successful.
 END DESCRIPTION **************************************************************/
 
-int set_ntp_time (long *padj)
+int ntp_set_time (long *padj)
 {
   int i, rc;
   long tz, skew;
@@ -336,6 +350,221 @@ int set_ntp_time (long *padj)
   DPRINTF(("The RTC date/time now is: %s %s\n\n", format_timestamp(read_rtc()), zone));
   return 0;
 }
+
+/*** BeginHeader ntp_set_time_async, ntp_query_server_async*/
+cofunc int ntp_set_time_async (long *padj);
+cofunc int ntp_query_server_async (char *server, uint32 *stamp, long *tdiff );
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ************************************************
+ntp_query_server_async                                 <ntp.lib>
+
+  Description:  Query an NTP server specified by name or IP address and get
+                the timestamp as seconds from 1980 (Rabbit epoch). This is a
+                cofunction that will yield while waiting for the DNS resolver
+                and for server reply.
+
+  Syntax:       int ntprc_query_server_async (char *server, uint32 *stamp, long *tdiff )
+
+  Parameters:
+      server    NTP server name or IP address
+      stamp     Pointer to returned timestamp
+      tdiff     Pointer to difference between server time and local time
+
+  Return:       Round trip travel time in milliseconds or a negative value if
+                an error occurs.
+
+  Note that time difference value is not adjusted for timezone difference.
+
+END DESCRIPTION *************************************************************/
+
+cofunc int ntp_query_server_async (char *server, uint32 *stamp, long *tdiff )
+{
+  static char packet[NTP_PACKET_SIZE];
+  static udp_Socket sock;
+  static int sock_opened;
+  uint32 rhost, rorig, cnt, lt;
+  int rc, delay, r;
+  uint16 rport;
+  char serverip[64], tmp[64];
+
+#GLOBAL_INIT { sock_opened = 0; }
+
+  if (!sock_opened)
+  {
+    if (!(rc = udp_open (&sock, 0, -1, NTP_PORT, NULL)))
+    {
+      DPRINTF(("Cannot open UDP socket.\n"));
+      return -4;
+    }
+    sock_opened = 1;
+  }
+
+
+  if ((r = resolve_name_start(server)) < 0)
+  {
+    DPRINTF (("Cannot initiate resolver for host %s (code=%d).\n", server, r));
+    return -3;
+  }
+
+  cnt = MS_TIMER;
+  do {
+    rc = resolve_name_check (r, &rhost);
+    if (rc == RESOLVE_SUCCESS)
+      break;
+    else if (rc != RESOLVE_AGAIN)
+    {
+      DPRINTF (("Resolver failure for host %s (code=%d).\n", server, rc));
+      return -3;
+    }
+    waitfor (DelayMs (100));
+  } while ( MS_TIMER - cnt < NTP_TIMEOUT);
+
+  if (rc != RESOLVE_SUCCESS)
+  {
+    DPRINTF (("Resolver timeout for host %s.\n", server));
+    return -3;
+  }
+  DPRINTF (("Pooling %s (%s)... ", server, inet_ntoa (serverip, rhost)));
+
+  // set all bytes in the buffer to 0
+  memset(packet, 0, NTP_PACKET_SIZE);
+  // Initialize values needed to form NTP request
+  // (see URL above for details on the packets)
+  packet[0] = 0x0b;   // LI=0, Version=1, Mode=3
+  packet[1] = 0;      // Stratum, or type of clock
+  packet[2] = 6;      // Polling Interval
+  packet[3] = 0xEC;   // Peer Clock Precision
+  // packet+4 (4 bytes) Root Delay = 0
+  // packet+8 (4 bytes) Root Dispersion = 0
+  // packet+12 (4 bytes) Reference Identifier = 0
+  // packet+16 (8 bytes) Reference Timestamp = 0
+  cnt = MS_TIMER;
+  *(uint32*)(packet+24) = htonl(cnt); //Originate timestamp
+  // packet+32 (8 bytes) Receive timestamp = 0
+
+  lt = SEC_TIMER;   //Get local time
+  udp_sendto (&sock, packet, NTP_PACKET_SIZE, rhost, NTP_PORT);
+  while (MS_TIMER - cnt < NTP_TIMEOUT)
+  {
+    tcp_tick (NULL);
+    rc = udp_peek (&sock, NULL);
+    if (rc > 0)
+      break;
+    waitfor (DelayMs (100));
+  }
+  if (rc <= 0)
+  {
+    DPRINTF (("No reply.\n"));
+    return -1;
+  }
+  rc = udp_recvfrom (&sock, packet, NTP_PACKET_SIZE, &rorig, &rport);
+  delay = (int)(MS_TIMER - cnt);
+
+  if (rc < NTP_PACKET_SIZE)
+  {
+    DPRINTF(("Reply too short (%d).\n", rc));
+    return -1;
+  }
+  if (rorig != rhost)
+  {
+    DPRINTF(("Unexpected reply from %s.\n", inet_ntoa(tmp, rorig)));
+    return -1;
+  }
+  //the timestamp starts at byte 40 of the received packet and is four bytes.
+  *stamp = ntohl (*(uint32*)(packet+40));
+  *stamp -= EPOCH_DIFF;
+  *tdiff = *stamp-lt;
+  DPRINTF(("Delay %dms time is %s UTC diff=%ld\n", delay, format_timestamp(*stamp), *tdiff));
+  return delay;
+}
+
+/* START FUNCTION DESCRIPTION ************************************************
+ntp_set_time_async                   <ntp.lib>
+
+  Syntax:       int ntp_set_time_async (long *padj);
+
+  Description:  Pool all configured NTP servers, find average offset between our
+                clock and NTP time and adjust RTC clock to match NTP time.
+
+
+  Parameters:
+    padj        pointer to time adjustment. If not NULL the function returns
+                the local clock adjustment.
+
+  Return:       0 if successful.
+END DESCRIPTION **************************************************************/
+
+cofunc int ntp_set_time_async (long *padj)
+{
+  int i, rc;
+  long tz, skew;
+  uint32 timestamp;
+  char zone[7];
+
+#ifndef RTC_IS_UTC
+  rc = rtc_timezone (&tz, zone);
+  DPRINTF (("Got timezone from %s\n", (rc==0)?"DHCP":(rc==-1)?"TIMEZONE":"UNSET"));
+#else
+  tz = 0;
+  strcpy (zone, "UTC");
+#endif
+
+  DPRINTF(("Starting time adjustment at: %s %s\n", format_timestamp(read_rtc()), zone));
+  // Query all configured servers.
+  nservers = 0;
+  for (i = 0; i < NSERVERS; i++)
+  {
+    use_this[i] = 0;
+    wfd rc = ntp_query_server_async (server_hosts[i], &timestamp, &tdiffs[i]);
+    if (rc >= 0)
+    {
+      tdiffs[i] += tz;    //Adjust difference for time zone
+      use_this[i] = 1;    // Mark as OK so far
+      nservers++;
+    }
+  }
+
+  if (!nservers)
+  {
+    DPRINTF(("No servers could be found - using local clock\n"));
+    return -1;
+  }
+
+  // Now that we have responses from hopefully all of the servers, determine the
+  // set that we are going to average.
+  discard_outliers();
+
+  // Average the time differences of the remaining servers.  This can't be
+  // done the obvious way, to avoid arithmetic overflow.
+  skew = 0;    // Offset that we need to add to our SEC_TIMER to get the
+               // correct averaged time.
+  nservers = 0;
+  for (i = 0; i < NSERVERS; i++)
+  {
+    if (use_this[i])
+    {
+      nservers++;
+      skew += (tdiffs[i]-skew)/nservers;
+    }
+  }
+
+  //Adjust RTC
+  if (skew)
+  {
+    DPRINTF (("Adjusting RTC clock by %ld seconds.\n", skew));
+#ifdef NTP_SET_TIMER
+    SEC_TIMER += skew;
+#endif
+    write_rtc (SEC_TIMER);
+  }
+  if (padj)
+    *padj = skew;
+
+  DPRINTF(("The RTC date/time now is: %s %s\n\n", format_timestamp(read_rtc()), zone));
+  return 0;
+}
+
 
 /*** BeginHeader dow*/
 int dow (int y, int m, int d);
