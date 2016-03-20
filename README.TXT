@@ -1,6 +1,22 @@
 *****************************************************************
-   README for Dynamic C Version 10.72
+   README for Dynamic C Version 10.72A
 *****************************************************************
+
+- Includes library and utility programs to write a System ID Block
+  to a device's flash (Utilities/Write_ID).
+
+- Incorporates Serial Flash update (40002882_A) for revision E of 
+  45DB641 chips used in new hardware.
+
+- Upgrades TLS (Transport Layer Security, aka SSL/HTTPS)
+  implementation from 1.0 to 1.2.
+  - Is compatible with modern web browsers.
+  - Removes support for insecure SSLv2, SSLv3 and TLS 1.0 protocols.
+  - Removes support for insecure RC4 cipher and MD5 digest.
+  - Automatically enables required AES128_CBC cipher.
+  - Defaults to 2048-bit RSA keys (previously 1024-bit).
+  - Adds optional AES256_CBC cipher, SHA256 digests, and support for
+    SHA256 signatures in X.509 (TLS/SSL) certificates.
 
 - FCC-labeled versions of RCM6600W family boards are locked to
   Americas region code.
