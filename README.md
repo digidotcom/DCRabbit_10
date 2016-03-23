@@ -30,7 +30,7 @@ with the following exceptions:
   
   - GPL 2.0: multiple libraries in `Lib/tcpip/WiFi`, including
     `wifi_eloop.lib`, `wifi_md5.lib`, `wifi_sha1.lib`, `wifi_wpa.lib`,
-    `wifi_wpa_supplicant.lib`, and `wpa.lib`
+    `wifi_wpa_supplicant.lib`, and `wpa.lib`; `Crypto/SHA2.LIB`
 	
   - MPL 1.1/GPL 2.0/LGPL 2.1: `Lib/XBee/util/jslong.c`
 

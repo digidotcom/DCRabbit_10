@@ -116,7 +116,7 @@
 #define IDIGI_CONTACT "support@digi.com"
 #define IDIGI_LOCATION "Planet Earth"
 #define IDIGI_DESCRIPTION "Simple iDigi+XBee demo"
-#define IDIGI_SERVER "sd1-na.idigi.com"
+#define IDIGI_SERVER "my.devicecloud.com"
 
 
 // Store non-volatile configuration data in the userID block, via the

@@ -63,6 +63,12 @@
 // define HTTPC_VERBOSE to turn on verbose output from the HTTP Client library
 //#define HTTPC_VERBOSE
 
+// Override the default number of redirections allowed (1).  Don't set this
+// too high, since it potentially causes that amount of recursion.  Anything
+// over 5 would probably indicate some sort of configuration error in the
+// servers (e.g. two servers bouncing a request back and forth).
+#define HTTPC_MAX_REDIRECT 5
+
 // define UPDATE_RTC to sync the Rabbit's real-time clock to the web server's
 // if more than 10 seconds out of sync.
 //#define UPDATE_RTC
@@ -147,9 +153,9 @@ int my_server_policy(ssl_Socket far * state, int trusted,
 	if (cert->subject.email)
 		printf("       Contact: %ls\n", cert->subject.email);
 	printf("Server claims to be CN='%ls'\n", cert->subject.cn);
-	printf("We are looking for  CN='%s'\n", s->hostname);
+	printf("We are looking for  CN='%ls'\n", s->hostname);
 
-	if (strcmp(cert->subject.cn, s->hostname)) {
+	if (x509_validate_hostname(cert, s->hostname)) {
 		printf("Mismatch!\n\n");
 		return 1;
 	}
@@ -211,6 +217,10 @@ void httpc_demo(tcp_Socket *sock)
 
 			// clear screen (first string) and print name of URL to download
          printf ("\x1B[2J" "Retrieving [%s]...\n", url);
+         
+         // Turn on auto redirect to follow 3xx redirect responses
+         httpc_set_mode(HTTPC_AUTO_REDIRECT);
+         
          retval = httpc_get_url (&hsock, url);
          if (retval)
          {

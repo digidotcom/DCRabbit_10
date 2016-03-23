@@ -432,7 +432,7 @@ int main()
 #endif
 
 #ifndef HTTP_UPLOAD_SSL_SUPRESS_WARNING
-#ifdef __SSL_LIB__
+#ifdef __SSL_DEFS_LIB__
 	#warns "HTTP Upload is not currently compatible with SSL. Make sure that"
 	#warns "you are not using HTTP upload on SSL-secured ports. To eliminate"
 	#warns "this warning, include '#define HTTP_UPLOAD_SSL_SUPRESS_WARNING'"
