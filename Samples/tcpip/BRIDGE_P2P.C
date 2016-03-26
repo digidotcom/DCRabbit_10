@@ -342,7 +342,6 @@
 //#define WIFI_MAC_MGMT_VERBOSE 1
 //#define IP_VERBOSE
 //#define _SSL_PRINTF_DEBUG 4
-//#define SSL3_PRINTF_DEBUG
 //#define SSL_SOCK_VERBOSE
 //#define TCP_VERBOSE
 
@@ -382,11 +381,8 @@
 #use "dcrtcp.lib"
 #use "crc32.lib"
 #ifdef USE_TLS
-	// Set TLS options.  For clarity in demonstration, use pre-shared keys
-   // with AES.
-	#define SSL_USE_AES
+	// Set TLS options.  For clarity in demonstration, use pre-shared keys.
 	#define SSL_USE_PSK
-	#define SSL_DONT_USE_RC4
 	#define SSL_DONT_USE_RSA
 	#use "ssl_sock.lib"
 #endif

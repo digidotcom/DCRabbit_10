@@ -392,7 +392,9 @@ PARAMETER 3:	Radix to use for the conversion, can be zero (see below) or
 
 RETURN VALUE:	The signed long number represented by <sptr>.
 
-					If no conversion could be performed, zero is returned.
+					If no conversion could be performed, zero is returned.  In
+					addition, the global <errno> is set to EINVAL if <radix> was
+					invalid.
 
 					If the correct value is outside the range of representable
 					values, LONG_MAX or LONG_MIN is returned (according to the sign
@@ -464,6 +466,8 @@ long _f_strtol(const char __far *sptr, char __far * __far * tailptr, int base)
 	auto int char_limit;
 	auto int negative;
 	auto int overflow;
+   auto const char __far *original_sptr = sptr;
+   auto int saw_digit = FALSE;
 	auto int ch;
 
 	// check base parameter
@@ -473,6 +477,7 @@ long _f_strtol(const char __far *sptr, char __far * __far * tailptr, int base)
 		{
 			*tailptr = (char __far *)sptr;
 		}
+		errno = EINVAL;
 		return 0;
 	}
 
@@ -544,6 +549,8 @@ long _f_strtol(const char __far *sptr, char __far * __far * tailptr, int base)
          break;
       }
 
+      saw_digit = TRUE;
+      
 		// check for overflow -- if either condition is true, the multiply/add
 		// to calculate the new sum will overflow
       if (overflow ||
@@ -560,7 +567,7 @@ long _f_strtol(const char __far *sptr, char __far * __far * tailptr, int base)
 	// only update tailptr if not NULL
    if (tailptr)
    {
-      *tailptr = (char __far *)sptr - 1;
+      *tailptr = (char __far *)(saw_digit ? sptr - 1 : original_sptr);
    }
 
 	if (overflow)
@@ -640,13 +647,15 @@ PARAMETER 3:	Radix to use for the conversion, can be zero (see below) or
 
 RETURN VALUE:	The unsigned long number represented by <sptr>.
 
-					If no conversion could be performed, zero is returned.
+					If no conversion could be performed, zero is returned.  In
+					addition, the global <errno> is set to EINVAL if <radix> was
+					invalid.
 
 					If the correct value is outside the range of representable
 					values, ULONG_MAX is returned, and the global <errno> is set
 					to ERANGE.
 
-SEE ALSO:	strtod (floating point), strtoul (unsigned long)
+SEE ALSO:	strtod (floating point), strtol (signed long)
 
 KEYWORDS: convert
 
@@ -709,22 +718,25 @@ unsigned long _f_strtoul( const char __far *sptr,
 {
 	auto unsigned long sum, premul_limit;
 	auto int char_limit, overflow;
+   auto const char __far *original_sptr = sptr;
+   auto int saw_digit = FALSE;
 	auto char ch;
 	auto int negative = 0;
 
-	// eat up whitespace
-	while (isspace( *sptr))
-	{
-		sptr++;
-	}
-
-	if (base > 36 || base < 0)
+	if (base > 36 || base < 0 || base == 1)
 	{
 		if (tailptr != (void __far *)NULL)
 		{
 			*tailptr = (char __far *) sptr;
 		}
+		errno = EINVAL;
 		return 0;
+	}
+
+	// eat up whitespace
+	while (isspace( *sptr))
+	{
+		sptr++;
 	}
 
 	// ignore sign
@@ -782,6 +794,8 @@ unsigned long _f_strtoul( const char __far *sptr,
          break;
       }
 
+      saw_digit = TRUE;
+      
 		// check for overflow -- if either condition is true, the multiply/add
 		// to calculate the new sum will overflow
       if (overflow ||
@@ -798,7 +812,7 @@ unsigned long _f_strtoul( const char __far *sptr,
 	// only update tailptr if not NULL
    if (tailptr)
    {
-      *tailptr = (char __far *)sptr - 1;
+      *tailptr = (char __far *)(saw_digit ? sptr - 1 : original_sptr);
    }
 
 	if (overflow)

@@ -1381,6 +1381,16 @@ int _x509_s3_x509_sha1_oid(struct asn1_oid __far * oid) {
 	oid->oid[5]==26;
 }
 
+/*** BeginHeader _x509_s3_x509_sha256_oid */
+int _x509_s3_x509_sha256_oid(struct asn1_oid __far * oid);
+/*** EndHeader */
+const far unsigned long _sha256_oid[9] = {2, 16, 840, 1, 101, 3, 4, 2, 1};
+_x509_debug
+int _x509_s3_x509_sha256_oid(struct asn1_oid __far * oid) {
+	return oid->len==9 &&
+   _f_memcmp(&oid->oid, &_sha256_oid, sizeof _sha256_oid)==0;
+}
+
 /*** BeginHeader x509_certificate_parse */
 // From "x509v3.c":1137
 struct x509_certificate __far * x509_certificate_parse(char __far * buf, size_t len);
@@ -1482,7 +1492,7 @@ int x509_certificate_check_signature(struct x509_certificate __far * issuer,
 	size_t data_len; 	// From "x509v3.c":1249
 	struct asn1_hdr hdr; 	// From "x509v3.c":1250
 	struct asn1_oid oid; 	// From "x509v3.c":1251
-	char hash[20]; 	// From "x509v3.c":1252
+	char hash[HMAC_MAX_HASH_SIZE]; 	// From "x509v3.c":1252
 	size_t hash_len; 	// From "x509v3.c":1253
 
 
@@ -1539,9 +1549,19 @@ int x509_certificate_check_signature(struct x509_certificate __far * issuer,
 	}
 	if (_x509_s3_x509_sha1_oid(&oid)) {
 		if (cert->signature.oid.oid[6]!=5) {
-			_X509_PRINTF((MSG_DEBUG, "X509: digestAlgorithm SHA1 " \
+			_X509_PRINTF((MSG_DEBUG, "X509: digestAlgorithm %s " \
 			 "does not match with certificate " \
-			 "signatureAlgorithm (%lu)" , cert->signature.oid.oid[6]));
+			 "signatureAlgorithm (%lu)" , "SHA1", cert->signature.oid.oid[6]));
+			_sys_free(data);
+			return  -1;
+		}
+		goto skip_digest_oid;
+	}
+	if (_x509_s3_x509_sha256_oid(&oid)) {
+		if (cert->signature.oid.oid[6]!=11) {
+			_X509_PRINTF((MSG_DEBUG, "X509: digestAlgorithm %s " \
+			 "does not match with certificate " \
+			 "signatureAlgorithm (%lu)" , "SHA256", cert->signature.oid.oid[6]));
 			_sys_free(data);
 			return  -1;
 		}
@@ -1555,9 +1575,9 @@ int x509_certificate_check_signature(struct x509_certificate __far * issuer,
 	switch ((int)(oid.oid[5])) {
 		case 5:
 		if (cert->signature.oid.oid[6]!=4) {
-			_X509_PRINTF((MSG_DEBUG, "X509: digestAlgorithm MD5 does " \
+			_X509_PRINTF((MSG_DEBUG, "X509: digestAlgorithm %s does " \
 			 "not match with certificate " \
-			 "signatureAlgorithm (%lu)" , cert->signature.oid.oid[6]));
+			 "signatureAlgorithm (%lu)" , "MD5", cert->signature.oid.oid[6]));
 			_sys_free(data);
 			return  -1;
 		}
@@ -1583,20 +1603,21 @@ int x509_certificate_check_signature(struct x509_certificate __far * issuer,
 	}
 	_X509_HEXDUMP((MSG_MSGDUMP, "X509: Decrypted Digest" , hdr.payload, hdr.length));
 	switch ((int)(cert->signature.oid.oid[6])) {
-		case 4:
+		case 4:  // MD5 with RSA encryption
 		md5_vector(1, &cert->tbs_cert_start, &cert->tbs_cert_len, hash);
-		hash_len = 16;
+		hash_len = HMAC_MD5_HASH_SIZE;
 		_X509_HEXDUMP((MSG_MSGDUMP, "X509: Certificate hash (MD5)" , hash, hash_len));
 		break;
-		case 5:
+		case 5:  // SHA-1 with RSA Encryption
 		sha1_vector(1, &cert->tbs_cert_start, &cert->tbs_cert_len, hash);
-		hash_len = 20;
+		hash_len = HMAC_SHA_HASH_SIZE;
 		_X509_HEXDUMP((MSG_MSGDUMP, "X509: Certificate hash (SHA1)" , hash, hash_len));
 		break;
-		case 2:
-		case 11:
-		case 12:
-		case 13:
+		case 11: // sha256WithRSAEncryption
+		sha256_vector(1, &cert->tbs_cert_start, &cert->tbs_cert_len, hash);
+		hash_len = HMAC_SHA256_HASH_SIZE;
+		_X509_HEXDUMP((MSG_MSGDUMP, "X509: Certificate hash (SHA256)" , hash, hash_len));
+      break;
 		default:
 		_X509_PRINTF((MSG_INFO, "X509: Unsupported certificate signature " \
 		 "algorithm (%lu)" , cert->signature.oid.oid[6]));
@@ -1990,6 +2011,170 @@ void __x509_initStatics() {
 		__x509_globals._x509_debug_level = MSG_MSGDUMP;
 
 	}
+}
+
+/*** BeginHeader x509_validate_hostname */
+int x509_validate_hostname(const struct x509_certificate __far *cert,
+	const char __far *hostname);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+x509_validate_hostname							   <X509.LIB>
+
+SYNTAX:  int x509_validate_hostname(const struct x509_certificate far *cert,
+                                 const char far *hostname);
+
+DESCRIPTION: See if a hostname is covered by the Subject Common Name (CN)
+             stored in a certificate.  Handles wildcard matching (*.example.com
+             valid for example.com, foo.example.com but not foo.bar.example.com)
+             and securing the root domain for the www-hostname (www.example.com
+             is a valid CN for hostname example.com and vice versa).
+
+PARAMETER 1: Certificate object
+
+PARAMETER 2: Hostname to verify
+
+RETURN VALUE: 0: Certificate is valid for given hostname.
+              -EINVAL: NULL passed as one of the two parameters, or certificate
+                       does not have a subject.cn.
+              -NETERR_HOST_REFUSED: Certificate is not valid for given hostname.
+
+END DESCRIPTION **********************************************************/
+
+_x509_debug
+int x509_validate_hostname(const struct x509_certificate __far *cert,
+	const char __far *hostname)
+{
+	const char __far *cn, *cn_end, *hostname_end;
+   int t;
+   
+	if (cert == NULL || cert->subject.cn == NULL || hostname == NULL)
+   {
+   	return -EINVAL;
+   }
+   /* Comparison strategy:
+      Starting at the ends of the strings, compare all characters until finding
+      a mismatch or reaching the start of one or both strings.
+   */
+   cn = cert->subject.cn;
+   cn_end = _f_strchr(cn, '\0') - 1;
+   hostname_end = _f_strchr(hostname, '\0') - 1;
+      
+   _X509_PRINTF(("X509: compare hostname '%ls' to CN '%ls'\n", hostname, cn));
+   
+   while (cn_end >= cn && hostname_end >= hostname && *cn_end == *hostname_end)
+   {
+   	--hostname_end;
+      --cn_end;
+   }
+   
+   // cn_end and hostname_end point to characters that do not match, or
+   // one or both of them point before the start of the string.
+   if (hostname_end < hostname)
+   {
+   	if (cn_end < cn)		// exact match
+      {
+      	_X509_PRINTF(("\texact match\n"));
+      	return 0;
+      }
+      if (_f_memcmp(cn, "*.", 2) == 0 && cn_end == &cn[1])
+      {
+      	_X509_PRINTF(("\tCN *.example.com valid for example.com\n"));
+      	return 0;
+      }
+      if (_f_memcmp(cn, "www.", 4) == 0 && cn_end == &cn[3])
+      {
+      	_X509_PRINTF(("\tCN www.example.com valid for example.com\n"));
+      	return 0;
+      }
+   }
+
+   if (cn_end < cn)
+   {
+      if (_f_memcmp(hostname, "www.", 4) == 0 && hostname_end == &hostname[3])
+      {
+      	_X509_PRINTF(("\tCN example.com valid for www.example.com\n"));
+      	return 0;
+      }
+   }
+   else if (*cn_end == '*')
+   {
+   	while (hostname_end >= hostname && *hostname_end != '.')
+      {
+      	--hostname_end;
+      }
+      if (hostname_end < hostname)
+      {
+      	_X509_PRINTF(("\tCN *.example.com valid for foo.example.com\n"));
+      	return 0;
+      }
+      // here because *.example.com is NOT valid for foo.bar.example.com
+      // fall through to failure case
+   }
+   
+   _X509_PRINTF(("\tINVALID\n"));
+   return -NETERR_HOST_REFUSED;
+}
+
+/*** BeginHeader _test_x509_validate_hostname */
+int _test_x509_validate_hostname(int verbose);
+/*** EndHeader */
+typedef  _x509_validate_hostname_test_t;
+
+_x509_debug
+int _test_x509_validate_hostname(int verbose)
+{
+	static const struct {
+	   char far *cn;
+	   const char far *hostname;
+	   int expected_result;
+	} __far test_case[] = {
+	   { NULL, NULL, -EINVAL },
+	   { "example.com", NULL, -EINVAL },
+	   { NULL, "example.com", -EINVAL },
+	   { "", "", 0 },
+	   { "example.com", "example.com", 0 },
+	   { "example.com", "", -NETERR_HOST_REFUSED },
+	   { "", "example.com", -NETERR_HOST_REFUSED },
+	   { "example.com", "example.org", -NETERR_HOST_REFUSED },
+	   { "www.example.com", "example.com", 0 },
+	   { "example.com", "www.example.com", 0 }, // included for www.google.com hostname
+	   { "*.example.com", "example.com", 0 },
+	   { "*.example.com", "foo.example.com", 0 },
+	   { "*.example.com", "foo.bar.example.com", -NETERR_HOST_REFUSED },
+	};
+	int TEST_COUNT = (sizeof test_case / sizeof test_case[0]);
+	struct x509_certificate cert;
+	int i, result, failures = 0;
+
+   if (verbose) printf("%s: running %u tests\n", __FUNCTION__, TEST_COUNT);
+   
+   if (x509_validate_hostname(NULL, "foo") != -EINVAL)
+   {
+      ++failures;
+      if (verbose) printf("FAIL test 0: NULL cert should return -EINVAL\n");
+   }
+   for (i = 0; i < TEST_COUNT; ++i)
+   {
+   	cert.subject.cn = test_case[i].cn;
+      result = x509_validate_hostname(&cert, test_case[i].hostname);
+      if (result != test_case[i].expected_result)
+      {
+      	++failures;
+         if (verbose) printf("FAIL test %u: expected %d, got %d\n", i + 1,
+         	test_case[i].expected_result, result);
+      } 
+   }
+   
+   if (failures)
+   {
+   	if (verbose)
+      	printf("%s: FAILED %u/%u\n", __FUNCTION__, failures, TEST_COUNT);
+   	return -1;
+   }
+   
+   if (verbose)
+   	printf("%s: PASSED all %u tests\n", __FUNCTION__, TEST_COUNT);
+	return 0;
 }
 
 /*** BeginHeader */

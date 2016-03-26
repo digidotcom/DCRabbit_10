@@ -61,21 +61,24 @@
            to check this if the sample seems to fail in spite of everything.
            You can override these macros in the Defines panel.
 
-        NOTE: you can also use a Hotmail account (a.k.a "Windows live").
-        In this case, #define SMTP_SERVER "smtp.live.com", and use your
-        Hotmail account settings in SMTP_USER and SMTP_PASS.  There is no
-        need to change any of your Hotmail account settings (as of the
-        date of writing, Sep 2009).
+        NOTE: you can also use a Hotmail/Outlook.com account once Microsoft
+        upgrades their servers from TLS 1.0 to TLS 1.2 (still not the case
+        in February 2016).
+        
+        In this case, #define SMTP_SERVER "smtp-mail.outlook.com", and use your
+        Hotmail/Outlook.com credentials in SMTP_USER and SMTP_PASS.  There is no
+        need to change any of your Hotmail account settings (still true as
+        of February 2016).
+        
         Unfortunately, Microsoft in their wisdom use 4096 bit RSA keys in
         some of their certificates, thus you need to #define MP_SIZE 514.
-        GMail only used 1024-bit keys, hence the default MP_SIZE (130)
-        is sufficient.
+        GMail uses 2048-bit keys, and requires a MP_SIZE of at least 258.
+        
         To date, Yahoo does not allow POP3/SMTP access with their free email
         accounts.
 
 *******************************************************************************/
 #class auto
-
 
 
 
@@ -88,12 +91,12 @@
 #ximport "../sample_certs/EquifaxSecureCA.crt"  ca_pem1
 #ximport "../sample_certs/ThawtePremiumServerCA.crt"  ca_pem2
 
-// This one for Hotmail (SMTP)
+// This one for Hotmail/Outlook.com (POP3 and SMTP)
 #ximport "../sample_certs/GTECyberTrustGlobalRoot.crt"  ca_pem3
-#define MP_SIZE 514			// Recommended to support 4096-bit RSA keys used by
-									// some Microsoft certs.  (Crazy, but the root CA
-									// uses only 2048 bit keys!)
+#define MP_SIZE 258			// necessary for GMail's RSA keys
 
+//#define MP_SIZE 514			// Recommended to support 4096-bit RSA keys used by
+									// some Microsoft certs.
 
 // Comment this out if the Real-Time Clock is set accurately.
 #define X509_NO_RTC_AVAILABLE
@@ -119,11 +122,17 @@
  *   reference your values.
  */
 
-#define FROM     "001@cloak-and-dagger.gov.uk"
+#ifndef FROM
+	#ifdef SMTP_USER
+		#define FROM SMTP_USER
+	#else
+		#define FROM     "001@example.com"
+	#endif
+#endif
 #ifndef SMTP_TO
 	#warnt "Using bogus recipient.  Set SMTP_TO=..."
 	#warnt "in the Options->Project->Defines panel."
-	#define SMTP_TO       "007@cloak-and-dagger.gov.uk"
+	#define SMTP_TO       "007@example.com"
 #endif
 #define SUBJECT  "Enemy agents in country"
 #define BODY     "Go see Q"
@@ -154,7 +163,7 @@
  */
 #ifndef SMTP_SERVER
 	#define SMTP_SERVER "smtp.gmail.com"
-	//#define SMTP_SERVER "smtp.live.com"
+	//#define SMTP_SERVER "smtp-mail.outlook.com"
 #endif
 #ifndef SMTP_PORT
 	// Port 587 used by secure SMTP service (both Gmail and Hotmail)
@@ -249,7 +258,7 @@ int smtp_server_policy(ssl_Socket far * state, int trusted,
 	printf("Server claims to be CN='%ls'\n", cert->subject.cn);
 	printf("We are looking for  CN='%s'\n", smtp_getserver());
 
-	if (strcmp(cert->subject.cn, smtp_getserver())) {
+	if (x509_validate_hostname(cert, smtp_getserver())) {
 		printf("Mismatch!\n\n");
 		return 1;
 	}
