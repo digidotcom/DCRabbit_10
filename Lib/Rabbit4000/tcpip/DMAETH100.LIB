@@ -1020,52 +1020,87 @@ netport_tx_isr::
    call  write_ilog
    pop	af
 #endif
-   bit   5,a
-   jr		nz,.netport_done
+   bit	5,a					; most of the time, transmit okay and dma tx will fire releasing the buffer
+   jr	nz,.netport_done
 
-   bit   4,a
-   jr		nz,.tx_packet_error
+   bit	4,a					; transmit error?
+   jr	nz,.tx_packet_error
+
+   bit  3,a					; transmit pause sent?
+   jr	nz,.netport_done_notxinc	; don't really care...and it shouldn't count as a transmitted packet
+; nothing else should come in here
    jr		.netport_done
 
 .tx_packet_error:
-ioi ld   a,(NBTSR)
+; Transmitted packet in error.  Check NBTSR and NBTESR for details
+; Some errors might have aborted the packet where we do not get the dma tx interrupt
+;  in that case, we need to do some special stuff
+	ld	b,0				; the aborted packet flag
 #ifdef DMAETH100_NET_STATS
-   ; Transmitted packet in error.  Check NBTSR for details
    ld    hl,(ix+[_decb]+pd_tx_error)
    inc   hl
    ld    (ix+[_decb]+pd_tx_error),hl
-
+#endif
+ioi ld   a,(NBTSR)
    bit   4,a
    jr    z,.txe1
+   ld	b,1				; packet aborted for underrun
+#ifdef DMAETH100_NET_STATS
    ld    hl,(ix+[_decb]+pd_txe_urun)
    inc   hl
    ld    (ix+[_decb]+pd_txe_urun),hl
-   jr    .txe3
+#endif
+   jr    .txeF
 .txe1:
    bit   5,a
    jr    z,.txe2
-	ld		b,1		; Reset aborted Tx DMA due to 16 collisions
+	ld	b,1		; packet aborted due to excessive collisions
+#ifdef DMAETH100_NET_STATS
    ld    hl,(ix+[_decb]+pd_txe_colls)
    inc   hl
    ld    (ix+[_decb]+pd_txe_colls),hl
-   jr    .txe3
+#endif
+   jr    .txeF
 .txe2:
-	ld		b,0		; For deferred Tx, don't reset Tx DMA
-   bit   6,a
+	ld	b,0		; the rest of the possible errors do not abort the transmission
+   bit   6,a		; we count deferred packets
    jr    z,.txe3
+#ifdef DMAETH100_NET_STATS
    ld    hl,(ix+[_decb]+pd_txe_defer)
    inc   hl
    ld    (ix+[_decb]+pd_txe_defer),hl
 #endif
+   jr	.txeF
 .txe3:
+; look at NBTESR for some more transmit error sources
 ioi ld   a,(NBTESR)        ; 11
+   bit   4,a		; check for crc error
+   jr    z,.txeF
 #ifdef DMAETH100_NET_STATS
-   bit   4,a
-   jr    z,.netport_done
    ld    hl,(ix+[_decb]+pd_txe_crc)
    inc   hl
    ld    (ix+[_decb]+pd_txe_crc),hl
 #endif
+.txeF:
+; Ok, done categorizing errors
+	djnz	.netport_done
+; Frame was aborted...need to halt dma and clean up a bit
+#if _RAB6K
+	ld   hl,(ix+[_decb]+txbit)	; Halt current DMA
+	ioi  ld   (DMHLR),hl
+#else
+	ld    a,(ix+[_decb]+txbit)	; Halt current DMA
+	ioi   ld   (DMHR),a
+#endif
+; May as well clear the fifo too
+	ld 	a,0x10     	; Purge FIFO
+	ioi	ld (NBCR),a
+; Not sending any more
+	ld   (ix+[_decb]+sending),0
+; Return buffer to packet buffer pool
+	ld    jkhl,(ix+[_decb]+txbuf)
+	ld    py,jkhl		; Buffer address to be freed
+	lcall	_pb_free
 
 .netport_done:
 #ifdef DMAETH100_NET_STATS
@@ -1073,6 +1108,7 @@ ioi ld   a,(NBTESR)        ; 11
    inc   hl
    ld    (ix+[_decb]+pd_transmitted),hl
 #endif
+.netport_done_notxinc:
 #if DMAETH100_ENABISR != DMAETH100_NET_IP
 	pop	ip
 #endif
@@ -1428,7 +1464,7 @@ int dmaeth100_setupinterrupts(_DMAEth100Config *rt)
    ilog_idx = 0;
 #endif
    // set up Network Port interrupt vectors
-   //SetVectIntern(NETB_OFS>>4, netport_tx_isr);
+    SetVectIntern(NETB_OFS>>4, netport_tx_isr);
 	SetVectExtern4000(RX_EIR_OFS+DMAETH100_RXCHAN, dma_rcv_isr);
   	SetVectExtern4000(TX_EIR_OFS+DMAETH100_TXCHAN, dma_tx_isr);
    return 0;
@@ -1534,8 +1570,7 @@ __nouseix int dmaeth100_resetinterface(_DMAEth100Config * nic, word instance,
    RdPortI(NBCSR);
 
    // Enable the network interrupt, Tx and Err interrupts serviced.
-   //WrPortI(NBCSR, NULL, 0x38+DMAETH100_NET_IP);
-   WrPortI(NBCSR, NULL, DMAETH100_NET_IP);
+   WrPortI(NBCSR, NULL, 0x38+DMAETH100_NET_IP);
 
    // DMA transfer priority the same as net interrupt. Net DMA uses interrupts.
    WrPortI(DMCR, NULL, (DMAETH100_NET_IP<<2) | DMAETH100_NET_IP);
