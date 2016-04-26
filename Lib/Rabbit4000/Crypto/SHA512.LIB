@@ -44,6 +44,43 @@ typedef sha512_context sha384_context;
 #define SHA384_LENGTH               48      /* bytes produced by hash */
 /*** EndHeader */
 
+/*** BeginHeader sha_copy_and_swap64 */
+__xmem
+void sha_copy_and_swap64(void __far* dest, const void __far* src, word count);
+/*** EndHeader */
+
+//   Copy 'count' 64-bit values from src to dest, byte swapping them into
+//   reverse endianness.
+
+_sha512_debug __xmem
+void sha_copy_and_swap64(void __far* dest, const void __far* src, word count)
+{
+	#asm
+   ld px, (sp+@sp+dest)		; dest in PX
+	ld hl, (sp+@sp+count)
+   ld bc, hl
+   ld py, (sp+@sp+src)	; source in PY
+   
+.loop:
+	ld hl, (py+6)
+   ld a, h $ ld h, L $ ld L, a   ; swap HL, 8 clocks
+   ld (px+0), hl
+	ld hl, (py+4)
+   ld a, h $ ld h, L $ ld L, a   ; swap HL, 8 clocks
+   ld (px+2), hl
+	ld hl, (py+2)
+   ld a, h $ ld h, L $ ld L, a   ; swap HL, 8 clocks
+   ld (px+4), hl
+	ld hl, (py+0)
+   ld a, h $ ld h, L $ ld L, a   ; swap HL, 8 clocks
+   ld (px+6), hl
+   ld px, px+8
+   ld py, py+8
+   
+   dwjnz	.loop
+	#endasm
+}
+
 /*** BeginHeader sha512_init, sha512_add */
 void sha512_init(sha512_context __far *ctx);
 void sha512_add(sha512_context __far *ctx,
@@ -51,7 +88,8 @@ void sha512_add(sha512_context __far *ctx,
                 uint16_t inputLen);
 __xmem void _byteswap8(void __far *value);
 __xmem void _addto(const JSUint64 __far *source, JSUint64 __far *dest);
-void sha512_process(sha512_context __far *ctx);
+void sha512_process(sha512_context __far *ctx,
+                    const uint8_t __far data[128]);
 /*** EndHeader */
 
 /* ============= Common constants and defines ======================= */
@@ -246,17 +284,19 @@ void _round(JSUint64 __far *work, int n, JSUint64 *locals)
 /* START _FUNCTION DESCRIPTION ********************************************
 sha512_process 										   <SHA512.LIB>
 
-SYNTAX: void sha256_process(sha512_context __far *ctx);
+SYNTAX: void sha512_process(sha512_context far *ctx,
+                            const uint8_t far data[128]);
 
-DESCRIPTION: Add a block of 128 bytes (ctx->u.b) to the SHA-384/SHA-512 hash.
+DESCRIPTION: Add a block of 128 bytes to the SHA-384/SHA-512 hash.
 
 PARAMETER 1: Pointer to SHA-384/SHA-512 state structure
+PARAMETER 2: Pointer buffer containing data block
 
 RETURN VALUE: None
 
 END DESCRIPTION **********************************************************/
 _sha512_debug
-void sha512_process(sha512_context __far *ctx)
+void sha512_process(sha512_context __far *ctx, const uint8_t __far data[128])
 {
 	int t;
 	uint32_t lo, tm;
@@ -265,13 +305,7 @@ void sha512_process(sha512_context __far *ctx)
 	JSUint64 work[16];  // rotating work buffer
 	JSUint64 locals[8];
 
-	// TODO: replace this with a swap_and_copy function
-	for (t = 0; t < 16; ++t)
-	{
-		work[t] = ctx->u.w[t];
-		_byteswap8(&work[t]);
-	}
-
+	sha_copy_and_swap64(work, data, 16);
 	_f_memcpy(locals, ctx->h, 64);
 
 	#define _WORK(n) work[(t+n)&0x0F]
@@ -322,17 +356,17 @@ void sha512_add(sha512_context __far *ctx,
 		input    += todo;
 		inputLen -= todo;
 		if (inBuf + todo == SHA512_BLOCK_LENGTH) {
-			sha512_process(ctx);
+			sha512_process(ctx, ctx->u.b);
 	   }
 	}
 
 	/* if enough data to fill one or more whole buffers, process them. */
 	while (inputLen >= SHA512_BLOCK_LENGTH) {
-	   _f_memcpy(ctx->u.b, input, SHA512_BLOCK_LENGTH);
+	   sha512_process(ctx, input);
 	   input    += SHA512_BLOCK_LENGTH;
 	   inputLen -= SHA512_BLOCK_LENGTH;
-	   sha512_process(ctx);
 	}
+	
 	/* if data left over, fill it into buffer */
 	if (inputLen) {
 		_f_memcpy(ctx->u.b, input, inputLen);
@@ -380,18 +414,11 @@ void _sha512_finish_common(sha512_context __far *ctx, uint8_t __far *digest,
     ctx->u.w[14].hi = 0;
     ctx->u.w[15] = lo;
     _byteswap8(&ctx->u.w[15]);
-    sha512_process(ctx);
+    sha512_process(ctx, ctx->u.b);
 
     /* now output the answer */
-    _byteswap8(&ctx->h[0]);
-    _byteswap8(&ctx->h[1]);
-    _byteswap8(&ctx->h[2]);
-    _byteswap8(&ctx->h[3]);
-    _byteswap8(&ctx->h[4]);
-    _byteswap8(&ctx->h[5]);
-    _byteswap8(&ctx->h[6]);
-    _byteswap8(&ctx->h[7]);
-    _f_memcpy(digest, ctx->h, digest_length);
+    sha_copy_and_swap64(digest, ctx->h, digest_length);
+    
 }
 
 /*** BeginHeader sha512_finish */
@@ -413,9 +440,10 @@ PARAMETER 2: Pointer to buffer for output data.  Must be at least 64 bytes.
 RETURN VALUE: None
 
 END DESCRIPTION **********************************************************/
+_sha512_debug
 void sha512_finish(sha512_context __far *ctx, uint8_t far digest[SHA512_LENGTH])
 {
-	_sha512_finish_common(ctx, digest, SHA512_LENGTH);
+	_sha512_finish_common(ctx, digest, SHA512_LENGTH / 8);
 }
 
 /*
@@ -487,9 +515,10 @@ PARAMETER 2: Pointer to buffer for output data.  Must be at least 28 bytes.
 RETURN VALUE: None
 
 END DESCRIPTION **********************************************************/
+_sha512_debug
 void sha384_finish(sha384_context __far *ctx, uint8_t far digest[SHA384_LENGTH])
 {
-	_sha512_finish_common(ctx, digest, SHA384_LENGTH);
+	_sha512_finish_common(ctx, digest, SHA384_LENGTH / 8);
 }
 
 /*
