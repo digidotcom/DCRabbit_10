@@ -27,14 +27,10 @@
 #use "jslong.c"
 #define JSU64_INIT(hi,lo) { 0x ## lo ## U, 0x ## hi ## U }
 
-// TODO: Reduce size of sha512_context by putting message schedule on stack
-//       the context should only hold 128 bytes of the input buffer, message
-//       schedule is wiped out on each call to sha512_process.
 typedef struct sha512_context {
 	union {
-	   JSUint64 w[80];       /* message schedule, input buffer, plus 64 words */
-	   uint32_t l[160];
-	   uint8_t  b[640];
+	   JSUint64 w[16];       /* input buffer */
+	   uint8_t  b[128];
 	} u;
 	JSUint64 h[8];       /* 8 state variables */
 	JSUint64 sizeLo;     /* 64-bit count of hashed bytes. */
@@ -197,11 +193,11 @@ void sha512_init(sha512_context __far *ctx)
 /* START _FUNCTION DESCRIPTION ********************************************
 _round 										   <SHA512.LIB>
 
-SYNTAX: void _round(sha512_context __far *ctx, int n, JSUint64 *locals);
+SYNTAX: void _round(JSUint64 __far *work, int n, JSUint64 *locals);
 
 DESCRIPTION: Perform one round of the SHA-384/SHA-512 hash.
 
-PARAMETER 1: Pointer to SHA-384/SHA-512 state structure
+PARAMETER 1: Pointer to current work value
 PARAMETER 2: Round to perform (a number from 0 to 79)
 PARAMETER 3: Pointer to the eight 64-bit locals (copy of ctx->h added back
              after 80 rounds completed)
@@ -210,7 +206,7 @@ RETURN VALUE: None
 
 END DESCRIPTION **********************************************************/
 _sha512_debug
-void _round(sha512_context __far *ctx, int n, JSUint64 *locals)
+void _round(JSUint64 __far *work, int n, JSUint64 *locals)
 {
 	uint32_t lo, tm;
 	int cy;
@@ -231,12 +227,12 @@ void _round(sha512_context __far *ctx, int n, JSUint64 *locals)
 	cy = (lo < tm);
 	lo += (tm = K512[n].lo);
 	if (lo < tm) cy++;
-	lo += (tm = ctx->u.w[n].lo);
+	lo += (tm = work->lo);
 	if (lo < tm) cy++;
 
 	h->lo += lo;
 	if (h->lo < lo) cy++;
-	h->hi += cy + S1hi((*e)) + Chxx((*e), (*f), (*g), hi) + K512[n].hi + ctx->u.w[n].hi;
+	h->hi += cy + S1hi((*e)) + Chxx((*e), (*f), (*g), hi) + K512[n].hi + work->hi;
 	d->lo += h->lo;
 	d->hi += h->hi + (d->lo < h->lo);
 	lo  = S0lo((*a));
@@ -265,32 +261,35 @@ void sha512_process(sha512_context __far *ctx)
 	int t;
 	uint32_t lo, tm;
 	int cy;
-	JSUint64 __far *_w;
+	JSUint64 *workptr;
+	JSUint64 work[16];  // rotating work buffer
 	JSUint64 locals[8];
 
-	for (_w = &(ctx->u.w[0]), t = 0; t < 16; ++_w, ++t)
+	// TODO: replace this with a swap_and_copy function
+	for (t = 0; t < 16; ++t)
 	{
-		_byteswap8(_w);
-	}
-
-	/* prepare the "message schedule"   */
-	for (_w = &(ctx->u.w[16]), t = 16; t < 80; ++_w, ++t)
-	{
-	   cy = 0;
-	   lo = s1lo(_w[-2]);
-	   lo += (tm = _w[-7].lo);     if (lo < tm) cy++;
-	   lo += (tm = s0lo(_w[-15])); if (lo < tm) cy++;
-	   lo += (tm = _w[-16].lo);    if (lo < tm) cy++;
-	   _w[0].lo = lo;
-	   _w[0].hi = cy + s1hi(ctx->u.w[t-2]) + ctx->u.w[t-7].hi + s0hi(ctx->u.w[t-15]) + ctx->u.w[t-16].hi;
+		work[t] = ctx->u.w[t];
+		_byteswap8(&work[t]);
 	}
 
 	_f_memcpy(locals, ctx->h, 64);
 
+	#define _WORK(n) work[(t+n)&0x0F]
 	for (t = 0; t < 80; ++t) {
-		_round(ctx, t, locals);
+		workptr = &_WORK(0);
+		if (t > 15) { // calculate the "message schedule"
+	      cy = 0;
+	      lo = s1lo(_WORK(-2));
+	      lo += (tm = _WORK(-7).lo);     if (lo < tm) cy++;
+	      lo += (tm = s0lo(_WORK(-15))); if (lo < tm) cy++;
+	      lo += (tm = _WORK(-16).lo);    if (lo < tm) cy++;
+	      workptr->lo = lo;
+	      workptr->hi = cy + s1hi(_WORK(-2)) + _WORK(-7).hi + s0hi(_WORK(-15)) + _WORK(-16).hi;
+		}
+		_round(workptr, t, locals);
 	}
-
+	#undef _WORK
+	
 	for (t = 0; t < 8; ++t) {
 		_addto(&locals[t], &ctx->h[t]);
 	}
