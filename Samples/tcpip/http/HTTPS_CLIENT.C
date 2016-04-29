@@ -310,34 +310,36 @@ void httpc_demo(tcp_Socket *sock)
 // a good habit to be in.
 tcp_Socket demosock;
 
-void main()
+int load_certificates(void)
 {
 	int rc;
-	SSL_Cert_t trusted;
+	// Can't store this on the stack (auto) since the HTTP client library stores
+	// a reference to it for use later.
+	static far SSL_Cert_t trusted;
 
 	// First, parse the trusted CA certificates.
-	memset(&trusted, 0, sizeof(trusted));
+	_f_memset(&trusted, 0, sizeof(trusted));
 	rc = SSL_new_cert(&trusted, ca_pem1, SSL_DCERT_XIM, 0);
 	if (rc) {
 		printf("Failed to parse CA certificate 1, rc=%d\n", rc);
-		return;
+		return rc;
 	}
 	rc = SSL_new_cert(&trusted, ca_pem2, SSL_DCERT_XIM, 1 /*append*/);
 	if (rc) {
 		printf("Failed to parse CA certificate 2, rc=%d\n", rc);
-		return;
+		return rc;
 	}
 	rc = SSL_new_cert(&trusted, ca_pem3, SSL_DCERT_XIM, 1 /*append*/);
 	if (rc) {
 		printf("Failed to parse CA certificate 3, rc=%d\n", rc);
-		return;
+		return rc;
 	}
 	rc = SSL_new_cert(&trusted, ca_pem4, SSL_DCERT_XIM, 1 /*append*/);
 	if (rc) {
 		printf("Failed to parse CA certificate 4, rc=%d\n", rc);
-		return;
+		return rc;
 	}
-
+	
 	// Set TLS/SSL options.  These act globally, for all HTTPS connections
 	// until chenged to some other setting.  Normally, this only needs to
 	// be done once at start of program.
@@ -347,7 +349,18 @@ void main()
 						&trusted,				// Have a trusted CA!
 						my_server_policy);	// Test policy callback
 
+	return 0;
+}
 
+int main()
+{
+	int rc;
+	
+	rc = load_certificates();
+	if (rc) {
+		return rc;
+	}
+	
 	// initialize tcp_Socket structure before use
 	memset( &demosock, 0, sizeof(demosock));
 
