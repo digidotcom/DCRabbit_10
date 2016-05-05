@@ -51,9 +51,13 @@
 #ximport "../sample_certs/VerisignClass3PublicPrimaryCA.crt"  ca_pem4
 
 #define MP_SIZE 258			// Recommended to support up to 2048-bit RSA keys.
+//#define MP_SIZE 514			// Support up to 4096-bit RSA keys.
 
 // Comment this out if the Real-Time Clock is set accurately.
 #define X509_NO_RTC_AVAILABLE
+
+// Comment this out if you don't need to support sha384/sha512-signed certs.
+#define X509_ENABLE_SHA512
 
 ///// Configuration Options /////
 
