@@ -5,12 +5,26 @@
    License, v. 2.0. If a copy of the MPL was not distributed with this
    file, You can obtain one at http://mozilla.org/MPL/2.0/.
 */
+/* START LIBRARY DESCRIPTION *********************************************
+X509.LIB
+
+Functions for processing X.509 (SSL/TLS) certificates.
+
+Define the following macros to configure the library:
+
+X509_VERBOSE: enable verbose debugging output
+
+X509_DEBUG: enable function debugging including breakpoints and single-stepping
+
+X509_ENABLE_SHA512: support certificates using sha384 or sha512 signatures
+
+END DESCRIPTION **********************************************************/
 
 /*** BeginHeader */
 #ifndef _X509_H
 #define _X509_H
 /*******************************************************************
-*  WARNING: this file is machine generated.  Do not edit directly. *
+*  WARNING: this file was machine generated, but has since been edited manually
 *******************************************************************/
 #ifndef FUNCPTR
 	#define FUNCPTR *
@@ -29,6 +43,11 @@
 	#define _X509_HEXDUMP(x)
 #endif
 
+#ifdef X509_ENABLE_SHA512
+	#use "sha512.lib"
+#endif
+#use "sha2.lib"
+#use "sha1.lib"
 
 /* Need to include malloc support. We may remove this later */
 #ifndef MALLOC_H_Incl
@@ -1360,6 +1379,7 @@ int _x509_s3_x509_pkcs_oid(struct asn1_oid __far * oid) {
 int _x509_s3_x509_digest_oid(struct asn1_oid __far * oid);
 /*** EndHeader */
 _x509_debug
+// return true for child of 1.2.840.113549.2
 int _x509_s3_x509_digest_oid(struct asn1_oid __far * oid) {
 	return oid->len>=5 &&
 	_x509_s3_x509_rsadsi_oid(oid) &&
@@ -1381,14 +1401,21 @@ int _x509_s3_x509_sha1_oid(struct asn1_oid __far * oid) {
 	oid->oid[5]==26;
 }
 
-/*** BeginHeader _x509_s3_x509_sha256_oid */
-int _x509_s3_x509_sha256_oid(struct asn1_oid __far * oid);
+/*** BeginHeader _x509_s3_x509_nistAlgorithm_oid */
+int _x509_s3_x509_nistAlgorithm_oid(struct asn1_oid __far * oid);
 /*** EndHeader */
-const far unsigned long _sha256_oid[9] = {2, 16, 840, 1, 101, 3, 4, 2, 1};
+const far unsigned long _nistAlgorithm_oid[8] = {2, 16, 840, 1, 101, 3, 4, 2};
+// returns the last element of the OID
 _x509_debug
-int _x509_s3_x509_sha256_oid(struct asn1_oid __far * oid) {
-	return oid->len==9 &&
-   _f_memcmp(&oid->oid, &_sha256_oid, sizeof _sha256_oid)==0;
+int _x509_s3_x509_nistAlgorithm_oid(struct asn1_oid __far * oid) {
+	if (oid->len==9 &&
+   	_f_memcmp(&oid->oid, &_nistAlgorithm_oid, sizeof _nistAlgorithm_oid)==0 &&
+   	oid->oid[8] <= INT_MAX )
+   {
+   	return (int) oid->oid[8];
+   }
+   
+   return -1;
 }
 
 /*** BeginHeader x509_certificate_parse */
@@ -1480,6 +1507,13 @@ struct x509_certificate __far * x509_certificate_parse(char __far * buf, size_t 
 int x509_certificate_check_signature(struct x509_certificate __far * issuer,
 			struct x509_certificate __far * cert, int _yield);
 /*** EndHeader */
+// Values for last element of a PKCS-1 OID (1.2.840.113549.1.1)
+#define _PKCS1_MD5       4      // md5WithRSAEncryption
+#define _PKCS1_SHA1      5      // sha1-with-rsa-signature
+#define _PKCS1_SHA256    11     // sha256WithRSAEncryption
+#define _PKCS1_SHA384    12     // sha384WithRSAEncryption
+#define _PKCS1_SHA512    13     // sha512WithRSAEncryption
+#define _PKCS1_SHA224    14     // sha224WithRSAEncryption
 _x509_debug
 int x509_certificate_check_signature(struct x509_certificate __far * issuer,
 			struct x509_certificate __far * cert, int _yield) {
@@ -1492,10 +1526,16 @@ int x509_certificate_check_signature(struct x509_certificate __far * issuer,
 	size_t data_len; 	// From "x509v3.c":1249
 	struct asn1_hdr hdr; 	// From "x509v3.c":1250
 	struct asn1_oid oid; 	// From "x509v3.c":1251
-	char hash[HMAC_MAX_HASH_SIZE]; 	// From "x509v3.c":1252
+#ifdef X509_ENABLE_SHA512
+	char hash[SHA512_LENGTH];
+#else
+	char hash[SHA256_LENGTH];
+#endif
 	size_t hash_len; 	// From "x509v3.c":1253
+	unsigned long sig_type, expected_sig_type;
+	const char *digest_alg;
 
-
+	// This function handles PKCS-1 signatures (1.2.840.113549.1)
 	if (!_x509_s3_x509_pkcs_oid(&cert->signature.oid) ||
 	cert->signature.oid.len!=7 ||
 	cert->signature.oid.oid[5]!=1) {
@@ -1547,43 +1587,49 @@ int x509_certificate_check_signature(struct x509_certificate __far * issuer,
 		_sys_free(data);
 		return  -1;
 	}
-	if (_x509_s3_x509_sha1_oid(&oid)) {
-		if (cert->signature.oid.oid[6]!=5) {
+	
+	sig_type = cert->signature.oid.oid[6];
+	digest_alg = NULL;
+	switch (_x509_s3_x509_nistAlgorithm_oid(&oid)) {
+		case 1: expected_sig_type = _PKCS1_SHA256;  digest_alg = "SHA256"; break;
+		case 2: expected_sig_type = _PKCS1_SHA384;  digest_alg = "SHA384"; break;
+		case 3: expected_sig_type = _PKCS1_SHA512;  digest_alg = "SHA512"; break;
+		case 4: expected_sig_type = _PKCS1_SHA224;  digest_alg = "SHA224"; break;
+		case -1: // not the nistAlgorithm.hashAlgs OID
+	      if (_x509_s3_x509_sha1_oid(&oid)) {
+	         expected_sig_type = _PKCS1_SHA1;
+	         digest_alg = "SHA1";
+	      }
+			break;
+	}
+	if (digest_alg != NULL) {
+		if (sig_type != expected_sig_type) {
 			_X509_PRINTF((MSG_DEBUG, "X509: digestAlgorithm %s " \
 			 "does not match with certificate " \
-			 "signatureAlgorithm (%lu)" , "SHA1", cert->signature.oid.oid[6]));
+			 "signatureAlgorithm (%lu)", digest_alg, sig_type));
 			_sys_free(data);
 			return  -1;
 		}
 		goto skip_digest_oid;
 	}
-	if (_x509_s3_x509_sha256_oid(&oid)) {
-		if (cert->signature.oid.oid[6]!=11) {
-			_X509_PRINTF((MSG_DEBUG, "X509: digestAlgorithm %s " \
-			 "does not match with certificate " \
-			 "signatureAlgorithm (%lu)" , "SHA256", cert->signature.oid.oid[6]));
-			_sys_free(data);
-			return  -1;
-		}
-		goto skip_digest_oid;
-	}
+	
 	if (!_x509_s3_x509_digest_oid(&oid)) {
 		_X509_PRINTF((MSG_DEBUG, "X509: Unrecognized digestAlgorithm" ));
 		_sys_free(data);
 		return  -1;
 	}
 	switch ((int)(oid.oid[5])) {
-		case 5:
-		if (cert->signature.oid.oid[6]!=4) {
+		case 5:  // md5
+		if (sig_type!=_PKCS1_MD5) {
 			_X509_PRINTF((MSG_DEBUG, "X509: digestAlgorithm %s does " \
 			 "not match with certificate " \
-			 "signatureAlgorithm (%lu)" , "MD5", cert->signature.oid.oid[6]));
+			 "signatureAlgorithm (%lu)" , "MD5", sig_type));
 			_sys_free(data);
 			return  -1;
 		}
 		break;
-		case 2:
-		case 4:
+		case 2:  // md2
+		case 4:  // md4
 		default:
 		_X509_PRINTF((MSG_DEBUG, "X509: Unsupported digestAlgorithm " \
 		 "(%lu)" , oid.oid[5]));
@@ -1602,28 +1648,46 @@ int x509_certificate_check_signature(struct x509_certificate __far * issuer,
 		return  -1;
 	}
 	_X509_HEXDUMP((MSG_MSGDUMP, "X509: Decrypted Digest" , hdr.payload, hdr.length));
-	switch ((int)(cert->signature.oid.oid[6])) {
-		case 4:  // MD5 with RSA encryption
+	switch ((int)(sig_type)) {
+		case _PKCS1_MD5:  // MD5 with RSA encryption
 		md5_vector(1, &cert->tbs_cert_start, &cert->tbs_cert_len, hash);
 		hash_len = HMAC_MD5_HASH_SIZE;
-		_X509_HEXDUMP((MSG_MSGDUMP, "X509: Certificate hash (MD5)" , hash, hash_len));
 		break;
-		case 5:  // SHA-1 with RSA Encryption
+		case _PKCS1_SHA1:  // SHA-1 with RSA Encryption
 		sha1_vector(1, &cert->tbs_cert_start, &cert->tbs_cert_len, hash);
 		hash_len = HMAC_SHA_HASH_SIZE;
-		_X509_HEXDUMP((MSG_MSGDUMP, "X509: Certificate hash (SHA1)" , hash, hash_len));
 		break;
-		case 11: // sha256WithRSAEncryption
-		sha256_vector(1, &cert->tbs_cert_start, &cert->tbs_cert_len, hash);
-		hash_len = HMAC_SHA256_HASH_SIZE;
-		_X509_HEXDUMP((MSG_MSGDUMP, "X509: Certificate hash (SHA256)" , hash, hash_len));
+		case _PKCS1_SHA224: // sha224WithRSAEncryption
+		sha224_vector(1, &cert->tbs_cert_start, &cert->tbs_cert_len, hash);
+		hash_len = SHA224_LENGTH;
       break;
+		case _PKCS1_SHA256: // sha256WithRSAEncryption
+		sha256_vector(1, &cert->tbs_cert_start, &cert->tbs_cert_len, hash);
+		hash_len = SHA256_LENGTH;
+      break;
+#ifdef X509_ENABLE_SHA512
+		case _PKCS1_SHA384: // sha384WithRSAEncryption
+		sha384_vector(1, &cert->tbs_cert_start, &cert->tbs_cert_len, hash);
+		hash_len = SHA384_LENGTH;
+      break;
+		case _PKCS1_SHA512: // sha512WithRSAEncryption
+		sha512_vector(1, &cert->tbs_cert_start, &cert->tbs_cert_len, hash);
+		hash_len = SHA512_LENGTH;
+      break;
+#else
+		case _PKCS1_SHA384: // sha384WithRSAEncryption
+		case _PKCS1_SHA512: // sha512WithRSAEncryption
+		_X509_PRINTF((MSG_INFO, "X509: * #define X509_ENABLE_SHA512 to support " \
+		"this certificate *"));
+#endif
 		default:
 		_X509_PRINTF((MSG_INFO, "X509: Unsupported certificate signature " \
-		 "algorithm (%lu)" , cert->signature.oid.oid[6]));
+		 "algorithm (%lu)" , sig_type));
 		_sys_free(data);
 		return  -1;
 	}
+   _X509_HEXDUMP((MSG_MSGDUMP, "X509: Certificate hash" , hash, hash_len));
+	
 	if (hdr.length!=hash_len ||
 	_f_memcmp(hdr.payload, hash, hdr.length)!=0) {
 		_X509_PRINTF((MSG_INFO, "X509: Certificate Digest does not match " \
