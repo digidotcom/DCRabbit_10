@@ -67,11 +67,14 @@ typedef struct {
    /****************************************************************/
 
 	int	flags;
-#define ASIX_FLAGS_LINKFAIL   	0x0001   // Indicate if the link is down (to
+#define ASIX_FLAGS_LINKFAIL   	0x0001   // Indicate if the link is down 
+														// and the PHY is turned off (to
 														// work around a PHY bug)
 #define ASIX_FLAGS_PHYWORKAROUND	0x0002	// Do we need to perform the AX88796
 														// PHY workaround?
 #define ASIX_FLAGS_NOAUTONEG		0x0004	// has auto-negotiation been disabled?
+#define ASIX_FLAGS_LINKRECOVERY  0x0008   // have we just turned the PHY back
+														// on after a 2-second reset cycle?
 
 	int	(*io_init)();	// func-pointer to the code that sets up the IO strobes
 
@@ -568,11 +571,15 @@ ioe	ld		(ix+ASIX_GPOC),0x10			; normal power, internal PHY
 		jr		neq, .exit
 
 .set_workaround:
-      ; Enable the PHY workaround
+      ; Enable the PHY workaround and set state to "just starting up"
       ld		hl,(ix+[nic]+flags)
-      ld    de,ASIX_FLAGS_PHYWORKAROUND
+      ld    de,_cexpr(ASIX_FLAGS_PHYWORKAROUND | ASIX_FLAGS_LINKRECOVERY)
       or		hl,de
       ld		(ix+[nic]+flags),hl
+
+ioi   ld		(RTC0R), a
+ioi   ld		a, (RTC2R)
+      ld		(ix+[nic]+link_fail_timeout), a
 
 .exit:
 		pop	ix
@@ -832,6 +839,44 @@ asix_external_func int asix_receive(_ASIXConfig * nic)
       ; the AX88796's internal PHY.  Every 2 seconds, a link check is
       ; executed.  If the link is down, then we power down the PHY.  Next
       ; time through this routine, the PHY is powered back up.
+      /*
+      	if ((flags & ASIX_FLAGS_PHYWORKAROUND)
+         	&& !(flags & ASIX_FLAGS_NOAUTONEG))
+         {
+         	if (current_rtc == stored_rtc))
+         	{
+            	if (flags & ASIX_FLAGS_LINKFAIL)
+               {
+               	return 1;
+               }
+            }
+            else if (flags & ASIX_FLAGS_LINKFAIL)
+            {
+            	flags &= ~ASIX_FLAGS_LINKFAIL;
+               flags |= ASIX_FLAGS_LINKRECOVERY;
+               pd_powerup();
+            }
+            else
+            {
+            	if (flags & ASIX_FLAGS_LINKRECOVERY)
+            	{
+               	if (current_rtc - stored_rtc < 10 seconds)
+                  {
+                  	goto .end_link_check;
+                  }
+                  flags &= ~ASIX_FLAGS_LINKRECOVERY;
+            	}
+               stored_rtc = current_rtc;
+               if (! pd_haslink())
+               {
+               	flags |= ASIX_FLAGS_LINKFAIL;
+                  pd_powerdown();
+                  return 1;
+               }
+            }
+         }
+         .end_link_check:
+      */
 
 		; Check if we should actually use the AX88796 PHY workaround
 		ld		hl, (ix+[nic]+flags)
@@ -846,40 +891,30 @@ asix_external_func int asix_receive(_ASIXConfig * nic)
 		and	hl, de
 		jp		nz, .end_link_check
 
-		ld		hl, _cexpr(RTC2R)
-.rtc_link_check:
 		; Latch the RTC registers' content
 ioi	ld		(RTC0R), a
 		; Load byte 2 of the RTC (counts in 2 second increments)
-ioi	ld		a, (hl)
-		; Re-latch the RTC registers' content
-ioi	ld		(RTC0R), a
-		; Verify byte 2 of the RTC (avoid RTC's asynchronous counter ripple)
-ioi	cp		(hl)
-		jr		nz, .rtc_link_check
+      ; no RTC ripple for single-byte read
+ioi	ld		a, (RTC2R)
 
-		; apply the 2-second mask to the latched RTC2R content
-		;  (don't bother, because RTC2R bit 0 is the 2 second counter)
-		;and	0xFF
+      ; save a copy of the reading for storage later
+      ld		b, a
+      
+		; Compare the time of the last call of the link check:
+		sub	(ix+[nic]+link_fail_timeout)   ; A = seconds/2 since last check
+		jp		z, .skip_link_check
 
-		; Compare the time of the last call of the link check
-		;  (skip link checking if still within the same timeout period)
-		cp		(ix+[nic]+link_fail_timeout)
-		jp		nz, .skip_link_check
-
-		; Update the link_fail_timeout with the time of this call
-		ld		(ix+[nic]+link_fail_timeout), a
-
-		; a few seconds have passed, so do the link checking
-		; Check if the linkfail flag is already set
+      ; at least two seconds have passed, do we need to power on PHY?
 		ld		hl, _cexpr(ASIX_FLAGS_LINKFAIL)
 		and	hl, de
-		jr		z, .check_link_failed
-
-		; It is already set--now clear the flag and power up the PHY
-		; Clear the flag
+		jr		z, .check_in_recovery
+      
+      ; clear LINKFAIL flag and set LINKRECOVERY flag
 		ld		hl, _cexpr(~ASIX_FLAGS_LINKFAIL)
 		and	hl, de
+      ex		de, hl
+		ld		hl, _cexpr(ASIX_FLAGS_LINKRECOVERY)
+		or		hl, de
 		ld		(ix+[nic]+flags), hl
 		; Power up the PHY
 		; asix_writephy(nic, 0x10, 0, 0x1200)
@@ -892,11 +927,29 @@ ioi	cp		(hl)
 		asix_internal_call(asix_writephy)
 		add	sp, 8
 		jr		.end_link_check
+      
+.check_in_recovery:      
+		; have we recently powered up the PHY as part of link recovery?
+      ; If so, wait 10 seconds from when we powered it down before checking link
+		ld		hl, _cexpr(ASIX_FLAGS_LINKRECOVERY)
+		and	hl, de
+		jr		z, .not_in_recovery
+      cp		5	; number of 2-second increments before resuming normal operations
+      jr		ltu, .end_link_check
+      
+      ; -- resuming normal operations after 2 seconds off and 8 seconds on
+		; Clear the flag, fall through to other link-checking code
+		ld		hl, _cexpr(~ASIX_FLAGS_LINKRECOVERY)
+		and	hl, de
+		ld		(ix+[nic]+flags), hl
+      
+.not_in_recovery:
+		; Update the link_fail_timeout with the time of this call, see if link up
+		ld		(ix+[nic]+link_fail_timeout), b
 
-.check_link_failed:
 		; initialize link check loop down-counter (register B content)
 		ld		b, 2
-.loop_link_failed:
+.loop_check_link:
 		; preserve the current link check loop down-count value
 		push	bc
 		; Read MII Register 1 (Status Register)
@@ -917,7 +970,7 @@ ioi	cp		(hl)
 		jr		nz, .end_link_check
 
 		; done all link checks?
-		djnz	.loop_link_failed
+		djnz	.loop_check_link
 
 		; The link still shows as being down
 		; Power down AX88796's PHY
@@ -933,7 +986,7 @@ ioi	cp		(hl)
 		add	sp, 8
 		; Set the linkfail flag
 		ld		hl, (ix+[nic]+flags)
-		ld		de, ASIX_FLAGS_LINKFAIL
+		ld		de, _cexpr(ASIX_FLAGS_LINKFAIL)
 		or		hl, de
 		ld		(ix+[nic]+flags), hl
 
