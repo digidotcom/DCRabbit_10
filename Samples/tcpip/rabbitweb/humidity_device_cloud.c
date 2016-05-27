@@ -14,11 +14,11 @@
    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 */
 /*******************************************************************************
-        Samples\TcpIp\RabbitWeb\humidity_idigi.c
+        Samples\tcpip\RabbitWeb\humidity_device_cloud.c
 
-        This works exactly the same as humidity.c, except that iDigi
+        This works exactly the same as humidity.c, except that Device Cloud
         functionality is included to take care of network configuration.
-        See the various samples in Samples\idigi for more details.
+        See the various samples in Samples\Device_Cloud for more details.
 
 *******************************************************************************/
 
@@ -31,7 +31,7 @@
 
 #ifdef USE_IDIGI
 
-	#define IDIGI_PRODUCT "HUMIDITY_IDIGI.C"
+	#define IDIGI_PRODUCT "humidity_device_cloud.c"
 	#define IDIGI_VENDOR "Digi International Inc."
 	#define IDIGI_VENDOR_ID "1234"
 	#define IDIGI_FIRMWARE_ID "1.01.00"
@@ -50,7 +50,7 @@
 	#define ADDP_PASSWORD   "rabbit"
 	#define IDIGI_IFACE_VERBOSE   // This prints interface status when it changes.
 
-	#use "idigi.lib"
+	#use "Device_Cloud.lib"
 
 #else
 // not USE_IDIGI...

@@ -89,7 +89,7 @@
 										// firmware updates.  In particular, set
 										// the appropriate BU_TEMP_USE_* macro
 
-#define IDIGI_PRODUCT "IDIGI_UPD_FIRMWARE.C"
+#define IDIGI_PRODUCT "cloud_update_firmware.c"
 #define IDIGI_VENDOR "Digi International Inc."
 #define IDIGI_VENDOR_ID "1234"
 #define IDIGI_FIRMWARE_ID "1.01.00"
@@ -132,7 +132,7 @@
 // Required only if using TLS, but not using any static Zserver resources.
 #define SSPEC_NO_STATIC
 
-#use "idigi.lib"
+#use "Device_Cloud.lib"
 
 
 

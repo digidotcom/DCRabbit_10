@@ -15,9 +15,10 @@
 */
 /*
 
-	Simple iDigi sample, with TLS security.
+	Simple iDigi sample, with XBee functionality.
 
-	This shows basic use of iDigi to view and change network settings.
+	This shows basic use of iDigi to view and change node settings on an
+   XBee network.
 
 	-----------------------------------------------------------------------
 	Instructions:
@@ -32,10 +33,14 @@
 
 		ROOT_SIZE_4K = 7U
 		XMEMCODE_SIZE = 0x90000
-		_SYS_MALLOC_BLOCKS=10
+		_SYS_MALLOC_BLOCKS=20
 		_FIRMWARE_NAME_=""
 		_FIRMWARE_VERSION_=0x0101
 		_PRIMARY_STATIC_IP="10.10.6.100"
+
+   [Setting _SYS_MALLOC_BLOCKS=20 is required because the RCI XBee
+   interface may use a large amount of RAM initially, which is freed
+	after initialization is complete.]
 
 	The first 3 options may not be necessary (and can be adjusted up or down
 	to suit the particular board being used).  The _FIRMWARE_* macros are
@@ -73,19 +78,46 @@
 	-----------------------------------------------------------------------
 */
 
-// You can comment out either or both of the following, to make a more spartan
-// demo.
-#define IDIGI_USE_TLS		// Required to include TLS support
-#define IDIGI_USE_ADDP		// Required to include ADDP support
+// Use these settings if you want to test with a static configuration.
+// Otherwise, use iDigi defaults (requires DHCP and/or ADDP)
+//#define USE_STATIC_TEST
+#ifdef USE_STATIC_TEST
+	#define TCPCONFIG 6
+	#define _IDIGI_FORCE_FACTORY
+#endif
 
-#define IDIGI_PRODUCT "IDIGI SIMPLE_TLS.C"
+// Uncomment to dump iDigi/RCI traffic (formatted)
+//#define RCI_VERBOSE_XML
+
+// Uncomment to show debug print
+//#define RCI_ZIGBEE_VERBOSE
+
+// Uncomment to allow single stepping in various library code
+//#define IDIGI_DEBUG
+//#define DCRTCP_DEBUG
+//#define ADDP_DEBUG
+//#define PKTDRV_DEBUG
+//#define WPAN_APS_DEBUG
+//#define XBEE_DEVICE_DEBUG
+//#define XBEE_SXA_DEBUG
+//#define XBEE_WPAN_DEBUG
+//#define XBEE_ATCMD_DEBUG
+
+#define IDIGI_IFACE_VERBOSE	// This prints interface status when it changes.
+
+#define IDIGI_USE_XBEE		// Required to include XBee support
+//#define IDIGI_USE_ADDP	// Uncomment to include ADDP support
+//#define IDIGI_USE_TLS		// Uncomment to include TLS support
+
+#define IDIGI_PRODUCT "cloud_simple_xbee.c"
 #define IDIGI_VENDOR "Digi International Inc."
 #define IDIGI_VENDOR_ID "1234"
-#define IDIGI_FIRMWARE_ID "1.01.00"
+#define IDIGI_FIRMWARE_ID "1.01.01"
 #define IDIGI_CONTACT "support@digi.com"
 #define IDIGI_LOCATION "Planet Earth"
-#define IDIGI_DESCRIPTION "Simple iDigi demo"
+#define IDIGI_DESCRIPTION "Simple iDigi+XBee demo"
 #define IDIGI_SERVER "my.devicecloud.com"
+
 
 // Store non-volatile configuration data in the userID block, via the
 // Simple UserID Block FileSystem.  You can use SUBFS to also store a limited
@@ -96,30 +128,11 @@
 
 #define ADDP_PASSWORD	"rabbit"
 
-// Comment this out if the Real-Time Clock is set accurately.
-#define X509_NO_RTC_AVAILABLE
-
-/*
-// Selectively enable the following debugging/diagnostic options when
-// developing new applications.
-#define IDIGI_DEBUG
-#define DCRTCP_DEBUG
-#define ADDP_DEBUG
-#define PKTDRV_DEBUG
-
-#define IDIGI_VERBOSE
-#define DNS_VERBOSE
-#define RABBITWEB_VERBOSE
-#define TLS_VERBOSE
-#define SSL_CERT_VERBOSE
-*/
-#define IDIGI_IFACE_VERBOSE	// This prints interface status when it changes.
-
-
-// Required because we're using TLS, but not using any static Zserver resources.
+// Required only if using TLS, but not using any static Zserver resources.
 #define SSPEC_NO_STATIC
 
-#use "idigi.lib"
+
+#use "Device_Cloud.lib"
 
 
 
@@ -128,12 +141,16 @@
 void main()
 {
 	int rc;
+	char c;
+   char mac[6];
 
 	if (idigi_init())
 		exit(1);
 
-	printf("Hit any key to print network interface status and MAC address\n\n");
-   printf("Note: MAC address is useful for manually adding device to iDigi.\n\n");
+	printf("Hit <space> to print network interface status and MAC address\n");
+	printf("    ?       to print XBee node table\n");
+	printf("    a       to print memory usage\n");
+   printf("\nNote: MAC address is useful for manually adding device to iDigi.\n\n");
 
 _restart:
 
@@ -141,12 +158,19 @@ _restart:
 		rc = idigi_tick();
 
 		if (kbhit()) {
-			getchar();
-			ip_print_ifs();
-         printf("MAC address: %02X%02X%02X:%02X%02X%02X\n",
-            SysIDBlock.macAddr[0], SysIDBlock.macAddr[1], SysIDBlock.macAddr[2],
-            SysIDBlock.macAddr[3], SysIDBlock.macAddr[4], SysIDBlock.macAddr[5]
-            );
+			c = getchar();
+         if (c == ' ') {
+				ip_print_ifs();
+            printf("MAC address: %02X%02X%02X:%02X%02X%02X\n",
+	            SysIDBlock.macAddr[0], SysIDBlock.macAddr[1], SysIDBlock.macAddr[2],
+	            SysIDBlock.macAddr[3], SysIDBlock.macAddr[4], SysIDBlock.macAddr[5]
+	            );
+
+         }
+         else if (c == '?')
+         	sxa_node_table_dump();
+			else if (c == 'a')
+				_sys_malloc_stats();
 		}
 
 	} while (!rc);

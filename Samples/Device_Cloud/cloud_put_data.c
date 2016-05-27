@@ -15,10 +15,7 @@
 */
 /*
 
-	Simple iDigi sample, with XBee functionality.
-
-	This shows basic use of iDigi to view and change node settings on an
-   XBee network.
+	Simple iDigi sample, to show how to put data to the iDigi server.
 
 	-----------------------------------------------------------------------
 	Instructions:
@@ -33,14 +30,10 @@
 
 		ROOT_SIZE_4K = 7U
 		XMEMCODE_SIZE = 0x90000
-		_SYS_MALLOC_BLOCKS=20
+		_SYS_MALLOC_BLOCKS=10
 		_FIRMWARE_NAME_=""
 		_FIRMWARE_VERSION_=0x0101
 		_PRIMARY_STATIC_IP="10.10.6.100"
-
-   [Setting _SYS_MALLOC_BLOCKS=20 is required because the RCI XBee
-   interface may use a large amount of RAM initially, which is freed
-	after initialization is complete.]
 
 	The first 3 options may not be necessary (and can be adjusted up or down
 	to suit the particular board being used).  The _FIRMWARE_* macros are
@@ -76,48 +69,29 @@
 	connect to the iDigi server.
 
 	-----------------------------------------------------------------------
+
+	This sample puts a file to the iDigi server.  You can verify the file
+	contents by going to the Management->Storage page, then double click on
+	the device ID which corresponds to this board.  This will list any
+	files uploaded to the server.
+
+
 */
+#define IDIGI_USE_ADDP		// Required to include ADDP support
+#define IDIGI_USE_DS			// Required to include Data Services support
 
-// Use these settings if you want to test with a static configuration.
-// Otherwise, use iDigi defaults (requires DHCP and/or ADDP)
-//#define USE_STATIC_TEST
-#ifdef USE_STATIC_TEST
-	#define TCPCONFIG 6
-	#define _IDIGI_FORCE_FACTORY
-#endif
+// Uncomment the following to enable TLS security.  In this case, we also
+// send the data to the server via a secure channel.
+//#define IDIGI_USE_TLS		// Required to include TLS support
 
-// Uncomment to dump iDigi/RCI traffic (formatted)
-//#define RCI_VERBOSE_XML
-
-// Uncomment to show debug print
-//#define RCI_ZIGBEE_VERBOSE
-
-// Uncomment to allow single stepping in various library code
-//#define IDIGI_DEBUG
-//#define DCRTCP_DEBUG
-//#define ADDP_DEBUG
-//#define PKTDRV_DEBUG
-//#define WPAN_APS_DEBUG
-//#define XBEE_DEVICE_DEBUG
-//#define XBEE_SXA_DEBUG
-//#define XBEE_WPAN_DEBUG
-//#define XBEE_ATCMD_DEBUG
-
-#define IDIGI_IFACE_VERBOSE	// This prints interface status when it changes.
-
-#define IDIGI_USE_XBEE		// Required to include XBee support
-//#define IDIGI_USE_ADDP	// Uncomment to include ADDP support
-//#define IDIGI_USE_TLS		// Uncomment to include TLS support
-
-#define IDIGI_PRODUCT "IDIGI SIMPLE_XBEE.C"
+#define IDIGI_PRODUCT "cloud_put_data.c"
 #define IDIGI_VENDOR "Digi International Inc."
 #define IDIGI_VENDOR_ID "1234"
-#define IDIGI_FIRMWARE_ID "1.01.01"
+#define IDIGI_FIRMWARE_ID "1.01.00"
 #define IDIGI_CONTACT "support@digi.com"
 #define IDIGI_LOCATION "Planet Earth"
-#define IDIGI_DESCRIPTION "Simple iDigi+XBee demo"
+#define IDIGI_DESCRIPTION "Simple iDigi DS demo"
 #define IDIGI_SERVER "my.devicecloud.com"
-
 
 // Store non-volatile configuration data in the userID block, via the
 // Simple UserID Block FileSystem.  You can use SUBFS to also store a limited
@@ -126,52 +100,124 @@
 #define SUBFS_RESERVE_START 0
 #define SUBFS_RESERVE_END 0
 
+
 #define ADDP_PASSWORD	"rabbit"
+
+// Comment this out if the Real-Time Clock is set accurately.
+#define X509_NO_RTC_AVAILABLE
+
+/*
+// Enable the following debugging/diagnostic options when
+// developing new applications.
+#define IDIGI_DEBUG
+#define DCRTCP_DEBUG
+#define ADDP_DEBUG
+#define PKTDRV_DEBUG
+#define IDIGI_VERBOSE
+#define DNS_VERBOSE
+#define RABBITWEB_VERBOSE
+*/
+
+#define IDIGI_IFACE_VERBOSE	// This prints interface status when it changes.
 
 // Required only if using TLS, but not using any static Zserver resources.
 #define SSPEC_NO_STATIC
 
+#use "Device_Cloud.lib"
 
-#use "idigi.lib"
+// The data we are going to send.  This is a simple string, but arbitrary
+// data can be sent if the appropriate content type parameter is set in
+// the idigi_upload() call.  Whatever the form of the data, it needs to be
+// in memory, and unchanging for the duration of the PUT.
+const char * test_data =
+"This data has been put here by the Rabbit!\r\n";
 
+const char * test_data2 =
+"<MyXML>\n"
+"<foo>This is the foo data</foo>\n"
+"<bar><baz>12345</baz><qux parm=\"attribute value\">QUX data</qux></bar>\n"
+"</MyXML>\n"
+;
 
-
-
+// Static DataSvcsState_t instances are required for each simultaneous PUT
+// transfer.
+DataSvcsState_t dss;
+DataSvcsState_t dss2;
 
 void main()
 {
 	int rc;
-	char c;
-   char mac[6];
+	int sendfile;
 
 	if (idigi_init())
 		exit(1);
 
-	printf("Hit <space> to print network interface status and MAC address\n");
-	printf("    ?       to print XBee node table\n");
-	printf("    a       to print memory usage\n");
-   printf("\nNote: MAC address is useful for manually adding device to iDigi.\n\n");
+	// idigi_init() does not necessarily gain a connection to the iDigi server,
+	// hence we can't use idigi_upload() straight away.  If necessary, the following
+	// loop can be used to wait for a connection.
+	while (idigi_status() == IDIGI_COMING_UP)
+		idigi_tick();
+
+	if (idigi_status() != IDIGI_UP) {
+		printf("iDigi failed to connect to server!\n");
+		exit(1);
+	}
+
+	// Start sending the plaintext data
+   // Append this data to the file each time
+	rc = idigi_upload(&dss, "myFile.txt", "text/plain",
+					test_data, strlen(test_data), IDIGI_DS_OPTION_APPEND);
+	sendfile = 1;
+	if (rc) {
+		printf("Could not start PUT service #1! rc=%d\n", rc);
+		if (rc == -EPERM)
+			printf("...Data service not enabled.  On iDigi web UI, select\n" \
+			       "  Configuration -> mgmtglobal -> Data Service Enabled.\n");
+		else
+			printf("...See documentation for idigi_upload().\n");
+		sendfile = 0;
+	}
+   if (sendfile) {
+	   // Start sending the XML data
+	   // Replace the file each time
+	   rc = idigi_upload(&dss2, "myFile.xml", "text/xml",
+	               test_data2, strlen(test_data2), 0);
+
+	   if (rc)
+	      printf("Could not start PUT service #2! rc=%d\n", rc);
+      else
+      	sendfile |= 2;
+   }
 
 _restart:
 
 	do {
-		rc = idigi_tick();
-
-		if (kbhit()) {
-			c = getchar();
-         if (c == ' ') {
-				ip_print_ifs();
-            printf("MAC address: %02X%02X%02X:%02X%02X%02X\n",
-	            SysIDBlock.macAddr[0], SysIDBlock.macAddr[1], SysIDBlock.macAddr[2],
-	            SysIDBlock.macAddr[3], SysIDBlock.macAddr[4], SysIDBlock.macAddr[5]
-	            );
-
-         }
-         else if (c == '?')
-         	sxa_node_table_dump();
-			else if (c == 'a')
-				_sys_malloc_stats();
+		if (sendfile & 1) {
+			rc = idigi_ds_tick(&dss);
+			if (rc != -EAGAIN) {
+				printf("\nPUT #1 completed, rc = %d\n", rc);
+				if (rc / 100 == 2)	// 2xx code
+					printf("Success!\n\n");
+				else
+					printf("Failed!\n\n");
+				sendfile &= ~1;
+			}
 		}
+		if (sendfile & 2) {
+			rc = idigi_ds_tick(&dss2);
+			if (rc != -EAGAIN) {
+				printf("\nPUT #2 completed, rc = %d\n", rc);
+				if (rc / 100 == 2)	// 2xx code
+					printf("Success!\n\n");
+				else
+					printf("Failed!\n\n");
+				sendfile &= ~2;
+			}
+		}
+
+		// We must tick the idigi server normally while waiting for data service
+      // completion.
+		rc = idigi_tick();
 
 	} while (!rc);
 

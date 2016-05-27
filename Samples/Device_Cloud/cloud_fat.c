@@ -133,7 +133,7 @@
 // send/receive file data via a secure channel.
 //#define IDIGI_USE_TLS
 
-#define IDIGI_PRODUCT "IDIGI_FAT.C"
+#define IDIGI_PRODUCT "cloud_fat.c"
 #define IDIGI_VENDOR "Digi International Inc."
 #define IDIGI_VENDOR_ID "1234"
 #define IDIGI_FIRMWARE_ID "1.01.00"
@@ -174,7 +174,7 @@
 // Required only if using TLS or FAT, but not using any static Zserver resources.
 #define SSPEC_NO_STATIC
 
-#use "idigi.lib"
+#use "Device_Cloud.lib"
 
 
 void main()
