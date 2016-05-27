@@ -52,6 +52,7 @@ int input_number(void)
 	while (1) {
 		inchar = getchar();
 		putchar(inchar); //echo input
+      fflush(stdout);
 		if (inchar == '\n' || inchar == '\r') {
 			return number;
 		}
