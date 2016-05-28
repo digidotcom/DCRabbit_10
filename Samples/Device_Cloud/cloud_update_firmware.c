@@ -142,9 +142,9 @@ void main()
 {
 	int rc;
 
-	// idigi_init() does everything required to start the network and the
+	// cloud_init() does everything required to start the network and the
 	// Device Cloud connection.
-	if (idigi_init())
+	if (cloud_init())
 		exit(1);
 
 _restart:
@@ -153,7 +153,7 @@ _restart:
 		// Insert any work your application needs to do at this point.
 
 		// Drive Device Cloud and the network, until it indicates a special condition.
-		rc = idigi_tick();
+		rc = cloud_tick();
 	} while (!rc);
 
 	printf("Final rc = %d\n", rc);
@@ -167,7 +167,7 @@ _restart:
 		// Device network has been reconfigured by Device Cloud web interface etc.
 		// The network is still up, so applications may use this opportunity
 		// to shut down any in-progress connections cleanly.  The next call
-		// to idigi_tick() will close down the network, reconfigure it,
+		// to cloud_tick() will close down the network, reconfigure it,
 		// then bring it back up.
 		printf("Network reconfiguration in progress...\n");
 	}

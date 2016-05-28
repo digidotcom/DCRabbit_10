@@ -110,7 +110,7 @@
 	are what are sent to the target device.  In this case, a <do_command>
 	element specifies a custom command target is to be invoked.  The
 	target= attribute specifies the target name, which must be registered
-	on the device (see the idigi_register_target() API function).
+	on the device (see the cloud_register_target() API function).
 
 	Inside the <do_command> element, nested elements indicate field names
 	in the object registered for that do_command target (which currently must
@@ -373,21 +373,21 @@ void main()
 {
 	int rc;
 
-	if (idigi_init())
+	if (cloud_init())
 		exit(1);
 
 	// This is where we actually register the cursom do_commands.
 	// Note use of the '#' (enquote) operator to turn the variable
 	// names into strings.  [The double macro indirection is required to
 	// get this to work!].  NOTE: this registration must be done after
-	// idigi_init(), since idigi_init() clears the do_command table.
+	// cloud_init(), since cloud_init() clears the do_command table.
 #define MKS(x) #x
 #define MKSTRING(x) MKS(x)
-	idigi_register_target(TARGET_NAME_1,
+	cloud_register_target(TARGET_NAME_1,
 		MKSTRING(REQ_VAR_NAME_1), MKSTRING(REPLY_VAR_NAME_1));
-	idigi_register_target(TARGET_NAME_2,
+	cloud_register_target(TARGET_NAME_2,
 		MKSTRING(REQ_VAR_NAME_2), MKSTRING(REPLY_VAR_NAME_2));
-	idigi_register_target(TARGET_NAME_3,
+	cloud_register_target(TARGET_NAME_3,
 		MKSTRING(REQ_VAR_NAME_3), MKSTRING(REPLY_VAR_NAME_3));
 
 
@@ -395,7 +395,7 @@ void main()
 _restart:
 
 	do {
-		rc = idigi_tick();
+		rc = cloud_tick();
 	} while (!rc);
 
 	printf("Final rc = %d\n", rc);

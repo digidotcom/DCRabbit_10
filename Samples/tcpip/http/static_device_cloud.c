@@ -123,7 +123,7 @@ void main()
 
 #ifdef USE_IDIGI
 	// Start Device Cloud services
-	if (idigi_init())
+	if (cloud_init())
 		exit(1);
 #else
 	// Start network and wait for interface to come up (or error exit).
@@ -146,7 +146,7 @@ void main()
 
    while (1) {
 #ifdef USE_IDIGI
-		idigi_tick();
+		cloud_tick();
 #endif
       http_handler();
    }

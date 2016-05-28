@@ -127,7 +127,7 @@
 
 // The data we are going to send.  This is a simple string, but arbitrary
 // data can be sent if the appropriate content type parameter is set in
-// the idigi_upload() call.  Whatever the form of the data, it needs to be
+// the cloud_upload() call.  Whatever the form of the data, it needs to be
 // in memory, and unchanging for the duration of the PUT.
 const char * test_data =
 "This data has been put here by the Rabbit!\r\n";
@@ -149,23 +149,23 @@ void main()
 	int rc;
 	int sendfile;
 
-	if (idigi_init())
+	if (cloud_init())
 		exit(1);
 
-	// idigi_init() does not necessarily gain a connection to the Device Cloud server,
-	// hence we can't use idigi_upload() straight away.  If necessary, the following
+	// cloud_init() does not necessarily gain a connection to the Device Cloud server,
+	// hence we can't use cloud_upload() straight away.  If necessary, the following
 	// loop can be used to wait for a connection.
-	while (idigi_status() == IDIGI_COMING_UP)
-		idigi_tick();
+	while (cloud_status() == IDIGI_COMING_UP)
+		cloud_tick();
 
-	if (idigi_status() != IDIGI_UP) {
+	if (cloud_status() != IDIGI_UP) {
 		printf("Device Cloud failed to connect to server!\n");
 		exit(1);
 	}
 
 	// Start sending the plaintext data
    // Append this data to the file each time
-	rc = idigi_upload(&dss, "myFile.txt", "text/plain",
+	rc = cloud_upload(&dss, "myFile.txt", "text/plain",
 					test_data, strlen(test_data), IDIGI_DS_OPTION_APPEND);
 	sendfile = 1;
 	if (rc) {
@@ -174,13 +174,13 @@ void main()
 			printf("...Data service not enabled.  On Device Cloud web UI, select\n" \
 			       "  Configuration -> mgmtglobal -> Data Service Enabled.\n");
 		else
-			printf("...See documentation for idigi_upload().\n");
+			printf("...See documentation for cloud_upload().\n");
 		sendfile = 0;
 	}
    if (sendfile) {
 	   // Start sending the XML data
 	   // Replace the file each time
-	   rc = idigi_upload(&dss2, "myFile.xml", "text/xml",
+	   rc = cloud_upload(&dss2, "myFile.xml", "text/xml",
 	               test_data2, strlen(test_data2), 0);
 
 	   if (rc)
@@ -193,7 +193,7 @@ _restart:
 
 	do {
 		if (sendfile & 1) {
-			rc = idigi_ds_tick(&dss);
+			rc = cloud_ds_tick(&dss);
 			if (rc != -EAGAIN) {
 				printf("\nPUT #1 completed, rc = %d\n", rc);
 				if (rc / 100 == 2)	// 2xx code
@@ -204,7 +204,7 @@ _restart:
 			}
 		}
 		if (sendfile & 2) {
-			rc = idigi_ds_tick(&dss2);
+			rc = cloud_ds_tick(&dss2);
 			if (rc != -EAGAIN) {
 				printf("\nPUT #2 completed, rc = %d\n", rc);
 				if (rc / 100 == 2)	// 2xx code
@@ -215,9 +215,9 @@ _restart:
 			}
 		}
 
-		// We must tick the idigi server normally while waiting for data service
+		// We must tick the server normally while waiting for data service
       // completion.
-		rc = idigi_tick();
+		rc = cloud_tick();
 
 	} while (!rc);
 

@@ -129,7 +129,7 @@ void main()
 {
 	int rc;
 
-	if (idigi_init())
+	if (cloud_init())
 		exit(1);
 
 	printf("Hit any key to print network interface status and MAC address\n\n");
@@ -138,7 +138,7 @@ void main()
 _restart:
 
 	do {
-		rc = idigi_tick();
+		rc = cloud_tick();
 
 		if (kbhit()) {
 			getchar();

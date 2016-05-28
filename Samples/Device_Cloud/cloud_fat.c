@@ -181,20 +181,20 @@ void main()
 {
    int rc;
 
-   if (idigi_init())
+   if (cloud_init())
       exit(1);
 
    // Add a rule to allow the Device Cloud server to access everything on the
-   // first partition.  idigi_get_group() returns the group mask of
-   // the special "idigi" user ID.  (Without this rule, Device Cloud won't be
-   // able to access any files).
+   // first partition.  cloud_get_group() returns the group mask of
+   // the special Device Cloud user ID.  (Without this rule, Device Cloud won't
+   // be able to access any files).
    sspec_addrule("/A/", NULL,
-   			idigi_get_group(), idigi_get_group(), SERVER_IDIGI, 0, NULL);
+   			cloud_get_group(), cloud_get_group(), SERVER_IDIGI, 0, NULL);
 
 _restart:
 
    do {
-      rc = idigi_tick();
+      rc = cloud_tick();
    } while (!rc);
 
    printf("Final rc = %d\n", rc);
