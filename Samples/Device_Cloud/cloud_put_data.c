@@ -21,8 +21,8 @@
 	Instructions:
 	-----------------------------------------------------------------------
 
-	Visit http://developer.idigi.com to create a test account if you have
-	not already done so.  You can also access the iDigi documentation
+	Visit https://devicecloud.digi.com/ to create a test account if you have
+	not already done so.  You can also access the Device Cloud documentation
 	at that site.
 
 	Compile and run this sample.  You may need to place the following
@@ -44,7 +44,7 @@
 	default iDigi network configuration uses DHCP, with a fallback to the
 	given static IP address.
 
-	When running, navigate to developer.idigi.com, log in, and add the
+	When running, navigate to https://devicecloud.digi.com/, log in, and add the
 	board using the '+' button - this is only necessary the first time
 	you run iDigi on a given board.  If you defined IDIGI_USE_ADDP, then the
 	board will automatically appear in the list of devices which may be
