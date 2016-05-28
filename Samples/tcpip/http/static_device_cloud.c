@@ -21,7 +21,7 @@
         See the various samples in Samples\Device_Cloud for more details.
 *******************************************************************************/
 
-// This macro used in this sample to select iDigi functionality.  If commented
+// This macro used in this sample to select Device Cloud functionality.  If commented
 // out, then works exactly like static.c (i.e. just the web interface)
 #define USE_IDIGI
 
@@ -43,12 +43,12 @@
 	#define IDIGI_FIRMWARE_ID "1.01.00"
 	#define IDIGI_CONTACT "support@digi.com"
 	#define IDIGI_LOCATION "Planet Earth"
-	#define IDIGI_DESCRIPTION "Simple iDigi demo"
+	#define IDIGI_DESCRIPTION "Simple Device Cloud demo"
 	#define IDIGI_SERVER "my.devicecloud.com"
 
 	// Store non-volatile configuration data in the userID block, via the
 	// Simple UserID Block FileSystem.  You can use SUBFS to also store a limited
-	// amount of non-iDigi application configuration data.
+	// amount of non-Device Cloud application configuration data.
 	#define IDIGI_USE_SUBFS
 	#define SUBFS_RESERVE_START 0
 	#define SUBFS_RESERVE_END 0
@@ -122,7 +122,7 @@ void main()
 	 */
 
 #ifdef USE_IDIGI
-	// Start iDigi services
+	// Start Device Cloud services
 	if (idigi_init())
 		exit(1);
 #else

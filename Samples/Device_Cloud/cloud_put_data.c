@@ -15,7 +15,7 @@
 */
 /*
 
-	Simple iDigi sample, to show how to put data to the iDigi server.
+	Simple Device Cloud sample, to show how to put data to the Device Cloud server.
 
 	-----------------------------------------------------------------------
 	Instructions:
@@ -41,12 +41,12 @@
 	_PRIMARY_STATIC_IP and related network configuration macros may also
 	be defined to set an initial "factory default" configuration.  See
 	tcpconfig.lib and the network programming manual for details.  The
-	default iDigi network configuration uses DHCP, with a fallback to the
+	default Device Cloud network configuration uses DHCP, with a fallback to the
 	given static IP address.
 
 	When running, navigate to https://devicecloud.digi.com/, log in, and add the
 	board using the '+' button - this is only necessary the first time
-	you run iDigi on a given board.  If you defined IDIGI_USE_ADDP, then the
+	you run Device Cloud on a given board.  If you defined IDIGI_USE_ADDP, then the
 	board will automatically appear in the list of devices which may be
 	added.  When the board is added, you can double click on it to view
 	and change the network configuration settings.
@@ -56,21 +56,21 @@
 	you can simply hit F9 to run the program again (no need to recompile).
 	In a real deployment, exit(0) causes the board to reboot.
 
-	When changing the network configuration using iDigi, the configuration
+	When changing the network configuration using Device Cloud, the configuration
 	is saved in non-volatile storage and will be used next time the program
-	(or any other iDigi sample) is run.  The macro settings you define
-	such as _PRIMARY_STATIC_IP are only used the first time the iDigi samples
-	are run.  Thereafter, it uses any settings set via the iDigi server,
+	(or any other Device Cloud sample) is run.  The macro settings you define
+	such as _PRIMARY_STATIC_IP are only used the first time the Device Cloud samples
+	are run.  Thereafter, it uses any settings set via the Device Cloud server,
 	and saved in flash.
 
 	If you accidentally configure a bad network setting (e.g. by setting a
 	non-existent gateway address), then the board will try to use the
 	last-known-good configuration if the "current" configuration cannot
-	connect to the iDigi server.
+	connect to the Device Cloud server.
 
 	-----------------------------------------------------------------------
 
-	This sample puts a file to the iDigi server.  You can verify the file
+	This sample puts a file to the Device Cloud server.  You can verify the file
 	contents by going to the Management->Storage page, then double click on
 	the device ID which corresponds to this board.  This will list any
 	files uploaded to the server.
@@ -90,12 +90,12 @@
 #define IDIGI_FIRMWARE_ID "1.01.00"
 #define IDIGI_CONTACT "support@digi.com"
 #define IDIGI_LOCATION "Planet Earth"
-#define IDIGI_DESCRIPTION "Simple iDigi DS demo"
+#define IDIGI_DESCRIPTION "Simple Device Cloud DS demo"
 #define IDIGI_SERVER "my.devicecloud.com"
 
 // Store non-volatile configuration data in the userID block, via the
 // Simple UserID Block FileSystem.  You can use SUBFS to also store a limited
-// amount of non-iDigi application configuration data.
+// amount of non-Device Cloud application configuration data.
 #define IDIGI_USE_SUBFS
 #define SUBFS_RESERVE_START 0
 #define SUBFS_RESERVE_END 0
@@ -152,14 +152,14 @@ void main()
 	if (idigi_init())
 		exit(1);
 
-	// idigi_init() does not necessarily gain a connection to the iDigi server,
+	// idigi_init() does not necessarily gain a connection to the Device Cloud server,
 	// hence we can't use idigi_upload() straight away.  If necessary, the following
 	// loop can be used to wait for a connection.
 	while (idigi_status() == IDIGI_COMING_UP)
 		idigi_tick();
 
 	if (idigi_status() != IDIGI_UP) {
-		printf("iDigi failed to connect to server!\n");
+		printf("Device Cloud failed to connect to server!\n");
 		exit(1);
 	}
 
@@ -171,7 +171,7 @@ void main()
 	if (rc) {
 		printf("Could not start PUT service #1! rc=%d\n", rc);
 		if (rc == -EPERM)
-			printf("...Data service not enabled.  On iDigi web UI, select\n" \
+			printf("...Data service not enabled.  On Device Cloud web UI, select\n" \
 			       "  Configuration -> mgmtglobal -> Data Service Enabled.\n");
 		else
 			printf("...See documentation for idigi_upload().\n");

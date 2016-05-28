@@ -16,7 +16,7 @@
    @note sxa.h needs to be included before including this header.
 
    @note This header is sensitive to the macro IDIGI_USE_XBEE.  If defined,
-   then extra fields are included in the table in order to support iDigi.
+   then extra fields are included in the table in order to support Device Cloud.
    Otherwise, the fields are omitted so as to save storage.
 */
 /*** BeginHeader _xbee_reg_table, _xbee_rci_types */

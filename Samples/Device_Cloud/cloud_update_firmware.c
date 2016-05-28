@@ -15,17 +15,17 @@
 */
 /*
 
-	Simple iDigi sample.
+	Simple Device Cloud sample.
 
-	This shows basic use of iDigi to view and change network settings and
+	This shows basic use of Device Cloud to view and change network settings and
 	update firmware.
 
 	-----------------------------------------------------------------------
 	Instructions:
 	-----------------------------------------------------------------------
 
-	It is recommended to run one of the other iDigi samples first.  Those
-	samples have general instructions for connecting to an iDigi server,
+	It is recommended to run one of the other Device Cloud samples first.  Those
+	samples have general instructions for connecting to an Device Cloud server,
 	which are not repeated here.
 
 	This looks rather long and complicated, however much of it is simply to
@@ -41,7 +41,7 @@
 	   .bin file.
 	2. Rename the .bin file (it will be called IDIGI_UPD_FIRMWARE.BIN in the
 	   same directory as this sample code) to, say, NEW_FIRMWARE.BIN
-	3. Change something in this sample that is visible in the iDigi user
+	3. Change something in this sample that is visible in the Device Cloud user
 	   interface.  For example, change IDIGI_DESCRIPTION to some other
 	   string.  This is just so that you can see which firmware is actually
 	   running.
@@ -51,15 +51,15 @@
 	6. Start a terminal program, and direct it to the same COM port as used to
 	   program the target, and set it to 115200bps, 8N1.
 	7. Hit the reset button on the target, or power it off and on.
-	8. You should see it connecting to the iDigi server (assuming you have
+	8. You should see it connecting to the Device Cloud server (assuming you have
 	   correctly configured the network).  The terminal program should show
 	   some initial messages including the device ID.
-	9. Connect to the iDigi server using a modern web browser such as Firefox
+	9. Connect to the Device Cloud server using a modern web browser such as Firefox
 	   or IE7, and log into your test account.
 	10. If the target board is not already in the list of devices, add it
 	   using the '+' button.  Note that device discovery should locate the
 	   target board using ADDP.  You can select it and it will be added
-	   automatically to the iDigi account.
+	   automatically to the Device Cloud account.
 	11. Note the 'Description' field will contain the value you defined for
 	   IDIGI_DESCRIPTION.  (If it doesn't, maybe you were running other samples
 	   before, so try hitting the "refresh" button).
@@ -68,7 +68,7 @@
 	   step (2) and hit "Update Firmware".
 	13. Observe, in the terminal window, that the board starts accepting the
 	   new firmware image, and eventually reboots.  When it reboots, hit
-	   "refresh" in the iDigi user interface.  You should see the original
+	   "refresh" in the Device Cloud user interface.  You should see the original
 	   description (i.e. "Update me!").
 	14. You can also try uploading a bad file.  The target should reject it
 	   and the upload will fail (unless, of course, you picked a valid .bin
@@ -100,7 +100,7 @@
 
 // Store non-volatile configuration data in the userID block, via the
 // Simple UserID Block FileSystem.  You can use SUBFS to also store a limited
-// amount of non-iDigi application configuration data.
+// amount of non-Device Cloud application configuration data.
 #define IDIGI_USE_SUBFS
 #define SUBFS_RESERVE_START 0
 #define SUBFS_RESERVE_END 0
@@ -143,7 +143,7 @@ void main()
 	int rc;
 
 	// idigi_init() does everything required to start the network and the
-	// iDigi connection.
+	// Device Cloud connection.
 	if (idigi_init())
 		exit(1);
 
@@ -152,7 +152,7 @@ _restart:
 	do {
 		// Insert any work your application needs to do at this point.
 
-		// Drive iDigi and the network, until it indicates a special condition.
+		// Drive Device Cloud and the network, until it indicates a special condition.
 		rc = idigi_tick();
 	} while (!rc);
 
@@ -164,7 +164,7 @@ _restart:
 		exit(0);
 	}
 	if (rc == -NETERR_NONE) {
-		// Device network has been reconfigured by iDigi web interface etc.
+		// Device network has been reconfigured by Device Cloud web interface etc.
 		// The network is still up, so applications may use this opportunity
 		// to shut down any in-progress connections cleanly.  The next call
 		// to idigi_tick() will close down the network, reconfigure it,
