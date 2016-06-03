@@ -15,14 +15,14 @@
 */
 /*
 
-   Simple iDigi sample, to demonstrate FAT filesystem.
+   Simple Device Cloud sample, to demonstrate FAT filesystem.
 
    -----------------------------------------------------------------------
    Instructions:
    -----------------------------------------------------------------------
 
-   Visit http://developer.idigi.com to create a test account if you have
-   not already done so.  You can also access the iDigi documentation
+   Visit https://devicecloud.digi.com/ to create a test account if you have
+   not already done so.  You can also access the Device Cloud documentation
    at that site.
 
    Compile and run this sample.  You may need to place the following
@@ -37,16 +37,16 @@
 
    The first 3 options may not be necessary (and can be adjusted up or down
    to suit the particular board being used).  The _FIRMWARE_* macros are
-   needed if you enable firmware updates by defining IDIGI_USE_RPU.
+   needed if you enable firmware updates by defining CLOUD_USE_RPU.
    _PRIMARY_STATIC_IP and related network configuration macros may also
    be defined to set an initial "factory default" configuration.  See
    tcpconfig.lib and the network programming manual for details.  The
-   default iDigi network configuration uses DHCP, with a fallback to the
+   default Device Cloud network configuration uses DHCP, with a fallback to the
    given static IP address.
 
-   When running, navigate to developer.idigi.com, log in, and add the
+   When running, navigate to https://devicecloud.digi.com/, log in, and add the
    board using the '+' button - this is only necessary the first time
-   you run iDigi on a given board.  If you defined IDIGI_USE_ADDP, then the
+   you run Device Cloud on a given board.  If you defined CLOUD_USE_ADDP, then the
    board will automatically appear in the list of devices which may be
    added.  When the board is added, you can double click on it to view
    and change the network configuration settings.
@@ -56,22 +56,22 @@
    you can simply hit F9 to run the program again (no need to recompile).
    In a real deployment, exit(0) causes the board to reboot.
 
-   When changing the network configuration using iDigi, the configuration
+   When changing the network configuration using Device Cloud, the configuration
    is saved in non-volatile storage and will be used next time the program
-   (or any other iDigi sample) is run.  The macro settings you define
-   such as _PRIMARY_STATIC_IP are only used the first time the iDigi samples
-   are run.  Thereafter, it uses any settings set via the iDigi server,
+   (or any other Device Cloud sample) is run.  The macro settings you define
+   such as _PRIMARY_STATIC_IP are only used the first time the Device Cloud samples
+   are run.  Thereafter, it uses any settings set via the Device Cloud server,
    and saved in flash.
 
    If you accidentally configure a bad network setting (e.g. by setting a
    non-existent gateway address), then the board will try to use the
    last-known-good configuration if the "current" configuration cannot
-   connect to the iDigi server.
+   connect to the Device Cloud server.
 
    -----------------------------------------------------------------------
 
 
-   To do something with this sample, go to the iDigi user interface
+   To do something with this sample, go to the Device Cloud user interface
    and select the "Web Services Console".
 
    1. Seelct your target device using the SCI Targets button.
@@ -126,26 +126,26 @@
       order to execute a sequence of operations.
 
 */
-#define IDIGI_USE_FAT       // Required to include FAT filesystem support
-//#define IDIGI_USE_ADDP     // Uncomment to include ADDP support
+#define CLOUD_USE_FAT       // Required to include FAT filesystem support
+//#define CLOUD_USE_ADDP     // Uncomment to include ADDP support
 
 // Uncomment the following to enable TLS security.  In this case, we also
 // send/receive file data via a secure channel.
-//#define IDIGI_USE_TLS
+//#define CLOUD_USE_TLS
 
-#define IDIGI_PRODUCT "IDIGI_FAT.C"
-#define IDIGI_VENDOR "Digi International Inc."
-#define IDIGI_VENDOR_ID "1234"
-#define IDIGI_FIRMWARE_ID "1.01.00"
-#define IDIGI_CONTACT "support@digi.com"
-#define IDIGI_LOCATION "Planet Earth"
-#define IDIGI_DESCRIPTION "Simple iDigi FAT demo"
-#define IDIGI_SERVER "my.devicecloud.com"
+#define CLOUD_PRODUCT "cloud_fat.c"
+#define CLOUD_VENDOR "Digi International Inc."
+#define CLOUD_VENDOR_ID "1234"
+#define CLOUD_FIRMWARE_ID "1.01.00"
+#define CLOUD_CONTACT "support@digi.com"
+#define CLOUD_LOCATION "Planet Earth"
+#define CLOUD_DESCRIPTION "Simple Device Cloud FAT demo"
+#define CLOUD_SERVER "my.devicecloud.com"
 
 // Store non-volatile configuration data in the userID block, via the
 // Simple UserID Block FileSystem.  You can use SUBFS to also store a limited
-// amount of non-iDigi application configuration data.
-#define IDIGI_USE_SUBFS
+// amount of non-Device Cloud application configuration data.
+#define CLOUD_USE_SUBFS
 #define SUBFS_RESERVE_START 0
 #define SUBFS_RESERVE_END 0
 
@@ -158,9 +158,9 @@
 /*
 // Selectively enable the following debugging/diagnostic options when
 // developing new applications.
-#define IDIGI_DEBUG
+#define CLOUD_DEBUG
 #define ZSERVER_DEBUG
-#define IDIGI_VERBOSE
+#define CLOUD_VERBOSE
 #define ZSERVER_VERBOSE
 #define DCRTCP_DEBUG
 #define ADDP_DEBUG
@@ -169,32 +169,32 @@
 #define RABBITWEB_VERBOSE
 */
 
-#define IDIGI_IFACE_VERBOSE   // This prints interface status when it changes.
+#define CLOUD_IFACE_VERBOSE   // This prints interface status when it changes.
 
 // Required only if using TLS or FAT, but not using any static Zserver resources.
 #define SSPEC_NO_STATIC
 
-#use "idigi.lib"
+#use "Device_Cloud.lib"
 
 
 void main()
 {
    int rc;
 
-   if (idigi_init())
+   if (cloud_init())
       exit(1);
 
-   // Add a rule to allow the iDigi server to access everything on the
-   // first partition.  idigi_get_group() returns the group mask of
-   // the special "idigi" user ID.  (Without this rule, iDigi won't be
-   // able to access any files).
+   // Add a rule to allow the Device Cloud server to access everything on the
+   // first partition.  cloud_get_group() returns the group mask of
+   // the special Device Cloud user ID.  (Without this rule, Device Cloud won't
+   // be able to access any files).
    sspec_addrule("/A/", NULL,
-   			idigi_get_group(), idigi_get_group(), SERVER_IDIGI, 0, NULL);
+   			cloud_get_group(), cloud_get_group(), SERVER_CLOUD, 0, NULL);
 
 _restart:
 
    do {
-      rc = idigi_tick();
+      rc = cloud_tick();
    } while (!rc);
 
    printf("Final rc = %d\n", rc);

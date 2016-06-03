@@ -12,10 +12,10 @@
 	@file xbee/reg_descr.h
 	Header for XBee register descriptors
 
-   @note This header is sensitive to the value of the macro IDIGI_USE_XBEE.
+   @note This header is sensitive to the value of the macro CLOUD_USE_XBEE.
    If this macro is defined, some additional fields in the register descriptor
    structure are defined (and initialized).  This data is required for
-   iDigi support to be included.
+   Device Cloud support to be included.
 
 */
 #ifndef __XBEE_REG_DESCR
@@ -23,7 +23,7 @@
 
 #include "xbee/platform.h"
 
-/// iDigi RCI type names used by do_command type=zigbee.  This table is used
+/// Device Cloud RCI type names used by do_command type=zigbee.  This table is used
 /// so as to avoid having XBEE_RCI_TYPE_STRING pointers in the register
 /// descriptor table.
 typedef enum
@@ -66,23 +66,23 @@ typedef struct _xbee_reg_descr_t
        it really is necessary to change one of these registers, the gateway
        bit in M can be reset before applying the above bitmask test.
 
-       @note This mask behavior is derived from NDS and is used by iDigi.
+       @note This mask behavior is derived from NDS and is used by Device Cloud.
    */
    uint16_t		cxval;
 	/// RCI type
    _xbee_rci_type_t		rci_type;
-#ifdef IDIGI_USE_XBEE
-	/// If iDigi support: RCI element name for this register
+#ifdef CLOUD_USE_XBEE
+	/// If Device Cloud support: RCI element name for this register
 	const char *rci_element;
-	/// If iDigi support: register description string
+	/// If Device Cloud support: register description string
    const char *desc;
-	/// If iDigi support: "units" element value for query descriptor
+	/// If Device Cloud support: "units" element value for query descriptor
    const char *units;
 	// Note: these are stored as strings since it results in less storage
    // use compared with 32-bit numbers, plus the format is correct for RCI.
-	/// If iDigi support: "min" element value for query descriptor
+	/// If Device Cloud support: "min" element value for query descriptor
    const char *min;
-	/// If iDigi support: "max" element value for query descriptor
+	/// If Device Cloud support: "max" element value for query descriptor
    const char *max;
 #endif
 	/// Offset in SXA node structure of cached field value

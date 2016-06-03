@@ -15,15 +15,15 @@
 */
 /*
 
-	Simple iDigi sample to demonstrate registration of a custom
+	Simple Device Cloud sample to demonstrate registration of a custom
 	"do_command" target.
 
 	-----------------------------------------------------------------------
 	Instructions:
 	-----------------------------------------------------------------------
 
-	Visit http://developer.idigi.com to create a test account if you have
-	not already done so.  You can also access the iDigi documentation
+	Visit https://devicecloud.digi.com/ to create a test account if you have
+	not already done so.  You can also access the Device Cloud documentation
 	at that site.
 
 	Compile and run this sample.  You may need to place the following
@@ -40,16 +40,16 @@
 
 	The first 3 options may not be necessary (and can be adjusted up or down
 	to suit the particular board being used).  The _FIRMWARE_* macros are
-	needed if you enable firmware updates by defining IDIGI_USE_RPU.
+	needed if you enable firmware updates by defining CLOUD_USE_RPU.
 	_PRIMARY_STATIC_IP and related network configuration macros may also
 	be defined to set an initial "factory default" configuration.  See
 	tcpconfig.lib and the network programming manual for details.  The
-	default iDigi network configuration uses DHCP, with a fallback to the
+	default Device Cloud network configuration uses DHCP, with a fallback to the
 	given static IP address.
 
-	When running, navigate to developer.idigi.com, log in, and add the
+	When running, navigate to https://devicecloud.digi.com/, log in, and add the
 	board using the '+' button - this is only necessary the first time
-	you run iDigi on a given board.  If you defined IDIGI_USE_ADDP, then the
+	you run Device Cloud on a given board.  If you defined CLOUD_USE_ADDP, then the
 	board will automatically appear in the list of devices which may be
 	added.  When the board is added, you can double click on it to view
 	and change the network configuration settings.
@@ -59,30 +59,30 @@
 	you can simply hit F9 to run the program again (no need to recompile).
 	In a real deployment, exit(0) causes the board to reboot.
 
-	When changing the network configuration using iDigi, the configuration
+	When changing the network configuration using Device Cloud, the configuration
 	is saved in non-volatile storage and will be used next time the program
-	(or any other iDigi sample) is run.  The macro settings you define
-	such as _PRIMARY_STATIC_IP are only used the first time the iDigi samples
-	are run.  Thereafter, it uses any settings set via the iDigi server,
+	(or any other Device Cloud sample) is run.  The macro settings you define
+	such as _PRIMARY_STATIC_IP are only used the first time the Device Cloud samples
+	are run.  Thereafter, it uses any settings set via the Device Cloud server,
 	and saved in flash.
 
 	If you accidentally configure a bad network setting (e.g. by setting a
 	non-existent gateway address), then the board will try to use the
 	last-known-good configuration if the "current" configuration cannot
-	connect to the iDigi server.
+	connect to the Device Cloud server.
 
 	-----------------------------------------------------------------------
 
-	The following gives a brief overview of custom do_command use with iDigi.
+	The following gives a brief overview of custom do_command use with Device Cloud.
 
-	iDigi allows web applications to send commands to some or all devices
-	governed by an iDigi account.  The mechanism is to POST the following
-	type of command to the iDigi server.  This is an example, and assumes
+	Device Cloud allows web applications to send commands to some or all devices
+	governed by an Device Cloud account.  The mechanism is to POST the following
+	type of command to the Device Cloud server.  This is an example, and assumes
 	use of the Firefox "Poster" plug-in:
 
 	set URL field to
 		http://my.devicecloud.com/ws/sci
-	userid and password to iDigi account information.
+	userid and password to Device Cloud account information.
 
 	Post following xml to server (content type application/xml):
 
@@ -102,7 +102,7 @@
 
 
 	The important parts of the above are the <targets>, which is a list
-	of device IDs to which the iDigi server will send the request.  The
+	of device IDs to which the Device Cloud server will send the request.  The
 	above example has only one device (and you should be careful to set
 	it to the appropriate ID).
 
@@ -110,7 +110,7 @@
 	are what are sent to the target device.  In this case, a <do_command>
 	element specifies a custom command target is to be invoked.  The
 	target= attribute specifies the target name, which must be registered
-	on the device (see the idigi_register_target() API function).
+	on the device (see the cloud_register_target() API function).
 
 	Inside the <do_command> element, nested elements indicate field names
 	in the object registered for that do_command target (which currently must
@@ -139,7 +139,7 @@
 	shows how to specify a different reply than request.  The third shows
 	how to make a command that takes no parameters.
 
-	To test this, POST the following data to the iDigi server:
+	To test this, POST the following data to the Device Cloud server:
 
 	<sci_request version="1.0">
 	   <send_message>
@@ -199,22 +199,22 @@
 
 // You can comment out either or both of the following, to make a more spartan
 // demo.
-//#define IDIGI_USE_TLS		// Required to include TLS support
-#define IDIGI_USE_ADDP		// Required to include ADDP support
+//#define CLOUD_USE_TLS		// Required to include TLS support
+#define CLOUD_USE_ADDP		// Required to include ADDP support
 
-#define IDIGI_PRODUCT "IDIGI_DO_COMMAND.C"
-#define IDIGI_VENDOR "Digi International Inc."
-#define IDIGI_VENDOR_ID "1234"
-#define IDIGI_FIRMWARE_ID "1.01.00"
-#define IDIGI_CONTACT "support@digi.com"
-#define IDIGI_LOCATION "Planet Earth"
-#define IDIGI_DESCRIPTION "Simple iDigi demo"
-#define IDIGI_SERVER "my.devicecloud.com"
+#define CLOUD_PRODUCT "cloud_do_command.c"
+#define CLOUD_VENDOR "Digi International Inc."
+#define CLOUD_VENDOR_ID "1234"
+#define CLOUD_FIRMWARE_ID "1.01.00"
+#define CLOUD_CONTACT "support@digi.com"
+#define CLOUD_LOCATION "Planet Earth"
+#define CLOUD_DESCRIPTION "Simple Device Cloud demo"
+#define CLOUD_SERVER "my.devicecloud.com"
 
 // Store non-volatile configuration data in the userID block, via the
 // Simple UserID Block FileSystem.  You can use SUBFS to also store a limited
-// amount of non-iDigi application configuration data.
-#define IDIGI_USE_SUBFS
+// amount of non-Device Cloud application configuration data.
+#define CLOUD_USE_SUBFS
 #define SUBFS_RESERVE_START 0
 #define SUBFS_RESERVE_END 0
 
@@ -226,20 +226,20 @@
 // Enable the following debugging/diagnostic options when
 // developing new applications.
 /*
-#define IDIGI_DEBUG
+#define CLOUD_DEBUG
 #define DCRTCP_DEBUG
 #define ADDP_DEBUG
 #define PKTDRV_DEBUG
-#define IDIGI_VERBOSE
+#define CLOUD_VERBOSE
 #define DNS_VERBOSE
 #define RABBITWEB_VERBOSE
 */
-#define IDIGI_IFACE_VERBOSE	// This prints interface status when it changes.
+#define CLOUD_IFACE_VERBOSE	// This prints interface status when it changes.
 
 // Required only if using TLS, but not using any static Zserver resources.
 #define SSPEC_NO_STATIC
 
-#use "idigi.lib"
+#use "Device_Cloud.lib"
 
 
 
@@ -322,7 +322,7 @@ struct {
  RabbitWeb structure update transaction.  If the transaction executes
  successfully, it calls the registered update function.
 
- With iDigi do_commands, the update function will normally perform the
+ With Device Cloud do_commands, the update function will normally perform the
  required operation, then set fields in the reply structure, which is then
  formatted as XML and returned to the requesting server.
  ==========================================================================*/
@@ -373,21 +373,21 @@ void main()
 {
 	int rc;
 
-	if (idigi_init())
+	if (cloud_init())
 		exit(1);
 
 	// This is where we actually register the cursom do_commands.
 	// Note use of the '#' (enquote) operator to turn the variable
 	// names into strings.  [The double macro indirection is required to
 	// get this to work!].  NOTE: this registration must be done after
-	// idigi_init(), since idigi_init() clears the do_command table.
+	// cloud_init(), since cloud_init() clears the do_command table.
 #define MKS(x) #x
 #define MKSTRING(x) MKS(x)
-	idigi_register_target(TARGET_NAME_1,
+	cloud_register_target(TARGET_NAME_1,
 		MKSTRING(REQ_VAR_NAME_1), MKSTRING(REPLY_VAR_NAME_1));
-	idigi_register_target(TARGET_NAME_2,
+	cloud_register_target(TARGET_NAME_2,
 		MKSTRING(REQ_VAR_NAME_2), MKSTRING(REPLY_VAR_NAME_2));
-	idigi_register_target(TARGET_NAME_3,
+	cloud_register_target(TARGET_NAME_3,
 		MKSTRING(REQ_VAR_NAME_3), MKSTRING(REPLY_VAR_NAME_3));
 
 
@@ -395,7 +395,7 @@ void main()
 _restart:
 
 	do {
-		rc = idigi_tick();
+		rc = cloud_tick();
 	} while (!rc);
 
 	printf("Final rc = %d\n", rc);

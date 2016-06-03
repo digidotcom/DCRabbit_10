@@ -371,9 +371,9 @@ typedef struct sxa_node_t
 	/// You always want both, so there is a command list to get them.
    addr64				dest_addr;
 
-   // Miscellaneous cached data.  This is mainly to support iDigi which
+   // Miscellaneous cached data.  This is mainly to support Device Cloud which
    // wants access to all possible device registers.  The names of the
-   // fields correspond to the iDigi RCI element tags in
+   // fields correspond to the Device Cloud RCI element tags in
    // <do_command target="zigbee"><query_state>...
    sxa_cached_uint8_t		aggregation;
    sxa_cached_uint8_t		assoc_led;
