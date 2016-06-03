@@ -37,7 +37,7 @@
 
    The first 3 options may not be necessary (and can be adjusted up or down
    to suit the particular board being used).  The _FIRMWARE_* macros are
-   needed if you enable firmware updates by defining IDIGI_USE_RPU.
+   needed if you enable firmware updates by defining CLOUD_USE_RPU.
    _PRIMARY_STATIC_IP and related network configuration macros may also
    be defined to set an initial "factory default" configuration.  See
    tcpconfig.lib and the network programming manual for details.  The
@@ -46,7 +46,7 @@
 
    When running, navigate to https://devicecloud.digi.com/, log in, and add the
    board using the '+' button - this is only necessary the first time
-   you run Device Cloud on a given board.  If you defined IDIGI_USE_ADDP, then the
+   you run Device Cloud on a given board.  If you defined CLOUD_USE_ADDP, then the
    board will automatically appear in the list of devices which may be
    added.  When the board is added, you can double click on it to view
    and change the network configuration settings.
@@ -126,26 +126,26 @@
       order to execute a sequence of operations.
 
 */
-#define IDIGI_USE_FAT       // Required to include FAT filesystem support
-//#define IDIGI_USE_ADDP     // Uncomment to include ADDP support
+#define CLOUD_USE_FAT       // Required to include FAT filesystem support
+//#define CLOUD_USE_ADDP     // Uncomment to include ADDP support
 
 // Uncomment the following to enable TLS security.  In this case, we also
 // send/receive file data via a secure channel.
-//#define IDIGI_USE_TLS
+//#define CLOUD_USE_TLS
 
-#define IDIGI_PRODUCT "cloud_fat.c"
-#define IDIGI_VENDOR "Digi International Inc."
-#define IDIGI_VENDOR_ID "1234"
-#define IDIGI_FIRMWARE_ID "1.01.00"
-#define IDIGI_CONTACT "support@digi.com"
-#define IDIGI_LOCATION "Planet Earth"
-#define IDIGI_DESCRIPTION "Simple Device Cloud FAT demo"
-#define IDIGI_SERVER "my.devicecloud.com"
+#define CLOUD_PRODUCT "cloud_fat.c"
+#define CLOUD_VENDOR "Digi International Inc."
+#define CLOUD_VENDOR_ID "1234"
+#define CLOUD_FIRMWARE_ID "1.01.00"
+#define CLOUD_CONTACT "support@digi.com"
+#define CLOUD_LOCATION "Planet Earth"
+#define CLOUD_DESCRIPTION "Simple Device Cloud FAT demo"
+#define CLOUD_SERVER "my.devicecloud.com"
 
 // Store non-volatile configuration data in the userID block, via the
 // Simple UserID Block FileSystem.  You can use SUBFS to also store a limited
 // amount of non-Device Cloud application configuration data.
-#define IDIGI_USE_SUBFS
+#define CLOUD_USE_SUBFS
 #define SUBFS_RESERVE_START 0
 #define SUBFS_RESERVE_END 0
 
@@ -158,9 +158,9 @@
 /*
 // Selectively enable the following debugging/diagnostic options when
 // developing new applications.
-#define IDIGI_DEBUG
+#define CLOUD_DEBUG
 #define ZSERVER_DEBUG
-#define IDIGI_VERBOSE
+#define CLOUD_VERBOSE
 #define ZSERVER_VERBOSE
 #define DCRTCP_DEBUG
 #define ADDP_DEBUG
@@ -169,7 +169,7 @@
 #define RABBITWEB_VERBOSE
 */
 
-#define IDIGI_IFACE_VERBOSE   // This prints interface status when it changes.
+#define CLOUD_IFACE_VERBOSE   // This prints interface status when it changes.
 
 // Required only if using TLS or FAT, but not using any static Zserver resources.
 #define SSPEC_NO_STATIC
@@ -189,7 +189,7 @@ void main()
    // the special Device Cloud user ID.  (Without this rule, Device Cloud won't
    // be able to access any files).
    sspec_addrule("/A/", NULL,
-   			cloud_get_group(), cloud_get_group(), SERVER_IDIGI, 0, NULL);
+   			cloud_get_group(), cloud_get_group(), SERVER_CLOUD, 0, NULL);
 
 _restart:
 

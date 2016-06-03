@@ -12,7 +12,7 @@
 	@file xbee/reg_descr.h
 	Header for XBee register descriptors
 
-   @note This header is sensitive to the value of the macro IDIGI_USE_XBEE.
+   @note This header is sensitive to the value of the macro CLOUD_USE_XBEE.
    If this macro is defined, some additional fields in the register descriptor
    structure are defined (and initialized).  This data is required for
    Device Cloud support to be included.
@@ -71,7 +71,7 @@ typedef struct _xbee_reg_descr_t
    uint16_t		cxval;
 	/// RCI type
    _xbee_rci_type_t		rci_type;
-#ifdef IDIGI_USE_XBEE
+#ifdef CLOUD_USE_XBEE
 	/// If Device Cloud support: RCI element name for this register
 	const char *rci_element;
 	/// If Device Cloud support: register description string

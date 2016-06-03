@@ -40,7 +40,7 @@
 
 	The first 3 options may not be necessary (and can be adjusted up or down
 	to suit the particular board being used).  The _FIRMWARE_* macros are
-	needed if you enable firmware updates by defining IDIGI_USE_RPU.
+	needed if you enable firmware updates by defining CLOUD_USE_RPU.
 	_PRIMARY_STATIC_IP and related network configuration macros may also
 	be defined to set an initial "factory default" configuration.  See
 	tcpconfig.lib and the network programming manual for details.  The
@@ -49,7 +49,7 @@
 
 	When running, navigate to https://devicecloud.digi.com/, log in, and add the
 	board using the '+' button - this is only necessary the first time
-	you run Device Cloud on a given board.  If you defined IDIGI_USE_ADDP, then the
+	you run Device Cloud on a given board.  If you defined CLOUD_USE_ADDP, then the
 	board will automatically appear in the list of devices which may be
 	added.  When the board is added, you can double click on it to view
 	and change the network configuration settings.
@@ -199,22 +199,22 @@
 
 // You can comment out either or both of the following, to make a more spartan
 // demo.
-//#define IDIGI_USE_TLS		// Required to include TLS support
-#define IDIGI_USE_ADDP		// Required to include ADDP support
+//#define CLOUD_USE_TLS		// Required to include TLS support
+#define CLOUD_USE_ADDP		// Required to include ADDP support
 
-#define IDIGI_PRODUCT "cloud_do_command.c"
-#define IDIGI_VENDOR "Digi International Inc."
-#define IDIGI_VENDOR_ID "1234"
-#define IDIGI_FIRMWARE_ID "1.01.00"
-#define IDIGI_CONTACT "support@digi.com"
-#define IDIGI_LOCATION "Planet Earth"
-#define IDIGI_DESCRIPTION "Simple Device Cloud demo"
-#define IDIGI_SERVER "my.devicecloud.com"
+#define CLOUD_PRODUCT "cloud_do_command.c"
+#define CLOUD_VENDOR "Digi International Inc."
+#define CLOUD_VENDOR_ID "1234"
+#define CLOUD_FIRMWARE_ID "1.01.00"
+#define CLOUD_CONTACT "support@digi.com"
+#define CLOUD_LOCATION "Planet Earth"
+#define CLOUD_DESCRIPTION "Simple Device Cloud demo"
+#define CLOUD_SERVER "my.devicecloud.com"
 
 // Store non-volatile configuration data in the userID block, via the
 // Simple UserID Block FileSystem.  You can use SUBFS to also store a limited
 // amount of non-Device Cloud application configuration data.
-#define IDIGI_USE_SUBFS
+#define CLOUD_USE_SUBFS
 #define SUBFS_RESERVE_START 0
 #define SUBFS_RESERVE_END 0
 
@@ -226,15 +226,15 @@
 // Enable the following debugging/diagnostic options when
 // developing new applications.
 /*
-#define IDIGI_DEBUG
+#define CLOUD_DEBUG
 #define DCRTCP_DEBUG
 #define ADDP_DEBUG
 #define PKTDRV_DEBUG
-#define IDIGI_VERBOSE
+#define CLOUD_VERBOSE
 #define DNS_VERBOSE
 #define RABBITWEB_VERBOSE
 */
-#define IDIGI_IFACE_VERBOSE	// This prints interface status when it changes.
+#define CLOUD_IFACE_VERBOSE	// This prints interface status when it changes.
 
 // Required only if using TLS, but not using any static Zserver resources.
 #define SSPEC_NO_STATIC

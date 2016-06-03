@@ -23,7 +23,7 @@
 
 // This macro used in this sample to select Device Cloud functionality.  If commented
 // out, then works exactly like static.c (i.e. just the web interface)
-#define USE_IDIGI
+#define USE_DEVICE_CLOUD
 
 /*
  *  The TIMEZONE compiler setting gives the number of hours from
@@ -35,32 +35,32 @@
 #define TIMEZONE        -8
 
 
-#ifdef USE_IDIGI
+#ifdef USE_DEVICE_CLOUD
 
-	#define IDIGI_PRODUCT "static_device_cloud.c"
-	#define IDIGI_VENDOR "Digi International Inc."
-	#define IDIGI_VENDOR_ID "1234"
-	#define IDIGI_FIRMWARE_ID "1.01.00"
-	#define IDIGI_CONTACT "support@digi.com"
-	#define IDIGI_LOCATION "Planet Earth"
-	#define IDIGI_DESCRIPTION "Simple Device Cloud demo"
-	#define IDIGI_SERVER "my.devicecloud.com"
+	#define CLOUD_PRODUCT "static_device_cloud.c"
+	#define CLOUD_VENDOR "Digi International Inc."
+	#define CLOUD_VENDOR_ID "1234"
+	#define CLOUD_FIRMWARE_ID "1.01.00"
+	#define CLOUD_CONTACT "support@digi.com"
+	#define CLOUD_LOCATION "Planet Earth"
+	#define CLOUD_DESCRIPTION "Simple Device Cloud demo"
+	#define CLOUD_SERVER "my.devicecloud.com"
 
 	// Store non-volatile configuration data in the userID block, via the
 	// Simple UserID Block FileSystem.  You can use SUBFS to also store a limited
 	// amount of non-Device Cloud application configuration data.
-	#define IDIGI_USE_SUBFS
+	#define CLOUD_USE_SUBFS
 	#define SUBFS_RESERVE_START 0
 	#define SUBFS_RESERVE_END 0
 
 	#define ADDP_PASSWORD   "rabbit"
-	#define IDIGI_IFACE_VERBOSE   // This prints interface status when it changes.
-#define IDIGI_VERBOSE
+	#define CLOUD_IFACE_VERBOSE   // This prints interface status when it changes.
+#define CLOUD_VERBOSE
 
 	#use "Device_Cloud.lib"
 
 #else
-// not USE_IDIGI...
+// not USE_DEVICE_CLOUD...
 
 	#define TCPCONFIG 1
 	#use "dcrtcp.lib"
@@ -121,7 +121,7 @@ void main()
 	 *  http_init initializes the web server.
 	 */
 
-#ifdef USE_IDIGI
+#ifdef USE_DEVICE_CLOUD
 	// Start Device Cloud services
 	if (cloud_init())
 		exit(1);
@@ -145,7 +145,7 @@ void main()
 	 */
 
    while (1) {
-#ifdef USE_IDIGI
+#ifdef USE_DEVICE_CLOUD
 		cloud_tick();
 #endif
       http_handler();

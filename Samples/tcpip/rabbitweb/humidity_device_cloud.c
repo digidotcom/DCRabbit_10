@@ -24,36 +24,36 @@
 
 // This macro used in this sample to select Device Cloud functionality.  If commented
 // out, then works exactly like humidity.c (i.e. just the web interface)
-#define USE_IDIGI
+#define USE_DEVICE_CLOUD
 
 // This is needed to pull in the ZHTML interpreter code.
 #define USE_RABBITWEB 1
 
-#ifdef USE_IDIGI
+#ifdef USE_DEVICE_CLOUD
 
-	#define IDIGI_PRODUCT "humidity_device_cloud.c"
-	#define IDIGI_VENDOR "Digi International Inc."
-	#define IDIGI_VENDOR_ID "1234"
-	#define IDIGI_FIRMWARE_ID "1.01.00"
-	#define IDIGI_CONTACT "support@digi.com"
-	#define IDIGI_LOCATION "Planet Earth"
-	#define IDIGI_DESCRIPTION "Simple Device Cloud demo"
-	#define IDIGI_SERVER "my.devicecloud.com"
+	#define CLOUD_PRODUCT "humidity_device_cloud.c"
+	#define CLOUD_VENDOR "Digi International Inc."
+	#define CLOUD_VENDOR_ID "1234"
+	#define CLOUD_FIRMWARE_ID "1.01.00"
+	#define CLOUD_CONTACT "support@digi.com"
+	#define CLOUD_LOCATION "Planet Earth"
+	#define CLOUD_DESCRIPTION "Simple Device Cloud demo"
+	#define CLOUD_SERVER "my.devicecloud.com"
 
 	// Store non-volatile configuration data in the userID block, via the
 	// Simple UserID Block FileSystem.  You can also use SUBFS to store a limited
 	// amount of non-Device Cloud application configuration data.
-	#define IDIGI_USE_SUBFS
+	#define CLOUD_USE_SUBFS
 	#define SUBFS_RESERVE_START 0
 	#define SUBFS_RESERVE_END 0
 
 	#define ADDP_PASSWORD   "rabbit"
-	#define IDIGI_IFACE_VERBOSE   // This prints interface status when it changes.
+	#define CLOUD_IFACE_VERBOSE   // This prints interface status when it changes.
 
 	#use "Device_Cloud.lib"
 
 #else
-// not USE_IDIGI...
+// not USE_DEVICE_CLOUD...
 
 	/*
 	 * NETWORK CONFIGURATION
@@ -64,7 +64,7 @@
 
 	#use "dcrtcp.lib"
 
-#endif	// USE_IDIGI
+#endif	// USE_DEVICE_CLOUD
 
 
 #use "http.lib"
@@ -125,7 +125,7 @@ void main(void)
 	alarm_interval = 60;
 	strcpy(alarm_email, "somebody@nowhere.org");
 
-#ifdef USE_IDIGI
+#ifdef USE_DEVICE_CLOUD
 	// Start Device Cloud services
 	if (cloud_init())
 		exit(1);
@@ -155,7 +155,7 @@ void main(void)
 
 	// This drives the HTTP server.
    while(1) {
-#ifdef USE_IDIGI
+#ifdef USE_DEVICE_CLOUD
 		cloud_tick();
 #endif
       http_handler();

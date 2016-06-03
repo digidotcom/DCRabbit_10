@@ -39,10 +39,10 @@
       "Targetless" tab, select the appropriate board which you are
 	   going to use.  Save the options and compile using Compile->Compile to
 	   .bin file.
-	2. Rename the .bin file (it will be called IDIGI_UPD_FIRMWARE.BIN in the
+	2. Rename the .bin file (it will be called CLOUD_UPD_FIRMWARE.BIN in the
 	   same directory as this sample code) to, say, NEW_FIRMWARE.BIN
 	3. Change something in this sample that is visible in the Device Cloud user
-	   interface.  For example, change IDIGI_DESCRIPTION to some other
+	   interface.  For example, change CLOUD_DESCRIPTION to some other
 	   string.  This is just so that you can see which firmware is actually
 	   running.
 	4. Compile this sample as normal to the target.
@@ -61,7 +61,7 @@
 	   target board using ADDP.  You can select it and it will be added
 	   automatically to the Device Cloud account.
 	11. Note the 'Description' field will contain the value you defined for
-	   IDIGI_DESCRIPTION.  (If it doesn't, maybe you were running other samples
+	   CLOUD_DESCRIPTION.  (If it doesn't, maybe you were running other samples
 	   before, so try hitting the "refresh" button).
 	12. Hit the "firmware" button.  The dialog box will allow you to specify a
 	   file to upload to the target.  Select the firmware file you renamed in
@@ -80,28 +80,28 @@
 #define	STDIO_DEBUG_ADDCR
 
 
-//#define IDIGI_USE_TLS			// Include security (TLS) support
-#define IDIGI_USE_ADDP			// Include ADDP support
-#define IDIGI_USE_RPU			// Required to include remote program update
+//#define CLOUD_USE_TLS			// Include security (TLS) support
+#define CLOUD_USE_ADDP			// Include ADDP support
+#define CLOUD_USE_RPU			// Required to include remote program update
 										// This is not always sufficient.  Read the
 										// Remote Program Update documentation to
 										// properly configure your board for
 										// firmware updates.  In particular, set
 										// the appropriate BU_TEMP_USE_* macro
 
-#define IDIGI_PRODUCT "cloud_update_firmware.c"
-#define IDIGI_VENDOR "Digi International Inc."
-#define IDIGI_VENDOR_ID "1234"
-#define IDIGI_FIRMWARE_ID "1.01.00"
-#define IDIGI_CONTACT "support@digi.com"
-#define IDIGI_LOCATION "Planet Earth"
-#define IDIGI_DESCRIPTION "Update me!"
-#define IDIGI_SERVER "my.devicecloud.com"
+#define CLOUD_PRODUCT "cloud_update_firmware.c"
+#define CLOUD_VENDOR "Digi International Inc."
+#define CLOUD_VENDOR_ID "1234"
+#define CLOUD_FIRMWARE_ID "1.01.00"
+#define CLOUD_CONTACT "support@digi.com"
+#define CLOUD_LOCATION "Planet Earth"
+#define CLOUD_DESCRIPTION "Update me!"
+#define CLOUD_SERVER "my.devicecloud.com"
 
 // Store non-volatile configuration data in the userID block, via the
 // Simple UserID Block FileSystem.  You can use SUBFS to also store a limited
 // amount of non-Device Cloud application configuration data.
-#define IDIGI_USE_SUBFS
+#define CLOUD_USE_SUBFS
 #define SUBFS_RESERVE_START 0
 #define SUBFS_RESERVE_END 0
 
@@ -113,18 +113,18 @@
 /*
 // Enable the following debugging/diagnostic options when
 // developing new applications.
-#define IDIGI_DEBUG
+#define CLOUD_DEBUG
 #define DCRTCP_DEBUG
 #define ADDP_DEBUG
 #define PKTDRV_DEBUG
-#define IDIGI_VERBOSE
+#define CLOUD_VERBOSE
 #define DNS_VERBOSE
 #define ARP_VERBOSE
 #define UDP_VERBOSE
 #define RABBITWEB_VERBOSE
 */
 
-#define IDIGI_IFACE_VERBOSE	// This prints interface status when it changes.
+#define CLOUD_IFACE_VERBOSE	// This prints interface status when it changes.
 #define EDP_VERBOSE 2	// This shows firmware upload progress.  Normally
 								// this would not be defined.
 

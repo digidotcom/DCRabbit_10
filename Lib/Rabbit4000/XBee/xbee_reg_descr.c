@@ -15,7 +15,7 @@
 
    @note sxa.h needs to be included before including this header.
 
-   @note This header is sensitive to the macro IDIGI_USE_XBEE.  If defined,
+   @note This header is sensitive to the macro CLOUD_USE_XBEE.  If defined,
    then extra fields are included in the table in order to support Device Cloud.
    Otherwise, the fields are omitted so as to save storage.
 */
@@ -27,7 +27,7 @@
 /*** EndHeader */
 
 
-#ifdef IDIGI_USE_XBEE
+#ifdef CLOUD_USE_XBEE
 
 #define _XRT_ENTRY(state,tag,at,cxv,desc,units,min,max,rci_type,sxa_field,group) \
 	{ state, #at, cxv, rci_type, \
