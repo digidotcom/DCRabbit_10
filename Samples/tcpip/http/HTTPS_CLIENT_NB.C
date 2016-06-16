@@ -140,6 +140,37 @@ int my_server_policy(ssl_Socket far * state, int trusted,
 	else
 		host = s->hostname;
 
+	printf("Certificate issuer:\n");
+	if (cert->issuer.c)
+		printf("       Country: %ls\n", cert->issuer.c);
+	if (cert->issuer.l)
+		printf("      Location: %ls\n", cert->issuer.l);
+	if (cert->issuer.st)
+		printf("         State: %ls\n", cert->issuer.st);
+	if (cert->issuer.o)
+		printf("  Organization: %ls\n", cert->issuer.o);
+	if (cert->issuer.ou)
+		printf("          Unit: %ls\n", cert->issuer.ou);
+	if (cert->issuer.email)
+		printf("       Contact: %ls\n", cert->issuer.email);
+	if (cert->issuer.cn)
+		printf("            CN: %ls\n", cert->issuer.cn);
+	printf("Certificate subject:\n");
+	if (cert->subject.c)
+		printf("       Country: %ls\n", cert->subject.c);
+	if (cert->subject.l)
+		printf("      Location: %ls\n", cert->subject.l);
+	if (cert->subject.st)
+		printf("         State: %ls\n", cert->subject.st);
+	if (cert->subject.o)
+		printf("  Organization: %ls\n", cert->subject.o);
+	if (cert->subject.ou)
+		printf("          Unit: %ls\n", cert->subject.ou);
+	if (cert->subject.email)
+		printf("       Contact: %ls\n", cert->subject.email);
+	printf("Server claims to be CN='%ls'\n", cert->subject.cn);
+	printf("We are looking for  CN='%ls'\n", s->hostname);
+
 	if (x509_validate_hostname(cert, host)) {
 		printf("Certificate hostname mismatch%s!\n",
 			httpc_globals.ip ? " (using proxy)" : "");
@@ -147,6 +178,15 @@ int my_server_policy(ssl_Socket far * state, int trusted,
 			host, cert->subject.cn);
 		return 1;
 	}
+	
+	if (trusted) {
+		printf("This server's certificate is trusted\n");
+	} else {
+		printf("Invalid certificate supplied, or missing root CA necessary to verify.\n");
+		// uncomment this line to reject untrusted certificates
+		//return 1;
+	}
+	
 	return 0;
 }
 

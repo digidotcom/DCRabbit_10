@@ -122,11 +122,15 @@ int my_server_policy(ssl_Socket far * state, int trusted,
 	                       struct x509_certificate far * cert,
 	                       httpc_Socket far * s)
 {
-	printf("\nChecking server certificate...\n");
-	if (trusted)
-		printf("This server's certificate is trusted\n");
+	// This code determines whether the hostname should be the
+	// proxy, or the origin ('real') server.
+	const char far * host;
+	if (httpc_globals.ip)
+		host = httpc_globals.proxy_hostname;
 	else
-		printf("There was no list of CAs, so cannot verify this server's certificate\n");
+		host = s->hostname;
+
+	printf("\nChecking server certificate...\n");
 
 	printf("Certificate issuer:\n");
 	if (cert->issuer.c)
@@ -159,11 +163,22 @@ int my_server_policy(ssl_Socket far * state, int trusted,
 	printf("Server claims to be CN='%ls'\n", cert->subject.cn);
 	printf("We are looking for  CN='%ls'\n", s->hostname);
 
-	if (x509_validate_hostname(cert, s->hostname)) {
-		printf("Mismatch!\n\n");
+	if (x509_validate_hostname(cert, host)) {
+		printf("Certificate hostname mismatch%s!\n",
+			httpc_globals.ip ? " (using proxy)" : "");
+		printf("Was expecting %ls, got %ls\n\n",
+			host, cert->subject.cn);
 		return 1;
 	}
-	printf("We'll let that pass...\n\n");
+	
+	if (trusted) {
+		printf("This server's certificate is trusted\n");
+	} else {
+		printf("Invalid certificate supplied, or missing root CA necessary to verify.\n");
+		// uncomment this line to reject untrusted certificates
+		//return 1;
+	}
+	
 	return 0;
 }
 
