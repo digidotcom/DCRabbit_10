@@ -10,42 +10,44 @@
  *
  *************************************************************************/
 
+
 /*** BeginHeader */
 #ifndef __R6K_I2C_H
 #define __R6K_I2C_H
 /*** EndHeader */
 
+
 /*** BeginHeader */
 #if (CPU_ID_MASK(_CPU_ID_) < R6000)
-   #fatal "I2C HW support is only available on Rabbit 6000 core modules"
+	#fatal "I2C HW support is only available on Rabbit 6000 core modules"
 #endif
 
-// These are board specific and should really already be defined
-//  on BOARDTYPES.LIB
+// These are board specific and should really already be defined in
+//  BOARDTYPES.LIB.
 #ifndef I2C_CLOCKPIN
-  #define  I2C_CLOCKPIN 1
+	#define  I2C_CLOCKPIN 1
 #endif
 #ifndef I2C_DATAPIN
-  #define  I2C_DATAPIN 0
+	#define  I2C_DATAPIN 0
 #endif
 
-
-
-typedef struct  _I2C_transaction{
-		long         lastSRval;   // Always loaded with last status reg value
-                                //    upon entry to the I2C ISR
-		char __far     *dataPtr;    // Initialized by API and incremeted by ISR
-		unsigned int  dataLen;    // Initialized by API and decremeted by ISR
-		unsigned long errorCount; // Total error count, must be zeroed explicitly
-      char          dummyWrite; // If = 1, no STOP is sent after write done
-      								  //   this is for combined dummy-write / reads.
-      char          isWrite;    // Flag set in slave mode when
-                                //  the transaction is write to master
-      char done;
-  } i2cTransaction;
+typedef struct _I2C_transaction {
+	long          lastSRval;	// Always loaded with last status reg value
+	                        	//  upon entry to the I2C ISR
+	char __far    *dataPtr;		// Initialized by API and incremented by ISR
+	unsigned int  dataLen;		// Initialized by API and decremented by ISR
+	unsigned long errorCount;	// Total error count, must be zeroed explicitly
+	int           command;		// Command code composed of:
+		#define _I2C_READ    0x01	// bit 0 reset == write mode
+		#define _I2C_NOSTOP  0x02	// bit 1 reset == initiate STOP on last byte
+		#define _I2C_NOSTART 0x04	// bit 2 reset == initiate START on first byte
+		// Note that for an I2C bus master, _I2C_READ set with _I2C_NOSTOP reset
+		//  implies non-ACK of the last byte read.
+	char          done;			// 0 == not done
+} i2cTransaction;
 
 #ifndef I2C_DEBUG
-  #define I2C_DEBUG __nodebug
+	#define I2C_DEBUG __nodebug
 #endif
 
 // I²C control register bits
@@ -77,152 +79,167 @@ typedef struct  _I2C_transaction{
 #define I2C_SR_ACK_BIT			0x0002
 #define I2C_SR_RW_BIT			0x0001
 
+#ifndef I2C_SLAVE_CHECK_TIMEOUT_MS
+	// Default milliseconds time out while waiting for an ACK from the slave
+	//  address passed into _I2C_CheckSlaveAddress().
+	#define I2C_SLAVE_CHECK_TIMEOUT_MS 10
+#endif
+
 /*** EndHeader */
+
+
+/*** BeginHeader I2Cdata */
+extern i2cTransaction I2Cdata;
+/*** EndHeader */
+
+i2cTransaction I2Cdata;
+
 
 /*** BeginHeader I2C_Init */
-
-int I2C_Init();
-
-extern  unsigned  I2C_ISR_State;
-extern  i2cTransaction  I2Cdata;
-
+int I2C_Init(void);
 /*** EndHeader */
 
-unsigned I2C_ISR_State;
-i2cTransaction  I2Cdata;
-#ifndef I2C_CLOCKPIN
+#if !defined I2C_CLOCKPIN || (1 != I2C_CLOCKPIN && 5 != I2C_CLOCKPIN)
 	#fatal "must define I2C_CLOCKPIN to 1 or 5 to use I2C_Init()"
 #endif
-#ifndef I2C_DATAPIN
+#if !defined I2C_DATAPIN || (0 != I2C_DATAPIN && 4 != I2C_DATAPIN)
 	#fatal "must define I2C_DATAPIN to 0 or 4 to use I2C_Init()"
 #endif
 
+#if !defined I2C_DEFAULT_CLK
+	// The default clock count will yield 100KHz for GSR = 7 and a 162.5 MHz
+	//  peripheral clock.
+	#define I2C_DEFAULT_CLK 807
+#endif
+
 I2C_DEBUG
-int I2C_Init()
+int I2C_Init(void)
 {
 	unsigned long CReg;
-   // Disable I2C - API R/W functions will enable as needed
 
-    // Clear 32-bit status and control registers, set reset bit
-   WrPortI32(SGCR, 1UL);
+	// Reset I2C and leave it disabled for now. API functions will enable, set
+	//  mode as needed.
+	WrPortI32(SGCR, 1UL);
+	// Reset the status flags.
+	RdPortI32(SGSR);	// ensure SGS0R flags are reset
+	RdPortI32(SGSR);	// ensure SGS1R flags are reset, too
+	// Initialize the I2C serial port's SCL and SDA I/O pins.
+	_I2C_initIO(I2C_CLOCKPIN, I2C_DATAPIN);
 
-   WrPortI32(SGCR, 2UL);
-   RdPortI32(SGSR);
+	CReg = ((freq_divider << 1) + 12) / 13;	// Calc TSR based on Main Clock
+	CReg += ((freq_divider + 32) / 33) << 10;	// Calc GSR based on Main Clock
+	if (CReg > 0x1FFFUL)
+	{
+		CReg = (CReg & 0X1FFFUL) | 0x1C00UL;	// Limit GSR to 7 if larger
+	}
+	WrPortI32(SGTCR, CReg);	// Write GSR & TSR to Timing Control Register
 
-   I2C_initClk(I2C_DEFAULT_CLK);
+	// Initialize the I2C clock divider value.
+	_I2C_initClk(I2C_DEFAULT_CLK);
 
-   CReg = ((freq_divider << 1) + 12) / 13;     // Calc TSR based on Main Clock
-   CReg += ((freq_divider + 32) / 33) << 10;   // Calc GSR based on Main Clock
-   if (CReg > 0x1FFFUL) {
-      CReg = (CReg & 0X1FFFUL) | 0x1C00UL;     // Limit GSR to 7 if larger
-   }
-   WrPortI32(SGTCR, CReg);  // Write GSR & TSR to Timing Control Register
-
-	I2C_initIO(I2C_CLOCKPIN, I2C_DATAPIN);
 #ifndef I2C_NO_INTERRUPTS
-   // Initialize global data used by ISR
-	I2Cdata.lastSRval  = 0UL;
+	// Initialize global data used by the ISR.
+	I2Cdata.lastSRval  = 0L;
 	I2Cdata.errorCount = 0UL;
- 	I2C_ISR_State  =  (unsigned)i2c_isr_State0;
-   _I2C_initISR(1);
+	_I2C_initISR(1);
 #endif
 }
 
 
-/*** BeginHeader I2C_initIO */
-	int I2C_initIO(int clkPin, int dataPin);
+/*** BeginHeader _I2C_initIO */
+int _I2C_initIO(int clkPin, int dataPin);
 /*** EndHeader */
 
-/* START FUNCTION DESCRIPTION ********************************************
+/* START_FUNCTION DESCRIPTION ******************************************
+_I2C_initIO                   <I2C_HW.LIB>
 
- I2C_initIO                                     <I2C_HW.LIB>
-
-SYNTAX:      int _I2C_initIO(int  clkPin, int dataPin);
+SYNTAX:
+   int _I2C_initIO(int  clkPin, int dataPin);
 
 DESCRIPTION:
-	Initialize I2C peripheral to use specified pins.
-	Called by I2C_Init() function for I2C with default values
-   I2C_CLOCKPIN and I2C_DATAPIN, but could be called to by user to
-   switch pins if using more than one I2C slave device.
+   Initialize I2C peripheral to use specified pins. Called by I2C_Init()
+   function for I2C with default values I2C_CLOCKPIN and I2C_DATAPIN,
+   but could be called to by user to switch pins if using more than one
+   I2C slave device.
 
-PARAMETER1:    1 or 5 to specify PE1 or PE5 for I2C clock pin
-PARAMETER2:    0 or 4 to specify PE0 or PE4 for I2C data pin
+PARAMETER1:
+   1 or 5 to specify PE1 or PE5, respectively, for I2C clock pin.
 
-RETURN VALUE:  0 - Success
-              -1 - Invalid input
+PARAMETER2:
+   0 or 4 to specify PE0 or PE4, respectively, for I2C data pin.
 
-END DESCRIPTION **********************************************************/
+RETURN VALUE:
+    0 - Success.
+   -1 - Invalid input.
+END DESCRIPTION *******************************************************/
+
 I2C_DEBUG
-int I2C_initIO(int  clkPin, int dataPin)
+int _I2C_initIO(int clkPin, int dataPin)
 {
 
-	if( (clkPin==1 || clkPin==5) && (dataPin==0 || dataPin==4)  )
-   {
-      if(clkPin==1){
-       	BitWrPortI(PEDR, &PEDRShadow, 0, 1);
-       	BitWrPortI(PEDDR, &PEDDRShadow, 1, 1);
-       	BitWrPortI(PE1CR, &PE1CRShadow, 0, 0);
-   		BitWrPortI(PEDCR, &PEDCRShadow, 1, 1); // Open drain
-      	BitWrPortI(SGMCR, &SGMCRShadow, 0, 3); // Specify PE1
-			BitWrPortI(PEALR, &PEALRShadow, 1, 2); // Specify alt. func. 1
-      	BitWrPortI(PEFR,  &PEFRShadow,  1, 1); // Use alternate PE1 function
-      }
-      else {
-       	BitWrPortI(PEDR, &PEDRShadow, 1, 5);
-       	BitWrPortI(PEDDR, &PEDDRShadow, 1, 5);
-       	BitWrPortI(PE5CR, &PE1CRShadow, 0, 0);
-   		BitWrPortI(PEDCR, &PEDCRShadow, 1, 5);
-      	BitWrPortI(SGMCR, &SGMCRShadow, 1, 3); // Specify PE5
-      	BitWrPortI(PEFR,  &PEFRShadow,  1, 5);
-			BitWrPortI(PEAHR, &PEAHRShadow, 1, 2);
-      }
-      if(dataPin){
-       	BitWrPortI(PEDR, &PEDRShadow, 1, 4);
-       	BitWrPortI(PEDDR, &PEDDRShadow, 1, 4);
-       	BitWrPortI(PE4CR, &PE1CRShadow, 0, 0);
-   		BitWrPortI(PEDCR, &PEDCRShadow, 1, 4);
-      	BitWrPortI(SGMCR, &SGMCRShadow, 1, 2); // Specify PE4
-			BitWrPortI(PEAHR, &PEAHRShadow, 1, 0);
-      	BitWrPortI(PEFR,  &PEFRShadow,  1, 4);
-      }
-      else {
-       	BitWrPortI(PEDR, &PEDRShadow, 1, 0);
-       	BitWrPortI(PEDDR, &PEDDRShadow, 1, 0);
-       	BitWrPortI(PE0CR, &PE1CRShadow, 0, 0);
-   		BitWrPortI(PEDCR, &PEDCRShadow, 1, 0);
-      	BitWrPortI(SGMCR, &SGMCRShadow, 0, 2); // Specify PE0
-			BitWrPortI(PEALR, &PEALRShadow, 1, 0);
-      	BitWrPortI(PEFR,  &PEFRShadow,  1, 0);
-      }
- 		return 0;
-   }
-   else {
- 		return -1;
-   }
+	if (1 != clkPin && 5 != clkPin || 0 != dataPin && 4 != dataPin)
+	{
+		return -1;
+	}
+
+	if (1 == clkPin)
+	{	// PE1
+		WrPortI(PEDCR, &PEDCRShadow, RdPortI(PEDCR) | 0x02);	// open drain
+		WrPortI(PE1CR, &PE1CRShadow, 0x00);				// fast, 4 mA, no pullup/down
+		WrPortI(PEDR,  &PEDRShadow,  RdPortI(PEDR)  | 0x02);	// preset high
+		WrPortI(PEDDR, &PEDDRShadow, RdPortI(PEDDR) | 0x02);	// enable output
+		WrPortI(PEALR, &PEALRShadow, RdPortI(PEALR) & 0xF3 | 0x04);	// pick SCLKG
+		WrPortI(PEFR,  &PEFRShadow,  RdPortI(PEFR)  | 0x02);	// enable SCLKG
+		WrPortI(SGMCR, &SGMCRShadow, RdPortI(SGMCR) & 0xF7);	// select SCL
+	}
+	else
+	{	// PE5
+		WrPortI(PEDCR, &PEDCRShadow, RdPortI(PEDCR) | 0x20);	// open drain
+		WrPortI(PE5CR, &PE5CRShadow, 0x00);				// fast, 4 mA, no pullup/down
+		WrPortI(PEDR,  &PEDRShadow,  RdPortI(PEDR)  | 0x20);	// preset high
+		WrPortI(PEDDR, &PEDDRShadow, RdPortI(PEDDR) | 0x20);	// enable output
+		WrPortI(PEAHR, &PEAHRShadow, RdPortI(PEAHR) & 0xF3 | 0x04);	// pick SCLKG
+		WrPortI(PEFR,  &PEFRShadow,  RdPortI(PEFR)  | 0x20);	// enable SCLKG
+		WrPortI(SGMCR, &SGMCRShadow, RdPortI(SGMCR) | 0x08);	// select SCL
+	}
+	if (0 == dataPin)
+	{	// PE0
+		WrPortI(PEDCR, &PEDCRShadow, RdPortI(PEDCR) | 0x01);	// open drain
+		WrPortI(PE0CR, &PE0CRShadow, 0x00);				// fast, 4 mA, no pullup/down
+		WrPortI(PEDR,  &PEDRShadow,  RdPortI(PEDR)  | 0x01);	// preset high
+		WrPortI(PEDDR, &PEDDRShadow, RdPortI(PEDDR) | 0x01);	// enable output
+		WrPortI(PEALR, &PEALRShadow, RdPortI(PEALR) & 0xFC | 0x01);	// pick SDATG
+		WrPortI(PEFR,  &PEFRShadow,  RdPortI(PEFR)  | 0x01);	// enable SDATG
+		WrPortI(SGMCR, &SGMCRShadow, RdPortI(SGMCR) & 0xFB);	// select SDA
+	}
+	else
+	{	// PE4
+		WrPortI(PEDCR, &PEDCRShadow, RdPortI(PEDCR) | 0x10);	// open drain
+		WrPortI(PE4CR, &PE4CRShadow, 0x00);				// fast, 4 mA, no pullup/down
+		WrPortI(PEDR,  &PEDRShadow,  RdPortI(PEDR)  | 0x10);	// preset high
+		WrPortI(PEDDR, &PEDDRShadow, RdPortI(PEDDR) | 0x10);	// enable output
+		WrPortI(PEAHR, &PEAHRShadow, RdPortI(PEAHR) & 0xFC | 0x01);	// pick SDATG
+		WrPortI(PEFR,  &PEFRShadow,  RdPortI(PEFR)  | 0x10);	// enable SDATG
+		WrPortI(SGMCR, &SGMCRShadow, RdPortI(SGMCR) & 0x04);	// select SDA
+	}
+	return 0;
 }
 
-/*** BeginHeader I2C_initClk */
 
-	int I2C_initClk(unsigned long count);
-   extern unsigned long I2C_CLK_COUNT;
-
-#ifndef I2C_DEFAULT_CLK
-  // The default clock count will yield 100KHz for GSR = 7
-  //  and a 200MHz peripheral clock
-  #define I2C_DEFAULT_CLK 991
-#endif
-
+/*** BeginHeader _I2C_initClk */
+int _I2C_initClk(unsigned long count);
+extern unsigned long I2C_CLK_COUNT;
 /*** EndHeader */
 
-/* START FUNCTION DESCRIPTION ********************************************
+/* START_FUNCTION DESCRIPTION ******************************************
+_I2C_initClk                  <I2C_HW.LIB>
 
-I2C_initClk                                     <I2C_HW.LIB>
-
-SYNTAX:      int I2C_initClk(unsigned long count);
+SYNTAX:
+   int _I2C_initClk(unsigned long count);
 
 DESCRIPTION:
    This function initializes the I2C clock counter register value,
-   but does NOT, write to that register. The value is used later by
+   but does NOT write to that register. The value is used later by
    the ISR that drives the I2C bus.
 
    This function is called by I2C_Init with an argument of
@@ -232,110 +249,134 @@ DESCRIPTION:
    The relation between PCLK and I2C bus clock (SCL) is shown in the
    following equation, where GSR is TGSR[12:10]:
 
-		SCLout = PCLK/( 2*(COUNT + 2) + GSR)
+      SCLout = PCLK/( 2*(COUNT + 2) + GSR)
 
-      Subject to the restriction that COUNT > 3 + GSR +TSR
-
+      Subject to the restriction that COUNT > 3 + GSR + TSR.
 
     The peripheral clock speed is dependendent on the main clock
     speed, the GCSR setting, the clock doubler setting, and the PLL
-    setting. Becareful that SCLout doesn't exceed the maximum speed
+    setting. Be careful that SCLout doesn't exceed the maximum speed
     of the I2C slave device.
+
+   IMPORTANT NOTE:
+      The value of pull-up resistors and capacitance can severely limit
+      the highest possible speed.  Make sure you use adequate pull-ups
+      on both SDA and SCL for the speed and capacitance of the bus.
 
 PARAMETER1:
    If count != 0, then count is written to the I2C clock register.
    If count == 0, then count the fastest allowable value (4 + TSR +GSR)
    is calculated.
 
-   IMPORTANT NOTE:
-   The value of pull-up resistors and capicitance can severely limit
-   the highest possible speed.  Make sure you use adequate pull-ups
-   on both SDA and SCL for the speed and capacitance of the bus.
-
-RETURN VALUE:  0 - Success
-              -1 - Invalid TSR/GSR value(s)
-
-END DESCRIPTION **********************************************************/
+RETURN VALUE:
+    0 - Success
+   -1 - Invalid TSR/GSR value(s)
+END DESCRIPTION *******************************************************/
 
 unsigned long I2C_CLK_COUNT;
 
 I2C_DEBUG
-int I2C_initClk(unsigned long count)
+int _I2C_initClk(unsigned long count)
 {
 
-   unsigned GSR, TSR;
+	unsigned GSR, TSR;
 
-   // TSR and GSR must be at least 1
-   if( !(GSR = _I2C_getGSR()) ) return -1;
-   if( !(TSR = _I2C_getTSR()) ) return -1;
+	// Both TSR and GSR must be at least 1.
+	if (!(GSR = _I2C_getGSR()) || !(TSR = _I2C_getTSR()))
+	{
+		return -1;
+	}
 
-   if(count)
-   {
-      if(count <= 3 + GSR +TSR) return -1;
-      I2C_CLK_COUNT = count;
-   }
-   else {
-
-	   I2C_CLK_COUNT = 4+TSR+GSR;
-   }
-
-   return 0;
+	if (count)
+	{
+		if (count <= 3 + GSR + TSR)
+		{
+			// The supplied count does not meet the restriction described in the
+			//  function help.
+			return -1;
+		}
+		I2C_CLK_COUNT = count;
+	}
+	else
+	{
+		I2C_CLK_COUNT = 4 + TSR + GSR;
+	}
+	return 0;
 }
 
 
 /*** BeginHeader _I2C_computeCLKdiv */
-  long _I2C_computeCLKdiv(float longI2Cspeed);
+long _I2C_computeCLKdiv(float longI2Cspeed);
 /*** EndHeader */
 
-/* START FUNCTION DESCRIPTION ********************************************
+/* START FUNCTION DESCRIPTION ******************************************
+_I2C_computeCLKdiv            <I2C_HW.LIB>
 
-_I2C_computeCLKdiv                  <I2C_HW.LIB>
+SYNTAX:
+   long _I2C_computeCLKdiv(float longI2Cspeed);
 
-SYNTAX:      long _I2C_computeCLKdiv(float longI2Cspeed);
+DESCRIPTION:
+   Compute value needed for I2C clock DIVISOR based on desired data rate
+   in bits per second, longI2Cspeed.
 
-DESCRIPTION:  Compute value needed for I2C clock DIVISOR based on
-              desired data rate in bits per second, longI2Cspeed.
+   DIVISOR = ((periphClkSpeed / longI2Cspeed) - (GSR + 4)) / 2
 
-         DIVISOR = ((periphClkSpeed / longI2Cspeed) - (GSR + 4)) / 2
+   Example (Sets I2C bus speed to 40 Kbits/second):
+      _I2C_initClk(_I2C_computeCLKdiv(40000.0));
+      WrPortI32(SGCDR, I2C_CLK_COUNT);
 
-    Example (Sets I2C bus speed to 40 Kbits/second):
-      I2C_initClk(_I2C_computeCLKdiv(40000.0));
-	   WrPortI32(SGCDR, I2C_CLK_COUNT);
+PARAMETER1:
+   The desired I2C data rate in bits per second.
 
-END DESCRIPTION **********************************************************/
+RETURN VALUE:
+   I2C clock divider value.
+END DESCRIPTION *******************************************************/
 
-I2C_DEBUG long _I2C_computeCLKdiv(float longI2Cspeed)
+I2C_DEBUG
+long _I2C_computeCLKdiv(float longI2Cspeed)
 {
-   unsigned GSR;
-   unsigned long TCR;
+	unsigned GSR;
+	unsigned long TCR;
 
-   if (longI2Cspeed > 100000.0) {
-      TCR = ((freq_divider << 1) + 30) / 33;  // Set 100ns minimum data delay
-   }
-   else {
-      TCR = ((freq_divider << 1) + 12) / 13;  // Set 250ns minimum data delay
-   }
-   GSR = (freq_divider + 32) / 33;     // Set 50ns minimum glitch suppression
-   if (GSR > 7) {
-      GSR = 7;                  // On high speeds, limit to maximum GSR value
-   }
+	if (longI2Cspeed > 100000.0)
+	{
+		TCR = ((freq_divider << 1) + 32) / 33;  // Set 100ns minimum data delay
+	}
+	else
+	{
+		TCR = ((freq_divider << 1) + 12) / 13;  // Set 250ns minimum data delay
+	}
+	GSR = (freq_divider + 32) / 33;     // Set 50ns minimum glitch suppression
+	if (GSR > 7)
+	{
+		GSR = 7;                  // On high speeds, limit to maximum GSR value
+	}
 
-   // Write GSR & TSR to Timing Control Register
-   WrPortI32(SGTCR, TCR | (GSR << 10));
+	// Write GSR & TSR to Timing Control Register
+	WrPortI32(SGTCR, TCR | (GSR << 10));
 
-   return ((((long)(((float)(freq_divider + 1) * 614400.0) / longI2Cspeed))
-                  - (GSR + 4)) >> 1);
+	return (((long) (((float) (freq_divider + 1) * 614400.0) / longI2Cspeed)) -
+	        (GSR + 4)) >> 1;
 }
 
 
 /*** BeginHeader _I2C_ISR, _I2C_initISR, i2c_isr_State0 */
-
-	__root void _I2C_ISR();
-	__root int _I2C_initISR(unsigned priority);
-   __root void i2c_isr_State0();
-
+__root void _I2C_ISR(void);
+__root int _I2C_initISR(unsigned priority);
+__root void i2c_isr_State0(void);
 /*** EndHeader */
 
+#if defined I2C_NO_INTERRUPTS
+	#fatal "Must undefine I2C_NO_INTERRUPTS to compile functions in this " \
+	                                                       "library module body."
+#endif
+
+#if defined I2C_OMIT_MASTER_CODE && defined I2C_OMIT_SLAVE_CODE
+	#fatal "Must undefine at least one of I2C_OMIT_MASTER_CODE, " \
+		                                                    "I2C_OMIT_SLAVE_CODE."
+#endif
+
+I2C_DEBUG
 void _I2C_initISRvector(void);
 #asm __root
 _I2C_ISR_Start::
@@ -355,212 +396,68 @@ _I2C_initISRvector::
    ret
 #endasm
 
+I2C_DEBUG
 int _I2C_initISR(unsigned priority)
 {
+	if (priority > 3)
+	{
+		return -1;
+	}
 	_I2C_initISRvector();
-   if(priority > 3) return -1;
-   WrPortI(SGMCR, &SGMCRShadow, RdPortI(SGMCR) | priority);
-   return 0;
+	WrPortI(SGMCR, &SGMCRShadow, RdPortI(SGMCR) | priority);
+	return 0;
 }
 
 
 #asm
 _I2C_ISR::
-/****************************************************************************
+/*******************************************************************************
+	This ISR uses SGCR and SGSR to determine master vs. slave mode and read vs.
+	write mode, respectively. Information stored in the I2Cdata structure is used
+	to continue the current same-modes data transfer through to completion.
 
- This ISR has a state machine for handling four cases of:
- 	 Master write
- 	 Master read
-    Slave  write
-    Slave  read
- each state shares some entry and exit code
+	Note that a complete I2C transaction is often composed of more than one data
+	transfer. For instance, a master-mode read at current address I2C transaction
+	is composed of a START condition + control byte write transfer immediately
+	followed by a re-START condition + data read transfer and a STOP condition.
 
-*****************************************************************************/
-	   push  jkhl
-	   push  bcde
-	   push  af
-      push	px
-      push  ix
-      ld    ix, I2Cdata       ; Use IX as root pointer to I2Cdata structure
+	To restate more concisely: The implementation of complete I2C transactions is
+	not the domain of this ISR, it is the domain of higher level functionality.
+*******************************************************************************/
+		push	jkhl
+		push	bcde
+		push	af
+		push	px
+		push	ix
+		ld		ix, I2Cdata			; use IX as root pointer to I2Cdata structure
+		; Read and save the status register.
+ioi	ld		jkhl, (SGSR)
+		ld		(ix+[I2Cdata]+lastSRval), jkhl
+		; Read the control register to determine master vs. slave mode operation.
+ioi	ld		bcde, (SGCR)
+		; Test for "clock is output" (i.e. master vs. slave mode).
+		bit	2, e
 
-ioi   ld  	jkhl, (SGSR)		; Read status register
-		ld    (I2Cdata), jkhl   ; Store in I2Cdata.lastSRval
-		ld    bc,hl             ; Save lower bits of SR for later
-		bit   2, h              ; Test for arbitration loss
-		jp    nz, .i2c_isr_ALret
+#if defined I2C_OMIT_SLAVE_CODE
+		; Mode error: I2C slave mode ISR conditional code has been omitted.
+		jp		z, .i2c_isr_ModeERRret
+#else
+		; Clock is output, jump to master mode operation.
+		jr		nz, .i2c_isr_MasterMode
 
-		bit   6, L              ; Test for non ACK slave response (BUS ERROR)
-		jp    nz, .i2c_isr_BERRret
-
-		ld    hl, (I2C_ISR_State)
-		jp    (hl)              ; Branch to current I2C_ISR_State state process
-
-// *********************************************************
-// **** ---------- Primary MASTER MODE state ---------- ****
-// *********************************************************
-i2c_isr_State0::              ; Primary MASTER MODE state
-
-;**** Check for master write to or read from slave ****
-		ld  	a, 0x31			   ; Setup mask of relevant bits (DR, DT & RW)
-      and   c                 ; Apply to saved SR (status) value
-      cp    0x10  			   ; Only DT bit should be set on master write
-      jp		nz, .i2c_isr_test_MRd   ; Jump to read routine if not DT only
-
-// -------------------------------------------
-//   Send next byte of Master Write to Slave
-// -------------------------------------------
-.i2C_isr_MWr_Send:
-		ld		hl, (ix + [I2Cdata] + dataLen)
-      test  hl                ; Test I2Cdata.dataLen value for zero
-      jp    z, .i2c_isr_exit  ; If zero, we're just polling for an ACK, so exit
-
-      ld    bcde, (ix + [I2Cdata] + dataPtr)
-      ld    px, bcde       ; Load PX with I2Cdata.dataPtr
-      ld    a, (px)			; Get data to write
-ioi   ld    (SGDR), a 		; Write data
-		dec	hl             ; Decrement count
-		ld		(ix + [I2Cdata] + dataLen), hl
-      test  hl
-      jr    z, .i2c_isr_MWr_Last
-
-      ld    px, px+1       ; Not last byte, advance data pointer
-      ld    jkhl, px
-      ld    (ix + [I2Cdata] + dataPtr), jkhl
-
-		ld    hl, i2c_isr_StateWaitMWrAck   ; Set Wait for ACK state
-      ld    (I2C_ISR_State), hl
-
-ioi   ld    jkhl, (SGCR)	; Read control register
-      res   4, L				; Clear START bit
-      res   5, L				; Clear STOP bit
-      set   7, L				; Set Transfer Byte Enable bit
-		jp		.i2c_isr_exitWrCR  ; Execution resumes next interrupt
-      						  	;		    @ i2c_isr_StateWaitMWrB
-                           ;  		 with Status reg. contents in HL
-
-.i2c_isr_MWr_Last:		      ; This is the last byte in the TX buffer
-		ld    hl, i2c_isr_StateWaitMWrLastAck  ; Set Wait for Last ACK state
-      ld    (I2C_ISR_State), hl
-      ld    a, (ix + [I2Cdata] + dummyWrite) ; Get I2Cdata.dummyWrite flag
-ioi   ld    jkhl, (SGCR)	; Read control register
-      set   5, L				; Set STOP bit
-      or    a              ; Set Z flag to inverse of I2Cdata.dummyWrite flag
-      jr		z, .i2c_isr_notDummyWr
-      res   5, L				; Clear STOP bit if I2Cdata.dummyWrite flag is set
-.i2c_isr_notDummyWr:
-      set   2, L				; Set MAster mode
-      set   7, L				; Set Transfer Byte Enable bit
-		jp		.i2c_isr_exitWrCR  ; Execution resumes next interrupt
-      						  	;		    @ i2c_isr_StateWaitMWrA
-                           ;  		 with Status reg. contents in HL
-
-// **************************************************
-// *** Wait for Last ACK of Master write to slave ***
-// **************************************************
-i2c_isr_StateWaitMWrLastAck::
-		ld    a, 0x33        ; Only DT, ACK and RW bits are relevant
-      and   c              ; Apply mask to saved SR (status) LSB
-      cp    0x10           ; Only DT should be set
-      jp    nz, .i2c_isr_exit
-
-      // **** Last byte written, reset state machine and exit
-  		ld    hl, i2c_isr_State0
-      ld    (I2C_ISR_State), hl    ; Set back to initial state
-      ld    a,1
-      ld    (ix + [I2Cdata] + done),a  ; Raise the I2Cdata.done flag
-		ld    jkhl,6             ; Clear all but SCL & I2C enable bits
-      jp    .i2c_isr_exitWrCR  ; Write JKHL to I2C Control Reg. and exit
-
-// *********************************************
-// *** Wait for ACK of Master write to slave ***
-// *********************************************
-i2c_isr_StateWaitMWrAck::
-		ld    a, 0x33        ; Only DT, ACK and RW bits are relevant
-      and   c              ; Apply mask to saved SR (status) LSB
-      cp    0x10           ; Only DT should be set
-      jp    z, .i2C_isr_MWr_Send   ; If so, go send next byte
-		jp    .i2c_isr_NAKret
-
-// ----------------------------------------------------
-// Test for completion of read request to slave device
-//  (Beginning of Master Read from Slave operation)
-// ----------------------------------------------------
-.i2c_isr_test_MRd:
-		ld    a, 0x33        ; Only DR, DT, ACK and RW bits are relevant
-      and   c              ; Apply mask to saved SR (status) LSB
-      cp    0x11           ; DT bit and RW bit should be set
-      jp		nz, .i2c_isr_test_SWr
-
-		ld    hl, i2c_isr_StateWaitMRd  ; Set to 'Master Read to Buffer' state
-      ld    (I2C_ISR_State), hl
-
-ioi   ld    jkhl, (SGCR)	; Read control register
-      ld    L, 0x86        ; Clear START, STOP & NAK bits
-               				; Set Transfer Byte Enable bit (TB_EN)
-		jp		.i2c_isr_exitWrCR  ; Execution resumes next interrupt
-      						  	;		        @ i2c_isr_StateWaitMRdA
-
-// ****************************************************
-// *** Master read last byte from slave into buffer ***
-// ****************************************************
-i2c_isr_StateWaitLastMRd::
-		ld    a, 0x31        ; Only DR, DT and RW bits are relevant
-      and   c              ; Apply mask to saved SR (status) LSB
-      cp    0x21           ; DR bit and RW bit should be set
-      jp    z, .i2c_isr_ReadByte
-      jp    .i2c_isr_exit
-
-// ***********************************************
-// *** Master read byte from slave into buffer ***
-// ***********************************************
-i2c_isr_StateWaitMRd::
-		ld    a, 0x33        ; Only DR, DT, ACK and RW bits are relevant
-      and   c              ; Apply mask to saved SR (status) LSB
-      cp    0x21           ; DR bit and RW bit should be set
-      jp    nz, .i2c_isr_exit
-.i2c_isr_ReadByte:
-      ld    jkhl, (ix + [I2Cdata] + dataPtr)
-      ld    px,jkhl
-ioi   ld    a, (SGDR) 		; Read data
-      ld    (px),a			; Write data to buffer
-		ld		hl, (ix + [I2Cdata] + dataLen)
-		dec	hl             ; Decrement count
-		ld		(ix + [I2Cdata] + dataLen),hl
-      test  hl
-      jr    z, .i2c_isr_EndRead
-
-      ld		px,px+1        ; Advance data pointer
-      ld    bcde, px
-      ld    (ix + [I2Cdata] + dataPtr), bcde
-      cp    hl, 1          ; Test if about to receive last byte
-ioi   ld    jkhl, (SGCR)	; Read control register
-      ld    L, 0x86        ; Clear START, STOP & NAK bits
-               				; Set Transfer Byte Enable bit (TB_EN)
-      jp    nz,.i2c_isr_exitWrCR
-      set   5, L           ; Set STOP & NAK bits if about to receive last byte
-      set   6, L
-		ld    de, i2c_isr_StateWaitLastMRd  ; Set to read last byte state
-      ld    (I2C_ISR_State), de
-		jp		.i2c_isr_exitWrCR  ; Execution resumes next interrupt
-      						  	;		        @ i2c_isr_StateWaitMRdWait
-                           ;             with Status reg. contents in HL
-.i2c_isr_EndRead:
-      // **** Last byte read, reset state machine and exit
-      ld    a,1                  ; Raise the 'done' flag
-      ld    (ix + [I2Cdata] + done),a
-  		ld    hl, i2c_isr_State0   ; Set state machine back to initial state
-      ld    (I2C_ISR_State), hl
-      ld    jkhl, 6              ; Clear all but SCL & I2C enable bits
-      jp    .i2c_isr_exitWrCR
+;.i2c_isr_SlaveMode:
+/*******************************************************************************
+	I2C is operating in slave mode.
+*******************************************************************************/
 
 
+
+
+#ifndef I2C_OMIT_SLAVE_CODE
 // ********************************************************
 // **** ---------- Primary SLAVE MODE state ---------- ****
 // ********************************************************
 .i2c_isr_test_SWr:
-
-#ifndef I2C_OMIT_SLAVE_CODE
-
 		ld		hl, bc			; Get status register value
 		ld		de, 0x0127		; Mask in relevant bits
 		and   hl, de
@@ -578,7 +475,7 @@ ioi   ld    jkhl, (SGCR)	; Read control register
       ld    jkhl, (ix + [I2Cdata] + dataPtr) ; Get data buffer pointer
       ld		px,jkhl
       ld    a, (px)			                  ; Get data to write
-ioi   ld    (SGDR), a 		                  ; Write data to I2C UART
+ioi   ld    (SGDR), a 		                  ; Write data to I2C port
 		ld		hl, (ix + [I2Cdata] + dataLen)
 		dec	hl                               ; Decrement write count
 		ld		(ix + [I2Cdata] + dataLen),hl
@@ -660,98 +557,252 @@ ioi   ld    a,(SGDR) 		; Read data byte
       bit   7, c               ; Test STOP bit in saved Status Reg. value
       jr		nz, .i2c_isr_exit  ; If STOP bit set, we're done with read
       jr    .i2C_isr_SlaveRead_Begin  ; Otherwise, setup for next byte
-
 #endif
 
-.i2c_unknownInt:
+
+
+
+.i2c_isr_MasterMode:				; fall through to master mode ISR code
+#endif
+
+#if defined I2C_OMIT_MASTER_CODE
+		; Mode error: I2C master mode ISR conditional code has been omitted.
+		jr		nz, .i2c_isr_ModeERRret
+#else
+/*******************************************************************************
+	I2C is operating in master mode.
+*******************************************************************************/
+		bit	2, h					; test for arbitration loss
+		jp		nz, .i2c_isr_ALret
+
+		bit	3, L					; test for bus busy with other's transaction
+		jp		nz, .i2c_isr_BBret
+
+		bit	6, L					; test for non-ACK slave response (BUS ERROR)
+		jp		nz, .i2c_isr_BERRret
+
+		bit	5, L					; test for data register received a byte
+		jr		nz, .i2c_isr_DRmaster
+
+		bit	4, L					; test for data register transmitted a byte
+		; If a byte was transmitted then fall through this conditional jump.
+		; Otherwise, go report an unknown (unexpected, unhandled) interrupt
+		;  occurrence.
+		jp		z, .i2c_isr_UERRret
+
+;.i2c_isr_DTmaster:
+		; Test for non-ACK detected (expected ACK).
+		bit	1, L
+		jp		nz, .i2c_isr_AERRret
+
+		ld		hl, (ix+[I2Cdata]+dataLen)	; test for remaining data to transmit
+		test	hl
+		; If no remaining data to transmit then go report success.
+		jp		z, .i2c_isr_exitDone1
+
+		; Get the next byte to be transmitted.
+		ld		jkhl, (ix+[I2Cdata]+dataPtr)
+		ld		px, jkhl
+		ld		a, (px+0)
+		; Write the transmit byte to the data register.
+ioi	ld		(SGDR), a
+		; Increment the data pointer.
+		ld		px, px+1
+		ld		jkhl, px
+		ld		(ix+[I2Cdata]+dataPtr), jkhl
+		; Decrement the remaining data length.
+		ld		hl, (ix+[I2Cdata]+dataLen)
+		dec	hl
+		ld		(ix+[I2Cdata]+dataLen), hl
+		; Initialize the I2C control register bit-OR mask for byte transmit.
+		ld		bcde, 0
+		; Will this be the last transmitted byte in this transfer?
+		test	hl
+		; If not the last byte then go write the control register.
+		jp		nz, .i2c_isr_exitWrCR
+
+		; Is the final byte transmit to be done with no STOP condition?
+		ld		a, (ix+[I2Cdata]+command)
+		and	_I2C_NOSTOP
+		; If no STOP condition then go write the control register.
+		jp		nz, .i2c_isr_exitWrCR
+
+		; Set the control register's initiate STOP condition bit.
+		set	5, e
+		jp		.i2c_isr_exitWrCR	; go write the control register
+
+.i2c_isr_DRmaster:
+		ld		hl, (ix+[I2Cdata]+dataLen)	; test for remaining data to receive
+		test	hl
+		; If no remaining data to receive then go report an unknown (unexpected,
+		;  unhandled) interrupt occurrence.
+		jr		z, .i2c_isr_UERRret
+
+		; Read the received byte from the data register.
+ioi	ld		a, (SGDR)
+		; Put the received byte into the data buffer.
+		ld		jkhl, (ix+[I2Cdata]+dataPtr)
+		ld		px, jkhl
+		ld		(px+0), a
+		; Increment the data pointer.
+		ld		px, px+1
+		ld		jkhl, px
+		ld		(ix+[I2Cdata]+dataPtr), jkhl
+		; Decrement the remaining data length.
+		ld		hl, (ix+[I2Cdata]+dataLen)
+		dec	hl
+		ld		(ix+[I2Cdata]+dataLen), hl
+		test	hl						; test for remaining data to receive
+		; If remaining data to receive then go continue.
+		jr		nz, .i2c_isr_DRmasterContinued
+
+		; Was this a "no STOP condition" receive?
+		ld		a, (ix+[I2Cdata]+command)
+		and	_I2C_NOSTOP
+		ld		a, (ix+[I2Cdata]+lastSRval)	; A = LSB of saved SGSR content
+		jr		z, .i2c_isr_DRmasterSTOP
+
+		; Test for non-ACK detected (expected ACK).
+		bit	1, a
+		; If ACK then go report success.
+		jr		z, .i2c_isr_exitDone1
+		jr		.i2c_isr_AERRret
+
+.i2c_isr_DRmasterSTOP:
+		; Test for non-ACK detected (expected non-ACK).
+		bit	1, a
+		; If non-ACK then go report success.
+		jr		nz, .i2c_isr_exitDone1
+		jr		.i2c_isr_AERRret
+
+.i2c_isr_DRmasterContinued:
+		; Test for non-ACK detected (expected ACK).
+		ld		a, (ix+[I2Cdata]+lastSRval)	; A = LSB of saved SGSR content
+		bit	1, a
+		jr		nz, .i2c_isr_AERRret
+
+		; Initialize the I2C control register bit-OR mask for byte receive.
+		ld		bcde, 0
+		; Will this be the last received byte in this transfer?
+		cp		hl, 1
+		; If not the last byte then go write the control register.
+		jr		nz, .i2c_isr_exitWrCR
+
+		; Is the final byte receive to be done with no STOP condition?
+		ld		a, (ix+[I2Cdata]+command)
+		and	_I2C_NOSTOP
+		; If no STOP condition then go write the control register.
+		jr		nz, .i2c_isr_exitWrCR
+
+		; Set the control register's initiate STOP condition enable bit.
+		set	5, e
+		; Set the control register's signal non-ACK enable bit.
+		set	6, e
+		jr		.i2c_isr_exitWrCR	; go write the control register
+#endif
+
+.i2c_isr_ModeERRret:
+		; Log an unsupported master / slave mode error as a Bus Busy (with
+		;  other's transaction) error.
+		ld		a, (ix+[I2Cdata]+lastSRval)
+		set	2, a
+		ld		(ix+[I2Cdata]+lastSRval), a
+.i2c_isr_AERRret:
 .i2c_isr_ALret:
+.i2c_isr_BBret:
 .i2c_isr_BERRret:
-.i2c_isr_NAKret:
-      // Treat all errors the same:
-      //  Increment I2Cdata.errorCount. I2Cdata.lastSRval can
-      //   be examined for more details after an error occurs.
-      ld    jkhl, (ix + [I2Cdata] + errorCount)
-      ld    px, jkhl
-      ld    px, px+1
-      ld    jkhl, px
-      ld    (ix + [I2Cdata] + errorCount), jkhl
+.i2c_isr_UERRret:
+		; Treat all errors the same: Increment I2Cdata.errorCount.
+		; I2Cdata.lastSRval can be examined for details after an error occurs.
+		ld		jkhl, (ix+[I2Cdata]+errorCount)
+		ld		bcde, 1
+		add	jkhl, bcde
+		ld		(ix+[I2Cdata]+errorCount), jkhl
+		; Mark the I2C transfer as done (aborted on error).
+		ld		a, 2
+		jr		.i2c_isr_exitDone2
 
-      // Disable all interrupts but keep I2C enabled - we could
-      //  just in a write cycle and polling for an ACK
+.i2c_isr_exitDone1:
+		; Mark the I2C transfer as done (completed successfully).
+		ld		a, 1
+.i2c_isr_exitDone2:
+		ld		(ix+[I2Cdata]+done), a
+		jr		.i2c_isr_exit
 
-.i2c_isr_exit::            ; Exit ISR and enable interrupts
+.i2c_isr_exitWrCR:
+ioi	ld		jkhl, (SGCR)		; read the current control register content
+		or		jkhl, bcde			; apply the provided control register bit-OR mask
+		set	7, L					; ensure the transfer byte enable bit is set
+ioi	ld		(SGCR), jkhl		; write the updated control register content
+.i2c_isr_exit:
+		; Exit the ISR and enable interrupts.
 		pop	ix
-      pop   px
+		pop	px
 		pop	af
-		pop   bcde
+		pop	bcde
 		pop	jkhl
-  	ipres                   ; Re-enable interrupts
-      ret
-
-.i2c_isr_exitWrCR:         ; Exit ISR with write to I2C Control Reg. from JKHL
-		pop	ix
-      pop   px
-		pop	af
-		pop   bcde
-ioi	ld    (SGCR),	jkhl	; Write to I2C Control register
-		pop	jkhl
-  	ipres                   ; Re-enable interrupts
-      ret
-
+		ipres
+		ret
 #endasm
 
 
-
 /*** BeginHeader I2C_WriteToSlave */
-
-	int I2C_WriteToSlave(unsigned slvAddr, char __far *data,
-   					int len, int blockingMode, unsigned long timeout);
-
+int I2C_WriteToSlave(unsigned slvAddr, char __far *data, unsigned len,
+                     int blockingMode, unsigned long timeout);
 /*** EndHeader */
 
-/* START FUNCTION DESCRIPTION ********************************************
+/* START FUNCTION DESCRIPTION ******************************************
+I2C_WriteToSlave              <I2C_HW.LIB>
 
- I2C_WriteToSlave                 <I2C_HW.LIB>
+SYNTAX:
+   int I2C_WriteToSlave(unsigned slvAddr, char *data, unsigned len,
+                        int blockingMode, unsigned long timeout);
 
-SYNTAX:  int I2C_WriteToSlave(unsigned slvAddr, char *data, int len,
-                            int blockingMode, unsigned long timeout);
+DESCRIPTION:
+   Writes data to I2C bus. This function runs in Master mode.
 
-DESCRIPTION:  Writes data to I2C bus. This function runs in Master mode.
+   IMPORTANT NOTE:
+      The I2C API is not re-entrant. Multi-tasking programs should use a
+      flag or semaphore to restrict access to it if multiple threads
+      will use it.
 
-NOTE: The I2C API is not re-entrant. Multi-tasking programs should
-		use a flag or semaphore to restrict access to it if mutliple
-      threads will use it.
+PARAMETER1:
+   7-bit slave destination address
 
-PARAMETER1: 7-bit slave destination address
+PARAMETER2:
+   Pointer to data to be written to I2C bus
 
-PARAMETER2: Pointer to data to be written to I2C bus
+PARAMETER3:
+   Number of bytes to be written to I2C bus
 
-PARAMETER3: Number of bytes to be written to I2C bus
+PARAMETER4:
+   Zero for non-blocking mode, non-zero for blocking. If non-blocking
+   and the function returns with a "Busy"  result code, it must be
+   called again until it returns 0.
 
-PARAMETER4: Zero for non-blocking mode, non-zero for blocking.
-				If non-blocking and the function returns with a "Busy"
-            return code, it must be called again until it returns 0.
+PARAMETER5:
+   Time in milliseconds to attempt to complete writing all bytes before
+   a time out error is returned. If zero, the function will not test for
+   a timeout condition. It is recommended that a timeout limit be set,
+   normally.
 
-PARAMETER5: Time in milliseconds to attempt to complete writing all
-				bytes before timing out error. If zero, the function will
-            not test for a timeout condition. It is recommended that
-            a timeout limit be set, normally.
-
-RETURN VALUE:	0	-	All bytes written successfully
-		  	 -EBUSY	-	Busy (non-blocking mode only)
-		  	 -ETIME	-	Timeout (if timeout argument non-zero only).
-  		 -ESLVADDR  -	Invalid slave address
-   	 -ELOSTARB	-	Lost arbitration dispute. This should
-       					only happen if there is another I2V
-                     master on the I2C bus. Retrying is
-                     recommended.
-		  -EBUSNAK  -  Bus or NAK error. Failure to receive
-                     NAK from a slave will cause this.
+RETURN VALUE:
+   0         - All bytes written successfully
+   -EBUSY    - Busy (non-blocking mode only)
+   -ETIME    - Timeout (if timeout argument non-zero only).
+   -ESLVADDR - Invalid slave address
+   -ELOSTARB - Lost arbitration dispute. This should only happen if
+               there is another I2C master on the I2C bus. Retrying is
+               recommended.
+   -EBUSNAK  - Bus or NAK error. Failure to receive NAK from a slave
+               will cause this.
+   -EINVAL   - Invalid read argument.
+   -EPERM    - State machine operation not permitted (invalid state).
 
 Blocking Usage Example:
 
       // Returns after transaction finished
-  		if(retval =
+  		if(retVal =
           I2C_WriteToSlave(
  			   SLAVE_ADDRESS,
   			    	     &data,
@@ -760,14 +811,14 @@ Blocking Usage Example:
                         5     // 5 msec timeout
          ))
       {
-       	printf("Error writing to slave %d\n",retval);
+       	printf("Error writing to slave %d\n",retVal);
       }
 
 Non-blocking Usage Example:
 
      while(
       	// Returns immediately
-			retval =
+			retVal =
           I2C_WriteToSlave(
 			   SLAVE_ADDRESS,
   				        &data,
@@ -776,403 +827,937 @@ Non-blocking Usage Example:
                        50     // 50 msec timeout
          ))
       {
-         if(retval != -EBUSY)
+         if(retVal != -EBUSY)
          {
            // Handle error
            ...
            break;
 			}
 
-         // Should yield here when mutlti-tasking
+         // Should yield here when multi-tasking
       }
-
-END DESCRIPTION **********************************************************/
+END DESCRIPTION *******************************************************/
 
 I2C_DEBUG
-int I2C_WriteToSlave(unsigned slvAddr, char __far *data,
-			int len, int blockingMode, unsigned long timeout)
+int I2C_WriteToSlave(unsigned slvAddr, char __far *data, unsigned len,
+                     int blockingMode, unsigned long timeout)
 {
-	return _I2C_RWSlave(0, slvAddr, data, len, blockingMode, timeout);
+	return _I2C_WriteToSlave(0, slvAddr, data, len, blockingMode, timeout);
 }
+
 
 /*** BeginHeader I2C_WriteToSlaveNoStop */
-
-	int I2C_WriteToSlaveNoStop(unsigned slvAddr, char __far *data,
-   					int len, int blockingMode, unsigned long timeout);
+int I2C_WriteToSlaveNoStop(unsigned slvAddr, char __far *data, unsigned len,
+                           int blockingMode, unsigned long timeout);
 /*** EndHeader */
+
 I2C_DEBUG
-int I2C_WriteToSlaveNoStop(unsigned slvAddr, char __far *data,
-			int len, int blockingMode, unsigned long timeout)
+int I2C_WriteToSlaveNoStop(unsigned slvAddr, char __far *data, unsigned len,
+                           int blockingMode, unsigned long timeout)
 {
-	return _I2C_RWSlave(2, slvAddr, data, len, blockingMode, timeout);
+	return _I2C_WriteToSlave(_I2C_NOSTOP, slvAddr, data, len, blockingMode,
+	                         timeout);
 }
 
-/*** BeginHeader I2C_PollForACK */
 
-	int I2C_PollForACK(unsigned slvAddr);
-
+/*** BeginHeader _I2C_WriteToSlave */
+int _I2C_WriteToSlave(int cmd, unsigned slvAddr, char __far *data, unsigned len,
+                     int blockingMode, unsigned long timeout);
 /*** EndHeader */
-int I2C_PollForACK(unsigned slvAddr)
-{
-	char data;
 
-   data = 0;
-	// Do a  write of 0 bytes in non blocking-mode
-   // if a NAK error is detected, return not ready (-EBUSY)
-	return _I2C_RWSlave(0, slvAddr, NULL, 0, 0, 0);
+I2C_DEBUG
+int _I2C_WriteToSlave(int cmd, unsigned slvAddr, char __far *data, unsigned len,
+                     int blockingMode, unsigned long timeout)
+{
+	static int state = 0;
+	static unsigned long tmo;
+	int retVal;
+
+	// This switch implements a small state machine to direct code execution
+	//  appropriately for any combination of blocking mode and / or time out.
+	switch (state)
+	{
+	default:
+		// This default case should never occur.
+		state = 0;
+		retVal = -EPERM;
+		break;
+
+	case 0:
+		// If timeout is desired, set the write operation time out timer.
+		if (0UL != timeout)
+		{
+			tmo = _SET_TIMEOUT(timeout);
+		}
+		state = 1;
+		// Intentionally fall through to case 1 . . .
+
+	case 1:
+		// Ensure the slave address is valid and that the slave isn't busy (e.g.
+		//  to allow time for a previous EEPROM write to complete).
+		do
+		{
+			retVal = _I2C_CheckSlaveAddress(slvAddr, blockingMode, timeout);
+			if (-EBUSY != retVal)
+			{
+				break;
+			}
+		} while (blockingMode && (0UL == timeout || !_CHK_TIMEOUT(tmo)));
+		if (0 != retVal)
+		{
+			// Exit this state machine on any non-success result code.
+			break;
+		}
+		// The slave is present and responsive; continue with the write.
+		state = 2;
+		// Intentionally fall through to case 2 . . .
+
+	case 2:
+		// Perform the address byte write to the I2C slave device.
+		do
+		{
+			retVal = _I2C_RWSlave(_I2C_NOSTART | _I2C_NOSTOP, (char*) &slvAddr, 1);
+			if (-EBUSY != retVal)
+			{
+				break;
+			}
+		} while (blockingMode && (0UL == timeout || !_CHK_TIMEOUT(tmo)));
+		if (0 != retVal)
+		{
+			// Exit this state machine on any non-success result code.
+			break;
+		}
+		// The slave address byte has been acknowledged; continue with the write.
+		state = 3;
+		// Intentionally fall through to case 3 . . .
+
+	case 3:
+		// Perform an I2C write data transfer.
+		do
+		{
+			retVal = _I2C_RWSlave(_I2C_NOSTART | cmd, data, len);
+			if (-EBUSY != retVal)
+			{
+				// Reset state on either of success result or write error result.
+				state = 0;
+				break;
+			}
+		} while (blockingMode && (0UL == timeout || !_CHK_TIMEOUT(tmo)));
+	}
+
+	if (0 != retVal && -EPERM != retVal &&
+       (-EBUSY != retVal || 0UL != timeout && _CHK_TIMEOUT(tmo)))
+	{
+		_I2C_RWSlave(-1, NULL, 0);	// send low-level reset command
+		state = 0;	// reset state on time out or any other error
+		if (-EBUSY == retVal)
+		{
+			// Was busy for too long; report the time out error.
+			retVal = -ETIME;
+		}
+	}
+
+	return retVal;
 }
 
 
 /*** BeginHeader I2C_ReadFromSlave */
-
-	int I2C_ReadFromSlave(unsigned slvAddr, char __far *data,
-   				 int len, int blockingMode, unsigned long timeout );
-
+int I2C_ReadFromSlave(unsigned slvAddr, char __far *data, unsigned len,
+                      int blockingMode, unsigned long timeout );
 /*** EndHeader */
 
-/* START FUNCTION DESCRIPTION ********************************************
+/* START FUNCTION DESCRIPTION ******************************************
+I2C_ReadFromSlave             <I2C_HW.LIB>
 
- I2C_ReadFromSlave                 <I2C_HW.LIB>
+SYNTAX:
+  int I2C_ReadFromSlave(unsigned slvAddr, char far *dataPtr,
+                        unsigned len, int blockingMode,
+                        unsigned long timeout);
 
-SYNTAX:  int I2C_ReadFromSlave(unsigned slvAddr, char far *dataPtr,
-                       int len, int blockingMode, unsigned long timeout);
+DESCRIPTION:
+   Reads data from the I2C bus. This function runs in Master mode.
 
-DESCRIPTION:  Reads data from I2C bus. This function runs in Master mode.
+   NOTE: The I2C API is not re-entrant. Multi-tasking programs should
+         use a flag or semaphore to restrict access to it if multiple
+         threads will use it.
 
-NOTE: The I2C API is not re-entrant. Multi-tasking programs should
-		use a flag or semaphore to restrict access to it if mutliple
-      threads will use it.
+PARAMETER1:
+   The MSB (i.e. bits 15:8) is the I2C control byte. Bits 15:9 form the
+   7-bit address of the slave to read from. For a serial EEPROM device,
+   bits 11:9 are either the device select bits (e.g. 24LC024) or the
+   EEPROM block select bits (e.g. 24LC16B). Bit 8 (R/W) is ignored, as
+   it is forced to the appropriate state in this function.
 
-PARAMETER1: 7-bit address of slave to read from
+   The LSB (i.e. bits 7:0) is the index of the first byte to be read.
 
-PARAMETER2: Pointer to data to be read from slave I2C bus
+PARAMETER2:
+   Pointer to a buffer for storing the data read from the I2C slave.
 
-PARAMETER3: Number of bytes to be read from slave
+PARAMETER3:
+   Number of bytes to be read from the I2C slave.
 
-PARAMETER4: Zero for non-blocking mode, non-zero for blocking.
-				If non-blocking and the function returns with a "Busy"
-            return code, it must be called again until it returns 0.
+PARAMETER4:
+   Zero for non-blocking mode, non-zero for blocking mode. If non-
+   blocking mode and the function returns with -EBUSY result code, it
+   must be called again until it returns 0.
 
-PARAMETER5: Time in milliseconds to attempt to complete reading all
-				bytes before timing out error. If zero, the function will
-            not test for a timeout condition. It is recommended that
-            a timeout limit be set, normally.
+PARAMETER5:
+   Time in milliseconds to attempt to complete reading all bytes before
+   timing out error. If zero, the function will not test for a timeout
+   condition. It is recommended that a timeout limit be set, normally.
 
-RETURN VALUE:	0	-	All bytes written successfully
-		  	 -EBUSY	-	Busy (non-blocking mode only)
-		  	 -ETIME	-	Timeout (if timeout argument non-zero only).
-  		 -ESLVADDR  -	Invalid slave address
-        -ENODATA	-	None NULL dataPtr with zero len, or
-        					non-zero len with NULL dataPtr.
-   	 -ELOSTARB	-	Lost arbitration dispute. This should
-       					only happen if there is another I2V
-                     master on the I2C bus. Retrying is
-                     recommended.
-		  -EBUSNAK  -  Bus or NAK error. Failure to receive
-                     NAK from a slave will cause this.
+RETURN VALUE:
+   0         - All bytes read successfully.
+   -EBUSY    - Device is busy (only if non-blocking mode).
+   -ETIME    - Timeout (only if non-zero timeout).
+   -ESLVADDR - Invalid slave address.
+   -ENODATA  - Either non-NULL dataPtr with zero len, or non-zero len
+               with NULL dataPtr.
+   -ELOSTARB - Lost arbitration dispute. This should only happen if
+               there is another master on the I2C bus. Retrying is
+               recommended.
+   -EBUSNAK  - Bus or NAK error. Failure to receive NAK from a slave
+               will cause this.
+   -EINVAL   - Invalid read argument.
+   -EPERM    - State machine operation not permitted (invalid state).
 
-See I2C_WriteToSlave for blocking and non-blocking usage examples.
-
-END DESCRIPTION **********************************************************/
+SEE ALSO:
+   See I2C_WriteToSlave() for blocking and non-blocking usage examples.
+END DESCRIPTION ******************************************************/
 
 I2C_DEBUG
-int I2C_ReadFromSlave(unsigned slvAddr, char __far *data,
-			int len, int blockingMode, unsigned long timeout)
+int I2C_ReadFromSlave(unsigned slvAddr, char __far *data, unsigned len,
+                      int blockingMode, unsigned long timeout)
 {
-	return _I2C_RWSlave(1, slvAddr, data, len, blockingMode, timeout);
+	static int state = 0;
+	static unsigned long tmo;
+	char controlByte;
+	int retVal;
+
+	// This switch implements a small state machine to direct code execution
+	//  appropriately for any combination of blocking mode and / or time out.
+	switch (state)
+	{
+	default:
+		// This default case should never occur.
+		state = 0;
+		retVal = -EPERM;
+		break;
+
+	case 0:
+		// If timeout is desired, set the read operation time out timer.
+		if (0UL != timeout)
+		{
+			tmo = _SET_TIMEOUT(timeout);
+		}
+		state = 1;
+		// Intentionally fall through to case 1 . . .
+
+	case 1:
+		// Ensure the slave address is valid and that the slave isn't busy (e.g.
+		//  to allow time for a previous EEPROM write to complete).
+		do
+		{
+			retVal = _I2C_CheckSlaveAddress(slvAddr, blockingMode, timeout);
+			if (-EBUSY != retVal)
+			{
+				break;
+			}
+		} while (blockingMode && (0UL == timeout || !_CHK_TIMEOUT(tmo)));
+		if (0 != retVal)
+		{
+			// Exit this state machine on any non-success result code.
+			break;
+		}
+		// The slave is present and responsive; continue with the read.
+		state = 2;
+		// Intentionally fall through to case 2 . . .
+
+	case 2:
+		// Complete random read's "dummy write" to set up the desired EEPROM
+		//  address on the I2C slave device.
+		do
+		{
+			retVal = _I2C_RWSlave(_I2C_NOSTART | _I2C_NOSTOP, (char*) &slvAddr, 1);
+			if (-EBUSY != retVal)
+			{
+				break;
+			}
+		} while (blockingMode && (0UL == timeout || !_CHK_TIMEOUT(tmo)));
+		if (0 != retVal)
+		{
+			// Exit this state machine on any non-success result code.
+			break;
+		}
+		// The "dummy write" was successfully completed; continue with the read.
+		state = 3;
+		// Intentionally fall through to case 3 . . .
+
+	case 3:
+		// Perform a re-START of the addressed slave and set read mode.
+		do
+		{
+			// Convert slvAddr's MSB into a 7-bit slave address control byte with
+			//  read mode enforced.
+			controlByte = (char) ((slvAddr >> 8) | 0x01);
+			retVal = _I2C_RWSlave(_I2C_NOSTOP, &controlByte, 1);
+			if (-EBUSY != retVal)
+			{
+				break;
+			}
+		} while (blockingMode && (0UL == timeout || !_CHK_TIMEOUT(tmo)));
+		if (0 != retVal)
+		{
+			// Exit this state machine on any non-success result code.
+			break;
+		}
+		// The addressed slave's reSTART was successfully completed; continue with
+		//  the read.
+		state = 4;
+		// Intentionally fall through to case 4 . . .
+
+	case 4:
+		// Perform a "read from current address" read from the I2C slave device.
+		do
+		{
+			retVal = _I2C_RWSlave(_I2C_NOSTART | _I2C_READ, data, len);
+			if (-EBUSY != retVal)
+			{
+				// Reset state on either of success result or write error result.
+				state = 0;
+				break;
+			}
+		} while (blockingMode && (0UL == timeout || !_CHK_TIMEOUT(tmo)));
+	}
+
+	if (0 != retVal && -EPERM != retVal &&
+       (-EBUSY != retVal || 0UL != timeout && _CHK_TIMEOUT(tmo)))
+	{
+		_I2C_RWSlave(-1, NULL, 0);	// send low-level reset command
+		state = 0;	// reset state on time out or any other error
+		if (-EBUSY == retVal)
+		{
+			// Was busy for too long; report the time out error.
+			retVal = -ETIME;
+		}
+	}
+
+	return retVal;
+}
+
+
+/*** BeginHeader _I2C_CheckSlaveAddress */
+int _I2C_CheckSlaveAddress(unsigned slvAddr, int blockingMode,
+                           unsigned long timeout);
+/*** EndHeader */
+
+// Check the slave address via ACK polling until either an ACK is received or
+//  time out occurs.
+I2C_DEBUG
+int _I2C_CheckSlaveAddress(unsigned slvAddr, int blockingMode,
+                           unsigned long timeout)
+{
+	static int state = 0;
+	static word tmo;
+	int retVal;
+
+	// This switch implements a small state machine to direct code execution
+	//  appropriately for any combination of blocking mode and / or time out.
+	switch (state)
+	{
+	default:
+		// This default case should never occur.
+		state = 0;
+		retVal = -EPERM;
+		break;
+
+	case 0:
+		if (0UL == timeout || I2C_SLAVE_CHECK_TIMEOUT_MS <= timeout)
+		{
+			tmo = _SET_SHORT_TIMEOUT(I2C_SLAVE_CHECK_TIMEOUT_MS);
+		}
+		else
+		{
+			tmo = _SET_SHORT_TIMEOUT(((word) timeout));
+		}
+		state = 1;
+		// Intentionally fall through to case 1 . . .
+
+	case 1:
+		do
+		{
+			// Execute an ACK poll of the specified slave address.
+			if (0 == (retVal = _I2C_PollForACK(slvAddr)))
+			{
+				//  Got an ACK response, so the slave address is valid.
+				state = 0;	// reset state on success result
+				break;
+			}
+		} while (blockingMode && !_CHK_SHORT_TIMEOUT(tmo));
+		// Convert any non-success result to -EBUSY.
+		retVal = retVal ? -EBUSY : retVal;
+		if (retVal && _CHK_SHORT_TIMEOUT(tmo))
+		{
+			// No response from the addressed slave within the time out period.
+			state = 0;	// reset state on error result
+			retVal = -ESLVADDR;
+		}
+	}
+
+	return retVal;
+}
+
+
+/*** BeginHeader _I2C_PollForACK */
+int _I2C_PollForACK(unsigned slvAddr);
+/*** EndHeader */
+
+I2C_DEBUG
+int _I2C_PollForACK(unsigned slvAddr)
+{
+	char controlByte;
+
+	// Convert slvAddr's MSB into a 7-bit slave address control byte with write
+	//  mode enforced.
+	controlByte = (char) ((slvAddr >> 8) & 0xFE);
+	// Acknowledge polling performs a write of 1 byte length with START but no
+	//  STOP. The result is 0 if the addressed slave ACKs the poll; otherwise,
+	//  the expected result is either -EBUSY or -EBUSNAK (when a non-ACK error is
+	//  detected).
+	return _I2C_RWSlave(_I2C_NOSTOP, &controlByte, 1);
+}
+
+
+/*** BeginHeader _I2C_ResetPortHW */
+int _I2C_ResetPortHW(void);
+/*** EndHeader */
+
+I2C_DEBUG
+int _I2C_ResetPortHW(void)
+{
+	// Reset the I2C serial port HW.
+	WrPortI32(SGCR, 1UL);
+	return 0;	// reset port HW always succeeds
+}
+
+
+/*** BeginHeader _I2C_RWSlaveBadACKorNAK */
+int _I2C_RWSlaveBadACKorNAK(int cmd, uint32 statusReg, int isLastByte);
+/*** EndHeader */
+
+I2C_DEBUG
+int _I2C_RWSlaveBadACKorNAK(int cmd, uint32 statusReg, int isLastByte)
+{
+	int retVal = 0;	// default result is "neither bad ACK nor bad non-ACK"
+
+	if (0x2UL & statusReg)
+	{
+		// Non-ACK is bad if a completed data transfer and any of: a write
+		//  transfer, the data transfer does not initiate a STOP condition, or not
+		//  the final byte in a data transfer.
+		if ((0x60UL & statusReg) &&
+		    (!(_I2C_READ & cmd) || (_I2C_NOSTOP & cmd) || !isLastByte))
+		{
+			retVal = 1;
+		}
+	}
+	else
+	{
+		// ACK is bad only if the final byte in a completed read transfer which
+		//  initiates a STOP condition.
+		if ((0x20UL & statusReg) && isLastByte && (_I2C_READ & cmd) &&
+		    !(_I2C_NOSTOP & cmd))
+		{
+			retVal = 1;
+		}
+	}
+	return retVal;
 }
 
 
 /*** BeginHeader _I2C_RWSlave */
-
-	int _I2C_RWSlave(int rw, unsigned slvAddr, char __far *data, int len,
-						    int blockingMode, unsigned long timeout);
-
+int _I2C_RWSlave(int cmd, char __far *data, unsigned len);
 /*** EndHeader */
 
-// This runs in Master mode.
+#if defined I2C_OMIT_MASTER_CODE
+	#fatal "Must undefine I2C_OMIT_MASTER_CODE."
+#endif
+
+/* START_FUNCTION DESCRIPTION ******************************************
+_I2C_RWSlave                  <I2C_HW.LIB>
+
+SYNTAX:
+   int _I2C_RWSlave(int cmd, char far *data, unsigned len);
+
+DESCRIPTION:
+   A Rabbit I2C bus Master transfers data to or from the I2C bus.
+
+   IMPORTANT NOTE:
+      The I2C API is not re-entrant. Multi-tasking programs should use a
+      flag or semaphore to restrict access to it if multiple threads
+      will use it.
+
+   Implementation Notes
+
+   Retention of maximum public API compatibility with the legacy bit-
+   banged I2C driver library influences the implementation of lower
+   level public API as well as private API. Because the legacy public
+   API combines I2C serial port transmit and receive transfers, the
+   lower level API functions use this private function as follows:
+
+      A "write to specified address" transaction is composed of a
+      command code 2 operation followed by a command code 4 operation:
+      START + write control and address bytes; write data byte(s) +
+      STOP.
+
+      A "read from current address" transaction is composed of a command
+      code 2 operation followed by a command code 5 operation: START +
+      write control byte; read data byte(s) + STOP.
+
+      A "random read" (i.e. read from a specified address) transaction
+      is composed of two command code 2 operations followed by a command
+      code 5 operation: START + write control and address bytes; START +
+      write control byte; read data byte(s) + STOP.
+
+   New API written by the user can avoid the inefficient command code 2
+   then command code 4 operations found in the current API's "write to
+   specified address" functionality. If the control and address bytes
+   are placed at the beginning of the buffer ahead of the data bytes,
+   then that functionality can be written as a single command code 0
+   operation.
+
+PARAMETER1:
+   A reset or data transfer command code with the following definitions:
+     -1 - reset the I2C state machine.
+      0 - write to specified address with both START and STOP.
+      1 - read from current address with both START and STOP.
+      2 - write to specified address with START but without STOP.
+      3 - read from current address with START but without STOP.
+      4 - write to specified address without START but with STOP.
+      5 - read from current address without START but with STOP.
+      6 - write to specified address with neither START nor STOP.
+      7 - read from current address with neither START nor STOP.
+   Excepting the reset command, all valid command codes can be formed by
+   bit-ORing together zero or more of the _I2C_READ (0x01), _I2C_NOSTOP
+   (0x02) and / or _I2C_NOSTART (0x04) macros.
+
+PARAMETER2:
+   The MSB (i.e. bits 15:8) is the I2C control byte. Bits 15:9 form the
+   7-bit address of the slave device. For a serial EEPROM device, bits
+   11:9 are either the device select bits (e.g. 24LC024) or the EEPROM
+   block select bits (e.g. 24LC16B). Bit 8 (R/W) is ignored, as it is
+   forced to the appropriate state in this function.
+
+   The LSB (i.e. bits 7:0) is the index of the first byte to be
+   accessed. Note that the LSB is ignored during command code 1, 3, 5
+   and 7 (i.e. read at current address with various specified START /
+   STOP conditions) operations.
+
+PARAMETER3:
+   Pointer to a buffer for the data transferred to or from the I2C
+   slave.
+
+PARAMETER4:
+   Number of bytes to be transferred to or from the I2C slave.
+
+RETURN VALUE:
+   0         - All bytes transferred successfully.
+   -EBUSY    - Device is busy (only if non-blocking mode).
+   -ENODATA  - Either non-NULL dataPtr with zero len, or non-zero len
+               with NULL dataPtr.
+   -ELOSTARB - Lost arbitration dispute. This should only happen if
+               there is another master on the I2C bus. Retrying is
+               recommended.
+   -EBUSNAK  - Bus or non-ACK error. Failure to receive ACK from a slave
+               will cause this.
+   -EINVAL   - Invalid cmd argument.
+   -EPERM    - State machine operation not permitted (invalid state).
+END DESCRIPTION *******************************************************/
 
 I2C_DEBUG
-int _I2C_RWSlave(int read, unsigned slvAddr, char __far *data,
-			int len, int blockingMode, unsigned long timeout)
+int _I2C_RWSlave(int cmd, char __far *data, unsigned len)
 {
-   static unsigned long t0;
-   static int retval, isTenBit, state;
-   static unsigned slvaddr;
-   unsigned long statusReg;
+	static int state = 0;
+#ifdef I2C_NO_INTERRUPTS
+	static unsigned subState;
+	static unsigned subStateFinal;
+#endif
+	int retVal;
+	uint32 controlReg;
+	uint32 statusReg;
 
-#GLOBAL_INIT
-{
-   state = 0;
+	// Immediately handle a reset command.
+	if (-1 == cmd)
+	{
+		// Reset the local state machine
+		state = 0;
+		// Reset the I2C serial port HW.
+		return _I2C_ResetPortHW();	// the reset command always succeeds
+	}
+
+	// Check the read / write command code.
+	if (0 > cmd || 7 < cmd)
+	{
+		return -EINVAL;
+	}
+
+	// Check data and len information. Either NULL pointer or zero length results
+	//  in an error return.
+	if (NULL == data || 0 == len)
+	{
+		return -ENODATA;
+	}
+
+	// This switch implements a state machine to direct I2C R/W access code
+	//  execution. Conditional code sections handle either interrupt-driven or
+	//  polled I/O mode.
+	switch (state)
+	{
+	default:
+		// This default case should never occur.
+		state = 0;
+		retVal = -EPERM;
+		break;
+
+	case 0:
+		// Reset any and all prior I2C status flags.
+		RdPortI32(SGSR);	// ensure SGS0R flags are reset
+		RdPortI32(SGSR);	// ensure SGS1R flags are reset, too
+
+		// Ensure the I2C clock divider is updated.
+		WrPortI32(SGCDR, I2C_CLK_COUNT);
+
+		// Prepare for the first byte transfer.
+#ifndef I2C_NO_INTERRUPTS
+		if (_I2C_READ & cmd)
+		{
+			// Master mode receive mode:
+			//    Enable I2C, master mode, transfer one byte, enable interrupt on
+			//    either of received byte or lost arbitration.
+			controlReg = 0x2286UL;
+		}
+		else
+		{
+			// Master mode transmit mode:
+			//    Enable I2C, master mode, transfer one byte, enable interrupt on
+			//    any of transmitted byte, non-ACK from slave or lost arbitration.
+			controlReg = 0x2586UL;
+		}
+#else
+		// Enable I2C, master mode, transfer one byte.
+		controlReg = 0x86UL;
+#endif
+		controlReg |= (_I2C_NOSTART & cmd) ? 0UL : 0x10UL;
+#ifndef I2C_NO_INTERRUPTS
+		I2Cdata.command = cmd;
+		I2Cdata.done = 0;
+#else
+		subState = 0;	// initialize the transfer operation's sub-state (index)
+		subStateFinal = len - 1U;	// index of the final data transfer
+#endif
+		if (_I2C_READ & cmd)
+		{
+			// Check if only one byte to read and STOP should be initiated, then
+			//  read should also send NACK.
+			controlReg |= (1U == len && !(_I2C_NOSTOP & cmd)) ? 0x60UL : 0UL;
+#ifndef I2C_NO_INTERRUPTS
+			I2Cdata.dataPtr = data;
+			I2Cdata.dataLen = len;
+#endif
+		}
+		else
+		{
+			// Check if only one byte to write and STOP should be initiated.
+			controlReg |= (1U == len && !(_I2C_NOSTOP & cmd)) ? 0x20UL : 0UL;
+			// Write the first byte into the I2C serial port's data register.
+#ifndef I2C_NO_INTERRUPTS
+			WrPortI(SGDR, NULL, data[0]);
+			I2Cdata.dataPtr = &data[1];
+			I2Cdata.dataLen = len - 1U;
+#else
+			WrPortI(SGDR, NULL, data[subState]);
+#endif
+		}
+
+		// Initiate the first byte transfer.
+		WrPortI32(SGCR, controlReg);
+		state = 1;	// set the I2C transfer operation's next state
+		retVal = -EBUSY;	// not done yet; next call in will move to the new state
+		break;
+
+#ifndef I2C_NO_INTERRUPTS
+	// Interrupt-driven I/O mode I2C R/W access state machine.
+	case 1:
+		if (0 == I2Cdata.done)
+		{
+			retVal = -EBUSY;	// data transfer is still in progress
+		}
+		else
+		{
+			// The ISR has completed data transfer processing, with or without
+			//  error, so reset state.
+			state = 0;
+			if (1 == I2Cdata.done)
+			{
+				retVal = 0;	// success
+			}
+			else // if (2 == I2Cdata.done)
+			{
+				// Reset the I2C serial port on any error condition(s).
+				_I2C_ResetPortHW();
+				// Report error condition(s).
+				statusReg = I2Cdata.lastSRval;
+				if (0x44AUL & statusReg)
+				{
+					if (0x408UL & statusReg)
+					{
+						// Detected lost arbitration or bus is busy with other's
+						//  transfer.
+						retVal = -ELOSTARB;
+					}
+					else // if (0x42UL & statusReg)
+					{
+						// Non-ACK response from slave after transmitting a byte.
+						retVal = -EBUSNAK;
+					}
+				}
+				else
+				{
+					// An unknown (unexpected, unhandled) interrupt occurred.
+					retVal = -ERR_UNEXPECTEDINTRPT;
+				}
+			}
+		}
+		//break;
+		// This is the end of the interrupt-driven I2C R/W access state machine.
+#else
+	// Polled I/O mode I2C R/W access state machine.
+	case 1:
+		// I2C transfer operation continued: Wait for the byte transfer to
+		//  complete or an error status to appear.
+		statusReg = RdPortI32(SGSR);
+		if ((0x448UL & statusReg) ||
+		    _I2C_RWSlaveBadACKorNAK(cmd, statusReg, subStateFinal == subState))
+		{
+			// Reset the I2C serial port on any error condition(s).
+			_I2C_ResetPortHW();
+			// Reset the local state machine.
+			state = 0;
+			if (0x408UL & statusReg)
+			{
+				// Detected lost arbitration or bus busy with other's transfer.
+				retVal = -ELOSTARB;
+			}
+			else // if ((0x40UL & statusReg) || _I2C_RWSlaveBadACKorNAK(...))
+			{
+				// Either a non-ACK response from slave after transmitting a byte or
+				//  an unexpected ACK or an unexpected non-ACK.
+				retVal = -EBUSNAK;
+			}
+			break;
+		}
+		if (0UL ==
+		    ((_I2C_READ & cmd) ? (0x20UL & statusReg) : (0x10UL & statusReg)))
+		{
+			// The byte transfer is not complete yet, return -EBUSY.
+			retVal = -EBUSY;
+			break;
+		}
+
+		if (_I2C_READ & cmd)
+		{
+			// I2C read transfer:
+			//    Read the data byte into the receive buffer, increment the sub-
+			//    state and then check if done.
+			data[subState++] = RdPortI(SGDR);
+			if (subState > subStateFinal)
+			{
+				// Completed this I2C read transfer, reset the local state machine
+				//  and return success.
+				state = 0;
+				retVal = 0;
+				break;
+			}
+		}
+		else
+		{
+			// I2C write transfer:
+			//    If not done, increment the sub-state then write the data byte
+			//    from the transmit buffer.
+			if (subState >= subStateFinal)
+			{
+				// Completed this I2C write transfer, reset the local state machine
+				//  and return success.
+				state = 0;
+				retVal = 0;
+				break;
+			}
+			WrPortI(SGDR, NULL, data[++subState]);
+		}
+
+		// Prepare for the next byte transfer.
+		if ((_I2C_NOSTOP & cmd) || subStateFinal != subState)
+		{
+			// Transfer a non-STOP or a non-last byte. Enable I2C, set master mode,
+			//  transfer one byte.
+			controlReg = 0x86L;
+		}
+		else if (_I2C_READ & cmd)
+		{
+			// Receive the last byte with STOP condition. Enable I2C, set master
+			//  mode, initiate STOP, send NAK, transfer one byte.
+			controlReg = 0xE6L;
+		}
+		else
+		{
+			// Transmit the last data byte with STOP condition. Enable I2C, set
+			//  master mode, initiate STOP, transfer one byte.
+			controlReg = 0xA6L;
+		}
+
+		// Initiate another byte transfer.
+		WrPortI32(SGCR, controlReg);
+		// The I2C transfer is not complete yet, return -EBUSY.
+		retVal = -EBUSY;
+		//break;
+		// This is the end of the polled-I/O I2C R/W access state machine.
+#endif
+	}
+
+	return retVal;
 }
 
-   if(state==0)
-   {
-		if(slvAddr > 511)return -ESLVADDR;
-
-      // Check data info
-      // A NULL ptr is allowed if len==0 to allow
-      // sending slvAddr only.
-      if( (len && data==(char __far*)NULL) ||
-          (!len && data!=(char __far*)NULL))
-      {
-      	return -ENODATA;
-      }
-		if(slvAddr > 127) {
-         // Construct 10-bit address MSB
-         slvaddr = 0x0F0 | ((slvAddr&0x0300)>>7);
-			isTenBit = 1;
-      }
-      else {
-         slvaddr = slvAddr<<1;
-         isTenBit = 0;
-      }
-
-		retval = -EBUSY;
-      I2Cdata.done = 0;
-
-      // This is the only difference between reading and writing.
-		if(read==1) slvaddr |= 1; 	// Set RW bit to read
-
-      // A dummy write uses R/W bit = 0 for the 1st device select,
-      // and issues a repeated START instead of a STOP when done.
-      // This is for the combination form used by many EEPROMS, for
-      // example, for doing reads.
-      I2Cdata.dummyWrite = (read == 2 ? 1 : 0);
-
-      I2Cdata.dataPtr = data;             // ISR uses these
-      I2Cdata.dataLen = len;
-
-      state = 1;
-      RdPortI32(SGSR);
-      if(timeout) t0 = MS_TIMER;			// Init. time out timer
-
-     #asm
-        ld    jkhl, (I2C_CLK_COUNT)
-   ioi  ld    (SGCDR), jkhl				// Write count to CDR
-
-        ld    a, (slvaddr)
-   ioi  ld    (SGDR), a					// Write slave addr.
-        ld    a,(isTenBit)
-        or    a
-        jp    z,_isSevenBit
-
-        //DEVIDEA - Faraday doc isn't very helpful for 10-bit addressing.
-        //          I think this is how it should work  - BPM
-
-        ld    bcde, -1 					// Sign extends to 0xFFFFFFFF
-
-        // Clear DTI_EN bit, STARTI_EN, STOPI_EN
-        res   0, d
-        res   3, d
-        res   6, d
-        and   jkhl,bcde
-
-        // Set master mode, enable, & start CR bits
-        set   2, e					// Set SCL_EN bit
-        set   1, e					// Set I2C_EN bit
-        set   4, e					// Set START bit
-        set   7, e					// Set TB_EN bit
-        or    jkhl, bcde
-   ioi  ld    (SGCR), jkhl				// Write Control reg.
-
-        ld  	b,255
-
-        // This should finish quickly
-_waitForFirstAddrByteSent:
-        // Wait for transfer complete
-   ioi  ld    jkhl, (SGCR)
-        ld    a, L          				// Check TB_EN bit, which should
-        and   0x80         				//  be cleared after byte is sent
-        jr    z, _firstAddrByteSent
-        djnz  _waitForFirstAddrByteSent
-
-        ld    hl, -ETIME    				// Something went wrong
-        jp    _i2cMRWexit
-
-_firstAddrByteSent:
-
-        // Send second addr byte
-c             slvaddr = slvAddr;
-
-        ld    a, (slvaddr)
-   ioi  ld    (SGDR), a	    				// Write slave addr.
-_isSevenBit:
-        ld    bcde, 0
-
-                          				// Set interrupt CR enable & DT, DR bits
-                            				// Set master mode, enable, & start CR bits
-        ld    de, 0x2F86    				// Set  ALI_EN, STOPI_EN, BERRI_EN,
-                             				//      DRI_EN & DTI_EN bits
-                             				// Set TB_EN, SCL_EN & I2C_EN bits
-        ld    a, (isTenBit)
-        or    a
-        jr    nz, _isTenBit   				// Already set START for 10-bit
-        set   4, e           				// Set START bit
-_isTenBit:
-c             I2Cdata.dataLen;
-
-        test  hl
-        jr    nz, _notZeroLenData
-        set   5, e           				// Just polling for ACK, set STOP
-_notZeroLenData:
-
-   ioi  ld    (SGCR), bcde     				// Write Control reg.
-     #endasm
-   }
-   if(state==1)
-   {
-      do
-      {
-         if(timeout && (MS_TIMER-t0) > timeout) {
-            state = 0;
-            retval = -ETIME;
-            WrPortI32(SGCR, 1UL);  // Reset the I2C UART and state machine
-            I2C_ISR_State = (unsigned)i2c_isr_State0;
-            break;
-         }
-      } while (blockingMode && !I2Cdata.done);  // Yield/return if non-blocking
-
-      if (I2Cdata.done) {
-         // ISR completed packet processing, check for error condition
-         state = 0;
-         statusReg = I2Cdata.lastSRval;
-	      // Check for lost arbitration dispute
-         if(statusReg & 0x0400UL) {
-            retval = -ELOSTARB;
-         }
-         else if (statusReg & 0x02UL) {
-            // NAK is used to end a read cycle, so it is expected
-            retval = (read == 1) ? 0 : -EBUSNAK;
-         }
-         else {
-            retval = (statusReg & 0x0040UL) ? -EBUSNAK : 0;
-         }
-      }
-      else if (!retval && blockingMode) {
-         retval = -EBUSY;
-      }
-   }
-_i2cMRWexit:
-   return retval;
-}
-
-/* START FUNCTION DESCRIPTION ********************************************
-
- I2C_WriteToMaster                 <I2C_HW.LIB>
-
-SYNTAX:    int I2C_WriteToMaster(unsigned slvAddr, char far *data, int len,
-           int blockingMode, int respondGC, unsigned long timeout);
-
-DESCRIPTION:  Writes data to I2C bus. This function runs in Slave mode.
-
-NOTE: The I2C API is not re-entrant. Multi-tasking programs should
-      use a flag or semaphore to restrict access to it if mutliple
-      threads will use it.
-
-PARAMETER1: Slave destination address
-
-PARAMETER2: Pointer to data to be written to I2C bus
-
-PARAMETER3: Number of bytes to be written to I2C bus
-
-PARAMETER4: Zero for non-blocking mode, non-zero for blocking.
-            If non-blocking and the function returns with a "Busy"
-            return code, it must be called again until it returns 0.
-
-PARAMETER5: Flag to respond to general call. 1 = respond, 0 = ignore.
-
-PARAMETER6: Time in milliseconds to attempt to complete writing all
-            bytes before timing out error. If zero, the function will
-            not test for a timeout condition. It is recommended that
-            a timeout limit be set, normally.
-
-RETURN VALUE:     0 - All bytes written successfully
-             -EBUSY - Busy (non-blocking mode only)
-             -ETIME - Timeout (if timeout argument non-zero only).
-          -ESLVADDR - Invalid slave address
-           -EBUSNAK - Bus or NAK error.
-
-See I2C_WriteToSlave for blocking and non-blocking usage examples.
-
-END DESCRIPTION **********************************************************/
 
 /*** BeginHeader I2C_WriteToMaster */
-
-int I2C_WriteToMaster(unsigned slvAddr, char __far *data, int len,
-                  int blockingMode, int respondGC, unsigned long timeout);
-
+int I2C_WriteToMaster(unsigned slvAddr, char __far *data, unsigned len,
+                      int blockingMode, int respondGC, unsigned long timeout);
 /*** EndHeader */
 
-int I2C_WriteToMaster(unsigned slvAddr, char __far *data, int len,
-               int blockingMode, int respondGC, unsigned long timeout)
-{
-   return _I2C_RWMaster(1, slvAddr, data, len,
-                  blockingMode, respondGC, timeout);
+/* START FUNCTION DESCRIPTION ******************************************
+I2C_WriteToMaster             <I2C_HW.LIB>
 
+SYNTAX:
+   int I2C_WriteToMaster(unsigned slvAddr, char far *data, unsigned len,
+                         int blockingMode, int respondGC,
+                         unsigned long timeout);
+
+DESCRIPTION:
+   Writes data to I2C bus. This function runs in Slave mode. See
+   I2C_WriteToSlave for blocking and non-blocking usage examples.
+
+   IMPORTANT NOTE:
+      The I2C API is not re-entrant. Multi-tasking programs should use a
+      flag or semaphore to restrict access to it if multiple threads
+      will use it.
+
+PARAMETER1:
+   Slave destination address
+
+PARAMETER2:
+   Pointer to data to be written to I2C bus
+
+PARAMETER3:
+   Number of bytes to be written to I2C bus
+
+PARAMETER4:
+   Zero for non-blocking mode, non-zero for blocking. If non-blocking
+   and the function returns with a "Busy" return code, it must be called
+   again until it returns 0.
+
+PARAMETER5:
+   Flag to respond to general call. 1 = respond, 0 = ignore.
+
+PARAMETER6:
+   Time in milliseconds to attempt to complete writing all bytes before
+   timing out error. If zero, the function will not test for a timeout
+   condition. It is recommended that a timeout limit be set, normally.
+
+RETURN VALUE:
+   0         - All bytes written successfully.
+   -EBUSY    - Busy (non-blocking mode only).
+   -ETIME    - Timeout (if timeout argument non-zero only).
+   -ESLVADDR - Invalid slave address.
+   -EBUSNAK  - Bus or NAK error.
+END DESCRIPTION *******************************************************/
+
+I2C_DEBUG
+int I2C_WriteToMaster(unsigned slvAddr, char __far *data, unsigned len,
+                      int blockingMode, int respondGC, unsigned long timeout)
+{
+	return _I2C_RWMaster(1, slvAddr, data, len, blockingMode, respondGC,
+	                     timeout);
 }
 
-/* START FUNCTION DESCRIPTION ********************************************
-
- I2C_ReadFromMaster                 <I2C_HW.LIB>
-
-SYNTAX:   int I2C_ReadFromMaster(unsigned slvAddr, char far *data, int len,
-               int blockingMode, int respondGC, unsigned long timeout);
-
-DESCRIPTION:  Reads data from I2C bus. This function runs in Slave mode.
-
-NOTE: The I2C API is not re-entrant. Multi-tasking programs should
-      use a flag or semaphore to restrict access to it if mutliple
-      threads will use it.
-
-PARAMETER1: Address of slave to read from
-
-PARAMETER2: Pointer to data to be read from slave I2C bus
-
-PARAMETER3: Number of bytes to be read from slave
-
-PARAMETER4: Zero for non-blocking mode, non-zero for blocking.
-            If non-blocking and the function returns with a "Busy"
-            return code, it must be called again until it returns 0.
-
-PARAMETER5: Flag to respond to general call. 1 = respond, 0 = ignore.
-
-PARAMETER5: Time in milliseconds to attempt to complete reading all
-            bytes before timing out error. If zero, the function will
-            not test for a timeout condition. It is recommended that
-            a timeout limit be set, normally.
-
-RETURN VALUE:    0 - All bytes written successfully
-            -EBUSY - Busy (non-blocking mode only)
-            -ETIME - Timeout (if timeout argument non-zero only).
-         -ESLVADDR - Invalid slave address
-          -EBUSNAK - Bus or NAK error.
-
-See I2C_WriteToSlave for blocking and non-blocking usage examples.
-
-END DESCRIPTION **********************************************************/
 
 /*** BeginHeader I2C_ReadFromMaster */
-
-int I2C_ReadFromMaster(unsigned slvAddr, char __far *data, int len,
-                  int blockingMode, int respondGC, unsigned long timeout);
-
+int I2C_ReadFromMaster(unsigned slvAddr, char __far *data, unsigned len,
+                       int blockingMode, int respondGC, unsigned long timeout);
 /*** EndHeader */
 
-int I2C_ReadFromMaster(unsigned slvAddr, char __far *data,  int len,
-               int blockingMode, int respondGC, unsigned long timeout)
-{
-   return _I2C_RWMaster(0, slvAddr, data, len,
-                  blockingMode, respondGC, timeout);
+/* START FUNCTION DESCRIPTION ******************************************
+I2C_ReadFromMaster            <I2C_HW.LIB>
 
+SYNTAX:
+   int I2C_ReadFromMaster(unsigned slvAddr, char far *data,
+                          unsigned len, int blockingMode, int respondGC,
+                          unsigned long timeout);
+
+DESCRIPTION:
+   Reads data from I2C bus. This function runs in Slave mode. See
+   I2C_WriteToSlave for blocking and non-blocking usage examples.
+
+   IMPORTANT NOTE:
+      The I2C API is not re-entrant. Multi-tasking programs should use a
+      flag or semaphore to restrict access to it if multiple threads
+      will use it.
+
+PARAMETER1:
+   Address of slave to read from
+
+PARAMETER2:
+   Pointer to data to be read from slave I2C bus
+
+PARAMETER3:
+   Number of bytes to be read from slave
+
+PARAMETER4:
+   Zero for non-blocking mode, non-zero for blocking. If non-blocking
+   and the function returns with a "Busy" return code, it must be called
+   again until it returns 0.
+
+PARAMETER5:
+   Flag to respond to general call. 1 = respond, 0 = ignore.
+
+PARAMETER5:
+   Time in milliseconds to attempt to complete reading all bytes before
+   timing out error. If zero, the function will not test for a timeout
+   condition. It is recommended that a timeout limit be set, normally.
+
+RETURN VALUE:
+   0         - All bytes written successfully.
+   -EBUSY    - Busy (non-blocking mode only).
+   -ETIME    - Timeout (if timeout argument non-zero only).
+   -ESLVADDR - Invalid slave address.
+   -EBUSNAK  - Bus or NAK error.
+END DESCRIPTION *******************************************************/
+
+I2C_DEBUG
+int I2C_ReadFromMaster(unsigned slvAddr, char __far *data,  unsigned len,
+                       int blockingMode, int respondGC, unsigned long timeout)
+{
+	return _I2C_RWMaster(0, slvAddr, data, len, blockingMode, respondGC,
+	                     timeout);
 }
 
+
 /*** BeginHeader _I2C_RWMaster */
-
-int _I2C_RWMaster(int write, unsigned slvAddr, char __far *data, int len,
-                      int blockingMode, int respondGC, unsigned long timeout);
-
+int _I2C_RWMaster(int cmd, unsigned slvAddr, char __far *data, unsigned len,
+                  int blockingMode, int respondGC, unsigned long timeout);
 /*** EndHeader */
+
+#if defined I2C_OMIT_SLAVE_CODE
+	#fatal "Must undefine I2C_OMIT_SLAVE_CODE."
+#endif
 
 // This runs in slave mode.
 
@@ -1184,225 +1769,312 @@ int _I2C_RWMaster(int write, unsigned slvAddr, char __far *data, int len,
 //  is the case. - BPM
 
 I2C_DEBUG
-int _I2C_RWMaster(int write, unsigned slvAddr, char __far *data, int len,
+int _I2C_RWMaster(int cmd, unsigned slvAddr, char __far *data, unsigned len,
                    int blockingMode, int respondGC, unsigned long timeout)
 {
-   static unsigned state;
-   static unsigned long t0;
-   unsigned long statusReg;
-   int retval, timeOutErr;
+	static unsigned state = 0;
+	static unsigned long t0;
+	unsigned long statusReg;
+	int retVal, timeOutErr;
 
-#GLOBAL_INIT
-{
-   state = 0;
-}
+ 	 if ( state == 0)
+	{
+		//BPM - TEMP? Really need every time?
+		if (retVal = I2C_SetSlvAddr(slvAddr))	// Write slave addr. to I2C reg.
+		{
+			return retVal;
+		}
 
-   if(state==0)
-   {
-      //BPM - TEMP? Really need every time?
-      if(retval=I2C_SetSlvAddr(slvAddr))  // Write slave addr. to I2C reg.
-      {
-         return retval;
-      }
+		I2Cdata.isWrite = 0;
+		retVal = -EBUSY;
 
-      I2Cdata.isWrite = 0;
-      retval = -EBUSY;
+		I2Cdata.dataPtr = data;	// ISR uses these
+		I2Cdata.dataLen = len;
 
-      I2Cdata.dataPtr = data;             // ISR uses these
-      I2Cdata.dataLen = len;
+		state = 1;
 
-      state = 1;
+		if (timeout)
+		{
+			t0 = MS_TIMER;	// Init. time out timer
+		}
 
-      if(timeout) t0 = MS_TIMER;            // Init. time out timer
-
-
-     #asm
-      	ld    hl, (sp+@SP+respondGC)
-        ld    a, L
-   ioi  ld    jkhl, (SGCR)			// Read Control reg.
-        ld    bcde, -1  			// Sign extends to 0xFFFFFFFF
-        res   5, e      			// Clear STOP bit
-        res   2, e      			// Clear SCL_EN bit
-        and   jkhl, bcde
-        ld    bcde, 0x00			// Sign extends
-
-                        			// Set interrupt CR enable & DT, DR bits
-        ld    d, 0x7F   			// Set STARTI_EN, ALI_EN, SAMI_EN,
+		#asm
+				ld		hl, (sp+@SP+respondGC)
+				ld		a, L
+		ioi	ld		jkhl, (SGCR)			// Read Control reg.
+				ld		bcde, -1			// Sign extends to 0xFFFFFFFF
+				res	5, e			// Clear STOP bit
+				res	2, e			// Clear SCL_EN bit
+				and	jkhl, bcde
+				ld		bcde, 0x00			// Sign extends
+				ld		d, 0x7F			// Set interrupt CR enable & DT, DR bits
+							// Set STARTI_EN, ALI_EN, SAMI_EN,
                          			//      STOPI_EN, BERRI_EN, DRI_EN
                         			//      & DTI_EN bits
 
-        set   1, e      			// Set I2C_EN bit
-        or    a
-        jr    z,noSlvGCresponse
-        set   3, e        			// Set GC_EN bit
+				set	1, e			// Set I2C_EN bit
+				or		a
+				jr		z, noSlvGCresponse
+
+				set	3, e			// Set GC_EN bit
 noSlvGCresponse:
-        or    jkhl, bcde
-   ioi  ld    (SGCR), jkhl			// Write Control reg.
+				or		jkhl, bcde
+		ioi	ld		(SGCR), jkhl			// Write Control reg.
+		#endasm
+	}
+	if (state == 1)
+	{
+		while (1)
+		{
+			// ISR decrements I2Cdata.dataLen on each byte sent
+			if (I2Cdata.dataLen == 0)
+			{
+				state = 0;
+				retVal = 0;	// Finished successfully
+				break;
+			}
 
-     #endasm
-   }
-   if(state==1)
-   {
-      while(1)
-      {
-         // ISR decrements I2Cdata.dataLen on each byte sent
-         if(I2Cdata.dataLen==0 )
-         {
-            state=0;
-            state  = 0;
-            retval = 0;    // Finished successfully
-            break;
-         }
+			// The difference between a read from slave and write to slave is
+			//  entirely in the interrupt handling.
+			// Check here to make sure it's the right type of transaction.
+			if (cmd != I2Cdata.isWrite)
+			{
+				state = 0;
+				retVal = -EBUSNAK;
+				break;
+			}
 
-         // The difference between a read from slave
-         // and write to slave is entirely in the
-         // interrupt handling. Check here to make
-         // sure it's the right type of transaction
-         if(write != I2Cdata.isWrite )
-         {
-            state  =  0;
-            retval = -EBUSNAK;
-            break;
-         }
+			if (timeout && (MS_TIMER-t0) > timeout)
+			{
+				state = 0;
+				retVal = -ETIME;
+				break;
+			}
 
-         if(timeout && (MS_TIMER-t0) > timeout)
-         {
-            state  =  0;
-            retval = -ETIME;
-            break;
-         }
-
-         if(!blockingMode)
-         {
-            break;         // Yield/return if non-blocking mode
-         }
-      }
-   }
-   return retval;
+			if (!blockingMode)
+			{
+				break;	// yield and return if non-blocking mode
+			}
+		}
+	}
+	return retVal;
 }
 
 
-/* START FUNCTION DESCRIPTION ********************************************
+/*** BeginHeader I2C_setGlitchTiming */
+int I2C_setGlitchTiming(int TSR, int GSR);
+/*** EndHeader */
 
-I2C_setGlitchTiming                     <I2C_HW.LIB>
+/* START FUNCTION DESCRIPTION ******************************************
+I2C_setGlitchTiming           <I2C_HW.LIB>
 
-SYNTAX:  int int I2C_setGlitchTiming(int TSR, int GSR); (int TSR, int GSR);
+SYNTAX:
+  int int I2C_setGlitchTiming(int TSR, int GSR);
 
 DESCRIPTION:
-   Users implementing opto-Isolation circuitry on the I2C bus should be
+   Users implementing opto-isolation circuitry on the I2C bus should be
    aware that timing glitches may be introduced by that circuitry.
 
-   The I2C set/hold time and glitch suppression setting register (SGTCR[9:0])
-   defines the values of PCLK clock cycles. After the SCL bus goes low,
-   the data will be sent to the SDA bus when the I2C controller serves
-   as a transmitter, or an acknowledgement will be sent to the SDA bus when
-   the I2C controller serves as a receiver.
+   The I2C set/hold time and glitch suppression setting register
+   (SGTCR[9:0]) defines the values of PCLK clock cycles. After the SCL
+   bus goes low, the data will be sent to the SDA bus when the I2C
+   controller serves as a transmitter, or an acknowledgement will be
+   sent to the SDA bus when the I2C controller serves as a receiver.
 
-	The I2C set/hold Time and glitch suppression setting register (SGTCR[12:10])
-   defines the values of PCLK clock period when the I2C bus interface has
-   a built-in glitch suppression logic. Glitches are suppressed according
-   to SGTCR[12:10]*PCLK clock period. For example, with a 66-MHz (15 ns period)
-   PCLK clock, and SGTCR[12:10] = b100, glitches of 60 ns or less are
-   suppressed. With a 40-MHz (25 ns period) clock, and SGTCR[12:10] = b010,
-   glitches of 50 ns or less are suppressed. This is within the 50 ns glitch
-   suppression specification. One limitation is: CDR > 3 + GSR + TSR.
+   The I2C set/hold time and glitch suppression setting register
+   (SGTCR[12:10]) defines the values of PCLK clock period when the I2C
+   bus interface has a built-in glitch suppression logic. Glitches are
+   suppressed according to SGTCR[12:10]*PCLK clock period. For example,
+   with a 66-MHz (15 ns period) PCLK clock, and SGTCR[12:10] = b100,
+   glitches of 60 ns or less are suppressed. With a 40-MHz (25 ns
+   period) clock, and SGTCR[12:10] = b010, glitches of 50 ns or less are
+   suppressed. This is within I2C's 50 ns glitch suppression
+   specification. One limitation is: CDR > 3 + GSR + TSR.
 
-NOTES:
-   The default values of GSR & TSR are 1. If they must be changed, they
-   should be changed by calling this function BEFORE calling
-   I2C_Init. This function is not called by I2C_Init().
+   NOTES:
+      The default values of GSR & TSR are 1. If they must be changed,
+      they should be changed by calling this function BEFORE calling
+      I2C_Init. This function is not called by I2C_Init.
 
-   TSR and GSR must conform to:  COUNT > 3 + GSR + TSR,   where COUNT is
-   the I2C clock counter register value. This is checked in I2C_initClk()
-   which is called by I2C_Init(), it is not checked here.
+      TSR and GSR must conform to: COUNT > 3 + GSR + TSR, where COUNT is
+      the I2C clock counter register value. This is checked in
+      _I2C_initClk which is called by I2C_Init, it is not checked here.
 
-PARAMETER1:   TSR value. Must be 1-1023
-PARAMETER2:   GSR value. Must be 1-7
+PARAMETER1:
+   TSR value. Must be in the range [1,1023].
 
-RETURN VALUE:   0  - Success
-               -1  - invalid TSR or GSR
+PARAMETER2:
+   GSR value. Must be in the range [1,7].
 
-END DESCRIPTION **********************************************************/
-/*** BeginHeader I2C_setGlitchTiming */
+RETURN VALUE:
+   0   - Success.
+   -1  - invalid TSR or GSR.
+END DESCRIPTION *******************************************************/
 
-int I2C_setGlitchTiming(int TSR, int GSR);
-
-/*** EndHeader */
 I2C_DEBUG
 int I2C_setGlitchTiming(int TSR, int GSR)
 {
-  if(!TSR || !GSR || TSR > 0x03ff || GSR > 0x07)return -1;
-  WrPortI32(SGTCR, TSR | (GSR<<10UL));
-  return 0;
+	if ( 0 >= TSR || 0 >= GSR || 0x3FF < TSR || 0x7 < GSR)
+	{
+		return -1;
+	}
+
+	WrPortI32(SGTCR, TSR | (GSR << 10));
+	return 0;
 }
+
 
 /*** BeginHeader _I2C_getTSR */
-
-int _I2C_getTSR();
-
+int _I2C_getTSR(void);
 /*** EndHeader */
 
 I2C_DEBUG
-int _I2C_getTSR()
+int _I2C_getTSR(void)
 {
-	return (int)( RdPortI32(SGTCR) & 0x03FF );
+	return (int) (RdPortI32(SGTCR) & 0x3FFUL);
 }
+
 
 /*** BeginHeader _I2C_getGSR */
-
-int _I2C_getGSR();
+int _I2C_getGSR(void);
 /*** EndHeader */
 
 I2C_DEBUG
-int _I2C_getGSR()
+int _I2C_getGSR(void)
 {
-   return (int)(RdPortI32(SGTCR) & 0x1C00) >> 10;
+	return (int) ((RdPortI32(SGTCR) & 0x1C00) >> 10);
 }
 
 
-/* START FUNCTION DESCRIPTION ********************************************
-
-I2C_SetSlvAddr                                 <I2C_HW.LIB>
-
-SYNTAX:   int I2C_SetSlvAddr(int myAddress);
-
-DESCRIPTION:  For slave mode only. Set the slave address
-              of the Rabbit I2C.
-
-PARAMETER1:  The 7 or 10 bit slave address.
-
-RETURN VALUE:  0 - Success
-              -1 - Invalid Slave address
-
-END DESCRIPTION **********************************************************/
-
 /*** BeginHeader I2C_SetSlvAddr */
-
 int I2C_SetSlvAddr(unsigned long myAddress);
-
 /*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ******************************************
+I2C_SetSlvAddr                <I2C_HW.LIB>
+
+SYNTAX:
+   int I2C_SetSlvAddr(int myAddress);
+
+DESCRIPTION:
+   For slave mode only. Set Rabbit's I2C slave address.
+
+PARAMETER1:
+   Rabbit's 7 or 10 bit I2C slave address.
+
+RETURN VALUE:
+   0         - Success.
+   -ESLVADDR - Invalid I2C slave address.
+END DESCRIPTION *******************************************************/
 
 I2C_DEBUG
 int I2C_SetSlvAddr(unsigned long myAddress)
 {
-   // bits 31-10 should not be used
-   if(myAddress & 0xFC00UL)return -ESLVADDR;
+	// Bits 31-10 must be all zeros.
+	if (0xFFFFFC00UL & myAddress)
+	{
+		return -ESLVADDR;
+	}
 
-   // If it's a 10-bit address, must set bit 31
-   if(myAddress & 0x0380UL)
-   {
-   	myAddress |= 0x80000000UL;
-   }
-   WrPortI32(SGSAR, myAddress);
+	// If it's a 10-bit address, must set bit 31
+	if (0x380UL & myAddress)
+	{
+		myAddress |= 0x80000000UL;
+	}
+	WrPortI32(SGSAR, myAddress);
 
-   return 0;
+	return 0;
 }
 
-/*** BeginHeader */
-// macros for legacy 32 bit io R/W functions needed for USB host driver
-#define ioWrite_32(port, value)	WrPortI32(port, value)
-#define ioRead_32(port)				RdPortI32(port)
+
+/*** BeginHeader _I2C_GetControlReg */
+long _I2C_GetControlReg(void);
 /*** EndHeader */
+
+I2C_DEBUG
+long _I2C_GetControlReg(void)
+{
+	return RdPortI32(SGCR);
+}
+
+
+/*** BeginHeader I2C_GetSlaveStatus */
+long I2C_GetSlaveStatus(void);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ******************************************
+I2C_GetSlaveStatus            <I2C_HW.LIB>
+
+SYNTAX:
+   long I2C_GetSlaveStatus(void);
+
+DESCRIPTION:
+   For slave mode only. Get the status of Rabbit's I2C peripheral.
+
+RETURN VALUE:
+   -1 - An invalid (impossible) slave status result is returned when
+        Rabbit's I2C peripheral is operating in master mode.
+   Otherwise, a valid bit-coded slave status result. Refer to the Rabbit
+   6000 Microprocessor User's Manual for I2C status bit definitions.
+END DESCRIPTION *******************************************************/
+
+I2C_DEBUG
+long I2C_GetSlaveStatus(void)
+{
+	auto long result = -1L;	// default to an impossible status result
+
+	if (!(I2C_CR_SCL_EN_BIT & _I2C_GetControlReg()))
+	{
+		/*
+		   Only return an actual status result when operating in slave mode.
+		   (SGCR's I2C controller clock disabled implies slave mode operation.)
+		*/
+#ifndef I2C_NO_INTERRUPTS
+		result = I2Cdata.lastSRval;
+#else
+		result = RdPortI32(SGSR);
+#endif
+	}
+	return result;
+}
+
+
+/*** BeginHeader I2C_SlaveSetup */
+int I2C_SlaveSetup(unsigned long myAddress, unsigned long myEnables);
+/*** EndHeader */
+
+/* START FUNCTION DESCRIPTION ******************************************
+I2C_SlaveSetup                <I2C_HW.LIB>
+
+SYNTAX:
+   int I2C_SlaveSetup(unsigned long myAddress, unsigned long myEnables);
+
+DESCRIPTION:
+   For slave mode only. Set up Rabbit's I2C peripheral for slave mode
+   operation.
+
+RETURN VALUE:
+   0         - Success.
+   -ESLVADDR - Invalid I2C slave address.
+END DESCRIPTION *******************************************************/
+
+I2C_DEBUG
+int I2C_SlaveSetup(unsigned long myAddress, unsigned long myEnables)
+{
+	int result;
+
+	if (result = I2C_SetSlvAddr(myAddress))
+	{
+		return result;
+	}
+
+#ifndef I2C_NO_INTERRUPTS
+	// enable caller-specified I2C interrupts
+	WrPortI32(SGCR, myEnables);
+#endif
+
+	return 0;
+}
 
 
 /*** BeginHeader */
