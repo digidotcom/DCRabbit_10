@@ -11,6 +11,14 @@ BOOTDEV_SFLASH.LIB
 DESCRIPTION:
 
   ATMEL AT45DB series are the only devices currently supported.
+  
+  Configuration macros:
+  
+  _FAST_BIOS_LOAD
+  	 If defined on the "Defines" tab of "Project Options" on Rabbit 6000
+  	 hardware, enables the clock doubler and makes use of optimized Rabbit
+  	 6000 assembly in _sbf_BIOS_LoadApp to reduce boot time (benchmark of
+  	 694,318 byte program: 2380ms to 918ms).
 
   The functions below are internal. Some are only for use from
   assembly code, and some are only for BIOS and pilot usage.
@@ -2124,6 +2132,11 @@ _sbf_BIOS_LoadApp::
 		;; _sbf_BIOS_LoadApp, so we can safely set up a faster serial flash clock.
 		ld		a, SFDIVISOR
 ioi	ld		(TAT5R), a				; For SCLCK divisor
+#if defined(_FAST_BIOS_LOAD) && CPU_ID_MASK(_CPU_ID_) >= R6000
+		ld		a, 0x03
+ioi	ld		(GCDR), a			; double 25MHz clock to 50MHz for loading code
+#endif
+		
 #endif//if CPU_ID_MASK(_CPU_ID_) >= R6000
 
 		; load the highest physical program address into JKHL
@@ -2161,12 +2174,27 @@ ioi	ld		(MB2CR), hl
 		ld		bc, SBF_CONTREAD_BYTES	;  For address and don't care bits
 		call	_sbfStreamOut
 
+ioi	ld		a, (ix+_AR_OFFS)		; start a byte receive operation (discard byte)
+
 		ld		jkhl, pz					; restore HPA into JKHL
 
 		; save firmware image to start of MB2 + 64k
 		ld		px, _cexpr(SBF_MB2_PHY_START + 0x10000UL)
-
-ioi	ld		a, (ix+_AR_OFFS)		; start a byte receive operation (discard byte)
+#if defined(_FAST_BIOS_LOAD) && CPU_ID_MASK(_CPU_ID_) >= R6000
+		ld		de, _cexpr(SBF_DR+_AR_OFFS)
+		nop $ nop $ nop $ nop $ nop $ nop $ nop $ nop
+		nop $ nop $ nop $ nop $ nop $ nop $ nop $ nop
+		align 2                ; force alignment to even address
+		; inner loop is one byte ioi, one byte ld a, (de); others are two bytes
+.loop:
+		nop $ nop
+ioi	ld		a, (de)
+      ld		(px), a
+      inc	px
+      inc	py
+      cp		jkhl, py
+		jr		nz, .loop
+#else
 .loop:
 		;; Optimization Note:
 		;;   Because the SPI divisor value may be greater than zero, we can't be
@@ -2182,7 +2210,8 @@ ioi	ld		a, (ix+_AR_OFFS)		; get byte from SxAR to trigger next read
 		ld		bcde, py
 		cp		jkhl, bcde				; HPA = bytes copied?
 		jr		nz, .loop
-
+#endif
+		
 		;; Optimization Note:
 		;;   Because the last byte read from SxAR in the above loop triggered a
 		;;   final read, wait for the final read to complete and discard the byte.
@@ -2193,6 +2222,11 @@ ioi	bit	7, (ix+_SR_OFFS)		; test receiver status bit
 ioi	ld		a, (ix)					; discard the final byte (no new SPI transfer)
 
       SFCSDISABLE
+
+#if defined(_FAST_BIOS_LOAD) && CPU_ID_MASK(_CPU_ID_) >= R6000
+		xor	a
+ioi	ld		(GCDR), a			; disable clock doubler
+#endif
 
 sbf_loadapp_exit:
       pop   ix
