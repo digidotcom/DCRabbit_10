@@ -95,8 +95,12 @@
    same DS1 LED, it blinks once for ping sent and twice
    when the ping response is received.
 ***********************************************************/
-#if (RCM5600W_SERIES)
-  #use "RCM56xxW.lib"
+#if RCM5600W_SERIES || RCM6600W_SERIES
+  #if RCM5600W_SERIES
+    #use "RCM56xxW.lib"
+  #elif RCM6600W_SERIES
+    #use "RCM66xxW.lib"
+  #endif
   #define pingoutled(onoff) BitWrPortI(PDDR, &PDDRShadow, onoff, 0);
   #define pinginled(onoff)  BitWrPortI(PDDR, &PDDRShadow, onoff, 0);
 #else
