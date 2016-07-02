@@ -23,12 +23,7 @@
 // requires two bytes of address to tell the processor where to place the code
 // in memory.
 
-// This source file should be used in conjunction with makecold.exe, which is
-// built from makecold.cpp.  The makecold.cpp source file contains several
-// options including the building a coldloader to work with either 8 or 16 bit
-// memories.  Note that if compiling a coldloader for 16-bit RAM, this
-// file must be compiled with 16-bit support enabled, and makecold.exe must also
-// be recompiled for 16-bit support.
+// This source file should be used in conjunction with triplets.exe.
 
 // After this program is compiled to a .bin file, check it in a hex editor to
 // make sure that the compiler has not inserted any extraneous bytes of code.
@@ -40,8 +35,7 @@
 // the bios.
 
 // Define the following macro to 1 if compiling the coldloader to run on a
-// 16-bit RAM.  Note that makecold.exe must be compiled to match the setting
-// of this macro.
+// 16-bit RAM.
 //#define BOOTSTRAP_FROM_16BIT	1
 
 // WARNING: This cold loader must not use any Rabbit 4000 specific instructions.
