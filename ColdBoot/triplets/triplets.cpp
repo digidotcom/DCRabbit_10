@@ -9,6 +9,8 @@
 // Author: Bryce Hathaway
 // Date: December 5, 2007
 
+#include <stdlib.h>
+
 #include <iostream>
 #include <map>
 #include <fstream>

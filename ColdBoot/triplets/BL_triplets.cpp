@@ -14,6 +14,8 @@
 //The original triplet utility has been modified to produce the boot loader triplets that get placed before the BIOS in serial flash.
 //The output is a text file rather than a binary file, as the result will be #used by StdBios.c
 
+#include <stdlib.h>
+
 #include <iostream>
 #include <iomanip>
 #include <map>
