@@ -91,12 +91,12 @@ set PROJ=compile_%FILE%
 
 :build
 echo Recompiling %FILE%.c
-..\distribcommon\dccl_cmp.exe %FILE%.c -pf %PROJ%.dcp
+..\dccl_cmp.exe %FILE%.c -pf %PROJ%.dcp
 if %TRIPLET%==1 (
 	echo Using triplet.exe to create BIOS\%FILE%.bin
-	triplets\triplets.exe %FILE% ..\distribcommon\bios\%FILE%
+	triplets\triplets.exe %FILE% ..\bios\%FILE%
 ) else (
 	echo Copying %FILE%.bin to BIOS\%FILE%.bin
-	copy %FILE%.bin ..\distribcommon\bios\%FILE%.bin
+	copy %FILE%.bin ..\bios\%FILE%.bin
 )
 :exit

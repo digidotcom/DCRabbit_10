@@ -39,7 +39,7 @@
 	Use BL_triplets.exe to convert to the .LIB:
 
 	BL_triplets.exe ..\COLDLOAD_serflash_boot
-		..\..\DistribCommon\Lib\Rabbit4000\BIOSLIB\serial_flash_boot_loader.lib
+		..\..\Lib\Rabbit4000\BIOSLIB\serial_flash_boot_loader.lib
 */
 
 /*

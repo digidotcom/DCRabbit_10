@@ -6,7 +6,7 @@
 # touch precoldload.c - tell make that precoldload.bin is stale and needs to be rebuilt
 # make precoldload.bin - rebuild a single .bin file
 # make all - rebuild all .bin files using Dynamic C's command-line compiler
-# make install - copy .bin files to DistribCommon's BIOS directory, tripletting as necessary
+# make install - copy .bin files to BIOS directory, tripletting as necessary
 # 	make install also builds BIOSLIB\serial_flash_boot_loader.lib
 # make clean - delete all .bin files created from previous builds
 
@@ -15,11 +15,11 @@
 
 .noautodepend
 
-DCCL=..\DistribCommon\dccl_cmp.exe
+DCCL=..\dccl_cmp.exe
 TRIP=triplets\triplets.exe
 BLTRIP=triplets\BL_triplets.exe
-BIOSDIR=..\DistribCommon\BIOS
-BIOSLIB=..\DistribCommon\Lib\Rabbit4000\BIOSLIB
+BIOSDIR=..\BIOS
+BIOSLIB=..\Lib\Rabbit4000\BIOSLIB
 
 # list of coldloaders that need to be tripletted
 COLD=precoldload.bin checkramcs0.bin checkcs04mem.bin coldload.bin coldload16bit.bin coldloadserflash.bin
