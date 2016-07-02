@@ -1,3 +1,10 @@
+/*
+   Copyright (c) 2016 Digi International Inc.
+
+   This Source Code Form is subject to the terms of the Mozilla Public
+   License, v. 2.0. If a copy of the MPL was not distributed with this
+   file, You can obtain one at http://mozilla.org/MPL/2.0/.
+*/
 // WARNING: This cold loader must not use any Rabbit 4000 specific
 // mainpage instructions.
 // A good heuristic is all 8-bit loads not involving 'a' and all 8 bit

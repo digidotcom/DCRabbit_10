@@ -1,4 +1,11 @@
 /*
+   Copyright (c) 2016 Digi International Inc.
+
+   This Source Code Form is subject to the terms of the Mozilla Public
+   License, v. 2.0. If a copy of the MPL was not distributed with this
+   file, You can obtain one at http://mozilla.org/MPL/2.0/.
+*/
+/*
 	Rabbit 5000 and new processors can boot directly off of a serial flash
 	without the assistance of a PIC (which was needed by the Rabbit 4000).
 	Bootstrap mode is entered and bytes are read in sets of three from the

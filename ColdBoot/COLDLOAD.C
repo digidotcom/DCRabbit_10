@@ -1,3 +1,10 @@
+/*
+   Copyright (c) 2016 Digi International Inc.
+
+   This Source Code Form is subject to the terms of the Mozilla Public
+   License, v. 2.0. If a copy of the MPL was not distributed with this
+   file, You can obtain one at http://mozilla.org/MPL/2.0/.
+*/
 //The cold loader takes care of the following tasks:
 //- Run a timing calculation to determine the clock speed of the board.
 //- Using the clock speed to determine 57600 baud, receive the pilot BIOS.
