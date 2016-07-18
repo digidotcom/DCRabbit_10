@@ -139,7 +139,9 @@ SSPEC_RESOURCETABLE_END
 
 void main()
 {
-	SSL_Cert_t my_cert;
+	// Can't store this on the stack (auto) since the HTTP server library stores
+	// a reference to it for use later.
+	static far SSL_Cert_t my_cert;
 
 	/*
 	 *  sock_init initializes the TCP/IP stack.
@@ -150,6 +152,7 @@ void main()
 	sock_init_or_exit(1);
    http_init();
 
+	_f_memset(&my_cert, 0, sizeof(my_cert));
 	// When using HTTPS (i.e. HTTP over SSL or TLS), the certificates need
 	// to be parsed and registered with the library.  For use with a
 	// server, we need to know our own private key.

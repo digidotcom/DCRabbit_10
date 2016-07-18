@@ -187,7 +187,9 @@ int checkHighTemp(int newval)
 
 void main(void)
 {
-	SSL_Cert_t my_cert;
+	// Can't store this on the stack (auto) since the HTTP server library stores
+	// a reference to it for use later.
+	static far SSL_Cert_t my_cert;
 	// Declare the FormVar array to hold form variable information
 	FormVar myform[5];
 	int var;
@@ -271,7 +273,7 @@ void main(void)
 	sock_init_or_exit(1);
    http_init();
 
-	memset(&my_cert, 0, sizeof(my_cert));
+	_f_memset(&my_cert, 0, sizeof(my_cert));
 	// When using HTTPS (i.e. HTTP over SSL or TLS), the certificates need
 	// to be parsed and registered with the library.  For use with a
 	// server, we need to know our own private key.

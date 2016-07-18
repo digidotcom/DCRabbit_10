@@ -269,11 +269,13 @@ int smtp_server_policy(ssl_Socket far * state, int trusted,
 
 void main()
 {
-	auto SSL_Cert_t trusted;
+	// Can't store this on the stack (auto) since the SMTP client library stores
+	// a reference to it for use later.
+	static far SSL_Cert_t trusted;
 	auto int rc;
 
 	// First, parse the trusted CA certificates.
-	memset(&trusted, 0, sizeof(trusted));
+	_f_memset(&trusted, 0, sizeof(trusted));
 	rc = SSL_new_cert(&trusted, ca_pem1, SSL_DCERT_XIM, 0);
 	if (rc) {
 		printf("Failed to parse CA certificate 1, rc=%d\n", rc);
