@@ -101,6 +101,13 @@
 // Comment this out if the Real-Time Clock is set accurately.
 #define X509_NO_RTC_AVAILABLE
 
+// Comment this out if you don't need to support sha384/sha512-signed certs.
+#define X509_ENABLE_SHA512
+
+// Uncomment this if you need to connect to SMTP servers that don't support
+// TLS 1.2 yet.  See smtp_set_tls() for flags related to TLS 1.0 fallback.
+//#define SSL_ALLOW_TLS10_CLIENT_FALLBACK
+
 /***********************************
  * Configuration                   *
  * -------------                   *
