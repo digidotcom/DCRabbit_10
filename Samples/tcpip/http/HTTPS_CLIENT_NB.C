@@ -61,6 +61,10 @@
 // Comment this out if you don't need to support sha384/sha512-signed certs.
 #define X509_ENABLE_SHA512
 
+// Uncomment this if you need to connect to HTTPS servers that don't support
+// TLS 1.2 yet.  See httpc_set_tls() for flags related to TLS 1.0 fallback.
+//#define SSL_ALLOW_TLS10_CLIENT_FALLBACK
+
 ///// Configuration Options /////
 
 // define SHOW_CONTENT to display the body content (else just shows a dot for

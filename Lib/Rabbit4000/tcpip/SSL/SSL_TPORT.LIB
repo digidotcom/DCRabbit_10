@@ -407,6 +407,10 @@ ssl_Socket __far * tls_connection_init_state(void __far *tls_ctx, ssl_Socket __f
    _f_memset(state->master_secret, 0, sizeof(SSL_Secret));
 
    // Finish hash initialization
+#if _SSL_USE_TLS10
+   // keep track of MD5 for TLS 1.0 Finish message until TLS 1.2 negotiated
+   md5_init(&state->fin_hash->md5_hash);
+#endif
    sha_init(&state->fin_hash->sha1_hash);
    sha256_init(&state->fin_hash->sha256_hash);
 
@@ -603,6 +607,9 @@ int tls_set_done(ssl_Socket __far * state)
 	state->tport && state->tport(state, TPORT_EVENT_DONE, 0);
 	state->is_client = 0;
 	state->is_psk = 0;
+#if _SSL_USE_TLS10
+	state->tls_ver_minor = 0;
+#endif
 }
 
 
@@ -1044,9 +1051,17 @@ int tls_connection_prf(void __far *tls_ctx, ssl_Socket __far *conn,
 			  sizeof(SSL_Random));
 	}
 
-	_SHA256_PRF(conn->master_secret, seed, lablen + 2*sizeof(SSL_Random), out,
-            out_len);
-
+#if _SSL_USE_TLS10
+	if (conn->tls_ver_minor == TLS10_VER_MIN) {
+		_tls_1_PRF(conn->master_secret, seed, lablen + 2*sizeof(SSL_Random), out,
+		           out_len);
+	} else
+#endif
+	{
+		_SHA256_PRF(conn->master_secret, seed, lablen + 2*sizeof(SSL_Random), out,
+		            out_len);
+	}
+	
 	return 0;
 }
 
@@ -1075,6 +1090,16 @@ int tls_digest_hs_message(ssl_Socket __far* state, ll_Gather * g)
 	   sha_add(&state->fin_hash->sha1_hash, g->data3, g->len3);
 	   sha256_add(&state->fin_hash->sha256_hash, g->data3, g->len3);
    }
+
+#if _SSL_USE_TLS10
+	// keep track of MD5 for TLS 1.0 Finish message unless definitely TLS 1.2
+	if (state->tls_ver_minor != TLS12_VER_MIN) {
+		md5_append(&state->fin_hash->md5_hash, g->data2, g->len2);
+		if (g->len3) {
+			md5_append(&state->fin_hash->md5_hash, g->data3, g->len3);
+		}
+	}
+#endif
 
    // Success
    return 0;
@@ -1665,7 +1690,11 @@ _do_output:
 		// we would create at this point.
       nag_curr = state->cipher_state->bulk_cipher->block_size;
       // If we're using a block cipher, leave room for the explicit IV.
-      if (nag_curr) {
+      if (nag_curr
+#if _SSL_USE_TLS10
+         && state->tls_ver_minor != TLS10_VER_MIN
+#endif
+         ) {
          nag_curr += SSL_EXPLICIT_IV_SIZE;
 		}
 		nag_curr += (nag_len = app_out->len) + sizeof(SSL_Record_Hdr) +
@@ -1844,14 +1873,24 @@ int tls_do_server_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
 	#endif
 
    // Check Protocol Version
-   if(!(srv.server_version.major == TLS1_VER_MAJ &&
-        srv.server_version.minor == TLS1_VER_MIN))
+   if(!(srv.server_version.major == TLS1_VER_MAJ && (
+#if _SSL_USE_TLS10
+        // Accept TLS 1.0 server response unless we've already locked into TLS 1.2
+        (srv.server_version.minor == TLS10_VER_MIN && state->tls_ver_minor != TLS12_VER_MIN) ||
+#endif
+        srv.server_version.minor == TLS12_VER_MIN)))
    {
 #if _SSL_PRINTF_DEBUG
-    	printf("*** Bad TLS version ***\n");
+    	printf("*** Bad ServerHello TLS version 0x%02X 0x%02X ***\n",
+    		srv.server_version.major, srv.server_version.minor);
 #endif
       return tls_error(state, SSL_HS_CLI_PROTOCOL_ERROR, out);
    }
+
+#if _SSL_USE_TLS10
+	// continue our handshake with same TLS version as in ServerHello
+	state->tls_ver_minor = srv.server_version.minor;
+#endif
 
 	rc = 0;
 
@@ -3185,6 +3224,21 @@ int tls_do_client_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
    // Parse the handshake message
    _tbuf_extract(&cli_hello.client_version, t, sizeof(SSL_ProtocolVersion) + sizeof(SSL_Random));
 
+   // Check Protocol Version the client is requesting for this connection.
+   // We only support TLS 1.2, and cannot downgrade to 1.1 or 1.0.
+#if _SSL_USE_TLS10
+	state->tls_ver_minor = TLS12_VER_MIN;
+#endif
+   if(!(cli_hello.client_version.major == TLS1_VER_MAJ &&
+        cli_hello.client_version.minor == TLS12_VER_MIN))
+   {
+#if _SSL_PRINTF_DEBUG
+      printf("*** Bad version in client hello 0x%02x 0x%02x***\n",
+         cli_hello.client_version.major, cli_hello.client_version.minor);
+#endif
+      return tls_error(state, SSL_HS_CLI_PROTOCOL_ERROR, out);
+   }
+
    // Extract length and session id and check for illegal length
    _tbuf_extract(&cli_hello.session_id_length, t, 1);
    if(cli_hello.session_id_length > SSL_MAX_SESSION_ID) {
@@ -3243,18 +3297,6 @@ int tls_do_client_hello(ssl_Socket __far * state, _tbuf * t, _tbuf __far * out)
 	   printf("\n\nClient Random:\n");
 	   mem_dump((SSL_byte_t*)&cli_hello.random, sizeof(SSL_Random));
 	#endif
-
-   // Check Protocol Version the client is requesting for this connection.
-   // We only support TLS 1.2, and cannot downgrade to 1.1 or 1.0.
-   if(!(cli_hello.client_version.major == TLS1_VER_MAJ &&
-        cli_hello.client_version.minor == TLS1_VER_MIN))
-   {
-#if _SSL_PRINTF_DEBUG
-      printf("*** Bad version in client hello 0x%02x 0x%02x***\n",
-         cli_hello.client_version.major, cli_hello.client_version.minor);
-#endif
-      return tls_error(state, SSL_HS_CLI_PROTOCOL_ERROR, out);
-   }
 
 #if !SSL_NO_SESSION_RENEGOTIATION
    // Check session ID for resume
@@ -3695,9 +3737,17 @@ int tls_gen_mac(ssl_Socket __far* state, void __far* mac,
    digest->add((void __far *)&digest->state, (void __far *)&temp_len, 2);
 
    // *** Digest Content ***
-   // Finally, add the content (skipping over received IV)
-   _tbuf_ref(data, &g, mac_mode == SSL_MAC_SEND ? 0 : SSL_EXPLICIT_IV_SIZE, data_len);
-   
+   // Finally, add the content (skipping over TLS 1.2 received IV)
+#if _SSL_USE_TLS10
+	if (state->tls_ver_minor == TLS10_VER_MIN) {
+		_tbuf_ref(data, &g, 0, data_len);
+	} else
+#endif
+	{
+		_tbuf_ref(data, &g, mac_mode == SSL_MAC_SEND ? 0 : SSL_EXPLICIT_IV_SIZE,
+		          data_len);
+	}
+	   
 #if _SSL_PRINTF_DEBUG > 3
    printf("Generating %s MAC - record length: %u+%u(mac)\n",
       mac_mode == SSL_MAC_RECEIVE ? "receive" : "send", data_len, digest->hash_size);
@@ -3895,7 +3945,11 @@ int tls_decrypt(ssl_Socket __far * state, ssl_Header __far * hdr, _tbuf __far * 
 
       // Generate the appropriate MAC for this record
 		tls_gen_mac(state, calcd_mac, data, SSL_MAC_RECEIVE,
-      	bytes_decrypted - SSL_EXPLICIT_IV_SIZE);
+      	bytes_decrypted - (
+#if _SSL_USE_TLS10
+			(state->tls_ver_minor == TLS10_VER_MIN) ? 0 :
+#endif
+      	SSL_EXPLICIT_IV_SIZE));
 
 		// Retrieve the actual mac
 	   _tbuf_xread(recvd_mac, data, bytes_decrypted, digest->hash_size);
@@ -4090,7 +4144,8 @@ int tls_proc_record(ssl_Socket __far *state,
 	// peek at header
 	_tbuf_xread(&h, data, 0, sizeof(h));
 
-	if (h.v3.version.major == TLS1_VER_MAJ && h.v3.version.minor >= 1) {
+	if (h.v3.version.major == TLS1_VER_MAJ
+	    && h.v3.version.minor >= TLS10_VER_MIN) {
 		rec_len = ntohs(h.v3.length);
       rec_type = h.v3.rec_type;
 	}
@@ -4198,12 +4253,16 @@ int tls_proc_record(ssl_Socket __far *state,
       return bytes_decrypted;
 
 	if (bytes_decrypted < rec_len) {
-		// strip the explicit IV from the start of the decrypted data
-      _ssl_assert(bytes_decrypted > SSL_EXPLICIT_IV_SIZE);
-		bytes_decrypted -= SSL_EXPLICIT_IV_SIZE;
-		rec_len -= SSL_EXPLICIT_IV_SIZE;
-		_tbuf_delete(data, SSL_EXPLICIT_IV_SIZE);
-      
+#if _SSL_USE_TLS10
+		if (state->tls_ver_minor != TLS10_VER_MIN)
+#endif
+		{
+			// strip the explicit IV from the start of the decrypted data
+	      _ssl_assert(bytes_decrypted > SSL_EXPLICIT_IV_SIZE);
+			bytes_decrypted -= SSL_EXPLICIT_IV_SIZE;
+			rec_len -= SSL_EXPLICIT_IV_SIZE;
+			_tbuf_delete(data, SSL_EXPLICIT_IV_SIZE);
+      }
 		// There was a non-zero footer (mac plus padding).
 		state->hdr.length = bytes_decrypted;
 	}
@@ -4515,12 +4574,24 @@ int tls_write_record(ssl_Socket __far * state, SSL_ContentType rec_type,
 
    state->wr_hdr.rec_type = rec_type;
 	state->wr_hdr.version.major = TLS1_VER_MAJ;
-	state->wr_hdr.version.minor = TLS1_VER_MIN;
+#if _SSL_USE_TLS10
+	// use negotiated TLS version number unless set to default value of 0
+	if ((state->wr_hdr.version.minor = state->tls_ver_minor) == 0)
+#endif
+	{
+		state->wr_hdr.version.minor = TLS12_VER_MIN;
+	}
+
    length = len;
    padding_len = 0;
    if (encrypted) {
-      // Account for the explicit IV before the cleartext payload
-      length += SSL_EXPLICIT_IV_SIZE;
+#if _SSL_USE_TLS10
+      if (state->tls_ver_minor != TLS10_VER_MIN)
+#endif
+      {
+         // Account for the explicit IV before the cleartext payload
+         length += SSL_EXPLICIT_IV_SIZE;
+      }
       
    	length += digest->hash_size;
       // Add padding for block ciphers according to RFC 2246 section 6.2.3.2
@@ -4551,7 +4622,11 @@ int tls_write_record(ssl_Socket __far * state, SSL_ContentType rec_type,
    if (encrypted) {
    	// This expects header length to be in host order
 		tls_gen_mac(state, mac, data, SSL_MAC_SEND, len);
-      if (block_size) {
+      if (
+#if _SSL_USE_TLS10
+          state->tls_ver_minor != TLS10_VER_MIN &&
+#endif
+          block_size) {
       	_ssl_big_rand(explicit_iv, sizeof explicit_iv);
       }
    }
@@ -4563,18 +4638,28 @@ int tls_write_record(ssl_Socket __far * state, SSL_ContentType rec_type,
 #if _SSL_PRINTF_DEBUG > 3
 		printf("------------------- S E N D ----------------------\n");
    	printf("Sending 5(hdr)+%u(iv)+%u+%u(mac)+%u(pad)\n",
+   	#if _SSL_USE_TLS10
+   		state->tls_ver_minor != TLS10_VER_MIN &&
+   	#endif
    		encrypted && block_size ? SSL_EXPLICIT_IV_SIZE : 0, len,
          encrypted ? digest->hash_size : 0, encrypted ? padding_len : 0);
+
 	#if _SSL_PRINTF_DEBUG > 4
   		printf("\nRecord header:\n");
    #endif
       mem_dump((SSL_byte_t __far*)&state->wr_hdr, sizeof(SSL_Record_Hdr));
-      if (encrypted && block_size) {
+
+      if (encrypted &&
+#if _SSL_USE_TLS10
+          state->tls_ver_minor != TLS10_VER_MIN &&
+#endif
+          block_size) {
 	#if _SSL_PRINTF_DEBUG > 4
 			printf("\nExplicit IV:\n");
    #endif
 			mem_dump(explicit_iv, sizeof explicit_iv);
 		}
+
 	#if _SSL_PRINTF_DEBUG > 4
   		printf("\nRecord data (plaintext):\n");
 	#endif
@@ -4617,7 +4702,11 @@ int tls_write_record(ssl_Socket __far * state, SSL_ContentType rec_type,
       printf("\nBlock cipher Padding value:%d\n", padding_len-1);
       printf("Record Length after padding:%ld=0x%lX\n", length, length);
 #endif
-      if (block_size) {
+      if (
+#if _SSL_USE_TLS10
+          state->tls_ver_minor != TLS10_VER_MIN &&
+#endif
+          block_size) {
          // encrypt explicit IV before cleartext payload
          tls_encrypt(state, out, explicit_iv, SSL_EXPLICIT_IV_SIZE);
       }
@@ -4737,8 +4826,23 @@ int tls_send_client_hello(ssl_Socket __far* state, _tbuf __far * out)
    	return tls_error(state, SSL_ALLOC_FAIL, out);
 
 	version.major = TLS1_VER_MAJ;
-   version.minor = TLS1_VER_MIN;
-
+#if _SSL_USE_TLS10
+	if (state->flags & SSL_F_FORCE_TLS10) {
+#if _SSL_PRINTF_DEBUG
+    	printf("Forcing TLS 1.0 for ClientHello\n");
+#endif
+		state->tls_ver_minor = version.minor = TLS10_VER_MIN;
+	} else if (state->flags & SSL_F_DISABLE_TLS10) {
+#if _SSL_PRINTF_DEBUG
+    	printf("Forcing TLS 1.2 for ClientHello\n");
+#endif
+		state->tls_ver_minor = version.minor = TLS12_VER_MIN;
+	} else
+#endif
+	{
+   	version.minor = TLS12_VER_MIN;
+	}
+	
 	_tbuf_append(t, &version, sizeof(version));
 
    // Client random
@@ -4805,9 +4909,9 @@ int tls_send_server_hello(ssl_Socket __far* state, _tbuf __far * out)
    if (!t)
    	return tls_error(state, SSL_ALLOC_FAIL, out);
 
-	// Server version
+	// Server version; unlike our client code, we ALWAYS use TLS 1.2 in our hello.
 	version.major = TLS1_VER_MAJ;
-   version.minor = TLS1_VER_MIN;
+   version.minor = TLS12_VER_MIN;
 	_tbuf_append(t, &version, sizeof(version));
 
    // Server random
@@ -5004,9 +5108,15 @@ int _ssl_cli_key_exch(ssl_Socket __far* state, SSL_ClientKeyExchange __far* cli_
 
 #if _SSL_USE_RSA_
 	case TLS_KX_RSA:
-	   // Check Protocol Version
+	   // Check Protocol Version, must match state of TLS session
       if(!(cli_key_exch->by_kx_algo.exchange_keys.client_version.major == TLS1_VER_MAJ &&
-           cli_key_exch->by_kx_algo.exchange_keys.client_version.minor == TLS1_VER_MIN)) {
+           cli_key_exch->by_kx_algo.exchange_keys.client_version.minor ==
+           #if _SSL_USE_TLS10
+              state->tls_ver_minor
+           #else
+              TLS12_VER_MIN
+           #endif
+           )) {
 	#if _SSL_PRINTF_DEBUG
          printf("*** Bad version in TLS CKE ***\n");
 	#endif
@@ -5044,8 +5154,16 @@ int _ssl_cli_key_exch(ssl_Socket __far* state, SSL_ClientKeyExchange __far* cli_
    label_len += sizeof(SSL_Random);
 
    // Derive the Master Secret using the TLS PRF
-	_SHA256_PRF(&pre_master_secret, seeded_label, label_len, output,
-  	         SSL_MASTER_SEC_SIZE);
+#if _SSL_USE_TLS10
+	if (state->tls_ver_minor == TLS10_VER_MIN) {
+		_tls_1_PRF(&pre_master_secret, seeded_label, label_len, output,
+		           SSL_MASTER_SEC_SIZE);
+	} else
+#endif
+	{
+		_SHA256_PRF(&pre_master_secret, seeded_label, label_len, output,
+		            SSL_MASTER_SEC_SIZE);
+	}
 
    // Save our secret for use in key block derivation
    memcpy(&master_secret.data, output, sizeof(master_secret.data));
@@ -5144,7 +5262,11 @@ int tls_send_client_key_exchange(ssl_Socket __far* state, _tbuf __far * out)
 	   // Since we only support RSA, this is the way to generate the pre-master secret
 	   _ssl_big_rand(secret+2, sizeof(secret)-2);
 	   secret[0] = TLS1_VER_MAJ;
-	   secret[1] = TLS1_VER_MIN;
+	   #if _SSL_USE_TLS10
+	      secret[1] = state->tls_ver_minor;
+	   #else
+	      secret[1] = TLS12_VER_MIN;
+	   #endif
 	    #ifdef _COPROCESS_H
 	   if (state->flags & SSL_F_COP_YIELD)
 	      state->peer_cert->rsa_key->flags |= RSA_KEY_PUB_COP_YIELD;
