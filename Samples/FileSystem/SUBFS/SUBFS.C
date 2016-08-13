@@ -22,9 +22,9 @@
 	userID block, which is a non-volatile area of storage available on
 	all Rabbit boards.
 
-	SUBFS is used to save network configuration if using iDigi, thus
+	SUBFS is used to save network configuration if using Device Cloud, thus
 	it is very handy for saving other application data when using
-	iDigi for network management.
+	Device Cloud for network management.
 
 	Without SUBFS, there are some basic routines in IDBLOCK.LIB which
 	allow direct read/write to specified offsets in the userID block.

@@ -85,20 +85,25 @@
 	pingoutled routine toggles DS2. The pinginled routine
 	toggles DS3.
 ***********************************************************/
+
+// Flashes LEDS on port D for each ping.  Minicore module only has one LED
+// on PD1, RCM4400W and RCM5400W use separate LEDS on PD2 and PD3.
+#if RCM4400W_SERIES || RCM5400W_SERIES
+	#define LED_PING_OUT_BIT 2
+	#define LED_PING_IN_BIT  3
+#else
+	#define LED_PING_OUT_BIT 0
+	#define LED_PING_IN_BIT  0
+#endif
+
 #if RCM4400W_SERIES
 	#use "RCM44xxW.lib"
-   #define DS2 2
-   #define DS3 3
-
 #elif RCM5400W_SERIES
 	#use "RCM54xxW.lib"
-   #define DS2 2
-   #define DS3 3
-
 #elif RCM5600W_SERIES
 	#use "RCM56xxW.lib"
-   #define DS1 0
-
+#elif RCM6600W_SERIES
+	#use "RCM66xxW.lib"
 #endif
 
 #define LEDON	1
@@ -108,20 +113,12 @@ int ledstatus;
 
 pingoutled(int onoff)
 {
-   #if RCM5600W_SERIES
-	BitWrPortI(PDDR, &PDDRShadow, onoff, DS1);
-   #else
-   BitWrPortI(PBDR, &PBDRShadow, onoff, DS2);
-   #endif
+   BitWrPortI(PBDR, &PBDRShadow, onoff, LED_PING_OUT_BIT);
 }
 
 pinginled(int onoff)
 {
-   #if RCM5600W_SERIES
-   BitWrPortI(PDDR, &PDDRShadow, onoff, DS1);
-	#else
-	BitWrPortI(PBDR, &PBDRShadow, onoff, DS3);
-   #endif
+	BitWrPortI(PBDR, &PBDRShadow, onoff, LED_PING_IN_BIT);
 }
 
 
@@ -222,12 +219,15 @@ int wifi_config_region(wifi_region *region_info)
    //		Display Menu for region selection
    //----------------------------------------------------------------------
    printf("\nSelect region:\n");
-   for(i=0; i<_END_OF_REGIONS; i++)
+   for(i=0; ; i++)
    {
       // Set region to populate region stucture with info
       // Note: Interface is down, its OK to iterate through settings to
       //       create menu options
-      ifconfig (IF_WIFI0, IFS_WIFI_REGION, i, IFS_END);
+      if (ifconfig (IF_WIFI0, IFS_WIFI_REGION, i, IFS_END))
+      {
+      	break;
+      }
 
       // Get info for menu display
       ifconfig (IF_WIFI0, IFG_WIFI_REGION_INFO, region_info, IFS_END);

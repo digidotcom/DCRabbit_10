@@ -48,6 +48,7 @@ long input_number()
    {
    	inchar = getchar();
       putchar(inchar); //echo input
+      fflush(stdout);
       if(inchar == '\n' || inchar == '\r')
       {
       	return number;
@@ -94,7 +95,8 @@ int main()
    else
    {
    	printf("Flash init OK\n");
-      printf("# of blocks: %ld\n", dev->sectors);
+   	// MB calculation is sectors * 512 / 1,000,000
+      printf("# of blocks: %ld (%luMB)\n", dev->sectors, dev->sectors * 8 / 15625);
       printf("Size of block: 512\n\n");
    }
 
