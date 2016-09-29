@@ -35,7 +35,7 @@ void hex_dump( const void FAR *address, uint16_t length, uint16_t flags)
    }
    else if (flags & HEX_DUMP_FLAG_ADDRESS)
    {
-		hex += 8;			// 000000:<sp>
+		hex += 10;			// 00000000:<sp>
    }
    else if (flags & HEX_DUMP_FLAG_TAB)
    {
