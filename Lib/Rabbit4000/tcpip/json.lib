@@ -16,6 +16,7 @@ typedef struct jsonvar_t {
   char *name;           //external name of variable
   void *addr;           //memory address
   char type;            //data type (one of JT_... values)
+  char sz;              //element size (used only for strings)
   char cnt;             //number of elements
 } JSONVAR;
 
@@ -24,8 +25,9 @@ typedef struct jsonvar_t {
 #define JT_UINT   1
 #define JT_LONG   2
 #define JT_ULONG  3
-#define JT_STR    4
-#define JT_FLT    5
+#define JT_FLT    4
+#define JT_PSTR   5
+#define JT_STR    6
 
 #define JSD_START const JSONVAR json_dict[] ={
 #define JSD_END { (char*)0,   (void*)0,           0,        0} }
@@ -33,7 +35,7 @@ typedef struct jsonvar_t {
 /* START FUNCTION DESCRIPTION ********************************************
 JSD                                                      <json.lib>
 
-SYNTAX:       JSD (variable, count, type)
+SYNTAX:       JSD (variable, type, count, size)
 
 DESCRIPTION:  This MACRO creates an entry in the JSON data dictionary.
               The JSON name assigned to this variable is the same as the
@@ -42,24 +44,27 @@ DESCRIPTION:  This MACRO creates an entry in the JSON data dictionary.
 PARAMETERS:
     variable  the variable that has to be added to to data dictionary
 
-    count     number of elements if the variable is an array or 1 otherwise
-
     type      type of each variable element. Can be one of:
-                  JT_STR    - character string
                   JT_INT    - short (2 bytes) integer
                   JT_UINT   - short (2 bytes) unsigned integer
                   JT_LONG   - long (4 bytes) integer
                   JT_ULONG  - long (4 bytes) unsigned integer
-                  JT_FLT    - floating point values
+                  JT_FLT    - floating point value
+                  JT_STR    - string (or array of stings)
+                  JT_PSTR   - pointer to string (or array of pointers)
+
+    count     number of elements if the variable is an array or 1 otherwise
+
+    size      string size for JT_STR and JT_PSTR variables
 
 END DESCRIPTION **********************************************************/
-#define JSD(V,C,T) {#V, &##V, T, C}
+#define JSD(V,T, C, S) {#V, &##V, T, S, C}
 
 
 /* START FUNCTION DESCRIPTION ********************************************
 JSDN                                                     <json.lib>
 
-SYNTAX:       JSDN (variable, name, count, type)
+SYNTAX:       JSDN (variable, name, type, count, size)
 
 DESCRIPTION:  This MACRO creates an entry in the JSON data dictionary.
 
@@ -68,18 +73,21 @@ PARAMETERS:
 
     name      JSON name of this variable
 
-    count     number of elements if the variable is an array or 1 otherwise
-
     type      type of each variable element. Can be one of:
-                  JT_STR    - character string
                   JT_INT    - short (2 bytes) integer
                   JT_UINT   - short (2 bytes) unsigned integer
                   JT_LONG   - long (4 bytes) integer
                   JT_ULONG  - long (4 bytes) unsigned integer
                   JT_FLT    - floating point values
+                  JT_STR    - string (or array of stings)
+                  JT_PSTR   - pointer to string (or array of pointers)
+
+    count     number of elements if the variable is an array or 1 otherwise
+
+    size      string size for JT_STR and JT_PSTR variables
 
 END DESCRIPTION **********************************************************/
-#define JSDN(V,N,C,T) {#N, &##V, T, C}
+#define JSDN(V,N,C,T) {#N, &##V, T, 0, C}
 
 
 #undef DPRINTF
@@ -99,8 +107,9 @@ void json_end (HttpState *state);
 /*** EndHeader */
 
 // Sizes of data elements (same order as JT_.. values)
-const int jsz[] = {sizeof(int), sizeof(unsigned int), sizeof(long), 
-  sizeof(unsigned long), sizeof(char*), sizeof(float)};
+// No need for an entry for JT_STR
+const int jsz[] = {sizeof(int), sizeof(unsigned int), sizeof(long),
+  sizeof(unsigned long), sizeof(float), sizeof(char*)};
 
 __far char* const reply_hdr = "HTTP/1.1 200 OK\r\n"     \
                               "Cache-Control: no-cache\r\n"  \
@@ -134,7 +143,7 @@ void json_begin (HttpState *state)
 /* START FUNCTION DESCRIPTION ************************************************
 jsonify                                           <json.lib>
 
-  Description:  Serializes a varaible to JSON format
+  Description:  Serializes a variable to JSON format
 
   Syntax:       int jsonify (HttpState *state, void *var)
 
@@ -177,6 +186,9 @@ int jsonify (HttpState *state, void *addr)
   {
     switch (entry->type)
     {
+      case JT_PSTR:
+        sprintf (p, "\"%s\"", *(char**)addr);
+        break;
       case JT_STR:
         sprintf (p, "\"%s\"", (char*)addr);
         break;
@@ -200,7 +212,10 @@ int jsonify (HttpState *state, void *addr)
     i++;
     if (i < entry->cnt)
       *p++ = ',';
-    (char*)addr += jsz[entry->type];
+    if (entry->type == JT_STR)
+      (char*)addr += entry->sz;
+    else
+      (char*)addr += jsz[entry->type];
   }
   if (entry->cnt > 1)
     *p++ = ']';
@@ -263,6 +278,8 @@ readpost                                          <json.lib>
 
     -3:   content-length <= 0 or invalid socket
 
+    -4:   request is not a POST request
+
      0:   insufficient data is in the buffer to satisfy the request. Try
           again later since the socket is still able to receive data from the peer
 
@@ -272,10 +289,13 @@ END DESCRIPTION *************************************************************/
 int readpost (HttpState *state)
 {
   int len;
+  //make sure this is a POST request
+  if (http_getHTTPMethod (state) != HTTP_METHOD_POST)
+    return -4;
   if (state->content_length > HTTP_MAXBUFFER - 1)
     return -1;
-  else
-    len = (int)state->content_length;
+
+  len = (int)state->content_length;
   if (len <= 0)
     return -3;
 
@@ -295,7 +315,7 @@ unsigned long atoul (char *str);
 /* START FUNCTION DESCRIPTION ************************************************
 url_post                                       <json.lib>
 
-  Description:  Read and parse an URL-encoded post response. Keywords in the POST
+  Description:  Read and parse an URL-encoded POST response. Keywords in the POST
                 response are parsed in variables based on JSON data dictionary.
 
   Syntax:       int url_post (HttpState *state)
@@ -312,6 +332,8 @@ url_post                                       <json.lib>
 
       -3: content-length <= 0 or invalid socket
 
+      -4: request is not a POST request
+
        0: insufficient data is in the buffer to satisfy the request. Try again
           later since the socket is still able to receive data from the peer
 
@@ -324,20 +346,23 @@ int url_post (HttpState *state)
 
   if ((len = readpost (state)) <= 0)
     return len;   //wait for more data or die
-  return urlparse (state);
+  return url_parse (state);
 }
 
 const JSONVAR* json_find (char *name, int *idx)
 {
   static const JSONVAR *entry;
-  char *pi;
+  char *pi, *tail;
+
+  *idx = 0;
   if (pi = strchr (name, '_'))
   {
-    *pi++ = 0;
-    *idx = atoi(pi);
+    *idx = (int)strtol (pi+1, &tail, 10);
+    if (*tail == 0 && *idx >= 0) //if name is indeed <var>_<number> and index is positive...
+      *pi = 0;                   //...search dictionary for <var>
+    else
+      *idx = 0;
   }
-  else
-    *idx = 0;
 
   for (entry = json_dict; entry->name; entry++)
   {
@@ -353,7 +378,7 @@ const JSONVAR* json_find (char *name, int *idx)
 
 /* START FUNCTION DESCRIPTION ************************************************
 url_parse                                         <json.lib>
-  Description:  Parse an URL-encoded post response. Keywords in the POST
+  Description:  Parse an URL-encoded POST response. Keywords in the POST
                 response are parsed corresponding variables from JSON dictionary.
 
   Syntax:       int url_parse (HttpState *state)
@@ -366,7 +391,7 @@ END DESCRIPTION *************************************************************/
 int url_parse (HttpState *state)
 {
   __far char *ptr;
-  __far char *pd, *tmp;
+  char *pd;
   char key[256], val[256];
   const JSONVAR *k;
   int len, nv, idx;
@@ -379,72 +404,80 @@ int url_parse (HttpState *state)
   len = 0;
   while (*ptr)
   {
-    if (*ptr == '=')
+    if (*ptr != '=')
     {
-      //end of keyword
-      *pd = 0;
-      k = json_find (key, &idx);
-      ptr++;
-      if (k)
-      {
-        //copy value
-        pd = val;
-        len = 0;
-        *pd = 0;
-        while (*ptr && *ptr != '&')
-        {
-          if (++len < sizeof (val) - 1)
-            *pd++ = *ptr;
-          ptr++;
-        }
-        *pd = 0;
-        if (http_urldecode (val, val, len + 1))
-        {
-          pv = (char*)(k->addr) + jsz[k->type]*idx;
-          DPRINTF (("Setting %s[%d] = %s\n", key, idx, val));
-          switch (k->type)
-          {
-          case JT_STR:
-            strcpy ((char *)pv, val);
-            break;
-          case JT_INT:
-            *(int*)pv = (int)_f_strtol (val, &pd, 0);
-            break;
-          case JT_UINT:
-            *(unsigned int*)pv = (unsigned int)atoul (val);
-            break;
-          case JT_LONG:
-            *(long *)pv = _f_strtol (val, &pd, 0);
-            break;
-          case JT_ULONG:
-            *(unsigned long *)pv = atoul (val);
-            break;
-          case JT_FLT:
-            *(float *)pv = atof (val);
-            break;
-          }
-          nv++;
-        }
-      }
-      else
-      {
-        //keyword not found - advance to next keyword
-        while (*ptr && *ptr != '&')
-          *ptr++;
-      }
-      if (!*ptr)
-        break;
-      ptr++;
-      pd = key;
-      len = 0;
-    }
-    else
-    {
-      //copy keyword
+      //copy key characters
       if (++len < sizeof (key) - 1)
         *pd++ = *ptr;
       ptr++;
+      continue;
     }
+
+    //end of key
+    *pd = 0;
+    k = json_find (key, &idx);
+    ptr++;
+    if (k)
+    {
+      //copy value
+      pd = val;
+      len = 0;
+      *pd = 0;
+      while (*ptr && *ptr != '&')
+      {
+        if (++len < sizeof (val) - 1)
+          *pd++ = *ptr;
+        ptr++;
+      }
+      *pd = 0;
+      if (http_urldecode (val, val, len + 1))
+      {
+        if (k->type == JT_STR)
+          pv = (char*)(k->addr) + k->sz*idx;
+        else
+          pv = (char*)(k->addr) + jsz[k->type]*idx;
+        DPRINTF (("Setting %s[%d] = %s\n", key, idx, val));
+        switch (k->type)
+        {
+        case JT_PSTR:
+          pv = *(char**)pv; //one more level of indirection
+          //flow through to JT_STR case. Don't break them appart!
+        case JT_STR:
+          strncpy ((char *)pv, val, k->sz);
+          if (k->sz)
+            *((char *)pv + k->sz -1) = 0; //always null-terminated
+          break;
+        case JT_INT:
+          *(int*)pv = (int)strtol (val, &pd, 0);
+          break;
+        case JT_UINT:
+          *(unsigned int*)pv = (unsigned int)atoul (val);
+          break;
+        case JT_LONG:
+          *(long *)pv = strtol (val, &pd, 0);
+          break;
+        case JT_ULONG:
+          *(unsigned long *)pv = atoul (val);
+          break;
+        case JT_FLT:
+          *(float *)pv = atof (val);
+          break;
+        }
+        nv++;
+      }
+    }
+    else
+    {
+      //key not found - advance to next key
+      while (*ptr && *ptr != '&')
+        *ptr++;
+    }
+
+    if (!*ptr)
+      break;
+    ptr++;
+    pd = key;
+    len = 0;
   }
   return nv;
 }
@@ -466,189 +499,3 @@ unsigned long atoul (char *str)
   return val;
 }
 
-int dequoute (__far char **pin, char *out, int sz)
-{
-  __far char *in;
-  int i, v;
-  char c;
-  
-  in=*pin;
-  
-  if (*in++ != '"')
-    return 0;
-  
-  while (sz)
-  {
-    if (*in == '\')
-    {
-      in++;
-      switch (*in) 
-      {
-        case '\\':
-        case '/':        
-        case '"': *out++ = *in; break;
-        case 'b': *out++ = '\b'; break;
-        case 'f': *out++ = '\f'; break;
-        case 'n': *out++ = '\n'; break;
-        case 'r': *out++ = '\r'; break;
-        case 't': *out++ = '\t'; break;
-        case 'u': 
-          in++;
-          v = 0;
-          for (i=0; i<4; i++)
-          {
-            if (*in && isxdigit (*in))
-            {
-              c= tolower(*in);
-              v = v*16 + (c & 0x0f);
-              if (c >= 'a')
-                v += 9;
-              in++;
-            }
-            else
-              return 0; //invalid unicode escape sequence
-          }
-          *out++ = v & 0xff;
-          
-        default:
-          return 0; //illegal escape sequence
-      }
-      sz--;
-    }
-    else if (*in == '"')
-    {
-      *pin = ++in;  //update pointer
-      return 1;
-    }
-    else if (!*in)
-      return 0;     //end of input
-    else
-    {
-      *out++ = *in++;
-      sz--;
-    }
-  }
-  return 0;   //string too long
-}
-
-/* START FUNCTION DESCRIPTION ************************************************
-json_parse                                         <json.lib>
-  Description:  Parse an JSON encoded post response. The buffer is assumed to
-                contain only one JSON object whose members are parsed in 
-                corresponding variables from JSON dictionary.
-
-  Syntax:       int json_parse (HttpState *state)
-
-  Parameters:
-      state     HTTP state
-
-  Return:       number of fields parsed.
-END DESCRIPTION *************************************************************/
-int json_parse (HttpState *state)
-{
-  __far char *p;
-  int fields, fsm, n;
-  char buffer[256];
-  char *pb;
-  const JSONVAR *entry;
-  
-  fields = 0;
-  
-  fsm = 0;
-  
-  while (*p)
-  {
-    switch (fsm)
-    {
-    case 0: //wait for start of object
-      if (isspace (*p))
-        break;
-      if (*p == '{')
-        fsm = 1;
-      else
-        fsm = 88;
-      break;
-      
-    case 1: //wait for start of key
-      if (isspace (*p))
-        break;
-      else if (*p == '"')
-        if (dequote (&p, buffer, sizeof(buffer))
-        {
-          for (entry = json_dict; entry->name && strcmp (buffer, entry->name); entry++)
-            ;
-          if (entry->name)
-            fsm = 2;
-          else
-          {
-            fsm = 88;
-            DPRINTF (("JSON key not found: %s\n", key));
-          }          
-        }
-        else
-          fsm = 88;
-        break;
-      
-    case 2: //wait for ':' delimiter
-      if (isspace (*p))
-        break;
-      else if (*p == ':')
-      {
-        fsm = 3;
-        pb = buffer;
-        n = 0;
-      }
-      else
-        fsm = 88;
-      break;
-      
-    case 3: //accumulate value
-      if (isspace (*p))
-        break;
-      else if (*p == '"' && dequote (&p, buffer, sizeof(buffer))
-      {
-        if (entry->type == JT_STR)
-          strcpy ()
-      }
-        fsm = 6;
-      else if (*p == '[')
-        fsm = 7;
-      else if (*p == '{')
-        fsm = 88; //we don't support emedded objects for the moment
-      else
-      {
-        if (entry->type < JT_STR) //must be one of integer types
-        {
-          if (isdigit (*p))
-          {
-            *pb++ = *p;
-            n++;
-            fsm = 8;
-          }
-          else if (!strncmp (p, "true", 4))
-            iassign (entry, 1);
-          else if (!strncmp (p, "false", 5))
-            iassign (entry, 0);
-          else if (!strncmp (p, "null", 4))
-            fsm = 88;   //not supported
-          else
-            fsm = 88;          
-        }
-        else
-          fsm = 88;
-      }
-      break;
-      
-    case 6:   //string value
-    case 7:   //array value
-    case 8:   //number value
-    
-    case 88:  //error
-    case 99:  //finished
-    }
-    p++;
-  }
-  
-  //hmm, normal exit is through state 99 of state machine.
-  return fields;
-}
