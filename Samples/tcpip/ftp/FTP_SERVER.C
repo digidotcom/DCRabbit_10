@@ -53,6 +53,12 @@
  */
 
 /*
+ * Some FTP clients (like FileZilla) make simultaneous connections, so
+ * allow for two at a time.
+ */
+#define FTP_MAXSERVERS 2
+
+/*
  * We are not defining any static resources.  Defining the following macro
  * tells ZSERVER.LIB (used by the FTP server) not to look for these static
  * resources.

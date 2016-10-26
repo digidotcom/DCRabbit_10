@@ -100,6 +100,12 @@
  */
 
 /*
+ * Some FTP clients (like FileZilla) make simultaneous connections, so
+ * allow for two at a time.
+ */
+#define FTP_MAXSERVERS 2
+
+/*
  * This is the size of the structure that keeps track of files for
  * the FTP server in the dynamic resource table.  Unlike the
  * ftp_server_full.c sample, there is no need to include one
@@ -122,13 +128,6 @@
  * Define this because we are using a static rule table.
  */
 #define SSPEC_FLASHRULES
-
-
-/*
- * This must be defined for the FTP server to support the DELE
- * (delete) command.
- */
-#define FTP_EXTENSIONS
 
 
 /*
