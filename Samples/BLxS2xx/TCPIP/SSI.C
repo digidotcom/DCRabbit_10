@@ -135,7 +135,7 @@
  *
  */
 
-#define REDIRECTTO  "http://" REDIRECTHOST "/index.shtml"
+#define REDIRECTTO  "http://" REDIRECTHOST "/"
 
 #memmap xmem
 #use "BLxS2xx.lib"
@@ -261,7 +261,6 @@ int led_toggle4(HttpState* state)
 
 SSPEC_RESOURCETABLE_START
 	SSPEC_RESOURCE_XMEMFILE("/", index_html),
-	SSPEC_RESOURCE_XMEMFILE("/index.shtml", index_html),
 	SSPEC_RESOURCE_XMEMFILE("/showsrc.shtml", showsrc_shtml),
 	SSPEC_RESOURCE_XMEMFILE("/rabbit1.gif", rabbit1_gif),
 	SSPEC_RESOURCE_XMEMFILE("/ledon.gif", ledon_gif),

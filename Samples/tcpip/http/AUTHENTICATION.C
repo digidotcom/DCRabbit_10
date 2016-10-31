@@ -136,7 +136,6 @@ void main(void)
 	int user2_enabled;
 	int user3_enabled;
 	int page1;
-	int page2;
 	int ch;
 
 	printf("Press '1', '2', or '3' to disable/enable the three users.\n");
@@ -178,12 +177,6 @@ void main(void)
 	sspec_adduser(page1, user3);
 	sspec_setrealm(page1, "Admin");
 
-	page2 = sspec_addxmemfile("index.html", index_html, SERVER_HTTP);
-	sspec_adduser(page2, user1);
-	sspec_adduser(page2, user2);
-	sspec_adduser(page2, user3);
-	sspec_setrealm(page2, "Admin");
-
 	sspec_addxmemfile("rabbit1.gif", rabbit1_gif, SERVER_HTTP);
 
 	/*
@@ -211,7 +204,6 @@ void main(void)
 					 * sspec_adduser() adds a user to a resource
 					 */
 					sspec_adduser(page1, user1);
-					sspec_adduser(page2, user1);
 					printf("User 1 enabled\n");
 				}
 				else {
@@ -219,7 +211,6 @@ void main(void)
 					 * sspec_removeuser() removes a user from a resource
 					 */
 					sspec_removeuser(page1, user1);
-					sspec_removeuser(page2, user1);
 					printf("User 1 disabled\n");
 				}
 				break;
@@ -227,12 +218,10 @@ void main(void)
 				user2_enabled = !user2_enabled;
 				if (user2_enabled) {
 					sspec_adduser(page1, user2);
-					sspec_adduser(page2, user2);
 					printf("User 2 enabled\n");
 				}
 				else {
 					sspec_removeuser(page1, user2);
-					sspec_removeuser(page2, user2);
 					printf("User 2 disabled\n");
 				}
 				break;
@@ -240,12 +229,10 @@ void main(void)
 				user3_enabled = !user3_enabled;
 				if (user3_enabled) {
 					sspec_adduser(page1, user3);
-					sspec_adduser(page2, user3);
 					printf("User 3 enabled\n");
 				}
 				else {
 					sspec_removeuser(page1, user3);
-					sspec_removeuser(page2, user3);
 					printf("User 3 disabled\n");
 				}
 				break;

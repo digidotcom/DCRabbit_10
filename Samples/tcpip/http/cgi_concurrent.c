@@ -113,7 +113,6 @@ SSPEC_MIMETABLE_END
 // This structure associates resource names with their locations in memory.
 SSPEC_RESOURCETABLE_START
 	SSPEC_RESOURCE_XMEMFILE("/", index_html),
-	SSPEC_RESOURCE_XMEMFILE("/index.html", index_html),
 	SSPEC_RESOURCE_FUNCTION("/add.cgi", add)
 SSPEC_RESOURCETABLE_END
 
@@ -318,7 +317,7 @@ int add(HttpState *state)
          _f_strcat(state->buffer, "<P>The parrot is CORRECT!");
       }
 #endif
-      _f_strcat(state->buffer, "<P>Click <A HREF=\"/index.html\">here</A> to go back to the sums page");
+      _f_strcat(state->buffer, "<P>Click <A HREF=\"/\">here</A> to go back to the sums page");
       _f_strcat(state->buffer, "</BODY></HTML>");
       state->length = strlen(state->buffer);
       state->offset = 0;

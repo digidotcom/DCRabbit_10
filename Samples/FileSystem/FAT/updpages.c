@@ -159,10 +159,10 @@
 // For new applications, use the following macros instead of the old
 // structure initializations...
 SSPEC_MIMETABLE_START
-SSPEC_MIME_FUNC(".shtml", "text/html", shtml_handler),
-SSPEC_MIME(".html", "text/html"),
-SSPEC_MIME(".jpg", "image/jpeg"),
-SSPEC_MIME(".gif", "image/gif")
+	SSPEC_MIME_FUNC(".shtml", "text/html", shtml_handler),
+	SSPEC_MIME(".html", "text/html"),
+	SSPEC_MIME(".jpg", "image/jpeg"),
+	SSPEC_MIME(".gif", "image/gif")
 SSPEC_MIMETABLE_END
 
 

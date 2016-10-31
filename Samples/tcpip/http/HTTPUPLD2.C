@@ -190,7 +190,7 @@ int upload_cgi(HttpState * s)
 
 // The flash resource table is now initialized with these macros...
 SSPEC_RESOURCETABLE_START
-	SSPEC_RESOURCE_XMEMFILE("/index.html", index_html),
+	SSPEC_RESOURCE_XMEMFILE("/", index_html),
 	SSPEC_RESOURCE_CGI("upload.cgi", upload_cgi)
 SSPEC_RESOURCETABLE_END
 

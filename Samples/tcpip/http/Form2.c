@@ -91,7 +91,7 @@
 #ximport "samples/tcpip/http/pages/passform.html" index_html
 #ximport "samples/tcpip/http/pages/launched.html" launched_html
 
-/* the default mime type for '/' must be first */
+/* the default mime type for files without an extension must be first */
 SSPEC_MIMETABLE_START
 	SSPEC_MIME(".html", MIMETYPE_HTML)
 SSPEC_MIMETABLE_END
@@ -134,7 +134,6 @@ void main(void)
 
 	// Add existing entry page and thank-you page (stored in flash).
 	sspec_addxmemfile("/", index_html, SERVER_HTTP);
-	sspec_addxmemfile("index.html", index_html, SERVER_HTTP);
 	sspec_addxmemfile("launched.html", launched_html, SERVER_HTTP);
 
 	// Add the form
