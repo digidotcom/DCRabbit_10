@@ -20,6 +20,12 @@
 - Improves boot time on 6000-based hardware (now < 1 second) when
   _FAST_BIOS_LOAD macro defined in Project Options [DC-269].
 
+- Replaces the outdated SSL Certificate Creation GUI (in
+  Utilities/SSL_Utilities) with command-line OpenSSL version 1.0.2j.
+  Added instructions on using OpenSSL to create certificates, which
+  should allow for more control over key size and choice of hashing
+  algorithm.
+
 - Includes library and utility programs to write a System ID Block
   to a device's flash (Utilities/Write_ID).
 
