@@ -38,10 +38,6 @@
         unprotected resources (see zserver.lib and flashspec) can be
         accessed via both HTTP and HTTPS.
 *******************************************************************************/
-/*
- * 	By default, have compiler make function variables storage class
- * 	"auto" (allocated on the stack).
- */
 #class auto
 
 
@@ -95,6 +91,12 @@
 #ximport "cert\mycerts.pem" server_pub_cert
 #ximport "cert\mycertkey.pem" server_priv_key
 
+// If defined, remove code which supports legacy .dcc format certificates.
+#define SSL_DISABLE_LEGACY_DCC
+
+// If defined, remove code which supports storing certificates in the UserBlock.
+#define SSL_DISABLE_USERBLOCK
+
 /********************************
  * End of configuration section *
  ********************************/
@@ -118,51 +120,30 @@
  *  of a file, places it in extended memory on the controller, and
  *  associates a symbol with the physical address on the controller of
  *  the image.
- *
  */
 
 #ximport "pages/static.html"    index_html
 #ximport "pages/rabbit1.gif"    rabbit1_gif
 
-/*
- *  http_types gives the HTTP server hints about handling incoming
- *  requests.  The server compares the extension of the incoming
- *  request with the http_types list and returns the second field
- *  as the Content-Type field.  The third field defines a custom
- *  function to handle that mime type.
- *
- *  You can get a list of mime types from Netscape's browser in:
- *
- *  Edit->Preferences->Navigator->Applications
- *
- */
-
-/* the default mime type for '/' must be first */
-const HttpType http_types[] =
-{
-   { ".html", "text/html", NULL},
-   { ".gif", "image/gif", NULL}
-};
+/* the default mime type for files without an extension must be first */
+SSPEC_MIMETABLE_START
+	SSPEC_MIME(".html", "text/html"),
+	SSPEC_MIME(".gif", "image/gif")
+SSPEC_MIMETABLE_END
 
 /*
- *  http_flashspec assocates the file image we brought in with ximport
- *  and associates it with its name on the webserver.  In this example
- *  the file "samples/http/pages/static.html" will be sent to the
- *  client when they request either "http://yoururl.com/" or
- *  "http://yoururl.com/index.html"
- *
+ *  The resource table associates ximported files with URLs on the webserver.
  */
-
-const HttpSpec http_flashspec[] =
-{
-   { HTTPSPEC_FILE,  "/",              index_html,    NULL, 0, NULL, NULL},
-   { HTTPSPEC_FILE,  "/index.html",    index_html,    NULL, 0, NULL, NULL},
-   { HTTPSPEC_FILE,  "/rabbit1.gif",   rabbit1_gif,   NULL, 0, NULL, NULL},
-};
+SSPEC_RESOURCETABLE_START
+	SSPEC_RESOURCE_XMEMFILE("/", index_html),
+	SSPEC_RESOURCE_XMEMFILE("/rabbit1.gif", rabbit1_gif)
+SSPEC_RESOURCETABLE_END
 
 void main()
 {
-	SSL_Cert_t my_cert;
+	// Can't store this on the stack (auto) since the HTTP server library stores
+	// a reference to it for use later.
+	static far SSL_Cert_t my_cert;
 
 
 	/*
@@ -174,7 +155,7 @@ void main()
 	sock_init_or_exit(1);
    http_init();
 
-	memset(&my_cert, 0, sizeof(my_cert));
+	_f_memset(&my_cert, 0, sizeof(my_cert));
 	// When using HTTPS (i.e. HTTP over SSL or TLS), the certificates need
 	// to be parsed and registered with the library.  For use with a
 	// server, we need to know our own private key.
@@ -192,10 +173,10 @@ void main()
 	 *  delays when retrieving pages.
 	 */
 
-   tcp_reserveport(80);
+   tcp_reserveport(HTTP_PORT);
 
    // Also reserve the HTTPS port
-   tcp_reserveport(443);
+   tcp_reserveport(HTTPS_PORT);
 
 	/*
 	 *  http_handler needs to be called to handle the active http servers.

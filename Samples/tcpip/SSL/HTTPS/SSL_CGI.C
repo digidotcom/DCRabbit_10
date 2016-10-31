@@ -81,6 +81,12 @@
 #ximport "cert\mycerts.pem" server_pub_cert
 #ximport "cert\mycertkey.pem" server_priv_key
 
+// If defined, remove code which supports legacy .dcc format certificates.
+#define SSL_DISABLE_LEGACY_DCC
+
+// If defined, remove code which supports storing certificates in the UserBlock.
+#define SSL_DISABLE_USERBLOCK
+
 /********************************
  * End of configuration section *
  ********************************/
@@ -97,19 +103,16 @@
 
 /*
  *  Notice that cgi doesn't have a MIME type or a handler.
- *  The handler for this type of entity is make the the HttpSpec
+ *  The handler for this type of entity is set in the HttpSpec
  *  structure.
  *
  */
 
-
-/* the default mime type for '/' must be first */
-const HttpType http_types[] =
-{
-   { ".html", "text/html", NULL},
-   { ".gif", "image/gif", NULL},
-   { ".cgi", "", NULL}
-};
+/* the default mime type for files without an extension must be first */
+SSPEC_MIMETABLE_START
+	SSPEC_MIME(".html", "text/html"),
+	SSPEC_MIME(".gif", "image/gif")
+SSPEC_MIMETABLE_END
 
 
 /*
@@ -122,25 +125,27 @@ const HttpType http_types[] =
 
 int test_cgi(HttpState* state);
 
-const HttpSpec http_flashspec[] =
-{
-   { HTTPSPEC_FILE,  "/",              index_html,    NULL, 0, NULL, NULL},
-   { HTTPSPEC_FILE,  "/index.html",    index_html,    NULL, 0, NULL, NULL},
-   { HTTPSPEC_FILE,  "/rabbit1.gif",   rabbit1_gif,   NULL, 0, NULL, NULL},
-
-   { HTTPSPEC_FUNCTION, "/test.cgi",   0, test_cgi, 0, NULL, NULL}
-};
+/*
+ *  The resource table associates ximported files with URLs on the webserver.
+ */
+SSPEC_RESOURCETABLE_START
+	SSPEC_RESOURCE_XMEMFILE("/", index_html),
+	SSPEC_RESOURCE_XMEMFILE("/rabbit1.gif", rabbit1_gif),
+	SSPEC_RESOURCE_FUNCTION("/test.cgi", test_cgi)
+SSPEC_RESOURCETABLE_END
 
 
 void main()
 {
-	SSL_Cert_t my_cert;
+	// Can't store this on the stack (auto) since the HTTP server library stores
+	// a reference to it for use later.
+	static far SSL_Cert_t my_cert;
 
 	// Start network and wait for interface to come up (or error exit).
 	sock_init_or_exit(1);
    http_init();
 
-	memset(&my_cert, 0, sizeof(my_cert));
+	_f_memset(&my_cert, 0, sizeof(my_cert));
 	// When using HTTPS (i.e. HTTP over SSL or TLS), the certificates need
 	// to be parsed and registered with the library.  For use with a
 	// server, we need to know our own private key.
@@ -151,7 +156,7 @@ void main()
 	// Register certificate with HTTPS server.
 	https_set_cert(&my_cert);
 
-   tcp_reserveport(443);
+   tcp_reserveport(HTTPS_PORT);
 
 /*
  *  http_handler needs to be called to handle the active http servers.
@@ -192,7 +197,7 @@ const char teststr[] =
 	"<HTML>" \
 	"<HEAD><TITLE><cgi.c></TITLE></HEAD>" \
 	"<BODY><H1>cgi.c, hit count %d</H1>" \
-	"      <BR><BR><BR><A HREF=\"/index.html\">home</A>" \
+	"      <BR><BR><BR><A HREF=\"/\">home</A>" \
 	"</BODY>" \
 	"</HEAD>";
 

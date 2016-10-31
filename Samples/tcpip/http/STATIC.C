@@ -93,23 +93,18 @@
  *
  */
 
-/* the default mime type for '/' must be first */
+/* the default mime type for files without an extension must be first */
 SSPEC_MIMETABLE_START
 	SSPEC_MIME(".html", MIMETYPE_HTML),
 	SSPEC_MIME(".gif", MIMETYPE_GIF)
 SSPEC_MIMETABLE_END
 
 /*
- *  The resource table assocates the file image we brought in with ximport
- *  and associates it with its name on the webserver.  In this example
- *  the file "samples/http/pages/static.html" will be sent to the
- *  client when they request either "http://yoururl.com/" or
- *  "http://yoururl.com/index.html"
- *
+ *  The resource table associates ximported files with URLs on the webserver.
  */
 
 SSPEC_RESOURCETABLE_START
-	SSPEC_RESOURCE_XMEMFILE("/index.html", index_html),
+	SSPEC_RESOURCE_XMEMFILE("/", index_html),
 	SSPEC_RESOURCE_XMEMFILE("/rabbit1.gif", rabbit1_gif)
 SSPEC_RESOURCETABLE_END
 

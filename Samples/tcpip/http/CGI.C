@@ -96,7 +96,7 @@ int test_cgi(HttpState* state);
 
 // The static resource table is initialized with these macros...
 SSPEC_RESOURCETABLE_START
-	SSPEC_RESOURCE_XMEMFILE("/index.html", index_html),
+	SSPEC_RESOURCE_XMEMFILE("/", index_html),
 	SSPEC_RESOURCE_XMEMFILE("/rabbit1.gif", rabbit1_gif),
 	SSPEC_RESOURCE_FUNCTION("/test.cgi", test_cgi)
 SSPEC_RESOURCETABLE_END

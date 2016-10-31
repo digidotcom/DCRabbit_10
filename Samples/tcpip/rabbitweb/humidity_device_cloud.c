@@ -14,46 +14,46 @@
    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 */
 /*******************************************************************************
-        Samples\TcpIp\RabbitWeb\humidity_idigi.c
+        Samples\tcpip\RabbitWeb\humidity_device_cloud.c
 
-        This works exactly the same as humidity.c, except that iDigi
+        This works exactly the same as humidity.c, except that Device Cloud
         functionality is included to take care of network configuration.
-        See the various samples in Samples\idigi for more details.
+        See the various samples in Samples\Device_Cloud for more details.
 
 *******************************************************************************/
 
-// This macro used in this sample to select iDigi functionality.  If commented
+// This macro used in this sample to select Device Cloud functionality.  If commented
 // out, then works exactly like humidity.c (i.e. just the web interface)
-#define USE_IDIGI
+#define USE_DEVICE_CLOUD
 
 // This is needed to pull in the ZHTML interpreter code.
 #define USE_RABBITWEB 1
 
-#ifdef USE_IDIGI
+#ifdef USE_DEVICE_CLOUD
 
-	#define IDIGI_PRODUCT "HUMIDITY_IDIGI.C"
-	#define IDIGI_VENDOR "Digi International Inc."
-	#define IDIGI_VENDOR_ID "1234"
-	#define IDIGI_FIRMWARE_ID "1.01.00"
-	#define IDIGI_CONTACT "support@digi.com"
-	#define IDIGI_LOCATION "Planet Earth"
-	#define IDIGI_DESCRIPTION "Simple iDigi demo"
-	#define IDIGI_SERVER "my.devicecloud.com"
+	#define CLOUD_PRODUCT "humidity_device_cloud.c"
+	#define CLOUD_VENDOR "Digi International Inc."
+	#define CLOUD_VENDOR_ID "1234"
+	#define CLOUD_FIRMWARE_ID "1.01.00"
+	#define CLOUD_CONTACT "support@digi.com"
+	#define CLOUD_LOCATION "Planet Earth"
+	#define CLOUD_DESCRIPTION "Simple Device Cloud demo"
+	#define CLOUD_SERVER "my.devicecloud.com"
 
 	// Store non-volatile configuration data in the userID block, via the
 	// Simple UserID Block FileSystem.  You can also use SUBFS to store a limited
-	// amount of non-iDigi application configuration data.
-	#define IDIGI_USE_SUBFS
+	// amount of non-Device Cloud application configuration data.
+	#define CLOUD_USE_SUBFS
 	#define SUBFS_RESERVE_START 0
 	#define SUBFS_RESERVE_END 0
 
 	#define ADDP_PASSWORD   "rabbit"
-	#define IDIGI_IFACE_VERBOSE   // This prints interface status when it changes.
+	#define CLOUD_IFACE_VERBOSE   // This prints interface status when it changes.
 
-	#use "idigi.lib"
+	#use "Device_Cloud.lib"
 
 #else
-// not USE_IDIGI...
+// not USE_DEVICE_CLOUD...
 
 	/*
 	 * NETWORK CONFIGURATION
@@ -64,7 +64,7 @@
 
 	#use "dcrtcp.lib"
 
-#endif	// USE_IDIGI
+#endif	// USE_DEVICE_CLOUD
 
 
 #use "http.lib"
@@ -125,9 +125,9 @@ void main(void)
 	alarm_interval = 60;
 	strcpy(alarm_email, "somebody@nowhere.org");
 
-#ifdef USE_IDIGI
-	// Start iDigi services
-	if (idigi_init())
+#ifdef USE_DEVICE_CLOUD
+	// Start Device Cloud services
+	if (cloud_init())
 		exit(1);
 #else
 	// Start network and wait for interface to come up (or error exit).
@@ -155,8 +155,8 @@ void main(void)
 
 	// This drives the HTTP server.
    while(1) {
-#ifdef USE_IDIGI
-		idigi_tick();
+#ifdef USE_DEVICE_CLOUD
+		cloud_tick();
 #endif
       http_handler();
    }

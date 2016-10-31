@@ -1,6 +1,30 @@
 *****************************************************************
-   README for Dynamic C Version 10.72A
+   README for Dynamic C Version 10.72B
 *****************************************************************
+
+- Adds support for SHA384/SHA512 hashes:
+  - New library and updated sample.
+  - TLS update to support for SHA384 and SHA512 hashes.
+  - X.509 update to support sha224, sha384 and sha512 signatures.
+
+- Adds support for falling back to TLS 1.0 on outbound (client)
+  TLS connections.
+
+- Adds source code and tools for building binaries in BIOS directory
+  (cold loaders and pilot BIOSes).
+
+- Adds sample for run-from-RAM boards to download a copy of the boot
+  flash via HTTP.  Useful for firmware recovery and analysis of flash
+  contents.
+
+- Improves boot time on 6000-based hardware (now < 1 second) when
+  _FAST_BIOS_LOAD macro defined in Project Options [DC-269].
+
+- Replaces the outdated SSL Certificate Creation GUI (in
+  Utilities/SSL_Utilities) with command-line OpenSSL version 1.0.2j.
+  Added instructions on using OpenSSL to create certificates, which
+  should allow for more control over key size and choice of hashing
+  algorithm.
 
 - Includes library and utility programs to write a System ID Block
   to a device's flash (Utilities/Write_ID).

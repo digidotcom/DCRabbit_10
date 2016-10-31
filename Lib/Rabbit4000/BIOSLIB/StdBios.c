@@ -1616,10 +1616,10 @@ _fi_running_start::
 		dw	_BOARD_TYPE_					; board_type
 _program_HPA::
 _fi_running_length::
-		#pragma filesize					; filesize (unsigned long)
+		#pragma filesize					; length (unsigned long)
 		dw _FIRMWARE_VERSION_			; version
 		dw CC_VER							; compiler_ver
-		dw	CC_FLAGS							; compiler_flags
+		dw	CC_FLAGS							; flags
 
 		dw (_FIRMWARE_TIMESTAMP_ & 0x0000FFFFul)	; lower word of build_timestamp
 		dw (_FIRMWARE_TIMESTAMP_ >> 16)				; upper word of build_timestamp
@@ -1627,9 +1627,13 @@ _fi_running_length::
 		dw	(_DC_MB_TYPE_ & 0x0000FFFFul)				; lower word of MB_TYPE macro
 		dw (_DC_MB_TYPE_ >> 16)							; upper word of MB_TYPE macro
 
-		; 19 bytes of reserved space
-		db 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-		db 0, 0, 0
+		db 'B'								; compiler revision, first added in 10.72B
+
+		; reserved, 10 bytes reserved for Digi's use
+		db 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+		
+		; user_defined, 8 bytes allocated for customer use
+		db 0, 0, 0, 0, 0, 0, 0, 0
 
 		db _FIRMWARE_NAME_				; program_name
 

@@ -18,8 +18,8 @@
 
  ******************************************************************************
  ******************************************************************************
- *** Currently, the only core module which will be able to run this sample  ***
- *** is the RCM5450W, and it should be compiled to flash                    ***
+ *** Currently, the only core modules which will be able to run this sample ***
+ *** are the RCM5450W and RCM66xxW, and it should be compiled to flash      ***
  ******************************************************************************
  ******************************************************************************
 
@@ -128,12 +128,12 @@
 #class auto
 
 #if _BOARD_TYPE_ != RCM5450W && \
-    !RCM6700_SERIES && \
+    !RCM6600W_SERIES && \
     !R6000TEST_SERIES
-	#warns "This sample requires an RCM5450W or RCM6700"
+	#warns "This sample requires an RCM5450W or RCM66xxW"
 	#warns "although it may run without USE_EAP on other boards."
 	#warns "Comment out these warnings if desired."
-	#warns _BOARD_TYPE_
+	#warns _BOARD_NAME_
 	#fatal "<--- see previous warning"
 #endif
 
@@ -410,7 +410,7 @@ void reconfig(int iface);
 
 #ifndef INSECURE_HTTP
 // This is global, since we use it in main() and reconfig()
-SSL_Cert_t my_cert;	// HTTPS server certificate
+far SSL_Cert_t my_cert;	// HTTPS server certificate
 #endif
 
 void main()
@@ -481,6 +481,7 @@ void main()
    tcp_reserveport(443);
 
    printf("Loading HTTPS server certificate...\n\n");
+   _f_memset(&my_cert, 0, sizeof(my_cert));
 	if (SSL_new_cert(&my_cert, server_pub_cert, SSL_DCERT_XIM, 0) ||
 	    SSL_set_private_key(&my_cert, server_priv_key, SSL_DCERT_XIM))
 		exit(7);

@@ -88,7 +88,7 @@ server serial flash. The log should be viewed and cleared from a browser.
  *  any address translation applied to it.
  */
 
-#define REDIRECTTO "/index.shtml"
+#define REDIRECTTO "/"
 
 
 #ximport "pages/log.shtml"    index_shtml
@@ -519,27 +519,28 @@ int printlog_cgi(HttpState *state)
 }
 
 
-const HttpType http_types[] =
-{
-   { ".shtml", "text/html",  shtml_handler },   // ssi
-   { ".cgi",   "",           NULL },            // cgi
-   { ".gif",   "image/gif",  NULL },            // gif
-   { ".c",     "text/plain", NULL }
-};
+/* the default mime type for files without an extension must be first */
+SSPEC_MIMETABLE_START
+   SSPEC_MIME_FUNC(".shtml", "text/html", shtml_handler),
+	SSPEC_MIME(".gif", "image/gif"),
+	SSPEC_MIME(".c", "text/plain")
+SSPEC_MIMETABLE_END
 
-const HttpSpec http_flashspec[] =
-{
-   { HTTPSPEC_FILE,     "/",             index_shtml, NULL, 0, NULL, NULL },
-   { HTTPSPEC_FILE,     "/index.shtml",  index_shtml, NULL, 0, NULL, NULL },
-   { HTTPSPEC_FILE,     "/rabbit1.gif",  rabbit1_gif, NULL, 0, NULL, NULL },
-   { HTTPSPEC_FILE,     "flashlog.c",    flashlog_c,  NULL, 0, NULL, NULL },
 
-   { HTTPSPEC_VARIABLE, "count",         0, &count, INT16, "%d", NULL },
-
-   { HTTPSPEC_FUNCTION, "/log.cgi",      0, log_cgi,      0, NULL, NULL },
-   { HTTPSPEC_FUNCTION, "/printlog.cgi", 0, printlog_cgi, 0, NULL, NULL },
-   { HTTPSPEC_FUNCTION, "/resetlog.cgi", 0, resetlog_cgi, 0, NULL, NULL },
-};
+/*
+ *  The resource table associates ximported files with URLs on the webserver.
+ */
+SSPEC_RESOURCETABLE_START
+	SSPEC_RESOURCE_XMEMFILE("/", index_shtml),
+	SSPEC_RESOURCE_XMEMFILE("/rabbit1.gif", rabbit1_gif),
+	SSPEC_RESOURCE_XMEMFILE("/flashlog.c", flashlog_c),
+	
+	SSPEC_RESOURCE_ROOTVAR("count", &count, INT16, "%d"),
+	
+	SSPEC_RESOURCE_FUNCTION("/log.cgi", log_cgi),
+	SSPEC_RESOURCE_FUNCTION("/printlog.cgi", printlog_cgi),
+	SSPEC_RESOURCE_FUNCTION("/resetlog.cgi", resetlog_cgi)
+SSPEC_RESOURCETABLE_END
 
 /*
  *  void setdate(HttpState *);

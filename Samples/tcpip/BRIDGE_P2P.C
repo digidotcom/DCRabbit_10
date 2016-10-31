@@ -1996,7 +1996,7 @@ void run_tunnel(void)
 	                      BUFSIZE, app_rxbuf,
 	                      BUFSIZE, app_txbuf,
 	                      0,   // Is a server
-	                      SSL_F_DISABLE_SSLV3 | SSL_F_NO_RESUME | SSL_S_ALLOW_PSK,
+	                      SSL_F_NO_RESUME | SSL_S_ALLOW_PSK,
 	                      0, 0, 0, 0,
 	                      NULL,
 	                      NULL,
@@ -2070,7 +2070,7 @@ void run_tunnel(void)
                       BUFSIZE, app_rxbuf,
                       BUFSIZE, app_txbuf,
                       1,   // Is a client
-                      SSL_F_DISABLE_SSLV3 | SSL_F_NO_RESUME | SSL_S_ALLOW_PSK,
+                      SSL_F_NO_RESUME | SSL_S_ALLOW_PSK,
                       0, 0, 0, 0,
                       NULL,
                       NULL,

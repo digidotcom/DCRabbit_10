@@ -392,7 +392,6 @@ SSPEC_RESOURCETABLE_START
 	SSPEC_RESOURCE_XMEMFILE("/register.html", reg_form),
 	SSPEC_RESOURCE_FUNCTION("/submit.cgi", submit),
 	SSPEC_RESOURCE_XMEMFILE("/", index_html),
-	SSPEC_RESOURCE_XMEMFILE("/index.html", index_html),
 	SSPEC_RESOURCE_XMEMFILE("/showsrc.shtml", showsrc_shtml),
 	SSPEC_RESOURCE_XMEMFILE("/rabbit1.gif", rabbit1_gif),
 	SSPEC_RESOURCE_XMEMFILE("/ledon.gif", ledon_gif),

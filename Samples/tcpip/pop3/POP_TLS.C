@@ -85,6 +85,12 @@
 // Comment this out if the Real-Time Clock is set accurately.
 #define X509_NO_RTC_AVAILABLE
 
+// Comment this out if you don't need to support sha384/sha512-signed certs.
+#define X509_ENABLE_SHA512
+
+// Uncomment this if you need to connect to POP servers that don't support
+// TLS 1.2 yet.  See pop3_set_tls() for flags related to TLS 1.0 fallback.
+//#define SSL_ALLOW_TLS10_CLIENT_FALLBACK
 
 
 /***********************************
@@ -254,13 +260,12 @@ int storemsg(int num, char *to, char *from, char *subject, char *body, int len)
 
 void main()
 {
-	static long address;
-	static int retval;
-	char buf[30];
-	auto SSL_Cert_t trusted;
+	// Can't store this on the stack (auto) since the POP client library stores
+	// a reference to it for use later.
+	static far SSL_Cert_t trusted;
 	auto int rc;
 
-	memset(&trusted, 0, sizeof(trusted));
+	_f_memset(&trusted, 0, sizeof(trusted));
 	rc = SSL_new_cert(&trusted, ca_pem1, SSL_DCERT_XIM, 0);
 	if (rc) {
 		printf("Failed to parse CA certificate 1, rc=%d\n", rc);
@@ -275,11 +280,6 @@ void main()
 	// Start network and wait for interface to come up (or error exit).
 	sock_init_or_exit(1);
 
-	/* As of DC10.60, the POP3 library can resolve host name for us...*/
-	//printf("Resolving name %s\n", POP_SERVER);
-	//address = resolve(POP_SERVER);
-	//printf("...is at %s\n", inet_ntoa(buf, address));
-
 	pop3_init(storemsg);
 
 	pop3_set_tls(SSL_F_REQUIRE_CERT,		// Check POP3 server certificate
@@ -292,7 +292,7 @@ void main()
 
 	pop3_getmail(POP_USER, POP_PASS, 0);
 
-	while((retval = pop3_tick()) == POP_PENDING)
+	while((rc = pop3_tick()) == POP_PENDING)
 		continue;
 
 	printf("============= Completed: ===============\n");

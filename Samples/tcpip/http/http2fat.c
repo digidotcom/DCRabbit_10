@@ -229,8 +229,8 @@ void main()
 	download( DL_URL, DL_FILE);
 
 	printf ("\n\nNow you try...  Enter a URL and filename to download to.\n");
-	printf ("Try downloading http://www.digi.com/images2/logo_digi.gif to\n");
-	printf ("a:/logo.gif\n");
+	printf ("Try downloading http://www.digi.com/images/nav-logo-digi.png to\n");
+	printf ("a:/logo.png\n");
 	while (1)
 	{
 	   printf ("\nEnter URL to download (blank to exit and unmount fs)\n]>");

@@ -53,9 +53,17 @@
 #ximport "../sample_certs/VerisignClass3PublicPrimaryCA.crt"  ca_pem4
 
 #define MP_SIZE 258			// Recommended to support up to 2048-bit RSA keys.
+//#define MP_SIZE 514			// Support up to 4096-bit RSA keys.
 
 // Comment this out if the Real-Time Clock is set accurately.
 #define X509_NO_RTC_AVAILABLE
+
+// Comment this out if you don't need to support sha384/sha512-signed certs.
+#define X509_ENABLE_SHA512
+
+// Uncomment this if you need to connect to HTTPS servers that don't support
+// TLS 1.2 yet.  See httpc_set_tls() for flags related to TLS 1.0 fallback.
+//#define SSL_ALLOW_TLS10_CLIENT_FALLBACK
 
 ///// Configuration Options /////
 
@@ -136,6 +144,37 @@ int my_server_policy(ssl_Socket far * state, int trusted,
 	else
 		host = s->hostname;
 
+	printf("Certificate issuer:\n");
+	if (cert->issuer.c)
+		printf("       Country: %ls\n", cert->issuer.c);
+	if (cert->issuer.l)
+		printf("      Location: %ls\n", cert->issuer.l);
+	if (cert->issuer.st)
+		printf("         State: %ls\n", cert->issuer.st);
+	if (cert->issuer.o)
+		printf("  Organization: %ls\n", cert->issuer.o);
+	if (cert->issuer.ou)
+		printf("          Unit: %ls\n", cert->issuer.ou);
+	if (cert->issuer.email)
+		printf("       Contact: %ls\n", cert->issuer.email);
+	if (cert->issuer.cn)
+		printf("            CN: %ls\n", cert->issuer.cn);
+	printf("Certificate subject:\n");
+	if (cert->subject.c)
+		printf("       Country: %ls\n", cert->subject.c);
+	if (cert->subject.l)
+		printf("      Location: %ls\n", cert->subject.l);
+	if (cert->subject.st)
+		printf("         State: %ls\n", cert->subject.st);
+	if (cert->subject.o)
+		printf("  Organization: %ls\n", cert->subject.o);
+	if (cert->subject.ou)
+		printf("          Unit: %ls\n", cert->subject.ou);
+	if (cert->subject.email)
+		printf("       Contact: %ls\n", cert->subject.email);
+	printf("Server claims to be CN='%ls'\n", cert->subject.cn);
+	printf("We are looking for  CN='%ls'\n", s->hostname);
+
 	if (x509_validate_hostname(cert, host)) {
 		printf("Certificate hostname mismatch%s!\n",
 			httpc_globals.ip ? " (using proxy)" : "");
@@ -143,6 +182,15 @@ int my_server_policy(ssl_Socket far * state, int trusted,
 			host, cert->subject.cn);
 		return 1;
 	}
+	
+	if (trusted) {
+		printf("This server's certificate is trusted\n");
+	} else {
+		printf("Invalid certificate supplied, or missing root CA necessary to verify.\n");
+		// uncomment this line to reject untrusted certificates
+		//return 1;
+	}
+	
 	return 0;
 }
 
@@ -360,34 +408,36 @@ void httpc_demo(tcp_Socket *sock)
 // a good habit to be in.
 tcp_Socket demosock;
 
-void main()
+int load_certificates(void)
 {
 	int rc;
-	SSL_Cert_t trusted;
+	// Can't store this on the stack (auto) since the HTTP client library stores
+	// a reference to it for use later.
+	static far SSL_Cert_t trusted;
 
 	// First, parse the trusted CA certificates.
-	memset(&trusted, 0, sizeof(trusted));
+	_f_memset(&trusted, 0, sizeof(trusted));
 	rc = SSL_new_cert(&trusted, ca_pem1, SSL_DCERT_XIM, 0);
 	if (rc) {
 		printf("Failed to parse CA certificate 1, rc=%d\n", rc);
-		return;
+		return rc;
 	}
 	rc = SSL_new_cert(&trusted, ca_pem2, SSL_DCERT_XIM, 1 /*append*/);
 	if (rc) {
 		printf("Failed to parse CA certificate 2, rc=%d\n", rc);
-		return;
+		return rc;
 	}
 	rc = SSL_new_cert(&trusted, ca_pem3, SSL_DCERT_XIM, 1 /*append*/);
 	if (rc) {
 		printf("Failed to parse CA certificate 3, rc=%d\n", rc);
-		return;
+		return rc;
 	}
 	rc = SSL_new_cert(&trusted, ca_pem4, SSL_DCERT_XIM, 1 /*append*/);
 	if (rc) {
 		printf("Failed to parse CA certificate 4, rc=%d\n", rc);
-		return;
+		return rc;
 	}
-
+	
 	// Set TLS/SSL options.  These act globally, for all HTTPS connections
 	// until chenged to some other setting.  Normally, this only needs to
 	// be done once at start of program.
@@ -397,7 +447,18 @@ void main()
 						&trusted,				// Have a trusted CA!
 						my_server_policy);	// Test policy callback
 
+	return 0;
+}
 
+int main()
+{
+	int rc;
+	
+	rc = load_certificates();
+	if (rc) {
+		return rc;
+	}
+	
 	// initialize tcp_Socket structure before use
 	memset( &demosock, 0, sizeof(demosock));
 

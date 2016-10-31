@@ -42,12 +42,12 @@ command-line "Git bash" tool, available in the Tools menu, that you can use
 to execute the script below.
 
 To make use of this code, either start with an existing (backed-up)
-Dynamic C 10.72 installation, or [download and install][2] a fresh copy.
-Then add the GitHub repository to the directory.  These instructions
+Dynamic C installation (10.72 or later), or [download and install][2] a fresh
+copy.  Then add the GitHub repository to the directory.  These instructions
 have you creating a private branch where you can store your own changes
 to the libraries and samples, merging them in with Digi International's
 changes.  It assumes you've already changed to the directory with Dynamic
-C installed (e.g., `cd /c/DCRABBIT_10.72`).
+C installed (e.g., `cd /c/DCRABBIT_10.72A`).
 
     # Connect the Dynamic C installation with the GitHub repository,
     # and download all of the branches and tags.
@@ -60,13 +60,15 @@ C installed (e.g., `cd /c/DCRABBIT_10.72`).
 	git config core.filemode false
 	git config core.autocrlf false
     
-    # Reset to the 10.72 release (without changing directory contents).
+    # Reset to the matching release (without changing directory contents)
+	# by selecting one of the following statements:
 	git reset 10.72
+	git reset 10.72A
     
     # Get the .gitignore file from the repository.
     git checkout .gitignore
 	
-    # Create a private branch using the 10.72 release as a start point.
+    # Create a private branch using the release as a start point.
     git checkout -B mybranch
 
 At this point, `git status` will show any changes to the directory

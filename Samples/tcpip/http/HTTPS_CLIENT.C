@@ -51,9 +51,17 @@
 #ximport "../sample_certs/VerisignClass3PublicPrimaryCA.crt"  ca_pem4
 
 #define MP_SIZE 258			// Recommended to support up to 2048-bit RSA keys.
+//#define MP_SIZE 514			// Support up to 4096-bit RSA keys.
 
 // Comment this out if the Real-Time Clock is set accurately.
 #define X509_NO_RTC_AVAILABLE
+
+// Comment this out if you don't need to support sha384/sha512-signed certs.
+#define X509_ENABLE_SHA512
+
+// Uncomment this if you need to connect to HTTPS servers that don't support
+// TLS 1.2 yet.  See httpc_set_tls() for flags related to TLS 1.0 fallback.
+//#define SSL_ALLOW_TLS10_CLIENT_FALLBACK
 
 ///// Configuration Options /////
 
@@ -118,11 +126,15 @@ int my_server_policy(ssl_Socket far * state, int trusted,
 	                       struct x509_certificate far * cert,
 	                       httpc_Socket far * s)
 {
-	printf("\nChecking server certificate...\n");
-	if (trusted)
-		printf("This server's certificate is trusted\n");
+	// This code determines whether the hostname should be the
+	// proxy, or the origin ('real') server.
+	const char far * host;
+	if (httpc_globals.ip)
+		host = httpc_globals.proxy_hostname;
 	else
-		printf("There was no list of CAs, so cannot verify this server's certificate\n");
+		host = s->hostname;
+
+	printf("\nChecking server certificate...\n");
 
 	printf("Certificate issuer:\n");
 	if (cert->issuer.c)
@@ -155,11 +167,22 @@ int my_server_policy(ssl_Socket far * state, int trusted,
 	printf("Server claims to be CN='%ls'\n", cert->subject.cn);
 	printf("We are looking for  CN='%ls'\n", s->hostname);
 
-	if (x509_validate_hostname(cert, s->hostname)) {
-		printf("Mismatch!\n\n");
+	if (x509_validate_hostname(cert, host)) {
+		printf("Certificate hostname mismatch%s!\n",
+			httpc_globals.ip ? " (using proxy)" : "");
+		printf("Was expecting %ls, got %ls\n\n",
+			host, cert->subject.cn);
 		return 1;
 	}
-	printf("We'll let that pass...\n\n");
+	
+	if (trusted) {
+		printf("This server's certificate is trusted\n");
+	} else {
+		printf("Invalid certificate supplied, or missing root CA necessary to verify.\n");
+		// uncomment this line to reject untrusted certificates
+		//return 1;
+	}
+	
 	return 0;
 }
 
@@ -310,34 +333,36 @@ void httpc_demo(tcp_Socket *sock)
 // a good habit to be in.
 tcp_Socket demosock;
 
-void main()
+int load_certificates(void)
 {
 	int rc;
-	SSL_Cert_t trusted;
+	// Can't store this on the stack (auto) since the HTTP client library stores
+	// a reference to it for use later.
+	static far SSL_Cert_t trusted;
 
 	// First, parse the trusted CA certificates.
-	memset(&trusted, 0, sizeof(trusted));
+	_f_memset(&trusted, 0, sizeof(trusted));
 	rc = SSL_new_cert(&trusted, ca_pem1, SSL_DCERT_XIM, 0);
 	if (rc) {
 		printf("Failed to parse CA certificate 1, rc=%d\n", rc);
-		return;
+		return rc;
 	}
 	rc = SSL_new_cert(&trusted, ca_pem2, SSL_DCERT_XIM, 1 /*append*/);
 	if (rc) {
 		printf("Failed to parse CA certificate 2, rc=%d\n", rc);
-		return;
+		return rc;
 	}
 	rc = SSL_new_cert(&trusted, ca_pem3, SSL_DCERT_XIM, 1 /*append*/);
 	if (rc) {
 		printf("Failed to parse CA certificate 3, rc=%d\n", rc);
-		return;
+		return rc;
 	}
 	rc = SSL_new_cert(&trusted, ca_pem4, SSL_DCERT_XIM, 1 /*append*/);
 	if (rc) {
 		printf("Failed to parse CA certificate 4, rc=%d\n", rc);
-		return;
+		return rc;
 	}
-
+	
 	// Set TLS/SSL options.  These act globally, for all HTTPS connections
 	// until chenged to some other setting.  Normally, this only needs to
 	// be done once at start of program.
@@ -347,7 +372,18 @@ void main()
 						&trusted,				// Have a trusted CA!
 						my_server_policy);	// Test policy callback
 
+	return 0;
+}
 
+int main()
+{
+	int rc;
+	
+	rc = load_certificates();
+	if (rc) {
+		return rc;
+	}
+	
 	// initialize tcp_Socket structure before use
 	memset( &demosock, 0, sizeof(demosock));
 

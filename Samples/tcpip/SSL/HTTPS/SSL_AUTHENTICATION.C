@@ -126,6 +126,26 @@
 #ximport "cert\mycerts.pem" server_pub_cert
 #ximport "cert\mycertkey.pem" server_priv_key
 
+// If defined, remove code which supports legacy .dcc format certificates.
+#define SSL_DISABLE_LEGACY_DCC
+
+// If defined, remove code which supports storing certificates in the UserBlock.
+#define SSL_DISABLE_USERBLOCK
+
+/********************************
+ * End of configuration section *
+ ********************************/
+
+/*
+ *  memmap forces the code into xmem.  Since the typical stack is larger
+ *  than the root memory, this is commonly a desirable setting.  Another
+ *  option is to do #memmap anymem 8096 which will force code to xmem when
+ *  the compiler notices that it is generating within 8096 bytes of the
+ *  end.
+ *
+ *  #use the Dynamic C TCP/IP stack library and the HTTP application library
+ */
+
 #memmap xmem
 #use "dcrtcp.lib"
 #use "http.lib"
@@ -136,21 +156,15 @@
  *  associates a symbol with the physical address on the controller of
  *  the image.
  */
-#ximport "samples/tcpip/http/pages/static.html"		index_html
-#ximport "samples/tcpip/http/pages/rabbit1.gif"		rabbit1_gif
 
-/*
- *  http_types gives the HTTP server hints about handling incoming
- *  requests.  The server compares the extension of the incoming
- *  request with the http_types list and returns the second field
- *  as the Content-Type field.  The third field defines a custom
- *  function to handle that mime type.
- */
-const HttpType http_types[] =
-{
-   { ".html", "text/html", NULL},
-   { ".gif", "image/gif", NULL}
-};
+#ximport "pages/static.html"    index_html
+#ximport "pages/rabbit1.gif"    rabbit1_gif
+
+/* the default mime type for files without an extension must be first */
+SSPEC_MIMETABLE_START
+	SSPEC_MIME(".html", "text/html"),
+	SSPEC_MIME(".gif", "image/gif")
+SSPEC_MIMETABLE_END
 
 void main(void)
 {
@@ -161,9 +175,10 @@ void main(void)
 	int user2_enabled;
 	int user3_enabled;
 	int page1;
-	int page2;
 	int ch;
-	SSL_Cert_t my_cert;
+	// Can't store this on the stack (auto) since the HTTP server library stores
+	// a reference to it for use later.
+	static far SSL_Cert_t my_cert;
 
 	/*
 	 *  sock_init initializes the TCP/IP stack.
@@ -173,7 +188,7 @@ void main(void)
 	sock_init_or_exit(1);
 	http_init();
 
-	memset(&my_cert, 0, sizeof(my_cert));
+	_f_memset(&my_cert, 0, sizeof(my_cert));
 	// When using HTTPS (i.e. HTTP over SSL or TLS), the certificates need
 	// to be parsed and registered with the library.  For use with a
 	// server, we need to know our own private key.
@@ -215,12 +230,6 @@ void main(void)
 	sspec_adduser(page1, user3);
 	sspec_setrealm(page1, "Admin");
 
-	page2 = sspec_addxmemfile("index.html", index_html, SERVER_HTTPS);
-	sspec_adduser(page2, user1);
-	sspec_adduser(page2, user2);
-	sspec_adduser(page2, user3);
-	sspec_setrealm(page2, "Admin");
-
 	sspec_addxmemfile("rabbit1.gif", rabbit1_gif, SERVER_HTTPS);
 
 	/*
@@ -230,7 +239,7 @@ void main(void)
 	 *  delays when retrieving pages (versus increasing HTTP_MAXSERVERS).
     *  We reserve port 443 for HTTPS communication
 	 */
-	tcp_reserveport(443);
+	tcp_reserveport(HTTPS_PORT);
 
 	while (1) {
 		/*
@@ -249,7 +258,6 @@ void main(void)
 					 * sspec_adduser() adds a user to a resource
 					 */
 					sspec_adduser(page1, user1);
-					sspec_adduser(page2, user1);
 					printf("User 1 enabled\n");
 				}
 				else {
@@ -257,7 +265,6 @@ void main(void)
 					 * sspec_removeuser() removes a user from a resource
 					 */
 					sspec_removeuser(page1, user1);
-					sspec_removeuser(page2, user1);
 					printf("User 1 disabled\n");
 				}
 				break;
@@ -265,12 +272,10 @@ void main(void)
 				user2_enabled = !user2_enabled;
 				if (user2_enabled) {
 					sspec_adduser(page1, user2);
-					sspec_adduser(page2, user2);
 					printf("User 2 enabled\n");
 				}
 				else {
 					sspec_removeuser(page1, user2);
-					sspec_removeuser(page2, user2);
 					printf("User 2 disabled\n");
 				}
 				break;
@@ -278,12 +283,10 @@ void main(void)
 				user3_enabled = !user3_enabled;
 				if (user3_enabled) {
 					sspec_adduser(page1, user3);
-					sspec_adduser(page2, user3);
 					printf("User 3 enabled\n");
 				}
 				else {
 					sspec_removeuser(page1, user3);
-					sspec_removeuser(page2, user3);
 					printf("User 3 disabled\n");
 				}
 				break;

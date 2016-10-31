@@ -42,11 +42,6 @@ END DESCRIPTION **********************************************************/
 	#endif
 #endif
 
-#if (_CPU_ID_ < R3000_R1)
-#fatal "SSL is not supported on Rabbit processors before the R3000A " \
-       "(R3000 rev. 1)"
-#endif
-
 // Standard BCD-coded module version macro - 0x0302 = version 3.02
 #define _SSL_VERS 0x0302
 
@@ -75,6 +70,13 @@ END DESCRIPTION **********************************************************/
    #define _SSL_USE_RSA_ 1
 #else
    #define _SSL_USE_RSA_ 0
+#endif
+
+// Enable support for falling back to TLS 1.0 for client connections
+#ifdef SSL_ALLOW_TLS10_CLIENT_FALLBACK
+	#define _SSL_USE_TLS10 1
+#else
+	#define _SSL_USE_TLS10 0
 #endif
 
 // Check to see that at least one supported key exchange is available
@@ -241,7 +243,9 @@ END DESCRIPTION **********************************************************/
 
 // TLS 1.0 is (3,1), 1.1 is (3,2) and 1.2 is (3,3)
 #define TLS1_VER_MAJ 3
-#define TLS1_VER_MIN 3
+#define TLS10_VER_MIN 1
+#define TLS11_VER_MIN 2
+#define TLS12_VER_MIN 3
 
 // Supported cipher suites.
 #define TLS_NULL_WITH_NULL_NULL 			   0x0000
@@ -496,6 +500,8 @@ typedef enum {
 	TLS_HASH_SHA       = 0x02,
 	TLS_HASH_SHA224    = 0x03,
 	TLS_HASH_SHA256    = 0x04,
+   TLS_HASH_SHA384    = 0x05,
+   TLS_HASH_SHA512    = 0x06,
 	TLS_HASH_UNDEFINED = 0xFF
 } TLS_HashAlgorithm;
 
@@ -530,6 +536,18 @@ typedef struct {
 	SSL_ProtocolVersion version; // Record protocol version
 	SSL_uint16_t        length;  // The length of the record (2 bytes)
 } SSL_Record_Hdr;
+
+/*
+	TLS records can span multiple TCP segments, all of which are required
+   before decryption.  The total TCP length is the 16KB maximum TLS record
+   length, plus some overhead.
+   
+   Note that the TLS 1.0 library claimed a 16420 maximum (16KB + 36) and
+   testing of TLS 1.2 found a 16437 maximum (16KB + 53).  The calculation
+   below may not accurately reflect the exact contents of the extra 53 bytes.
+*/
+#define TLS_MAX_TCP_BUFFER_LENGTH (16 * 1024 \
+	+ SSL_EXPLICIT_IV_SIZE + SSL_MAX_HASH_SIZE + sizeof(SSL_Record_Hdr))
 
 // ********************************************************
 // *****        Cross-Version Data structures         *****
@@ -663,6 +681,9 @@ typedef struct {
 
 // TLS finished hash structure, also used for certificate verify operations
 typedef struct {
+#if _SSL_USE_TLS10
+	md5_state_t	   md5_hash; // MD5 hash for TLS 1.0 finished calc
+#endif
    sha_state      sha1_hash;
 	sha256_context sha256_hash;
 } SSL_Finish_Hash_t;
@@ -825,6 +846,11 @@ typedef struct tls_connection {
    SSL_state_t 	    cur_state; 	// Identifying value for current state
    char               is_psk;			// TRUE if pre-shared key
    char					 is_client;		// True if client
+#if _SSL_USE_TLS10
+   char					 tls_ver_minor;// Negotiated TLS minor version (if downgrading
+   											// to 1.0 is allowed).  0 for default/unset,
+   											// TLS1x_VER_MIN macro otherwise.
+#endif
 	SSL_CipherState __far*   cipher_state;// Current ciphersuite state
 #if _SSL_USE_RSA_
    char					 wait_rsa;		// Non-zero if waiting for RSA operation to
@@ -885,7 +911,9 @@ typedef struct tls_connection {
 #define SSL_F_PEER_CERT_OK		0x0008		// Per cert validated OK (or we had no means to validate).
 														// This can also be set initially, in order to pretend all certs
 														// are valid.  See tls_set_flags()
-#define SSL_F_DISABLE_SSLV3	0x0010		// Set to not accept SSLv3 (always set for clients)
+#define SSL_F_DISABLE_SSLV3	0x0000		// (deprecated flag -- SSLv3 always disabled)
+#define SSL_F_DISABLE_TLS10	0x0010		// (client only) Don't allow server to re-negotiate
+														// connection down to TLS 1.0.
 #define SSL_F_NO_RESUME			0x0020		// Set to not accept or attempt session resumption
 #define SSL_F_TRIED_RESUME		0x0040		// Set when client hello included old session ID
 #define SSL_F_RESUMED			0x0080		// This session was resumed via cached session ID
@@ -895,13 +923,15 @@ typedef struct tls_connection {
 #define SSL_F_CLOSE_NOTIFY		0x0800		// Received close notify alert from peer
 #define SSL_F_COP_YIELD			0x1000		// Call cop_yield() during long-running calculations
 														// This is only meaningful if #use coprocess.lib
+#define SSL_F_FORCE_TLS10		0x2000		// (client only) Initiate connection with TLS 1.0
+														// (for servers that don't accept TLS 1.2 connections).
 #define SSL_F_ENCRYPT			0x4000		// Encrypt outgoing data with current cipher
 #define SSL_F_DECRYPT			0x8000		// Decrypt incoming data with current cipher
 
 // Define set of the above flags which may be set by tls_set_flags()
 #define SSL_F_OPTIONS			(SSL_F_REQUIRE_CERT|SSL_F_PEER_CERT_OK| \
-                               SSL_F_DISABLE_SSLV3|SSL_F_NO_RESUME| \
-                               SSL_F_COP_YIELD)	// 0x103A
+                               SSL_F_DISABLE_TLS10|SSL_F_NO_RESUME| \
+                               SSL_F_COP_YIELD|SSL_F_FORCE_TLS10)	// 0x303A
 	word					 tport_flags;	// Flags reserved for use by transport layer.
 												// Set/get using tls_set/get_tport_flags().
 												// Not otherwise used by TLS/SSL libraries.
@@ -915,13 +945,16 @@ typedef struct tls_connection {
 #define SSL_S_ALLOW_NULL		0x0100	// Permit NULL bulk encryption suites.  This
 													// allows eavesdropping, but still requires
 													// strong authentication and message integrity.
-#define SSL_S_FORBID_RC4		0x0200	// deprecated (RC4 no longer supported)
 #define SSL_S_ALLOW_PSK			0x0400	// Allow pre-shared key authentication
-#define SSL_S_FORBID_MD5		0x4000	// deprecated (MD5 no longer supported)
+
+#define SSL_S_FORBID_RC4		0x0000	// deprecated (RC4 no longer supported)
+#define SSL_S_FORBID_MD5		0x0000	// deprecated (MD5 no longer supported)
 
 // Define to all the above flags
-#define SSL_S_OPTIONS	(SSL_S_ALLOW_NULL|SSL_S_FORBID_RC4| \
-								 SSL_S_FORBID_MD5|SSL_S_ALLOW_PSK)
+#define SSL_S_OPTIONS	(SSL_S_ALLOW_NULL|SSL_S_ALLOW_PSK)
+#if SSL_S_OPTIONS & SSL_F_OPTIONS
+	#error Conflict between flags and suite_flags passed to sock_secure().
+#endif
 	SSL_Record_Hdr     hdr;		// Current read record header being processed, in
 										// SSLv3/TLS equivalent format.
 	SSL_Record_Hdr     wr_hdr;	// Current write record header being generated, in

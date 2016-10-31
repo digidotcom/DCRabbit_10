@@ -46,7 +46,7 @@
 #endif
 
 #ifndef DMAETH100_NET_IP
-   // Interrupt priority for network port A.
+   // Interrupt priority for network port B.
    // This is also used for the DMA transfer priority.
    #define DMAETH100_NET_IP   2
 #endif
@@ -541,6 +541,7 @@ ioi ld   hl,(hl)           ; 13
 	; Less 6 to account for the status vector itself
    ld    hl,MAX_MTU+MAX_OVERHEAD-6
    sub   hl,de    ; HL = length of last buffer
+   push  hl	  ; save that length part for later
 
    // Parse 6 byte Rx Frame Status
 	ld		bcde,(py+[_llp_]+data1)
@@ -554,6 +555,7 @@ ioi ld   hl,(hl)           ; 13
    ; status.  This will cause a fifo purge (which is probably required
    ; if there is this sort of inconsistency).
    ld		hl,(pz+2)		; length from vector
+   pop      de			; grab length from dma back into de
    cp		hl,de
    ld		hl,(pz+4)		; Get status bits
    jr		z,.store_stat
@@ -619,6 +621,7 @@ dmaeth100_process_rx::
    ret
 
 ; Allocate the next buffer for receive
+; IX points to control struct
 dmaeth100_alloc_rx::
    push  ix
    exx
@@ -678,6 +681,7 @@ dmaeth100_alloc_rx::
 #endasm
 
 #asm __root _dmaeth100_asmdebug
+; IX points to control struct
 dmaeth100_fire_rx::
    ld    bc,[_decb]+rxDescPtr
 #ifdef DMAETH100_SUPERDEBUG
@@ -697,16 +701,17 @@ dmaeth100_fire_rx::
 ;------
 ; dmaeth100_toss_packet: re-use the same buffer for the
 ; next receive DMA.  This is called from Net Rx ISR.
+; IX points to control struct
 dmaeth100_toss_packet::
 #ifdef DMAETH100_SUPERDEBUG
    ld    l,ISRL_TOSS
    call  write_ilog
+#endif
    ld    jkhl,(ix+[_decb]+rxbuf)
    ; Reset the received length field to zero
    ld    py,jkhl
    clr	hl
    ld    (py+[_llp_]+len1),hl
-#endif
 
 .startRxDMA:
    ; Fire off DMA, ready for next packet. Initial addr. doesn't need reloading.
@@ -771,7 +776,7 @@ dmaeth100_txfire::
 
 #asm __root _dmaeth100_asmdebug
 ;------------------------------------------------------------------------------
-; Network receive interrupt handler.
+; Network receive interrupt handler (really the dma receive interrupt handler)
 ;------------------------------------------------------------------------------
 dma_rcv_isr::
    push  af          ; 10
@@ -808,34 +813,31 @@ dma_rcv_isr::
    jr    nz,.reset_rx_port ; 5
 
    ; Check if only status rcv'd with no packet data
+   ; This is the catch all for errors with R6000
 	ld		hl,(ix+[_decb]+rcvlen)
    test	hl
    jr		z,.test_rx_error
 
    ; Check for valid Rcv Packet
-	ld		a,(ix+[_decb]+rcvlsbstat)
+   ; Don't know where this is documented for R6000, but we'll leave it in based on hopeful precedent
+   ld		a,(ix+[_decb]+rcvlsbstat)
    bit   7,a               ; 4
    jr    z,.test_rx_error
 
 .test_fire_dma:
-   ; Process received packet.
-   ld    a,(ix+[_decb]+receiving)
-   ld    (ix+[_decb]+receiving),0   ; one less available
-
-   ; test whether 'receiving' was decremented to zero...
-   or    a
-   jr    z,.cont20        ; 5 - jump if it was already 0
-   ; yes, receiving was 1, therefore we need to immediately allocate a new rx
-   ; buffer and fire it off.
+   ; Good packet in
+   ld    (ix+[_decb]+receiving),0   ; technically, we're now done with this buffer and will need another
+   ; quickly try to get another buffer
 #ifdef DMAETH100_SUPERDEBUG
    ld    l,ISRL_ALLOC_2
    call  write_ilog
 #endif
    call  dmaeth100_alloc_rx
-   jr    c,.cont21
+   jr    c,.cont21				; CF means couldn't get a buffer
 .cont20:
    call  dmaeth100_fire_rx
 .cont21:
+; Now process it
    ld		jkhl, (ix+[_decb]+rxBuffer)
    ld		py,jkhl
    call  dmaeth100_process_rx ; and process it (i.e. pass to tcp/ip stack)
@@ -847,6 +849,7 @@ dma_rcv_isr::
 
 ; Usually come here when Rx overrun, or length mismatch between DMA and
 ; status vector.
+; Note we get to keep our buffer since we won't send upstairs
 .reset_rx_port:
 	ld	a,0x01			; Reset Rx fifo
 ioi ld   (NBCR),a
@@ -869,38 +872,35 @@ ioi ld   (NBCR),a
    inc   hl
    ld    (ix+[_decb]+pd_rx_error),hl
 
-	ld		a,(ix+[_decb]+rcvlsbstat)
+   ; Again, where in the R6000 is this documented?  We'll leave it in though...
+   ld		a,(ix+[_decb]+rcvlsbstat)
    bit   5,a
    jr    z,.rxe2
    ld    hl,(ix+[_decb]+pd_rxe_align)
    inc   hl
    ld    (ix+[_decb]+pd_rxe_align),hl
-#endif
 
 #ifdef DMAETH100_SUPERDEBUG
    ld    l,ISRL_ERR_ALIGN
    call  write_ilog
 #endif
+
    jr    .rxe3
 
 .rxe2:
-#ifdef DMAETH100_NET_STATS
    bit   4,a
    jr    z,.rxe3
    ld    hl,(ix+[_decb]+pd_rxe_crc)
    inc   hl
    ld    (ix+[_decb]+pd_rxe_crc),hl
-#endif
 
 #ifdef DMAETH100_SUPERDEBUG
    ld    l,ISRL_ERR_CRC
    call  write_ilog
 #endif
-
+#endif	// DMAETH100_NET_STATS
 .rxe3:
-   ld    a,(ix+[_decb]+receiving)
-   or    a
-   jr    z,.normal_exit         	; 5  Skip if no outstanding rx.
+	; here, we always had a buffer...we're just reusing it
    call  dmaeth100_toss_packet   ; This basically just restarts the DMA
 
 .normal_exit:
@@ -928,6 +928,11 @@ ioi ld   (NBCR),a
 #asm __root _dmaeth100_asmdebug
 ;------------------------------------------------------------------------------
 ; Transmit DMA interrupt handler.
+; This interrupt will occur after the dma transfer is complete (the fifo gets filled)
+; You can't tell if things got sent though...the error stuff occurs later
+; and can be noticed in the netport isr.
+; But, you can sure free the buffer here and you "could" put more frames in the
+; fifo if you want.  You only have 2048 bytes in there though.
 ;------------------------------------------------------------------------------
 dma_tx_isr::
    push  af
@@ -936,7 +941,7 @@ dma_tx_isr::
    push  jkhl
    push  ix
    push  iy
-   ld		hl, lxpc
+   ld	hl, lxpc
    push	hl
    push	px
    push	py
@@ -945,8 +950,11 @@ dma_tx_isr::
    ; Get address of NIC structure
    ld    ix,_decb
 .netTxDMA_free:
+	; only free a buffer if we still owned it
+   ld   a, (ix+[_decb]+sending)
+   cp	0
+   jr	z,.no_txfire
    ld   (ix+[_decb]+sending),0 ; Not sending this one any more.
-   ; We test this again at end to see if there is a pending further transmit
 
    ; Return buffer to packet buffer pool
    ld    jkhl,(ix+[_decb]+txbuf)
@@ -959,7 +967,9 @@ dma_tx_isr::
    call  write_ilog
 #endif
 
+   push		ix
    lcall	_pb_free
+   pop		ix
 
 .no_txfire:
 #ifdef DMAETH100_SUPERDEBUG
@@ -971,40 +981,41 @@ dma_tx_isr::
    pop	py
    pop	px
    pop	hl
-   ld		lxpc,hl
+   ld	lxpc,hl
    pop   iy
    pop   ix
    pop   jkhl
-   pop   bcde
+   pop	 de
+   pop	 bc
    pop   af
    ipres
    ret
 #endasm
 
+#if _RAB6K
 #asm __root _dmaeth100_asmdebug
 ;------------------------------------------------------------------------------
 ; Transmit netport interrupt handler.
+; These interrupts can occur when data appears in the network peripheral.
+; DMA interrupts will occur when the DMA transfer is complete.
+; So, in theory, you could get this interrupt after or during a dma transfer
 ;------------------------------------------------------------------------------
 netport_tx_isr::
-#if 0
-	//// TEST
-	push	af
-   ioi ld a,(NBCSR)
-	pop	af
-	ipres
-	ret
-	//// END TEST
-#endif
+	   push  af
+	   push  bc
+	   push  de
+	   push  jkhl
+	   push  ix
+	   push  iy
+	   ld	hl, lxpc
+	   push	hl
+	   push	px
+	   push	py
+	   push	pz
 
-   push  af
-#ifdef DMAETH100_NET_STATS
-   push  bc
-   push  de
-   push  hl
-   push  ix
-  	ld    ix,_decb
-#endif
+   ld    ix,_decb
    ioi ld a,(NBCSR)
+; The below lets you allow some interrupt nesting if you want. By default, it's enabled.  Watch yourself  ;-)
 #if DMAETH100_ENABISR != DMAETH100_NET_IP
 	push ip
 	ipset DMAETH100_ENABISR
@@ -1020,52 +1031,95 @@ netport_tx_isr::
    call  write_ilog
    pop	af
 #endif
-   bit   5,a
-   jr		nz,.netport_done
+   bit	5,a					; most of the time, transmit okay so all is well
+   jr	nz,.netport_done
 
-   bit   4,a
-   jr		nz,.tx_packet_error
+   bit	4,a					; transmit error?
+   jr	nz,.tx_packet_error
+
+   bit  3,a					; transmit pause sent?
+   jr	nz,.netport_done_notxinc	; don't really care...and it shouldn't count as a transmitted packet
+; nothing else should come in here
    jr		.netport_done
 
 .tx_packet_error:
-ioi ld   a,(NBTSR)
+; Transmitted packet in error.  Check NBTSR and NBTESR for details
+; Some errors might have aborted the packet where we do not get the dma tx interrupt
+;  in that case, we need to do some special stuff
+	ld	b,0				; the aborted packet flag
 #ifdef DMAETH100_NET_STATS
-   ; Transmitted packet in error.  Check NBTSR for details
    ld    hl,(ix+[_decb]+pd_tx_error)
    inc   hl
    ld    (ix+[_decb]+pd_tx_error),hl
-
+#endif
+ioi ld   a,(NBTSR)
    bit   4,a
    jr    z,.txe1
+   ld	b,1				; packet aborted for underrun
+#ifdef DMAETH100_NET_STATS
    ld    hl,(ix+[_decb]+pd_txe_urun)
    inc   hl
    ld    (ix+[_decb]+pd_txe_urun),hl
-   jr    .txe3
+#endif
+   jr    .txeF
 .txe1:
    bit   5,a
    jr    z,.txe2
-	ld		b,1		; Reset aborted Tx DMA due to 16 collisions
+	ld	b,1		; packet aborted due to excessive collisions
+#ifdef DMAETH100_NET_STATS
    ld    hl,(ix+[_decb]+pd_txe_colls)
    inc   hl
    ld    (ix+[_decb]+pd_txe_colls),hl
-   jr    .txe3
+#endif
+   jr    .txeF
 .txe2:
-	ld		b,0		; For deferred Tx, don't reset Tx DMA
-   bit   6,a
+; the rest of the possible errors do not abort the transmission
+; AND we really only care about them if we have stats running
+	ld	b,0		; the rest of the possible errors do not abort the transmission
+#ifdef DMAETH100_NET_STATS
+	bit   6,a		; we count deferred packets
    jr    z,.txe3
    ld    hl,(ix+[_decb]+pd_txe_defer)
    inc   hl
    ld    (ix+[_decb]+pd_txe_defer),hl
-#endif
+   jr	.txeF
 .txe3:
+; look at NBTESR for some more transmit error sources
 ioi ld   a,(NBTESR)        ; 11
-#ifdef DMAETH100_NET_STATS
-   bit   4,a
-   jr    z,.netport_done
+   bit   4,a		; check for crc error
+   jr    z,.txeF
    ld    hl,(ix+[_decb]+pd_txe_crc)
    inc   hl
    ld    (ix+[_decb]+pd_txe_crc),hl
 #endif
+.txeF:
+; Ok, done categorizing errors
+	djnz	.netport_done
+; Frame was aborted...need to halt dma if needed and clean up a bit
+	ld   a, (ix+[_decb]+sending)
+	cp	0
+	jr	z,.txePurgeOnly
+; tx dma interrupt didn't get called...so clean it up here
+#if _RAB6K
+	ld   hl,(ix+[_decb]+txbit)	; Halt current DMA
+	ioi  ld   (DMHLR),hl
+#else
+	ld    a,(ix+[_decb]+txbit)	; Halt current DMA
+	ioi   ld   (DMHR),a
+#endif
+; Return buffer to packet buffer pool
+	ld    jkhl,(ix+[_decb]+txbuf)
+	ld    py,jkhl		; Buffer address to be freed
+	push	ix
+	lcall	_pb_free
+	pop		ix
+; Not sending any more
+	ld   (ix+[_decb]+sending),0
+.txePurgeOnly:
+; May as well clear the fifo too
+	ld 	a,0x10     	; Purge FIFO
+	ioi	ld (NBCR),a
+; not sure we should count this as "transmitted" for stats, but what the heck
 
 .netport_done:
 #ifdef DMAETH100_NET_STATS
@@ -1073,21 +1127,27 @@ ioi ld   a,(NBTESR)        ; 11
    inc   hl
    ld    (ix+[_decb]+pd_transmitted),hl
 #endif
+.netport_done_notxinc:
 #if DMAETH100_ENABISR != DMAETH100_NET_IP
 	pop	ip
 #endif
 
-#ifdef DMAETH100_NET_STATS
-   pop   ix
-   pop   hl
-   pop   de
-   pop   bc
-#endif
-   pop   af
-   ipres
-   ret
+	pop pz
+	pop	py
+	pop	px
+	pop	hl
+	ld	lxpc,hl
+	pop   iy
+	pop   ix
+	pop   jkhl
+	pop	 de
+	pop	 bc
+	pop   af
+	ipres
+	ret
 #endasm
 
+#endif // _RAB6K
 /* **************************************************************************/
 /* **************************************************************************/
 
@@ -1381,17 +1441,17 @@ int dmaeth100_hardwarereset(_DMAEth100Config * nic)
    // WrPortI(NBFLMR, NULL, ((MAX_MTU+18) & 0xFF00) >> 8);
 
    // Get current state of the PHY interface
-   nic->netstatus = (_phy_read_reg (PHY_ADDR,  PHY00_CNTRL) |
+   nic->phy00_reg = _phy_read_reg (PHY_ADDR,  PHY00_CNTRL);
+   nic->netstatus = (nic->phy00_reg |
    					  _phy_read_reg (PHY_ADDR,  PHY01_STATUS))	&
    					  REG0_1_STATUS_MASK;
    // Initialize network port speed and duplex mode of operation.
-   nic->phy00_reg = _phy_read_reg (PHY_ADDR,  PHY00_CNTRL);
    nic->flags = 0;
-   if(nic->netstatus & PHY_DATARATE)
+   if(nic->phy00_reg & PHY_DATARATE)
    {
   		nic->flags |= DE_FLAGS_SPEED;
    }
-   if(nic->netstatus & PHY_DUPLEX)
+   if(nic->phy00_reg & PHY_DUPLEX)
    {
    	nic->flags |= DE_FLAGS_FULLDUPLEX;
    }
@@ -1428,7 +1488,9 @@ int dmaeth100_setupinterrupts(_DMAEth100Config *rt)
    ilog_idx = 0;
 #endif
    // set up Network Port interrupt vectors
-   //SetVectIntern(NETB_OFS>>4, netport_tx_isr);
+#if _RAB6K
+	SetVectIntern(NETB_OFS>>4, netport_tx_isr);
+#endif
 	SetVectExtern4000(RX_EIR_OFS+DMAETH100_RXCHAN, dma_rcv_isr);
   	SetVectExtern4000(TX_EIR_OFS+DMAETH100_TXCHAN, dma_tx_isr);
    return 0;
@@ -1534,8 +1596,11 @@ __nouseix int dmaeth100_resetinterface(_DMAEth100Config * nic, word instance,
    RdPortI(NBCSR);
 
    // Enable the network interrupt, Tx and Err interrupts serviced.
-   //WrPortI(NBCSR, NULL, 0x38+DMAETH100_NET_IP);
+#if _RAB6K
+   WrPortI(NBCSR, NULL, 0x38+DMAETH100_NET_IP);
+#else
    WrPortI(NBCSR, NULL, DMAETH100_NET_IP);
+#endif
 
    // DMA transfer priority the same as net interrupt. Net DMA uses interrupts.
    WrPortI(DMCR, NULL, (DMAETH100_NET_IP<<2) | DMAETH100_NET_IP);
@@ -1584,25 +1649,20 @@ int dmaeth100_receive(_DMAEth100Config * nic)
       call dmaeth100_alloc_rx
       jr    c,.cont1
 
-#if _RAB6K
-		ld		hl,(ix+[_decb]+rxbit)
-		ex		de,hl
-		ioi	ld	hl,(DMCSLR)
-		and	hl,de
-#else
+		/* Don't have to do this with the R6000...tx fire will do it */
+#if !defined(_RAB6K)
       ld		a, (ix+[_decb]+rxbit)
       ld		b,a
       ioi	ld a,(DMCSR)
       and   a,b
-#endif
-      jr		nz,.cont1
-
+      jr	nz,.cont1
       ;FIXME - this should not be required!
-   	; Purge fifo to defeat condition where fifo always retains one frame.
-   	ld		a,0x01
-   	ioi ld (NBCR),a
+      ; Purge fifo to defeat condition where fifo always retains one frame.
+      ld	a,0x01
+      ioi ld (NBCR),a
+#endif
 
-      call dmaeth100_fire_rx
+     call dmaeth100_fire_rx
 .cont1:
 		ipres
       pop   ix
@@ -2074,6 +2134,15 @@ int dmaeth100_havelink(_DMAEth100Config * nic)
 	{
 		nic->pd_jabber = TRUE;
 	}
+   nic->flags = 0;
+   if (phy00 & PHY_DATARATE)
+   {
+      nic->flags |= DE_FLAGS_SPEED;
+   }
+   if (phy00 & PHY_DUPLEX)
+   {
+      nic->flags |= DE_FLAGS_FULLDUPLEX;
+   }
 
 	// If no link status, then re-initialize
 	if (!(netstatus & PHY_LINK))
@@ -2121,25 +2190,16 @@ int dmaeth100_havelink(_DMAEth100Config * nic)
 #if defined _ENABLED_ENET_STATUS
 		_enet_link_status = (char) 1;
 #endif
-		if (nic->netstatus != netstatus)
-		{
+	   if (nic->netstatus != netstatus)
+	   {
 #ifdef DMAETH100_VERBOSE
-			printf("%s: status was 0x%04x, now 0x%04x\n", "dmaeth100_havelink",
-			       nic->netstatus, netstatus);
+	      printf("%s: status was 0x%04x, now 0x%04x\n", __FUNCTION__,
+	             nic->netstatus, netstatus);
 #endif
-			nic->flags = 0;
-			if (netstatus & PHY_DATARATE)
-			{
-				nic->flags |= DE_FLAGS_SPEED;
-			}
-			if (netstatus & PHY_DUPLEX)
-			{
-				nic->flags |= DE_FLAGS_FULLDUPLEX;
-			}
-			// Initialize network port duplex mode of operation
-			dmaeth100_NetConfig(nic);
-			nic->netstatus = netstatus;
-		}
+	      // Initialize network port duplex mode of operation
+	      dmaeth100_NetConfig(nic);
+	      nic->netstatus = netstatus;
+	   }
 	}
 	nic->linkstate = 0;
 #ifdef PKTDRV_VERBOSE
@@ -2571,7 +2631,7 @@ _dmaeth100_nodebug void dmaeth100_prt_nicreg(_DMAEth100Config * nic)
       temp == 2 	 ? "TxHalf-Full" : "Tx4th Full"
       );
 
-   temp = (nbtcr & 0xC0) >> 6;
+   temp = (nbrcr & 0xC0) >> 6;
    printf("NBRCR  %02X   %s %s %s %s %s %s %s\n",
    	nbrcr,
       temp == 0 	 ? "RxDisabled," :
@@ -2776,6 +2836,15 @@ _dmaeth100_nodebug void dmaeth100_prt_nicreg(_DMAEth100Config * nic)
    	phystatus & 0x00FF,
       phystatus & 0x0080 ? "Col Test" : ""
       );
+      
+	#if CPU_ID_MASK(_CPU_ID_) >= R6000
+	// Some other PHY registers for Faraday PHY...
+	printf("Reg04   (ANAR): %04X\n", _phy_read_reg (PHY_ADDR,  PHY04_AUTONEG));
+	printf("Reg05 (ANLPAR): %04X\n", _phy_read_reg (PHY_ADDR,  PHY05_AUTONEG_LINK));
+	printf("Reg06   (ANER): %04X\n", _phy_read_reg (PHY_ADDR,  PHY06_AUTONEG_EXP));
+	printf("Reg10   (int.): %04X\n", _phy_read_reg (PHY_ADDR,  0x10));
+	printf("Reg18   (int.): %04X\n", _phy_read_reg (PHY_ADDR,  0x18));
+	#endif
 
 	#ifdef DMAETH100_NET_STATS
 	printf("\n");
@@ -2797,7 +2866,7 @@ _dmaeth100_nodebug void dmaeth100_prt_nicreg(_DMAEth100Config * nic)
    printf("  rx errs: orun=%u align=%u crc=%u\n",
       nic->pd_rxe_orun, nic->pd_rxe_align, nic->pd_rxe_crc);
 
-   printf("Other conds: nobufs=%d\n",
+   printf("Other conds: nobufs=%u\n",
       nic->pd_nobufs
       );
 	#endif
