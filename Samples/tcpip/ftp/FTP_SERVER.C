@@ -53,10 +53,18 @@
  */
 
 /*
- * Some FTP clients (like FileZilla) make simultaneous connections, so
- * allow for two at a time.
+ * Some GUI FTP clients make multiple connections, so allow for three at a
+ * time.  This supports the FileZilla default setting of one connection for
+ * directory listings and two simultanous file transfers.
  */
-#define FTP_MAXSERVERS 2
+#define FTP_MAXSERVERS 3
+
+/*
+ * Each FTP connection uses two TCP sockets, one for control and one for
+ * data.  Configure the TCP/IP stack with enough pre-allocated buffers for
+ * two sockets per FTP Server connection.
+ */
+#define MIN_TCP_SOCKET_BUFFERS (2 * FTP_MAXSERVERS)
 
 /*
  * We are not defining any static resources.  Defining the following macro
@@ -68,6 +76,12 @@
 /********************************
  * End of configuration section *
  ********************************/
+#if defined(MAX_TCP_SOCKET_BUFFERS) && MAX_TCP_SOCKET_BUFFERS < MIN_TCP_SOCKET_BUFFERS
+	#undef MAX_TCP_SOCKET_BUFFERS
+#endif
+#ifndef MAX_TCP_SOCKET_BUFFERS
+	#define MAX_TCP_SOCKET_BUFFERS MIN_TCP_SOCKET_BUFFERS
+#endif
 
 #memmap xmem
 #use "dcrtcp.lib"
