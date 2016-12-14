@@ -42,8 +42,8 @@
 	bits PC3 and PC2.  This default overrides the RXC and TXC pins on the
 	prototyping board's RS232 connector.
 
-	Also note that the same IOCONFIG.EXE generated library is used for both the
-	59MHz RCM4300 and the 59MHz RCM4310.
+	Also note that the same IOCONFIG.EXE generated library is used for the
+	59MHz RCM4300, RCM4310 and RCM4320.
 
 
 	Prototyping Board Connections
