@@ -53,6 +53,8 @@ Revision History:	Rev 1.0 Initial Release
 // be commented out at a cost to SD card throughput.
 #define CRC16_USE_TABLE
 
+#define SDFLASH_SDHC 1
+
 #ifdef SDFLASH_DEBUG
 	#define _sdflash_nodebug __debug
 #else
@@ -91,6 +93,7 @@ Revision History:	Rev 1.0 Initial Release
  * Data packet sizes and buffer offsets
  */
 #define COMMAND_BYTE_COUNT       6
+#define REPLY_BYTE_COUNT         6
 #define R1_BYTE_COUNT            1
 #define R2_BYTE_COUNT            2
 #define R3_BYTE_COUNT            3
@@ -98,15 +101,15 @@ Revision History:	Rev 1.0 Initial Release
 #define CSD_BYTE_COUNT           19
 #define BLOCK_SIZE               512L
 /* DATA BLOCK = 512 bytes data, 1 byte start block and 2 bytes for 16 bit CRC */
-#define DATA_BLOCK_SIZE          BLOCK_SIZE + 3
+#define DATA_BLOCK_SIZE          (BLOCK_SIZE + 3)
 #define DATA_RESPONSE_BYTE_COUNT 1
 // COMMAND R1 = NCS_MIN + COMMAND_BYTE_COUNT + NCR_MAX + R1_BYTE_COUNT + NEC_MIN
 #define CMD_R1_BUFFER_SIZE       1
 // COMMAND R2 = NCS_MIN + COMMAND_BYTE_COUNT + NCR_MAX + R2_BYTE_COUNT + NEC_MIN
 #define CMD_R2_BUFFER_SIZE       2
-#define READ_CSD_BUFFER_SIZE     CMD_R2_BUFFER_SIZE + CSD_BYTE_COUNT
-#define READ_BLOCK_BUFFER_SIZE   CMD_R2_BUFFER_SIZE + DATA_BLOCK_SIZE
-#define READ_SCR_BUFFER_SIZE     CMD_R2_BUFFER_SIZE + SCR_BYTE_COUNT
+#define READ_CSD_BUFFER_SIZE     (CMD_R2_BUFFER_SIZE + CSD_BYTE_COUNT)
+#define READ_BLOCK_BUFFER_SIZE   (CMD_R2_BUFFER_SIZE + DATA_BLOCK_SIZE)
+#define READ_SCR_BUFFER_SIZE     (CMD_R2_BUFFER_SIZE + SCR_BYTE_COUNT)
 #define SCR_BYTE_COUNT           11
 
 /*
@@ -114,6 +117,7 @@ Revision History:	Rev 1.0 Initial Release
  */
 #define CMD0        0
 #define CMD1        1
+#define CMD8        8
 #define CMD9        9
 #define CMD13       13
 #define CMD16       16
@@ -234,7 +238,8 @@ typedef struct sd_csd_type
 {
    unsigned char init_ok;
    unsigned char CSD_STR;
-   unsigned int  SPEC_VERS;
+   	#define SD_CSD_STR_V1 0x00
+   	#define SD_CSD_STR_V2 0x01
    unsigned char TAAC;
    unsigned char NSAC;
    unsigned char TRANSPEED;
@@ -958,7 +963,7 @@ int sdspi_sendingAP(sd_device *sd)
     SD_CMD_REPLY cmd_reply;
 
     sdspi_init_reply(&cmd_reply, CMD55);
-    cmd_reply.reply_size = CMD_R1_BUFFER_SIZE;
+    cmd_reply.reply_size = REPLY_BYTE_COUNT;
     if (result = sdspi_process_command(sd, &cmd_reply, 0))
     {
 #ifdef SDFLASH_VERBOSE
@@ -1021,8 +1026,15 @@ int sdspi_get_status_reg(sd_device *sd, int * status)
 }
 
 
-/*** Beginheader sdspi_init_card ***/
-int sdspi_init_card(sd_device *sd);
+/*** BeginHeader */
+#if SDFLASH_SDHC
+    #define sdspi_init_card(sd) sdspi_init_card_sdhc(sd)
+#else
+    #define sdspi_init_card(sd) sdspi_init_card_sdsc(sd)
+#endif
+/*** EndHeader */
+/*** Beginheader sdspi_init_card_sdsc ***/
+int sdspi_init_card_sdsc(sd_device *sd);
 /*** endheader ***/
 
 /* START FUNCTION DESCRIPTION ********************************************
@@ -1043,22 +1055,21 @@ RETURN VALUE:     0               Success
                -ESHAREDBUSY       Shared SPI port busy
 
 END DESCRIPTION **********************************************************/
-
 _sdflash_nodebug
-int sdspi_init_card(sd_device *sd)
+int sdspi_init_card_sdsc(sd_device *sd)
 {
     int result, j;
     SD_CMD_REPLY cmd_reply;
 
 #ifdef SDFLASH_VERBOSE
-    printf("sdspi_init_card: attempting init");
+    printf("%s: attempting init", __FUNCTION__);
 #endif
-
-    result = 0;
-    cmd_reply.cmd = CMD1;
+    
     sdspi_init_reply(&cmd_reply, CMD1);
     cmd_reply.reply_size = CMD_R1_BUFFER_SIZE;
 
+    result = 0;
+    
     for (j = 0; j < CMD1_RETRIES; j++)
     {
 #ifdef SDFLASH_VERBOSE
@@ -1093,6 +1104,103 @@ int sdspi_init_card(sd_device *sd)
 #ifdef SDFLASH_VERBOSE
         printf("\n");
 #endif
+
+    return 0;
+}
+
+/*** BeginHeader sdspi_init_card_sdhc */
+int sdspi_init_card_sdhc(sd_device *sd);
+/*** EndHeader */
+#define CMD8_VOLTAGE_SUPPLIED 0x0100  // 2.7V to 3.6V
+#define CMD8_CHECK_PATTERN    0xA5
+
+#define ACMD41_HCS_BIT        0x40000000
+
+_sdflash_nodebug
+int sdspi_init_card_sdhc(sd_device *sd)
+{
+    int result, j;
+    SD_CMD_REPLY cmd_reply;
+
+#ifdef SDFLASH_VERBOSE
+    printf("%s: attempting init", __FUNCTION__);
+#endif
+
+    result = 0;
+    
+    sdspi_init_reply(&cmd_reply, CMD8);
+    cmd_reply.argument = CMD8_VOLTAGE_SUPPLIED | CMD8_CHECK_PATTERN;
+    cmd_reply.reply_size = REPLY_BYTE_COUNT;
+    if (result = sdspi_process_command(sd, &cmd_reply, 1))
+    {
+#ifdef SDFLASH_VERBOSE
+        printf("sdspi_init_card: CMD8 failed, error %d\n",
+                    result);
+#endif
+        return result;
+    }
+    else
+    {
+        if (cmd_reply.reply == 5) {
+            return sdspi_init_card_sdsc(sd);
+        }
+        if (cmd_reply.reply != 0x01)
+        {
+#ifdef SDFLASH_VERBOSE
+            printf("sdspi_init_card: command response error %d\n",
+                        cmd_reply.reply);
+#endif
+            return -EIO;
+        }
+    }
+    
+    // If card does not support this command, revert to old SDSC init.
+    if (cmd_reply.rx_buffer[4] != CMD8_CHECK_PATTERN) {
+        return sdspi_init_card_sdsc(sd);
+    }
+    
+    for (j = 0; j < 1000; j++)
+    {
+        if (result = sdspi_sendingAP(sd))
+        {
+#ifdef SDFLASH_VERBOSE
+            printf("sdspi_init_card: sdspi_sendingAP failed, error %d\n",
+                        result);
+#endif
+            return result;
+        }
+        
+        sdspi_init_reply(&cmd_reply, ACMD41);
+        cmd_reply.argument = ACMD41_HCS_BIT;
+        cmd_reply.reply_size = REPLY_BYTE_COUNT;
+#ifdef SDFLASH_VERBOSE
+        printf("*");
+#endif
+        if (result = sdspi_process_command(sd, &cmd_reply, 1))
+        {
+#ifdef SDFLASH_VERBOSE
+            printf("sdspi_init_card: ACMD41 failed, error %d\n",
+                        result);
+#endif
+            return result;
+        }
+        else
+        {
+            if (cmd_reply.reply)
+            {
+                if (cmd_reply.reply != R1_IDLE_STATE)
+                {
+#ifdef SDFLASH_VERBOSE
+                    printf("sdspi_init_card: command response error %d\n",
+                                cmd_reply.reply);
+#endif
+                    return -EIO;
+                }
+            }
+            else
+               break;
+        }
+    }
 
     return result;
 }
@@ -1196,6 +1304,10 @@ int sdspi_process_command(sd_device *sd, SD_CMD_REPLY * cmd_reply, int mode)
         return -ESHAREDBUSY;   // And return error that SPI port is busy
     }
 
+#ifdef SDFLASH_VERBOSE
+    printf("CMD 0x%02X 0x%08lX\n", cmd_reply->cmd, cmd_reply->argument);
+#endif
+
     rc = _sdspi_ReadWrite(sd, cmd_reply->tx_buffer, cmd_reply->rx_buffer,
                         cmd_reply->reply_size, cmd_reply->data_size, mode);
 
@@ -1225,21 +1337,22 @@ int sdspi_process_command(sd_device *sd, SD_CMD_REPLY * cmd_reply, int mode)
             }
             else
             {
+                cmd_reply->reply = cmd_reply->rx_buffer[i];
                 if (cmd_reply->cmd == CMD13)
                 {
                     // SD card returns 2 bytes when command 13 is issued
-                    cmd_reply->reply = cmd_reply->rx_buffer[i];
-                    cmd_reply->reply <<= 8;
-                    cmd_reply->reply |= cmd_reply->rx_buffer[i+1];
-                }
-                else
-                {
-                    cmd_reply->reply = cmd_reply->rx_buffer[i];
+                    cmd_reply->reply = (cmd_reply->reply << 8)
+                                       | cmd_reply->rx_buffer[i+1];
                 }
                 break;
             }
         }
     }
+
+#ifdef SDFLASH_VERBOSE
+    printf("Reply (%u bytes):\n", cmd_reply->reply_size);
+    mem_dump(cmd_reply->rx_buffer, cmd_reply->reply_size);
+#endif
 
     if (i >= (int)cmd_reply->reply_size)
     {
@@ -1415,11 +1528,11 @@ int sdspi_get_csd(sd_device *sd)
         char current_byte = csd_buffer[k];
         switch (k)
         {
-            case CSD_BLOCK_OFFSET_0:
+            case CSD_BLOCK_OFFSET_0:    // [127:120]
                 sd_csd->CSD_STR = current_byte >> 6;
                 break;
 
-            case CSD_BLOCK_OFFSET_1:
+            case CSD_BLOCK_OFFSET_1:    // [119:112]
                 sd_csd->TAAC = current_byte;
                 x = (sd_csd->TAAC & 0x7C) >> 3;
                 if ((x < 3) || (x == 15)) {
@@ -1436,7 +1549,7 @@ int sdspi_get_csd(sd_device *sd)
                 temp = ((temp * x) / 1000) + 1;
                 break;
 
-            case CSD_BLOCK_OFFSET_2:
+            case CSD_BLOCK_OFFSET_2:    // [111:104]
                 sd_csd->NSAC = current_byte;
                 // Add NSAC timeout to TAAC timeout
                 temp += (unsigned long)(sd_csd->NSAC) * 100;
@@ -1444,20 +1557,20 @@ int sdspi_get_csd(sd_device *sd)
                 sd->data_timeout = (temp >= 0x10000 ? 0xFFFF : (unsigned)temp);
                 break;
 
-            case CSD_BLOCK_OFFSET_3:
+            case CSD_BLOCK_OFFSET_3:    // [103:96]
                 sd_csd->TRANSPEED = current_byte;
                 break;
 
-            case CSD_BLOCK_OFFSET_4:
+            case CSD_BLOCK_OFFSET_4:    // [95:88]
                 sd_csd->CCC = current_byte << 4;
                 break;
 
-            case CSD_BLOCK_OFFSET_5:
+            case CSD_BLOCK_OFFSET_5:    // [87:80]
                 sd_csd->CCC |= current_byte >> 4;
                 sd_csd->R_BL_LEN = current_byte & 0x0F;
                 break;
 
-            case CSD_BLOCK_OFFSET_6:
+            case CSD_BLOCK_OFFSET_6:    // [79:72]
                 sd_csd->R_BL_PART = (current_byte >> 7) & 0x01;
                 sd_csd->WR_BL_MIS = (current_byte >> 6) & 0x01;
                 sd_csd->RD_BL_MIS = (current_byte >> 5) & 0x01;
@@ -1465,45 +1578,66 @@ int sdspi_get_csd(sd_device *sd)
                 sd_csd->CSIZE = (current_byte & 0x3) << 8;
                 break;
 
-            case CSD_BLOCK_OFFSET_7:
+            case CSD_BLOCK_OFFSET_7:    // [71:64]
                 sd_csd->CSIZE |= current_byte;
                 sd_csd->CSIZE <<= 2;
                 break;
 
-            case CSD_BLOCK_OFFSET_8:
-                sd_csd->CSIZE |= current_byte >> 6;
-                sd_csd->RC_MIN = (current_byte >> 3) & 0x07;
-                sd_csd->RC_MAX = current_byte & 0x07;
+            case CSD_BLOCK_OFFSET_8:    // [63:56]
+#if SDFLASH_SDHC
+                if (sd_csd->CSD_STR == SD_CSD_STR_V2) {
+                    sd_csd->CSIZE = current_byte << 8;
+                } else
+#endif
+                {
+                    sd_csd->CSIZE |= current_byte >> 6;
+                    sd_csd->RC_MIN = (current_byte >> 3) & 0x07;
+                    sd_csd->RC_MAX = current_byte & 0x07;
+                }
                 break;
 
-            case CSD_BLOCK_OFFSET_9:
-                sd_csd->WC_MIN = (current_byte >> 5) & 0x07;
-                sd_csd->WC_MAX = (current_byte >> 2) & 0x07;
-                sd_csd->C_SIZE_M = (current_byte & 0x3) << 1;
+            case CSD_BLOCK_OFFSET_9:    // [55:48]
+#if SDFLASH_SDHC
+                if (sd_csd->CSD_STR == SD_CSD_STR_V2) {
+                    sd_csd->CSIZE |= current_byte;
+                } else
+#endif
+                {
+                    sd_csd->WC_MIN = (current_byte >> 5) & 0x07;
+                    sd_csd->WC_MAX = (current_byte >> 2) & 0x07;
+                    sd_csd->C_SIZE_M = (current_byte & 0x3) << 1;
+                }
                 break;
 
-            case CSD_BLOCK_OFFSET_10:
-                sd_csd->C_SIZE_M |= (current_byte >> 7) & 0x1;
+            case CSD_BLOCK_OFFSET_10:   // [47:40]
+#if SDFLASH_SDHC
+                if (sd_csd->CSD_STR == SD_CSD_STR_V2) {
+                    sd->sectors = (sd_csd->CSIZE + 1L) << 10;
+                } else
+#endif
+                {
+                    sd_csd->C_SIZE_M |= (current_byte >> 7) & 0x1;
+                    // Compute the number of 512 byte sectors on the SD card
+                    // shift C_SIZE_M + 2 and R_BL_LEN - 9
+                    sd->sectors = (sd_csd->CSIZE + 1L) <<
+                                  (sd_csd->C_SIZE_M + sd_csd->R_BL_LEN - 7);
+                }
                 sd_csd->ERASE_BLK_EN = (current_byte >> 6) & 0x1;
                 sd_csd->SECTOR_SIZE = (current_byte & 0x3F) << 1;
-                // Compute the number of 512 byte sectors on the SD card
-                // shift C_SIZE_M + 2 and R_BL_LEN - 9
-                sd->sectors = (sd_csd->CSIZE + 1L) <<
-                              (sd_csd->C_SIZE_M + sd_csd->R_BL_LEN - 7);
                 break;
 
-            case CSD_BLOCK_OFFSET_11:
+            case CSD_BLOCK_OFFSET_11:   // [39:32]
                 sd_csd->SECTOR_SIZE += ((current_byte & 0x80) >> 7) + 1;
                 sd_csd->WP_G_S = (current_byte & 0x7F) + 1;
                 break;
 
-            case CSD_BLOCK_OFFSET_12:
+            case CSD_BLOCK_OFFSET_12:   // [31:24]
                 sd_csd->WP_G_EN = (current_byte >> 7) & 0x01;
                 sd_csd->R2W_FACT = (current_byte >> 2) & 0x07;
                 sd_csd->WR_BL_LEN = (current_byte & 0x3) << 2;
                 break;
 
-            case CSD_BLOCK_OFFSET_13:
+            case CSD_BLOCK_OFFSET_13:   // [23:16]
   		          sd_csd->WR_BL_LEN |= (current_byte >> 6) & 0x03;
 		          sd_csd->WR_BL_PAR = (current_byte >> 5) & 0x01;
                 sd->pagebitshift = (int)(sd_csd->WR_BL_LEN);
@@ -1515,7 +1649,7 @@ int sdspi_get_csd(sd_device *sd)
                 }
                 break;
 
-            case CSD_BLOCK_OFFSET_14:
+            case CSD_BLOCK_OFFSET_14:   // [15:8]
 		          sd_csd->F_FORMATG = (current_byte >> 7) & 0x01;
 		          sd_csd->COPY = (current_byte >> 6) & 0x01;
 		          sd_csd->P_WR_PROT = (current_byte >> 5) & 0x01;
@@ -1523,7 +1657,7 @@ int sdspi_get_csd(sd_device *sd)
 		          sd_csd->F_FORMAT = (current_byte >> 2) & 0x03;
                 break;
 
-            case CSD_BLOCK_OFFSET_15:
+            case CSD_BLOCK_OFFSET_15:   // [7:0]
                 sd_csd->CRC7 = current_byte >> 1;
                 break;
         }
@@ -1746,7 +1880,14 @@ int sdspi_xread_sector(sd_device *sd, unsigned long sector_number,
     SD_DISABLECS(sd->SDintf);
 
     sdspi_init_reply(&cmd_reply, CMD17);
-    cmd_reply.argument = sector_number * BLOCK_SIZE;
+#if SDFLASH_SDHC
+    if (sd->CSD.CSD_STR == SD_CSD_STR_V2) {
+        cmd_reply.argument = sector_number;
+    } else
+#endif
+    {
+        cmd_reply.argument = sector_number * BLOCK_SIZE;
+    }
     cmd_reply.reply_size = CMD_R1_BUFFER_SIZE;
     cmd_reply.data_size = DATA_BLOCK_SIZE;
 
@@ -1894,7 +2035,14 @@ int sdspi_xwrite_sector(sd_device *sd, unsigned long  sector_number,
     read_data_ptr = NULL;
 
     sdspi_init_reply(&cmd_reply, CMD24);
-    cmd_reply.argument = sector_number * BLOCK_SIZE;
+#if SDFLASH_SDHC
+    if (sd->CSD.CSD_STR == SD_CSD_STR_V2) {
+        cmd_reply.argument = sector_number;
+    } else
+#endif
+    {
+        cmd_reply.argument = sector_number * BLOCK_SIZE;
+    }
     cmd_reply.reply_size = CMD_R1_BUFFER_SIZE;
 
     if (result = sdspi_process_command(sd, &cmd_reply,0))
