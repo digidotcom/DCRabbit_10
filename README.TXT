@@ -900,3 +900,12 @@
         typedef const int const_int;
         void foo(const_int bar, const_int baz) {}
 
+29. On platforms with an ASIX Ethernet controller (e.g., RCM42xx, RCM43xx),
+    the network stack can get stuck in an infinite loop after executing the
+    sequence ifdown()/pd_powerdown()/pd_powerup()/ifup().  Issue present
+    since at least Dynamic C 10.60, and might only happen when calling
+    tcp_tick() while interface is powered down, or calling ifup() too soon
+    after pd_powerup().  If this affects you, contact Digi and reference
+    issue DC-300.
+
+
