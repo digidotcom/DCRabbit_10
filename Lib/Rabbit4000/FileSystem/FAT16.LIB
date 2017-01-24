@@ -160,6 +160,17 @@ END DESCRIPTION **********************************************************/
                                  //  sectors) for sector based FTL's
                                  //  Must be a power of 2
 
+// Min/max cluster counts and FAT16 sector count per Microsoft:
+//   https://technet.microsoft.com/en-us/library/cc776720(v=ws.10).aspx
+#define FAT16_MAX_CLUSTERS 65524
+#define FAT32_MIN_CLUSTERS 65527
+
+// Maximum partition based on 32KB cluster size, 512 byte sector size.
+// Calculation underestimates actual maximum, since it doesn't take into
+// account space for reserved sectors, FATs and root directory.  Changes
+// here require changes to sectors/cluster calculation in fat_FormatPartition().
+#define FAT16_MAX_PARTSECSIZE (FAT16_MAX_CLUSTERS * 32UL * 1024 / 512)
+
 /***********************************************************************/
 /* END OF CONFIGURATION - END OF CONFIGURATION - END OF CONFIGURATION  */
 /***********************************************************************/
@@ -643,6 +654,89 @@ __debug void _fat_DumpBuf( __far char * sbuf )
    return;
 }
 
+/*** BeginHeader _fat_dump_mbr_part */
+void _fat_dump_mbr_part(const mbr_part *p);
+/*** EndHeader */
+#define _mpd_int(x)  printf(#x ": %u\n", p-> ## x)
+#define _mpd_long(x) printf(#x ": %lu\n", p-> ## x)
+void _fat_dump_mbr_part(const mbr_part *p)
+{
+	printf("-mbr_part %p\n", p);
+	
+	_mpd_int(bootflag);
+	_mpd_int(starthead);
+	_mpd_int(startseccyl);
+	_mpd_int(parttype);
+	_mpd_int(endhead);
+	_mpd_int(endseccyl);
+	
+	_mpd_long(startsector);
+	_mpd_long(partsecsize);
+
+	_mpd_int(status);
+}
+#undef _mpd_int
+#undef _mpd_long
+
+/*** BeginHeader _fat_dump_mbr_dev */
+void _fat_dump_mbr_dev(const mbr_dev *d);
+/*** EndHeader */
+#define _mdd_int(x)  printf(#x ": %u\n", d-> ## x)
+#define _mdd_long(x) printf(#x ": %lu\n", d-> ## x)
+void _fat_dump_mbr_dev(const mbr_dev *d)
+{
+	printf("-mbr_dev %p\n", d);
+
+	_mdd_long(seccount);
+	_mdd_int(heads);
+	_mdd_int(cylinder);
+	_mdd_int(sec_track);
+	_mdd_int(byte_sec);
+	_mdd_int(byte_page);
+	_mdd_int(sec_block);
+	_mdd_int(dev_num);
+	_mdd_int(ftc_dev);
+	_mdd_int(ftl_dev_idx);
+}
+#undef _mdd_int
+#undef _mdd_long
+
+/*** BeginHeader _fat_dump_fat_part */
+void _fat_dump_fat_part(const fat_part *p);
+/*** EndHeader */
+#define _fpd_int(x)  printf(#x ": %u\n", p-> ## x)
+#define _fpd_long(x) printf(#x ": %lu\n", p-> ## x)
+void _fat_dump_fat_part(const fat_part *p)
+{
+	printf("-fat_part %p\n", p);
+	
+	_fpd_int(sec_clust);
+	_fpd_int(fat_cnt);
+	_fpd_int(fat_len);
+	_fpd_int(root_cnt);
+	_fpd_int(res_sec);
+	_fpd_int(byte_sec);
+	
+	_fpd_long(sec_fat);
+	_fpd_long(serialnumber);
+	_fpd_long(totcluster);
+	_fpd_long(badcluster);
+	_fpd_long(freecluster);
+	_fpd_long(nextcluster);
+	_fpd_long(fatstart);
+	_fpd_long(rootstart);
+	_fpd_long(datastart);
+	_fpd_long(clustlen);
+
+	_fpd_int(type);
+	_fpd_int(ftc_prt);
+	_fpd_int(pnum);
+	
+	_fat_dump_mbr_part(p->mpart);
+	_fat_dump_mbr_dev(p->dev);
+}
+#undef _fpd_int
+#undef _fpd_long
 
 /*** BeginHeader _fat_Clust2Dir */
 int _fat_Clust2Dir( unsigned char *, unsigned long );
@@ -2551,6 +2645,9 @@ _fat_debug int _fat_PartCalc( fat_part *part )
 	auto unsigned long c;
 	auto int rc;
 
+   #ifdef FAT_VERBOSE
+      _fat_dump_fat_part(part);
+   #endif
    if (!part->byte_sec || !part->sec_clust || !part->fat_cnt || !part->sec_fat
          || !part->root_cnt || !part->dev->byte_page)
    {
@@ -2574,14 +2671,17 @@ _fat_debug int _fat_PartCalc( fat_part *part )
 	c = ((part->mpart->startsector + part->mpart->partsecsize - part->datastart)
    		 		/ part->sec_clust ) + 2;
 	rc = 0;
-   if( c < 65527 ) {
+   if (c <= FAT16_MAX_CLUSTERS) {
 		part->type |= FAT_TYPE_16;		/* Volume is FAT16 */
 		part->fat_len = (unsigned)c;
 	}
-	else {
+	else if (c >= FAT32_MIN_CLUSTERS) {
 		part->type |= FAT_TYPE_32;		/* Volume is FAT32 */
 		part->fat_len = (unsigned)c << 1;
 		rc = -ENOSYS;						/* FAT32 is not supported at this time */
+	}
+	else {
+		rc = -ENOSYS;   // too many clusters for FAT16, but not enough for FAT32
 	}
 
 	return rc;
@@ -3859,6 +3959,9 @@ _fat_debug int fat_FormatDevice( mbr_dev *dev, int mode )
 #endif
       {
          dev->part[0].partsecsize = dev->seccount - dev->part[0].startsector;
+      }
+      if (dev->part[0].partsecsize > FAT16_MAX_PARTSECSIZE) {
+      	dev->part[0].partsecsize = FAT16_MAX_PARTSECSIZE;
       }
       dev->part[0].parttype = 6;    // Always force to FAT16
 
@@ -5240,31 +5343,18 @@ _fat_debug int fat_FormatPartition( mbr_dev *dev, fat_part *part, int pnum,
          //Set sectors per cluster & FAT type based on type & size of partition
          part->type = FAT_TYPE_16;
          part->byte_sec = dev->byte_sec;
-	      if (dev->driver->type[dev->dev_num] & MBRTYPE_FLASH) {
-            // If sector addressable device, use smallest cluster size possible
-	         if (dev->driver->type[dev->dev_num] & MBRTYPE_SECTOR_FTL) {
-	            s = (word)((dev->seccount + 0x0FFFFL) / 0x10000L);
-					for (b = FAT_MIN_CLUST_SIZE; s > b; b <<= 1);
-	            part->sec_clust = b;
-	         }
-	         else {
-	            part->sec_clust = dev->byte_page / dev->byte_sec;
-	         }
-            while (part->mpart->partsecsize > (((long)part->sec_clust) << 16))
-            {
-               part->sec_clust <<= 1;
-            }
+         b = dev->byte_page / dev->byte_sec;
+         if (b < FAT_MIN_CLUST_SIZE) {
+         	b = FAT_MIN_CLUST_SIZE;
          }
-      	else {
-				// calculate the megabyte size of the partition
-		  		x = part->mpart->partsecsize;
-            if ( x < SEC_512MB ) {
-              	part->sec_clust = (x < SEC_128MB ? 4 : 8);
-            }
-				else {
-               x >>= 16;
-            }
-			}
+         // Calculation still not perfect since it doesn't take into account
+         // space reserved for FAT and root directory.
+         s = (word)( (part->mpart->partsecsize + (FAT16_MAX_CLUSTERS - 1)) 
+                     / FAT16_MAX_CLUSTERS);
+         while (s > b) {
+         	b <<= 1;
+         }
+         part->sec_clust = b;
 
          for (i = 0; i < num_fat_drivers &&
                 dev->driver != &(_fat_driver_table[i]); i++);

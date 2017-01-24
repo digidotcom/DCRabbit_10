@@ -74,7 +74,7 @@
  *
  */
 
-#define REDIRECTTO 		"/index.shtml"
+#define REDIRECTTO 		"/"
 
 /*
  *  Notice that we have ximported in the source code for
@@ -281,7 +281,6 @@ int led4toggle(HttpState* state)
 
 SSPEC_RESOURCETABLE_START
 	SSPEC_RESOURCE_XMEMFILE("/", index_html),
-	SSPEC_RESOURCE_XMEMFILE("/index.shtml", index_html),
 	SSPEC_RESOURCE_XMEMFILE("/showsrc.shtml", showsrc_shtml),
 	SSPEC_RESOURCE_XMEMFILE("/rabbit1.gif", rabbit1_gif),
 	SSPEC_RESOURCE_XMEMFILE("/ledon.gif", ledon_gif),

@@ -312,28 +312,19 @@
  *
  */
 
-/* the default mime type for '/' must be first */
-const HttpType http_types[] =
-{
-   { ".html", "text/html", NULL},
-   { ".gif", "image/gif", NULL}
-};
+/* the default mime type for files without an extension must be first */
+SSPEC_MIMETABLE_START
+	SSPEC_MIME(".html", "text/html"),
+	SSPEC_MIME(".gif", "image/gif")
+SSPEC_MIMETABLE_END
 
 /*
- *  http_flashspec assocates the file image we brought in with ximport
- *  and associates it with its name on the webserver.  In this example
- *  the file "samples/http/pages/static.html" will be sent to the
- *  client when they request either "http://yoururl.com/" or
- *  "http://yoururl.com/index.html"
- *
+ *  The resource table associates ximported files with URLs on the webserver.
  */
-
-const HttpSpec http_flashspec[] =
-{
-   { HTTPSPEC_FILE,  "/",              index_html,    NULL, 0, NULL, NULL},
-   { HTTPSPEC_FILE,  "/index.html",    index_html,    NULL, 0, NULL, NULL},
-   { HTTPSPEC_FILE,  "/rabbit1.gif",   rabbit1_gif,   NULL, 0, NULL, NULL},
-};
+SSPEC_RESOURCETABLE_START
+	SSPEC_RESOURCE_XMEMFILE("/", index_html),
+	SSPEC_RESOURCE_XMEMFILE("/rabbit1.gif", rabbit1_gif)
+SSPEC_RESOURCETABLE_END
 
 
 void main()

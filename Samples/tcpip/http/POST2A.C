@@ -87,7 +87,7 @@
  *
  */
 
-#define REDIRECTTO      "/index.shtml"
+#define REDIRECTTO      "/"
 #define REGISTERFORM    "/register.html"
 
 #memmap xmem
@@ -414,7 +414,6 @@ void main()
 
 	/* normal SSI button stuff */
 	sspec_addxmemfile("/", index_html, SERVER_HTTP);
-	sspec_addxmemfile("index.shtml", index_html, SERVER_HTTP);
 	sspec_addxmemfile("showsrc.shtml", showsrc_shtml, SERVER_HTTP);
 	sspec_addxmemfile("rabbit1.gif", rabbit1_gif, SERVER_HTTP);
 	sspec_addxmemfile("ledon.gif", ledon_gif, SERVER_HTTP);

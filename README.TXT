@@ -20,6 +20,12 @@
 - Improves boot time on 6000-based hardware (now < 1 second) when
   _FAST_BIOS_LOAD macro defined in Project Options [DC-269].
 
+- Replaces the outdated SSL Certificate Creation GUI (in
+  Utilities/SSL_Utilities) with command-line OpenSSL version 1.0.2j.
+  Added instructions on using OpenSSL to create certificates, which
+  should allow for more control over key size and choice of hashing
+  algorithm.
+
 - Includes library and utility programs to write a System ID Block
   to a device's flash (Utilities/Write_ID).
 
@@ -893,4 +899,13 @@
 
         typedef const int const_int;
         void foo(const_int bar, const_int baz) {}
+
+29. On platforms with an ASIX Ethernet controller (e.g., RCM42xx, RCM43xx),
+    the network stack can get stuck in an infinite loop after executing the
+    sequence ifdown()/pd_powerdown()/pd_powerup()/ifup().  Issue present
+    since at least Dynamic C 10.60, and might only happen when calling
+    tcp_tick() while interface is powered down, or calling ifup() too soon
+    after pd_powerup().  If this affects you, contact Digi and reference
+    issue DC-300.
+
 

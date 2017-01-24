@@ -53,9 +53,15 @@
  */
 #define TCPCONFIG 1
 
+
 /*
- * Web server configuration
+ *  The TIMEZONE compiler setting gives the number of hours from
+ *  local time to Greenwich Mean Time (GMT).  For pacific standard
+ *  time this is -8.  Note:  for the time to be correct it must be set
+ *  with tm_rd which is documented in the Dynamic C user manual.
  */
+
+#define TIMEZONE        -8
 
 /*
  * only one socket and server are needed for a reserved port,
@@ -92,6 +98,12 @@
 #ximport "cert\mycerts.pem" server_pub_cert
 #ximport "cert\mycertkey.pem" server_priv_key
 
+// If defined, remove code which supports legacy .dcc format certificates.
+#define SSL_DISABLE_LEGACY_DCC
+
+// If defined, remove code which supports storing certificates in the UserBlock.
+#define SSL_DISABLE_USERBLOCK
+
 /********************************
  * End of configuration section *
  ********************************/
@@ -108,24 +120,23 @@
 #zimport "pages/alice.html"				alice_html
 #zimport "pages/alice-rabbit.jpg"		alice_jpg
 
-/* the default for / must be first */
-const HttpType http_types[] =
-{
-   { ".shtml", "text/html", shtml_handler}, // ssi
-   { ".html", "text/html", NULL},           // html
-   { ".jpg", "image/jpeg", NULL}            // jpeg
-};
+/* the default mime type for files without an extension must be first */
+SSPEC_MIMETABLE_START
+   SSPEC_MIME_FUNC(".shtml", "text/html", shtml_handler),
+	SSPEC_MIME(".html", "text/html"),
+	SSPEC_MIME(".jpg", "image/jpeg")
+SSPEC_MIMETABLE_END
 
 /*
- * Compressed files, when included in the http_flashspec[] structure, will
+ *  The resource table associates zimported files with URLs on the webserver.
+ *
+ * Compressed files, when included in the resource table, will
  * be automatically uncompressed when they are sent to the client.
  */
-const HttpSpec http_flashspec[] =
-{
-   { HTTPSPEC_FILE,  "/",              zimport_shtml, NULL, 0, NULL, NULL},
-   { HTTPSPEC_FILE,  "/index.shtml",   zimport_shtml, NULL, 0, NULL, NULL},
-   { HTTPSPEC_FILE,	"/alice.html",		alice_html,		NULL,	0,	NULL,	NULL}
-};
+SSPEC_RESOURCETABLE_START
+	SSPEC_RESOURCE_ZMEMFILE("/", zimport_shtml),
+	SSPEC_RESOURCE_ZMEMFILE("/alice.html", alice_html)
+SSPEC_RESOURCETABLE_END
 
 /*
  * The following variables will be used to hold the sizes of the compressed
@@ -183,10 +194,10 @@ void main(void)
 	 *  delays when retrieving pages.
 	 */
 
-   tcp_reserveport(80);
+   tcp_reserveport(HTTP_PORT);
 
    // Also reserve the HTTPS port
-   tcp_reserveport(443);
+   tcp_reserveport(HTTPS_PORT);
 
    while (1) {
    	http_handler();

@@ -194,7 +194,7 @@ int submit(HttpState* state)
 }
 
 SSPEC_RESOURCETABLE_START
-	SSPEC_RESOURCE_XMEMFILE("/index.html", index_html),
+	SSPEC_RESOURCE_XMEMFILE("/", index_html),
 	SSPEC_RESOURCE_FUNCTION("/submit.cgi", submit)
 SSPEC_RESOURCETABLE_END
 

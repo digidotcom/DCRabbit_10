@@ -137,14 +137,12 @@ windowFrame wholewindow;
 #ximport "samples/icom/pages/main.html"		index_html
 #ximport "samples/icom/pages/enter.html"		enter_html
 
-/* the default for / must be first */
-const HttpType http_types[] =
-{
-   { ".shtml", "text/html", shtml_handler}, // ssi
-   { ".html", "text/html", NULL},           // html
-   { ".cgi", "", NULL},                     // cgi
-   { ".gif", "image/gif", NULL}
-};
+/* the default mime type for files without an extension must be first */
+SSPEC_MIMETABLE_START
+   SSPEC_MIME_FUNC(".shtml", "text/html", shtml_handler),
+	SSPEC_MIME(".html", "text/html"),
+	SSPEC_MIME(".gif", "image/gif")
+SSPEC_MIMETABLE_END
 
 /*
  * The following structure is used to parse data returned from a FORM
@@ -905,15 +903,17 @@ int ViewLog(HttpState *state)
 	return 0;
 }
 
-const HttpSpec http_flashspec[] =
-{
-   { HTTPSPEC_FILE, 		"/",				index_html,    NULL, 	0, NULL, NULL},
-   { HTTPSPEC_FILE, 		"/index.html",	index_html,    NULL, 	0, NULL, NULL},
-	{ HTTPSPEC_FILE,		"/enter.html", enter_html,		NULL, 	0, NULL, NULL},
-   { HTTPSPEC_FUNCTION,	"/enteremail.cgi",	0,  		Submit,	0, NULL, NULL},
-	{ HTTPSPEC_FUNCTION, "/read.html",	0,					Read,		0,	NULL,	NULL},
-	{ HTTPSPEC_FUNCTION, "/display.html",	0,				ViewLog,	0,	NULL,	NULL}
-};
+/*
+ *  The resource table associates ximported files with URLs on the webserver.
+ */
+SSPEC_RESOURCETABLE_START
+	SSPEC_RESOURCE_XMEMFILE("/", index_html),
+	SSPEC_RESOURCE_XMEMFILE("/enter.html", enter_html),
+	
+	SSPEC_RESOURCE_FUNCTION("/enteremail.cgi", Submit),
+	SSPEC_RESOURCE_FUNCTION("/read.html", Read),
+	SSPEC_RESOURCE_FUNCTION("/display.html", ViewLog)
+SSPEC_RESOURCETABLE_END
 
 /*
  * These constants define keypad actions

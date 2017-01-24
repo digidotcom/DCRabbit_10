@@ -169,7 +169,7 @@ char *myurl() {
    long ipval;
 
    ifconfig(IF_DEFAULT, IFG_IPADDR, &ipval, IFS_END);
-   sprintf(URL, "http://%s/index.shtml", inet_ntoa(tmpstr, ipval));
+   sprintf(URL, "http://%s/", inet_ntoa(tmpstr, ipval));
    return URL;
 }
 int led1toggle(HttpState* state)
@@ -197,7 +197,6 @@ int led2toggle(HttpState* state)
 
 SSPEC_RESOURCETABLE_START
    SSPEC_RESOURCE_XMEMFILE("/", index_html),
-   SSPEC_RESOURCE_XMEMFILE("/index.shtml", index_html),
    SSPEC_RESOURCE_XMEMFILE("/showsrc.shtml", showsrc_shtml),
    SSPEC_RESOURCE_XMEMFILE("/rabbit1.gif", rabbit1_gif),
    SSPEC_RESOURCE_XMEMFILE("/ledon.gif", ledon_gif),

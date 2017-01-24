@@ -138,7 +138,7 @@ int upload_cgi(HttpState * s)
       case CGI_EOF:
       	printf("EOF (unused content=%ld) \"%ls\"\n", s->content_length, http_getData(s));
          // Since we use switchCGI, there is no need to return CGI_DONE.
-   		http_switchCGI(s, "index.html");
+   		http_switchCGI(s, "/");
          break;
       case CGI_ABORT:
       	printf("ABORT!\n");
@@ -153,7 +153,7 @@ int upload_cgi(HttpState * s)
 
 // The flash resource table is now initialized with these macros...
 SSPEC_RESOURCETABLE_START
-	SSPEC_RESOURCE_XMEMFILE("/index.html", index_html),
+	SSPEC_RESOURCE_XMEMFILE("/", index_html),
 	SSPEC_RESOURCE_CGI("upload.cgi", upload_cgi)
 SSPEC_RESOURCETABLE_END
 
