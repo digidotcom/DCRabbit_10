@@ -1,5 +1,5 @@
 *****************************************************************
-   README for Dynamic C Version 10.72B
+   README for Dynamic C Version 10.72C
 *****************************************************************
 
 - Adds support for SHA384/SHA512 hashes:
