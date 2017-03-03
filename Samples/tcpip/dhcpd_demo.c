@@ -192,7 +192,8 @@
 #endif
 
 // Uncomment the following macro definition to only respond to Rabbit devices
-// (MAC address starts with 00:90:c2).
+// (MAC address starts with 00:90:C2).  Not recommended for use in production
+// code because future Rabbit devices may use an OUI other than 00:90:C2.
 //#define DHCPD_RABBIT_ONLY
 
 // Uncomment the following macro definition to see DHCP server library activity,
