@@ -323,6 +323,83 @@ int sock_secure(tcp_Socket *s, ssl_Socket ** secure,
 					 SSL_Session_Resume_t __far * sess
                 )
 {
+	sock_secure_options_t options;
+	
+	options.rdbuf_size = rdbuf_size;
+	options.rdbuf = rdbuf;
+	options.wrbuf_size = wrbuf_size;
+	options.wrbuf = wrbuf;
+	options.be_client = be_client;
+	options.flags = flags;
+	options.my_cert_addr = my_cert_addr;
+	options.my_cert_import_type = my_cert_import_type;
+	options.my_priv_addr = my_priv_addr;
+	options.my_priv_import_type = my_priv_import_type;
+	options.my_cert = my_cert;
+	options.trusted = trusted;
+	options.sess = sess;
+	options.sni_hostname = NULL;
+	
+	return sock_secure_ext(s, secure, &options);
+}
+/*** BeginHeader sock_secure_ext */
+typedef struct sock_secure_options_t {
+	size_t rdbuf_size;
+	char __far * rdbuf;
+	size_t wrbuf_size;
+	char __far * wrbuf;
+	int be_client;
+	word flags;
+	long my_cert_addr;        // 0 if no cert
+	_SSL_Cert_Import_t my_cert_import_type;
+	long my_priv_addr;        // 0 if no private key
+	_SSL_Cert_Import_t my_priv_import_type;
+	_SSL_Cert_fp_t my_cert;
+	_SSL_Cert_fp_t trusted;
+	SSL_Session_Resume_t __far * sess;
+	const char __far *sni_hostname;   // NULL or hostname for SNI ClientHello Extension
+} sock_secure_options_t;
+int sock_secure_ext(tcp_Socket *s, ssl_Socket ** secure,
+                    sock_secure_options_t *opt);
+/*** EndHeader */
+_ssl_sock_debug
+int _sock_set_sni_extension(ssl_Socket *ssl_sock, const char __far *hostname)
+{
+	int host_len;
+	TLS_Extension SNI;
+	struct {
+		uint16_t list_length_be;
+		uint8_t type;
+		uint16_t length_be;
+		char hostname[128];
+	} sni_buffer;
+
+	if (ssl_sock == NULL || hostname == NULL) {
+		return -EINVAL;
+	}
+	
+	host_len = _f_strlen(hostname);
+	if (host_len > 128) {
+		return -E2BIG;
+	}
+	
+	sni_buffer.list_length_be = htobe16(host_len + 3);
+	sni_buffer.type = 0; // host_name
+	sni_buffer.length_be = htobe16(host_len);
+	_f_memcpy(sni_buffer.hostname, hostname, host_len);
+	
+   // add SNI extension to client hello
+   SNI.extension_type = TLS_EXT_SERVER_NAME;
+   SNI.extension_length = host_len + 5;
+   SNI.extension_data = &sni_buffer;
+   
+   tls_connection_client_hello_ext(NULL, ssl_sock, &SNI, 1);   
+}
+
+_ssl_sock_debug
+int sock_secure_ext(tcp_Socket *s, ssl_Socket ** secure,
+                    sock_secure_options_t *opt)
+{
 	auto ssl_Socket * ssl;
 	auto ssl_Socket __far * _f_ssl;
 	auto int rdbuf_allocd;
@@ -331,23 +408,24 @@ int sock_secure(tcp_Socket *s, ssl_Socket ** secure,
 
 #ifdef SSL_SOCK_VERBOSE
 	printf("sock_secure: as %s\n",
-	   be_client ? "client" : "server"
+	   opt->be_client ? "client" : "server"
 	   );
 #endif
-	rdbuf_allocd = 0;
-	wrbuf_allocd = 0;
+	rdbuf_allocd = wrbuf_allocd = 0;
 	*secure = NULL;
-	if (!rdbuf)
-		rdbuf = _sys_malloc(rdbuf_size), rdbuf_allocd = 1;
-	if (!rdbuf) {
-		rc = -ENOMEM;
-		goto _cleanup;
+	if (!opt->rdbuf) {
+	   if ((opt->rdbuf = _sys_malloc(opt->rdbuf_size)) == NULL) {
+	      rc = -ENOMEM;
+	      goto _cleanup;
+		}
+		rdbuf_allocd = SSL_SOCK_RDBUF_ALLOCD;
 	}
-	if (!wrbuf)
-		wrbuf = _sys_malloc(wrbuf_size), wrbuf_allocd = 1;
-	if (!wrbuf) {
-		rc = -ENOMEM;
-		goto _cleanup;
+	if (!opt->wrbuf) {
+	   if ((opt->wrbuf = _sys_malloc(opt->wrbuf_size)) == NULL) {
+	      rc = -ENOMEM;
+	      goto _cleanup;
+	   }
+	   wrbuf_allocd = SSL_SOCK_WRBUF_ALLOCD;
 	}
 
 	_f_ssl = tls_connection_init(&_ssl_globals);
@@ -371,50 +449,46 @@ int sock_secure(tcp_Socket *s, ssl_Socket ** secure,
 	// HS.  HS may still need some space, since HS messages can be sometimes received,
 	// however we assume there will be no more HS messages.  (Alerts are OK since they
 	// do not use the HS buffer).
-	ssl->rd.buf = rdbuf;
-	ssl->hs.buf = rdbuf;
-	ssl->hs.maxlen = rdbuf_size;
-	ssl->wr.buf = wrbuf;
-	ssl->wr.maxlen = wrbuf_size;
+	ssl->hs.buf = ssl->rd.buf = opt->rdbuf;
+	ssl->hs.maxlen = opt->rdbuf_size;
+	ssl->wr.buf = opt->wrbuf;
+	ssl->wr.maxlen = opt->wrbuf_size;
 
-	tls_set_flags(ssl, flags, -1);
-	tls_set_tport_flags(ssl,
-		(rdbuf_allocd ? SSL_SOCK_RDBUF_ALLOCD : 0) |
-		(wrbuf_allocd ? SSL_SOCK_WRBUF_ALLOCD : 0),
-		-1
-		);
+	tls_set_flags(ssl, opt->flags, -1);
+	tls_set_tport_flags(ssl, rdbuf_allocd | wrbuf_allocd, -1);
 #if _SSL_USE_RSA_
-	if (my_cert) {
+	if (opt->my_cert) {
 #ifdef SSL_SOCK_VERBOSE
-		printf("sock_secure:  setting parsed cert %08lX\n", my_cert);
+		printf("sock_secure:  setting parsed cert %08lX\n", opt->my_cert);
 #endif
 		rc = tls_set_cert(ssl, 0, 0,
-		                    0, 0, 0, my_cert);
+		                    0, 0, 0, opt->my_cert);
 		if (rc < 0)
 			goto _cleanup;
 	}
-	else if (my_cert_addr) {
+	else if (opt->my_cert_addr) {
 #ifdef SSL_SOCK_VERBOSE
-		printf("sock_secure:  setting unparsed cert %08lX\n", my_cert_addr);
+		printf("sock_secure:  setting unparsed cert %08lX\n", opt->my_cert_addr);
 #endif
-		rc = tls_set_cert(ssl, my_cert_addr, my_cert_import_type,
-		                    0, my_priv_addr, my_priv_import_type, NULL);
+		rc = tls_set_cert(ssl, opt->my_cert_addr, opt->my_cert_import_type,
+		                    0, opt->my_priv_addr, opt->my_priv_import_type, NULL);
 		if (rc < 0)
 			goto _cleanup;
 	}
-	if (trusted) {
+	if (opt->trusted) {
 #ifdef SSL_SOCK_VERBOSE
-		printf("sock_secure:  setting trusted %08lX\n", trusted);
+		printf("sock_secure:  setting trusted %08lX\n", opt->trusted);
 #endif
-		tls_set_trusted(ssl, trusted);
+		tls_set_trusted(ssl, opt->trusted);
 	}
 #endif
 	// Set our transport/TLS callback
 	ssl->tport = _sock_tls_handler;
 
-	if (be_client) {
-		if (sess)
-			tls_set_session(ssl, sess);
+	if (opt->be_client) {
+		if (opt->sess)
+			tls_set_session(ssl, opt->sess);
+		_sock_set_sni_extension(ssl, opt->sni_hostname);
 		rc = tls_sm(ssl, NULL, &s->wr, &ssl->hs, s->app_rd, s->app_wr);
 		if (rc < 0)
 			goto _cleanup;
@@ -434,9 +508,9 @@ _cleanup:
    	*secure = NULL;
    }
    if (wrbuf_allocd)
-      _sys_free(wrbuf);
+      _sys_free(opt->wrbuf);
    if (rdbuf_allocd)
-      _sys_free(rdbuf);
+      _sys_free(opt->rdbuf);
 #ifdef SSL_SOCK_VERBOSE
 	printf("sock_secure: ERROR, rc=%d\n", rc);
 #endif

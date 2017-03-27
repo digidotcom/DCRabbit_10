@@ -39,40 +39,39 @@
 
         Before running:
 
-        1) Make sure your basic network configuration is OK, including a
+        *  Make sure your basic network configuration is OK, including a
            DNS (name server) and a route to the outside Internet.  The
            default in this sample expects DHCP.  You can use a different
            TCPCONFIG macro and set alternative parameters if necessary.
            (If necessary, use a simpler sample to get this working).
-        2) Set up a Google Gmail account for test purposes.  Follow Google's
+        *  Set up a Google Gmail account for test purposes.  Follow Google's
            instructions for "enabling POP" on this account.  Enabling POP
            also enables mail origination using SMTP.  See http://gmail.com.
-        3) Modify the parameters to the smtp_setauth() function call (in this
+        *  You'll also need to turn on access for "Less secure apps".  As of
+           March 2017, you can do so at:
+             https://www.google.com/settings/u/1/security/lesssecureapps
+        *  Modify the parameters to the smtp_setauth() function call (in this
            sample) to the account name and password that you used in step (2).
            It is most convenient to put these in the
            Options->ProjectOptions->Defines panel e.g.
               SMTP_USER="my_account@gmail.com"
               SMTP_PASS="myPassw0rd"
-        4) Modify the FROM, SMTP_TO, SUBJECT and BODY macros to be a valid mail
+        *  Modify the FROM, SMTP_TO, SUBJECT and BODY macros to be a valid mail
            recipient and desired message.  Preferably, override SMTP_TO
            in the Defines box to be a valid recipient (that you can check!)
-        5) The SMTP_SERVER and SMTP_PORT macros are set appropriately for
+        *  The SMTP_SERVER and SMTP_PORT macros are set appropriately for
            Gmail as of the time this sample was constructed, but you may wish
            to check this if the sample seems to fail in spite of everything.
            You can override these macros in the Defines panel.
 
-        NOTE: you can also use a Hotmail/Outlook.com account once Microsoft
-        upgrades their servers from TLS 1.0 to TLS 1.2 (still not the case
-        in February 2016).
+        NOTE: you can also use a Hotmail/Outlook.com account by forcing the
+        Rabbit to use TLS 1.0 instead of TLS 1.2 (since Microsoft does not
+        support TLS 1.2 on their mail servers as of March 2017).
         
         In this case, #define SMTP_SERVER "smtp-mail.outlook.com", and use your
         Hotmail/Outlook.com credentials in SMTP_USER and SMTP_PASS.  There is no
         need to change any of your Hotmail account settings (still true as
-        of February 2016).
-        
-        Unfortunately, Microsoft in their wisdom use 4096 bit RSA keys in
-        some of their certificates, thus you need to #define MP_SIZE 514.
-        GMail uses 2048-bit keys, and requires a MP_SIZE of at least 258.
+        of March 2017).
         
         To date, Yahoo does not allow POP3/SMTP access with their free email
         accounts.
@@ -92,11 +91,12 @@
 #ximport "../sample_certs/ThawtePremiumServerCA.crt"  ca_pem2
 
 // This one for Hotmail/Outlook.com (POP3 and SMTP)
-#ximport "../sample_certs/GTECyberTrustGlobalRoot.crt"  ca_pem3
-#define MP_SIZE 258			// necessary for GMail's RSA keys
+#ximport "../sample_certs/GlobalSign Organization Validation CA - SHA256 - G2.cer" ca_pem3
 
-//#define MP_SIZE 514			// Recommended to support 4096-bit RSA keys used by
-									// some Microsoft certs.
+// Uncomment the following line if you're connecting to smtp-mail.outlook.com
+//#define USE_OUTLOOK_SETTINGS
+
+#define MP_SIZE 258			// necessary for GMail's RSA keys
 
 // Comment this out if the Real-Time Clock is set accurately.
 #define X509_NO_RTC_AVAILABLE
@@ -169,13 +169,21 @@
  *   and/or smtp_setport() at run-time.
  */
 #ifndef SMTP_SERVER
-	#define SMTP_SERVER "smtp.gmail.com"
-	//#define SMTP_SERVER "smtp-mail.outlook.com"
+	#ifndef USE_OUTLOOK_SETTINGS
+		#define SMTP_SERVER "smtp.gmail.com"
+	#else
+		#define SMTP_SERVER "smtp-mail.outlook.com"
+	#endif
 #endif
 #ifndef SMTP_PORT
 	// Port 587 used by secure SMTP service (both Gmail and Hotmail)
 	#define SMTP_PORT   587
 #endif
+
+#if defined(USE_OUTLOOK_SETTINGS) && !defined(SSL_ALLOW_TLS10_CLIENT_FALLBACK)
+	#define SSL_ALLOW_TLS10_CLIENT_FALLBACK
+#endif
+
 /*
  *   The SMTP_DOMAIN should be the name of your controller.  i.e.
  *   "somecontroller.somewhere.com"  Many SMTP servers ignore this
@@ -265,7 +273,12 @@ int smtp_server_policy(ssl_Socket far * state, int trusted,
 	printf("Server claims to be CN='%ls'\n", cert->subject.cn);
 	printf("We are looking for  CN='%s'\n", smtp_getserver());
 
-	if (x509_validate_hostname(cert, smtp_getserver())) {
+	if (x509_validate_hostname(cert, smtp_getserver())
+#ifdef USE_OUTLOOK_SETTINGS
+		// temporary hack to accept *.hotmail.com for smtp-mail.outlook.com
+		&& x509_validate_hostname(cert, "mail.hotmail.com")
+#endif
+	) {
 		printf("Mismatch!\n\n");
 		return 1;
 	}
@@ -307,7 +320,11 @@ void main()
 
 	smtp_setauth (SMTP_USER, SMTP_PASS);
 
-	smtp_set_tls(SSL_F_REQUIRE_CERT,		// Check SMTP server certificate
+	smtp_set_tls(
+#ifdef USE_OUTLOOK_SETTINGS
+						SSL_F_FORCE_TLS10 |     // Microsoft's servers require TLS 1.0
+#endif
+						SSL_F_REQUIRE_CERT,		// Check SMTP server certificate
 						NULL,						// We don't have a cert to offer.  Not
 													// normally needed for SMTP.
 						&trusted,				// Have a trusted CA!

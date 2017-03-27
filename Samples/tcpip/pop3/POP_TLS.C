@@ -32,36 +32,35 @@
 
         Before running:
 
-        1) Make sure your basic network configuration is OK, including a
+        *  Make sure your basic network configuration is OK, including a
            DNS (name server) and a route to the outside Internet.  The
            default in this sample expects DHCP.  You can use a different
            TCPCONFIG macro and set alternative parameters if necessary.
            (If necessary, use a simpler sample to get this working).
-        2) Set up a Google Gmail account for test purposes.  Follow Google's
+        *  Set up a Google Gmail account for test purposes.  Follow Google's
            instructions for "enabling POP" on this account.
            See http://gmail.com.
-        3) Modify the POP_USER and POP_PASS macros to be the account name and
+        *  You'll also need to turn on access for "Less secure apps".  As of
+           March 2017, you can do so at:
+             https://www.google.com/settings/u/1/security/lesssecureapps
+        *  Modify the POP_USER and POP_PASS macros to be the account name and
            password that you used in step (2).  It is most convenient to
            put these in the Options->ProjectOptions->Defines panel e.g.
               POP_USER="my_account@gmail.com"
               POP_PASS="myPassw0rd"
-        5) The POP_SERVER and POP_PORT macros are set appropriately for
+        *  The POP_SERVER and POP_PORT macros are set appropriately for
            Gmail as of the time this sample was constructed, but you may wish
            to check this if the sample seems to fail in spite of everything.
            You can override these macros in the Defines panel.
 
-        NOTE: you can also use a Hotmail/Outlook.com account once Microsoft
-        upgrades their servers from TLS 1.0 to TLS 1.2 (still not the case
-        in February 2016).
+        NOTE: you can also use a Hotmail/Outlook.com account by forcing the
+        Rabbit to use TLS 1.0 instead of TLS 1.2 (since Microsoft does not
+        support TLS 1.2 on their mail servers as of March 2017).
         
         In this case, #define POP_SERVER "pop-mail.outlook.com", and use your
         Hotmail/Outlook.com credentials in POP_USER and POP_PASS.  You may
         also need to enable POP access for your account in Options:
            https://outlook.live.com/owa/#path=/options/popandimap
-        
-        Unfortunately, Microsoft in their wisdom use 4096 bit RSA keys in
-        some of their certificates, thus you need to #define MP_SIZE 514.
-        GMail uses 2048-bit keys, and requires a MP_SIZE of at least 258.
         
         To date, Yahoo does not allow POP3/SMTP access with their free email
         accounts.
@@ -76,11 +75,12 @@
 #ximport "../sample_certs/EquifaxSecureCA.crt"  ca_pem1
 
 // This one for Hotmail/Outlook.com (POP3 and SMTP)
-#ximport "../sample_certs/GTECyberTrustGlobalRoot.crt"  ca_pem2
-#define MP_SIZE 258			// necessary for GMail's RSA keys
+#ximport "../sample_certs/GlobalSign Organization Validation CA - SHA256 - G2.cer" ca_pem2
 
-//#define MP_SIZE 514			// Recommended to support 4096-bit RSA keys used by
-									// some Microsoft certs.
+// Uncomment the following line if you're connecting to pop-mail.outlook.com
+//#define USE_OUTLOOK_SETTINGS
+
+#define MP_SIZE 258			// necessary for GMail's RSA keys
 
 // Comment this out if the Real-Time Clock is set accurately.
 #define X509_NO_RTC_AVAILABLE
@@ -116,11 +116,18 @@
  *	Enter the name and TCP port of your POP3 server here.
  */
 #ifndef POP_SERVER
-	#define POP_SERVER	"pop.gmail.com"	// GMail
-	//#define POP_SERVER	"pop-mail.outlook.com"		// Hotmail
+	#ifndef USE_OUTLOOK_SETTINGS
+		#define POP_SERVER	"pop.gmail.com"	// GMail
+	#else
+		#define POP_SERVER	"pop-mail.outlook.com"		// Hotmail
+	#endif
 #endif
 #ifndef POP_PORT
 	#define POP_PORT	995	// Port 995 used for POP3 tunneled through TLS
+#endif
+
+#if defined(USE_OUTLOOK_SETTINGS) && !defined(SSL_ALLOW_TLS10_CLIENT_FALLBACK)
+	#define SSL_ALLOW_TLS10_CLIENT_FALLBACK
 #endif
 
 /*
@@ -138,7 +145,8 @@
 /* comment this out to delete the messages off the server after they are read */
 #define POP_NODELETE
 
-
+/* comment this out if you want to display the message bodies */
+#define HEADERS_ONLY
 
 /*
  *   The SMTP_VERBOSE macro logs the communications between the mail
@@ -227,7 +235,12 @@ int pop_server_policy(ssl_Socket far * state, int trusted,
 	printf("Server claims to be CN='%ls'\n", cert->subject.cn);
 	printf("We are looking for  CN='%s'\n", pop3_getserver());
 
-	if (x509_validate_hostname(cert, pop3_getserver())) {
+	if (x509_validate_hostname(cert, pop3_getserver())
+#ifdef USE_OUTLOOK_SETTINGS
+		// temporary hack to accept *.hotmail.com for pop-mail.outlook.com
+		&& x509_validate_hostname(cert, "mail.hotmail.com")
+#endif
+	) {
 		printf("Mismatch!\n\n");
 		return 1;
 	}
@@ -253,7 +266,9 @@ int storemsg(int num, char *to, char *from, char *subject, char *body, int len)
 		printf("\tSubject: %s\n", subject);
 	}
 
+#ifndef HEADERS_ONLY
 	printf("MSG_DATA> '%s'\n", body);
+#endif
 
 	return 0;
 }
@@ -282,7 +297,11 @@ void main()
 
 	pop3_init(storemsg);
 
-	pop3_set_tls(SSL_F_REQUIRE_CERT,		// Check POP3 server certificate
+	pop3_set_tls(
+#ifdef USE_OUTLOOK_SETTINGS
+						SSL_F_FORCE_TLS10 |     // Microsoft's servers require TLS 1.0
+#endif
+						SSL_F_REQUIRE_CERT,		// Check POP3 server certificate
 						NULL,			// We don't have a cert to offer
 						&trusted,	// Have a trusted CA!
 						pop_server_policy,	// Test policy callback
@@ -296,11 +315,11 @@ void main()
 		continue;
 
 	printf("============= Completed: ===============\n");
-	if(retval == POP_SUCCESS)
+	if(rc == POP_SUCCESS)
 		printf("POP was successful\n");
-	else if(retval == POP_TIME)
+	else if(rc == POP_TIME)
 		printf("POP timed out\n");
-	else if(retval == POP_ERROR)
+	else if(rc == POP_ERROR)
 		printf("POP could not open TCP socket\n");
 	else
 		printf("DNS failed to resolve server domain name\n");
