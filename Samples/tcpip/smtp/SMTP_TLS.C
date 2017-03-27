@@ -39,24 +39,27 @@
 
         Before running:
 
-        1) Make sure your basic network configuration is OK, including a
+        *  Make sure your basic network configuration is OK, including a
            DNS (name server) and a route to the outside Internet.  The
            default in this sample expects DHCP.  You can use a different
            TCPCONFIG macro and set alternative parameters if necessary.
            (If necessary, use a simpler sample to get this working).
-        2) Set up a Google Gmail account for test purposes.  Follow Google's
+        *  Set up a Google Gmail account for test purposes.  Follow Google's
            instructions for "enabling POP" on this account.  Enabling POP
            also enables mail origination using SMTP.  See http://gmail.com.
-        3) Modify the parameters to the smtp_setauth() function call (in this
+        *  You'll also need to turn on access for "Less secure apps".  As of
+           March 2017, you can do so at:
+             https://www.google.com/settings/u/1/security/lesssecureapps
+        *  Modify the parameters to the smtp_setauth() function call (in this
            sample) to the account name and password that you used in step (2).
            It is most convenient to put these in the
            Options->ProjectOptions->Defines panel e.g.
               SMTP_USER="my_account@gmail.com"
               SMTP_PASS="myPassw0rd"
-        4) Modify the FROM, SMTP_TO, SUBJECT and BODY macros to be a valid mail
+        *  Modify the FROM, SMTP_TO, SUBJECT and BODY macros to be a valid mail
            recipient and desired message.  Preferably, override SMTP_TO
            in the Defines box to be a valid recipient (that you can check!)
-        5) The SMTP_SERVER and SMTP_PORT macros are set appropriately for
+        *  The SMTP_SERVER and SMTP_PORT macros are set appropriately for
            Gmail as of the time this sample was constructed, but you may wish
            to check this if the sample seems to fail in spite of everything.
            You can override these macros in the Defines panel.
@@ -69,10 +72,6 @@
         Hotmail/Outlook.com credentials in SMTP_USER and SMTP_PASS.  There is no
         need to change any of your Hotmail account settings (still true as
         of March 2017).
-        
-        Unfortunately, Microsoft in their wisdom use 4096 bit RSA keys in
-        some of their certificates, thus you need to #define MP_SIZE 514.
-        GMail uses 2048-bit keys, and requires a MP_SIZE of at least 258.
         
         To date, Yahoo does not allow POP3/SMTP access with their free email
         accounts.
@@ -95,7 +94,7 @@
 #ximport "../sample_certs/GlobalSign Organization Validation CA - SHA256 - G2.cer" ca_pem3
 
 // Uncomment the following line if you're connecting to smtp-mail.outlook.com
-#define USE_OUTLOOK_SETTINGS
+//#define USE_OUTLOOK_SETTINGS
 
 #define MP_SIZE 258			// necessary for GMail's RSA keys
 

@@ -32,20 +32,23 @@
 
         Before running:
 
-        1) Make sure your basic network configuration is OK, including a
+        *  Make sure your basic network configuration is OK, including a
            DNS (name server) and a route to the outside Internet.  The
            default in this sample expects DHCP.  You can use a different
            TCPCONFIG macro and set alternative parameters if necessary.
            (If necessary, use a simpler sample to get this working).
-        2) Set up a Google Gmail account for test purposes.  Follow Google's
+        *  Set up a Google Gmail account for test purposes.  Follow Google's
            instructions for "enabling POP" on this account.
            See http://gmail.com.
-        3) Modify the POP_USER and POP_PASS macros to be the account name and
+        *  You'll also need to turn on access for "Less secure apps".  As of
+           March 2017, you can do so at:
+             https://www.google.com/settings/u/1/security/lesssecureapps
+        *  Modify the POP_USER and POP_PASS macros to be the account name and
            password that you used in step (2).  It is most convenient to
            put these in the Options->ProjectOptions->Defines panel e.g.
               POP_USER="my_account@gmail.com"
               POP_PASS="myPassw0rd"
-        5) The POP_SERVER and POP_PORT macros are set appropriately for
+        *  The POP_SERVER and POP_PORT macros are set appropriately for
            Gmail as of the time this sample was constructed, but you may wish
            to check this if the sample seems to fail in spite of everything.
            You can override these macros in the Defines panel.
@@ -58,10 +61,6 @@
         Hotmail/Outlook.com credentials in POP_USER and POP_PASS.  You may
         also need to enable POP access for your account in Options:
            https://outlook.live.com/owa/#path=/options/popandimap
-        
-        Unfortunately, Microsoft in their wisdom use 4096 bit RSA keys in
-        some of their certificates, thus you need to #define MP_SIZE 514.
-        GMail uses 2048-bit keys, and requires a MP_SIZE of at least 258.
         
         To date, Yahoo does not allow POP3/SMTP access with their free email
         accounts.
@@ -79,7 +78,7 @@
 #ximport "../sample_certs/GlobalSign Organization Validation CA - SHA256 - G2.cer" ca_pem2
 
 // Uncomment the following line if you're connecting to pop-mail.outlook.com
-#define USE_OUTLOOK_SETTINGS
+//#define USE_OUTLOOK_SETTINGS
 
 #define MP_SIZE 258			// necessary for GMail's RSA keys
 
