@@ -76,7 +76,7 @@
 #ximport "../sample_certs/EquifaxSecureCA.crt"  ca_pem1
 
 // This one for Hotmail/Outlook.com (POP3 and SMTP)
-#ximport "../sample_certs/GTECyberTrustGlobalRoot.crt"  ca_pem2
+#ximport "../sample_certs/GlobalSign Organization Validation CA - SHA256 - G2.cer" ca_pem2
 #define MP_SIZE 258			// necessary for GMail's RSA keys
 
 //#define MP_SIZE 514			// Recommended to support 4096-bit RSA keys used by
