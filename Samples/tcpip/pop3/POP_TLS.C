@@ -296,11 +296,11 @@ void main()
 		continue;
 
 	printf("============= Completed: ===============\n");
-	if(retval == POP_SUCCESS)
+	if(rc == POP_SUCCESS)
 		printf("POP was successful\n");
-	else if(retval == POP_TIME)
+	else if(rc == POP_TIME)
 		printf("POP timed out\n");
-	else if(retval == POP_ERROR)
+	else if(rc == POP_ERROR)
 		printf("POP could not open TCP socket\n");
 	else
 		printf("DNS failed to resolve server domain name\n");
