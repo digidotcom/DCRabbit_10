@@ -908,4 +908,8 @@
     after pd_powerup().  If this affects you, contact Digi and reference
     issue DC-300.
 
+30. The compiler incorrectly reports errors and warnings as occurring on line 1
+    if they are beyond line 32,767 of a file.  Limit file sizes by creating
+    .LIB modules loaded with #use, or .H header files loaded with #include.
+
 
