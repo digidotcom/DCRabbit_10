@@ -309,6 +309,9 @@ int main()
 	// Start network and wait for interface to come up (or error exit).
 	sock_init_or_exit(1);
 
+	// initialize tcp_Socket structure before use
+	memset(&demosock, 0, sizeof(demosock));
+
 #ifdef BU_TEMP_USE_FAT
 	// Auto-mount the FAT filesystem
 	printf( "mounting FAT partitions\n");
