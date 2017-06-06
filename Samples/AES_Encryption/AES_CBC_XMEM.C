@@ -14,7 +14,7 @@
    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 */
 /**********************************************************************
-	Samples\AES_Encryption\AES_CBC.c
+	Samples\AES_Encryption\AES_CBC_XMEM.c
 
    This sample runs the test cases for AES CBC (Cipher-block Chaining)
    from RFC3602, both forward (encryption) and backward (decryption).
@@ -181,21 +181,21 @@ int test(int test_case, const char *key, const char *iv,
           const far char *plain, const far char *encrypted, int size)
 {
    auto AESstreamState state;
-   auto char text[256];
+   auto long xmem_text, alloc_size;
+   auto char far *far_text;
    auto failures = 0;
    
-   if (size > sizeof text) {
-      printf("Test case %d too big (%d bytes), skipped\n", test_case, size);
-      return 1;
-   }
+   alloc_size = size;
+   xmem_text = _xalloc(&alloc_size, 0, XALLOC_ANY);
+	far_text = (char far *)xmem_text;
+	
    printf("Test case %d - encrypt %d bytes\n", test_case, size);
    AESinitStream(&state, key, iv);
 
-   _f_memcpy(text, plain, size);
-   AESencryptStream_CBC(&state, text, size);
+   AESencryptStream_CBC_XMEM(&state, (long) paddr_far(plain), xmem_text, size);
    printf("Encrypted text:\n");
-   mem_dump(text, size);
-   if (_f_memcmp(text, encrypted, size) != 0) {
+   mem_dump(far_text, size);
+   if (_f_memcmp(far_text, encrypted, size) != 0) {
    	++failures;
       printf("Did not match expected result:\n");
       mem_dump(encrypted, size);
@@ -205,16 +205,17 @@ int test(int test_case, const char *key, const char *iv,
    printf("Test case %d - decrypt %d bytes\n", test_case, size);
    AESinitStream(&state, key, iv);
 
-   _f_memcpy(text, encrypted, size);
-   AESdecryptStream_CBC(&state, text, size);
+   AESdecryptStream_CBC_XMEM(&state, (long) paddr_far(encrypted), xmem_text, size);
    printf("Decrypted text:\n");
-   mem_dump(text, size);
-   if (_f_memcmp(text, plain, size) != 0) {
+   mem_dump(far_text, size);
+   if (_f_memcmp(far_text, plain, size) != 0) {
    	++failures;
       printf("Did not match expected result:\n");
       mem_dump(plain, size);
    }
    printf("\n");
+   
+   xrelease(xmem_text, alloc_size);
    
    return failures;
 }
