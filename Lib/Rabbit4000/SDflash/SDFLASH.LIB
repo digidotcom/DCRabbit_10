@@ -1128,9 +1128,9 @@ END DESCRIPTION **********************************************************/
 _sdflash_nodebug
 int sdspi_process_command(sd_device *sd, SD_CMD_REPLY * cmd_reply, int mode)
 {
-    int result, rc, i;
+    int rc, i;
     unsigned short crc7;
-    char * cmd_buffer;
+    unsigned char request[8];
 
     if (!sd) {
        return -EINVAL;
@@ -1142,24 +1142,20 @@ int sdspi_process_command(sd_device *sd, SD_CMD_REPLY * cmd_reply, int mode)
 #endif
        return -ENOMEDIUM;
     }
-    result = 0;
-    cmd_buffer = NULL;
-    crc7 = 0;
 
-    cmd_reply->tx_buffer[CMD_INDEX_OFFSET] = CMD_START | cmd_reply->cmd;
-    cmd_reply->tx_buffer[CMD_ARGUMENT_OFFSET] = (char)(cmd_reply->argument>>24L);
-    cmd_reply->tx_buffer[CMD_ARGUMENT_OFFSET+1]=(char)(cmd_reply->argument>>16L);
-    cmd_reply->tx_buffer[CMD_ARGUMENT_OFFSET+2]=(char)(cmd_reply->argument>>8L);
-    cmd_reply->tx_buffer[CMD_ARGUMENT_OFFSET+3]=(char)(cmd_reply->argument);
-
-    cmd_buffer = &cmd_reply->tx_buffer[CMD_INDEX_OFFSET];
-    for (i = 0; i < COMMAND_BYTE_COUNT - 1; i++)
+    request[0] = 0xFF;
+    request[1] = CMD_START | cmd_reply->cmd;
+    request[2] = (char)(cmd_reply->argument>>24L);
+    request[3] = (char)(cmd_reply->argument>>16L);
+    request[4] = (char)(cmd_reply->argument>>8L);
+    request[5] = (char)(cmd_reply->argument);
+    for (crc7 = 0, i = 1; i < 6; i++)
     {
-        crc7 = _sd_crc7(crc7, cmd_buffer[i]);
+        crc7 = _sd_crc7(crc7, request[i]);
     }
-
-    cmd_reply->tx_buffer[CMD_CRC_INDEX] = (crc7 << 1) | CMD_END;
-
+    request[6] = (crc7 << 1) | CMD_END;
+    request[7] = 0xFF;
+   
     rc = _SPIgetSemaphore(SPI_SD);
     if (rc)
     {   // Semaphore is being held by another device, SPI port is busy
@@ -1173,10 +1169,20 @@ int sdspi_process_command(sd_device *sd, SD_CMD_REPLY * cmd_reply, int mode)
     printf("CMD%u 0x%08lX\n", cmd_reply->cmd, cmd_reply->argument);
 #endif
 
-    rc = _sdspi_ReadWrite(sd, cmd_reply->tx_buffer, cmd_reply->rx_buffer,
-                        cmd_reply->reply_size, cmd_reply->data_size, mode);
-
-    if (rc)
+    SD_ENABLECS(sd->SDintf);
+    _sdspi_write_block(request, 8, sd->port);
+    rc = _sdspi_read_block(cmd_reply->rx_buffer, cmd_reply->reply_size,
+        sd->port, REPLY_TIMEOUT_MS);
+    if (cmd_reply->data_size && rc > 0) {
+        rc = _sdspi_read_block(cmd_reply->rx_buffer + cmd_reply->reply_size,
+            cmd_reply->data_size, sd->port, sd->read_timeout_ms);
+    }
+    if (mode) {
+       _sdspi_end_command(sd);
+       _SPIfreeSemaphore(SPI_SD);
+    }
+   
+    if (rc < 0)
     {
 #ifdef SDFLASH_VERBOSE
         printf("%s: Error %d sending command\n", __FUNCTION__, rc);
@@ -1199,7 +1205,8 @@ int sdspi_process_command(sd_device *sd, SD_CMD_REPLY * cmd_reply, int mode)
     if (cmd_reply->rx_buffer[0] & R1_MASK_LOW_BITS)
     {
 #ifdef SDFLASH_VERBOSE
-       printf("%s: Response high bit not 0\n", __FUNCTION__);
+       printf("%s: Response high bit not 0 (0x%02X)\n", __FUNCTION__,
+          cmd_reply->rx_buffer[0]);
 #endif
        _sdspi_end_command(sd);
        _SPIfreeSemaphore(SPI_SD);
@@ -1217,7 +1224,7 @@ int sdspi_process_command(sd_device *sd, SD_CMD_REPLY * cmd_reply, int mode)
 #endif
 
     _SPIfreeSemaphore(SPI_SD);
-    return result;
+    return 0;
 }
 
 /*** Beginheader _sd_crc7 ***/
@@ -1345,7 +1352,7 @@ int sdspi_get_csd(sd_device *sd)
     if (j >= READ_CSD_BUFFER_SIZE)
     {
 #ifdef SDFLASH_VERBOSE
-        printf("%s: %s() returned invalid data\n", __FUNCTION__, "_sdspi_ReadWrite");
+        printf("%s: %s() returned invalid data\n", __FUNCTION__, "sdspi_process_command");
 #endif
         return -EIO;
     }
@@ -1613,7 +1620,7 @@ int sdspi_get_scr(sd_device *sd)
     if (j >= READ_SCR_BUFFER_SIZE)
     {
 #ifdef SDFLASH_VERBOSE
-        printf("%s: %s() returned invalid data\n", __FUNCTION__, "_sdspi_ReadWrite");
+        printf("%s: %s() returned invalid data\n", __FUNCTION__, "sdspi_process_command");
 #endif
         return -EIO;
     }
@@ -2252,53 +2259,6 @@ ioi	ld		L, (iy)						; get the byte
 .BZret:
 		ret
 #endasm
-
-/*** Beginheader _sdspi_ReadWrite ***/
-__root int _sdspi_ReadWrite(sd_device *sd, char *tx_buffer, char *rx_buffer,
-                unsigned int reply_size, unsigned int data_size, int disable);
-/*** endheader ***/
-
-/*************************************************************************
-SYNTAX: int _sdspi_ReadWrite(sd_device *sd, char *tx_buffer,
-                              char *rx_buffer, unsigned int reply_size,
-                               unsigned int data_size, int disable)
-
-DESCRIPTION:   Performs an end of command sequence - raising the chip
-					select and clocking out a high line character.  This
-					finishes the command and puts the SD out in hi-Z mode.
-               You must obtain the SPI semaphore before calling this
-               function as it raises and lowers the SD card chip select.
-               It will end the command and release the SPI semaphore if
-               disable is passed as true.
-
-PARAMETER1:		sd - Pointer to an SD device structure
-PARAMETER2:		len - number of bytes to transmit ( maximum 64K)
-PARAMETER3:		port - Base address of the SPI serial port to use
-
-RETURN VALUE:   0       Success
-                -EIO    Timeout Occured in Command Response
-**************************************************************************/
-_sdflash_nodebug
-__root int _sdspi_ReadWrite(sd_device *sd, char *tx_buffer, char *rx_buffer,
-                 unsigned int reply_size, unsigned int data_size, int disable)
-{
-   int rc;
-
-      SD_ENABLECS(sd->SDintf);
-      tx_buffer[6]=0xff;    //extra character needed to keep clk on
-      _sdspi_write_block(tx_buffer, 7, sd->port);
-      rc = _sdspi_read_block(rx_buffer, reply_size, sd->port, REPLY_TIMEOUT_MS);
-      if (data_size && rc > 0) {
-         rc = _sdspi_read_block(rx_buffer + reply_size, data_size, sd->port,
-                               sd->read_timeout_ms);
-      }
-      if(disable) {
-        _sdspi_end_command(sd);
-        _SPIfreeSemaphore(SPI_SD);
-      }
-   return (rc < 0 ? rc : 0);
-}
-
 
 /*** Beginheader _sdspi_end_command ***/
 void _sdspi_end_command(sd_device *sd);
