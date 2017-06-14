@@ -141,8 +141,8 @@ Revision History:	Rev 1.0 Initial Release
 #define CMD1_RETRIES               5000
 #define BUSY_RETRIES               5400
 
-// number of high line bytes allowed before timeout
-#define REPLY_TIMEOUT              0x41
+// number of milliseconds allowed before timeout
+#define REPLY_TIMEOUT_MS           2
 
 /*
  * Command R1 (one byte command response) error codes
@@ -383,7 +383,8 @@ typedef struct sd_device_st
    unsigned long write_sector; // current sector being written (used by FAT)
    __far char *bptr;             // pointer to date buffer for writes
 	int erasebitshift;	       // "don't care" bits in an erase block address
-   unsigned int data_timeout;  // Computed data timeout value
+   unsigned int read_timeout_ms;   // Computed data timeout value
+   unsigned int write_timeout_ms;  // Computed data timeout value
    sd_cspin cspin;             // Structure with Pin for Chip Select info
    int port;                   // Base address for the SD card's SPI port
    const sd_dev_interface *SDintf;   // Pointer to sd_dev_interface structure
@@ -542,8 +543,10 @@ int sdspi_initDevice(int indx, const sd_dev_interface *sd_dev)
 
    sd->write_state = 0;      // Used by FAT, just set to zero
    sd->write_sector = 0;
-   sd->data_timeout = 1000;  // Initial timeout, will be replaced
-                                  //  when CSD has been read from card
+   // set default read/write timeouts for SDHC cards, updated 
+   // for SD cards after reading CSD.
+   sd->read_timeout_ms = 100;
+   sd->write_timeout_ms = 250;
    SD_DISABLECS(sd_dev);
 
    // **** Set up chip select
@@ -1308,6 +1311,9 @@ int sdspi_get_csd(sd_device *sd);
 _sdflash_nodebug
 int sdspi_get_csd(sd_device *sd)
 {
+    // mapping of TAAC values * 10
+    static const unsigned char _taac_table[16] = {
+       10, 10, 12, 13, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 70, 80 };
     int result, j, k;
     char *csd_buffer;
     SD_CSD_TYPE  *sd_csd;
@@ -1411,27 +1417,33 @@ int sdspi_get_csd(sd_device *sd)
 
             case CSD_BLOCK_OFFSET_1:    // [119:112]
                 sd_csd->TAAC = current_byte;
-                x = (sd_csd->TAAC & 0x7C) >> 3;
-                if ((x < 3) || (x == 15)) {
-                  x++;
-                }
-                else {
-                  if (x > 3) x--;
-                }
-                // Now x has value times 2
-                j = sd_csd->TAAC & 7;
-                // Create base multiplier in nanoseconds
-                for (temp = 1; j--; temp *= 10);
-                // Base multiplier times value divided by character time
-                temp = ((temp * x) / 1000) + 1;
                 break;
 
             case CSD_BLOCK_OFFSET_2:    // [111:104]
                 sd_csd->NSAC = current_byte;
-                // Add NSAC timeout to TAAC timeout
-                temp += (unsigned long)(sd_csd->NSAC) * 100;
-                // Save timeout in character time in data_timeout (w/ max check)
-                sd->data_timeout = (temp >= 0x10000 ? 0xFFFF : (unsigned)temp);
+#if SDFLASH_SDHC
+                if (! CSD_IS_SDHC(sd_csd))
+#endif
+                {
+                    // Calculate timeout in ms
+                    x = _taac_table[(sd_csd->TAAC >> 3) & 0xF];
+                    // x has value times 10 (correct value for j == 7)
+                    for (j = sd_csd->TAAC & 7; x && (j != 7); ++j) {
+                        x /= 10;
+                    }
+                    // Calculate NSAC timeout on conservative 1Mhz clock
+                    // NSAC * 100 clocks / 1,000 clocks/msec = NSAC / 10
+                    x += sd_csd->NSAC / 10;
+                    
+                    // minimum timeout of 2ms
+                    sd->read_timeout_ms = x < 2 ? 2 : x;
+#ifdef SDFLASH_VERBOSE
+                    printf("%s: TAAC=0x%02x  NSAC=%u\n", __FUNCTION__,
+                           sd_csd->TAAC, sd_csd->NSAC);
+                    printf("%s: set %s to %u\n", __FUNCTION__,
+                           "read_timeout_ms", sd->read_timeout_ms);
+#endif
+                }
                 break;
 
             case CSD_BLOCK_OFFSET_3:    // [103:96]
@@ -1512,6 +1524,18 @@ int sdspi_get_csd(sd_device *sd)
                 sd_csd->WP_G_EN = (current_byte >> 7) & 0x01;
                 sd_csd->R2W_FACT = (current_byte >> 2) & 0x07;
                 sd_csd->WR_BL_LEN = (current_byte & 0x3) << 2;
+#if SDFLASH_SDHC
+                if (! CSD_IS_SDHC(sd_csd))
+#endif
+                {
+                    sd->write_timeout_ms = sd->read_timeout_ms * (1 << sd_csd->R2W_FACT);
+#ifdef SDFLASH_VERBOSE
+                    printf("%s: R2W_FACT=%u (%u)\n", __FUNCTION__,
+                           sd_csd->R2W_FACT, (1 << sd_csd->R2W_FACT));
+                    printf("%s: set %s to %u\n", __FUNCTION__,
+                           "write_timeout_ms", sd->write_timeout_ms);
+#endif
+                }
                 break;
 
             case CSD_BLOCK_OFFSET_13:   // [23:16]
@@ -1956,7 +1980,7 @@ int sdspi_xwrite_sector(sd_device *sd, unsigned long  sector_number,
     tx_buffer[513] = (char)(crc16>>8);		// MSB
 
     _sdspi_write_block(tx_buffer, 515, sd->port);
-    result = _sdspi_read_block(rx_buffer, 1, sd->port, REPLY_TIMEOUT);
+    result = _sdspi_read_block(rx_buffer, 1, sd->port, sd->write_timeout_ms);
 
     if (result == 1) {
 	    rx_buffer[0] |= 0xE0;      // Set don't care bits high for comparing
@@ -2313,10 +2337,10 @@ __root int _sdspi_ReadWrite(sd_device *sd, char *tx_buffer, char *rx_buffer,
       SD_ENABLECS(sd->SDintf);
       tx_buffer[6]=0xff;    //extra character needed to keep clk on
       _sdspi_write_block(tx_buffer, 7, sd->port);
-      rc = _sdspi_read_block(rx_buffer, reply_size, sd->port, REPLY_TIMEOUT);
+      rc = _sdspi_read_block(rx_buffer, reply_size, sd->port, REPLY_TIMEOUT_MS);
       if (data_size && rc > 0) {
          rc = _sdspi_read_block(rx_buffer + reply_size, data_size, sd->port,
-                               sd->data_timeout);
+                               sd->read_timeout_ms);
       }
       if(disable) {
         _sdspi_end_command(sd);
@@ -2413,14 +2437,14 @@ ioi	ld		a, (iy)						; discard Rx byte (clear receiver bit)
 
 /*** Beginheader _sdspi_read_block ***/
 __root int _sdspi_read_block(char *buffer, unsigned int len, int port,
-                                   unsigned int timeout);
+                                   unsigned int timeout_ms);
 /*** endheader ***/
 
 /*************************************************************************
 _sdspi_read_block
 
 SYNTAX: int _sdspi_read_block(char *buffer, unsigned int len, int port,
-                                     unsigned int timeout)
+                                     unsigned int timeout_ms)
 
 DESCRIPTION:   Reads in len bytes of data (ignoring high line sequence)
                from the SPI port into a buffer.  Timeout is based on the
@@ -2432,7 +2456,7 @@ DESCRIPTION:   Reads in len bytes of data (ignoring high line sequence)
 PARAMETER1:		buffer - buffer for reply and received bytes
 PARAMETER2:		len - number of bytes to receive (after high line condition)
 PARAMETER3:		port - Base address of the SPI serial port to use
-PARAMETER4:    timeout - number of high line bytes allowed before timeout
+PARAMETER4:    timeout - number of milliseconds before timeout
 
 RETURN VALUE:  number of bytes received (if positive)
                -EIO = Response Timeout occured
@@ -2440,13 +2464,15 @@ RETURN VALUE:  number of bytes received (if positive)
 **************************************************************************/
 _sdflash_nodebug
 __root int _sdspi_read_block(char *buffer, unsigned int len, int port,
-                                  unsigned int timeout)
+                                  unsigned int timeout_ms)
 {
 #asm
 		; set up the registers
-		ex		de, hl						; save dest in de
-		ld		hl, (sp+@SP+timeout)		; get timeout count
-		ld		bc, hl
+		ldl	px, hl						; save dest in px
+		ld		jkhl, 0
+		ld		hl, (sp+@SP+timeout_ms)	; load timeout count into jkhl
+		ld		bcde, (MS_TIMER)
+		add	jkhl, bcde					; jkhl holds target MS_TIMER value
 		ld		iy, (sp+@SP+port)
 		; de = destination address
 		; bc = timeout counter
@@ -2473,18 +2499,20 @@ ioi	ld		a, (iy)						; get the byte
 		cp		0xFF							; Compare to high line condition
 		jr		nz, ._RxGetData			; If not, then go get reply/data
 
-		dwjnz	._Rx0Loop					; Loop back if not expired
+		ld		bcde, (MS_TIMER)
+		cp		jkhl, bcde
+		jr		gtu, ._Rx0Loop				; Loop back if not expired
 
 		; Timeout occurred
-		ld		(de), a						; Save 0xFF byte to indicate timeout
+		ld		(px), a						; Save 0xFF byte to indicate timeout
 		jr		._Rx0Exit					; And exit
 
 		; receive the reply/data bytes
 ._RxGetData:
 		ld		hl, (sp+@SP+len)			; get the number of bytes to receive
 		ld		bc, hl
-		; de = destination address
-		; bc = timeout counter
+		; px = destination address
+		; bc = byte count
 		; iy = serial port register base (SxDR)
 		jr		._RxSaveByte				; Save the first byte and get the rest
 
@@ -2501,8 +2529,8 @@ ioi	bit	7, (iy+SD_SR_OFFSET)		; test receiver bit
 
 ioi	ld		a, (iy)						; get the byte
 ._RxSaveByte:
-		ld		(de), a						; store the byte
-		inc	de								; point to next byte
+		ld		(px), a						; store the byte
+		ld		px, px+1						; point to next byte
 		dwjnz	._Rx1Loop					; jump if not done
 
 ._Rx0Exit:
