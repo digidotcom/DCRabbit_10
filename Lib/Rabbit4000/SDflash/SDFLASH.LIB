@@ -98,6 +98,9 @@ Revision History:	Rev 1.0 Initial Release
 #define R3_BYTE_COUNT            5   // R3 (READ_OCR) responses are 5 bytes
 #define R7_BYTE_COUNT            5   // R7 (SEND_IF_COND) responses are 5 bytes
 
+// largest response that doesn't include a data block
+#define MAX_RESPONSE_COUNT       R7_BYTE_COUNT
+
 /* CSD = 16 bytes data, 1 byte start block and 2 bytes for 16 bit CRC */
 #define CSD_BYTE_COUNT           19
 #define BLOCK_SIZE               512L
@@ -382,7 +385,8 @@ typedef struct sd_cmd_reply
    unsigned int reply;
    unsigned int reply_size;
    unsigned int data_size;
-   char * rx_buffer;
+   char * data_buffer;
+   char reply_buffer[MAX_RESPONSE_COUNT];
 } SD_CMD_REPLY;
 
 int sdspi_initDevice(int indx, const sd_dev_interface *sd_dev);
@@ -762,7 +766,7 @@ void sdspi_init_reply(SD_CMD_REPLY *reply, int command)
     
     reply->cmd = command;
     reply->reply_size = R1_BYTE_COUNT;
-    reply->rx_buffer = rx_buffer;
+    reply->data_buffer = rx_buffer;
 }
 
 /*** Beginheader sdspi_reset_card ***/
@@ -818,9 +822,6 @@ int sdspi_reset_card(sd_device *sd)
     
     for (j = 0; j < CMD0_RETRIES; j++)
     {
-#ifdef SDFLASH_VERBOSE
-      printf("*");
-#endif
       if (result = sdspi_process_command(sd, &cmd_reply, 2))
       {
         if (result == -ESHAREDBUSY)
@@ -830,9 +831,6 @@ int sdspi_reset_card(sd_device *sd)
 
         if (result != -EAGAIN)
         {
-#ifdef SDFLASH_VERBOSE
-          printf("%s: Process command failed.\n", __FUNCTION__);
-#endif
           break;
         }
       }
@@ -852,9 +850,6 @@ int sdspi_reset_card(sd_device *sd)
        result = -EIO;
     }
 
-#ifdef SDFLASH_VERBOSE
-        printf("\n");
-#endif
     return result;
 }
 
@@ -890,10 +885,6 @@ int sdspi_sendingAP(sd_device *sd)
     sdspi_init_reply(&cmd_reply, CMD55);
     if (result = sdspi_process_command(sd, &cmd_reply, 0))
     {
-#ifdef SDFLASH_VERBOSE
-        printf("%s: %s() failed, error %d\n",
-                      __FUNCTION__, "sdspi_process_command", result);
-#endif
         _sdspi_end_command(sd);
         _SPIfreeSemaphore(SPI_SD);
     }
@@ -930,19 +921,11 @@ int sdspi_get_status_reg(sd_device *sd, int * status)
     int result;
     SD_CMD_REPLY cmd_reply;
 
-    result = 0;
-
     sdspi_init_reply(&cmd_reply, CMD13);
     cmd_reply.reply_size = R2_BYTE_COUNT;
 
-    if (result = sdspi_process_command(sd, &cmd_reply, 1))
-    {
-#ifdef SDFLASH_VERBOSE
-       printf("%s: %s() failed, error %d(%d)\n",
-                   __FUNCTION__, "sdspi_process_command", result, *status);
-#endif
-    }
-    else
+    result = sdspi_process_command(sd, &cmd_reply, 1);
+    if (result == 0)
     {
         *status = cmd_reply.reply;
     }
@@ -994,25 +977,18 @@ int sdspi_init_card(sd_device *sd)
     cmd_reply.reply_size = R7_BYTE_COUNT;
     if (result = sdspi_process_command(sd, &cmd_reply, 1))
     {
-#ifdef SDFLASH_VERBOSE
-        printf("%s: CMD8 failed, error %d\n", __FUNCTION__, result);
-#endif
         return result;
     }
     else
     {
-        if (cmd_reply.reply == 5) {
+        if (cmd_reply.reply & R1_ILLEGAL_COMMAND) {
             cmd8_success = FALSE;
         }
-        else if (cmd_reply.reply == 1) {
-            cmd8_success = (cmd_reply.rx_buffer[4] == CMD8_CHECK_PATTERN);
+        else if (! (cmd_reply.reply & ~R1_IDLE_STATE)) {
+            cmd8_success = (cmd_reply.reply_buffer[4] == CMD8_CHECK_PATTERN);
         }
-        else
+        else  // some error bit other than ILLEGAL_COMMAND or IDLE_STATE set
         {
-#ifdef SDFLASH_VERBOSE
-            printf("%s: command response error %d\n",
-                        __FUNCTION__, cmd_reply.reply);
-#endif
             return -EIO;
         }
     }
@@ -1021,10 +997,6 @@ int sdspi_init_card(sd_device *sd)
     {
         if (result = sdspi_sendingAP(sd))
         {
-#ifdef SDFLASH_VERBOSE
-            printf("%s: %s() failed, error %d\n",
-                        __FUNCTION__, "sdspi_sendingAP", result);
-#endif
             return result;
         }
         
@@ -1034,15 +1006,8 @@ int sdspi_init_card(sd_device *sd)
 #else
         cmd_reply.argument = 0;
 #endif
-#ifdef SDFLASH_VERBOSE
-        printf("*");
-#endif
         if (result = sdspi_process_command(sd, &cmd_reply, 1))
         {
-#ifdef SDFLASH_VERBOSE
-            printf("%s: ACMD41 failed, error %d\n",
-                        __FUNCTION__, result);
-#endif
             return result;
         }
         else
@@ -1051,10 +1016,6 @@ int sdspi_init_card(sd_device *sd)
             {
                 if (cmd_reply.reply != R1_IDLE_STATE)
                 {
-#ifdef SDFLASH_VERBOSE
-                    printf("%s: command response error %d\n",
-                                __FUNCTION__, cmd_reply.reply);
-#endif
                     return -EIO;
                 }
             }
@@ -1105,7 +1066,8 @@ PARAMETER2: cmd_reply    Pointer to cmd_reply structure, which contains:
 									reply      - storage for command reply
 									reply_size - size in bytes of expected reply
 									data_size  - size in bytes of expected data
-									rx_buffer  - pointer to RX buffer to use
+									data_buffer  - pointer to RX buffer for data
+									reply_buffer - reply bytes before data block
 PARAMETER3: mode         Zero = SPI port semaphore should be retained.
                          One  = If SPI port to be released before return.
                          Two  = Attempting SD card reset, otherwise same as one.
@@ -1123,17 +1085,35 @@ END DESCRIPTION **********************************************************/
 _sdflash_nodebug
 int sdspi_process_command(sd_device *sd, SD_CMD_REPLY * cmd_reply, int mode)
 {
-    int rc, i;
-    unsigned short crc7;
+    int rc, i, j;
+    unsigned short crc7, crc16;
     unsigned char request[8];
+    unsigned char r1, r2;
 
-    if (!sd) {
+#ifdef SDFLASH_VERBOSE
+    if (cmd_reply) {
+        printf("%s: CMD%u 0x%08lX\n", __FUNCTION__,
+            cmd_reply->cmd, cmd_reply->argument);
+    }
+#endif
+
+    if (!sd || !cmd_reply) {
+#ifdef SDFLASH_VERBOSE
+       printf("%s: invalid parameter.\n", __FUNCTION__);
+#endif
        return -EINVAL;
     }
 
+    if (cmd_reply->reply_size > MAX_RESPONSE_COUNT) {
+#ifdef SDFLASH_VERBOSE
+       printf("%s: reply size (%u) > %u\n", __FUNCTION__,
+           cmd_reply->reply_size, MAX_RESPONSE_COUNT);
+#endif
+       return -EINVAL;
+    }
     if (!SD_cardDetect(sd)) {
 #ifdef SDFLASH_VERBOSE
-       printf("%s: No SD card to present.\n", __FUNCTION__);
+       printf("%s: No SD card present.\n", __FUNCTION__);
 #endif
        return -ENOMEDIUM;
     }
@@ -1160,17 +1140,35 @@ int sdspi_process_command(sd_device *sd, SD_CMD_REPLY * cmd_reply, int mode)
         return -ESHAREDBUSY;   // And return error that SPI port is busy
     }
 
-#ifdef SDFLASH_VERBOSE
-    printf("CMD%u 0x%08lX\n", cmd_reply->cmd, cmd_reply->argument);
-#endif
-
     SD_ENABLECS(sd->SDintf);
     _sdspi_write_block(request, 8, sd->port);
-    rc = _sdspi_read_block(cmd_reply->rx_buffer, cmd_reply->reply_size,
+    rc = _sdspi_read_block(cmd_reply->reply_buffer, cmd_reply->reply_size,
         sd->port, REPLY_TIMEOUT_MS);
     if (cmd_reply->data_size && rc > 0) {
-        rc = _sdspi_read_block(cmd_reply->rx_buffer + cmd_reply->reply_size,
-            cmd_reply->data_size, sd->port, sd->read_timeout_ms);
+        rc = _sdspi_read_block(cmd_reply->data_buffer, cmd_reply->data_size,
+            sd->port, sd->read_timeout_ms);
+        if (rc > 0) {
+#ifdef SDFLASH_VERBOSE
+            printf("%s: read %u bytes:\n", __FUNCTION__, rc);
+            mem_dump(cmd_reply->data_buffer, rc);
+#endif
+            if (cmd_reply->data_buffer[0] != READ_WRITE_START_BLOCK) {
+#ifdef SDFLASH_VERBOSE
+                printf("%s: invalid data block start 0x%x\n",
+                           __FUNCTION__, cmd_reply->data_buffer[0]);
+#endif
+                return -EIO;
+            }
+
+            /* The crc16 for data block, including 2-byte CRC, should be 0. */
+            crc16 = crc16_calc(&cmd_reply->data_buffer[1], rc - 1, 0);
+            if (crc16) {
+#ifdef SDFLASH_VERBOSE
+                printf("%s: CRC16 failed 0x%04x\n", __FUNCTION__, crc16);
+#endif
+                return -EIO;
+            }
+        }
     }
     if (mode) {
        _sdspi_end_command(sd);
@@ -1187,25 +1185,48 @@ int sdspi_process_command(sd_device *sd, SD_CMD_REPLY * cmd_reply, int mode)
        return (mode == 2 ? -EAGAIN : rc);
     }
 
-    if (cmd_reply->rx_buffer[0] & R1_MASK_LOW_BITS)
-    {
+    r1 = cmd_reply->reply_buffer[0];
+    if (r1 & R1_MASK_LOW_BITS) {
 #ifdef SDFLASH_VERBOSE
-       printf("%s: Response high bit not 0 (0x%02X)\n", __FUNCTION__,
-          cmd_reply->rx_buffer[0]);
+       printf("%s: Response high bit not 0 (0x%02X)\n", __FUNCTION__, r1);
 #endif
        _sdspi_end_command(sd);
        _SPIfreeSemaphore(SPI_SD);
        return (mode == 2 ? -EAGAIN : -EIO);
     }
     
-    cmd_reply->reply = cmd_reply->rx_buffer[0];
     if (cmd_reply->reply_size == 2) {
-        cmd_reply->reply = (cmd_reply->reply << 8) | cmd_reply->rx_buffer[1];
+        r2 = cmd_reply->reply_buffer[1];
+        cmd_reply->reply = (r1 << 8) | r2;
+    } else {
+        cmd_reply->reply = r1;
     }
 
 #ifdef SDFLASH_VERBOSE
-    printf("Reply (%u bytes):\n", cmd_reply->reply_size);
-    mem_dump(cmd_reply->rx_buffer, cmd_reply->reply_size);
+    printf("%s: reply R1 0x%x ", __FUNCTION__, r1);
+    if (r1 & R1_IDLE_STATE)           printf("IDLE ");
+    if (r1 & R1_ERASE_RESET)          printf("ERASE_RST ");
+    if (r1 & R1_ILLEGAL_COMMAND)      printf("ILLEGAL_CMD ");
+    if (r1 & R1_CRC_ERROR)            printf("CRC_ERR ");
+    if (r1 & R1_ERASE_SEQUENCE_ERROR) printf("ERASE_SEQ_ERR ");
+    if (r1 & R1_ADDRESS_ERROR)        printf("ADDR_ERR ");
+    if (r1 & R1_PARAMETER_ERROR)      printf("PARAM_ERR ");
+    printf("\n");
+    if (cmd_reply->reply_size == 2) {
+        printf("%s: reply R2 0x%x ", __FUNCTION__, r2);
+        if (r2 & R2_CARD_LOCKED)             printf("CARD_LOCK ");
+        if (r2 & R2_WRITE_PROTECT_ERASE)     printf("WR_PROT_ERASE ");
+        if (r2 & R2_GENERAL_ERROR)           printf("GEN_ERR ");
+        if (r2 & R2_CC_ERROR)                printf("CC_ERR ");
+        if (r2 & R2_CARD_ECC_FAILED)         printf("CARD_LOCK ");
+        if (r2 & R2_WRITE_PROTECT_VIOLATION) printf("WR_PROT_VIOL ");
+        if (r2 & R2_ERASE_PARAM)             printf("ERASE_PARAM ");
+        if (r2 & R2_OUT_OF_RANGE)            printf("OUT_OF_RANGE ");
+        printf("\n");
+    } else if (cmd_reply->reply_size > 2) {
+        printf("%s: reply data:\n", __FUNCTION__);
+        mem_dump(&cmd_reply->reply_buffer[1], cmd_reply->reply_size - 1);
+    }
 #endif
 
     _SPIfreeSemaphore(SPI_SD);
@@ -1282,7 +1303,7 @@ int sdspi_get_csd(sd_device *sd)
     int result, j, k;
     char *csd_buffer;
     SD_CSD_TYPE  *sd_csd;
-    unsigned short crc7, crc16, x;
+    unsigned short x;
     SD_CMD_REPLY cmd_reply;
     unsigned long temp, l;
 
@@ -1296,9 +1317,6 @@ int sdspi_get_csd(sd_device *sd)
     sdspi_init_reply(&cmd_reply, CMD9);
     cmd_reply.data_size = CSD_BYTE_COUNT;
 
-#ifdef SDFLASH_VERBOSE
-    printf("%s: calling %s().\n", __FUNCTION__, "sdspi_process_command");
-#endif
     j = 4;
     do {
     	result = sdspi_process_command(sd, &cmd_reply, 1);
@@ -1311,48 +1329,11 @@ int sdspi_get_csd(sd_device *sd)
     {
        if (cmd_reply.reply)
        {
-#ifdef SDFLASH_VERBOSE
-          printf("%s: command response error %d\n", __FUNCTION__, cmd_reply.reply);
-#endif
           return -EIO;
        }
     }
 
-    if (cmd_reply.rx_buffer[cmd_reply.reply_size] != READ_WRITE_START_BLOCK)
-    {
-#ifdef SDFLASH_VERBOSE
-        printf("%s: Read data error 0x%x\n",
-                   __FUNCTION__, cmd_reply.rx_buffer[cmd_reply.reply_size]);
-#endif
-        return -EIO;
-    }
-
-    csd_buffer = &cmd_reply.rx_buffer[cmd_reply.reply_size + 1];
-
-    /* Get the crc16 for CSD block and 2 byte CRC */
-    crc16 = crc16_calc( csd_buffer, CSD_BYTE_COUNT - 1, 0);
-
-    /*
-       Using the 2 CRC bytes in the crc16 calculation should result in 0;
-       if not 0 then try the crc7 calculation.
-    */
-    if (crc16)
-    {
-        /* The crc16 check failed, so compute crc7 for CSD data */
-        crc7 = 0;
-        for (k = 0; k < CSD_BYTE_COUNT - 4; ++k)
-            crc7 = _sd_crc7(crc7, csd_buffer[k]);
-
-        if (csd_buffer[CSD_BYTE_COUNT - 4] != (((crc7 << 1) | CMD_END) & 0xFF))
-        {
-#ifdef SDFLASH_VERBOSE
-            printf("%s: CRC mismatch error\n", __FUNCTION__);
-#endif
-            return -EIO;
-        }
-    }
-
-
+    csd_buffer = &cmd_reply.data_buffer[1];
     /* extract the CSD information from the CSD block */
     for (k = 0; k < CSD_BYTE_COUNT - 3; k++)
     {
@@ -1526,17 +1507,12 @@ int sdspi_get_scr(sd_device *sd);
 _sdflash_nodebug
 int sdspi_get_scr(sd_device *sd)
 {
-    int result, j, k;
+    int result, k;
     char *scr_buffer;
     SD_SCR_TYPE  *sd_scr;
-    unsigned short crc16;
     SD_CMD_REPLY cmd_reply;
-    unsigned long temp;
 
     if (result = sdspi_sendingAP(sd)) {
-#ifdef SDFLASH_VERBOSE
-       printf("%s: APCMD51 response error %d\n", __FUNCTION__, cmd_reply.reply);
-#endif
          return result;
     }
 
@@ -1553,48 +1529,18 @@ int sdspi_get_scr(sd_device *sd)
 
     if (result = sdspi_process_command(sd, &cmd_reply, 1))
     {
-#ifdef SDFLASH_VERBOSE
-        printf("%s: %s() failed, error %d\n",
-                  __FUNCTION__, "sdspi_process_command", result);
-#endif
         return result;
     }
     else
     {
        if (cmd_reply.reply)
        {
-#ifdef SDFLASH_VERBOSE
-          printf("%s: command response error %d\n", __FUNCTION__, cmd_reply.reply);
-#endif
           return -EIO;
        }
     }
 
-    if (cmd_reply.rx_buffer[cmd_reply.reply_size] != READ_WRITE_START_BLOCK)
-    {
-#ifdef SDFLASH_VERBOSE
-        printf("%s: Read data error 0x%x\n",
-                  __FUNCTION__, cmd_reply.rx_buffer[cmd_reply.reply_size]);
-#endif
-        return -EIO;
-    }
-
-    scr_buffer = &cmd_reply.rx_buffer[cmd_reply.reply_size + 1];
-
-    /* Get the CRC for SCR block and 2 byte CRC */
-    crc16 = crc16_calc( scr_buffer, SCR_BYTE_COUNT - 1, 0);
-
-    /* Using the 2 CRC bytes in the CRC calculation results in 0 */
-    if (crc16)
-    {
-#ifdef SDFLASH_VERBOSE
-        printf("%s: CRC mismatch error\n", __FUNCTION__);
-#endif
-        return -EIO;
-    }
-
-
-    /* extract the SCR information from the CSD block */
+    scr_buffer = &cmd_reply.data_buffer[1];
+    /* extract the SCR information from the data block */
     for (k = 0; k < SCR_BYTE_COUNT - 3; k++)
     {
         switch (k)
@@ -1683,13 +1629,8 @@ _sdflash_nodebug
 int sdspi_xread_sector(sd_device *sd, unsigned long sector_number,
                              __far void * data_buffer)
 {
-    int result, j, k;
-    char * read_data_ptr;
-    unsigned short crc16;
+    int result;
     SD_CMD_REPLY cmd_reply;
-
-    result = 0;
-    read_data_ptr = NULL;
 
     SD_DISABLECS(sd->SDintf);
 
@@ -1706,64 +1647,19 @@ int sdspi_xread_sector(sd_device *sd, unsigned long sector_number,
 
     if (result = sdspi_process_command(sd, &cmd_reply, 1))
     {
-#ifdef SDFLASH_VERBOSE
-       printf("%s: %s() failed, error %d\n",
-                 __FUNCTION__, "sdspi_process_command", result);
-#endif
        return result;
     }
     else
     {
         if (cmd_reply.reply)
         {
-#ifdef SDFLASH_VERBOSE
-            printf("%s: command response error, reply=0x%02x\n",
-                      __FUNCTION__, cmd_reply.reply);
-#endif
             return -EIO;
         }
     }
 
-    if (cmd_reply.rx_buffer[cmd_reply.reply_size] != READ_WRITE_START_BLOCK)
-    { // Automatic retry on bad start block reception
-      if (result = sdspi_process_command(sd, &cmd_reply, 1))
-      { // If it happens again, report it as an error
-#ifdef SDFLASH_VERBOSE
-        printf("%s: command failed retry, error %d\n",
-                 __FUNCTION__, result);
-#endif
-        return result;
-      }
-      else
-      {
-        if (cmd_reply.rx_buffer[cmd_reply.reply_size] != READ_WRITE_START_BLOCK)
-        {
-#ifdef SDFLASH_VERBOSE
-           printf("%s: Expected start block, received 0x%x\n",
-                       __FUNCTION__, cmd_reply.rx_buffer[cmd_reply.reply_size]);
-#endif
-           return -EIO;
-        }
-      }
-    }
+    _f_memcpy(data_buffer, &cmd_reply.data_buffer[1], BLOCK_SIZE);
 
-    read_data_ptr = &cmd_reply.rx_buffer[cmd_reply.reply_size + 1];
-
-    /* Get the CRC for CSD block and 2 byte CRC */
-    crc16 = crc16_calc( read_data_ptr, DATA_BLOCK_SIZE - 1, 0);
-
-    /* Using the 2 CRC bytes in the CRC calculation results in 0 */
-    if (crc16)
-    {
-#ifdef SDFLASH_VERBOSE
-        printf("%s: CRC mismatch error\n", __FUNCTION__);
-#endif
-        return -EIO;
-    }
-
-    _f_memcpy(data_buffer, (__far void *)read_data_ptr, BLOCK_SIZE);
-
-    return result;
+    return 0;
 }
 
 
@@ -1859,9 +1755,6 @@ int sdspi_xwrite_sector(sd_device *sd, unsigned long  sector_number,
 
     if (result = sdspi_process_command(sd, &cmd_reply,0))
     {
-#ifdef SDFLASH_VERBOSE
-        printf("%s: %s() failed.\n", __FUNCTION__, "sdspi_process_command");
-#endif
         _sdspi_end_command(sd);
         _SPIfreeSemaphore(SPI_SD);
         return result;
@@ -1870,10 +1763,6 @@ int sdspi_xwrite_sector(sd_device *sd, unsigned long  sector_number,
     {
         if (cmd_reply.reply)
         {
-#ifdef SDFLASH_VERBOSE
-            printf("%s: command response error (%d).\n",
-                      __FUNCTION__, cmd_reply.reply);
-#endif
             _sdspi_end_command(sd);
             _SPIfreeSemaphore(SPI_SD);
             return -EIO;
@@ -2075,9 +1964,6 @@ int sdspi_set_block_length(sd_device *sd, int block_length)
     sdspi_init_reply(&cmd_reply, CMD16);
     cmd_reply.argument = (long)block_length;
 
-#ifdef SDFLASH_VERBOSE
-    printf("%s: calling %s()\n", __FUNCTION__, "sdspi_process_command");
-#endif
     if (result = sdspi_process_command(sd, &cmd_reply, 1))
     {
        return result;
@@ -2086,10 +1972,6 @@ int sdspi_set_block_length(sd_device *sd, int block_length)
     {
         if (cmd_reply.reply)
         {
-#ifdef SDFLASH_VERBOSE
-            printf("%s: command response error (%d)\n",
-                      __FUNCTION__, cmd_reply.reply);
-#endif
             result = -EIO;
         }
     }
