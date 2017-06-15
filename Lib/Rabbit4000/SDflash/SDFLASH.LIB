@@ -21,7 +21,6 @@ sdspi_print_dev
 sdspi_getSectorCount
 sdspi_isWriting
 sdspi_reset_card
-sdspi_sendingAP
 sdspi_get_status_reg
 sdspi_init_card
 sdspi_process_command
@@ -130,9 +129,11 @@ Revision History:	Rev 1.0 Initial Release
 #define CMD55       55   // APP_CMD
 #define CMD58       58   // READ_OCR
 #define CMD59       59   // CRC_ON_OFF
-#define ACMD51      51   // SEND_SCR
-#define ACMD41      41   // SD_SEND_OP_COND
-#define ACMD42      42   // SET_CLR_CARD_DETECT
+
+// Re-use CMD_START flag for application commands (ACMDs) to automate sending CMD55 first
+#define ACMD51      (CMD_START + 51)   // SEND_SCR
+#define ACMD41      (CMD_START + 41)   // SD_SEND_OP_COND
+#define ACMD42      (CMD_START + 42)   // SET_CLR_CARD_DETECT
 
 /*
  * Command retry count
@@ -856,41 +857,7 @@ int sdspi_reset_card(sd_device *sd)
 /*** Beginheader sdspi_sendingAP ***/
 int sdspi_sendingAP(sd_device *sd);
 /*** endheader ***/
-
-/* START FUNCTION DESCRIPTION ********************************************
-sdspi_sendingAP                 <SDFLASH.LIB>
-
-SYNTAX: int sdspi_sendingAP(sd_device *sd)
-
-DESCRIPTION:	Sends AP command 55 to set Alternate Command mode on
-               the next command sent to the card.  This function does
-               not release the port sharing semaphore unless an error
-               is encountered.
-
-PARAMETER1: sd          Pointer to sd_device structure for the SD card.
-
-RETURN VALUE:    0                Success
-               -EIO               I/O Error
-               -ENOMEDIUM         No SD card in socket
-               -ESHAREDBUSY       Shared SPI port busy
-
-END DESCRIPTION **********************************************************/
-
-_sdflash_nodebug
-int sdspi_sendingAP(sd_device *sd)
-{
-    int result;
-    SD_CMD_REPLY cmd_reply;
-
-    sdspi_init_reply(&cmd_reply, CMD55);
-    if (result = sdspi_process_command(sd, &cmd_reply, 0))
-    {
-        _sdspi_end_command(sd);
-        _SPIfreeSemaphore(SPI_SD);
-    }
-
-    return result;
-}
+#fatal "sdspi_sendingAP functionality incorporated into sdspi_process_command()"
 
 
 /*** Beginheader sdspi_get_status_reg ***/
@@ -995,11 +962,6 @@ int sdspi_init_card(sd_device *sd)
     
     for (j = 0; j < 2000; j++)
     {
-        if (result = sdspi_sendingAP(sd))
-        {
-            return result;
-        }
-        
         sdspi_init_reply(&cmd_reply, ACMD41);
 #if SDFLASH_SDHC
         cmd_reply.argument = cmd8_success ? ACMD41_HCS_BIT : 0;
@@ -1085,6 +1047,8 @@ END DESCRIPTION **********************************************************/
 _sdflash_nodebug
 int sdspi_process_command(sd_device *sd, SD_CMD_REPLY * cmd_reply, int mode)
 {
+    static const unsigned char _cmd55[8] =
+        { 0xFF, 0x77, 0x00, 0x00, 0x00, 0x00, 0x65, 0xFF };
     int rc, i, j;
     unsigned short crc7, crc16;
     unsigned char request[8];
@@ -1092,8 +1056,9 @@ int sdspi_process_command(sd_device *sd, SD_CMD_REPLY * cmd_reply, int mode)
 
 #ifdef SDFLASH_VERBOSE
     if (cmd_reply) {
-        printf("%s: CMD%u 0x%08lX\n", __FUNCTION__,
-            cmd_reply->cmd, cmd_reply->argument);
+        printf("%s: %s%u 0x%08lX\n", __FUNCTION__,
+            (cmd_reply->cmd & CMD_START) ? "ACMD" : "CMD",
+            (cmd_reply->cmd & ~CMD_START), cmd_reply->argument);
     }
 #endif
 
@@ -1130,7 +1095,7 @@ int sdspi_process_command(sd_device *sd, SD_CMD_REPLY * cmd_reply, int mode)
     }
     request[6] = (crc7 << 1) | CMD_END;
     request[7] = 0xFF;
-   
+    
     rc = _SPIgetSemaphore(SPI_SD);
     if (rc)
     {   // Semaphore is being held by another device, SPI port is busy
@@ -1141,6 +1106,14 @@ int sdspi_process_command(sd_device *sd, SD_CMD_REPLY * cmd_reply, int mode)
     }
 
     SD_ENABLECS(sd->SDintf);
+    if (cmd_reply->cmd & CMD_START) {
+        // send CMD55 prefix for ACMD
+        _sdspi_write_block(_cmd55, sizeof(_cmd55), sd->port);
+        _sdspi_read_block(&r1, 1, sd->port, REPLY_TIMEOUT_MS);
+#ifdef SDFLASH_VERBOSE
+        printf("%s:   (CMD55's R1=0x%02X)\n", __FUNCTION__, r1);
+#endif
+    }
     _sdspi_write_block(request, 8, sd->port);
     rc = _sdspi_read_block(cmd_reply->reply_buffer, cmd_reply->reply_size,
         sd->port, REPLY_TIMEOUT_MS);
@@ -1512,31 +1485,20 @@ int sdspi_get_scr(sd_device *sd)
     SD_SCR_TYPE  *sd_scr;
     SD_CMD_REPLY cmd_reply;
 
-    if (result = sdspi_sendingAP(sd)) {
-         return result;
-    }
-
-    _sdspi_end_command(sd);
     sd_scr = &sd->SCR;
-
-    scr_buffer = NULL;
-    result = 0;
-
     memset(sd_scr, 0x0, sizeof(SD_SCR_TYPE));
 
     sdspi_init_reply(&cmd_reply, ACMD51);
     cmd_reply.data_size = SCR_BYTE_COUNT;
-
-    if (result = sdspi_process_command(sd, &cmd_reply, 1))
+    result = sdspi_process_command(sd, &cmd_reply, 1);
+    
+    if (result)
     {
         return result;
     }
-    else
+    else if (cmd_reply.reply)
     {
-       if (cmd_reply.reply)
-       {
-          return -EIO;
-       }
+        return -EIO;
     }
 
     scr_buffer = &cmd_reply.data_buffer[1];
@@ -2121,13 +2083,13 @@ void _sdspi_end_command(sd_device *sd)
 
 
 /*** Beginheader _sdspi_write_block ***/
-__root void _sdspi_write_block(char *buffer, unsigned int len, int port);
+__root void _sdspi_write_block(const char *buffer, unsigned int len, int port);
 /*** endheader ***/
 
 /*************************************************************************
 _sdspi_write_block
 
-SYNTAX: void _sdspi_write_block(char *buffer, unsigned int len, int port)
+SYNTAX: void _sdspi_write_block(const char *buffer, unsigned int len, int port)
 
 DESCRIPTION:   Transmits a block of data over the SPI port. This
 					function blocks until the tranmission completes.
@@ -2140,7 +2102,7 @@ PARAMETER3:		port - Base address of the SPI serial port to use
 
 **************************************************************************/
 _sdflash_nodebug
-void _sdspi_write_block(char *buffer, unsigned int len, int port)
+void _sdspi_write_block(const char *buffer, unsigned int len, int port)
 {
 #asm
 		; set up the registers
