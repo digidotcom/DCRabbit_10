@@ -17,6 +17,7 @@ sdspi_read_sector
 sdspi_write_sector
 sdspi_WriteContinue
 sdspi_notbusy
+sdspi_print_cid
 sdspi_print_dev
 sdspi_getSectorCount
 sdspi_isWriting
@@ -26,6 +27,7 @@ sdspi_init_card
 sdspi_process_command
 sdspi_get_csd
 sdspi_get_scr
+sdspi_get_cid
 sdspi_set_block_length
 sdspi_debounce
 sdspi_setLED
@@ -277,6 +279,16 @@ typedef struct sd_scr_type
    char SD_BUS_WIDTHS;
 } SD_SCR_TYPE;
 
+typedef struct sd_cid_type
+{
+   unsigned char MID;       // manufacturer ID
+   char          OID[2];    // 2-character OEM ID
+   char          PNM[5];    // 5-character product name
+   unsigned char PRV;       // product revision
+   unsigned long PSN;       // 32-bit product serial number
+   unsigned int  MDT;       // manufacturing date
+   unsigned char CRC7;      // CRC7 checksum
+} SD_CID_TYPE;
 
 typedef struct {
    // Chip select PxDR reg, pin number, control registers
@@ -1241,6 +1253,95 @@ unsigned short _sd_crc7(unsigned short crc7, unsigned char ch)
     return crc7;
 }
 
+/*** BeginHeader _sdspi_get_R2_cmd */
+int _sdspi_get_R2_cmd(sd_device *sd, SD_CMD_REPLY *cmd_reply);
+/*** EndHeader */
+_sdflash_nodebug
+int _sdspi_get_R2_cmd(sd_device *sd, SD_CMD_REPLY *cmd_reply)
+{
+    int result;
+    int j = 4;
+    
+    cmd_reply->data_size = CSD_BYTE_COUNT;
+    do {
+    	result = sdspi_process_command(sd, cmd_reply, 1);
+    } while (!result && cmd_reply->reply && --j);
+    if (j == 0) {
+       result = -EIO;
+    }
+    
+    return result;
+}
+
+/*** BeginHeader sdspi_get_cid */
+int sdspi_get_cid(sd_device *sd, SD_CID_TYPE *cid);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+sdspi_get_cid               <SDFLASH.LIB>
+
+SYNTAX: int sdspi_get_cid(sd_device *sd, SD_CID_TYPE *cid)
+
+DESCRIPTION: This function is called to execute protocol command 10 to
+             retrieve the SD card's Card IDenticiation (CID).  See
+             sdspi_print_cid() for information on parsing that structure.
+
+PARAMETER1: sd           The device structure for the SD card.
+
+PARAMETER2: cid          Structure to hold the 16-byte CID
+
+RETURN VALUE:    0                Success
+               -EIO               I/O Error
+               -EINVAL            Invalid parameter given
+               -ENOMEDIUM         No SD card in socket
+               -ESHAREDBUSY       Shared SPI port busy
+
+END DESCRIPTION **********************************************************/
+_sdflash_nodebug
+int sdspi_get_cid(sd_device *sd, SD_CID_TYPE *cid)
+{
+    int result;
+    SD_CMD_REPLY cmd_reply;
+    
+    if (cid == NULL) {
+        return -EINVAL;
+    }
+    
+    sdspi_init_reply(&cmd_reply, CMD10);
+    result = _sdspi_get_R2_cmd(sd, &cmd_reply);
+    if (result == 0) {
+        memcpy(cid, &cmd_reply.data_buffer[1], 16);
+    }
+    
+    return result;
+}
+
+/*** BeginHeader sdspi_print_cid */
+void sdspi_print_cid(const SD_CID_TYPE *cid);
+/*** EndHeader */
+/* START FUNCTION DESCRIPTION ********************************************
+sdspi_print_cid                <SDFLASH.LIB>
+
+SYNTAX: void sdspi_print_cid(const SD_CID_TYPE *cid)
+
+DESCRIPTION:	Prints parameters from the SD Card IDentification register.
+
+PARAMETER1:		cid - pointer to SD_CID_TYPE structure loaded by sdspi_get_cid().
+
+RETURN VALUE:  None
+
+END DESCRIPTION **********************************************************/
+_sdflash_nodebug
+void sdspi_print_cid(const SD_CID_TYPE *cid)
+{
+    unsigned int mdt;
+    
+    mdt = ntohs(cid->MDT);
+    printf("Manufacturer:0x%02X  OEM:'%c%c'  Product Name:'%.5s'\n",
+        cid->MID, cid->OID[0], cid->OID[1], cid->PNM);
+    printf("Product Rev:%X.%X  Serial #:0x%08lX  Mfg Date:%u/%u  CRC7:0x%02X\n",
+        cid->PRV >> 4, cid->PRV & 0x0F, ntohl(cid->PSN),
+        mdt & 0x000F, 2000 + ((mdt >> 4) & 0x00FF), cid->CRC7);
+}
 
 /* START FUNCTION DESCRIPTION ********************************************
 sdspi_get_csd               <SDFLASH.LIB>
@@ -1281,29 +1382,12 @@ int sdspi_get_csd(sd_device *sd)
     unsigned long temp, l;
 
     sd_csd = &sd->CSD;
-
-    csd_buffer = NULL;
-    result = 0;
-
     memset(sd_csd, 0x0, sizeof(SD_CSD_TYPE));
 
     sdspi_init_reply(&cmd_reply, CMD9);
-    cmd_reply.data_size = CSD_BYTE_COUNT;
-
-    j = 4;
-    do {
-    	result = sdspi_process_command(sd, &cmd_reply, 1);
-    } while (!result && cmd_reply.reply && --j);
-    if (result)
-    {
+    result = _sdspi_get_R2_cmd(sd, &cmd_reply);
+    if (result != 0) {
         return result;
-    }
-    else
-    {
-       if (cmd_reply.reply)
-       {
-          return -EIO;
-       }
     }
 
     csd_buffer = &cmd_reply.data_buffer[1];
