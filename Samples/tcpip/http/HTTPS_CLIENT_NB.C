@@ -137,9 +137,10 @@ int my_server_policy(ssl_Socket far * state, int trusted,
 	                       struct x509_certificate far * cert,
 	                       httpc_Socket far * s)
 {
+	const char far *host, *alt_name;
+	
 	// This code determines whether the hostname should be the
 	// proxy, or the origin ('real') server.
-	const char far * host;
 	if (httpc_globals.ip)
 		host = httpc_globals.proxy_hostname;
 	else
@@ -173,8 +174,18 @@ int my_server_policy(ssl_Socket far * state, int trusted,
 		printf("          Unit: %ls\n", cert->subject.ou);
 	if (cert->subject.email)
 		printf("       Contact: %ls\n", cert->subject.email);
-	printf("Server claims to be CN='%ls'\n", cert->subject.cn);
-	printf("We are looking for  CN='%ls'\n", s->hostname);
+	if ((alt_name = cert->subject_alt_name) != NULL) {
+		// Only reference Subject.CN if Subject Alternative Name not present
+		printf("Server claims to be: %ls\n", cert->subject.cn);
+	} else {
+		printf("Server claims to be: ");
+		while (*alt_name) {
+			printf("%ls ", alt_name);
+			alt_name += _f_strlen(alt_name) + 1;
+		}
+		printf("\n");
+	}
+	printf("We are looking for '%ls'\n", s->hostname);
 
 	if (x509_validate_hostname(cert, host)) {
 		printf("Certificate hostname mismatch%s!\n",
