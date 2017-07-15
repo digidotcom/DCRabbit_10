@@ -52,15 +52,10 @@
            Gmail as of the time this sample was constructed, but you may wish
            to check this if the sample seems to fail in spite of everything.
            You can override these macros in the Defines panel.
-
-        NOTE: you can also use a Hotmail/Outlook.com account by forcing the
-        Rabbit to use TLS 1.0 instead of TLS 1.2 (since Microsoft does not
-        support TLS 1.2 on their mail servers as of March 2017).
-        
-        In this case, #define POP_SERVER "pop-mail.outlook.com", and use your
-        Hotmail/Outlook.com credentials in POP_USER and POP_PASS.  You may
-        also need to enable POP access for your account in Options:
-           https://outlook.live.com/owa/#path=/options/popandimap
+        *  For Hotmail/Outlook.com, #define USE_OUTLOOK_SETTINGS, and use your
+           Hotmail/Outlook.com credentials in POP_USER and POP_PASS.  You may
+           also need to enable POP access for your account in Options:
+              https://outlook.live.com/owa/#path=/options/popandimap
         
         To date, Yahoo does not allow POP3/SMTP access with their free email
         accounts.
@@ -124,10 +119,6 @@
 #endif
 #ifndef POP_PORT
 	#define POP_PORT	995	// Port 995 used for POP3 tunneled through TLS
-#endif
-
-#if defined(USE_OUTLOOK_SETTINGS) && !defined(SSL_ALLOW_TLS10_CLIENT_FALLBACK)
-	#define SSL_ALLOW_TLS10_CLIENT_FALLBACK
 #endif
 
 /*
@@ -297,11 +288,7 @@ void main()
 
 	pop3_init(storemsg);
 
-	pop3_set_tls(
-#ifdef USE_OUTLOOK_SETTINGS
-						SSL_F_FORCE_TLS10 |     // Microsoft's servers require TLS 1.0
-#endif
-						SSL_F_REQUIRE_CERT,		// Check POP3 server certificate
+	pop3_set_tls(SSL_F_REQUIRE_CERT,		// Check POP3 server certificate
 						NULL,			// We don't have a cert to offer
 						&trusted,	// Have a trusted CA!
 						pop_server_policy,	// Test policy callback
