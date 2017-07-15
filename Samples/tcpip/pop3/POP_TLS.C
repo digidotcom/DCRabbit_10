@@ -68,9 +68,13 @@
 // #define SSL_CERT_VERBOSE and X509_VERBOSE in order to find out the
 // certificates in use.
 #ximport "../sample_certs/EquifaxSecureCA.crt"  ca_pem1
+#ximport "../sample_certs/ThawtePremiumServerCA.crt"  ca_pem2
 
-// This one for Hotmail/Outlook.com (POP3 and SMTP)
-#ximport "../sample_certs/GlobalSign Organization Validation CA - SHA256 - G2.cer" ca_pem2
+// These are for Hotmail/Outlook.com (POP3 and SMTP)
+#ximport "../sample_certs/GlobalSign Organization Validation CA - SHA256 - G2.cer" ca_pem3
+#ximport "../sample_certs/DigiCert-Global-Root-CA.cer" ca_pem4
+
+const long certs[] = { ca_pem1, ca_pem2, ca_pem3, ca_pem4 };
 
 // Uncomment the following line if you're connecting to pop-mail.outlook.com
 //#define USE_OUTLOOK_SETTINGS
@@ -269,18 +273,15 @@ void main()
 	// Can't store this on the stack (auto) since the POP client library stores
 	// a reference to it for use later.
 	static far SSL_Cert_t trusted;
-	auto int rc;
+	auto int rc, i;
 
 	_f_memset(&trusted, 0, sizeof(trusted));
-	rc = SSL_new_cert(&trusted, ca_pem1, SSL_DCERT_XIM, 0);
-	if (rc) {
-		printf("Failed to parse CA certificate 1, rc=%d\n", rc);
-		return;
-	}
-	rc = SSL_new_cert(&trusted, ca_pem2, SSL_DCERT_XIM, 1 /*append*/);
-	if (rc) {
-		printf("Failed to parse CA certificate 2, rc=%d\n", rc);
-		return;
+	for (i = 0; i < (sizeof certs / sizeof certs[0]); ++i) {
+	   rc = SSL_new_cert(&trusted, certs[i], SSL_DCERT_XIM, i > 0);
+	   if (rc) {
+	      printf("Failed to parse CA certificate %u, rc=%d\n", i + 1, rc);
+	      return;
+	   }
 	}
 
 	// Start network and wait for interface to come up (or error exit).

@@ -49,6 +49,7 @@
 #ximport "../sample_certs/ThawtePremiumServerCA.crt"  ca_pem2
 #ximport "../sample_certs/GTECyberTrustGlobalRoot.crt"  ca_pem3
 #ximport "../sample_certs/VerisignClass3PublicPrimaryCA.crt"  ca_pem4
+const long certs[] = { ca_pem1, ca_pem2, ca_pem3, ca_pem4 };
 
 #define MP_SIZE 258			// Recommended to support up to 2048-bit RSA keys.
 //#define MP_SIZE 514			// Support up to 4096-bit RSA keys.
@@ -335,32 +336,19 @@ tcp_Socket demosock;
 
 int load_certificates(void)
 {
-	int rc;
+	int rc, i;
 	// Can't store this on the stack (auto) since the HTTP client library stores
 	// a reference to it for use later.
 	static far SSL_Cert_t trusted;
 
 	// First, parse the trusted CA certificates.
 	_f_memset(&trusted, 0, sizeof(trusted));
-	rc = SSL_new_cert(&trusted, ca_pem1, SSL_DCERT_XIM, 0);
-	if (rc) {
-		printf("Failed to parse CA certificate 1, rc=%d\n", rc);
-		return rc;
-	}
-	rc = SSL_new_cert(&trusted, ca_pem2, SSL_DCERT_XIM, 1 /*append*/);
-	if (rc) {
-		printf("Failed to parse CA certificate 2, rc=%d\n", rc);
-		return rc;
-	}
-	rc = SSL_new_cert(&trusted, ca_pem3, SSL_DCERT_XIM, 1 /*append*/);
-	if (rc) {
-		printf("Failed to parse CA certificate 3, rc=%d\n", rc);
-		return rc;
-	}
-	rc = SSL_new_cert(&trusted, ca_pem4, SSL_DCERT_XIM, 1 /*append*/);
-	if (rc) {
-		printf("Failed to parse CA certificate 4, rc=%d\n", rc);
-		return rc;
+	for (i = 0; i < (sizeof certs / sizeof certs[0]); ++i) {
+	   rc = SSL_new_cert(&trusted, certs[i], SSL_DCERT_XIM, i > 0);
+	   if (rc) {
+	      printf("Failed to parse CA certificate %u, rc=%d\n", i + 1, rc);
+	      return rc;
+	   }
 	}
 	
 	// Set TLS/SSL options.  These act globally, for all HTTPS connections
