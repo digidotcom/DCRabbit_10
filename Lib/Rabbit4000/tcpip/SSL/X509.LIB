@@ -522,6 +522,7 @@ struct x509_certificate {
 	size_t cert_len;
 	const char __far * tbs_cert_start;
 	size_t tbs_cert_len;
+	char __far * subject_alt_name;
 
 } ;	// From "x509v3.h":80
 
@@ -569,6 +570,7 @@ void x509_certificate_free(struct x509_certificate __far * cert) {
 	_x509_s3_x509_free_name(&cert->subject);
 	_sys_free(cert->public_key);
 	_sys_free(cert->sign_value);
+	_sys_free(cert->subject_alt_name);
 	_sys_free(cert);
 }
 
@@ -996,6 +998,59 @@ int _x509_s3_x509_parse_ext_key_usage(struct x509_certificate __far * cert, char
 	return 0;
 }
 
+/*** BeginHeader _x509_s3_x509_parse_subj_alt_name */
+int _x509_s3_x509_parse_subj_alt_name(struct x509_certificate __far * cert,
+                                      char __far * pos, size_t len);
+/*** EndHeader */
+_x509_debug
+int _x509_s3_x509_parse_subj_alt_name(struct x509_certificate __far * cert,
+                                      char __far * pos, size_t len) {
+	struct asn1_hdr hdr;
+	char __far *end = pos + len;
+	char __far *payload, *dest;
+	int names_length;
+	
+	if (asn1_get_next(pos, len, &hdr)<0 ||
+	hdr.class!=0 ||
+	hdr.tag!=0x10 ||
+	hdr.length>len-2) {
+		_X509_PRINTF((MSG_DEBUG, "X509: Expected %s in %s; found %d tag 0x%x len %d",
+			"SEQUENCE", "SubjectAltName", hdr.class, hdr.tag, hdr.length));
+		return  -1;
+	}
+	
+	// Allocate space to hold a list of alternate names.  hdr.length will be
+	// enough space, since each name has a two-byte prefix with the class/tag
+	// and length.  We'll use one byte for a null between each entry, and
+	// an extra null at the end to terminate the list.
+	_sys_free(cert->subject_alt_name);
+	cert->subject_alt_name = dest = _sys_malloc(hdr.length);
+	if (cert->subject_alt_name == NULL) {
+		_X509_PRINTF((MSG_DEBUG, "X509: Failed to allocate memory for %s",
+		 "SubjectAltName" ));
+		return -1;
+	}
+	
+	payload = hdr.payload;
+	while (payload < end) {
+		if (asn1_get_next(payload, (size_t)(end - payload), &hdr)<0 ||
+		hdr.class!=2 ||
+		hdr.tag!=0x02) {
+			_X509_PRINTF((MSG_DEBUG, "X509: Failed to parse %s", "SubjectAltName" ));
+			return  -1;
+		}
+		_X509_PRINTF((MSG_DEBUG, "X509: SubjectAltName %.*ls", hdr.length, hdr.payload));
+		_f_memcpy(dest, hdr.payload, hdr.length);
+		dest += hdr.length;
+		*dest++ = '\0';  // null-terminate each entry
+		payload = hdr.payload + hdr.length;
+	}
+	
+	// add a second null to terminate the list
+	*dest++ = '\0';
+	return 0;
+}
+
 /*** BeginHeader _x509_s3_x509_parse_ext_basic_constraints */
 // From "x509v3.c":674
 int _x509_s3_x509_parse_ext_basic_constraints(struct x509_certificate __far * cert,
@@ -1078,6 +1133,8 @@ int _x509_s3_x509_parse_extension_data(struct x509_certificate __far * cert, str
 	switch ((int)(oid->oid[3])) {
 		case 15:
 		return _x509_s3_x509_parse_ext_key_usage(cert, pos, len);
+		case 17:
+		return _x509_s3_x509_parse_subj_alt_name(cert, pos, len);
 		case 19:
 		return _x509_s3_x509_parse_ext_basic_constraints(cert, pos, len);
 		default:
@@ -2063,41 +2120,41 @@ void __x509_initStatics() {
 	}
 }
 
-/*** BeginHeader x509_validate_hostname */
+/*** BeginHeader x509_compare_hostname, x509_validate_hostname */
+int x509_compare_hostname(const char __far *cert_name, const char __far *hostname);
 int x509_validate_hostname(const struct x509_certificate __far *cert,
 	const char __far *hostname);
 /*** EndHeader */
 /* START FUNCTION DESCRIPTION ********************************************
-x509_validate_hostname							   <X509.LIB>
+x509_compare_hostname							   <X509.LIB>
 
-SYNTAX:  int x509_validate_hostname(const struct x509_certificate far *cert,
+SYNTAX:  int x509_compare_hostname(const char __far *cert_name,
                                  const char far *hostname);
 
-DESCRIPTION: See if a hostname is covered by the Subject Common Name (CN)
-             stored in a certificate.  Handles wildcard matching (*.example.com
-             valid for example.com, foo.example.com but not foo.bar.example.com)
-             and securing the root domain for the www-hostname (www.example.com
-             is a valid CN for hostname example.com and vice versa).
+DESCRIPTION: See if a hostname is covered by a name listed in the certificate
+             (either the Subject Common Name (CN) or one of the Subject
+             Alternative Names (SANs)).
+             
+             Helper function for x509_validate_hostname().  See that function
+             for additional details.
 
-PARAMETER 1: Certificate object
+PARAMETER 1: Subject Common Name or Subject Alternative Name from a certificate.
 
 PARAMETER 2: Hostname to verify
 
-RETURN VALUE: 0: Certificate is valid for given hostname.
-              -EINVAL: NULL passed as one of the two parameters, or certificate
-                       does not have a subject.cn.
+RETURN VALUE: 0: Certificate's hostname is valid for given hostname.
+              -EINVAL: NULL passed as one of the two parameters.
               -NETERR_HOST_REFUSED: Certificate is not valid for given hostname.
 
 END DESCRIPTION **********************************************************/
 
 _x509_debug
-int x509_validate_hostname(const struct x509_certificate __far *cert,
-	const char __far *hostname)
+int x509_compare_hostname(const char __far *cert_name, const char __far *hostname)
 {
-	const char __far *cn, *cn_end, *hostname_end;
+	const char __far *cn_end, *hostname_end;
    int t;
    
-	if (cert == NULL || cert->subject.cn == NULL || hostname == NULL)
+	if (cert_name == NULL || hostname == NULL)
    {
    	return -EINVAL;
    }
@@ -2105,14 +2162,13 @@ int x509_validate_hostname(const struct x509_certificate __far *cert,
       Starting at the ends of the strings, compare all characters until finding
       a mismatch or reaching the start of one or both strings.
    */
-   cn = cert->subject.cn;
-   cn_end = _f_strchr(cn, '\0') - 1;
+   cn_end = _f_strchr(cert_name, '\0') - 1;
    hostname_end = _f_strchr(hostname, '\0') - 1;
       
-   _X509_PRINTF((MSG_DEBUG, "X509: compare hostname '%ls' to CN '%ls'\n",
-   	hostname, cn));
+   _X509_PRINTF((MSG_DEBUG, "X509: compare hostname '%ls' to cert's '%ls'",
+   	hostname, cert_name));
    
-   while (cn_end >= cn && hostname_end >= hostname && *cn_end == *hostname_end)
+   while (cn_end >= cert_name && hostname_end >= hostname && *cn_end == *hostname_end)
    {
    	--hostname_end;
       --cn_end;
@@ -2122,28 +2178,28 @@ int x509_validate_hostname(const struct x509_certificate __far *cert,
    // one or both of them point before the start of the string.
    if (hostname_end < hostname)
    {
-   	if (cn_end < cn)		// exact match
+   	if (cn_end < cert_name)		// exact match
       {
-      	_X509_PRINTF((MSG_DEBUG, "\texact match\n"));
+      	_X509_PRINTF((MSG_DEBUG, "\texact match"));
       	return 0;
       }
-      if (_f_memcmp(cn, "*.", 2) == 0 && cn_end == &cn[1])
+      if (_f_memcmp(cert_name, "*.", 2) == 0 && cn_end == &cert_name[1])
       {
-      	_X509_PRINTF((MSG_DEBUG, "\tCN *.example.com valid for example.com\n"));
+      	_X509_PRINTF((MSG_DEBUG, "\tcert *.example.com valid for example.com"));
       	return 0;
       }
-      if (_f_memcmp(cn, "www.", 4) == 0 && cn_end == &cn[3])
+      if (_f_memcmp(cert_name, "www.", 4) == 0 && cn_end == &cert_name[3])
       {
-      	_X509_PRINTF((MSG_DEBUG, "\tCN www.example.com valid for example.com\n"));
+      	_X509_PRINTF((MSG_DEBUG, "\tcert www.example.com valid for example.com"));
       	return 0;
       }
    }
 
-   if (cn_end < cn)
+   if (cn_end < cert_name)
    {
       if (_f_memcmp(hostname, "www.", 4) == 0 && hostname_end == &hostname[3])
       {
-      	_X509_PRINTF((MSG_DEBUG, "\tCN example.com valid for www.example.com\n"));
+      	_X509_PRINTF((MSG_DEBUG, "\tcert example.com valid for www.example.com"));
       	return 0;
       }
    }
@@ -2155,24 +2211,73 @@ int x509_validate_hostname(const struct x509_certificate __far *cert,
       }
       if (hostname_end < hostname)
       {
-      	_X509_PRINTF((MSG_DEBUG, "\tCN *.example.com valid for foo.example.com\n"));
+      	_X509_PRINTF((MSG_DEBUG, "\tcert *.example.com valid for foo.example.com"));
       	return 0;
       }
       // here because *.example.com is NOT valid for foo.bar.example.com
       // fall through to failure case
    }
    
-   _X509_PRINTF((MSG_DEBUG, "\tINVALID\n"));
+   _X509_PRINTF((MSG_DEBUG, "\tINVALID"));
    return -NETERR_HOST_REFUSED;
 }
 
-/*** BeginHeader _test_x509_validate_hostname */
-int _test_x509_validate_hostname(int verbose);
-/*** EndHeader */
-typedef  _x509_validate_hostname_test_t;
+/* START FUNCTION DESCRIPTION ********************************************
+x509_validate_hostname							   <X509.LIB>
 
+SYNTAX:  int x509_validate_hostname(const struct x509_certificate far *cert,
+                                 const char far *hostname);
+
+DESCRIPTION: See if a hostname is covered by the Subject Alternative Names
+             (SANs) (or the Subject Common Name (CN) if SANs aren't present)
+             stored in a certificate.
+             
+             Handles wildcard matching (*.example.com valid for example.com,
+             foo.example.com but not foo.bar.example.com) and securing the
+             root domain for the www-hostname (subject name www.example.com
+             is valid for hostname example.com and vice versa).
+
+PARAMETER 1: Certificate object
+
+PARAMETER 2: Hostname to verify
+
+RETURN VALUE: 0: Certificate is valid for given hostname.
+              -EINVAL: NULL passed as one of the two parameters, or certificate
+                       does not have a subject.cn.
+              -NETERR_HOST_REFUSED: Certificate is not valid for given hostname.
+
+END DESCRIPTION **********************************************************/
 _x509_debug
-int _test_x509_validate_hostname(int verbose)
+int x509_validate_hostname(const struct x509_certificate __far *cert,
+	const char __far *hostname)
+{
+	const char __far *alt_name;
+   int retval = -NETERR_HOST_REFUSED;
+   
+	if (cert == NULL) {
+   	return -EINVAL;
+   }
+   
+   // Per RFC 6125 the validator must use SAN if present, otherwise it can check CN.
+   alt_name = cert->subject_alt_name;
+   if (alt_name == NULL) {
+   	retval = x509_compare_hostname(cert->subject.cn, hostname);
+   } else {
+   	// Try all names in SubjectAltName.
+   	while (retval == -NETERR_HOST_REFUSED && *alt_name) {
+   		retval = x509_compare_hostname(alt_name, hostname);
+   		alt_name += _f_strlen(alt_name) + 1;  // point to next name
+   	}
+   }
+   
+   return retval;
+}
+
+/*** BeginHeader _test_x509_compare_hostname */
+int _test_x509_compare_hostname(int verbose);
+/*** EndHeader */
+_x509_debug
+int _test_x509_compare_hostname(int verbose)
 {
 	static const struct {
 	   char far *cn;
@@ -2194,20 +2299,18 @@ int _test_x509_validate_hostname(int verbose)
 	   { "*.example.com", "foo.bar.example.com", -NETERR_HOST_REFUSED },
 	};
 	int TEST_COUNT = (sizeof test_case / sizeof test_case[0]);
-	struct x509_certificate cert;
 	int i, result, failures = 0;
 
    if (verbose) printf("%s: running %u tests\n", __FUNCTION__, TEST_COUNT);
    
-   if (x509_validate_hostname(NULL, "foo") != -EINVAL)
+   if (x509_compare_hostname(NULL, "foo") != -EINVAL)
    {
       ++failures;
       if (verbose) printf("FAIL test 0: NULL cert should return -EINVAL\n");
    }
    for (i = 0; i < TEST_COUNT; ++i)
    {
-   	cert.subject.cn = test_case[i].cn;
-      result = x509_validate_hostname(&cert, test_case[i].hostname);
+      result = x509_compare_hostname(test_case[i].cn, test_case[i].hostname);
       if (result != test_case[i].expected_result)
       {
       	++failures;
