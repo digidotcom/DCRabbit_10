@@ -166,7 +166,7 @@ int my_server_policy(ssl_Socket far * state, int trusted,
 		printf("          Unit: %ls\n", cert->subject.ou);
 	if (cert->subject.email)
 		printf("       Contact: %ls\n", cert->subject.email);
-	if ((alt_name = cert->subject_alt_name) != NULL) {
+	if ((alt_name = cert->subject_alt_name) == NULL) {
 		// Only reference Subject.CN if Subject Alternative Name not present
 		printf("Server claims to be: %ls\n", cert->subject.cn);
 	} else {
