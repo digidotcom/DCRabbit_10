@@ -47,6 +47,11 @@
    included here to make initial formatting of preformatted commercial
    media easier for the Rabbit user.
 
+   Note that default settings in Lib/Rabbit4000/BIOSLIB/fatconfig.lib
+   impose a limit of 2 partitions mounted at any one time.  If you want
+   to format all 4 primary partitions on a device, you need to add
+   "FAT_MAXPARTITIONS=4" to your Project Options.
+
 ************************************************************************/
 
 // Map program to xmem if not compiling to separate I&D space.

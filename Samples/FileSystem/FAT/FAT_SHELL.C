@@ -28,6 +28,11 @@
    a prompt will be presented asking permission to proceed.  Formatting
    of partitions (formatted or unformatted) is done through the shell's
    format command.
+   
+   Note that default settings in Lib/Rabbit4000/BIOSLIB/fatconfig.lib
+   impose a limit of 2 partitions mounted at any one time.  If you want
+   to mount all 4 primary partitions on a device, you need to add
+   "FAT_MAXPARTITIONS=4" to your Project Options.
 
 ************************************************************************/
 
