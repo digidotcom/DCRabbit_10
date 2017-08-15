@@ -44,8 +44,7 @@
 
 // Import the certificate files.  These are the CAs used at the time of writing
 // this sample.  It is subject to change (beyond Digi's control).  You can
-// #define SSL_CERT_VERBOSE and X509_VERBOSE in order to find out the
-// certificates in use.
+// #define X509_CHAIN_VERBOSE in order to find out the certificates in use.
 
 #ximport "../sample_certs/EquifaxSecureCA.crt"  ca_pem1
 #ximport "../sample_certs/ThawtePremiumServerCA.crt"  ca_pem2
@@ -95,27 +94,23 @@ const long certs[] = { ca_pem1, ca_pem2, ca_pem3, ca_pem4 };
 /*
  * Uncomment these macros to enable single-stepping and debug messages.
  */
-/*
-#define HTTPC_VERBOSE
+
+//#define HTTPC_VERBOSE
 //#define URL_VERBOSE
-#define SSL_SOCK_VERBOSE
+//#define SSL_SOCK_VERBOSE
 //#define _SSL_PRINTF_DEBUG 1
-#define SSL_CERT_VERBOSE
+//#define SSL_CERT_VERBOSE
+#define X509_CHAIN_VERBOSE
 //#define X509_VERBOSE
 
-#define DCRTCP_DEBUG
-#define HTTPC_DEBUG
+//#define DCRTCP_DEBUG
+//#define HTTPC_DEBUG
 //#define URL_DEBUG
 //#define X509_DEBUG
-#define RSA_DEBUG
-#define SSL_CERT_DEBUG
-#define SSL_TPORT_DEBUG
-#define SSL_SOCK_DEBUG
-
-#define _MALLOC_AUDIT
-
-
-*/
+//#define RSA_DEBUG
+//#define SSL_CERT_DEBUG
+//#define SSL_TPORT_DEBUG
+//#define SSL_SOCK_DEBUG
 
 ///// End of Configuration Options /////
 
