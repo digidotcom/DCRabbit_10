@@ -2,6 +2,30 @@
    README for Dynamic C Version 10.72C
 *****************************************************************
 
+- Adds support for RCM4320 variant -- an RCM4310 with 1MB of SRAM
+  for firmware (instead of 512KB) and a 4MB serial flash for storage
+  (instead of 1MB).
+
+- Updated sdflash.lib to support SDHC cards from 4GB to 32GB.  Note
+  that Dynamic C still does not support FAT32.  When using SDHC cards
+  you must format them on the Rabbit with up to four FAT16 partitions,
+  but you can still read and write them on Mac/Windows/Linux.
+  Email Jim.Pause@digi.com if interested in FAT32 support in Dynamic C.
+
+- Updated FAT16.lib to work on SDHC cards (larger than 2GB).
+
+- Updated TLS to send Server Name Indication (SNI) in ClientHello.
+  Includes updates to HTTP, SMTP and POP3 client libraries.
+
+- Updated X.509 certificate handling to process subjectAltName
+  extension, allowing for improved hostname matching in TLS client
+  connections.
+
+- Defined a CC_REV macro as 'C' for use in compiler version checks.
+
+- Added RCM6xxx support for Panel-Mount Keypad/Display Unit (Digi part
+  number 20-101-0502).
+
 - Adds support for SHA384/SHA512 hashes:
   - New library and updated sample.
   - TLS update to support for SHA384 and SHA512 hashes.
