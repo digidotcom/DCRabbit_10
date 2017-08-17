@@ -16,7 +16,7 @@
 /**************************************************************
   FAT_HOT_SWAP_SD.c
 
-  Requires a core module with SD interface (RCM4300 or RCM4310).
+  Requires a core module with SD interface (RCM4300 Series).
 
   Demonstrate hot swapping an SD card.
 

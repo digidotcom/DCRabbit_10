@@ -148,9 +148,6 @@ int download( char *url, char *localfile)
 	http2fat_t	dl;
 	int 			result;
 
-	// initialize tcp_Socket structure before use
-	memset( &demosock, 0, sizeof(demosock));
-
    result = http2fat_init (&dl, &demosock, url, localfile);
 
    if (result)
@@ -190,6 +187,9 @@ void main()
 	int result;
 	char url[128];
 	char localfile[128];
+
+	// initialize tcp_Socket structure before use
+	memset(&demosock, 0, sizeof(demosock));
 
 	printf ("http2fat sample\n\n");
 

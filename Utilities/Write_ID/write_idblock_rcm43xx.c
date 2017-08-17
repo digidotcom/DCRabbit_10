@@ -77,6 +77,44 @@
 	   _DC_MD2_SPEED_=0x37
 	   _DC_MD2_MBC_=0x45
 
+	For an RCM4320 add:
+	   _BOARD_TYPE_=RCM4320
+	   _DC_CLK_DBL_=1
+	   _DC_BRD_OPT0_=0x20
+	   _DC_DFLASH0_=0x16011F34
+	   _DC_MD0_=0x1
+	   _DC_MD0_ID_=0x1F34
+	   _DC_MD0_TYPE_=0x2
+	   _DC_MD0_SIZE_=0x400
+	   _DC_MD0_SECSIZE_=0x210
+	   _DC_MD0_SECNUM_=0x2000
+	   _DC_MD0_SPEED_=0x0
+	   _DC_MD0_MBC_=0x0
+	   _DC_MD2_=0x1
+	   _DC_MD2_ID_=0x0
+	   _DC_MD2_TYPE_=0x0
+	   _DC_MD2_SIZE_=0x80
+	   _DC_MD2_SECSIZE_=0x0
+	   _DC_MD2_SECNUM_=0x0
+	   _DC_MD2_SPEED_=0xF
+	   _DC_MD2_MBC_=0xC0
+	   _DC_MD3_=0x1
+	   _DC_MD3_ID_=0x0
+	   _DC_MD3_TYPE_=0x0
+	   _DC_MD3_SIZE_=0x80
+	   _DC_MD3_SECSIZE_=0x0
+	   _DC_MD3_SECNUM_=0x0
+	   _DC_MD3_SPEED_=0x37
+	   _DC_MD3_MBC_=0x45
+	   _DC_MD4_=0x1
+	   _DC_MD4_ID_=0x0
+	   _DC_MD4_TYPE_=0x0
+	   _DC_MD4_SIZE_=0x80
+	   _DC_MD4_SECSIZE_=0x0
+	   _DC_MD4_SECNUM_=0x0
+	   _DC_MD4_SPEED_=0xF
+	   _DC_MD4_MBC_=0xC6
+
 	If an RCM4310 core is to be programmed as a BL4S200 SBC topping, uncomment
 	the wib_addMacro() function call line in the main() function's RCM4310
 	conditional code section.
@@ -129,7 +167,7 @@
 	area size.
 */
 
-// edit the last three bytes of the newMAC array to set the unique MAC address
+// Update newMAC to set the unique MAC address, matching the device's sticker.
 const char newMAC[6] = { 0x00, 0x90, 0xC2,
                          0x00, 0x00, 0x00 };
 
@@ -178,6 +216,9 @@ void main(void)
 	// if programming an RCM4310 core as a BL4S200 SBC topping,
 	//  uncomment the following line to add the necessary system macro
 //	wib_addMacro(build, "MB_TYPE", 0x0100);
+#elif RCM4320 == _BOARD_TYPE_
+	// add RCM4320 specific, fixed information
+	wib_addRCM4320Info(build);
 #else	// RCM4300 == _BOARD_TYPE_
 	#fatal "This sample does not support the current _BOARD_TYPE_ definition."
 #endif	// RCM4300 == _BOARD_TYPE_

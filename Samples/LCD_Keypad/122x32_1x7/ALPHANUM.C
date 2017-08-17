@@ -19,8 +19,6 @@
 	Sample program to demonstrate how you can create messages with the
 	keypad and then display them on the LCD display.
 
-   NOTE: Not currently supported on RCM4xxx modules.
-
 	Instructions:
 	1. Compile and run this program.
 	2. Follow the instructions on the LCD display.
@@ -28,8 +26,14 @@
 ***************************************************************************/
 #class auto
 
-#if CPU_ID_MASK(_CPU_ID_) >= R4000
-#fatal "This sample is not currently supported by Rabbit 4000 based products."
+#define USE_DISPLAY_KEYPAD
+#define PORTA_AUX_IO
+#if RCM6700_SERIES
+	#use "RCM67xx.LIB"
+#elif RCM6600W_SERIES
+	#use "RCM66xxW.LIB"
+#else
+	#fatal "Include platform library with necessary macros."
 #endif
 
 #memmap xmem  // Required to reduce root memory usage

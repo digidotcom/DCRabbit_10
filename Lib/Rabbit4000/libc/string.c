@@ -206,7 +206,6 @@ __nodebug
 char *_n_strcpy(char *dst, const char *src)
 {
 	#asm
-	ld		bc, hl					; BC = HL = dst
 	ld		de, hl					; DE = dst
 	ld		hl, (sp+@sp+src)		; HL = src
 	xor	a							; A = 0
@@ -215,7 +214,7 @@ char *_n_strcpy(char *dst, const char *src)
 	ldi								; *dst++ = *src++ (strcpy includes nul terminator)
 	jr		nz, .cpy					; if no (Zero flag reset), go copy another byte
 
-	ld		hl, bc					; HL = dst (restore the return value)
+	ld		hl, (sp+@sp+dst)		; HL = dst (restore the return value)
 	#endasm
 	// char * result is returned in HL
 }

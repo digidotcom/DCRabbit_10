@@ -1627,7 +1627,7 @@ _fi_running_length::
 		dw	(_DC_MB_TYPE_ & 0x0000FFFFul)				; lower word of MB_TYPE macro
 		dw (_DC_MB_TYPE_ >> 16)							; upper word of MB_TYPE macro
 
-		db 'B'								; compiler revision, first added in 10.72B
+		db CC_REV							; compiler revision, first added in 10.72B
 
 		; reserved, 10 bytes reserved for Digi's use
 		db 0, 0, 0, 0, 0, 0, 0, 0, 0, 0

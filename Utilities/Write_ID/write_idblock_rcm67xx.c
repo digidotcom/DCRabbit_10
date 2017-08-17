@@ -87,8 +87,8 @@
 	   _DC_MD0_ID_=0x1F34
 	   _DC_MD0_TYPE_=0x2
 	   _DC_MD0_SIZE_=0x400
-	   _DC_MD0_SECSIZE_=0x108
-	   _DC_MD0_SECNUM_=0x1000
+	   _DC_MD0_SECSIZE_=0x210
+	   _DC_MD0_SECNUM_=0x2000
 	   _DC_MD0_SPEED_=0x0
 	   _DC_MD0_MBC_=0x0
 	   _DC_MD2_=0x1
@@ -117,8 +117,8 @@
 	   _DC_MD0_ID_=0x1F34
 	   _DC_MD0_TYPE_=0x2
 	   _DC_MD0_SIZE_=0x400
-	   _DC_MD0_SECSIZE_=0x108
-	   _DC_MD0_SECNUM_=0x1000
+	   _DC_MD0_SECSIZE_=0x210
+	   _DC_MD0_SECNUM_=0x2000
 	   _DC_MD0_SPEED_=0x0
 	   _DC_MD0_MBC_=0x0
 	   _DC_MD2_=0x1
@@ -262,7 +262,7 @@
 	area size.
 */
 
-// edit the last three bytes of the newMAC array to set the unique MAC address
+// Update newMAC to set the unique MAC address, matching the device's sticker.
 const char newMAC[6] = { 0x00, 0x90, 0xC2,
                          0x00, 0x00, 0x00 };
 

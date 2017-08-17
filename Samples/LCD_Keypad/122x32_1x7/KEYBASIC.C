@@ -16,8 +16,6 @@
  /***************************************************************************
 	keybasic.c
 
-   NOTE: Not currently supported on RCM4xxx modules.
-
 	Sample program to demonstrate the keypad functions. This program
 	will display the following in the STDIO display window:
 
@@ -35,8 +33,14 @@
 #class auto		// Change default: local vars now stored on stack.
 #memmap xmem  // Required to reduce root memory usage
 
-#if CPU_ID_MASK(_CPU_ID_) >= R4000
-#fatal "This sample is not currently supported by Rabbit 4000 based products."
+#define USE_DISPLAY_KEYPAD
+#define PORTA_AUX_IO
+#if RCM6700_SERIES
+	#use "RCM67xx.LIB"
+#elif RCM6600W_SERIES
+	#use "RCM66xxW.LIB"
+#else
+	#fatal "Include platform library with necessary macros."
 #endif
 
 void main (	void	)

@@ -160,6 +160,17 @@ END DESCRIPTION **********************************************************/
                                  //  sectors) for sector based FTL's
                                  //  Must be a power of 2
 
+// Min/max cluster counts and FAT16 sector count per Microsoft:
+//   https://technet.microsoft.com/en-us/library/cc776720(v=ws.10).aspx
+#define FAT16_MAX_CLUSTERS 65524
+#define FAT32_MIN_CLUSTERS 65527
+
+// Maximum partition based on 32KB cluster size, 512 byte sector size.
+// Calculation underestimates actual maximum, since it doesn't take into
+// account space for reserved sectors, FATs and root directory.  Changes
+// here require changes to sectors/cluster calculation in fat_FormatPartition().
+#define FAT16_MAX_PARTSECSIZE (FAT16_MAX_CLUSTERS * 32UL * 1024 / 512)
+
 /***********************************************************************/
 /* END OF CONFIGURATION - END OF CONFIGURATION - END OF CONFIGURATION  */
 /***********************************************************************/
@@ -274,6 +285,11 @@ END DESCRIPTION **********************************************************/
 #define FAT_BRK_END		-1		// Break file at EOF position
 #define FAT_BRK_POS		-2    // Break file at current position pointer
 
+/* Note that FAT_MAX_PARTITIONS defines the number of supported partitions
+	on a device.  The similarly-named macro FAT_MAXPARTITIONS limits the
+	number of partitions mounted at any one time, and because it's used in
+	the BIOS you must define it in your Project Options.
+*/
 #ifndef FAT_MAX_PARTITIONS
  #define FAT_MAX_PARTITIONS  4  /* Allow all primary partitions if unstated */
 #endif
@@ -295,6 +311,7 @@ END DESCRIPTION **********************************************************/
 
 #define FAT_BADMARK  0xFFF7   /* Bad cluster marker for FAT table */
 #define FAT_EOC      0xFFFF   /* End of chain marker for FAT table */
+// 32TODO: add markers for FAT32
 
 #ifndef EDRVBUSY              // For backwards compatibility with DC9.01
   #define  EDRVBUSY       309 // Driver level is busy, new write not started
@@ -332,6 +349,7 @@ typedef struct
 	unsigned long cluster;			/* temporary cluster */
 	unsigned long offset;	 		/* offset within cluster */
 
+	// 32-bit sector * 512bytes/sector = 2 terabytes, beyond SDHC max of 32GB
 	unsigned long sector;			/* sector of entry/file (for access speed) */
 	unsigned int sofs;				/* sector offset */
 
@@ -508,9 +526,11 @@ typedef struct _fat_part
 		#define FAT_PART_ALLOC    0x4000 // Flag to show allocation in progress
 		#define FAT_PART_DEL      0x8000 // Flag to show deletion in progress
    int opcount;						// Operational counter
+	// 32TODO: clust1 and clust2 need to be uint32_t for FAT32 partition?
 	unsigned int  clust1;			// begining cluster values during allocation
 	unsigned int  clust2;			// read buffer for clusters during allocation
    void *active;						// Pointer to active operation structure
+	// 32TODO: linkclust needs to be uint32_t for FAT32
 	unsigned int  linkclust;		// Cluster to link new block to
 
 	mbr_part *mpart;					/* mbr partition record for this partition */
@@ -519,14 +539,16 @@ typedef struct _fat_part
 }  fat_part;
 
 // BPB data section, at the begining of each partition.  62 bytes.
+// 32TODO: update for FAT32 differences
 typedef struct
 {
 	char		jmpBoot[3];		// Jump instuction to Boot Code
-	char		OEMname[8];		// OS Name string
+	char		OEMname[8];		// OS Name string (typically "MSWIN4.1")
    word		byte_sec;		// Bytes per sector
    char		sec_clust;		// Sectors per cluster
    word		res_sec;			// Reserved sector count (FAT12/16=1 FAT32=32)
    char		fat_cnt;			// Number of FAT tables
+   // 32TODO: FAT16 uses 512, for FAT32 root_cnt must be 0.
    word		root_cnt;		// Number of Entries in Root Directory
    word		sec_cnt16;		// Total Number of Sectors (if 0, look to sec_cnt32)
    char		media;			// Media type (0xF8 = fixed, 0xF0 = removable)
@@ -535,12 +557,16 @@ typedef struct
    word		heads;			// Number of heads for INT13 (Not used here)
    unsigned long hid_sec;	// Count of hidden sectors for INT13 (Not used here)
    unsigned long sec_cnt32;  // Total Number of Sectors (if 0, see sec_cnt16)
+	// structure for FAT12 and FAT16
    char		drv_num;			// Drive number for INT13 (0x80 = hard drive)
    char		reserved;		// Reserved for use by WIN-NT
    char		boot_sig;		// Extended boot signature (set to 0x29)
    unsigned long vol_ID;   // Volume serial number
 	char		vol_label[11];	// Volume label
 	char		fs_type[8];		// File system type "FAT12   " or "FAT16   "
+	// 32TODO: add alternate structure with FAT32 entries, _fat_bpb32 or union
+	// of two structures, one for fat16 and one for fat32 (help identify
+	// references to FAT12/FAT16 entries that need updating).
 } _fat_bpb;
 
 // Directory entry mapping, as it appears on disk.  32 bytes.
@@ -566,13 +592,6 @@ typedef struct
    word		fstClustLo;		// Lo word of first cluster
    unsigned long fileSize;	// EOF position
 } fat_dirent;
-
-#define _fat_cUint2Ulong(buf, L) (*(unsigned long *)(L) = *(word *)(buf))
-#define _fat_cUlong2Ulong(buf,L) (*(unsigned long *)(L)=*(unsigned long *)(buf))
-#define _fat_cUint2Uint(buf, u) (*(word *)(u) = *(word *)(buf))
-#define _fat_Uint2Ulongc(buf, i) (*(unsigned long *)(buf) = (word)(i))
-#define _fat_Ulong2Ulongc(buf, L) (*(unsigned long *)(buf) = (unsigned long)(L))
-#define _fat_Uint2Uintc(buf, i) (*(word *)(buf) = (word)(i))
 
 #use "fat_config.lib"		// FAT (driver and devices) configuration library
 #use "fatftc.lib"				// Write-thru cache library
@@ -643,6 +662,89 @@ __debug void _fat_DumpBuf( __far char * sbuf )
    return;
 }
 
+/*** BeginHeader _fat_dump_mbr_part */
+void _fat_dump_mbr_part(const mbr_part *p);
+/*** EndHeader */
+#define _mpd_int(x)  printf(#x ": %u\n", p-> ## x)
+#define _mpd_long(x) printf(#x ": %lu\n", p-> ## x)
+void _fat_dump_mbr_part(const mbr_part *p)
+{
+	printf("-mbr_part %p\n", p);
+	
+	_mpd_int(bootflag);
+	_mpd_int(starthead);
+	_mpd_int(startseccyl);
+	_mpd_int(parttype);
+	_mpd_int(endhead);
+	_mpd_int(endseccyl);
+	
+	_mpd_long(startsector);
+	_mpd_long(partsecsize);
+
+	_mpd_int(status);
+}
+#undef _mpd_int
+#undef _mpd_long
+
+/*** BeginHeader _fat_dump_mbr_dev */
+void _fat_dump_mbr_dev(const mbr_dev *d);
+/*** EndHeader */
+#define _mdd_int(x)  printf(#x ": %u\n", d-> ## x)
+#define _mdd_long(x) printf(#x ": %lu\n", d-> ## x)
+void _fat_dump_mbr_dev(const mbr_dev *d)
+{
+	printf("-mbr_dev %p\n", d);
+
+	_mdd_long(seccount);
+	_mdd_int(heads);
+	_mdd_int(cylinder);
+	_mdd_int(sec_track);
+	_mdd_int(byte_sec);
+	_mdd_int(byte_page);
+	_mdd_int(sec_block);
+	_mdd_int(dev_num);
+	_mdd_int(ftc_dev);
+	_mdd_int(ftl_dev_idx);
+}
+#undef _mdd_int
+#undef _mdd_long
+
+/*** BeginHeader _fat_dump_fat_part */
+void _fat_dump_fat_part(const fat_part *p);
+/*** EndHeader */
+#define _fpd_int(x)  printf(#x ": %u\n", p-> ## x)
+#define _fpd_long(x) printf(#x ": %lu\n", p-> ## x)
+void _fat_dump_fat_part(const fat_part *p)
+{
+	printf("-fat_part %p\n", p);
+	
+	_fpd_int(sec_clust);
+	_fpd_int(fat_cnt);
+	_fpd_int(fat_len);
+	_fpd_int(root_cnt);
+	_fpd_int(res_sec);
+	_fpd_int(byte_sec);
+	
+	_fpd_long(sec_fat);
+	_fpd_long(serialnumber);
+	_fpd_long(totcluster);
+	_fpd_long(badcluster);
+	_fpd_long(freecluster);
+	_fpd_long(nextcluster);
+	_fpd_long(fatstart);
+	_fpd_long(rootstart);
+	_fpd_long(datastart);
+	_fpd_long(clustlen);
+
+	_fpd_int(type);
+	_fpd_int(ftc_prt);
+	_fpd_int(pnum);
+	
+	_fat_dump_mbr_part(p->mpart);
+	_fat_dump_mbr_dev(p->dev);
+}
+#undef _fpd_int
+#undef _fpd_long
 
 /*** BeginHeader _fat_Clust2Dir */
 int _fat_Clust2Dir( unsigned char *, unsigned long );
@@ -720,6 +822,7 @@ _fat_debug long _fat_table_update(fat_part *part, unsigned long clust,
 	unsigned ofs, i, s;
    unsigned long sec;
 
+   // 32TODO: shift by 2 if part->??? indicates FAT32?  And right shift below?
    ofs = (unsigned)clust << 1;
    s = part->byte_sec;
    ofs &= s - 1;               // Calc offset of requested cluster entry
@@ -734,6 +837,7 @@ _fat_debug long _fat_table_update(fat_part *part, unsigned long clust,
    }
 
    // *state not zero, update FAT table entry with link in part->clust1
+   // 32TODO: for FAT32, read current value and keep upper 4 bits when writing
    if ( ( rc = fatftc_write( part->ftc_prt, sec, ofs, 2,
                paddr(&part->clust1), FAT_BLOCK_FLAGS ) ) != 2 ) {
       return rc;
@@ -765,6 +869,8 @@ RETURN VALUE:	Offset from starting search cluster to the first free
 
 END DESCRIPTION **********************************************************/
 
+// 32TODO: create version for FAT32 that uses 32-bit clusters; remember
+// to ignore upper four bits when reading cluster.
 #asm __nodebug
 _fat_xfind_free::
 		ld		hl, (SP+2+4)		; HL = len
@@ -816,6 +922,8 @@ RETURN VALUE:	length of contiguous free cluster entries in bytes
 
 *************************************************************************/
 
+// 32TODO: create version for FAT32 that uses 32-bit clusters; remember
+// to ignore upper four bits when reading cluster.
 #asm __nodebug
 _fat_xnull_len::
 		ld		hl, (SP+2+4)		; HL = len
@@ -866,6 +974,8 @@ RETURN VALUE:	count of free cluster entries found in search range
 
 *************************************************************************/
 
+// 32TODO: create version for FAT32 that uses 32-bit clusters; remember
+// to ignore upper four bits when reading cluster.
 #asm __nodebug
 _fat_xcount_free::
 		ld		hl, (SP+2+4)		; HL = len
@@ -906,6 +1016,7 @@ int _fat_new_clust( fat_part *, unsigned long, unsigned long *, int );
 #define FAT_NC_LINK			FAT_PART_ALLOC+6	// Link new cluster to existing chain
 #define FAT_NC_ERROR			FAT_PART_ALLOC+7 // Error occured, rollback transaction
 
+// 32TODO: lots of updates throughout
 _fat_debug int _fat_new_clust( fat_part *part, unsigned long clust,
 											unsigned long *n_clust, int count )
 {
@@ -914,10 +1025,13 @@ _fat_debug int _fat_new_clust( fat_part *part, unsigned long clust,
    auto int y;        			// Temp storage
 	auto unsigned x;           // Temp storage
    auto long cl;              // Cluster link temp storage
+   // 32TODO: update for 32-bit cluster ID, but also investigate impact
+   // on "fixed variable locations" if we change its size.
 	auto unsigned myclust;     // Cluster value for current position
    auto int z;
 	auto int rc;               // Return codes and temp storage
 // End of fixed variable locations
+	// 32TODO: increase <allocated> to allow more than 65,536 clusters
    auto int allocated;			// Counts number of clusters allocated so far
 	auto int ofs;         		// Offset in current sector
    auto unsigned fat_sector;  // Sector within the FAT partition
@@ -925,6 +1039,7 @@ _fat_debug int _fat_new_clust( fat_part *part, unsigned long clust,
    auto int fat_cntr;			// Counts FAT sectors
    auto int fat_end_offset;	// Offset to end of FAT in last sector
    auto long sbuf;            // Sector buffer pointer
+   // 32TODO: need to point to an unsigned long if FAT32 (ptr16, ptr32)
    auto union {
       __far unsigned * ptr;     // Pointer to cluster entry in FAT table
       long l;
@@ -948,6 +1063,7 @@ _fat_debug int _fat_new_clust( fat_part *part, unsigned long clust,
    	   part->active = (void *)n_clust;   // Save pointer as caller reference
 #endif
 	      part->opstate = FAT_PART_ALLOC;    	 // Idle, start new allocation
+	      // 32TODO: support 32-bit cluster IDs
 		   part->clust1 = (unsigned)part->nextcluster; // Set starting cluster
          if (count) {                  // If allocating, start a transaction
 			   if ((rc = fatrj_transtart(part->ftc_prt)) < 0) {
@@ -982,6 +1098,7 @@ _fat_debug int _fat_new_clust( fat_part *part, unsigned long clust,
       if (part->badcluster == 0xFFFFFFFFL) {
        	part->badcluster = 0;
       }
+      // 32TODO: does FAT32 always start on cluster 2 as well?
       myclust = 2;
       fat_sector = 0;
       ofs = 4;
@@ -992,11 +1109,13 @@ _fat_debug int _fat_new_clust( fat_part *part, unsigned long clust,
 		/* Start search from last used cluster.  Check for wrapping. */
       myclust = part->clust1;
       if ( myclust >= part->fat_len || myclust < 2 ) {
+      	// 32TODO: does FAT32 always start on cluster 2 as well?
       	myclust = 2;
          fat_sector = 0;
 	      ofs = 4;
       }
       else {	// Use sector as temporary long storage during calculation
+      	// 32TODO: shift by 2 for FAT32
       	sector = (unsigned long)myclust <<  1;
 		   fat_sector = (unsigned)(sector / part->byte_sec);
    	   ofs = (int)(sector & (part->byte_sec - 1));
@@ -1264,10 +1383,11 @@ int _fat_next_clust( fat_part *, unsigned long *, word );
    		   or any error possible from a call to fatftc_read
 *************************************************************************/
 
+// 32TODO: lots of updates throughout
 _fat_debug int _fat_next_clust(fat_part *part, unsigned long *clust, word block)
 {
 	auto int rc;
-	auto unsigned int x;
+	auto unsigned int x;	// 32TODO: unsigned long to allow for FAT32
 	auto long sbuf;
 
 #GLOBAL_INIT{ fat_sysdriver = NULL; }
@@ -1295,6 +1415,8 @@ _fat_debug int _fat_next_clust(fat_part *part, unsigned long *clust, word block)
 	/* get the word at location x */
 	x = *((int __far *)( sbuf + x ));
 
+	// 32TODO: mask off upper four bits
+	
 	/* this is either the end of the file or an invalid state */
    if ( x == 0 ) {
 #ifdef FAT_VERBOSE
@@ -1303,8 +1425,9 @@ _fat_debug int _fat_next_clust(fat_part *part, unsigned long *clust, word block)
 #endif
 		return -ENODATA;
    }
-	if( x >= 0xfff7 ) {
-		return (x == 0xfff7 ? -EFAULT : -EEOF);
+   // 32TODO: different values for FAT32
+	if( x >= FAT_BADMARK ) {
+		return (x == FAT_BADMARK ? -EFAULT : -EEOF);
    }
 
 	*clust = (unsigned long)x;
@@ -1335,6 +1458,7 @@ int _fat_free_clust( fat_part *, unsigned long );
 #define FAT_FC_FREE	FAT_PART_DEL+5	// Free next link from the chain
 #define FAT_FC_ERR	FAT_PART_DEL+6	// Error handling, rollback the transaction
 
+// 32TODO: lots of updates throughout
 _fat_debug int _fat_free_clust( fat_part *part, unsigned long clust )
 {
 #ifndef FAT16_READONLY
@@ -1387,7 +1511,8 @@ _fat_debug int _fat_free_clust( fat_part *part, unsigned long clust )
 	printf( "FAT: _fat_free_clust() entry %ld\r\n", MS_TIMER );
 #endif
 
-   inuse = (part->type == FAT_TYPE_12 ? 0x0FF7 : 0xFFF7);
+   // 32TODO: update for FAT32, and remove support for FAT12
+   inuse = (part->type == FAT_TYPE_12 ? 0x0FF7 : FAT_BADMARK);
 	while( (myclust < inuse) && myclust )
 	{
     switch (part->opstate)
@@ -1429,6 +1554,7 @@ _fat_debug int _fat_free_clust( fat_part *part, unsigned long clust )
 
     	case FAT_FC_GET:
 			// Get the next link in the chain
+			// 32TODO: read as unsigned long and clear upper 4 bits (use macro)
          newclust = *((int __far *)( sbuf + ofs ));
          y = 2;
          part->opstate = FAT_FC_FREE;
@@ -1480,6 +1606,7 @@ _fat_debug int _fat_free_clust( fat_part *part, unsigned long clust )
 	         }
    	   }
          if (newclust < inuse) {
+            // 32TODO: offset changes by 4-bytes per cluster
            	ofs += ((newclust - myclust) * 2);
            	if (ofs >= part->byte_sec || ofs < 0) {
          		part->opstate = FAT_FC_CALC;
@@ -1536,6 +1663,7 @@ int _fat_chkpoint(word dev, word prt, mbr_dev * fdev, __far word * chkdat);
 
 RETURNS:		0
 *************************************************************************/
+// 32TODO update checkpoint structure (multiple locations) for FAT32
 _fat_debug int _fat_chkpoint(word dev, word prt, mbr_dev * fdev,
                                __far word * chkdat)
 {
@@ -1601,6 +1729,7 @@ int _fat_clust2sec( fat_part *, unsigned long, unsigned long * );
    				-EEOF if clust is not within the given partition
 *************************************************************************/
 
+// 32TODO verify logic for FAT32 (is clust - 2 accurate?, works for 32GB volume?)
 _fat_debug int _fat_clust2sec( fat_part *part, unsigned long clust,
 											unsigned long *sector )
 {
@@ -1688,6 +1817,7 @@ _fat_debug int _fat_checkdir( fat_part *part, fat_location *loc )
          }
 #endif
 
+	      // 32TODO: update to ignore LFN entries in directory
 	      for( i = 0; i < part->byte_sec; i += FAT_DIRSZ ) {
 	         rc = (int)(*((char __far *)(sbuf + i)));
 	         if( rc && rc != '.' && rc != 0xe5 ) {
@@ -2551,6 +2681,9 @@ _fat_debug int _fat_PartCalc( fat_part *part )
 	auto unsigned long c;
 	auto int rc;
 
+   #ifdef FAT_VERBOSE
+      _fat_dump_fat_part(part);
+   #endif
    if (!part->byte_sec || !part->sec_clust || !part->fat_cnt || !part->sec_fat
          || !part->root_cnt || !part->dev->byte_page)
    {
@@ -2574,14 +2707,18 @@ _fat_debug int _fat_PartCalc( fat_part *part )
 	c = ((part->mpart->startsector + part->mpart->partsecsize - part->datastart)
    		 		/ part->sec_clust ) + 2;
 	rc = 0;
-   if( c < 65527 ) {
+   if (c <= FAT16_MAX_CLUSTERS) {
 		part->type |= FAT_TYPE_16;		/* Volume is FAT16 */
 		part->fat_len = (unsigned)c;
 	}
-	else {
+	else if (c >= FAT32_MIN_CLUSTERS) {
 		part->type |= FAT_TYPE_32;		/* Volume is FAT32 */
 		part->fat_len = (unsigned)c << 1;
+		// 32TODO: Allow for FAT32 partitions, ensure that calculations are correct
 		rc = -ENOSYS;						/* FAT32 is not supported at this time */
+	}
+	else {
+		rc = -ENOSYS;   // too many clusters for FAT16, but not enough for FAT32
 	}
 
 	return rc;
@@ -2698,7 +2835,7 @@ _fat_debug int _fat_isopen( fat_part *part, fat_location *loc )
 /*** BeginHeader fat_IsFatMBREntry */
 int fat_IsFatMBREntry( unsigned char parttype );
 /*** EndHeader */
-
+// 32TODO: Add partition codes for FAT32 (and create macros for these codes)
 const char FAT_codes[7] = {0x01, 0x04, 0x06, 0x0b, 0x0c, 0x0e, 0};
 
 /********************** >> INTERNAL FUNCTION << *************************
@@ -3176,11 +3313,11 @@ int _fat_automount(word nDrvs, word nDevs, const _fat_driver_descr *drvConfig,
                //*** Create volume label from the volume serial number
                sprintf(devVolLabel, "%08lx", serial);
                //*** Compare volume label from device to cache
-               if(memcmp((char __far *)devVolLabel,_ftc.dv[j].di->devsig,8)){
+               if(_f_memcmp(devVolLabel, _ftc.dv[j].di->devsig, 8)){
                   newVolume = 1;
 #ifdef FAT_VERBOSE
                   printf(
-                    "_fat_automount: found new volume label(N = %s, O = %s)\n",
+                    "_fat_automount: found new volume label(N = %s, O = %ls)\n",
                     devVolLabel, _ftc.dv[j].di->devsig);
 #endif
                }
@@ -3196,7 +3333,7 @@ int _fat_automount(word nDrvs, word nDevs, const _fat_driver_descr *drvConfig,
             if(newVolume &&
                 !(useflags & (FDDF_UNCOND_DEV_FORMAT | FDDF_UNCOND_PART_FORMAT)))
             {
-                _f_memcpy((void __far *)&di, _ftc.dv[j].di, sizeof(di));
+                _f_memcpy(&di, _ftc.dv[j].di, sizeof(di));
                 // Unregister existing volume
                 rc = fatftc_regdev(NULL,di.devsig,1,NULL);
 #ifdef FAT_VERBOSE
@@ -3860,6 +3997,9 @@ _fat_debug int fat_FormatDevice( mbr_dev *dev, int mode )
       {
          dev->part[0].partsecsize = dev->seccount - dev->part[0].startsector;
       }
+      if (dev->part[0].partsecsize > FAT16_MAX_PARTSECSIZE) {
+      	dev->part[0].partsecsize = FAT16_MAX_PARTSECSIZE;
+      }
       dev->part[0].parttype = 6;    // Always force to FAT16
 
       if ((mode == 3) && (retcode != -EUNFORMAT)) {
@@ -3890,7 +4030,7 @@ int fat_EnumPartition( mbr_dev *, int, fat_part * );
 int _fat_EnumPartition( mbr_dev *, int, fat_part * );
 #endif
 /*** EndHeader */
-
+// 32TODO: Resume code review here.
 /* START FUNCTION DESCRIPTION *******************************************
 fat_EnumPartition                        <FAT16.LIB>
 
@@ -4715,15 +4855,22 @@ PARAMETER 1:   Run-time device configuration flags to allow overriding the
                  FDDF_COND_PART_FORMAT   //format partition if unformatted
                  FDDF_UNCOND_DEV_FORMAT  //format device unconditionally
                  FDDF_UNCOND_PART_FORMAT //format partition unconditional
+
                Note: the FDDF_MOUNT_PART_* flags apply equally to all
                FDDF_MOUNT_DEV_* devices which are specified.  If this is a
                problem, call this function multiple times with a single
                DEV flag bit each time.
+
                Note: formatting the device creates a single FAT partition
                covering the entire device.  It is recommended that you
                always set the *_PART_FORMAT flag bit if you set the
                corresponding *_DEV_FORMAT flag bit.
 
+               Note: Default settings in Lib/Rabbit4000/BIOSLIB/fatconfig.lib
+               impose a limit of 2 partitions mounted at any one time.  If
+               you want to mount all 4 primary partitions on a device, you
+               need to add "FAT_MAXPARTITIONS=4" to your Project Options.
+   
 RETURN VALUE: 	0 on success
 					-EIO on device IO error.
                -EINVAL if prtTable is invalid
@@ -5240,31 +5387,18 @@ _fat_debug int fat_FormatPartition( mbr_dev *dev, fat_part *part, int pnum,
          //Set sectors per cluster & FAT type based on type & size of partition
          part->type = FAT_TYPE_16;
          part->byte_sec = dev->byte_sec;
-	      if (dev->driver->type[dev->dev_num] & MBRTYPE_FLASH) {
-            // If sector addressable device, use smallest cluster size possible
-	         if (dev->driver->type[dev->dev_num] & MBRTYPE_SECTOR_FTL) {
-	            s = (word)((dev->seccount + 0x0FFFFL) / 0x10000L);
-					for (b = FAT_MIN_CLUST_SIZE; s > b; b <<= 1);
-	            part->sec_clust = b;
-	         }
-	         else {
-	            part->sec_clust = dev->byte_page / dev->byte_sec;
-	         }
-            while (part->mpart->partsecsize > (((long)part->sec_clust) << 16))
-            {
-               part->sec_clust <<= 1;
-            }
+         b = dev->byte_page / dev->byte_sec;
+         if (b < FAT_MIN_CLUST_SIZE) {
+         	b = FAT_MIN_CLUST_SIZE;
          }
-      	else {
-				// calculate the megabyte size of the partition
-		  		x = part->mpart->partsecsize;
-            if ( x < SEC_512MB ) {
-              	part->sec_clust = (x < SEC_128MB ? 4 : 8);
-            }
-				else {
-               x >>= 16;
-            }
-			}
+         // Calculation still not perfect since it doesn't take into account
+         // space reserved for FAT and root directory.
+         s = (word)( (part->mpart->partsecsize + (FAT16_MAX_CLUSTERS - 1)) 
+                     / FAT16_MAX_CLUSTERS);
+         while (s > b) {
+         	b <<= 1;
+         }
+         part->sec_clust = b;
 
          for (i = 0; i < num_fat_drivers &&
                 dev->driver != &(_fat_driver_table[i]); i++);
@@ -5380,7 +5514,7 @@ _fat_debug int fat_FormatPartition( mbr_dev *dev, fat_part *part, int pnum,
          {
            sprintf(sig, "%08lx        ", *((long *)wptr));
            //*** Write new volume serial number to cache layer
-           root2xmem((long)_ftc.dv[dev->ftc_dev].di->devsig, sig, 16);
+           _f_memcpy(_ftc.dv[dev->ftc_dev].di->devsig, sig, 16);
          }
 
          // Set Volume Label

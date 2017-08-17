@@ -32,36 +32,30 @@
 
         Before running:
 
-        1) Make sure your basic network configuration is OK, including a
+        *  Make sure your basic network configuration is OK, including a
            DNS (name server) and a route to the outside Internet.  The
            default in this sample expects DHCP.  You can use a different
            TCPCONFIG macro and set alternative parameters if necessary.
            (If necessary, use a simpler sample to get this working).
-        2) Set up a Google Gmail account for test purposes.  Follow Google's
+        *  Set up a Google Gmail account for test purposes.  Follow Google's
            instructions for "enabling POP" on this account.
            See http://gmail.com.
-        3) Modify the POP_USER and POP_PASS macros to be the account name and
+        *  You'll also need to turn on access for "Less secure apps".  As of
+           March 2017, you can do so at:
+             https://www.google.com/settings/u/1/security/lesssecureapps
+        *  Modify the POP_USER and POP_PASS macros to be the account name and
            password that you used in step (2).  It is most convenient to
            put these in the Options->ProjectOptions->Defines panel e.g.
               POP_USER="my_account@gmail.com"
               POP_PASS="myPassw0rd"
-        5) The POP_SERVER and POP_PORT macros are set appropriately for
+        *  The POP_SERVER and POP_PORT macros are set appropriately for
            Gmail as of the time this sample was constructed, but you may wish
            to check this if the sample seems to fail in spite of everything.
            You can override these macros in the Defines panel.
-
-        NOTE: you can also use a Hotmail/Outlook.com account once Microsoft
-        upgrades their servers from TLS 1.0 to TLS 1.2 (still not the case
-        in February 2016).
-        
-        In this case, #define POP_SERVER "pop-mail.outlook.com", and use your
-        Hotmail/Outlook.com credentials in POP_USER and POP_PASS.  You may
-        also need to enable POP access for your account in Options:
-           https://outlook.live.com/owa/#path=/options/popandimap
-        
-        Unfortunately, Microsoft in their wisdom use 4096 bit RSA keys in
-        some of their certificates, thus you need to #define MP_SIZE 514.
-        GMail uses 2048-bit keys, and requires a MP_SIZE of at least 258.
+        *  For Hotmail/Outlook.com, #define USE_OUTLOOK_SETTINGS, and use your
+           Hotmail/Outlook.com credentials in POP_USER and POP_PASS.  You may
+           also need to enable POP access for your account in Options:
+              https://outlook.live.com/owa/#path=/options/popandimap
         
         To date, Yahoo does not allow POP3/SMTP access with their free email
         accounts.
@@ -71,16 +65,20 @@
 
 // Import the certificate file(s).  This is the CA used at the time of writing
 // this sample.  It is subject to change (beyond Digi's control).  You can
-// #define SSL_CERT_VERBOSE and X509_VERBOSE in order to find out the
-// certificates in use.
+// #define X509_CHAIN_VERBOSE in order to find out the certificates in use.
 #ximport "../sample_certs/EquifaxSecureCA.crt"  ca_pem1
+#ximport "../sample_certs/ThawtePremiumServerCA.crt"  ca_pem2
 
-// This one for Hotmail/Outlook.com (POP3 and SMTP)
-#ximport "../sample_certs/GTECyberTrustGlobalRoot.crt"  ca_pem2
+// These are for Hotmail/Outlook.com (POP3 and SMTP)
+#ximport "../sample_certs/GlobalSign Organization Validation CA - SHA256 - G2.cer" ca_pem3
+#ximport "../sample_certs/DigiCert-Global-Root-CA.cer" ca_pem4
+
+const long certs[] = { ca_pem1, ca_pem2, ca_pem3, ca_pem4 };
+
+// Uncomment the following line if you're connecting to pop-mail.outlook.com
+//#define USE_OUTLOOK_SETTINGS
+
 #define MP_SIZE 258			// necessary for GMail's RSA keys
-
-//#define MP_SIZE 514			// Recommended to support 4096-bit RSA keys used by
-									// some Microsoft certs.
 
 // Comment this out if the Real-Time Clock is set accurately.
 #define X509_NO_RTC_AVAILABLE
@@ -116,8 +114,11 @@
  *	Enter the name and TCP port of your POP3 server here.
  */
 #ifndef POP_SERVER
-	#define POP_SERVER	"pop.gmail.com"	// GMail
-	//#define POP_SERVER	"pop-mail.outlook.com"		// Hotmail
+	#ifndef USE_OUTLOOK_SETTINGS
+		#define POP_SERVER	"pop.gmail.com"	// GMail
+	#else
+		#define POP_SERVER	"pop-mail.outlook.com"		// Hotmail
+	#endif
 #endif
 #ifndef POP_PORT
 	#define POP_PORT	995	// Port 995 used for POP3 tunneled through TLS
@@ -138,7 +139,8 @@
 /* comment this out to delete the messages off the server after they are read */
 #define POP_NODELETE
 
-
+/* comment this out if you want to display the message bodies */
+#define HEADERS_ONLY
 
 /*
  *   The SMTP_VERBOSE macro logs the communications between the mail
@@ -149,6 +151,7 @@
 //#define SSL_SOCK_VERBOSE
 //#define _SSL_PRINTF_DEBUG 1
 //#define SSL_CERT_VERBOSE
+#define X509_CHAIN_VERBOSE
 //#define X509_VERBOSE
 //#define TCP_VERBOSE
 
@@ -190,6 +193,8 @@ int pop_server_policy(ssl_Socket far * state, int trusted,
 	                       struct x509_certificate far * cert,
                           void __far * data)
 {
+	char far *alt_name;
+	
 	printf("\nChecking server certificate...\n");
 	if (trusted)
 		printf("This server's certificate is trusted\n");
@@ -224,8 +229,18 @@ int pop_server_policy(ssl_Socket far * state, int trusted,
 		printf("          Unit: %ls\n", cert->subject.ou);
 	if (cert->subject.email)
 		printf("       Contact: %ls\n", cert->subject.email);
-	printf("Server claims to be CN='%ls'\n", cert->subject.cn);
-	printf("We are looking for  CN='%s'\n", pop3_getserver());
+	if ((alt_name = cert->subject_alt_name) == NULL) {
+		// Only reference Subject.CN if Subject Alternative Name not present
+		printf("Server claims to be: %ls\n", cert->subject.cn);
+	} else {
+		printf("Server claims to be: ");
+		while (*alt_name) {
+			printf("%ls ", alt_name);
+			alt_name += _f_strlen(alt_name) + 1;
+		}
+		printf("\n");
+	}
+	printf("We are looking for '%s'\n", pop3_getserver());
 
 	if (x509_validate_hostname(cert, pop3_getserver())) {
 		printf("Mismatch!\n\n");
@@ -253,7 +268,9 @@ int storemsg(int num, char *to, char *from, char *subject, char *body, int len)
 		printf("\tSubject: %s\n", subject);
 	}
 
+#ifndef HEADERS_ONLY
 	printf("MSG_DATA> '%s'\n", body);
+#endif
 
 	return 0;
 }
@@ -263,18 +280,15 @@ void main()
 	// Can't store this on the stack (auto) since the POP client library stores
 	// a reference to it for use later.
 	static far SSL_Cert_t trusted;
-	auto int rc;
+	auto int rc, i;
 
 	_f_memset(&trusted, 0, sizeof(trusted));
-	rc = SSL_new_cert(&trusted, ca_pem1, SSL_DCERT_XIM, 0);
-	if (rc) {
-		printf("Failed to parse CA certificate 1, rc=%d\n", rc);
-		return;
-	}
-	rc = SSL_new_cert(&trusted, ca_pem2, SSL_DCERT_XIM, 1 /*append*/);
-	if (rc) {
-		printf("Failed to parse CA certificate 2, rc=%d\n", rc);
-		return;
+	for (i = 0; i < (sizeof certs / sizeof certs[0]); ++i) {
+	   rc = SSL_new_cert(&trusted, certs[i], SSL_DCERT_XIM, i > 0);
+	   if (rc) {
+	      printf("Failed to parse CA certificate %u, rc=%d\n", i + 1, rc);
+	      return;
+	   }
 	}
 
 	// Start network and wait for interface to come up (or error exit).
@@ -296,11 +310,11 @@ void main()
 		continue;
 
 	printf("============= Completed: ===============\n");
-	if(retval == POP_SUCCESS)
+	if(rc == POP_SUCCESS)
 		printf("POP was successful\n");
-	else if(retval == POP_TIME)
+	else if(rc == POP_TIME)
 		printf("POP timed out\n");
-	else if(retval == POP_ERROR)
+	else if(rc == POP_ERROR)
 		printf("POP could not open TCP socket\n");
 	else
 		printf("DNS failed to resolve server domain name\n");

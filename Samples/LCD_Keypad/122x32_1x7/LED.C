@@ -19,8 +19,6 @@
 	This sample program is used with 122x32 display and 1x7 keypad module
 	with LED's.
 
-   NOTE: Not currently supported on RCM4xxx modules.
-
 	This program demonstrates how to toggle the LED's on the display
 	module/controller.
 
@@ -40,8 +38,14 @@
 #class auto		// Change default: local vars now stored on stack.
 #memmap xmem  // Required to reduce root memory usage
 
-#if CPU_ID_MASK(_CPU_ID_) >= R4000
-#fatal "This sample is not currently supported by Rabbit 4000 based products."
+#define USE_DISPLAY_KEYPAD
+#define PORTA_AUX_IO
+#if RCM6700_SERIES
+	#use "RCM67xx.LIB"
+#elif RCM6600W_SERIES
+	#use "RCM66xxW.LIB"
+#else
+	#fatal "Include platform library with necessary macros."
 #endif
 
 #define LEDOFF 0  //Value used to turn the LED OFF

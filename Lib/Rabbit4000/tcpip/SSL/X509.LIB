@@ -43,6 +43,12 @@ END DESCRIPTION **********************************************************/
 	#define _X509_HEXDUMP(x)
 #endif
 
+#if defined X509_VERBOSE || defined X509_CHAIN_VERBOSE
+	#define _X509_CHAIN_PRINTF(x) _x509_printf x
+#else
+	#define _X509_CHAIN_PRINTF(x)
+#endif
+
 #ifdef X509_ENABLE_SHA512
 	#use "sha512.lib"
 #endif
@@ -152,6 +158,10 @@ struct asn1_hdr {
 	char __far * payload;
 	char identifier;
 	char class;
+		#define ASN1_CLASS_UNIVERSAL        0
+		#define ASN1_CLASS_APPLICATION      1
+		#define ASN1_CLASS_CONTEXT_SPECIFIC 2
+		#define ASN1_CLASS_PRIVATE          3
 	char constructed;
 	unsigned int tag;
 	unsigned int length;
@@ -248,7 +258,7 @@ int asn1_get_oid(char __far * buf, size_t len, struct asn1_oid __far * oid, char
 	if (asn1_get_next(buf, len, &hdr)<0 ||
 	hdr.length==0)
 		return  -1;
-	if (hdr.class!=0 ||
+	if (hdr.class!=ASN1_CLASS_UNIVERSAL ||
 	hdr.tag!=0x06) {
 		_X509_PRINTF((MSG_DEBUG, "ASN.1: Expected OID - found class %d " \
 		 "tag 0x%x" , hdr.class, hdr.tag));
@@ -522,6 +532,7 @@ struct x509_certificate {
 	size_t cert_len;
 	const char __far * tbs_cert_start;
 	size_t tbs_cert_len;
+	char __far * subject_alt_name;
 
 } ;	// From "x509v3.h":80
 
@@ -569,6 +580,7 @@ void x509_certificate_free(struct x509_certificate __far * cert) {
 	_x509_s3_x509_free_name(&cert->subject);
 	_sys_free(cert->public_key);
 	_sys_free(cert->sign_value);
+	_sys_free(cert->subject_alt_name);
 	_sys_free(cert);
 }
 
@@ -595,15 +607,10 @@ int _x509_s3_x509_str_compare(char __far * a, char __far * b);
 /*** EndHeader */
 _x509_debug
 int _x509_s3_x509_str_compare(char __far * a, char __far * b) {
-	if (!a &&
-	b)
-		return  -1;
-	if (a &&
-	!b)
+	if (!a)
+		return b ? -1 : 0;
+	if (!b)
 		return 1;
-	if (!a &&
-	!b)
-		return 0;
 	return _f_strcmp(a, b);
 }
 
@@ -615,16 +622,11 @@ _x509_debug
 int x509_name_compare(struct x509_name __far * a, struct x509_name __far * b) {
 	int res; 	// From "x509v3.c":100
 
-
-	if (!a &&
-	b)
-		return  -1;
-	if (a &&
-	!b)
+	if (!a)
+		return b ? -1 : 0;
+	if (!b)
 		return 1;
-	if (!a &&
-	!b)
-		return 0;
+	
 	res = _x509_s3_x509_str_compare(a->cn, b->cn);
 	if (res)
 		return res;
@@ -640,13 +642,9 @@ int x509_name_compare(struct x509_name __far * a, struct x509_name __far * b) {
 	res = _x509_s3_x509_str_compare(a->o, b->o);
 	if (res)
 		return res;
+
 	res = _x509_s3_x509_str_compare(a->ou, b->ou);
-	if (res)
-		return res;
-	res = _x509_s3_x509_str_compare(a->email, b->email);
-	if (res)
-		return res;
-	return 0;
+	return res ? res : _x509_s3_x509_str_compare(a->email, b->email);
 }
 
 /*** BeginHeader _x509_s3_x509_parse_algorithm_identifier */
@@ -663,7 +661,7 @@ int _x509_s3_x509_parse_algorithm_identifier(char __far * buf, size_t len, struc
 
 
 	if (asn1_get_next(buf, len, &hdr)<0 ||
-	hdr.class!=0 ||
+	hdr.class!=ASN1_CLASS_UNIVERSAL ||
 	hdr.tag!=0x10) {
 		_X509_PRINTF((MSG_DEBUG, "X509: Expected SEQUENCE " \
 		 "(AlgorithmIdentifier) - found class %d tag 0x%x" , hdr.class, hdr.tag));
@@ -695,7 +693,7 @@ int _x509_s3_x509_parse_public_key(char __far * buf, size_t len, struct x509_cer
 	pos = buf;
 	end = buf+len;
 	if (asn1_get_next(pos, (_x509_ptrdiff_t)(end-pos), &hdr)<0 ||
-	hdr.class!=0 ||
+	hdr.class!=ASN1_CLASS_UNIVERSAL ||
 	hdr.tag!=0x10) {
 		_X509_PRINTF((MSG_DEBUG, "X509: Expected SEQUENCE " \
 		 "(SubjectPublicKeyInfo) - found class %d tag 0x%x" , hdr.class, hdr.tag));
@@ -710,7 +708,7 @@ int _x509_s3_x509_parse_public_key(char __far * buf, size_t len, struct x509_cer
                                               &pos))
 		return  -1;
 	if (asn1_get_next(pos, (_x509_ptrdiff_t)(end-pos), &hdr)<0 ||
-	hdr.class!=0 ||
+	hdr.class!=ASN1_CLASS_UNIVERSAL ||
 	hdr.tag!=0x03) {
 		_X509_PRINTF((MSG_DEBUG, "X509: Expected BITSTRING " \
 		 "(subjectPublicKey) - found class %d tag 0x%x" , hdr.class, hdr.tag));
@@ -755,7 +753,7 @@ int _x509_s3_x509_parse_name(char __far * buf, size_t len, struct x509_name __fa
 
 
 	if (asn1_get_next(buf, len, &hdr)<0 ||
-	hdr.class!=0 ||
+	hdr.class!=ASN1_CLASS_UNIVERSAL ||
 	hdr.tag!=0x10) {
 		_X509_PRINTF((MSG_DEBUG, "X509: Expected SEQUENCE " \
 		 "(Name / RDNSequencer) - found class %d tag 0x%x" , hdr.class, hdr.tag));
@@ -767,7 +765,7 @@ int _x509_s3_x509_parse_name(char __far * buf, size_t len, struct x509_name __fa
 	end = *next = pos+hdr.length;
 	while (pos<end) {
 		if (asn1_get_next(pos, (_x509_ptrdiff_t)(end-pos), &hdr)<0 ||
-		hdr.class!=0 ||
+		hdr.class!=ASN1_CLASS_UNIVERSAL ||
 		hdr.tag!=0x11) {
 			_X509_PRINTF((MSG_DEBUG, "X509: Expected SET " \
 			 "(RelativeDistinguishedName) - found class " \
@@ -778,7 +776,7 @@ int _x509_s3_x509_parse_name(char __far * buf, size_t len, struct x509_name __fa
 		set_pos = hdr.payload;
 		pos = set_end = hdr.payload+hdr.length;
 		if (asn1_get_next(set_pos, (_x509_ptrdiff_t)(set_end-set_pos), &hdr)<0 ||
-		hdr.class!=0 ||
+		hdr.class!=ASN1_CLASS_UNIVERSAL ||
 		hdr.tag!=0x10) {
 			_X509_PRINTF((MSG_DEBUG, "X509: Expected SEQUENCE " \
 			 "(AttributeTypeAndValue) - found class %d " \
@@ -793,7 +791,7 @@ int _x509_s3_x509_parse_name(char __far * buf, size_t len, struct x509_name __fa
 			return  -1;
 		}
 		if (asn1_get_next(seq_pos, (_x509_ptrdiff_t)(seq_end-seq_pos), &hdr)<0 ||
-		hdr.class!=0) {
+		hdr.class!=ASN1_CLASS_UNIVERSAL) {
 			_X509_PRINTF((MSG_DEBUG, "X509: Failed to parse " \
 			 "AttributeValue" ));
 			_x509_s3_x509_free_name(name);
@@ -941,7 +939,7 @@ int _x509_s3_x509_parse_validity(char __far * buf, size_t len, struct x509_certi
 
 
 	if (asn1_get_next(buf, len, &hdr)<0 ||
-	hdr.class!=0 ||
+	hdr.class!=ASN1_CLASS_UNIVERSAL ||
 	hdr.tag!=0x10) {
 		_X509_PRINTF((MSG_DEBUG, "X509: Expected SEQUENCE " \
 		 "(Validity) - found class %d tag 0x%x" , hdr.class, hdr.tag));
@@ -953,7 +951,7 @@ int _x509_s3_x509_parse_validity(char __far * buf, size_t len, struct x509_certi
 		return  -1;
 	*next = pos+plen;
 	if (asn1_get_next(pos, plen, &hdr)<0 ||
-	hdr.class!=0 ||
+	hdr.class!=ASN1_CLASS_UNIVERSAL ||
 	_x509_s3_x509_parse_time(hdr.payload, hdr.length, hdr.tag, &cert->not_before)<0) {
 		_X509_HEXDUMP((MSG_DEBUG, "X509: Failed to parse notBefore " \
 		 "Time" , hdr.payload, hdr.length));
@@ -962,7 +960,7 @@ int _x509_s3_x509_parse_validity(char __far * buf, size_t len, struct x509_certi
 	pos = hdr.payload+hdr.length;
 	plen = (_x509_ptrdiff_t)(*next-pos);
 	if (asn1_get_next(pos, plen, &hdr)<0 ||
-	hdr.class!=0 ||
+	hdr.class!=ASN1_CLASS_UNIVERSAL ||
 	_x509_s3_x509_parse_time(hdr.payload, hdr.length, hdr.tag, &cert->not_after)<0) {
 		_X509_HEXDUMP((MSG_DEBUG, "X509: Failed to parse notAfter " \
 		 "Time" , hdr.payload, hdr.length));
@@ -997,7 +995,7 @@ int _x509_s3_x509_parse_ext_key_usage(struct x509_certificate __far * cert, char
 
 
 	if (asn1_get_next(pos, len, &hdr)<0 ||
-	hdr.class!=0 ||
+	hdr.class!=ASN1_CLASS_UNIVERSAL ||
 	hdr.tag!=0x03 ||
 	hdr.length<1) {
 		_X509_PRINTF((MSG_DEBUG, "X509: Expected BIT STRING in " \
@@ -1007,6 +1005,74 @@ int _x509_s3_x509_parse_ext_key_usage(struct x509_certificate __far * cert, char
 	cert->extensions_present |= (1<<2);
 	cert->key_usage = asn1_bit_string_to_long(hdr.payload, hdr.length);
 	_X509_PRINTF((MSG_DEBUG, "X509: KeyUsage 0x%lx" , cert->key_usage));
+	return 0;
+}
+
+/*** BeginHeader _x509_s3_x509_parse_subj_alt_name */
+int _x509_s3_x509_parse_subj_alt_name(struct x509_certificate __far * cert,
+                                      char __far * pos, size_t len);
+/*** EndHeader */
+_x509_debug
+int _x509_s3_x509_parse_subj_alt_name(struct x509_certificate __far * cert,
+                                      char __far * pos, size_t len) {
+	struct asn1_hdr hdr;
+	char __far *end = pos + len;
+	char __far *payload, *dest;
+	int names_length;
+	
+	if (asn1_get_next(pos, len, &hdr)<0 ||
+	hdr.class!=ASN1_CLASS_UNIVERSAL ||
+	hdr.tag!=0x10 ||
+	hdr.length>len-2) {
+		_X509_PRINTF((MSG_DEBUG, "X509: Expected %s in %s; found %d tag 0x%x len %d",
+			"SEQUENCE", "subjectAltName", hdr.class, hdr.tag, hdr.length));
+		return  -1;
+	}
+	
+	// Allocate space to hold a list of alternate names.  hdr.length will be
+	// enough space, since each name has a two-byte prefix with the class/tag
+	// and length.  We'll use one byte for a null between each entry, and
+	// an extra null at the end to terminate the list.
+	_sys_free(cert->subject_alt_name);
+	cert->subject_alt_name = dest = _sys_malloc(hdr.length);
+	if (cert->subject_alt_name == NULL) {
+		_X509_PRINTF((MSG_DEBUG, "X509: Failed to allocate memory for %s",
+		 "subjectAltName" ));
+		return -1;
+	}
+	
+	payload = hdr.payload;
+	while (payload < end) {
+		if (asn1_get_next(payload, (size_t)(end - payload), &hdr)<0 ||
+		hdr.class!=ASN1_CLASS_CONTEXT_SPECIFIC) {
+			_X509_PRINTF((MSG_DEBUG, "X509: Expected %s in %s; found %d tag 0x%x len %d",
+				"Context-specific", "subjectAltName", hdr.class, hdr.tag, hdr.length));
+			return  -1;
+		}
+		/*
+		#   GeneralName ::= CHOICE {
+		#        otherName                       [0]     OtherName,
+		#        rfc822Name                      [1]     IA5String,
+		#        dNSName                         [2]     IA5String,
+		#        x400Address                     [3]     ORAddress,
+		#        directoryName                   [4]     Name,
+		#        ediPartyName                    [5]     EDIPartyName,
+		#        uniformResourceIdentifier       [6]     IA5String,
+		#        iPAddress                       [7]     OCTET STRING,
+		#        registeredID                    [8]     OBJECT IDENTIFIER }
+		*/
+		_X509_PRINTF((MSG_DEBUG, "X509: subjectAltName tag %u: %.*ls",
+			hdr.tag, hdr.length, hdr.payload));
+		if (hdr.tag == 2) {	// dNSName
+			_f_memcpy(dest, hdr.payload, hdr.length);
+			dest += hdr.length;
+			*dest++ = '\0';  // null-terminate each entry
+		}
+		payload = hdr.payload + hdr.length;
+	}
+	
+	// add a second null to terminate the list
+	*dest++ = '\0';
 	return 0;
 }
 
@@ -1024,7 +1090,7 @@ int _x509_s3_x509_parse_ext_basic_constraints(struct x509_certificate __far * ce
 
 
 	if (asn1_get_next(pos, len, &hdr)<0 ||
-	hdr.class!=0 ||
+	hdr.class!=ASN1_CLASS_UNIVERSAL ||
 	hdr.tag!=0x10) {
 		_X509_PRINTF((MSG_DEBUG, "X509: Expected SEQUENCE in " \
 		 "BasicConstraints; found %d tag 0x%x" , hdr.class, hdr.tag));
@@ -1034,7 +1100,7 @@ int _x509_s3_x509_parse_ext_basic_constraints(struct x509_certificate __far * ce
 	if (hdr.length==0)
 		return 0;
 	if (asn1_get_next(hdr.payload, hdr.length, &hdr)<0 ||
-	hdr.class!=0) {
+	hdr.class!=ASN1_CLASS_UNIVERSAL) {
 		_X509_PRINTF((MSG_DEBUG, "X509: Failed to parse " \
 		 "BasicConstraints" ));
 		return  -1;
@@ -1053,7 +1119,7 @@ int _x509_s3_x509_parse_ext_basic_constraints(struct x509_certificate __far * ce
 		if (asn1_get_next(hdr.payload + hdr.length, len - hdr.length,
 				  &hdr) < 0 ||
 		//SJH if (asn1_get_next(pos, len, &hdr)<0 ||
-		hdr.class!=0) {
+		hdr.class!=ASN1_CLASS_UNIVERSAL) {
 			_X509_PRINTF((MSG_DEBUG, "X509: Failed to parse " \
 			 "BasicConstraints" ));
 			return  -1;
@@ -1092,6 +1158,8 @@ int _x509_s3_x509_parse_extension_data(struct x509_certificate __far * cert, str
 	switch ((int)(oid->oid[3])) {
 		case 15:
 		return _x509_s3_x509_parse_ext_key_usage(cert, pos, len);
+		case 17:
+		return _x509_s3_x509_parse_subj_alt_name(cert, pos, len);
 		case 19:
 		return _x509_s3_x509_parse_ext_basic_constraints(cert, pos, len);
 		default:
@@ -1117,7 +1185,7 @@ int _x509_s3_x509_parse_extension(struct x509_certificate __far * cert, char __f
 	critical_ext = 0;
 
 	if (asn1_get_next(pos, len, &hdr)<0 ||
-	hdr.class!=0 ||
+	hdr.class!=ASN1_CLASS_UNIVERSAL ||
 	hdr.tag!=0x10) {
 		_X509_PRINTF((MSG_DEBUG, "X509: Unexpected ASN.1 header in " \
 		 "Extensions: class %d tag 0x%x; expected SEQUENCE" , hdr.class, hdr.tag));
@@ -1131,7 +1199,7 @@ int _x509_s3_x509_parse_extension(struct x509_certificate __far * cert, char __f
 		return  -1;
 	}
 	if (asn1_get_next(pos, (_x509_ptrdiff_t)(end-pos), &hdr)<0 ||
-	hdr.class!=0 ||
+	hdr.class!=ASN1_CLASS_UNIVERSAL ||
 	(hdr.tag!=0x01 &&
 	hdr.tag!=0x04)) {
 		_X509_PRINTF((MSG_DEBUG, "X509: Unexpected ASN.1 header in " \
@@ -1148,8 +1216,8 @@ int _x509_s3_x509_parse_extension(struct x509_certificate __far * cert, char __f
 		critical_ext = hdr.payload[0];
 		pos = hdr.payload;
 		if (asn1_get_next(pos, (_x509_ptrdiff_t)(end-pos), &hdr)<0 ||
-		(hdr.class!=0 &&
-		hdr.class!=3) ||
+		(hdr.class!=ASN1_CLASS_UNIVERSAL &&
+		hdr.class!=ASN1_CLASS_PRIVATE) ||
 		hdr.tag!=0x04) {
 			_X509_PRINTF((MSG_DEBUG, "X509: Unexpected ASN.1 header " \
 			 "in Extensions: class %d tag 0x%x; " \
@@ -1185,7 +1253,7 @@ int _x509_s3_x509_parse_extensions(struct x509_certificate __far * cert, char __
 
 
 	if (asn1_get_next(pos, len, &hdr)<0 ||
-	hdr.class!=0 ||
+	hdr.class!=ASN1_CLASS_UNIVERSAL ||
 	hdr.tag!=0x10) {
 		_X509_PRINTF((MSG_DEBUG, "X509: Unexpected ASN.1 data " \
 		 "for Extensions: class %d tag 0x%x; " \
@@ -1219,7 +1287,7 @@ int _x509_s3_x509_parse_tbs_certificate(char __far * buf, size_t len, struct x50
 
 
 	if (asn1_get_next(buf, len, &hdr)<0 ||
-	hdr.class!=0 ||
+	hdr.class!=ASN1_CLASS_UNIVERSAL ||
 	hdr.tag!=0x10) {
 		_X509_PRINTF((MSG_DEBUG, "X509: tbsCertificate did not start " \
 		 "with a valid SEQUENCE - found class %d tag 0x%x" , hdr.class, hdr.tag));
@@ -1230,10 +1298,10 @@ int _x509_s3_x509_parse_tbs_certificate(char __far * buf, size_t len, struct x50
 	if (asn1_get_next(pos, (_x509_ptrdiff_t)(end-pos), &hdr)<0)
 		return  -1;
 	pos = hdr.payload;
-	if (hdr.class==2) {
+	if (hdr.class==ASN1_CLASS_CONTEXT_SPECIFIC) {
 		if (asn1_get_next(pos, (_x509_ptrdiff_t)(end-pos), &hdr)<0)
 			return  -1;
-		if (hdr.class!=0 ||
+		if (hdr.class!=ASN1_CLASS_UNIVERSAL ||
 		hdr.tag!=0x02) {
 			_X509_PRINTF((MSG_DEBUG, "X509: No INTEGER tag found for " \
 			 "version field - found class %d tag 0x%x" , hdr.class, hdr.tag));
@@ -1265,7 +1333,7 @@ int _x509_s3_x509_parse_tbs_certificate(char __far * buf, size_t len, struct x50
 	else
 		cert->version = X509_CERT_V1;
 	_X509_PRINTF((MSG_MSGDUMP, "X509: Version X.509v%d" , cert->version+1));
-	if (hdr.class!=0 ||
+	if (hdr.class!=ASN1_CLASS_UNIVERSAL ||
 	hdr.tag!=0x02) {
 		_X509_PRINTF((MSG_DEBUG, "X509: No INTEGER tag found for " \
 		 "serialNumber; class=%d tag=0x%x" , hdr.class, hdr.tag));
@@ -1299,7 +1367,7 @@ int _x509_s3_x509_parse_tbs_certificate(char __far * buf, size_t len, struct x50
 	if (cert->version==X509_CERT_V1)
 		return 0;
 	if (asn1_get_next(pos, (_x509_ptrdiff_t)(end-pos), &hdr)<0 ||
-	hdr.class!=2) {
+	hdr.class!=ASN1_CLASS_CONTEXT_SPECIFIC) {
 		_X509_PRINTF((MSG_DEBUG, "X509: Expected Context-Specific" \
 		 " tag to parse optional tbsCertificate " \
 		 "field(s); parsed class %d tag 0x%x" , hdr.class, hdr.tag));
@@ -1310,7 +1378,7 @@ int _x509_s3_x509_parse_tbs_certificate(char __far * buf, size_t len, struct x50
 		if (hdr.payload+hdr.length==end)
 			return 0;
 		if (asn1_get_next(pos, (_x509_ptrdiff_t)(end-pos), &hdr)<0 ||
-		hdr.class!=2) {
+		hdr.class!=ASN1_CLASS_CONTEXT_SPECIFIC) {
 			_X509_PRINTF((MSG_DEBUG, "X509: Expected Context-Specific" \
 			 " tag to parse optional tbsCertificate " \
 			 "field(s); parsed class %d tag 0x%x" , hdr.class, hdr.tag));
@@ -1322,7 +1390,7 @@ int _x509_s3_x509_parse_tbs_certificate(char __far * buf, size_t len, struct x50
 		if (hdr.payload+hdr.length==end)
 			return 0;
 		if (asn1_get_next(pos, (_x509_ptrdiff_t)(end-pos), &hdr)<0 ||
-		hdr.class!=2) {
+		hdr.class!=ASN1_CLASS_CONTEXT_SPECIFIC) {
 			_X509_PRINTF((MSG_DEBUG, "X509: Expected Context-Specific" \
 			 " tag to parse optional tbsCertificate " \
 			 "field(s); parsed class %d tag 0x%x" , hdr.class, hdr.tag));
@@ -1440,7 +1508,7 @@ struct x509_certificate __far * x509_certificate_parse(char __far * buf, size_t 
 	pos = buf;
 	end = buf+len;
 	if (asn1_get_next(pos, len, &hdr)<0 ||
-	hdr.class!=0 ||
+	hdr.class!=ASN1_CLASS_UNIVERSAL ||
 	hdr.tag!=0x10) {
 		_X509_PRINTF((MSG_DEBUG, "X509: Certificate did not start with " \
 		 "a valid SEQUENCE - found class %d tag 0x%x" , hdr.class, hdr.tag));
@@ -1471,7 +1539,7 @@ struct x509_certificate __far * x509_certificate_parse(char __far * buf, size_t 
 		return ((void  __far * )0);
 	}
 	if (asn1_get_next(pos, (_x509_ptrdiff_t)(end-pos), &hdr)<0 ||
-	hdr.class!=0 ||
+	hdr.class!=ASN1_CLASS_UNIVERSAL ||
 	hdr.tag!=0x03) {
 		_X509_PRINTF((MSG_DEBUG, "X509: Expected BITSTRING " \
 		 "(signatureValue) - found class %d tag 0x%x" , hdr.class, hdr.tag));
@@ -1564,7 +1632,7 @@ int x509_certificate_check_signature(struct x509_certificate __far * issuer,
 	crypto_public_key_free(pk);
 	_X509_HEXDUMP((MSG_MSGDUMP, "X509: Signature data D" , data, data_len));
 	if (asn1_get_next(data, data_len, &hdr)<0 ||
-	hdr.class!=0 ||
+	hdr.class!=ASN1_CLASS_UNIVERSAL ||
 	hdr.tag!=0x10) {
 		_X509_PRINTF((MSG_DEBUG, "X509: Expected SEQUENCE " \
 		 "(DigestInfo) - found class %d tag 0x%x" , hdr.class, hdr.tag));
@@ -1574,7 +1642,7 @@ int x509_certificate_check_signature(struct x509_certificate __far * issuer,
 	pos = hdr.payload;
 	end = pos+hdr.length;
 	if (asn1_get_next(pos, (_x509_ptrdiff_t)(end-pos), &hdr)<0 ||
-	hdr.class!=0 ||
+	hdr.class!=ASN1_CLASS_UNIVERSAL ||
 	hdr.tag!=0x10) {
 		_X509_PRINTF((MSG_DEBUG, "X509: Expected SEQUENCE " \
 		 "(AlgorithmIdentifier) - found class %d tag 0x%x" , hdr.class, hdr.tag));
@@ -1640,7 +1708,7 @@ int x509_certificate_check_signature(struct x509_certificate __far * issuer,
 	pos = da_end;
 	end = data+data_len;
 	if (asn1_get_next(pos, (_x509_ptrdiff_t)(end-pos), &hdr)<0 ||
-	hdr.class!=0 ||
+	hdr.class!=ASN1_CLASS_UNIVERSAL ||
 	hdr.tag!=0x04) {
 		_X509_PRINTF((MSG_DEBUG, "X509: Expected OCTETSTRING " \
 		 "(Digest) - found class %d tag 0x%x" , hdr.class, hdr.tag));
@@ -1740,20 +1808,20 @@ int x509_certificate_chain_validate(struct x509_certificate __far * trusted, str
 	chain_trusted = 0;
 
 	*reason = X509_VALIDATE_OK;
-	_X509_PRINTF((MSG_DEBUG, "X509: Validate certificate chain" ));
+	_X509_CHAIN_PRINTF((MSG_DEBUG, "X509: Validate certificate chain" ));
 #ifndef X509_NO_RTC_AVAILABLE
 	os_get_time(&now);
 #endif
 	for (cert = chain, idx = 0; cert; cert = cert->next, idx++) {
 		x509_name_string(&cert->subject, buf, sizeof (buf));
-		_X509_PRINTF((MSG_DEBUG, "X509: %d: %ls" , idx, (char  __far * )(buf)));
+		_X509_CHAIN_PRINTF((MSG_DEBUG, "X509: %d: %ls" , idx, (char  __far * )(buf)));
 		if (chain_trusted)
 			continue;
 #ifndef X509_NO_RTC_AVAILABLE
 		//XXX SJH - can't do this check if no RTC, can we?
 		if (now.sec<cert->not_before ||
 		now.sec>cert->not_after) {
-			_X509_PRINTF((MSG_INFO, "X509: Certificate not valid " \
+			_X509_CHAIN_PRINTF((MSG_INFO, "X509: Certificate not valid " \
 			 "(now=%lu not_before=%lu not_after=%lu)" , now.sec, cert->not_before, cert->not_after));
 			*reason = X509_VALIDATE_CERTIFICATE_EXPIRED;
 			return  -1;
@@ -1761,7 +1829,7 @@ int x509_certificate_chain_validate(struct x509_certificate __far * trusted, str
 #endif
 		if (cert->next) {
 			if (x509_name_compare(&cert->issuer, &cert->next->subject)!=0) {
-				_X509_PRINTF((MSG_DEBUG, "X509: Certificate " \
+				_X509_CHAIN_PRINTF((MSG_DEBUG, "X509: Certificate " \
 				 "chain issuer name mismatch" ));
 				*reason = X509_VALIDATE_CERTIFICATE_UNKNOWN;
 				return  -1;
@@ -1771,7 +1839,7 @@ int x509_certificate_chain_validate(struct x509_certificate __far * trusted, str
 				return  -1;
 			}
 			if (x509_certificate_check_signature(cert->next, cert, _yield)<0) {
-				_X509_PRINTF((MSG_DEBUG, "X509: Invalid " \
+				_X509_CHAIN_PRINTF((MSG_DEBUG, "X509: Invalid " \
 				 "certificate signature within " \
 				 "chain" ));
 				*reason = X509_VALIDATE_BAD_CERTIFICATE;
@@ -1783,34 +1851,34 @@ int x509_certificate_chain_validate(struct x509_certificate __far * trusted, str
 				break;
 		}
 		if (trust) {
-			_X509_PRINTF((MSG_DEBUG, "X509: Found issuer from the " \
+			_X509_CHAIN_PRINTF((MSG_DEBUG, "X509: Found issuer from the " \
 			 "list of trusted certificates" ));
 			if (_x509_s3_x509_valid_issuer(trust)<0) {
 				*reason = X509_VALIDATE_BAD_CERTIFICATE;
 				return  -1;
 			}
 			if (x509_certificate_check_signature(trust, cert, _yield)<0) {
-				_X509_PRINTF((MSG_DEBUG, "X509: Invalid " \
+				_X509_CHAIN_PRINTF((MSG_DEBUG, "X509: Invalid " \
 				 "certificate signature" ));
 				*reason = X509_VALIDATE_BAD_CERTIFICATE;
 				return  -1;
 			}
-			_X509_PRINTF((MSG_DEBUG, "X509: Trusted certificate " \
+			_X509_CHAIN_PRINTF((MSG_DEBUG, "X509: Trusted certificate " \
 			 "found to complete the chain" ));
 			chain_trusted = 1;
 		}
 	}
 	if (!chain_trusted) {
-		_X509_PRINTF((MSG_DEBUG, "X509: Did not find any of the issuers " \
+		_X509_CHAIN_PRINTF((MSG_DEBUG, "X509: Did not find any of the issuers " \
 		 "from the list of trusted certificates" ));
 		if (trusted) {
 			*reason = X509_VALIDATE_UNKNOWN_CA;
 			return  -1;
 		}
-		_X509_PRINTF((MSG_DEBUG, "X509: Certificate chain validation " \
+		_X509_CHAIN_PRINTF((MSG_DEBUG, "X509: Certificate chain validation " \
 		 "disabled - ignore unknown CA issue" ));
 	}
-	_X509_PRINTF((MSG_DEBUG, "X509: Certificate chain valid" ));
+	_X509_CHAIN_PRINTF((MSG_DEBUG, "X509: Certificate chain valid" ));
 	return 0;
 }
 
@@ -1871,13 +1939,13 @@ char * _x509_s4_asn1_class_str(int class);
 _x509_debug
 char * _x509_s4_asn1_class_str(int class) {
 	switch ((int)(class)) {
-		case 0:
+		case ASN1_CLASS_UNIVERSAL:
 		return "Universal" ;
-		case 1:
+		case ASN1_CLASS_APPLICATION:
 		return "Application" ;
-		case 2:
+		case ASN1_CLASS_CONTEXT_SPECIFIC:
 		return "Context-specific" ;
-		case 3:
+		case ASN1_CLASS_PRIVATE:
 		return "Private" ;
 		default:
 		return "?" ;
@@ -1919,13 +1987,13 @@ int asn1_parse(char __far * buf, size_t len, int level) {
                 hdr.constructed, (char  __far * )(hdr.constructed ?
 		  "Constructed"  :
 		  "Primitive" ), hdr.tag, hdr.length));
-		if (hdr.class==2 &&
+		if (hdr.class==ASN1_CLASS_CONTEXT_SPECIFIC &&
 		hdr.constructed) {
 			if (asn1_parse(pos, hdr.length, level+1)<0)
 				return  -1;
 			pos += hdr.length;
 		}
-		if (hdr.class!=0)
+		if (hdr.class!=ASN1_CLASS_UNIVERSAL)
 			continue;
 		switch ((int)(hdr.tag)) {
 			case 0x00:
@@ -2077,41 +2145,41 @@ void __x509_initStatics() {
 	}
 }
 
-/*** BeginHeader x509_validate_hostname */
+/*** BeginHeader x509_compare_hostname, x509_validate_hostname */
+int x509_compare_hostname(const char __far *cert_name, const char __far *hostname);
 int x509_validate_hostname(const struct x509_certificate __far *cert,
 	const char __far *hostname);
 /*** EndHeader */
 /* START FUNCTION DESCRIPTION ********************************************
-x509_validate_hostname							   <X509.LIB>
+x509_compare_hostname							   <X509.LIB>
 
-SYNTAX:  int x509_validate_hostname(const struct x509_certificate far *cert,
+SYNTAX:  int x509_compare_hostname(const char __far *cert_name,
                                  const char far *hostname);
 
-DESCRIPTION: See if a hostname is covered by the Subject Common Name (CN)
-             stored in a certificate.  Handles wildcard matching (*.example.com
-             valid for example.com, foo.example.com but not foo.bar.example.com)
-             and securing the root domain for the www-hostname (www.example.com
-             is a valid CN for hostname example.com and vice versa).
+DESCRIPTION: See if a hostname is covered by a name listed in the certificate
+             (either the Subject Common Name (CN) or one of the Subject
+             Alternative Names (SANs)).
+             
+             Helper function for x509_validate_hostname().  See that function
+             for additional details.
 
-PARAMETER 1: Certificate object
+PARAMETER 1: Subject Common Name or Subject Alternative Name from a certificate.
 
 PARAMETER 2: Hostname to verify
 
-RETURN VALUE: 0: Certificate is valid for given hostname.
-              -EINVAL: NULL passed as one of the two parameters, or certificate
-                       does not have a subject.cn.
+RETURN VALUE: 0: Certificate's hostname is valid for given hostname.
+              -EINVAL: NULL passed as one of the two parameters.
               -NETERR_HOST_REFUSED: Certificate is not valid for given hostname.
 
 END DESCRIPTION **********************************************************/
 
 _x509_debug
-int x509_validate_hostname(const struct x509_certificate __far *cert,
-	const char __far *hostname)
+int x509_compare_hostname(const char __far *cert_name, const char __far *hostname)
 {
-	const char __far *cn, *cn_end, *hostname_end;
+	const char __far *cn_end, *hostname_end;
    int t;
    
-	if (cert == NULL || cert->subject.cn == NULL || hostname == NULL)
+	if (cert_name == NULL || hostname == NULL)
    {
    	return -EINVAL;
    }
@@ -2119,14 +2187,13 @@ int x509_validate_hostname(const struct x509_certificate __far *cert,
       Starting at the ends of the strings, compare all characters until finding
       a mismatch or reaching the start of one or both strings.
    */
-   cn = cert->subject.cn;
-   cn_end = _f_strchr(cn, '\0') - 1;
+   cn_end = _f_strchr(cert_name, '\0') - 1;
    hostname_end = _f_strchr(hostname, '\0') - 1;
       
-   _X509_PRINTF((MSG_DEBUG, "X509: compare hostname '%ls' to CN '%ls'\n",
-   	hostname, cn));
+   _X509_PRINTF((MSG_DEBUG, "X509: compare hostname '%ls' to cert's '%ls'",
+   	hostname, cert_name));
    
-   while (cn_end >= cn && hostname_end >= hostname && *cn_end == *hostname_end)
+   while (cn_end >= cert_name && hostname_end >= hostname && *cn_end == *hostname_end)
    {
    	--hostname_end;
       --cn_end;
@@ -2136,28 +2203,28 @@ int x509_validate_hostname(const struct x509_certificate __far *cert,
    // one or both of them point before the start of the string.
    if (hostname_end < hostname)
    {
-   	if (cn_end < cn)		// exact match
+   	if (cn_end < cert_name)		// exact match
       {
-      	_X509_PRINTF((MSG_DEBUG, "\texact match\n"));
+      	_X509_PRINTF((MSG_DEBUG, "\texact match"));
       	return 0;
       }
-      if (_f_memcmp(cn, "*.", 2) == 0 && cn_end == &cn[1])
+      if (_f_memcmp(cert_name, "*.", 2) == 0 && cn_end == &cert_name[1])
       {
-      	_X509_PRINTF((MSG_DEBUG, "\tCN *.example.com valid for example.com\n"));
+      	_X509_PRINTF((MSG_DEBUG, "\tcert *.example.com valid for example.com"));
       	return 0;
       }
-      if (_f_memcmp(cn, "www.", 4) == 0 && cn_end == &cn[3])
+      if (_f_memcmp(cert_name, "www.", 4) == 0 && cn_end == &cert_name[3])
       {
-      	_X509_PRINTF((MSG_DEBUG, "\tCN www.example.com valid for example.com\n"));
+      	_X509_PRINTF((MSG_DEBUG, "\tcert www.example.com valid for example.com"));
       	return 0;
       }
    }
 
-   if (cn_end < cn)
+   if (cn_end < cert_name)
    {
       if (_f_memcmp(hostname, "www.", 4) == 0 && hostname_end == &hostname[3])
       {
-      	_X509_PRINTF((MSG_DEBUG, "\tCN example.com valid for www.example.com\n"));
+      	_X509_PRINTF((MSG_DEBUG, "\tcert example.com valid for www.example.com"));
       	return 0;
       }
    }
@@ -2169,24 +2236,73 @@ int x509_validate_hostname(const struct x509_certificate __far *cert,
       }
       if (hostname_end < hostname)
       {
-      	_X509_PRINTF((MSG_DEBUG, "\tCN *.example.com valid for foo.example.com\n"));
+      	_X509_PRINTF((MSG_DEBUG, "\tcert *.example.com valid for foo.example.com"));
       	return 0;
       }
       // here because *.example.com is NOT valid for foo.bar.example.com
       // fall through to failure case
    }
    
-   _X509_PRINTF((MSG_DEBUG, "\tINVALID\n"));
+   _X509_PRINTF((MSG_DEBUG, "\tINVALID"));
    return -NETERR_HOST_REFUSED;
 }
 
-/*** BeginHeader _test_x509_validate_hostname */
-int _test_x509_validate_hostname(int verbose);
-/*** EndHeader */
-typedef  _x509_validate_hostname_test_t;
+/* START FUNCTION DESCRIPTION ********************************************
+x509_validate_hostname							   <X509.LIB>
 
+SYNTAX:  int x509_validate_hostname(const struct x509_certificate far *cert,
+                                 const char far *hostname);
+
+DESCRIPTION: See if a hostname is covered by the Subject Alternative Names
+             (SANs) (or the Subject Common Name (CN) if SANs aren't present)
+             stored in a certificate.
+             
+             Handles wildcard matching (*.example.com valid for example.com,
+             foo.example.com but not foo.bar.example.com) and securing the
+             root domain for the www-hostname (subject name www.example.com
+             is valid for hostname example.com and vice versa).
+
+PARAMETER 1: Certificate object
+
+PARAMETER 2: Hostname to verify
+
+RETURN VALUE: 0: Certificate is valid for given hostname.
+              -EINVAL: NULL passed as one of the two parameters, or certificate
+                       does not have a subject.cn.
+              -NETERR_HOST_REFUSED: Certificate is not valid for given hostname.
+
+END DESCRIPTION **********************************************************/
 _x509_debug
-int _test_x509_validate_hostname(int verbose)
+int x509_validate_hostname(const struct x509_certificate __far *cert,
+	const char __far *hostname)
+{
+	const char __far *alt_name;
+   int retval = -NETERR_HOST_REFUSED;
+   
+	if (cert == NULL) {
+   	return -EINVAL;
+   }
+   
+   // Per RFC 6125 the validator must use SAN if present, otherwise it can check CN.
+   alt_name = cert->subject_alt_name;
+   if (alt_name == NULL) {
+   	retval = x509_compare_hostname(cert->subject.cn, hostname);
+   } else {
+   	// Try all names in subjectAltName.
+   	while (retval == -NETERR_HOST_REFUSED && *alt_name) {
+   		retval = x509_compare_hostname(alt_name, hostname);
+   		alt_name += _f_strlen(alt_name) + 1;  // point to next name
+   	}
+   }
+   
+   return retval;
+}
+
+/*** BeginHeader _test_x509_compare_hostname */
+int _test_x509_compare_hostname(int verbose);
+/*** EndHeader */
+_x509_debug
+int _test_x509_compare_hostname(int verbose)
 {
 	static const struct {
 	   char far *cn;
@@ -2208,20 +2324,18 @@ int _test_x509_validate_hostname(int verbose)
 	   { "*.example.com", "foo.bar.example.com", -NETERR_HOST_REFUSED },
 	};
 	int TEST_COUNT = (sizeof test_case / sizeof test_case[0]);
-	struct x509_certificate cert;
 	int i, result, failures = 0;
 
    if (verbose) printf("%s: running %u tests\n", __FUNCTION__, TEST_COUNT);
    
-   if (x509_validate_hostname(NULL, "foo") != -EINVAL)
+   if (x509_compare_hostname(NULL, "foo") != -EINVAL)
    {
       ++failures;
       if (verbose) printf("FAIL test 0: NULL cert should return -EINVAL\n");
    }
    for (i = 0; i < TEST_COUNT; ++i)
    {
-   	cert.subject.cn = test_case[i].cn;
-      result = x509_validate_hostname(&cert, test_case[i].hostname);
+      result = x509_compare_hostname(test_case[i].cn, test_case[i].hostname);
       if (result != test_case[i].expected_result)
       {
       	++failures;

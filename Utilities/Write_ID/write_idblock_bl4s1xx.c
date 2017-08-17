@@ -207,7 +207,7 @@
 //  system macro edit the following XBEE_ID_VALUE macro definition to suit
 #define XBEE_ID_VALUE 0xFFFFFFFFul
 
-// edit the last three bytes of the newMAC array to set the unique MAC address
+// Update newMAC to set the unique MAC address, matching the device's sticker.
 const char newMAC[6] = { 0x00, 0x90, 0xC2,
                          0x00, 0x00, 0x00 };
 

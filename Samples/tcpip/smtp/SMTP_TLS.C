@@ -39,41 +39,33 @@
 
         Before running:
 
-        1) Make sure your basic network configuration is OK, including a
+        *  Make sure your basic network configuration is OK, including a
            DNS (name server) and a route to the outside Internet.  The
            default in this sample expects DHCP.  You can use a different
            TCPCONFIG macro and set alternative parameters if necessary.
            (If necessary, use a simpler sample to get this working).
-        2) Set up a Google Gmail account for test purposes.  Follow Google's
+        *  Set up a Google Gmail account for test purposes.  Follow Google's
            instructions for "enabling POP" on this account.  Enabling POP
            also enables mail origination using SMTP.  See http://gmail.com.
-        3) Modify the parameters to the smtp_setauth() function call (in this
+        *  You'll also need to turn on access for "Less secure apps".  As of
+           March 2017, you can do so at:
+             https://www.google.com/settings/u/1/security/lesssecureapps
+        *  Modify the parameters to the smtp_setauth() function call (in this
            sample) to the account name and password that you used in step (2).
            It is most convenient to put these in the
            Options->ProjectOptions->Defines panel e.g.
               SMTP_USER="my_account@gmail.com"
               SMTP_PASS="myPassw0rd"
-        4) Modify the FROM, SMTP_TO, SUBJECT and BODY macros to be a valid mail
+        *  Modify the FROM, SMTP_TO, SUBJECT and BODY macros to be a valid mail
            recipient and desired message.  Preferably, override SMTP_TO
            in the Defines box to be a valid recipient (that you can check!)
-        5) The SMTP_SERVER and SMTP_PORT macros are set appropriately for
+        *  The SMTP_SERVER and SMTP_PORT macros are set appropriately for
            Gmail as of the time this sample was constructed, but you may wish
            to check this if the sample seems to fail in spite of everything.
            You can override these macros in the Defines panel.
-
-        NOTE: you can also use a Hotmail/Outlook.com account once Microsoft
-        upgrades their servers from TLS 1.0 to TLS 1.2 (still not the case
-        in February 2016).
-        
-        In this case, #define SMTP_SERVER "smtp-mail.outlook.com", and use your
-        Hotmail/Outlook.com credentials in SMTP_USER and SMTP_PASS.  There is no
-        need to change any of your Hotmail account settings (still true as
-        of February 2016).
-        
-        Unfortunately, Microsoft in their wisdom use 4096 bit RSA keys in
-        some of their certificates, thus you need to #define MP_SIZE 514.
-        GMail uses 2048-bit keys, and requires a MP_SIZE of at least 258.
-        
+        *  For Hotmail/Outlook.com, #define USE_OUTLOOK_SETTINGS, and use your
+           Hotmail/Outlook.com credentials in SMTP_USER and SMTP_PASS.
+                   
         To date, Yahoo does not allow POP3/SMTP access with their free email
         accounts.
 
@@ -84,19 +76,22 @@
 
 // Import the certificate files.  These are the CAs used at the time of writing
 // this sample.  It is subject to change (beyond Digi's control).  You can
-// #define SSL_CERT_VERBOSE and X509_VERBOSE in order to find out the
-// certificates in use.
+// #define X509_CHAIN_VERBOSE in order to find out the certificates in use.
 
 // These two are for Google Gmail (POP3 and SMTP)
 #ximport "../sample_certs/EquifaxSecureCA.crt"  ca_pem1
 #ximport "../sample_certs/ThawtePremiumServerCA.crt"  ca_pem2
 
-// This one for Hotmail/Outlook.com (POP3 and SMTP)
-#ximport "../sample_certs/GTECyberTrustGlobalRoot.crt"  ca_pem3
-#define MP_SIZE 258			// necessary for GMail's RSA keys
+// These are for Hotmail/Outlook.com (POP3 and SMTP)
+#ximport "../sample_certs/GlobalSign Organization Validation CA - SHA256 - G2.cer" ca_pem3
+#ximport "../sample_certs/DigiCert-Global-Root-CA.cer" ca_pem4
 
-//#define MP_SIZE 514			// Recommended to support 4096-bit RSA keys used by
-									// some Microsoft certs.
+const long certs[] = { ca_pem1, ca_pem2, ca_pem3, ca_pem4 };
+
+// Uncomment the following line if you're connecting to smtp-mail.outlook.com
+//#define USE_OUTLOOK_SETTINGS
+
+#define MP_SIZE 258			// necessary for GMail's RSA keys
 
 // Comment this out if the Real-Time Clock is set accurately.
 #define X509_NO_RTC_AVAILABLE
@@ -169,13 +164,17 @@
  *   and/or smtp_setport() at run-time.
  */
 #ifndef SMTP_SERVER
-	#define SMTP_SERVER "smtp.gmail.com"
-	//#define SMTP_SERVER "smtp-mail.outlook.com"
+	#ifndef USE_OUTLOOK_SETTINGS
+		#define SMTP_SERVER "smtp.gmail.com"
+	#else
+		#define SMTP_SERVER "smtp-mail.outlook.com"
+	#endif
 #endif
 #ifndef SMTP_PORT
 	// Port 587 used by secure SMTP service (both Gmail and Hotmail)
 	#define SMTP_PORT   587
 #endif
+
 /*
  *   The SMTP_DOMAIN should be the name of your controller.  i.e.
  *   "somecontroller.somewhere.com"  Many SMTP servers ignore this
@@ -199,6 +198,7 @@
 //#define SSL_SOCK_VERBOSE
 //#define _SSL_PRINTF_DEBUG 1
 //#define SSL_CERT_VERBOSE
+#define X509_CHAIN_VERBOSE
 //#define X509_VERBOSE
 //#define TCP_VERBOSE
 
@@ -228,6 +228,8 @@ int smtp_server_policy(ssl_Socket far * state, int trusted,
 	                       struct x509_certificate far * cert,
                           void __far * data)
 {
+	char far *alt_name;
+	
 	printf("\nChecking server certificate...\n");
 	if (trusted)
 		printf("This server's certificate is trusted\n");
@@ -262,8 +264,18 @@ int smtp_server_policy(ssl_Socket far * state, int trusted,
 		printf("          Unit: %ls\n", cert->subject.ou);
 	if (cert->subject.email)
 		printf("       Contact: %ls\n", cert->subject.email);
-	printf("Server claims to be CN='%ls'\n", cert->subject.cn);
-	printf("We are looking for  CN='%s'\n", smtp_getserver());
+	if ((alt_name = cert->subject_alt_name) == NULL) {
+		// Only reference Subject.CN if Subject Alternative Name not present
+		printf("Server claims to be: %ls\n", cert->subject.cn);
+	} else {
+		printf("Server claims to be: ");
+		while (*alt_name) {
+			printf("%ls ", alt_name);
+			alt_name += _f_strlen(alt_name) + 1;
+		}
+		printf("\n");
+	}
+	printf("We are looking for '%s'\n", smtp_getserver());
 
 	if (x509_validate_hostname(cert, smtp_getserver())) {
 		printf("Mismatch!\n\n");
@@ -279,26 +291,17 @@ void main()
 	// Can't store this on the stack (auto) since the SMTP client library stores
 	// a reference to it for use later.
 	static far SSL_Cert_t trusted;
-	auto int rc;
+	auto int rc, i;
 
 	// First, parse the trusted CA certificates.
 	_f_memset(&trusted, 0, sizeof(trusted));
-	rc = SSL_new_cert(&trusted, ca_pem1, SSL_DCERT_XIM, 0);
-	if (rc) {
-		printf("Failed to parse CA certificate 1, rc=%d\n", rc);
-		return;
+	for (i = 0; i < (sizeof certs / sizeof certs[0]); ++i) {
+	   rc = SSL_new_cert(&trusted, certs[i], SSL_DCERT_XIM, i > 0);
+	   if (rc) {
+	      printf("Failed to parse CA certificate %u, rc=%d\n", i + 1, rc);
+	      return;
+	   }
 	}
-	rc = SSL_new_cert(&trusted, ca_pem2, SSL_DCERT_XIM, 1 /*append*/);
-	if (rc) {
-		printf("Failed to parse CA certificate 2, rc=%d\n", rc);
-		return;
-	}
-	rc = SSL_new_cert(&trusted, ca_pem3, SSL_DCERT_XIM, 1 /*append*/);
-	if (rc) {
-		printf("Failed to parse CA certificate 3, rc=%d\n", rc);
-		return;
-	}
-
 
 	// Start network and wait for interface to come up (or error exit).
 	sock_init_or_exit(1);

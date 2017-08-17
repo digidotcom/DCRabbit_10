@@ -18,8 +18,6 @@
 
 	This sample program is for the LCD MSCG12232 Display Module.
 
-   NOTE: Not currently supported on RCM4xxx modules.
-
   	This program demonstrates the scrolling features of the graphic
   	library.
 
@@ -34,8 +32,14 @@
 					// (Demo runs slower with "#class auto")
 #memmap xmem  // Required to reduce root memory usage
 
-#if CPU_ID_MASK(_CPU_ID_) >= R4000
-#fatal "This sample is not currently supported by Rabbit 4000 based products."
+#define USE_DISPLAY_KEYPAD
+#define PORTA_AUX_IO
+#if RCM6700_SERIES
+	#use "RCM67xx.LIB"
+#elif RCM6600W_SERIES
+	#use "RCM66xxW.LIB"
+#else
+	#fatal "Include platform library with necessary macros."
 #endif
 
 // Define font width for scrolling demo

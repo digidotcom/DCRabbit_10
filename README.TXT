@@ -1,6 +1,30 @@
 *****************************************************************
-   README for Dynamic C Version 10.72B
+   README for Dynamic C Version 10.72C
 *****************************************************************
+
+- Adds support for RCM4320 variant -- an RCM4310 with 1MB of SRAM
+  for firmware (instead of 512KB) and a 4MB serial flash for storage
+  (instead of 1MB).
+
+- Updated sdflash.lib to support SDHC cards from 4GB to 32GB.  Note
+  that Dynamic C still does not support FAT32.  When using SDHC cards
+  you must format them on the Rabbit with up to four FAT16 partitions,
+  but you can still read and write them on Mac/Windows/Linux.
+  Email Jim.Pause@digi.com if interested in FAT32 support in Dynamic C.
+
+- Updated FAT16.lib to work on SDHC cards (larger than 2GB).
+
+- Updated TLS to send Server Name Indication (SNI) in ClientHello.
+  Includes updates to HTTP, SMTP and POP3 client libraries.
+
+- Updated X.509 certificate handling to process subjectAltName
+  extension, allowing for improved hostname matching in TLS client
+  connections.
+
+- Defined a CC_REV macro as 'C' for use in compiler version checks.
+
+- Added RCM6xxx support for Panel-Mount Keypad/Display Unit (Digi part
+  number 20-101-0502).
 
 - Adds support for SHA384/SHA512 hashes:
   - New library and updated sample.
@@ -899,4 +923,17 @@
 
         typedef const int const_int;
         void foo(const_int bar, const_int baz) {}
+
+29. On platforms with an ASIX Ethernet controller (e.g., RCM42xx, RCM43xx),
+    the network stack can get stuck in an infinite loop after executing the
+    sequence ifdown()/pd_powerdown()/pd_powerup()/ifup().  Issue present
+    since at least Dynamic C 10.60, and might only happen when calling
+    tcp_tick() while interface is powered down, or calling ifup() too soon
+    after pd_powerup().  If this affects you, contact Digi and reference
+    issue DC-300.
+
+30. The compiler incorrectly reports errors and warnings as occurring on line 1
+    if they are beyond line 32,767 of a file.  Limit file sizes by creating
+    .LIB modules loaded with #use, or .H header files loaded with #include.
+
 

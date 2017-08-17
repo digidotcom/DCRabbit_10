@@ -23,6 +23,9 @@ The graphic sample programs are intended for Rabbit's
 development boards or controllers that have a graphic
 LCD display module (or optional connectors).
 
+See Samples/RCM6700/LCD_Keypad and Samples/RCM6600W/LCD_Keypad for
+additional samples targeting those boards.
+
 If you compile a graphic sample program on a product
 that wasn't designed with a Graphic LCD, then you will
 get compiler errors because target controller has not been
@@ -46,6 +49,8 @@ DEFINITIONS NEEDED FOR CUSTOM WIRING OF LCD122KEY7 module:
 #define KEYSTROBE		  // Bit mask of I/O strobe pin, usually same as LCDSTROBE
 #define KEYBASEADDR 	  // Usually same as LCDBASEADDR
 
+Note that RCM67xx.LIB and RCM66xxW.LIB include definitions appropriate for
+connecting to LCD/Keypad interface circuitry on the RCM3000 prototyping board.
 
 If you're trying to use these sample programs with your
 own custom Graphic LCD application, instructions for

@@ -103,6 +103,11 @@ int main()
      if (megs > 0.01) {
        partsize = (unsigned long)(megs * 2048.0);
        if (partsize > sectors) partsize = sectors;
+       if (partsize > FAT16_MAX_PARTSECSIZE) {
+         partsize = FAT16_MAX_PARTSECSIZE;
+         printf("Partition %d limited to FAT16 maximum of %6.1fMB\n",
+           i + 1, (float)partsize / 2048.0);
+       }
        my_device.part[i].starthead = 254;
        my_device.part[i].parttype = 6;
        my_device.part[i].endhead = 254;
