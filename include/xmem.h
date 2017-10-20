@@ -7,7 +7,7 @@
 */
 // A macro to be used in assembler code.  On entry, AHL contains
 // linear 24-bit address.  Converts this to segmented form
-// with XPC value in JK, and logical part in HL (in range 0xE000-0xEFFF).
+// with LXPC value in JK, and logical part in HL (in range 0xE000-0xEFFF).
 // 118 clocks
 // high 8 bits of linear address put in bc
 #define _LIN2SEG	\
