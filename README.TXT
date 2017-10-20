@@ -620,6 +620,10 @@
    in an unexpected location.  When either of these instructions are followed
    by instructions other than rst 0x28, the debug kernel behaves correctly.
 
+-  The Register Contents debug window (F11) doesn't report the correct LXPC
+   value if it's >= 0xFF.  It reports 0x0FF as "LXPC: FFF" and leaves the
+   high nibble off of values >= 0x100 (so 0x123 appears as "LXPC: 023").
+
 2. Software modules.
 
    RabbitWeb gives a cryptic error message for buffer overflow when
