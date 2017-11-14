@@ -1285,7 +1285,7 @@ __static void wpa_supplicant_process_1_of_4(struct wpa_supplicant *wpa_s,
 #endif
 	wpa_pmk_to_ptk(wpa_s->pmk, wpa_s->pmk_len, wpa_s->nic->hwa, src_addr,
 		       wpa_s->snonce, key->key_nonce,
-		       (uint8 *) ptk, sizeof(*ptk));
+		       (uint8 *) ptk, SIZE_OF_WPA_PTK);
 	/* Supplicant: swap tx/rx Mic keys */
 	memcpy(buf, ptk->u.auth.tx_mic_key, 8);
 	memcpy(ptk->u.auth.tx_mic_key, ptk->u.auth.rx_mic_key, 8);
@@ -1522,6 +1522,11 @@ __static void wpa_supplicant_process_3_of_4(struct wpa_supplicant *wpa_s,
 	wpa_s->renew_snonce = 1;
 
 	if (key_info & WPA_KEY_INFO_INSTALL) {
+		if (wpa_s->ptk.installed) {
+			WPA_PRINTF((MSG_DEBUG, "WPA: Do not re-install same PTK to the driver"));
+			return;
+		}
+
 		WPA_PRINTF((MSG_DEBUG, "WPA: Installing PTK to the driver."))
 		switch (wpa_s->pairwise_cipher) {
 		case WPA_CIPHER_CCMP:
@@ -1552,6 +1557,8 @@ __static void wpa_supplicant_process_3_of_4(struct wpa_supplicant *wpa_s,
 					   0, 1, key_rsc, rsclen,
 					   (uint8 *) &wpa_s->ptk.tk1, keylen) < 0) {
 			WPA_PRINTF((MSG_WARNING, "WPA: Failed to set PTK to the driver."))
+		} else {
+			wpa_s->ptk.installed = 1;
 		}
 	}
 
@@ -1562,6 +1569,8 @@ __static void wpa_supplicant_process_3_of_4(struct wpa_supplicant *wpa_s,
 	wpa_s->wpa_state = WPA_GROUP_HANDSHAKE;
 
 	if (gtk) {
+		int gtk_success = TRUE;
+		
 		WPA_HEXDUMP((MSG_DEBUG,
 			    "WPA: received GTK in pairwise handshake",
 			    gtk, gtk_len))
@@ -1621,6 +1630,14 @@ __static void wpa_supplicant_process_3_of_4(struct wpa_supplicant *wpa_s,
 			return;
 		}
 
+		/* Detect possible key reinstallation */
+		if (wpa_s->gtk.gtk_len == (size_t) gtk_len &&
+		    memcmp(wpa_s->gtk.gtk, gtk, gtk_len) == 0) {
+			WPA_PRINTF((MSG_DEBUG, "WPA: Not reinstalling already in-use GTK to the driver (keyidx=%d tx=%d len=%d)"
+				   , keyidx, tx, gtk_len));
+			return ;
+		}
+
 		WPA_PRINTF((MSG_DEBUG, "WPA: Installing GTK to the driver (keyidx=%d tx=%d).", keyidx, tx))
 		WPA_HEXDUMP((MSG_DEBUG, "WPA: RSC", key->key_rsc, key_rsc_len))
 		if (wpa_s->group_cipher == WPA_CIPHER_TKIP) {
@@ -1635,13 +1652,20 @@ __static void wpa_supplicant_process_3_of_4(struct wpa_supplicant *wpa_s,
 						   keyidx, 1, key->key_rsc,
 						   key_rsc_len, gtk, gtk_len) <
 			    0) {
+				gtk_success = FALSE;
 				WPA_PRINTF((MSG_WARNING, "WPA: Failed to set GTK to the driver (Group only).")) }
 		} else if (wpa_driver_wln_set_key(alg,
 						  "\xff\xff\xff\xff\xff\xff",
 						  keyidx, tx,
 						  key->key_rsc, key_rsc_len,
 						  gtk, gtk_len) < 0) {
+			gtk_success = FALSE;
 			WPA_PRINTF((MSG_WARNING, "WPA: Failed to set GTK to the driver."))
+		}
+
+		if (gtk_success) {
+			wpa_s->gtk.gtk_len = gtk_len;
+			memcpy(wpa_s->gtk.gtk, gtk, gtk_len);
 		}
 
 		wpa_msg(wpa_s, MSG_INFO, "WPA: Key negotiation completed with " MACSTR, MAC2STR(src_addr));
