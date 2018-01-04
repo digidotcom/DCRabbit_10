@@ -940,4 +940,21 @@
     if they are beyond line 32,767 of a file.  Limit file sizes by creating
     .LIB modules loaded with #use, or .H header files loaded with #include.
 
+31. Compiler will report "Cannot load object, report to Rabbit." when trying
+    to compile (0 && j == 0) in the code below:
+
+        int foo(int i, int j) { return (i == 0 || (0 && j == 0)); }
+
+    This can occur when using constant macros to short-circuit conditionals
+    at compile time.  The workaround is to adapt the conditional using the
+    macro preprocessor.  In the example above:
+    
+        int foo(int i, int j) {
+            return (i == 0
+                #if FOO
+                    || (j == 0)
+                #endif
+                   );
+        }
+
 
