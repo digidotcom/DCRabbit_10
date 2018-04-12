@@ -1,7 +1,10 @@
 *****************************************************************
-   README for Dynamic C Version 10.72C
+   README for Dynamic C Version 10.72D
 *****************************************************************
 
+- Addresses Key Reinstallation Attack (KRACK) vulnerabilities in
+  the WPA2 libraries.
+  
 - Adds support for RCM4320 variant -- an RCM4310 with 1MB of SRAM
   for firmware (instead of 512KB) and a 4MB serial flash for storage
   (instead of 1MB).
@@ -21,7 +24,7 @@
   extension, allowing for improved hostname matching in TLS client
   connections.
 
-- Defined a CC_REV macro as 'C' for use in compiler version checks.
+- Defined a CC_REV macro for use in compiler version checks.
 
 - Added RCM6xxx support for Panel-Mount Keypad/Display Unit (Digi part
   number 20-101-0502).
@@ -956,5 +959,9 @@
                 #endif
                    );
         }
+
+32. The "Start" button may be hidden on the main Rabbit Field Utility screen
+    when using certain Windows Display Scaling values (seen at 125% but not
+    199%).
 
 
