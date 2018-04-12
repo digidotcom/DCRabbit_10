@@ -28,7 +28,7 @@ __root void _ctype();
 /*** Endheader */
 
 // Ctype Table
-const char _ctype_table[] = {
+const char __far _ctype_table[] = {
 	_CNTRL,									// control-@ (null)
 	_CNTRL,									// control-A
 	_CNTRL,									// control-B
@@ -184,9 +184,8 @@ _ctype::
    cp   hl,127
    jr   gtu,.invalid    ; HL > 127 and zero flag is set, so return 0 for failure
 
-   ld   bc,_ctype_table ; Index Character into Table
-   add  hl,bc
-   ld   a,(hl)          ; Read Mask Entry from Table
+   ld   px,_ctype_table ; Index Character into Table
+   ld   a,(px+hl)       ; Read Mask Entry from Table
    and  e               ; Mask Against Request
    clr  hl              ; Return 0 for Failure
    ret  z
