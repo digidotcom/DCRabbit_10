@@ -37,7 +37,7 @@ I2C_HW.LIB
 
 		I2C_SLAVE_CHECK_TIMEOUT_MS
 			Default milliseconds time out while waiting for an ACK from the slave
-			address passed into _I2C_StartWrite().
+			address passed into _I2C_Start().
 		
 		I2C_WRITE_TIMEOUT(len)
 			Function macro to calculate the timeout for I2C_WriteToSlave() calls.
@@ -164,7 +164,7 @@ typedef struct _I2C_transaction {
 
 #ifndef I2C_SLAVE_CHECK_TIMEOUT_MS
 	// Default milliseconds time out while waiting for an ACK from the slave
-	//  address passed into _I2C_StartWrite().
+	//  address passed into _I2C_Start().
 	#define I2C_SLAVE_CHECK_TIMEOUT_MS 10
 #endif
 
@@ -850,20 +850,24 @@ ioi	ld		(SGCR), jkhl		; write the updated control register content
 
 
 /*** BeginHeader I2C_WriteToSlave */
-int I2C_WriteToSlave(unsigned slave_address, unsigned index, char __far *data,
-                     unsigned len, int blockingMode, unsigned long timeout);
+int I2C_WriteToSlave(unsigned slave_address,
+                     void __far *header, size_t header_len,
+                     void __far *data, size_t data_len,
+                     int blockingMode, unsigned long timeout);
 /*** EndHeader */
 
 /* START FUNCTION DESCRIPTION ******************************************
 I2C_WriteToSlave              <I2C_HW.LIB>
 
 SYNTAX:
-   int I2C_WriteToSlave(unsigned slave_address, unsigned index,
-                        char far *data, unsigned len,
+   int I2C_WriteToSlave(unsigned slave_address,
+                        void far *header, size_t header_len,
+                        void far *data, size_t data_len,
                         int blockingMode, unsigned long timeout);
 
 DESCRIPTION:
-   Writes data to I2C bus. This function runs in Master mode.
+   Writes data to I2C bus. This function runs in Master mode and will only
+   send a STOP to the I2C slave if <data> is non-NULL and <data_len> is > 0.
 
    IMPORTANT NOTE:
       The I2C API is not re-entrant. Multi-tasking programs should use a
@@ -874,20 +878,26 @@ PARAMETER1:
    7-bit slave destination address in bottom 7 bits.
 
 PARAMETER2:
-   Offset/index to write to on the device.
+   Header bytes to write, often an index or address for the write.  Pass
+   NULL if all bytes are in <data>.
 
 PARAMETER3:
-   Pointer to data to be written to I2C bus
+   Length of header to write, or 0 if all bytes to write are in <data>.
 
 PARAMETER4:
-   Number of bytes to be written to I2C bus
+   Pointer to data to write on I2C bus.  If NULL, function will just send
+   bytes in <header> without a STOP, used to specify an address on the
+   device before calling I2C_ReadFromSlave().
 
 PARAMETER5:
+   Length of data to write, or 0 if PARAMETER4 is NULL.
+
+PARAMETER6:
    Zero for non-blocking mode, non-zero for blocking. If non-blocking
    and the function returns with a "Busy"  result code, it must be
    called again until it returns 0.
 
-PARAMETER6:
+PARAMETER7:
    Time in milliseconds to attempt to complete writing all bytes before
    a time out error is returned. If zero, the function will not test for
    a timeout condition. It is recommended that a timeout limit be set,
@@ -913,8 +923,9 @@ Blocking Usage Example:
 
       // Returns after transaction finished
   		if(retVal =
-          I2C_WriteToSlave(SLAVE_ADDRESS, INDEX,
-                           &data, len,
+          I2C_WriteToSlave(SLAVE_ADDRESS,
+                           &header, header_len,
+                           &data, data_len,
                            1,    // Blocking mode
                            5     // 5 msec timeout
          ))
@@ -928,7 +939,8 @@ Non-blocking Usage Example:
       	// Returns immediately
 			retVal =
           I2C_WriteToSlave(SLAVE_ADDRESS, INDEX,
-                           &data, len,
+                           &header, header_len,
+                           &data, data_len,
                            0,    // Blocking mode
                            50     // 50 msec timeout
          ))
@@ -945,8 +957,9 @@ Non-blocking Usage Example:
 END DESCRIPTION *******************************************************/
 
 I2C_DEBUG
-int I2C_WriteToSlave(unsigned slave_address, unsigned index,
-                     char __far *data, unsigned len,
+int I2C_WriteToSlave(unsigned slave_address,
+                     void __far *header, size_t header_len,
+                     void __far *data, size_t data_len,
                      int blockingMode, unsigned long timeout)
 {
 	static int state = 0;
@@ -977,7 +990,8 @@ int I2C_WriteToSlave(unsigned slave_address, unsigned index,
 		//  to allow time for a previous EEPROM write to complete).
 		do
 		{
-			retVal = _I2C_StartWrite(slave_address, blockingMode, timeout);
+			// Send slave address in upper 7 bits with bit0 set to 0 for write.
+			retVal = _I2C_Start(slave_address << 1, blockingMode, timeout);
 			if (-EBUSY != retVal)
 			{
 				break;
@@ -993,36 +1007,45 @@ int I2C_WriteToSlave(unsigned slave_address, unsigned index,
 		// Intentionally fall through to case 2 . . .
 
 	case 2:
-		// Perform the index byte write to the I2C slave device.
-		do
-		{
-			retVal = _I2C_RWSlave(_I2C_NOSTART | _I2C_NOSTOP, (char*) &index, 1);
-			if (-EBUSY != retVal)
+		// If provided, write the header to the I2C slave device without a STOP.
+		if (header && header_len) {
+			do
 			{
+				retVal = _I2C_RWSlave(_I2C_NOSTART | _I2C_NOSTOP, header, header_len);
+				if (-EBUSY != retVal)
+				{
+					break;
+				}
+			} while (blockingMode && (0UL == timeout || !_CHK_TIMEOUT(tmo)));
+			if (0 != retVal)
+			{
+				// Exit this state machine on any non-success result code.
 				break;
 			}
-		} while (blockingMode && (0UL == timeout || !_CHK_TIMEOUT(tmo)));
-		if (0 != retVal)
-		{
-			// Exit this state machine on any non-success result code.
-			break;
 		}
 		// The slave address byte has been acknowledged; continue with the write.
 		state = 3;
 		// Intentionally fall through to case 3 . . .
 
 	case 3:
-		// Perform an I2C write data transfer.
-		do
+		// If provided, perform an I2C write data transfer.
+		if (data && data_len)
 		{
-			retVal = _I2C_RWSlave(_I2C_NOSTART, data, len);
-			if (-EBUSY != retVal)
+			do
 			{
-				// Reset state on either of success result or write error result.
-				state = 0;
-				break;
-			}
-		} while (blockingMode && (0UL == timeout || !_CHK_TIMEOUT(tmo)));
+				retVal = _I2C_RWSlave(_I2C_NOSTART, data, data_len);
+				if (-EBUSY != retVal)
+				{
+					// Reset state on either of success result or write error result.
+					state = 0;
+					break;
+				}
+			} while (blockingMode && (0UL == timeout || !_CHK_TIMEOUT(tmo)));
+		}
+		else
+		{
+			state = 0;
+		}
 	}
 
 	if (0 != retVal && -EPERM != retVal &&
@@ -1042,8 +1065,8 @@ int I2C_WriteToSlave(unsigned slave_address, unsigned index,
 
 
 /*** BeginHeader I2C_ReadFromSlave */
-int I2C_ReadFromSlave(unsigned slave_address, unsigned index,
-                      char __far *data, unsigned len,
+int I2C_ReadFromSlave(unsigned slave_address,
+                      void __far *data, size_t len,
                       int blockingMode, unsigned long timeout );
 /*** EndHeader */
 
@@ -1051,16 +1074,15 @@ int I2C_ReadFromSlave(unsigned slave_address, unsigned index,
 I2C_ReadFromSlave             <I2C_HW.LIB>
 
 SYNTAX:
-  int I2C_ReadFromSlave(unsigned slave_address, unsigned index,
-                        char far *dataPtr, unsigned len,
+  int I2C_ReadFromSlave(unsigned slave_address,
+                        void far *data, size_t len,
                         int blockingMode, unsigned long timeout);
 
 DESCRIPTION:
-   This function runs in Master mode.
+   This function runs in Master mode, and is typically called AFTER
+   I2C_WriteToSlave() has written an index/offset to the slave.
    
-   Reads data from a slave device on the I2C bus by first sending the
-   8-bit index in a WRITE command, followed by a repeated start and a
-   READ command.
+   Reads data from a slave device on the I2C bus.
 
    NOTE: The I2C API is not re-entrant. Multi-tasking programs should
          use a flag or semaphore to restrict access to it if multiple
@@ -1071,20 +1093,17 @@ PARAMETER1:
    support 10-bit I2C addressing.
 
 PARAMETER2:
-   Offset/index to read from on the device.
-
-PARAMETER3:
    Pointer to a buffer for storing the data read from the I2C slave.
 
-PARAMETER4:
+PARAMETER3:
    Number of bytes to be read from the I2C slave.
 
-PARAMETER5:
+PARAMETER4:
    Zero for non-blocking mode, non-zero for blocking mode. If non-
    blocking mode and the function returns with -EBUSY result code, it
    must be called again until it returns 0.
 
-PARAMETER6:
+PARAMETER5:
    Time in milliseconds to attempt to complete reading all bytes before
    timing out error. If zero, the function will not test for a timeout
    condition. It is recommended that a timeout limit be set, normally.
@@ -1112,13 +1131,12 @@ SEE ALSO:
 END DESCRIPTION ******************************************************/
 
 I2C_DEBUG
-int I2C_ReadFromSlave(unsigned slave_address, unsigned index,
-                      char __far *data, unsigned len,
+int I2C_ReadFromSlave(unsigned slave_address,
+                      void __far *data, size_t len,
                       int blockingMode, unsigned long timeout)
 {
 	static int state = 0;
 	static unsigned long tmo;
-	char controlByte;
 	int retVal;
 
 	// This switch implements a small state machine to direct code execution
@@ -1141,52 +1159,11 @@ int I2C_ReadFromSlave(unsigned slave_address, unsigned index,
 		// Intentionally fall through to case 1 . . .
 
 	case 1:
-		// Ensure the slave address is valid and that the slave isn't busy (e.g.
-		//  to allow time for a previous EEPROM write to complete).
-		do
-		{
-			retVal = _I2C_StartWrite(slave_address, blockingMode, timeout);
-			if (-EBUSY != retVal)
-			{
-				break;
-			}
-		} while (blockingMode && (0UL == timeout || !_CHK_TIMEOUT(tmo)));
-		if (0 != retVal)
-		{
-			// Exit this state machine on any non-success result code.
-			break;
-		}
-		// The slave is present and responsive; continue with the read.
-		state = 2;
-		// Intentionally fall through to case 2 . . .
-
-	case 2:
-		// Complete random read's "dummy write" to set up the desired EEPROM
-		//  address on the I2C slave device.
-		do
-		{
-			retVal = _I2C_RWSlave(_I2C_NOSTART | _I2C_NOSTOP, (char*) &index, 1);
-			if (-EBUSY != retVal)
-			{
-				break;
-			}
-		} while (blockingMode && (0UL == timeout || !_CHK_TIMEOUT(tmo)));
-		if (0 != retVal)
-		{
-			// Exit this state machine on any non-success result code.
-			break;
-		}
-		// The "dummy write" was successfully completed; continue with the read.
-		state = 3;
-		// Intentionally fall through to case 3 . . .
-
-	case 3:
 		// Perform a re-START of the addressed slave and set read mode.
 		do
 		{
 			// Send slave address in upper 7 bits with bit0 set to 1 for read.
-			controlByte = (char) ((slave_address << 1) | 0x01);
-			retVal = _I2C_RWSlave(_I2C_NOSTOP, &controlByte, 1);
+			retVal = _I2C_Start((slave_address << 1) | 0x01, blockingMode, timeout);
 			if (-EBUSY != retVal)
 			{
 				break;
@@ -1199,10 +1176,10 @@ int I2C_ReadFromSlave(unsigned slave_address, unsigned index,
 		}
 		// The addressed slave's reSTART was successfully completed; continue with
 		//  the read.
-		state = 4;
-		// Intentionally fall through to case 4 . . .
+		state = 2;
+		// Intentionally fall through to case 2 . . .
 
-	case 4:
+	case 2:
 		// Perform a "read from current address" read from the I2C slave device.
 		do
 		{
@@ -1232,21 +1209,25 @@ int I2C_ReadFromSlave(unsigned slave_address, unsigned index,
 }
 
 
-/*** BeginHeader _I2C_StartWrite */
-int _I2C_StartWrite(unsigned slave_address, int blockingMode,
-                    unsigned long timeout);
+/*** BeginHeader _I2C_Start */
+int _I2C_Start(unsigned shifted_address, int blockingMode,
+               unsigned long timeout);
 /*** EndHeader */
 
 // Check the slave address via ACK polling until either an ACK is received or
-//  time out occurs.
+// time out occurs.  This is where we'd need to add support for 10-bit slave
+// addresses by sending a 2-byte sequence if bits set in MSB of shifted_address.
 I2C_DEBUG
-int _I2C_StartWrite(unsigned slave_address, int blockingMode,
-                    unsigned long timeout)
+int _I2C_Start(unsigned shifted_address, int blockingMode,
+               unsigned long timeout)
 {
 	static int state = 0;
 	static word tmo;
+	unsigned char address_byte;
 	int retVal;
 
+	address_byte = (char)shifted_address;
+	
 	// This switch implements a small state machine to direct code execution
 	//  appropriately for any combination of blocking mode and / or time out.
 	switch (state)
@@ -1272,8 +1253,11 @@ int _I2C_StartWrite(unsigned slave_address, int blockingMode,
 	case 1:
 		do
 		{
-			// Execute an ACK poll of the specified slave address.
-			if (0 == (retVal = _I2C_PollForACK(slave_address)))
+			// Acknowledge polling performs a write of 1 byte length with START but no
+			//  STOP. The result is 0 if the addressed slave ACKs the poll; otherwise,
+			//  the expected result is either -EBUSY or -EBUSNAK (when a non-ACK error is
+			//  detected).
+			if (0 == (retVal = _I2C_RWSlave(_I2C_NOSTOP, &address_byte, 1)))
 			{
 				//  Got an ACK response, so the slave address is valid.
 				state = 0;	// reset state on success result
@@ -1291,25 +1275,6 @@ int _I2C_StartWrite(unsigned slave_address, int blockingMode,
 	}
 
 	return retVal;
-}
-
-
-/*** BeginHeader _I2C_PollForACK */
-int _I2C_PollForACK(unsigned slave_address);
-/*** EndHeader */
-
-I2C_DEBUG
-int _I2C_PollForACK(unsigned slave_address)
-{
-	char controlByte;
-
-	// Send slave address in upper 7 bits with bit0 set to 0 for write.
-	controlByte = (char) (slave_address << 1);
-	// Acknowledge polling performs a write of 1 byte length with START but no
-	//  STOP. The result is 0 if the addressed slave ACKs the poll; otherwise,
-	//  the expected result is either -EBUSY or -EBUSNAK (when a non-ACK error is
-	//  detected).
-	return _I2C_RWSlave(_I2C_NOSTOP, &controlByte, 1);
 }
 
 
@@ -1361,7 +1326,7 @@ int _I2C_RWSlaveBadACKorNAK(int cmd, uint32 statusReg, int isLastByte)
 
 
 /*** BeginHeader _I2C_RWSlave */
-int _I2C_RWSlave(int cmd, char __far *data, unsigned len);
+int _I2C_RWSlave(int cmd, void __far *data, unsigned len);
 /*** EndHeader */
 
 #if defined I2C_OMIT_MASTER_CODE
@@ -1372,7 +1337,7 @@ int _I2C_RWSlave(int cmd, char __far *data, unsigned len);
 _I2C_RWSlave                  <I2C_HW.LIB>
 
 SYNTAX:
-   int _I2C_RWSlave(int cmd, char far *data, unsigned len);
+   int _I2C_RWSlave(int cmd, void far *data, unsigned len);
 
 DESCRIPTION:
    A Rabbit I2C bus Master transfers data to or from the I2C bus.
@@ -1460,13 +1425,14 @@ RETURN VALUE:
 END DESCRIPTION *******************************************************/
 
 I2C_DEBUG
-int _I2C_RWSlave(int cmd, char __far *data, unsigned len)
+int _I2C_RWSlave(int cmd, void __far *data_in, unsigned len)
 {
 	static int state = 0;
 #ifdef I2C_NO_INTERRUPTS
 	static unsigned subState;
 	static unsigned subStateFinal;
 #endif
+	char __far *data = data_in;
 	int retVal;
 	uint32 controlReg;
 	uint32 statusReg;

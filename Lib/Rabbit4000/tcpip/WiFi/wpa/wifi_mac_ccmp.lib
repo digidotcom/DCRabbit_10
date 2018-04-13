@@ -51,8 +51,9 @@ typedef struct {
 	BOOL valid;				// TRUE if key is valid
 	uint16 	txPN0;		// Transmit packet number (low 16 bits)
 	uint32 	txPN1;		// Transmit packet number (high 32 bits)
-	uint16 	rxPN0;		// Next receive packet number
+	uint16 	rxPN0;		// largest received packet number
 	uint32 	rxPN1;
+	uint16 	pn_seen_mask;		// bitmask of keys seen before current rxPN
 	_WIFI_AES_KEY	rk;			// AES key schedule
 } _wifi_CcmpKey;
 
@@ -289,6 +290,8 @@ BOOL _wifi_CcmpEncrypt (__far WiFiMacBuffer *buf)
 	buf->body[3] = (aes_txKeyID << 6) | _WIFI_EXT_IV;
 	_WIFI_SET32_FAR (buf->body+4, key->txPN1);
 
+	DPRINTF("CCMP TX key %u PN:0x%08lX 0x%04X\n", aes_txKeyID, key->txPN1, key->txPN0);
+	
 	// Adjust buffer length
 	buf->length += _WIFI_CCMP_SIZE;
 
@@ -327,6 +330,198 @@ BOOL _wifi_CcmpEncrypt (__far WiFiMacBuffer *buf)
 	return TRUE;
 }
 
+/*** BeginHeader _wifi_Ccmp_PnCheck */
+#define CCMP_PN_TOO_OLD -100
+#define CCMP_PN_REPLAY  -101
+int _wifi_Ccmp_PnCheck(_wifi_CcmpKey __far *key,
+                       uint32 pn1, uint16 pn0, int update);
+#define _wifi_Ccmp_PnInvalid(key, pn1, pn0) \
+	_wifi_Ccmp_PnCheck(key, pn1, pn0, FALSE)
+#define _wifi_Ccmp_PnUpdate(key, pn1, pn0) \
+	_wifi_Ccmp_PnCheck(key, pn1, pn0, TRUE)
+/*** EndHeader */
+/*
+	Validate packet number (PN) for the given key.  The key stores the
+	largest-seen PN and a bitmask of the 16 prior PNs to allow for receiving
+	packets slightly out of order (but not allowing duplicate packets).
+	
+	Set <update> to non-zero to update key with new packet number if valid.
+	
+	Returns negative value if the stack shouldn't accept the packet (possible
+	replay attack) or 0 if PN hasn't been seen before.
+*/
+_wifi_ccmp_debug
+int _wifi_Ccmp_PnCheck(_wifi_CcmpKey __far *key,
+                       uint32 pn1, uint16 pn0, int update)
+{
+	uint32 delta1;	// upper 32 bits of new PN - largest-seen PN
+	uint16 delta0;
+	uint16 bitmask; 
+	
+	delta1 = pn1 - key->rxPN1;
+	delta0 = pn0 - key->rxPN0;
+	if (delta0 > pn0) {
+		// overflow calculating pn0 difference, borrow from pn1 calculation
+		--delta1;
+	}
+	
+	if (delta0 == 0 && delta1 == 0) {
+		// PN matches last PN seen
+		return CCMP_PN_REPLAY;
+	}
+	
+	if (delta1 > pn1) {
+		// overflow calculating pn0 difference, result is negative and PN is older
+		if (delta1 != (uint32) -1 || delta0 < (uint16) -16) {
+			return CCMP_PN_TOO_OLD;
+		}
+		bitmask = 1U << (0xFFFF - delta0);
+		if (key->pn_seen_mask & bitmask) {
+			return CCMP_PN_REPLAY;
+		}
+		if (update) {
+			key->pn_seen_mask |= bitmask;
+		}
+		
+		DPRINTF("%s PN 0x%08LX %04X %s\n",
+			"Prior", pn1, pn0, update ? "seen" : "OK");
+		return 0;         // PN is earlier than largest-seen, but still new to us
+	}
+
+
+	if (update) {
+		if (delta1 == 0 && delta0 < 16) {
+			// update bitmask of seen PNs
+			key->pn_seen_mask <<= delta0;
+			// set bit corresponding to previous largest-seen PN value
+			key->pn_seen_mask |= 1U << (delta0 - 1);
+		} else {
+			// shifting bitmask >= 16 positions results in 0
+			key->pn_seen_mask = 0;
+		}
+		key->rxPN1 = pn1;
+		key->rxPN0 = pn0;
+	}
+	
+	DPRINTF("%s PN 0x%08LX %04X %s\n",
+		"  New", pn1, pn0, update ? "seen" : "OK");
+	return 0;            // PN larger than previous largest and therefore valid
+}
+
+/*** BeginHeader _wifi_Ccmp_PnCheck_test */
+void _wifi_Ccmp_PnCheck_test(void);
+/*** EndHeader */
+/*
+	Test code to validate proper operation of _wifi_Ccmp_PnCheck() using asserts.
+*/
+#define _WIFI_CCMP_SETUP_KEY(pn1, pn0) \
+	{ memset(&k, 0, sizeof k); k.rxPN1 = pn1; k.rxPN0 = pn0; }
+void _wifi_Ccmp_PnCheck_test(void)
+{
+	_wifi_CcmpKey k;
+	uint32 i;
+	
+	_WIFI_CCMP_SETUP_KEY(0, 0);
+	
+	// all keys other than 0 are valid when largest-seen key is 0
+	assert(_wifi_Ccmp_PnCheck(&k, 0, 0, FALSE) == CCMP_PN_REPLAY);
+	assert(_wifi_Ccmp_PnCheck(&k, 0, 1, FALSE) == 0);
+	assert(_wifi_Ccmp_PnCheck(&k, 0xFFFFFFFF, 0, FALSE) == 0);
+	assert(_wifi_Ccmp_PnCheck(&k, 1000, 10000, FALSE) == 0);
+	assert(_wifi_Ccmp_PnCheck(&k, 0xFFFFFFFF, 0, FALSE) == 0);
+	assert(_wifi_Ccmp_PnCheck(&k, 0xFFFFFFFF, 0xFFFF, FALSE) == 0);
+	
+	_WIFI_CCMP_SETUP_KEY(0xF0F0F0F0, 0x3);
+	assert(_wifi_Ccmp_PnCheck(&k, 0, 0, FALSE) == CCMP_PN_TOO_OLD);
+	assert(_wifi_Ccmp_PnCheck(&k, 0xF0F0F0F0, 0x3, FALSE) == CCMP_PN_REPLAY);
+	assert(_wifi_Ccmp_PnCheck(&k, 0xFFFFFFFF, 0, FALSE) == 0);
+	assert(_wifi_Ccmp_PnCheck(&k, 0xFFFFFFFF, 0xFFFF, FALSE) == 0);
+	
+	// keys in recent past are OK:
+	assert(_wifi_Ccmp_PnCheck(&k, 0xF0F0F0EF, 0xFFFF, FALSE) == 0);
+	assert(_wifi_Ccmp_PnCheck(&k, 0xF0F0F0EF, 0xFFF3, FALSE) == 0);
+	
+	// but go too far back and they aren't
+	assert(_wifi_Ccmp_PnCheck(&k, 0xF0F0F0EF, 0xFFF2, FALSE) == CCMP_PN_TOO_OLD);
+	
+
+	for (i = 1; i; i <<= 1) {
+		_WIFI_CCMP_SETUP_KEY(i, 0);
+		
+		// load a few packet numbers
+		assert(_wifi_Ccmp_PnCheck(&k, i, 1, TRUE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 1, TRUE) == CCMP_PN_REPLAY);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 2, TRUE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 3, TRUE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 5, TRUE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 8, TRUE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 13, TRUE) == 0);
+		
+		// should still be able to detect replay of recent packets
+		assert(_wifi_Ccmp_PnCheck(&k, i, 1, TRUE) == CCMP_PN_REPLAY);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 2, TRUE) == CCMP_PN_REPLAY);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 3, TRUE) == CCMP_PN_REPLAY);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 5, TRUE) == CCMP_PN_REPLAY);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 8, TRUE) == CCMP_PN_REPLAY);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 12, FALSE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 13, TRUE) == CCMP_PN_REPLAY);
+		
+		// This should shift bitmask even further, but still allow for detection
+		assert(_wifi_Ccmp_PnCheck(&k, i, 21, TRUE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 1, TRUE) == CCMP_PN_TOO_OLD);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 2, TRUE) == CCMP_PN_TOO_OLD);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 3, TRUE) == CCMP_PN_TOO_OLD);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 4, TRUE) == CCMP_PN_TOO_OLD); // -17 boundary
+		assert(_wifi_Ccmp_PnCheck(&k, i, 5, TRUE) == CCMP_PN_REPLAY);  // -16 boundary
+		assert(_wifi_Ccmp_PnCheck(&k, i, 8, TRUE) == CCMP_PN_REPLAY);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 13, TRUE) == CCMP_PN_REPLAY);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 21, TRUE) == CCMP_PN_REPLAY);
+		
+		// do some back-fill and re-check for replay
+		assert(_wifi_Ccmp_PnCheck(&k, i, 7, TRUE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 9, TRUE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 11, TRUE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 15, TRUE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 17, TRUE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 20, TRUE) == 0);
+		
+		assert(_wifi_Ccmp_PnCheck(&k, i, 7, TRUE) == CCMP_PN_REPLAY);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 9, TRUE) == CCMP_PN_REPLAY);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 11, TRUE) == CCMP_PN_REPLAY);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 15, TRUE) == CCMP_PN_REPLAY);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 17, TRUE) == CCMP_PN_REPLAY);
+		assert(_wifi_Ccmp_PnCheck(&k, i, 20, TRUE) == CCMP_PN_REPLAY);
+		
+		// roll-over test
+		assert(_wifi_Ccmp_PnCheck(&k, i+1, 0x000B, TRUE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i,   0xFFFE, TRUE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i,   0xFFFF, TRUE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i,   0xFFFA, TRUE) == CCMP_PN_TOO_OLD);
+		assert(_wifi_Ccmp_PnCheck(&k, i+1, 0x0003, TRUE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i+1, 0x0005, TRUE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i+1, 0x000E, TRUE) == 0);
+		
+		assert(_wifi_Ccmp_PnCheck(&k, i,   0xFFFE, FALSE) == CCMP_PN_REPLAY);
+		assert(_wifi_Ccmp_PnCheck(&k, i,   0xFFFF, FALSE) == CCMP_PN_REPLAY);
+		assert(_wifi_Ccmp_PnCheck(&k, i+1, 0x0000, FALSE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i+1, 0x0001, FALSE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i+1, 0x0002, FALSE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i+1, 0x0003, FALSE) == CCMP_PN_REPLAY);
+		assert(_wifi_Ccmp_PnCheck(&k, i+1, 0x0004, FALSE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i+1, 0x0005, FALSE) == CCMP_PN_REPLAY);
+		assert(_wifi_Ccmp_PnCheck(&k, i+1, 0x0006, FALSE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i+1, 0x0007, FALSE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i+1, 0x0008, FALSE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i+1, 0x0009, FALSE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i+1, 0x000A, FALSE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i+1, 0x000B, FALSE) == CCMP_PN_REPLAY);
+		assert(_wifi_Ccmp_PnCheck(&k, i+1, 0x000C, FALSE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i+1, 0x000D, FALSE) == 0);
+		assert(_wifi_Ccmp_PnCheck(&k, i+1, 0x000E, FALSE) == CCMP_PN_REPLAY);
+		assert(_wifi_Ccmp_PnCheck(&k, i+1, 0x000F, FALSE) == 0);
+	}
+}
+
 /*** BeginHeader _wifi_CcmpDecrypt */
 BOOL _wifi_CcmpDecrypt (__far WiFiMacBuffer *buf);
 /*** EndHeader */
@@ -358,15 +553,12 @@ BOOL _wifi_CcmpDecrypt (__far WiFiMacBuffer *buf)
 
 	// Get packet number from IV and check for replay.
 	// Counters are 48 bits: 16 LSB in pn0, 32 LSB in pn1.
-	// Allow frame counter (pn) to be REPLAY_WINDOW-1 less than previous value (rxPN).
 	pn0 = _WIFI_GET16_FAR (buf->body);
 	pn1 = _WIFI_GET32_FAR (buf->body+4);
 
-	// Received PN must be greater than or equal to next expected PN
-	if ((pn1   == key->rxPN1 && pn0+_WIFI_REPLAY_WINDOW <= key->rxPN0) ||
-		// micTSC0 has wrapped, tsc0 has not
-		(pn1+1 == key->rxPN1 && pn0+_WIFI_REPLAY_WINDOW <= key->rxPN0+0x10000UL) ||
-		(pn1+2 <= key->rxPN1))
+	// New PN must be larger than largest previously seen, or in the prior 16
+	// PN values and not yet seen.
+	if (_wifi_Ccmp_PnInvalid(key, pn1, pn0))
 	{
 		DPRINTF ("CCMP replay detected\n");
 		return FALSE;
@@ -411,12 +603,9 @@ BOOL _wifi_CcmpDecrypt (__far WiFiMacBuffer *buf)
 		}
 	}
 
-	// Save next expected packet number if successful
-	key->rxPN0 = pn0+1;
-	key->rxPN1 = pn1;
-	if (key->rxPN0 == 0)
-		key->rxPN1++;
-
+	// Mark packet number as seen if successful.
+	_wifi_Ccmp_PnUpdate(key, pn1, pn0);
+	
 	// Adjust buffer length
 	buf->length -= _WIFI_CCMP_SIZE;
 

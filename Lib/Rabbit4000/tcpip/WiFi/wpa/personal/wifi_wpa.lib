@@ -1123,6 +1123,12 @@ __static void wpa_supplicant_process_1_of_4(struct wpa_supplicant *wpa_s,
 	auto uint8 *pos, * end;
 	auto word nlen;
 
+	/*FIX: TestCase 4.1.6 WPA2 Vulnerability*/
+	if (wpa_s->wpa_state == WPA_COMPLETED){
+		WPA_PRINTF((MSG_DEBUG, "WPA: WPA COMPLETED. DROPPING 1/4!"));
+		return;
+	}
+
 	pmkid = NULL;
 	wpa_s->wpa_state = WPA_4WAY_HANDSHAKE;
 	WPA_PRINTF((MSG_DEBUG, "WPA: RX message 1 of 4-Way Handshake from " \
@@ -1235,6 +1241,7 @@ __static void wpa_supplicant_process_1_of_4(struct wpa_supplicant *wpa_s,
 		#if 0
 		if (hostapd_get_rand(wpa_s->snonce, WPA_NONCE_LEN)) {
 			wpa_msg(wpa_s, MSG_WARNING, "WPA: Failed to get random data for SNonce");
+			//free(rbuf);
 			return;
 		}
 		#endif
@@ -1268,6 +1275,7 @@ __static void wpa_supplicant_process_1_of_4(struct wpa_supplicant *wpa_s,
 				"WPA: Failed to get master session key from EAPOL state machines");
 			wpa_msg(wpa_s, MSG_WARNING,
 				"WPA: Key handshake aborted");
+			//free(rbuf);
 			return;
 		}
 	} else if (wpa_s->key_mgmt == WPA_KEY_MGMT_IEEE8021X) {
@@ -1276,13 +1284,14 @@ __static void wpa_supplicant_process_1_of_4(struct wpa_supplicant *wpa_s,
 				   "been received from the external IEEE " \
 				   "802.1X Supplicant - ignoring WPA " \
 				   "EAPOL-Key frame"))
+			//free(rbuf);
 			return;
 		}
 	}
 #endif
 	wpa_pmk_to_ptk(wpa_s->pmk, wpa_s->pmk_len, wpa_s->nic->hwa, src_addr,
 		       wpa_s->snonce, key->key_nonce,
-		       (uint8 *) ptk, sizeof(*ptk));
+		       (uint8 *) ptk, SIZE_OF_WPA_PTK);
 	/* Supplicant: swap tx/rx Mic keys */
 	memcpy(buf, ptk->u.auth.tx_mic_key, 8);
 	memcpy(ptk->u.auth.tx_mic_key, ptk->u.auth.rx_mic_key, 8);
@@ -1371,6 +1380,12 @@ __static void wpa_supplicant_process_3_of_4(struct wpa_supplicant *wpa_s,
 	auto int alg, rsclen;
 	auto int keyidx, tx, key_rsc_len;
 
+	/*FIX: TestCase 4.1.6 WPA2 Vulnerability*/
+	if (wpa_s->wpa_state == WPA_COMPLETED){
+		WPA_PRINTF((MSG_DEBUG, "WPA: WPA COMPLETED. DROPPING 3/4!"));
+		return;
+	}
+	
 	key_rsc_len = 0;
 	wpa_ie_len = 0;
 	rsn_ie_len = 0;
@@ -1519,6 +1534,11 @@ __static void wpa_supplicant_process_3_of_4(struct wpa_supplicant *wpa_s,
 	wpa_s->renew_snonce = 1;
 
 	if (key_info & WPA_KEY_INFO_INSTALL) {
+		if (wpa_s->ptk.installed) {
+			WPA_PRINTF((MSG_DEBUG, "WPA: Do not re-install same PTK to the driver"));
+			return;
+		}
+
 		WPA_PRINTF((MSG_DEBUG, "WPA: Installing PTK to the driver."))
 		switch (wpa_s->pairwise_cipher) {
 		case WPA_CIPHER_CCMP:
@@ -1549,6 +1569,8 @@ __static void wpa_supplicant_process_3_of_4(struct wpa_supplicant *wpa_s,
 					   0, 1, key_rsc, rsclen,
 					   (uint8 *) &wpa_s->ptk.tk1, keylen) < 0) {
 			WPA_PRINTF((MSG_WARNING, "WPA: Failed to set PTK to the driver."))
+		} else {
+			wpa_s->ptk.installed = 1;
 		}
 	}
 
@@ -1559,6 +1581,8 @@ __static void wpa_supplicant_process_3_of_4(struct wpa_supplicant *wpa_s,
 	wpa_s->wpa_state = WPA_GROUP_HANDSHAKE;
 
 	if (gtk) {
+		int gtk_success = TRUE;
+		
 		WPA_HEXDUMP((MSG_DEBUG,
 			    "WPA: received GTK in pairwise handshake",
 			    gtk, gtk_len))
@@ -1618,6 +1642,14 @@ __static void wpa_supplicant_process_3_of_4(struct wpa_supplicant *wpa_s,
 			return;
 		}
 
+		/* Detect possible key reinstallation */
+		if (wpa_s->gtk.gtk_len == (size_t) gtk_len &&
+		    memcmp(wpa_s->gtk.gtk, gtk, gtk_len) == 0) {
+			WPA_PRINTF((MSG_DEBUG, "WPA: Not reinstalling already in-use GTK to the driver (keyidx=%d tx=%d len=%d)"
+				   , keyidx, tx, gtk_len));
+			return ;
+		}
+
 		WPA_PRINTF((MSG_DEBUG, "WPA: Installing GTK to the driver (keyidx=%d tx=%d).", keyidx, tx))
 		WPA_HEXDUMP((MSG_DEBUG, "WPA: RSC", key->key_rsc, key_rsc_len))
 		if (wpa_s->group_cipher == WPA_CIPHER_TKIP) {
@@ -1632,13 +1664,20 @@ __static void wpa_supplicant_process_3_of_4(struct wpa_supplicant *wpa_s,
 						   keyidx, 1, key->key_rsc,
 						   key_rsc_len, gtk, gtk_len) <
 			    0) {
+				gtk_success = FALSE;
 				WPA_PRINTF((MSG_WARNING, "WPA: Failed to set GTK to the driver (Group only).")) }
 		} else if (wpa_driver_wln_set_key(alg,
 						  "\xff\xff\xff\xff\xff\xff",
 						  keyidx, tx,
 						  key->key_rsc, key_rsc_len,
 						  gtk, gtk_len) < 0) {
+			gtk_success = FALSE;
 			WPA_PRINTF((MSG_WARNING, "WPA: Failed to set GTK to the driver."))
+		}
+
+		if (gtk_success) {
+			wpa_s->gtk.gtk_len = gtk_len;
+			memcpy(wpa_s->gtk.gtk, gtk, gtk_len);
 		}
 
 		wpa_msg(wpa_s, MSG_INFO, "WPA: Key negotiation completed with " MACSTR, MAC2STR(src_addr));
@@ -1682,6 +1721,12 @@ __static void wpa_supplicant_process_1_of_2(struct wpa_supplicant *wpa_s,
 	auto uint8 *gtk_ie;
 	auto size_t gtk_ie_len;
 	auto uint8 *pos, *end;
+
+	/*FIX: TestCase 4.1.6 WPA2 Vulnerability*/
+	if (wpa_s->wpa_state == WPA_COMPLETED){
+		WPA_PRINTF((MSG_DEBUG, "WPA: WPA COMPLETED. DROPPING 1/2!"));
+		return;
+	}
 
 	key_rsc_len = 0;
 	gtk_ie = NULL;
@@ -1804,6 +1849,14 @@ __static void wpa_supplicant_process_1_of_2(struct wpa_supplicant *wpa_s,
 		else if (ver == WPA_KEY_INFO_TYPE_HMAC_SHA1_AES) {
 			if (keydatalen % 8) {
 				WPA_PRINTF((MSG_WARNING, "WPA: Unsupported AES-WRAP len %d", keydatalen))
+				return;
+			}
+			if (maxkeylen > sizeof(gtk)) {
+				wpa_printf(MSG_WARNING, "WPA: AES-WRAP key "
+					   "data too long (keydatalen=%lu "
+					   "maxkeylen=%lu)",
+					   (unsigned long) keydatalen,
+					   (unsigned long) maxkeylen);
 				return;
 			}
 			if (aes_unwrap(wpa_s->ptk.encr_key, maxkeylen / 8,
