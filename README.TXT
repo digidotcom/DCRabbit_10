@@ -964,4 +964,9 @@
     when using certain Windows Display Scaling values (seen at 125% but not
     199%).
 
+33. The command-line compiler fails on project files that contain multiple
+    .C files.  As a workaround, compile a single .C file that references
+    either libraries (with the #use directive) or .H files (with the #include
+    directive) for additional code.
+
 
