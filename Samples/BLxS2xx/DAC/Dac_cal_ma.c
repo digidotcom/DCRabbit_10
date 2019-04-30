@@ -105,7 +105,7 @@ void main()
 
    while(1)
    {
-	   while(!kbhit);
+	   while(!kbhit());
 	   key = getchar() - '0';
 	   switch (key)
 	   {
@@ -147,7 +147,7 @@ void main()
 	         DispStr(1, 17, display);
 
             DispStr(1, 18, "(press any key to continue)");
-            while(!kbhit);
+            while(!kbhit());
             getchar();
             clearLines(11, 18);
 				break;
@@ -170,7 +170,7 @@ void main()
             DispStr(1, 12, display);
 
             DispStr(1, 13, "(press any key to continue)");
-            while(!kbhit);
+            while(!kbhit());
             getchar();
             clearLines(11, 13);
 				break;
