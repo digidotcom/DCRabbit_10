@@ -45,7 +45,7 @@
 //  Set a default of declaring all local variables "auto" (on stack)
 #class auto
 
-// include BLxS2xx series lbrary
+// include BLxS2xx series library
 #use "BLxS2xx.lib"
 
 // set the STDIO cursor location and display a string

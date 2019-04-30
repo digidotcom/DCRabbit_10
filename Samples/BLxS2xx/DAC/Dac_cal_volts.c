@@ -45,7 +45,7 @@
 //  Set a default of declaring all local variables "auto" (on stack)
 #class auto
 
-// include BLxS2xx series lbrary
+// include BLxS2xx series library
 #use "BLxS2xx.lib"
 
 // Note: The DAC output goes thru a inverting amplifier, the higher

@@ -39,7 +39,7 @@
 ***************************************************************************/
 #class auto	 // Change local var storage default to "auto"
 
-// include BLxS2xx series lbrary
+// include BLxS2xx series library
 #use "BLxS2xx.lib"
 
 // size of circular buffer
