@@ -547,7 +547,7 @@ int firmware_upload(HttpState * s)
 	            http_setCond(s, FW_UPLOAD_ERROR, wlen); // Save error code
       			sprintf( http_getData(s),
                  "<h1><font color=red>%s</h1><h2>Error code %d</h2>\n",
-                 "Upload failed: could not write.", error);
+                 "Upload failed: could not write.", wlen);
 	            http_skipCGI(s);  // Skip to next part
 	            return CGI_SEND;  // ...after sending this message
 	         }
