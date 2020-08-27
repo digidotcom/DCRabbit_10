@@ -5,18 +5,18 @@ Hopkins, MN 55343, USA
 +1 (952) 912-3444 | +1 (877) 912-3444  
 [www.digi.com](https://www.digi.com)
 
-Dynamic C 10 Release Notes
+Dynamic C 10 Release Notes
 ==========================
-### Dynamic C 10
-### Version 10.72E (July 2020)
+### Dynamic C 10
+### Version 10.72E (August 2020)
 
 ---
 
 INTRODUCTION
 ------------
-These are the release notes for Dynamic C 10.
+These are the release notes for Dynamic C 10.
 
-[Dynamic C 10](https://www.digi.com/support/productdetail?pid=4978) is the
+[Dynamic C 10](https://www.digi.com/support/productdetail?pid=4978) is the
 IDE (Integrated Development Environment) for Digi International's core
 modules and single-board computers based on Rabbit 4000, 5000 and 6000
 processors.
@@ -93,12 +93,12 @@ KNOWN ISSUES
 
    The Rabbit 4000 CPU's advanced 16-bit memory mode has a defect
    which affects ioe instructions (auxiliary I/O, external I/O)
-   and self-timed chip select.  The Dynamic C BIOS has been
+   and self-timed chip select.  The Dynamic C BIOS has been
    updated to work around this ioe defect on affected boards, all
    of the RCM40xx family.  If absolute top performance is required
    and the User is certain their application is unaffected by the
    ioe bug, the work around can be disabled by adding the
-   `__ALLOW_16BIT_AUXIO_DEFECT` macro into Dynamic C's Project
+   `__ALLOW_16BIT_AUXIO_DEFECT` macro into Dynamic C's Project
    Options Defines Box.  See the Rabbit 4000 Users Manual Appendix
    B (errata section) or TN255 for complete details.
 
@@ -186,14 +186,14 @@ KNOWN ISSUES
 17. Number of dimensions in array initializer are not checked against the
     array declaration.
 
-    Dynamic C will compile an initializer with too few dimensions without
+    Dynamic C will compile an initializer with too few dimensions without
     complaining:
 
         // two few dimensions in initializer
         const static int a[][3][2] = {{11, 12}, {21, 22}};
 
     The results are undefined.  If there are too many dimensions in the
-    initializer, Dynamic C will indicate an error `} is missing/expected.`
+    initializer, Dynamic C will indicate an error `} is missing/expected.`
 
 18. For functions with both a near and far syntax, function help is available
     only using the unadorned name.  For instance, placing the cursor over
@@ -279,7 +279,7 @@ KNOWN ISSUES
            }
         }
 
-22. Dynamic C currently does not allow function pointers to return structures
+22. Dynamic C currently does not allow function pointers to return structures
     by value. The following code snippet will generate an error:
 
         typedef struct { int a; } my_struct_t;
@@ -322,7 +322,7 @@ KNOWN ISSUES
         . . .
         ".00000000000000000000000000000000000001e-38"
 
-25. Dynamic C's assembler does not support embedded C return statements (e.g.
+25. Dynamic C's assembler does not support embedded C return statements (e.g.
     `c return;` or `c return X;`) within an asm block that is within a C
     function. All such occurrences have been removed from standard libraries
     (i.e. DMA.LIB, FFT.LIB) and no occurrences exist in standard samples code.
@@ -332,7 +332,7 @@ KNOWN ISSUES
 
 26. Complex macros inside a one-line for-loop may fail to compile, with an
     internal error (`Internal error: input stream non-existant. Compiler
-    confused. Look for previous syntax error.`) that requires Dynamic C to be
+    confused. Look for previous syntax error.`) that requires Dynamic C to be
     restarted.
 
     Work-around: replace
@@ -346,7 +346,7 @@ KNOWN ISSUES
         }
 
 27. When compiling an initialized array of unspecified dimension(s) in a nested
-    scope, Dynamic C does not generate a jump over the initializer data, which
+    scope, Dynamic C does not generate a jump over the initializer data, which
     results in errant execution of the initializer data. One work around is to
     avoid declaration of such arrays in nested scope. Another work around is to
     ensure all initialized arrays in nested scope have fully specified
@@ -382,7 +382,7 @@ KNOWN ISSUES
 29. On platforms with an ASIX Ethernet controller (e.g., RCM42xx, RCM43xx),
     the network stack can get stuck in an infinite loop after executing the
     sequence `ifdown()`/`pd_powerdown()`/`pd_powerup()`/`ifup()`.  Issue
-    present since at least Dynamic C 10.60, and might only happen when calling
+    present since at least Dynamic C 10.60, and might only happen when calling
     `tcp_tick()` while interface is powered down, or calling `ifup()` too soon
     after `pd_powerup()`.  If this affects you, contact Digi and reference
     issue DC-300.
@@ -420,29 +420,29 @@ KNOWN ISSUES
 
 UPDATE CONSIDERATIONS
 ---------------------
-Reminder: When opening a project in a new version of Dynamic C,
+Reminder: When opening a project in a new version of Dynamic C,
 update the "Include Path" tab in the Project Options to use the
-new Dynamic C directory.  (Or change it to `.\include` to always
+new Dynamic C directory.  (Or change it to `.\include` to always
 use the current compiler's include directory.)
 
-If updating an existing installation of 10.72D or earlier via the Dynamic C 10
+If updating an existing installation of 10.72D or earlier via the Dynamic C 10
 [GitHub repository](https://github.com/digidotcom/DCRabbit_10), you should
-manually apply the changes in `ucos2.patch`, found in the Dynamic C
+manually apply the changes in `ucos2.patch`, found in the Dynamic C
 installation directory.
 
-If using I2C with Dynamic C 10.72B on Rabbit 6000 products, you must update
+If using I2C with Dynamic C 10.72B on Rabbit 6000 products, you must update
 your calls to `I2CRead()` and `I2CWrite()` to pass the slave address
 in bits 1-7 instead of bits 0-6 of the first parameter.  This release
-restores compatibility with software-based I2C from Dynamic C 10.72A
+restores compatibility with software-based I2C from Dynamic C 10.72A
 and earlier.  In addition, the APIs for `I2C_ReadFromSlave()` and
 `I2C_WriteToSlave()` now include an index parameter so `I2C_ReadFromSlave()`
 can send a START, SLAVE_WRITE, INDEX, START, SLAVE_READ sequence for
 efficient reads.  If necessary, use the new `CC_REV` compiler macro to
 conditionally compile code so it can work with new and old APIs.
 
-If updating iDigi-enabled applications to Dynamic C 10.72B or later, you
+If updating iDigi-enabled applications to Dynamic C 10.72B or later, you
 *should* update all IDIGI/idigi references to CLOUD/cloud and replace
-`#use "iDigi.lib"` with `#use "Device_Cloud.lib"`.  All of the iDigi
+`#use "iDigi.lib"` with `#use "Device_Cloud.lib"`.  All of the iDigi
 libraries, APIs and samples were renamed to match the (then) current
 "Device Cloud" name for that service.  `iDigi.lib` remains with macros
 mapping old names to new ones.
@@ -466,10 +466,10 @@ to find out more.
 
 CHANGE LOG
 ==========
-## 10.72E (July 31, 2020)
+## 10.72E (August 31, 2020)
 This is a recommended release.
 
-Note that the bugfix for DC-391 below is included in the Dynamic C
+Note that the bugfix for DC-391 below is included in the Dynamic C
 10.72E installer, but included as a patch in the GitHub repository
 due to licensing issues with the uC/OS-II code.  View `ucos2.patch`
 for instructions on how to apply it.
@@ -509,7 +509,7 @@ for instructions on how to apply it.
 This is a required release for Wi-Fi products, and recommended for all others.
 
 The primary focus of this release is to address the Key Reinstallation
-Attacks (KRACK) against WPA2.  Dynamic C includes two versions of
+Attacks (KRACK) against WPA2.  Dynamic C includes two versions of
 wpa_supplicant -- v0.2.8 used when WPA_USE_EAP isn't defined and
 v0.5.11 for when it is.  This release updates to the last stable
 release of each series and patches them to block the KRACKs.
@@ -575,10 +575,10 @@ This is a recommended release.
   for firmware (instead of 512KB) and a 4MB serial flash for storage
   (instead of 1MB).
 - Updated `sdflash.lib` to support SDHC cards from 4GB to 32GB.  Note
-  that Dynamic C still does not support FAT32.  When using SDHC cards
+  that Dynamic C still does not support FAT32.  When using SDHC cards
   you must format them on the Rabbit with up to four FAT16 partitions,
   but you can still read and write them on Mac/Windows/Linux.
-  Email Jim.Pause@digi.com if interested in FAT32 support in Dynamic C.
+  Email Jim.Pause@digi.com if interested in FAT32 support in Dynamic C.
 - Updated `FAT16.lib` to work on SDHC cards (larger than 2GB).
 - Defined a `CC_REV` macro as 'C' for use in compiler version checks.
 - Added RCM6xxx support for Panel-Mount Keypad/Display Unit (Digi part
@@ -602,7 +602,7 @@ This is a recommended release.
   stack size.
 - DC-304: After DHCP fallback, further DHCP discovery would fail.
 - DC-310: Revert commit that incorrectly processed slave address in
-  `I2CRead()` and `I2CWrite()` calls on Rabbit 6000 hardware with DC 10.72B.
+  `I2CRead()` and `I2CWrite()` calls on Rabbit 6000 hardware with DC 10.72B.
 - DC-317: Correctly set interrupt level when `RS232_INT_LEVEL != 1`.
 - DC-322: Don't hard-code keysize in `AES{en,de}cryptStream_CBC()`
   and `_CBC_XMEM()` functions.  Now works correctly for AES-192/256.
@@ -630,7 +630,7 @@ This is a recommended release.
 ## 10.72B (October 31, 2016)
 This is a recommended release.
 
-This release builds upon the TLS 1.2 update in Dynamic C 10.72A,
+This release builds upon the TLS 1.2 update in Dynamic C 10.72A,
 by adding support for SHA384 and SHA512 hashes in TLS communications
 and X.509 certificates.  It also brings back support for TLS 1.0 in
 outbound client connections to support legacy servers that have not
@@ -685,7 +685,7 @@ resolve all outstanding link recovery issues.
 - DC-285: Fix possible overflow when calculating PMKSA reauth timeout
   for WPA/WPA2 Enterprise Wi-Fi connections.
 - DC-287: Fix for FTP client uploading files using a datahandler instead
-  of a fixed-length buffer (broken by DC-129 in Dynamic C 10.72A).
+  of a fixed-length buffer (broken by DC-129 in Dynamic C 10.72A).
 - DC-290: Ensure that `SSL_set_private_key()` always returns error upon
   failure to parse key.
 - GITHUB-7/DC-265: Handle Ethernet netport interrupt on 6000-based
@@ -708,7 +708,7 @@ resolve all outstanding link recovery issues.
 ## 10.72A (March 17, 2016)
 This is a recommended release.
 
-The big change for this release is that Dynamic C is now an [Open
+The big change for this release is that Dynamic C is now an [Open
 Source project on GitHub](https://github.com/digidotcom/DCRabbit_10).
 It includes source code to the previously-encrypted Wi-Fi and SSL
 libraries, and the license was changed to MPL 2.0 (Libraries) and
@@ -768,7 +768,7 @@ The latest version of XCTU is on [Digi's website](http://www.digi.com/xctu).
 - DC-31: `HTTP.LIB`'s `zhtml_handler()` function now correctly handles
   `HttpState` (unsigned) `extlen` values greater than 32767.
 - DC-55: Fixed multiple stacks (as when using e.g. uC/OS-II
-  multi-tasking) misplacement bug affecting Dynamic C versions 10.62
+  multi-tasking) misplacement bug affecting Dynamic C versions 10.62
   through 10.72, inclusive.
 - DC-78: Fix memory leaks in `idigi_put()` and `idigi_upload()`.
 - DC-117: `PPP.LIB`'s `LCPsendEchoReply()` now echoes the request's
@@ -858,7 +858,7 @@ This is a recommended release.
      level, and manual disconnection of the programming cable is
      inconvenient or undesirable.
 
-  -  When `RFU_BIN_RUN_IMMEDIATELY` is defined in Dynamic C's
+  -  When `RFU_BIN_RUN_IMMEDIATELY` is defined in Dynamic C's
      Project Options' Defines tab, a BIN program image
      successfully loaded by RFU 4.72 or later will run both BIOS
      code and user code immediately after loading, with the
@@ -866,13 +866,13 @@ This is a recommended release.
      cable disconnected, BIOS code and user code will execute as
      usual.
 
-     This mode of operation is enforced when Dynamic C's debug
+     This mode of operation is enforced when Dynamic C's debug
      kernel is enabled. It can also be useful in test fixture
      code, for example, where a test fixture can not or does not
      control the `SMODEx` levels and manual disconnection of the
      programming cable is inconvenient or undesirable.
 
-  -  When `RFU_BIN_WAIT_FOR_RUN_MODE` is defined in Dynamic C's
+  -  When `RFU_BIN_WAIT_FOR_RUN_MODE` is defined in Dynamic C's
      Project Options' Defines tab, a BIN program image
      successfully loaded by RFU 4.72 or later will run BIOS code
      and then pause in an idle loop, waiting for the programming
@@ -896,10 +896,10 @@ This is a recommended release.
   nand flash device installed.
   Custom applications which use nand flash, whether based on
   RCM4000, RCM4050 boards or a custom nand flash board design,
-  should be recompiled using Dynamic C 10.72 in order to support
+  should be recompiled using Dynamic C 10.72 in order to support
   the new, increased selection of small-block nand flash devices.
 - The EXCEPTION(x) macro is no longer used in any standard
-  Dynamic C code and is now deprecated. Please refer to the
+  Dynamic C code and is now deprecated. Please refer to the
   associated deprecation comments in ERRORS.LIB for more
   information.
 - iDigi access via a PPP serial port can now be hosted on an
@@ -914,7 +914,7 @@ This is a recommended release.
   header buffer content.
 - Defect #42073. The `digOutConfig_H()` function in `BLxS2xx.LIB` now
   returns the expected 0 result on success.
-- Defect #43173. Dynamic C's run time error reporting now
+- Defect #43173. Dynamic C's run time error reporting now
   consistently reports the return address on the stack when
   `exception()` is called.
 
