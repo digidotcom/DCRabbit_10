@@ -59,7 +59,7 @@
 	#error "WAVE_FREQUENCY must be between 1 and 50 Hz."
 #endif
 
-// include BLxS2xx series lbrary
+// include BLxS2xx series library
 #use "BLxS2xx.lib"
 
 typedef float (*CALC_T)() ;
