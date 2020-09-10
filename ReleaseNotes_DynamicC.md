@@ -418,6 +418,11 @@ KNOWN ISSUES
     either libraries (with the `#use` directive) or .H files (with the
     `#include` directive) for additional code.
 
+34. When generating .HEX files, the compiler incorrectly pads the length to
+    a multiple of 32, using bytes from the previous block of 32 bytes.  The
+    generated .BIN file is the correct length and contains a complete
+    firmware image.
+
 UPDATE CONSIDERATIONS
 ---------------------
 Reminder: When opening a project in a new version of Dynamic C,
