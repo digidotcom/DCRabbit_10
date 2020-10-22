@@ -423,6 +423,13 @@ KNOWN ISSUES
     generated .BIN file is the correct length and contains a complete
     firmware image.
 
+35. Shared SPI port code (using `SPIgetSemaphore()` and `SPIsetSemaphore()`)
+    was intended for high-speed SPI devices using separate chip select inputs.
+    If sharing the TX/RX signals with an async serial device at a lower baud
+    rates, you will need to set the baud rate to 460800 before releasing the
+    semaphore.  It's possible that just setting TAT1R to the correct value
+    will work as well, but changing the baud rate is a reliable workaround.
+
 UPDATE CONSIDERATIONS
 ---------------------
 Reminder: When opening a project in a new version of Dynamic C,
