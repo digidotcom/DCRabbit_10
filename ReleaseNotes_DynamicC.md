@@ -8,7 +8,7 @@ Hopkins, MN 55343, USA
 Dynamic C 10 Release Notes
 ==========================
 ### Dynamic C 10
-### Version 10.72E (August 2020)
+### Version 10.72F (Unreleased)
 
 ---
 
@@ -471,6 +471,16 @@ to find out more.
 
 CHANGE LOG
 ==========
+## 10.72F (Unreleased, available on GitHub)
+
+### NEW FEATURES
+- None
+
+### BUG FIXES
+- None
+
+---
+
 ## 10.72E (August 31, 2020)
 This is a recommended release.
 
