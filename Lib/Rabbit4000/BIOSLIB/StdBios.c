@@ -2613,14 +2613,15 @@ _more_inits0::
 // Initialize the status pin, clocks, clock doubler, debug baud rate
 _more_inits02::
       lcall _getDoublerSetting   ; get doubler setting value into L (h always 0)
-      ld    a, L                 ; zero value also disables /OEx early output
+      ld    a, L
       or    a                    ; update the Zero flag
       jr    z, .notEarlyOutputEnable
 
       ld    a, 0x0C              ; value to set both /OE0 and /OE1 early output
-.notEarlyOutputEnable:
 ioi   ld    (MTCR), a            ; first, update /OE0, /OE1 early output enable
       ld    (MTCRShadow), a
+
+.notEarlyOutputEnable:
       ld    a, L                 ; recover the doubler setting value
 ioi   ld    (GCDR), a            ; next, update clock doubler setting
       ld    (GCDRShadow), a
