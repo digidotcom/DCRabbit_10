@@ -1874,6 +1874,13 @@ ioi   ld    (STACKSEG), a
 #endif
 //end serial flash fast RAM copy
 
+#if _BOARD_TYPE_ == RCM4110
+; RCM4110 with 55ns flash requires early output enable on MTCR when running
+; with 0 wait states, so configure that before setting MB0CR.
+      ld    a, 0x0C
+ioi   ld    (MTCR), a
+#endif
+
 .fastRAMCopyDone::
 ; Following a fast RAM copy, the current device mapped to MB0 and the device
 ; that is actually supposed to be mapped to MB0 contain the same code at this
