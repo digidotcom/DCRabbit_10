@@ -1397,13 +1397,14 @@ _PB_getDoublerSetting::
       ret
 
 _PB_clock_doubler_table::
-      ;first two bytes are clock speed, third is GCDR setting
+      ;first two bytes are clock speed*, third is GCDR setting
       ;all entries have some minor error (0x20) added since some
       ;are common oscillator speeds.  If the timing measurement
       ;is just slightly high we still want to use the correct
       ;GCDR setting, and adding the error covers this.
       ;This table is based on the settings from _getDoublerSetting
       ;in cpuparam.lib.  Adjust or expand as deemed necessary.
+      ; (* Clock speed of 0x420 * 7200 = 7603200 = 7.6032MHz)
       ;     Clock speed | GCDR setting
       db    0x20, 0x04,       0x0F     ;7.3728 MHz
       db    0x20, 0x06,       0x0D     ;11.0592 MHz
