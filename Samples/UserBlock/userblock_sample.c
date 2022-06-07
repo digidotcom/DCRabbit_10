@@ -36,8 +36,10 @@
 /* Set the size of the test string */
 #define TEST_STRING_LEN		20
 
-void main(void)
+int main(void)
 {
+	int result;
+	
 	/* Create variables for our test data */
 	struct test_struct {
 		int foo;
@@ -73,8 +75,16 @@ void main(void)
 	save_lens[1] = sizeof(test_long);
 	save_data[2] = test_string;
 	save_lens[2] = TEST_STRING_LEN;
-	writeUserBlockArray(0, (const void * const *) save_data, save_lens, 3);
-
+	
+	do {
+		result = writeUserBlockArray(0, (const void * const *) save_data, 
+		                             save_lens, 3);
+	} while (result > 0);
+	if (result < 0) {
+		printf("Error %d writing to user block.\n", result);
+		return -1;
+	}
+	
 	/*
 	 * Clear our variables (to ensure that when we read the data back, it
 	 * is not correct simply because nothing was read).
@@ -88,8 +98,14 @@ void main(void)
 	 * Read back our saved values (note that you could also just use
 	 * readUserBlock() in a loop)
 	 */
-	readUserBlockArray(save_data, save_lens, 3, 0);
-
+	do {
+		result = readUserBlockArray(save_data, save_lens, 3, 0);
+	} while (result > 0);
+	if (result < 0) {
+		printf("Error %d reading from user block.\n", result);
+		return -1;
+	}
+	
 	/* Print out what we are loading */
 	printf("\nLoading...\n");
 	printf("test_data.foo = %d\n", test_data.foo);
