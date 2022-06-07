@@ -480,11 +480,23 @@ CHANGE LOG
 ==========
 ## 10.72F (Unreleased, available on GitHub)
 
+Note that the bugfix for DC-466 below is included in the Dynamic C
+10.72F installer, but a change to UCOS2.LIB is included as a patch
+in the GitHub repository due to licensing issues with the uC/OS-II
+code.  View `ucos2-patch2.patch` for instructions on how to apply it.
+
 ### NEW FEATURES
 - None
 
 ### BUG FIXES
-- None
+- DC-466: Preserve ordering of pointer and alternate pointer registers when
+  switching tasks to prevent corruption of AES state on Rabbit 6000.
+- Return sock_write() errors in sock_puts() instead of ignoring them.
+- In RIO_SBC.LIB's get/set_block APIs, don't limit options to the first pin's
+  configuration.
+
+### OTHER FUNCTIONAL CHANGES
+- Document "Known Issues" #34 and #35.
 
 ---
 
