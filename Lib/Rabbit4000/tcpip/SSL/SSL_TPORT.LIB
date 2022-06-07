@@ -361,6 +361,7 @@ ssl_Socket __far * tls_connection_init_state(void __far *tls_ctx, ssl_Socket __f
    auto ssl_ResourcePool_t __far* rp;
    auto ssl_NResourcePool_t * nrp;
    auto char __far* p;
+   auto SSL_CipherState __far* cs_ptr;
 
  	// Get an index from the alloc pool
    rp = pfcalloc(&_ssl_globals.pool);
@@ -394,10 +395,10 @@ ssl_Socket __far * tls_connection_init_state(void __far *tls_ctx, ssl_Socket __f
 
    // Allocate resources to state structure
 	state->resource_index = rp;
-	state->cipher_state = &rp->cipher;
-   state->cipher_state->key_exch = &rp->key_exch;
-   state->cipher_state->bulk_cipher = &rp->bulk_cipher;
-   state->cipher_state->digest = &rp->digest;
+   state->cipher_state = cs_ptr = &rp->cipher;
+   cs_ptr->key_exch = &rp->key_exch;
+   cs_ptr->bulk_cipher = &rp->bulk_cipher;
+   cs_ptr->digest = &rp->digest;
 
    // Secret and message digest information
    state->master_secret = &rp->master_secret;
@@ -451,6 +452,7 @@ void tls_connection_deinit(void __far *tls_ctx, ssl_Socket __far *state)
 	auto ssl_ResourcePool_t __far * rp;
 	auto ssl_NResourcePool_t * nrp;
 	auto SSL_CipherState __far* cipher;
+    auto void __far* f_null = NULL;
 
 	// Allow state to be null (since it sometimes is when called from
 	// WPA supplicant)
@@ -463,7 +465,7 @@ void tls_connection_deinit(void __far *tls_ctx, ssl_Socket __far *state)
 
 	if (state->client_hello_ext_len) {
 	   _sys_free(state->client_hello_ext);
-	   state->client_hello_ext = NULL;
+	   state->client_hello_ext = f_null; //NULL
 	   state->client_hello_ext_len = 0;
 	}
 
@@ -481,19 +483,19 @@ void tls_connection_deinit(void __far *tls_ctx, ssl_Socket __far *state)
 	if (state->trusted) {
 		if (state->cert_flags & SSL_CF_OWN_TRUST)
 			SSL_free_cert(state->trusted);
-		state->trusted = NULL;
+		state->trusted = f_null; // NULL
 		state->cert_flags &= ~SSL_CF_OWN_TRUST;
 	}
 #endif
    cipher = state->cipher_state;
 
    // Clear the state structure
-	state->resource_index = NULL; // NULL indicates uninitialized
-  	cipher->key_exch = NULL;
-	cipher->auth = NULL;
-   cipher->bulk_cipher = NULL;
-   cipher->digest = NULL;
-	state->cipher_state = NULL;
+   state->resource_index = f_null; // NULL indicates uninitialized
+   cipher->key_exch = f_null;      // NULL
+   cipher->auth = f_null;          // NULL
+   cipher->bulk_cipher = f_null;   // NULL
+   cipher->digest = f_null;        // NULL
+   state->cipher_state = f_null;   // NULL
    state->ip_type = 0;
 
 
@@ -620,6 +622,7 @@ _ssl_tport_debug
 int tls_shutdown(ssl_Socket __far * state, SSL_shutdown_type how, _tbuf __far * tport_out)
 {
 	auto int rc;
+    auto SSL_state_t temp_state;
 
 #if _SSL_PRINTF_DEBUG
    printf("tls_shutdown: how=%s\n",
@@ -656,15 +659,16 @@ int tls_shutdown(ssl_Socket __far * state, SSL_shutdown_type how, _tbuf __far * 
 		state->flags |= SSL_F_NO_RESUME;
 	   // fall through
 	case SHUTDOWN_FULL:
-		if (state->cur_state == SSL_STATE_APP_DATA ||
-		    state->cur_state == SSL_STATE_HALF_CLOSED ||
-		    SSL_STATE_DRAINING == state->cur_state) {
+      temp_state = state->cur_state;
+		if (temp_state == SSL_STATE_APP_DATA ||
+		    temp_state == SSL_STATE_HALF_CLOSED ||
+		    SSL_STATE_DRAINING == temp_state) {
 			state->tport && state->tport(state, TPORT_EVENT_APP_FULL_CLOSE, 0);
 	      rc = tls_send_alert(state, TLS_ALRT_close_notify, tport_out, TLS_warning);
 	      if (rc < 0)
 	         return rc;
 		}
-		else if (state->cur_state != SSL_STATE_DONE)
+		else if (temp_state != SSL_STATE_DONE)
 			tls_set_done(state);
 		break;
 	}
@@ -1293,6 +1297,7 @@ int tls_sm(ssl_Socket __far * state,
 	} hash_sofar;
 
 	auto SSL_Handshake_Hdr_t hh;
+    auto int hh_msg_type;
 	auto _tbuf t;			// HS message data only (not header), overlays hs_in.
 	auto ll_Gather g;		// complete HS message buffer (ref to hs_in data)
 	auto long hs_len;		// length of HS message (incl its header)
@@ -1300,6 +1305,10 @@ int tls_sm(ssl_Socket __far * state,
 	auto word in_hs, out_hs;
 	auto size_t app_get, hs_get;
 	auto size_t nag_curr, nag_extra, nag_avail, nag_len;
+    auto SSL_state_t temp_state;
+    auto int temp_wait_rsa;
+    auto unsigned int temp_hash;
+    auto size_t temp_remain;
 #ifndef TLS_OLDBUF
 	auto word app_remain;
 	auto _tbuf _hs_in;
@@ -1311,8 +1320,9 @@ int tls_sm(ssl_Socket __far * state,
 		// generate the initial client_hello.  If in DONE state, this is an
 		// attempted session resumption.  Caller can also set a ticket key
 		// and/or client hello extension data which will be used if provided.
-		if (state->cur_state != SSL_STATE_HS_LISTEN &&
-		    state->cur_state != SSL_STATE_DONE) {
+        temp_state = state->cur_state;
+		if (temp_state != SSL_STATE_HS_LISTEN &&
+		    temp_state != SSL_STATE_DONE) {
 #if _SSL_PRINTF_DEBUG
     		printf("*** NULL tport_in in forbidden state ***\n");
 #endif
@@ -1327,26 +1337,21 @@ int tls_sm(ssl_Socket __far * state,
 	}
 
 #if _SSL_USE_RSA_
-	switch (state->wait_rsa) {
-	case SSL_WAIT_RSA_PCKE:
+   temp_wait_rsa = state->wait_rsa;
+   if((temp_wait_rsa == SSL_WAIT_RSA_PCKE) || (temp_wait_rsa == SSL_WAIT_RSA_CCV)){
+      if(temp_wait_rsa == SSL_WAIT_RSA_PCKE) {
 		// server processing client key exchange
       rc = tls_do_client_key_exchange(state, &t, tport_out, 1);
-      if (rc == -EAGAIN)
-         // non-blocking RSA operation not yet complete
-         return 0;
-      // else continue with next message
-      state->wait_rsa = SSL_WAIT_RSA_NONE;
-      break;
-   case SSL_WAIT_RSA_CCV:
+      }
+      else {
    	// client constructing certificate verify
 		rc = tls_do_server_hello_done(state, &t, tport_out, 1);
+      }
       if (rc == -EAGAIN)
          // non-blocking RSA operation not yet complete
          return 0;
       // else continue with next message
       state->wait_rsa = SSL_WAIT_RSA_NONE;
-   default:
-   	break;
 	}
 #endif
 
@@ -1354,15 +1359,16 @@ int tls_sm(ssl_Socket __far * state,
 
 
 #ifndef TLS_OLDBUF
-	if (state->indata_remain) {
+   temp_remain = state->indata_remain;
+	if (temp_remain) {
       app_remain = _tbuf_remain(app_in);
-      if (state->indata_remain <= app_remain) {
+      if (temp_remain <= app_remain) {
 #if _SSL_PRINTF_DEBUG
     		printf("tls_sm: completed long rec, app_remain=%u, indata=%u, footer=%u\n",
-    				app_remain, state->indata_remain, state->footer_remain);
+    				app_remain, temp_remain, state->footer_remain);
 #endif
-         _tbuf_move(app_in, tport_in, state->indata_remain, 1, 0);
-         _tbuf_delete(tport_in, state->indata_remain + state->footer_remain);
+         _tbuf_move(app_in, tport_in, temp_remain, 1, 0);
+         _tbuf_delete(tport_in, temp_remain + state->footer_remain);
          state->indata_remain = 0;
          // Done, can continue normally now.
       }
@@ -1371,7 +1377,7 @@ int tls_sm(ssl_Socket __far * state,
          // to drain down the tport buffer).
 #if _SSL_PRINTF_DEBUG
     		printf("tls_sm: incomplete read of long rec, app_remain=%u, indata=%u\n",
-    				app_remain, state->indata_remain);
+    				app_remain, temp_remain);
 #endif
          _tbuf_move(app_in, tport_in, app_remain, 1, 0);
          _tbuf_delete(tport_in, app_remain);
@@ -1422,9 +1428,10 @@ int tls_sm(ssl_Socket __far * state,
 	         if (hs_in->len >= sizeof(hh)) {
 	            _tbuf_xread(&hh, hs_in, 0, sizeof(hh));
 	            hs_len = n24toul(hh.length) + sizeof(hh);
+                hh_msg_type = hh.msg_type;
 #if _SSL_PRINTF_DEBUG > 2
-    				printf("  [TLS HS] got type %u, length %lu\n", hh.msg_type, hs_len);
-    				if (hh.msg_type == certificate_request)
+    				printf("  [TLS HS] got type %u, length %lu\n", hh_msg_type, hs_len);
+    				if (hh_msg_type == certificate_request)
     					;
 #endif
 	            if (hs_len > (unsigned long)hs_in->maxlen) {
@@ -1452,7 +1459,7 @@ int tls_sm(ssl_Socket __far * state,
 
 	         _hs_proc:
 					// Since we're here, may as well check and/or add HS message digest
-					if (hh.msg_type == finished) {
+					if (hh_msg_type == finished) {
 						_tbuf_xread(recvd_mac, hs_in, sizeof(hh), sizeof(recvd_mac));
 						if (tls_finished_mac(state, recvd_mac, 1)) {
 #if _SSL_PRINTF_DEBUG
@@ -1461,8 +1468,8 @@ int tls_sm(ssl_Socket __far * state,
 							return tls_error(state, SSL_FINISH_VERIFY_FAIL, tport_out);
 						}
 					}
-					if (hh.msg_type != hello_request) {
-						if (hh.msg_type == certificate_verify) {
+					if (hh_msg_type != hello_request) {
+						if (hh_msg_type == certificate_verify) {
                      _tbuf_xread(&state->cert_verify_sigalgo, hs_in, sizeof(hh), 2);
                      if (state->cert_verify_sigalgo.signature != TLS_SIGN_RSA) {
                         // unsupported signature type
@@ -1471,26 +1478,25 @@ int tls_sm(ssl_Socket __far * state,
                      
 							// Take snapshot of hashes so far, since this is the data
 							// which was signed by the client.
-                     switch (state->cert_verify_sigalgo.hash) {
-                     	case TLS_HASH_SHA:
+
+                     temp_hash = state->cert_verify_sigalgo.hash;
+                     if (temp_hash == TLS_HASH_SHA) {
                            hash_sofar.sha1 = state->fin_hash->sha1_hash;
                            sha_finish(&hash_sofar.sha1, cert_verf_hashes);
-                        	break;
-                     	case TLS_HASH_SHA256:
+                     }
+                     else if (temp_hash == TLS_HASH_SHA256) {
                            hash_sofar.sha256 = state->fin_hash->sha256_hash;
                            sha256_finish(&hash_sofar.sha256, cert_verf_hashes);
-                        	break;
-                        default:
-                        	// unsupported hash type
+                     }
+                     else 	// unsupported hash type
                            return tls_error(state, SSL_ILLEGAL_PARAMETER_ERROR, tport_out);
                      }
-						}
 						tls_digest_hs_message(state, &g);
 					}
 
 	            _tbuf_delete(hs_in, (word)hs_len);
 
-	            if (hh.msg_type == hello_request) {
+	            if (hh_msg_type == hello_request) {
 	            	continue;
 	            }
 	         }
@@ -1533,9 +1539,9 @@ int tls_sm(ssl_Socket __far * state,
             if (state->hdr.rec_type == SSL_REC_handshake) {
             	// If it is a client or server hello message, send a no_renegotiation
             	// (warning) alert since we don't support renegotiation.
-            	if (hh.msg_type == hello_request
-            		|| state->is_client && hh.msg_type == server_hello
-            		|| !state->is_client && hh.msg_type == client_hello) {
+            	if (hh_msg_type == hello_request
+            		|| state->is_client && hh_msg_type == server_hello
+            		|| !state->is_client && hh_msg_type == client_hello) {
 	            #if _SSL_PRINTF_DEBUG
 	                printf("*** Got renegotiation in app data state ***\n");
 	            #endif
@@ -1553,25 +1559,25 @@ int tls_sm(ssl_Socket __far * state,
             // buffer, so we are done for this record.
             break;
          case SSL_STATE_SENT_CLI_HELLO:
-	      	if (hh.msg_type != server_hello)
+	      	if (hh_msg_type != server_hello)
 	            goto _unexpected;
 	         rc = tls_do_server_hello(state, &t, tport_out);
 	         break;
 #if _SSL_USE_RSA_
          case SSL_STATE_WAIT_CERT:
-	      	if (hh.msg_type != certificate)
+	      	if (hh_msg_type != certificate)
 	            goto _unexpected;
 	         rc = tls_do_certificate(state, &t, tport_out);
 	         break;
 #endif
          case SSL_STATE_WAIT_SHD:
 #if _SSL_USE_PSK_
-	      	if (hh.msg_type == server_key_exchange && state->is_psk) {
+	      	if (hh_msg_type == server_key_exchange && state->is_psk) {
             	rc = tls_do_server_key_exchange(state, &t, tport_out);
             }
             else
 #endif
-	      	if (hh.msg_type == server_hello_done) {
+	      	if (hh_msg_type == server_hello_done) {
 #if _SSL_USE_RSA_
 	#ifdef SSL_BLOCKING_RSA
 		 			rc = tls_do_server_hello_done(state, &t, tport_out, 0);
@@ -1591,7 +1597,7 @@ int tls_sm(ssl_Socket __far * state,
 #endif
 				}
 #if _SSL_USE_RSA_
-	      	else if (hh.msg_type == certificate_request && !state->is_psk)
+	      	else if (hh_msg_type == certificate_request && !state->is_psk)
 					rc = tls_do_certificate_request(state, &t, tport_out);
 					// this remains in WAIT_SHD state
 #endif
@@ -1606,7 +1612,7 @@ int tls_sm(ssl_Socket __far * state,
 	      	goto _unexpected;
          case SSL_STATE_WAIT_FIN:
          case SSL_STATE_WAIT_FIN_RESUME:
-	      	if (hh.msg_type != finished)
+	      	if (hh_msg_type != finished)
 	            goto _unexpected;
 	         // Note the 'logical xor' following...
 	         if ((state->cur_state == SSL_STATE_WAIT_FIN_RESUME) ^ !state->is_client) {
@@ -1623,12 +1629,12 @@ int tls_sm(ssl_Socket __far * state,
 	         break;
 	      case SSL_STATE_HS_LISTEN:
 	      _listen:
-	      	if (hh.msg_type != client_hello)
+	      	if (hh_msg_type != client_hello)
 	            goto _unexpected;
 				rc = tls_do_client_hello(state, &t, tport_out);
 	      	break;
 	      case SSL_STATE_WAIT_CKE:
-	         if (hh.msg_type != client_key_exchange)
+	         if (hh_msg_type != client_key_exchange)
 	            goto _unexpected;
 #if _SSL_USE_RSA_
 	#ifdef SSL_BLOCKING_RSA
@@ -1650,7 +1656,7 @@ int tls_sm(ssl_Socket __far * state,
 	         break;
 #if _SSL_USE_RSA_
 	      case SSL_STATE_WAIT_CERT_VERIFY:
-	         if (hh.msg_type != certificate_verify)
+	         if (hh_msg_type != certificate_verify)
 	            goto _unexpected;
 	         rc = tls_do_certificate_verify(state, &t, tport_out, cert_verf_hashes);
 	         break;
@@ -1667,12 +1673,13 @@ int tls_sm(ssl_Socket __far * state,
 
 _do_output:
 
-	if (state->cur_state == SSL_STATE_DRAINING &&
+    temp_state = state->cur_state;
+	if (temp_state == SSL_STATE_DRAINING &&
 		 !(state->tport ? state->tport(state, TPORT_QUERY_UNSENT, 0) : 0)) {
 		state->cur_state = SSL_STATE_WAIT_CLOSE;
 		state->cn_timeout = _SET_TIMEOUT(state->cn_timeout);
 	}
-	else if (state->cur_state == SSL_STATE_WAIT_CLOSE &&
+	else if (temp_state == SSL_STATE_WAIT_CLOSE &&
 	    _CHK_TIMEOUT(state->cn_timeout)) {
 		// Timed out waiting for peer CN after we sent CN.  Set done.
 		state->tport && state->tport(state, TPORT_EVENT_CLOSE_NOTIFY_TIMEOUT, 0);
