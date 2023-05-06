@@ -93,7 +93,7 @@ __root void L_div();
 ;          BCDE  = Dividend / Divisor
 ;          HL'HL = Dividend % Divisor
 ;	Modulus is given same sign as dividend (numerator).
-
+   align even
 L_div::
 	test	bcde
    jp		z,div0long
@@ -148,6 +148,9 @@ __root void G_div_ep2();
 ; OUTPUT :
 ;          BCDE  = Dividend / Divisor
 ;          HL'HL = Dividend % Divisor
+;
+;          For R6K, PY = Divisor, PW and PX untouched so we can call from
+;          G_div_ll_l::
 
 ; Note: the HL'HL register convention is not optimum for the R4k, but we don't want to change too much...
 ; This function may be called (from C code) using the wrapper uldiv().
@@ -158,6 +161,142 @@ G_div::
 	test	bcde
    jp		z,div0long
    pop	iy
+#if _RAB6K
+    exx
+    ; The following code is carefully aligned for R6K 16 bit memory
+    ; If you change anything, check the alignment after.
+    align even
+    pop bcde
+.ep2:
+    ld jkhl, 0          ; Clear accumulator
+    ;
+    ; Next we look at the top 3 bytes of dividend to see if there are leading
+    ; 0s. Each leading byte of 0s allows us skip one whole iteration of the loop
+    ; so it is worth trying first.
+    ;
+    ld a, b				; These two are single byte instructions (cp 0 is two bytes...)
+    or a
+    jr nz, high_test_done1 ; Top byte non 0 so go and do full 32 bit divide
+    rlb A,bcde			; Adjust dividend and fake loop result in e
+	ld e,255
+    ld a, b
+    or a
+    jr z, high_test2
+    ld a, 24
+    scf    				; Need this for first shift below...
+    align even
+    jr high_test_done2
+
+high_test2:
+    rlb a,bcde
+	ld e,255
+    ld a, b
+    or a
+    jr z, high_test3
+	ld a, 16
+	scf
+    align even
+    jr high_test_done2
+
+high_test3:
+    rlb a,bcde
+	ld e,255
+	ld a, 8
+	scf
+    align even
+    jr high_test_done2
+
+high_test_done1:
+    ld a, 32
+high_test_done2:
+    rl 1,bcde
+    exx
+    ld py, bcde
+    exx
+div_loop:
+    rl 1,jkhl
+    sub jkhl,py
+    jr nc, sub_ok
+    add jkhl,py
+    scf
+
+sub_ok:
+    dec a
+    rl 1,bcde
+    rl 1,jkhl
+    sub jkhl,py     ; Trial subtraction
+    jr nc, sub_ok2
+    add jkhl,py     ; Overshot so undo subtraction
+    scf				; Record the overshoot
+
+sub_ok2:
+    dec a           ; Interleaving the dec a here balances the scf to keep
+    rl 1,bcde       ; everything aligned and avoid need for sub 8 at the end...
+    rl 1,jkhl
+    sub jkhl,py
+    jr nc, sub_ok3
+    add jkhl,py
+    scf
+
+sub_ok3:
+    dec a
+    rl 1,bcde
+    rl 1,jkhl
+    sub jkhl,py
+    jr nc, sub_ok4
+    add jkhl,py
+    scf
+
+sub_ok4:
+    dec a
+    rl 1,bcde
+    rl 1,jkhl
+    sub jkhl,py
+    jr nc, sub_ok5
+    add jkhl,py
+    scf
+
+sub_ok5:
+    dec a
+    rl 1,bcde
+    rl 1,jkhl
+    sub jkhl,py
+    jr nc, sub_ok6
+    add jkhl,py
+    scf
+
+sub_ok6:
+    dec a
+    rl 1,bcde
+    rl 1,jkhl
+    sub jkhl,py
+    jr nc, sub_ok7
+    add jkhl,py
+    scf
+
+sub_ok7:
+    dec a
+    rl 1,bcde
+    rl 1,jkhl
+    sub jkhl,py
+    jr nc, sub_ok8
+    add jkhl,py
+    scf
+
+sub_ok8:
+    rl 1,bcde
+    dec a            	; Last of the decrements
+    jr nz, div_loop
+	ld pz, jkhl
+    ld jkhl, -1         ; Invert it back to normal
+    xor jkhl, bcde
+    ex  jkhl, bcde
+    exx
+    ld jkhl, pz
+    ex		jk,hl
+    exx
+    ld jkhl, pz
+#else
    exx
    pop	bcde		; dividend (numerator)
 .ep2:
@@ -182,7 +321,214 @@ G_div::
    exx
    pop	hl
    rlb	a,bcde		; now bcde = quotient, hl'hl = mod.  Incidentally, A is preserved.
+#endif
    jp		(iy)
+#endasm
+
+
+/*** beginheader G_div_ll_l */
+__root void G_div_ll_l();
+/*** endheader */
+
+#asm
+;
+; Divide 64 bit unsigned long by 32 bit unsigned long
+; Divisor in bcde on entry, dividend in pw/px (lo/hi)
+;
+; On exit, high part of quotient in px, low in pw, remainder in jkhl
+;
+G_div_ll_l::
+    test	bcde
+    jp		z,div0long
+
+    ; First do a straight 32 bit div of upper long word as per normal
+    exx
+    ld bcde, px     ; high long word of dividend (numerator)
+	call G_div_ep2
+
+    ld px, bcde     ; Save top half of quotient
+    ld bcde, py     ; restore divisor
+    exx
+
+    ; Now we want to do the second part which needs 64 bit operations
+    ld jkhl, 0      ; Clear upper part of accumulator
+    ld pz, jkhl		; Clear high part of divisor
+    ld bcde, pw     ; Fetch low part of dividend
+    rlb	a,bcde      ; a, bcde = b, cdea
+    exx             ; Divisor is back in bcde, low accumulator in jkhl, high in jkhl'
+    call	dloop8ll
+    exx
+    rlb	a, bcde
+    exx
+    call	dloop8ll
+    exx
+    rlb	a, bcde
+    exx
+    call	dloop8ll
+    exx
+    rlb	a, bcde
+    exx
+    call	dloop8ll
+    exx
+    rlb	a, bcde
+    ld pw, bcde     ; save lower part of quotient
+    ret
+#endasm
+
+/*** BeginHeader dloop8ll */
+__root void dloop8ll();
+/*** Endheader */
+
+#asm __nodebug
+   align even
+dloop8ll::
+    rl a             ; carry has msb of a
+    rl 1, jkhl      ; now it is in lsb of jkhl
+    exx
+    rl 1, jkhl      ; feed on into upper accumulator
+    exx
+    sub jkhl, bcde  ; subtract divisor
+    exx
+    sbc jkhl, pz
+    exx
+    jr nc, skip1    ; No carry so ok
+    add jkhl, bcde  ; Else undo subtraction
+    exx
+    align even
+    adc jkhl, pz
+    exx
+    scf             ; Make sure carry is still set
+
+skip1:
+    rl a
+    rl 1, jkhl
+    exx
+    rl 1, jkhl
+    exx
+    sub jkhl, bcde
+    exx
+    sbc jkhl, pz
+    exx
+    jr nc, skip2
+    add jkhl, bcde
+    exx
+    align even
+    adc jkhl, pz
+    exx
+    scf
+
+skip2:
+    rl a
+    rl 1, jkhl
+    exx
+    rl 1, jkhl
+    exx
+    sub jkhl, bcde
+    exx
+    sbc jkhl, pz
+    exx
+    jr nc, skip3
+    add jkhl, bcde
+    exx
+    align even
+    adc jkhl, pz
+    exx
+    scf
+
+skip3:
+    rl a
+    rl 1, jkhl
+    exx
+    rl 1, jkhl
+    exx
+    sub jkhl, bcde
+    exx
+    sbc jkhl, pz
+    exx
+    jr nc, skip4
+    add jkhl, bcde
+    exx
+    align even
+    adc jkhl, pz
+    exx
+    scf
+
+skip4:
+    rl a
+    rl 1, jkhl
+    exx
+    rl 1, jkhl
+    exx
+    sub jkhl, bcde
+    exx
+    sbc jkhl, pz
+    exx
+    jr nc, skip5
+    add jkhl, bcde
+    exx
+    align even
+    adc jkhl, pz
+    exx
+    scf
+
+skip5:
+    rl a
+    rl 1, jkhl
+    exx
+    rl 1, jkhl
+    exx
+    sub jkhl, bcde
+    exx
+    sbc jkhl, pz
+    exx
+    jr nc, skip6
+    align even
+    add jkhl, bcde
+    exx
+    adc jkhl, pz
+    exx
+    scf
+
+skip6:
+    rl a
+    rl 1, jkhl
+    exx
+    rl 1, jkhl
+    exx
+    sub jkhl, bcde
+    exx
+    sbc jkhl, pz
+    exx
+    jr nc, skip7
+    add jkhl, bcde
+    exx
+    align even
+    adc jkhl, pz
+    exx
+    scf
+
+skip7:
+    rl a
+    rl 1, jkhl
+    exx
+    rl 1, jkhl
+    exx
+    sub jkhl, bcde
+    exx
+    sbc jkhl, pz
+    exx
+    jr nc, skip8
+    add jkhl, bcde
+    exx
+    align even
+    adc jkhl, pz
+    exx
+    scf
+
+skip8:
+    rla             ; Transfer last carry bit to A
+    cpl             ; Invert A
+    ret
 #endasm
 
 /*** BeginHeader uldiv */
@@ -254,9 +600,6 @@ uldiv_t uldiv( unsigned long numer, unsigned long denom)
 
 }
 
-
-
-
 /*** BeginHeader dloop8 */
 __root void dloop8();
 /*** Endheader */
@@ -264,6 +607,7 @@ __root void dloop8();
 #define _DIVSTEP rla $ rl 1,jkhl $ sub jkhl,bcde $ jr nc,@pc+5 $ add jkhl,bcde $ scf
 
 #asm __nodebug
+   align odd
 dloop8::
 	_DIVSTEP
 	_DIVSTEP
@@ -307,6 +651,7 @@ mod0::
 __root void L_asr();
 /*** endheader */
 #asm
+   align even
 ; right shift item on stack by count in bcde
 L_asr::
 	pop   iy ;return
@@ -324,17 +669,33 @@ L_asr::
    rra
    jr		nc,@pc+4
    sra	1,bcde
-   rra
+#if _RAB6K
+   rr a  ; 2 byte instruction
+#else
+   rra   ; 1 byte instruction
+#endif
    jr		nc,@pc+4
    sra	2,bcde
-   rra
+#if _RAB6K
+   rr a  ; 2 byte instruction
+#else
+   rra   ; 1 byte instruction
+#endif
    jr		nc,@pc+4
    sra	4,bcde
-	rra
+#if _RAB6K
+   rr a  ; 2 byte instruction
+#else
+   rra   ; 1 byte instruction
+#endif
    jr		nc,@pc+6
    rrc	8,bcde
    ld		b,h			; fill 8 sign bits
-   rra
+#if _RAB6K
+   rr a  ; 2 byte instruction
+#else
+   rra   ; 1 byte instruction
+#endif
    jr		nc,@pc+4
    ex		bc,hl			; fill 16 sign bits
    ex		de,hl
@@ -351,48 +712,77 @@ L_asr::
 ; right shift unsigned item on stack by count in bcde
 #endasm
 
-/*** beginheader G_asr */
+/*** beginheader G_asr, _fast_asr */
 // signed & unsigned long bit operations
 __root void G_asr();
+__root void _fast_asr();
 /*** endheader */
 #asm __nodebug
+   align even
 G_asr::  ; almost the same as L.asr, except sign is not preserved
 	pop   iy ;return
 	; In practice, shifts by 1, 8, 16 or 24 would be much more common than any others.
    ; But we don't take advantage of this, since the compiler should in-line constant shifts.
-	ld		jkhl,31
+   ld		jkhl,31
    cp		jkhl,bcde
-	jp		c,_ZGLExit
+   jp		c,_ZGLExit
    ld		a,e			; A <= 31.
-	pop	bcde
-   rra
-   jr		nc,@pc+4
+   pop	bcde
+   rr a
+   jr		nc,@pc+5
    srl	1,bcde
-   rra
-   jr		nc,@pc+4
+   rr a
+   jr		nc,@pc+5
    srl	2,bcde
-   rra
-   jr		nc,@pc+4
+   rr a
+   jr		nc,@pc+5
    srl	4,bcde
-	rra
-   jr		nc,@pc+6
+   rr a
+   jr		nc,@pc+7
    rrc	8,bcde
    ld		B,0
-   rra
+   rr a
    jr		nc,@pc+5
    clr	hl
    ex		bc,hl
    ex		de,hl
    jp		(iy)
+
+; Speedier version with no stack args, value in bcde and a set to shift (<= 31)
+; useful for maths routines with limited ranges
+   align even
+_fast_asr::
+   rr a
+   jr		nc,@pc+5
+   srl	1,bcde
+   rr a
+   jr		nc,@pc+5
+   srl	2,bcde
+   rr a
+   jr		nc,@pc+5
+   srl	4,bcde
+	rr a
+   jr		nc,@pc+7
+   rrc	8,bcde
+   ld		B,0
+   rr a
+   jr		nc,@pc+5
+   clr	hl
+   ex		bc,hl
+   ex		de,hl
+   ret
+
 #endasm
 
-/*** beginheader L_asl,G_asl */
+/*** beginheader L_asl,G_asl, _fast_asl */
 // signed & unsigned long bit operations.
 // Shift amount (in BCDE) is assumed to be unsigned!
 __root void L_asl();
 __root void G_asl();
+__root void _fast_asl();
 /*** endheader */
 #asm __nodebug
+   align even
 G_asl::  ; shift left
 L_asl::
 	pop   iy
@@ -402,26 +792,51 @@ L_asl::
    cp		jkhl,bcde
 	jp		c,_ZGLExit
    ld		a,e			; A <= 31.
-	pop	bcde
-   rra
-   jr		nc,@pc+4
+   align even
+   pop	bcde
+   rr a
+   jr		nc,@pc+5
    sla	1,bcde
-   rra
-   jr		nc,@pc+4
+   rr a
+   jr		nc,@pc+5
    sla	2,bcde
-   rra
-   jr		nc,@pc+4
+   rr a
+   jr		nc,@pc+5
    sla	4,bcde
-	rra
-   jr		nc,@pc+6
+	rr a
+   jr		nc,@pc+7
    rlc	8,bcde
    ld		e,0
-   rra
+   rr a
    jr		nc,@pc+5
    clr	hl
    ex		de,hl
    ex		bc,hl
    jp		(iy)
+
+; Speedier version with no stack args, value in bcde and a set to shift (<= 31)
+; useful for maths routines with limited ranges
+   align even
+_fast_asl::
+   rr a
+   jr		nc,@pc+5
+   sla	1,bcde
+   rr a
+   jr		nc,@pc+5
+   sla	2,bcde
+   rr a
+   jr		nc,@pc+5
+   sla	4,bcde
+	rr a
+   jr		nc,@pc+7
+   rlc	8,bcde
+   ld		e,0
+   rr a
+   jr		nc,@pc+5
+   clr	hl
+   ex		de,hl
+   ex		bc,hl
+   ret
 #endasm
 
 /*** beginheader L_go */
