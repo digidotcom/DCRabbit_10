@@ -49,7 +49,8 @@ END DESCRIPTION **********************************************************/
 /*** Beginheader _f_memcpy, _f_memmove */
 /*** Endheader */
 #asm __nodebug __root
-   align odd
+   align odd  ; Aligns most of instructions on even boundary without the
+              ; potential nop impacting performnce
 _f_memcpy::
 _f_memmove::
 #if _RAB6K
@@ -78,7 +79,7 @@ _f_memmove::
 	dec	hl
 	jr		.contf
 
-    align even
+    align even  ; Make next 8 instructions align for better performnce
 .movbak:
 	ld		bcde, pw	; n
     dec 	pw          ; n - 1
@@ -238,31 +239,22 @@ __nodebug
 char far *_f_strcpy(char far *dst, const char far *src)
 {
 	#asm
-#if _RAB6K
-	ld		pz, px					; PZ = PX = dst (saved for return value)
-	ld		py, (sp+@sp+src)		; PY = src
-    clr     hl                      ; set hl to 0 as ps+hl is quicker than ps+0
-	.cpy:
-	ld		a, (py+hl)
-    pldi              				; *dst++ = *src++
-	or		a							; end of src string?
-	jr		nz, .cpy					; if no (Zero flag reset), go copy another char
-
-	ld		px, pz					; PX = dst (restore the return value)
-#else
 	ld		pz, px					; PZ = PX = dst (saved for return value)
 	ld		py, (sp+@sp+src)		; PY = src
     clr     hl
 	.cpy:
 	ld		a, (py+hl)				; *dst = *src
+#if _RAB6K
+    pldi              				; *dst++ = *src++
+#else
 	ld		(px+hl), a				;  (strcpy includes nul terminator)
 	ld		py, py+1					; dst++
 	ld		px, px+1					; src++
+#endif
 	or		a							; end of src string?
 	jr		nz, .cpy					; if no (Zero flag reset), go copy another char
 
 	ld		px, pz					; PX = dst (restore the return value)
-#endif
 #endasm
 	// char far * result is returned in PX
 }
@@ -577,7 +569,7 @@ int memcmp( const void __far * s1, const void __far * s2, size_t n)
 {
 #asm
 #if _RAB6K
-    align even
+    align even ; Put 4 of the next 5 instructions on even boundary
 	ld		hl, (sp+@sp+n)	;	n
 	ld		py, (sp+@sp+s2)	;	py = str2
 	ex		bc, hl
@@ -587,7 +579,7 @@ int memcmp( const void __far * s1, const void __far * s2, size_t n)
 .loop:
 	ld		a, (px+hl)
 	sub		a, (py)
-    align even
+    align even ; Align most of loop on even boundary for 16 bit mem performance
 	jr		nz, .done
 	inc		px
 	inc		py
@@ -602,7 +594,7 @@ int memcmp( const void __far * s1, const void __far * s2, size_t n)
 	dec	h
 .over:
 #else
-    align even
+    align even  ; Improves performance for 16 bit memory
 	ld		py, (sp+@sp+s2)	;	py = str2
 	ld		hl, (sp+@sp+n)	;	n
     ld      bcde, 1
@@ -770,7 +762,7 @@ END DESCRIPTION **********************************************************/
 /*** Beginheader _f_memchr */
 /*** Endheader */
 #asm __nodebug __root
-   align odd
+   align odd ; Aligns most of loop on even boundary to improve 16 bit mem speed
 #if _RAB6K
 _f_memchr::				; px = src
 	ld		bcde, (sp+6)	; load second param to DE, third param to BC
@@ -1512,9 +1504,9 @@ size_t strlen(const char far *s)
 {
 	#asm
 #if _RAB6K
-	align odd                       ; Nicely aligns majority of code on even boundary
+	align odd ; Nicely aligns majority of code on even boundary
     clr hl
-	ld		py, px					; BCDE = PX = s
+	ld		py, px					; PY = PX = s
 	.find_end:
 	ld		a, (px + hl)            ; Unroll the loop a bit for speed
 	or		a
