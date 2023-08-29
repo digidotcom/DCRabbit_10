@@ -49,8 +49,62 @@ END DESCRIPTION **********************************************************/
 /*** Beginheader _f_memcpy, _f_memmove */
 /*** Endheader */
 #asm __nodebug __root
+   align odd  ; Aligns most of instructions on even boundary without the
+              ; potential nop impacting performnce
 _f_memcpy::
 _f_memmove::
+#if _RAB6K
+	ld		pw, (sp+10)	; n
+	tstnull pw          ; If someone is moving 0xFFFF0000 bytes we are out of our depth...
+	ret	z
+
+	ld		pz, px		; save for ret
+	ld		py, (sp+6)	; src
+
+	ld		jkhl, px	; dst
+	cp		jkhl, py
+	jr		z, .nomov	; if dst == src, we're done
+	jr		gt, .movbak	; if dst > src, move from back to front
+
+	ld		jkhl, pw	; n
+	ld		bc, hl		; bc = n (LSW)
+	ex		jk,hl			; hl = 64k count
+	test	bc
+	jr		nz,.contf
+	dec	hl
+.contf:
+	pldir
+	test	hl
+	jr		z,.nomov
+	dec	hl
+	jr		.contf
+
+    align even  ; Make next 8 instructions align for better performnce
+.movbak:
+	ld		bcde, pw	; n
+    dec 	pw          ; n - 1
+	ld		jkhl,px
+	add	    jkhl,pw
+	ld		px,jkhl
+	ld		jkhl,py
+	add	    jkhl,pw
+	ld		py,jkhl
+	ex		jkhl,bcde
+	ld		bc, hl		; bc = n (LSW)
+	ex		jk,hl			; hl = 64k count
+	test	bc
+	jr		nz,.contb
+	dec	hl
+.contb:
+	plddr
+	test	hl
+	jr		z,.nomov
+	dec	hl
+	jr		.contb
+.nomov:
+	ld		px, pz		; reload px with dst for ret
+	ret
+#else
 	ld		jkhl, (sp+10)	; n
 	test	jkhl
 	ret	z
@@ -111,6 +165,7 @@ _f_memmove::
 .nomov:
 	ld		px, pz		; reload px with dst for ret
 	ret
+#endif
 #endasm
 
 /*** Beginheader _n_memcpy, _n_memmove */
@@ -186,16 +241,21 @@ char far *_f_strcpy(char far *dst, const char far *src)
 	#asm
 	ld		pz, px					; PZ = PX = dst (saved for return value)
 	ld		py, (sp+@sp+src)		; PY = src
+    clr     hl
 	.cpy:
-	ld		a, (py+0)				; *dst = *src
-	ld		(px+0), a				;  (strcpy includes nul terminator)
+	ld		a, (py+hl)				; *dst = *src
+#if _RAB6K
+    pldi              				; *dst++ = *src++
+#else
+	ld		(px+hl), a				;  (strcpy includes nul terminator)
 	ld		py, py+1					; dst++
 	ld		px, px+1					; src++
+#endif
 	or		a							; end of src string?
 	jr		nz, .cpy					; if no (Zero flag reset), go copy another char
 
 	ld		px, pz					; PX = dst (restore the return value)
-	#endasm
+#endasm
 	// char far * result is returned in PX
 }
 
@@ -508,8 +568,36 @@ _string_debug
 int memcmp( const void __far * s1, const void __far * s2, size_t n)
 {
 #asm
+#if _RAB6K
+    align even ; Put 4 of the next 5 instructions on even boundary
+	ld		hl, (sp+@sp+n)	;	n
+	ld		py, (sp+@sp+s2)	;	py = str2
+	ex		bc, hl
+	test	bc
+	jr		z, .countdone
+    clr hl
+.loop:
+	ld		a, (px+hl)
+	sub		a, (py)
+    align even ; Align most of loop on even boundary for 16 bit mem performance
+	jr		nz, .done
+	inc		px
+	inc		py
+	dwjnz	.loop
+.countdone:
+	clr	hl
+	jr		.over
+.done:
+	clr     hl
+	ld		l, a		;load a sign extended into hl
+	jr		nc, .over
+	dec	h
+.over:
+#else
+    align even  ; Improves performance for 16 bit memory
 	ld		py, (sp+@sp+s2)	;	py = str2
 	ld		hl, (sp+@sp+n)	;	n
+    ld      bcde, 1
 	ex		bc, hl
 	test	bc
 	jr		z, .countdone
@@ -518,8 +606,8 @@ int memcmp( const void __far * s1, const void __far * s2, size_t n)
 	ld		hl, (py)
 	sub	L
 	jr		nz, .done
-	ld		px, px+1
-	ld		py, py+1
+	ld		px, px+de
+	ld		py, py+de
 	dwjnz	.loop
 .countdone:
 	clr	hl
@@ -530,6 +618,7 @@ int memcmp( const void __far * s1, const void __far * s2, size_t n)
 	jr		nc, .over
 	dec	h
 .over:
+#endif
 #endasm
 }
 
@@ -673,19 +762,42 @@ END DESCRIPTION **********************************************************/
 /*** Beginheader _f_memchr */
 /*** Endheader */
 #asm __nodebug __root
+   align odd ; Aligns most of loop on even boundary to improve 16 bit mem speed
+#if _RAB6K
 _f_memchr::				; px = src
 	ld		bcde, (sp+6)	; load second param to DE, third param to BC
+   test	bc      ; check for n = 0
+   jr		z, .notfound
+   ld       a, e
+.find:
+	cp		a, (px)
+	jr	z, .find_exit
+	inc		px
+	dwjnz	.find
+.notfound:
+	ld     jkhl,0   ; quicker than ld px, 0
+    ld px, jkhl
+.find_exit:
+	ret
+#else
+_f_memchr::				; px = src
+	ld		bcde, (sp+6)	; load second param to DE, third param to BC
+    ld      jkhl, 1
    test	bc      ; check for n = 0
    jr		z, .notfound
 .find:
 	ld		a, (px)
 	cp		e
-	ret	z
-	ld		px, px+1
+	jr	z, .find_exit
+	ld		px, px+hl     ; hl is 1...
 	dwjnz	.find
 .notfound:
-	ld		px, 0
+	clr hl
+    ld px, jkhl
+;	ld		px, 0
+.find_exit:
 	ret
+#endif
 #endasm
 
 /*** Beginheader _n_memchr */
@@ -1391,6 +1503,37 @@ __nodebug
 size_t strlen(const char far *s)
 {
 	#asm
+#if _RAB6K
+	align odd ; Nicely aligns majority of code on even boundary
+    clr hl
+	ld		py, px					; PY = PX = s
+	.find_end:
+	ld		a, (px + hl)            ; Unroll the loop a bit for speed
+	or		a
+	jr		z, .found_end
+	inc		px
+
+	ld		a, (px + hl)
+	or		a
+	jr		z, .found_end
+	inc		px
+
+	ld		a, (px + hl)
+	or		a
+	jr		z, .found_end
+	inc 	px
+
+	ld		a, (px + hl)
+	or		a
+	jr		z, .found_end
+	inc		px
+
+	jr		.find_end
+
+	.found_end:
+	ld		jkhl, px		; JKHL = PX = src + string length
+	sub	jkhl, py	; JKHL = string length
+#else
 	ld		bcde, px					; BCDE = PX = s
 	.find_end:
 	ld		a, (px+0)
@@ -1403,6 +1546,7 @@ size_t strlen(const char far *s)
 	.found_end:
 	ld		jkhl, px		; JKHL = PX = src + string length
 	sub	jkhl, bcde	; JKHL = string length
+#endif
 	#endasm
 	// the "truncated" size_t result is returned in HL
 }
