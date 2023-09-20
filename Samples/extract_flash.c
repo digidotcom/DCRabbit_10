@@ -14,7 +14,7 @@
    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 */
 /*
-	extract_flash.c          v10.0.1
+	extract_flash.c          v10.1.0
 	
 	A program you can compile to RAM on Rabbit hardware in order to dump a copy
 	of the firmware stored on the flash.  You can use the Rabbit Field Utility
@@ -27,6 +27,9 @@
 	Consider this an Alpha release that still needs a lot of work.
 	
 	Tested on RCM4510W (512KB parallel flash, MSB_BIT of 19, 256KB quadrants).
+	Tested on boards with serial boot flash (RCM4300, BL4S100).
+	
+	v10.1.0 updated for RCM4200, RCM4120 and other boards with "Fast SRAM".
 
 	If you need to comment out the compiler warnings in BOARDTYPES.LIB (see
 	above), this process will erase the board's non-volatile, battery-backed RAM.
@@ -125,6 +128,9 @@ int read_flash(void __far *dest, unsigned long offset, int bytes)
 		do {
 			retval = sbf_far_Read(dest, offset, (unsigned) bytes);
 		} while (retval > 0);
+	#elif _RUN_FROM_RAM
+		// this is a parallel flash board with fast SRAM and 512KB memory banks
+		_f_memcpy(dest, (void __far *)((1536ul*1024) + offset), bytes);
 	#else
 		_f_memcpy(dest, (void __far *)((1LU<<MSB_BIT) + offset), bytes);
 	#endif
@@ -152,12 +158,14 @@ int main()
 	#if _SERIAL_BOOT_FLASH_
 		flash_bytes = SBF_FLASH_BYTES;
 	#else
-		// map flash into MB2 and MB3 quadrant
-		WrPortI(MB2CR, &MB2CRShadow, FLASH_WSTATES | 0x00);
-		WrPortI(MB3CR, &MB3CRShadow, FLASH_WSTATES | 0x00);
-      // re-initialize flash driver so it knows flash is in second two quadrants
-      _InitFlashDriver((1ul << (MSB_BIT + 1)) - (1ul << (MSB_BIT - 1)),
-      	(1ul << (MSB_BIT + 1)) - (1ul << (MSB_BIT - 1)));
+		#if !_RUN_FROM_RAM
+	      // map flash into MB2 and MB3 quadrant
+	      WrPortI(MB2CR, &MB2CRShadow, FLASH_WSTATES | 0x00);
+	      WrPortI(MB3CR, &MB3CRShadow, FLASH_WSTATES | 0x00);
+	      // re-initialize flash driver so it knows flash is in second two quadrants
+	      _InitFlashDriver((1ul << (MSB_BIT + 1)) - (1ul << (MSB_BIT - 1)),
+	         (1ul << (MSB_BIT + 1)) - (1ul << (MSB_BIT - 1)));
+		#endif
 		flash_bytes = _FLASH_SIZE_ * 4096UL;
 	#endif
 
