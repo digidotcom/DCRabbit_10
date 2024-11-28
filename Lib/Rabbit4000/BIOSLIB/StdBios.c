@@ -1874,6 +1874,13 @@ ioi   ld    (STACKSEG), a
 #endif
 //end serial flash fast RAM copy
 
+#if _BOARD_TYPE_ == RCM4110
+; RCM4110 with 55ns flash requires early output enable on MTCR when running
+; with 0 wait states, so configure that before setting MB0CR.
+      ld    a, 0x0C
+ioi   ld    (MTCR), a
+#endif
+
 .fastRAMCopyDone::
 ; Following a fast RAM copy, the current device mapped to MB0 and the device
 ; that is actually supposed to be mapped to MB0 contain the same code at this
@@ -2613,14 +2620,15 @@ _more_inits0::
 // Initialize the status pin, clocks, clock doubler, debug baud rate
 _more_inits02::
       lcall _getDoublerSetting   ; get doubler setting value into L (h always 0)
-      ld    a, L                 ; zero value also disables /OEx early output
+      ld    a, L
       or    a                    ; update the Zero flag
       jr    z, .notEarlyOutputEnable
 
       ld    a, 0x0C              ; value to set both /OE0 and /OE1 early output
-.notEarlyOutputEnable:
 ioi   ld    (MTCR), a            ; first, update /OE0, /OE1 early output enable
       ld    (MTCRShadow), a
+
+.notEarlyOutputEnable:
       ld    a, L                 ; recover the doubler setting value
 ioi   ld    (GCDR), a            ; next, update clock doubler setting
       ld    (GCDRShadow), a
